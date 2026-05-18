@@ -1,0 +1,13 @@
+[package]
+name = "tune-pyo3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tune_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+tune-core = { path = "../tune-core" }
+pyo3 = { workspace = true }

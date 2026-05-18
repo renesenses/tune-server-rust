@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+*.so
+*.dylib
+*.pyd
+*.egg-info/
+__pycache__/
+.env
