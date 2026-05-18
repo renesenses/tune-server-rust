@@ -71,20 +71,25 @@ impl AudioPipeline {
             args.extend(["-ss".into(), format!("{secs:.3}")]);
         }
 
+        let codec = if cfg.output_format == AudioFormat::Wav {
+            match cfg.bit_depth {
+                24 => "pcm_s24le",
+                32 => "pcm_s32le",
+                _ => "pcm_s16le",
+            }
+        } else {
+            cfg.output_format.ffmpeg_codec_arg()
+        };
+
         args.extend([
             "-i".into(), cfg.file_path.clone(),
             "-vn".into(),
             "-f".into(), cfg.output_format.ffmpeg_format_arg().into(),
-            "-acodec".into(), cfg.output_format.ffmpeg_codec_arg().into(),
+            "-acodec".into(), codec.into(),
             "-ar".into(), cfg.sample_rate.to_string(),
             "-ac".into(), cfg.channels.to_string(),
+            "pipe:1".into(),
         ]);
-
-        if cfg.output_format == AudioFormat::Wav {
-            args.extend(["-bits_per_sample".into(), cfg.bit_depth.to_string()]);
-        }
-
-        args.push("pipe:1".into());
 
         info!(file = %cfg.file_path, format = ?cfg.output_format, "pipeline_start");
 

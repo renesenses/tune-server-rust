@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 [dependencies]
 tune-core = { path = "../tune-core" }
 pyo3 = { workspace = true }
+tokio = { workspace = true }
