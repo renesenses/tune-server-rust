@@ -1,3 +1,4 @@
+pub mod buffer;
 pub mod metadata;
 
 pub fn version() -> &'static str {
