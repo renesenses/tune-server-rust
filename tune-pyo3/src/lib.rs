@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::path::Path;
 
 #[pyfunction]
@@ -69,9 +69,49 @@ fn read_metadata(py: Python<'_>, path: &str) -> PyResult<Option<PyObject>> {
     }
 }
 
+#[pyfunction]
+fn build_wav_header(py: Python<'_>, channels: u16, sample_rate: u32, bit_depth: u16) -> PyObject {
+    let header = tune_core::audio::wav::build_wav_header(channels, sample_rate, bit_depth);
+    PyBytes::new(py, &header).into()
+}
+
+#[pyfunction]
+fn find_ffmpeg() -> Option<String> {
+    tune_core::audio::pipeline::find_ffmpeg()
+}
+
+#[pyfunction]
+fn format_from_extension(ext: &str) -> Option<String> {
+    tune_core::audio::formats::AudioFormat::from_extension(ext)
+        .map(|f| format!("{:?}", f).to_lowercase())
+}
+
+#[pyfunction]
+fn mime_type_for_format(format_name: &str) -> String {
+    let fmt = match format_name {
+        "flac" => tune_core::audio::formats::AudioFormat::Flac,
+        "wav" => tune_core::audio::formats::AudioFormat::Wav,
+        "mp3" => tune_core::audio::formats::AudioFormat::Mp3,
+        "aac" => tune_core::audio::formats::AudioFormat::Aac,
+        "alac" => tune_core::audio::formats::AudioFormat::Alac,
+        "ogg" => tune_core::audio::formats::AudioFormat::Ogg,
+        "opus" => tune_core::audio::formats::AudioFormat::Opus,
+        "aiff" => tune_core::audio::formats::AudioFormat::Aiff,
+        "dsd" => tune_core::audio::formats::AudioFormat::Dsd,
+        "wavpack" => tune_core::audio::formats::AudioFormat::WavPack,
+        "ape" => tune_core::audio::formats::AudioFormat::Ape,
+        _ => return "application/octet-stream".to_string(),
+    };
+    fmt.mime_type().to_string()
+}
+
 #[pymodule]
 fn tune_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(read_metadata, m)?)?;
+    m.add_function(wrap_pyfunction!(build_wav_header, m)?)?;
+    m.add_function(wrap_pyfunction!(find_ffmpeg, m)?)?;
+    m.add_function(wrap_pyfunction!(format_from_extension, m)?)?;
+    m.add_function(wrap_pyfunction!(mime_type_for_format, m)?)?;
     Ok(())
 }
