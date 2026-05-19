@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["local-audio"]
+local-audio = ["tune-core/local-audio"]
+
 [dependencies]
-tune-core = { path = "../tune-core", features = ["local-audio"] }
+tune-core = { path = "../tune-core", default-features = false }
 tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
