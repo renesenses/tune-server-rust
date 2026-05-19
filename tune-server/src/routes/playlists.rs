@@ -46,6 +46,8 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_playlist).put(update_playlist).delete(delete_playlist))
         .route("/{id}/tracks", get(get_tracks).post(add_tracks))
         .route("/{id}/tracks/remove", post(remove_track))
+        .route("/{id}/duplicate", post(duplicate_playlist))
+        .route("/{id}/export", get(export_m3u))
 }
 
 async fn list_playlists(
@@ -138,4 +140,66 @@ async fn remove_track(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+async fn duplicate_playlist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db.clone());
+    let original = match repo.get(id) {
+        Ok(Some(p)) => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let new_name = format!("{} (copy)", original.name);
+    let new_id = match repo.create(&new_name, None) {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    if !track_ids.is_empty() {
+        repo.add_tracks(new_id, &track_ids, None).ok();
+    }
+
+    (StatusCode::CREATED, Json(json!({ "id": new_id, "name": new_name }))).into_response()
+}
+
+async fn export_m3u(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db.clone());
+    let playlist = match repo.get(id) {
+        Ok(Some(p)) => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
+
+    let mut m3u = String::from("#EXTM3U\n");
+    for t in &tracks {
+        let duration_secs = t.duration_ms / 1000;
+        let artist = t.artist_name.as_deref().unwrap_or("Unknown");
+        m3u.push_str(&format!("#EXTINF:{},{} - {}\n", duration_secs, artist, t.title));
+        if let Some(ref path) = t.file_path {
+            m3u.push_str(path);
+            m3u.push('\n');
+        }
+    }
+
+    let filename = format!("{}.m3u", playlist.name.replace(' ', "_"));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        axum::http::HeaderValue::from_static("audio/x-mpegurl; charset=utf-8"),
+    );
+    headers.insert(
+        "Content-Disposition",
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
+    );
+
+    (axum::http::StatusCode::OK, headers, m3u).into_response()
 }

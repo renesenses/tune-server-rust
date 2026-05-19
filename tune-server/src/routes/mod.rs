@@ -4,10 +4,12 @@ pub mod history;
 pub mod library;
 pub mod playback;
 pub mod playlists;
+pub mod profiles;
 pub mod radios;
 pub mod search;
 pub mod streaming;
 pub mod system;
+pub mod tags;
 pub mod ws;
 pub mod zones;
 
@@ -30,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/search", search::router())
         .nest("/api/v1/devices", devices::router())
         .nest("/api/v1/streaming", streaming::router())
+        .nest("/api/v1/profiles", profiles::router())
+        .nest("/api/v1/tags", tags::router())
         .nest("/api/v1/export", export::router())
         .nest("/ws", ws::router())
         .with_state(state)

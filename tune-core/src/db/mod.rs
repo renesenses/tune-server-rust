@@ -10,3 +10,6 @@ pub mod zone_repo;
 pub mod radio_repo;
 pub mod history_repo;
 pub mod settings_repo;
+pub mod profile_repo;
+pub mod tag_repo;
+pub mod rating_repo;

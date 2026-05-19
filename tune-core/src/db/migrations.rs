@@ -80,6 +80,70 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 ",
     },
+    Migration {
+        version: 6,
+        name: "add_profiles_favorites_tags_ratings",
+        up: "
+CREATE TABLE IF NOT EXISTS profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    avatar_path TEXT,
+    password_hash TEXT,
+    is_admin INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(profile_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    color TEXT DEFAULT '#808080'
+);
+
+CREATE TABLE IF NOT EXISTS item_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    UNIQUE(tag_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
+
+CREATE TABLE IF NOT EXISTS album_ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    rating INTEGER NOT NULL CHECK(rating >= 1 AND rating <= 5),
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(album_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
+
+CREATE TABLE IF NOT EXISTS smart_playlists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    rules TEXT NOT NULL DEFAULT '[]',
+    sort_by TEXT DEFAULT 'title',
+    sort_order TEXT DEFAULT 'asc',
+    max_tracks INTEGER,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+INSERT OR IGNORE INTO profiles (id, username, display_name, is_admin) VALUES (1, 'default', 'Default', 1);
+",
+    },
 ];
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {

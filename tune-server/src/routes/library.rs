@@ -11,6 +11,7 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::rating_repo::RatingRepo;
 
 use crate::state::AppState;
 
@@ -52,6 +53,9 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}", get(get_track))
         .route("/tracks/{id}/audio", get(stream_track_audio))
         .route("/tracks/{id}/rescan", post(rescan_track))
+        .route("/albums/top-rated", get(top_rated_albums))
+        .route("/albums/{id}/rate", post(rate_album))
+        .route("/albums/{id}/rating", get(get_album_rating))
         .route("/search", get(search))
         .route("/stats", get(library_stats))
 }
@@ -349,4 +353,67 @@ async fn library_stats(State(state): State<AppState>) -> Json<Value> {
         "total_duration_ms": total_duration_ms,
         "total_size_bytes": total_size_bytes,
     }))
+}
+
+#[derive(Deserialize)]
+struct RateRequest {
+    rating: i32,
+    note: Option<String>,
+    profile_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RatingQuery {
+    profile_id: Option<i64>,
+}
+
+async fn rate_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<RateRequest>,
+) -> impl IntoResponse {
+    let repo = RatingRepo::new(state.db);
+    let profile_id = body.profile_id.unwrap_or(1);
+    match repo.rate_album(id, profile_id, body.rating, body.note.as_deref()) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn get_album_rating(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<RatingQuery>,
+) -> impl IntoResponse {
+    let repo = RatingRepo::new(state.db);
+    let profile_id = q.profile_id.unwrap_or(1);
+    match repo.get_rating(id, profile_id) {
+        Ok(Some(r)) => Json(json!(r)).into_response(),
+        Ok(None) => Json(json!({ "rating": null, "album_id": id })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn top_rated_albums(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(20);
+    let repo = RatingRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::new(state.db);
+    let top = repo.top_rated(limit).unwrap_or_default();
+
+    let items: Vec<Value> = top
+        .iter()
+        .filter_map(|(album_id, avg_rating, count)| {
+            let album = album_repo.get(*album_id).ok()??;
+            Some(json!({
+                "album": album,
+                "avg_rating": avg_rating,
+                "rating_count": count,
+            }))
+        })
+        .collect();
+
+    Json(json!({ "items": items, "total": items.len() }))
 }
