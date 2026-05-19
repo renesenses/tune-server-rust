@@ -177,7 +177,7 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 
 ---
 
-## Phase 6 — API Layer (v1.8.0) — 16-22 semaines
+## Phase 6 — API Layer (v1.8.0) — 16-22 semaines — 🔧 IN PROGRESS (2026-05-19)
 
 **But** : FastAPI → Axum. Le binaire Rust sert tous les endpoints HTTP. Python sort du hot path.
 
@@ -186,14 +186,26 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 - `app.py` (1 462), `config.py` (289), `event_bus.py` (172)
 
 **Implémentation** :
-- Chaque route FastAPI → handler Axum (contrat API byte-identical pour les clients Flutter/Swift/Web)
-- WebSocket via `tokio-tungstenite` avec pattern-based filtering
-- Event bus via `tokio::sync::broadcast`
-- Config via `figment` (même variables `TUNE_*`)
-- Logging via `tracing` (remplace `structlog`)
+- ✅ **System routes** : version, health, stats, config CRUD, scan (parallel metadata import), scan/status, restart, database/status, database/optimize, music-dirs, env
+- ✅ **Library routes** : artists/albums/tracks (paginated), search (FTS5 federated), artist→albums, album→tracks
+- ✅ **Playback engine** : PlaybackManager (state machine play/pause/stop/seek), NowPlaying, volume/shuffle/repeat, broadcast event bus
+- ✅ **Playback routes** : play (track/album/playlist), pause, resume, stop, next, previous, seek, volume, shuffle, repeat, queue CRUD (add/move/jump/clear)
+- ✅ **Zone routes** : CRUD, volume, mute, rename
+- ✅ **Playlist routes** : CRUD, track management (add/remove/reorder)
+- ✅ **Radio routes** : CRUD, search, favorites, play count
+- ✅ **Search** : federated search (local FTS5 + radios + streaming stubs)
+- ✅ **History** : listen history, top tracks, top artists, dashboard stats
+- ✅ **WebSocket** : `/ws` endpoint via axum ws, broadcast PlaybackEvents
+- ✅ **Devices** : list/scan stubs (discovery integration pending)
+- ✅ **Streaming services** : service list/status/auth/search stubs
+- ✅ **New DB repos** : RadioRepo, HistoryRepo, SettingsRepo
+- ✅ **Schema migrations** : versioned (5 migrations), idempotent, auto-applied at startup
+- ⬜ Remaining ~150 endpoints (profiles, tags, export/import, plugins, podcasts, DJ, party, etc.)
+- ⬜ Tower-HTTP middleware (CORS, compression, request logging)
+- ⬜ Config via `figment` (currently env vars only)
 
-**Crates** : `axum`, `tower-http`, `tokio-tungstenite`, `figment`, `tracing`, `clap`
-**LOC Rust** : ~25 000 | **Remplace** : 19 661 Python
+**Crates** : `axum` (+ ws), `tokio::sync::broadcast`, `tracing`
+**LOC Rust** : ~4 500 (de ~25 000 cible) | **Remplace** : ~5 000 Python (core routes)
 **Gains** : startup <0.5s, RSS 50-80 MB, latence API 2-5x
 
 ---
