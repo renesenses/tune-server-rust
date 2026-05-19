@@ -1,0 +1,337 @@
+use std::collections::HashSet;
+
+use rusqlite::{params, OptionalExtension};
+
+use super::models::Track;
+use super::sqlite::SqliteDb;
+
+const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
+
+pub struct TrackRepo {
+    db: SqliteDb,
+}
+
+impl TrackRepo {
+    pub fn new(db: SqliteDb) -> Self {
+        Self { db }
+    }
+
+    pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.id = ?"))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![id], |row| Ok(row_to_track(row)))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![file_path], |row| Ok(row_to_track(row)))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn create(&self, track: &Track) -> Result<i64, String> {
+        self.db.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                &track.title as &dyn rusqlite::types::ToSql,
+                &track.album_id, &track.artist_id,
+                &track.disc_number, &track.disc_subtitle,
+                &track.track_number, &track.duration_ms,
+                &track.file_path, &track.format,
+                &track.sample_rate, &track.bit_depth, &track.channels,
+                &track.file_mtime, &track.file_size, &track.audio_hash,
+                &track.source, &track.source_id, &track.isrc,
+                &track.genre, &track.composer, &track.year,
+                &track.bpm, &track.label, &track.musicbrainz_recording_id,
+            ],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn update(&self, track: &Track) -> Result<(), String> {
+        let id = track.id.ok_or("track has no id")?;
+        self.db.execute(
+            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
+            &[
+                &track.title as &dyn rusqlite::types::ToSql,
+                &track.album_id, &track.artist_id,
+                &track.disc_number, &track.disc_subtitle,
+                &track.track_number, &track.duration_ms,
+                &track.file_path, &track.format,
+                &track.sample_rate, &track.bit_depth, &track.channels,
+                &track.file_mtime, &track.file_size, &track.audio_hash,
+                &track.genre, &track.composer, &track.year,
+                &track.bpm, &track.label, &track.musicbrainz_recording_id,
+                &id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete(&self, id: i64) -> Result<(), String> {
+        self.db.execute("DELETE FROM tracks WHERE id = ?", &[&id])?;
+        Ok(())
+    }
+
+    pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
+        self.db.execute("DELETE FROM tracks WHERE file_path = ?", &[&file_path as &dyn rusqlite::types::ToSql])?;
+        Ok(())
+    }
+
+    pub fn count(&self) -> Result<i64, String> {
+        let conn = self.db.connection().lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(paths)
+    }
+
+    pub fn update_mtime_and_size(&self, file_path: &str, mtime: f64, file_size: i64) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE tracks SET file_mtime = ?, file_size = ? WHERE file_path = ?",
+            &[&mtime as &dyn rusqlite::types::ToSql, &file_size, &file_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE tracks SET audio_hash = ? WHERE file_path = ?",
+            &[&audio_hash as &dyn rusqlite::types::ToSql, &file_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.album_id = ? ORDER BY t.disc_number, t.track_number, t.file_path"))
+            .map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![album_id], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
+    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.artist_id = ? ORDER BY t.title"))
+            .map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![artist_id], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
+        let like = format!("%{query}%");
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR al.title LIKE ? COLLATE NOCASE LIMIT ?"))
+            .map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![like, like, like, limit], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
+    pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!("{SELECT_TRACK} WHERE t.id IN ({})", placeholders.join(","));
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let tracks: Vec<Track> = stmt
+            .query_map(params.as_slice(), |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Preserve caller's ordering
+        let mut ordered = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
+                ordered.push(t.clone());
+            }
+        }
+        Ok(ordered)
+    }
+
+    pub fn deduplicate(&self) -> Result<i64, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+
+        if count > 0 {
+            conn.execute(
+                "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))",
+                [],
+            ).map_err(|e| e.to_string())?;
+        }
+        Ok(count)
+    }
+}
+
+fn row_to_track(row: &rusqlite::Row) -> Track {
+    Track {
+        id: row.get(0).ok(),
+        title: row.get(1).unwrap_or_default(),
+        album_id: row.get(2).ok(),
+        album_title: row.get(3).ok(),
+        artist_id: row.get(4).ok(),
+        artist_name: row.get(5).ok(),
+        disc_number: row.get(6).unwrap_or(1),
+        disc_subtitle: row.get(7).ok(),
+        track_number: row.get(8).unwrap_or(0),
+        duration_ms: row.get(9).unwrap_or(0),
+        file_path: row.get(10).ok(),
+        format: row.get(11).ok(),
+        sample_rate: row.get(12).ok(),
+        bit_depth: row.get(13).ok(),
+        channels: row.get(14).unwrap_or(2),
+        file_mtime: row.get(15).ok(),
+        file_size: row.get(16).ok(),
+        audio_hash: row.get(17).ok(),
+        source: row.get(18).unwrap_or_else(|_| "local".into()),
+        source_id: row.get(19).ok(),
+        isrc: row.get(20).ok(),
+        genre: row.get(21).ok(),
+        composer: row.get(22).ok(),
+        year: row.get(23).ok(),
+        bpm: row.get(24).ok(),
+        label: row.get(25).ok(),
+        musicbrainz_recording_id: row.get(26).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::album_repo::AlbumRepo;
+    use crate::db::models::{Artist, Album};
+
+    fn test_db() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db
+    }
+
+    #[test]
+    fn crud_track() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let alid = album_repo.get_or_create("DSOTM", aid, Some(1973)).unwrap().id.unwrap();
+
+        let mut track = Track::new("Time".into());
+        track.artist_id = Some(aid);
+        track.album_id = Some(alid);
+        track.file_path = Some("/music/pink_floyd/dsotm/time.flac".into());
+        track.duration_ms = 413000;
+        track.sample_rate = Some(44100);
+        track.bit_depth = Some(16);
+
+        let id = repo.create(&track).unwrap();
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.title, "Time");
+        assert_eq!(fetched.artist_name.as_deref(), Some("Pink Floyd"));
+        assert_eq!(fetched.album_title.as_deref(), Some("DSOTM"));
+
+        let by_path = repo.get_by_path("/music/pink_floyd/dsotm/time.flac").unwrap();
+        assert!(by_path.is_some());
+
+        repo.delete(id).unwrap();
+        assert!(repo.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_all_paths() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t1 = Track::new("Song 1".into());
+        t1.file_path = Some("/a.flac".into());
+        let mut t2 = Track::new("Song 2".into());
+        t2.file_path = Some("/b.flac".into());
+
+        repo.create(&t1).unwrap();
+        repo.create(&t2).unwrap();
+
+        let paths = repo.get_all_paths().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("/a.flac"));
+    }
+
+    #[test]
+    fn get_multiple_preserves_order() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t1 = Track::new("Alpha".into());
+        t1.file_path = Some("/1.flac".into());
+        let mut t2 = Track::new("Beta".into());
+        t2.file_path = Some("/2.flac".into());
+        let mut t3 = Track::new("Gamma".into());
+        t3.file_path = Some("/3.flac".into());
+
+        let id1 = repo.create(&t1).unwrap();
+        let id2 = repo.create(&t2).unwrap();
+        let id3 = repo.create(&t3).unwrap();
+
+        let result = repo.get_multiple(&[id3, id1, id2]).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].title, "Gamma");
+        assert_eq!(result[1].title, "Alpha");
+        assert_eq!(result[2].title, "Beta");
+    }
+
+    #[test]
+    fn search_tracks() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Comfortably Numb".into());
+        t.file_path = Some("/numb.flac".into());
+        repo.create(&t).unwrap();
+
+        let results = repo.search("comfort", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+}

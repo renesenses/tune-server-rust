@@ -19,3 +19,4 @@ walkdir = { workspace = true }
 rayon = { workspace = true }
 notify = { workspace = true }
 md-5 = { workspace = true }
+rusqlite = { workspace = true }

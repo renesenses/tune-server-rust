@@ -1,3 +1,4 @@
+mod db_wrapper;
 mod discovery_wrapper;
 mod pipeline_wrapper;
 mod scanner_wrapper;
@@ -121,5 +122,6 @@ fn tune_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<discovery_wrapper::RustSsdpScanner>()?;
     m.add_class::<discovery_wrapper::RustMdnsScanner>()?;
     scanner_wrapper::register(m)?;
+    db_wrapper::register(m)?;
     Ok(())
 }
