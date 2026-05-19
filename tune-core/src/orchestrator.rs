@@ -89,10 +89,10 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.resolve_local_track(req)
+        self.resolve_local_track(req).await
     }
 
-    fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
+    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::new(self.db.clone());
         let track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
@@ -112,9 +112,7 @@ impl PlaybackOrchestrator {
             file_size: track.file_size.map(|s| s as u64),
         };
 
-        let session_id = tokio::runtime::Handle::current().block_on(
-            self.streamer.create_file_session(info, file_path.clone(), false)
-        );
+        let session_id = self.streamer.create_file_session(info, file_path.clone(), false).await;
 
         let server_ip = crate::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())

@@ -19,6 +19,14 @@ struct PlayRequest {
     album_id: Option<i64>,
     playlist_id: Option<i64>,
     start_index: Option<i64>,
+    source: Option<String>,
+    source_id: Option<String>,
+    output_device_id: Option<String>,
+    title: Option<String>,
+    artist_name: Option<String>,
+    album_title: Option<String>,
+    cover_path: Option<String>,
+    duration_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -146,36 +154,45 @@ async fn play(
     let target_id = track_ids.get(start as usize).copied().unwrap_or(track_ids[0]);
     let track = track_repo.get(target_id).ok().flatten();
 
-    let np = NowPlaying {
+    let output_device_id = body.output_device_id.or_else(|| {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+    });
+
+    let orch_req = tune_core::orchestrator::PlayRequest {
+        zone_id,
+        output_device_id,
         track_id: Some(target_id),
-        title: track
-            .as_ref()
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "Unknown".into()),
-        artist_name: track.as_ref().and_then(|t| t.artist_name.clone()),
-        album_title: track.as_ref().and_then(|t| t.album_title.clone()),
-        cover_path: None,
-        duration_ms: track.as_ref().map(|t| t.duration_ms).unwrap_or(0),
-        source: "local".into(),
-        source_id: None,
-        stream_id: None,
+        source: body.source,
+        source_id: body.source_id,
+        title: body.title.or_else(|| track.as_ref().map(|t| t.title.clone())),
+        artist_name: body.artist_name.or_else(|| track.as_ref().and_then(|t| t.artist_name.clone())),
+        album_title: body.album_title.or_else(|| track.as_ref().and_then(|t| t.album_title.clone())),
+        cover_url: body.cover_path,
+        duration_ms: body.duration_ms.or_else(|| track.as_ref().map(|t| t.duration_ms)),
     };
 
-    state.playback.play(zone_id, np).await;
-    state
-        .playback
-        .update_queue_info(zone_id, start, track_ids.len() as i64)
-        .await;
-
-    let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!(zone_state)).into_response()
+    match state.orchestrator.play(orch_req).await {
+        Ok(result) => {
+            state.playback.update_queue_info(zone_id, start, track_ids.len() as i64).await;
+            let zone_state = state.playback.get_state(zone_id).await;
+            Json(json!({
+                "zone": zone_state,
+                "stream_url": result.stream_url,
+                "output_sent": result.output_sent,
+                "source": result.source,
+            })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn pause(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
 ) -> Json<Value> {
-    state.playback.pause(zone_id).await;
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.pause(zone_id, device_id.as_deref()).await;
     Json(json!({ "status": "paused" }))
 }
 
@@ -183,7 +200,8 @@ async fn resume(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
 ) -> Json<Value> {
-    state.playback.resume(zone_id).await;
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.resume(zone_id, device_id.as_deref()).await;
     Json(json!({ "status": "playing" }))
 }
 
@@ -191,7 +209,8 @@ async fn stop(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
 ) -> Json<Value> {
-    state.playback.stop(zone_id).await;
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     Json(json!({ "status": "stopped" }))
 }
 
@@ -278,7 +297,8 @@ async fn seek(
     Path(zone_id): Path<i64>,
     Json(body): Json<SeekRequest>,
 ) -> Json<Value> {
-    state.playback.seek(zone_id, body.position_ms).await;
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.seek(zone_id, body.position_ms as u64, device_id.as_deref()).await;
     Json(json!({ "position_ms": body.position_ms }))
 }
 
@@ -287,7 +307,8 @@ async fn set_volume(
     Path(zone_id): Path<i64>,
     Json(body): Json<VolumeRequest>,
 ) -> Json<Value> {
-    state.playback.set_volume(zone_id, body.volume).await;
+    let device_id = get_zone_device_id(&state, zone_id);
+    state.orchestrator.set_volume(zone_id, body.volume, device_id.as_deref()).await;
     Json(json!({ "volume": body.volume }))
 }
 
@@ -614,4 +635,12 @@ async fn delete_alarm(
 ) -> impl IntoResponse {
     state.db.execute("DELETE FROM alarms WHERE id = ?", &[&alarm_id]).ok();
     StatusCode::NO_CONTENT
+}
+
+fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
+    tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
 }

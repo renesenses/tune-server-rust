@@ -17,6 +17,7 @@ pub struct AppState {
     pub playback: Arc<PlaybackManager>,
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
+    pub orchestrator: Arc<PlaybackOrchestrator>,
     pub port: u16,
     pub started_at: Instant,
 }
@@ -40,14 +41,24 @@ impl AppState {
         services.register(Box::new(tune_core::streaming::deezer::DeezerService::new()));
         services.register(Box::new(tune_core::streaming::youtube::YouTubeService::new()));
 
-        let outputs = OutputRegistry::new();
+        let services = Arc::new(Mutex::new(services));
+        let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
+
+        let orchestrator = Arc::new(PlaybackOrchestrator {
+            db: db.clone(),
+            playback: playback.clone(),
+            streamer: streamer.clone(),
+            services: services.clone(),
+            outputs: outputs.clone(),
+        });
 
         Ok(Self {
             db,
             streamer,
             playback,
-            services: Arc::new(Mutex::new(services)),
-            outputs: Arc::new(Mutex::new(outputs)),
+            services,
+            outputs,
+            orchestrator,
             port,
             started_at: Instant::now(),
         })
