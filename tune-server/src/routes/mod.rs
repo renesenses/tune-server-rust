@@ -1,4 +1,5 @@
 pub mod devices;
+pub mod export;
 pub mod history;
 pub mod library;
 pub mod playback;
@@ -11,6 +12,8 @@ pub mod ws;
 pub mod zones;
 
 use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
 
 use crate::state::AppState;
 
@@ -27,7 +30,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/search", search::router())
         .nest("/api/v1/devices", devices::router())
         .nest("/api/v1/streaming", streaming::router())
+        .nest("/api/v1/export", export::router())
         .nest("/ws", ws::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
+        .layer(CompressionLayer::new())
+        .layer(CorsLayer::permissive())
 }

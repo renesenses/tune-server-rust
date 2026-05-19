@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::http::streamer::AudioStreamer;
@@ -10,6 +11,7 @@ pub struct AppState {
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
     pub port: u16,
+    pub started_at: Instant,
 }
 
 impl AppState {
@@ -26,6 +28,7 @@ impl AppState {
             streamer,
             playback,
             port,
+            started_at: Instant::now(),
         })
     }
 }

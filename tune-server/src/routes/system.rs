@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -32,6 +32,9 @@ pub fn router() -> Router<AppState> {
         .route("/music-dirs", get(get_music_dirs))
         .route("/music-dirs/add", post(add_music_dir))
         .route("/env", get(get_env))
+        .route("/diagnostics", get(diagnostics))
+        .route("/cleanup", post(cleanup))
+        .route("/logs", get(logs))
 }
 
 async fn version() -> Json<Value> {
@@ -323,4 +326,73 @@ fn chrono_now() -> String {
         .unwrap()
         .as_secs();
     format!("{now}")
+}
+
+async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
+    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
+    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
+    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let db_version = migrations::current_version(&state.db).unwrap_or(0);
+    let music_dirs = get_music_dirs_list(&state.db);
+    let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
+    Json(json!({
+        "version": tune_core::version(),
+        "engine": "rust",
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "pid": std::process::id(),
+        "uptime_seconds": uptime_secs,
+        "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        "db": {
+            "engine": "sqlite",
+            "migration_version": db_version,
+        },
+        "music_dirs": music_dirs,
+        "tracks_count": tracks,
+        "albums_count": albums,
+        "artists_count": artists,
+        "ffmpeg_path": ffmpeg,
+        "ffmpeg_available": ffmpeg.is_some(),
+        "rust_engines": {
+            "available": true,
+            "version": tune_core::version(),
+            "metadata_engine": "lofty",
+            "discovery_engine": "mdns-sd + socket2",
+            "scanner_engine": "walkdir + rayon",
+            "db_engine": "rusqlite",
+        },
+    }))
+}
+
+async fn cleanup(State(state): State<AppState>) -> Json<Value> {
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
+
+    let tracks = TrackRepo::new(state.db.clone()).deduplicate().unwrap_or(0);
+
+    let db_optimized = state
+        .db
+        .execute_batch("PRAGMA optimize; ANALYZE;")
+        .is_ok();
+
+    Json(json!({
+        "orphan_albums_deleted": orphan_albums,
+        "duplicate_tracks_removed": tracks,
+        "db_optimized": db_optimized,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    lines: Option<usize>,
+}
+
+async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
+    let _lines = q.lines.unwrap_or(100);
+    Json(json!({
+        "logs": "log retrieval not yet implemented (journalctl/file)",
+        "lines": 0,
+    }))
 }
