@@ -2,6 +2,7 @@ pub mod audio;
 pub mod buffer;
 pub mod db;
 pub mod discovery;
+pub mod http;
 pub mod metadata;
 pub mod scanner;
 

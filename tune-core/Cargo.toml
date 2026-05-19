@@ -20,3 +20,6 @@ rayon = { workspace = true }
 notify = { workspace = true }
 md-5 = { workspace = true }
 rusqlite = { workspace = true }
+axum = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
