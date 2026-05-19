@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::http::streamer::AudioStreamer;
+use tune_core::playback::PlaybackManager;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqliteDb,
     pub streamer: Arc<AudioStreamer>,
+    pub playback: Arc<PlaybackManager>,
     pub port: u16,
 }
 
@@ -17,7 +19,13 @@ impl AppState {
         tune_core::db::migrations::run_migrations(&db)?;
 
         let streamer = Arc::new(AudioStreamer::new(port));
+        let playback = Arc::new(PlaybackManager::new());
 
-        Ok(Self { db, streamer, port })
+        Ok(Self {
+            db,
+            streamer,
+            playback,
+            port,
+        })
     }
 }
