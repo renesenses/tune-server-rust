@@ -15,3 +15,7 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 socket2 = { workspace = true }
 uuid = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+notify = { workspace = true }
+md-5 = { workspace = true }

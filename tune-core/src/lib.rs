@@ -2,6 +2,7 @@ pub mod audio;
 pub mod buffer;
 pub mod discovery;
 pub mod metadata;
+pub mod scanner;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

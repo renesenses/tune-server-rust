@@ -95,7 +95,7 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 
 ---
 
-## Phase 4 — Library Scanner + File Watcher (v1.3.0) — 4-5 semaines
+## Phase 4 — Library Scanner + File Watcher (v1.3.0) — 4-5 semaines ✅ CORE DONE (2026-05-19)
 
 **But** : File walk + metadata reading parallélisés sur tous les cores CPU.
 
@@ -103,12 +103,25 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 - `library/scanner.py` (585), `watcher.py` (169), `artwork.py` (~234 partiel)
 
 **Implémentation** :
-- `tune_native.scan_directory(path, callback)` : `walkdir` + `rayon` pour parallélisme
-- `tune_native.FileWatcher` : `notify` (inotify/FSEvents natif) remplace `watchfiles`
-- Hash audio MD5 et extraction cover art en Rust
+- ✅ `tune_native.list_audio_files(dirs)` : `walkdir` enumération rapide
+- ✅ `tune_native.scan_directories(dirs, with_hash)` : `walkdir` + `rayon` parallélisme complet
+- ✅ `tune_native.RustFileWatcher` : `notify` (inotify/FSEvents/kqueue natif) avec debounce
+- ✅ `tune_native.audio_hash(path)` : MD5 64KB at 25% offset
+- ✅ `tune_native.same_quality_tier()` + `tune_native.quality_suffix_fn()`
+- ✅ PyO3 bindings : 6 fonctions + `RustFileWatcher` class
+- ✅ Python integration : `rust_scanner.py` shim + `scanner.py` hot path replacement
+- ⬜ Benchmark comparison Python vs Rust scan speed
+- ⬜ Artwork extraction via lofty (cover art embedded dans les tags)
 
-**Crates** : `walkdir`, `rayon`, `notify`, `md5`, `image`
-**LOC Rust** : ~1 500 | **Remplace** : 988 Python
+**Fichiers Rust** :
+- `tune-core/src/scanner/walker.rs` — Parallel file walk + metadata via rayon
+- `tune-core/src/scanner/hasher.rs` — Audio hash MD5
+- `tune-core/src/scanner/watcher.rs` — File watcher via notify crate
+- `tune-core/src/scanner/quality.rs` — Quality tier helpers
+- `tune-pyo3/src/scanner_wrapper.rs` — PyO3 bindings
+
+**Crates** : `walkdir`, `rayon`, `notify`, `md-5`
+**LOC Rust** : ~750 | **Remplace** : 988 Python (scanner hot paths)
 **Gains** : scan 5-10x plus rapide (parallèle sur tous les cores, pas de GIL), -60% mémoire scan
 
 ---
