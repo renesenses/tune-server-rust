@@ -91,6 +91,19 @@ impl TrackRepo {
             .map_err(|e| e.to_string())
     }
 
+    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} ORDER BY ar.name COLLATE NOCASE, al.title COLLATE NOCASE, t.disc_number, t.track_number LIMIT ? OFFSET ?"))
+            .map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
     pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn

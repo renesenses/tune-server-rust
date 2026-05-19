@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::audio::wav::build_wav_header;
 

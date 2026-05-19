@@ -137,27 +137,42 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 
 **Implémentation** :
 - ✅ `SqliteDb` : rusqlite wrapper (WAL, foreign keys, busy_timeout, PRAGMA)
-- ✅ `ArtistRepo` : CRUD, get_or_create, search (LIKE COLLATE NOCASE)
-- ✅ `AlbumRepo` : CRUD, get_or_create, delete_orphans, update_track_count, search
-- ✅ `TrackRepo` : CRUD, get_all_paths, get_multiple (order-preserving), search, deduplicate
-- ✅ Models : Artist, Album, Track, TrackCredit structs
+- ✅ `ArtistRepo` : CRUD, get_or_create, list, search (FTS5 + LIKE COLLATE NOCASE)
+- ✅ `AlbumRepo` : CRUD, get_or_create, list, list_by_artist, delete_orphans, update_track_count, search
+- ✅ `TrackRepo` : CRUD, list, list_by_album/artist, get_all_paths, get_multiple (order-preserving), search, deduplicate
+- ✅ `PlaylistRepo` : CRUD, add/remove/reorder tracks, get_track_ids
+- ✅ `PlayQueueRepo` : get_queue, set_queue, add_tracks, set_current, clear, count
+- ✅ `ZoneRepo` : CRUD, update volume/muted/name, list
+- ✅ Models : Artist, Album, Track, TrackCredit, Playlist, Zone, QueueItem (all Serialize/Deserialize)
+- ✅ FTS5 virtual tables + triggers (tracks_fts, albums_fts, artists_fts)
 - ✅ PyO3 `RustDatabase` class exposing key operations
-- ⬜ PlaylistRepo, PlayQueueRepo, ZoneRepo, RadioStationRepo
-- ⬜ FTS5 virtual tables + triggers
+- ✅ HTTP audio streamer (Axum) — file Range, proxy, chunked, ICY metadata
+- ✅ Axum server (`tune-server`) with full REST API:
+  - `/api/system/version`, `/api/system/health`, `/api/system/stats`
+  - `/api/library/artists`, `/albums`, `/tracks`, `/search` (paginated, FTS5)
+  - `/api/zones/*` (CRUD + volume/mute + play queue)
+  - `/api/playlists/*` (CRUD + track management)
+  - `/stream/{id}` (file/proxy/chunked streaming)
 - ⬜ PostgreSQL backend (sqlx)
-- ⬜ HTTP audio streamer (Axum)
-- ⬜ Schema migrations
+- ⬜ Schema migrations (versioned)
 
 **Fichiers Rust** :
-- `tune-core/src/db/sqlite.rs` — SQLite wrapper + core schema
+- `tune-core/src/db/sqlite.rs` — SQLite wrapper + core schema + FTS5
 - `tune-core/src/db/models.rs` — Artist, Album, Track, TrackCredit
-- `tune-core/src/db/artist_repo.rs` — ArtistRepo (8 methods)
-- `tune-core/src/db/album_repo.rs` — AlbumRepo (12 methods)
-- `tune-core/src/db/track_repo.rs` — TrackRepo (14 methods)
+- `tune-core/src/db/artist_repo.rs` — ArtistRepo (11 methods)
+- `tune-core/src/db/album_repo.rs` — AlbumRepo (14 methods)
+- `tune-core/src/db/track_repo.rs` — TrackRepo (17 methods)
+- `tune-core/src/db/playlist_repo.rs` — PlaylistRepo (10 methods)
+- `tune-core/src/db/play_queue_repo.rs` — PlayQueueRepo (8 methods)
+- `tune-core/src/db/zone_repo.rs` — ZoneRepo (8 methods)
+- `tune-core/src/http/streamer.rs` — AudioStreamer + Axum handlers
 - `tune-pyo3/src/db_wrapper.rs` — RustDatabase PyO3 class
+- `tune-server/src/main.rs` — Axum server entry point
+- `tune-server/src/state.rs` — AppState (DB + streamer)
+- `tune-server/src/routes/` — system, library, zones, playlists
 
-**Crates** : `rusqlite` (bundled SQLite)
-**LOC Rust** : ~1 330 (de ~6 000 cible) | **Remplace** : 6 697 Python
+**Crates** : `rusqlite` (bundled SQLite), `axum`
+**LOC Rust** : ~3 500 (de ~6 000 cible) | **Remplace** : 6 697 Python
 **Gains** : queries 2-5x plus rapides, -50% mémoire/stream, -20 MB binaire
 
 ---

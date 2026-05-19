@@ -1,8 +1,7 @@
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OpenFlags, params};
-use tracing::{info, warn};
+use rusqlite::{Connection, OpenFlags};
+use tracing::info;
 
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,

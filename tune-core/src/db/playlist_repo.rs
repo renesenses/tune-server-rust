@@ -1,10 +1,9 @@
 use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
-use super::models::Track;
 use super::sqlite::SqliteDb;
-use super::track_repo::TrackRepo;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: Option<i64>,
     pub name: String,
