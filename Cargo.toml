@@ -36,6 +36,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 urlencoding = "2"
 toml = "0.8"
+cpal = "0.15"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

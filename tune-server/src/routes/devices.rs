@@ -90,9 +90,10 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_audio_devices() -> Json<Value> {
+    let devices = tune_core::outputs::local::list_audio_devices();
     Json(json!({
-        "items": [],
-        "message": "local audio device enumeration requires cpal (Phase 7)",
+        "items": devices,
+        "total": devices.len(),
     }))
 }
 
