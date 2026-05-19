@@ -126,7 +126,7 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 
 ---
 
-## Phase 5 — Database + HTTP Streamer (v1.5.0) — 10-14 semaines
+## Phase 5 — Database + HTTP Streamer (v1.5.0) — 10-14 semaines — 🔧 IN PROGRESS
 
 **But** : Couche données et streaming HTTP en Rust. Plus grande phase.
 
@@ -136,13 +136,28 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 - `models.py` (1 028 partiel)
 
 **Implémentation** :
-- `tune_native.Database` : SQLite (`rusqlite`) + PostgreSQL (`sqlx`) unifié
-- 12+ classes Repository en Rust avec SQL vérifié à la compilation
-- `tune_native.HttpAudioStreamer` : serveur Axum/Hyper dédié au streaming audio
-  - Chunked transfer, ICY metadata, WAV headers, Range requests, proxy HTTPS→HTTP
+- ✅ `SqliteDb` : rusqlite wrapper (WAL, foreign keys, busy_timeout, PRAGMA)
+- ✅ `ArtistRepo` : CRUD, get_or_create, search (LIKE COLLATE NOCASE)
+- ✅ `AlbumRepo` : CRUD, get_or_create, delete_orphans, update_track_count, search
+- ✅ `TrackRepo` : CRUD, get_all_paths, get_multiple (order-preserving), search, deduplicate
+- ✅ Models : Artist, Album, Track, TrackCredit structs
+- ✅ PyO3 `RustDatabase` class exposing key operations
+- ⬜ PlaylistRepo, PlayQueueRepo, ZoneRepo, RadioStationRepo
+- ⬜ FTS5 virtual tables + triggers
+- ⬜ PostgreSQL backend (sqlx)
+- ⬜ HTTP audio streamer (Axum)
+- ⬜ Schema migrations
 
-**Crates** : `rusqlite`, `sqlx`, `axum`, `hyper`, `serde`, `uuid`
-**LOC Rust** : ~6 000 | **Remplace** : 6 697 Python
+**Fichiers Rust** :
+- `tune-core/src/db/sqlite.rs` — SQLite wrapper + core schema
+- `tune-core/src/db/models.rs` — Artist, Album, Track, TrackCredit
+- `tune-core/src/db/artist_repo.rs` — ArtistRepo (8 methods)
+- `tune-core/src/db/album_repo.rs` — AlbumRepo (12 methods)
+- `tune-core/src/db/track_repo.rs` — TrackRepo (14 methods)
+- `tune-pyo3/src/db_wrapper.rs` — RustDatabase PyO3 class
+
+**Crates** : `rusqlite` (bundled SQLite)
+**LOC Rust** : ~1 330 (de ~6 000 cible) | **Remplace** : 6 697 Python
 **Gains** : queries 2-5x plus rapides, -50% mémoire/stream, -20 MB binaire
 
 ---
