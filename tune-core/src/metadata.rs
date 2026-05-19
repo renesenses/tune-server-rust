@@ -98,6 +98,49 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
     })
 }
 
+pub struct MetadataUpdate {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub year: Option<u32>,
+    pub composer: Option<String>,
+    pub label: Option<String>,
+}
+
+pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String> {
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{Accessor, ItemKey, TagItem, ItemValue, TagExt};
+
+    let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
+    let tag = tagged.primary_tag_mut().ok_or("no primary tag")?;
+
+    if let Some(ref v) = update.title { tag.set_title(v.clone()); }
+    if let Some(ref v) = update.artist { tag.set_artist(v.clone()); }
+    if let Some(ref v) = update.album { tag.set_album(v.clone()); }
+    if let Some(ref v) = update.genre { tag.set_genre(v.clone()); }
+    if let Some(v) = update.track_number { tag.set_track(v); }
+    if let Some(v) = update.disc_number { tag.set_disk(v); }
+    if let Some(v) = update.year { tag.set_year(v); }
+
+    if let Some(ref v) = update.album_artist {
+        tag.insert(TagItem::new(ItemKey::AlbumArtist, ItemValue::Text(v.clone())));
+    }
+    if let Some(ref v) = update.composer {
+        tag.insert(TagItem::new(ItemKey::Composer, ItemValue::Text(v.clone())));
+    }
+    if let Some(ref v) = update.label {
+        tag.insert(TagItem::new(ItemKey::Label, ItemValue::Text(v.clone())));
+    }
+
+    tag.save_to_path(path, WriteOptions::default()).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
 fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
     use lofty::tag::ItemKey;
 

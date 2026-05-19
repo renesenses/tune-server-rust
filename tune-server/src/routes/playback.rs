@@ -77,6 +77,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/move", post(queue_move))
         .route("/{id}/queue/jump", post(queue_jump))
         .route("/{id}/queue/clear", post(queue_clear))
+        .route("/{id}/sleep", get(get_sleep).post(set_sleep))
 }
 
 async fn now_listening(State(state): State<AppState>) -> Json<Value> {
@@ -395,4 +396,41 @@ async fn queue_clear(
     queue_repo.clear(zone_id).ok();
     state.playback.stop(zone_id).await;
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct SleepRequest {
+    minutes: u64,
+}
+
+async fn set_sleep(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<SleepRequest>,
+) -> Json<Value> {
+    if body.minutes == 0 {
+        return Json(json!({ "sleep_timer": null, "zone_id": zone_id }));
+    }
+
+    let playback = state.playback.clone();
+    let minutes = body.minutes;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(minutes * 60)).await;
+        playback.stop(zone_id).await;
+    });
+
+    Json(json!({
+        "sleep_timer": { "minutes": minutes, "zone_id": zone_id },
+    }))
+}
+
+async fn get_sleep(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "active": false,
+        "remaining_seconds": null,
+    }))
 }
