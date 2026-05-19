@@ -59,6 +59,8 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/rating", get(get_album_rating))
         .route("/search", get(search))
         .route("/stats", get(library_stats))
+        .route("/artwork/{hash}", get(serve_artwork))
+        .route("/albums/{id}/artwork", get(album_artwork))
 }
 
 async fn list_artists(
@@ -446,4 +448,62 @@ async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
         "genres": genres,
         "total": genres.len(),
     }))
+}
+
+async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    for ext in &["jpg", "png"] {
+        let path = cache_dir.join(format!("{hash}.{ext}"));
+        if path.exists() {
+            if let Ok(data) = tokio::fs::read(&path).await {
+                let mime = if *ext == "png" { "image/png" } else { "image/jpeg" };
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
+                headers.insert("Cache-Control", axum::http::HeaderValue::from_static("public, max-age=86400"));
+                return (StatusCode::OK, headers, data).into_response();
+            }
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    if let Some(ref cover_path) = album.cover_path {
+        if cover_path.starts_with("http") {
+            return axum::response::Redirect::temporary(cover_path).into_response();
+        }
+        let hash = tune_core::artwork::artwork_hash(cover_path);
+        return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response();
+    }
+
+    let track_repo = TrackRepo::new(state.db);
+    let tracks = track_repo.list_by_album(id).unwrap_or_default();
+    if let Some(track) = tracks.first() {
+        if let Some(ref file_path) = track.file_path {
+            let cache_dir = artwork_cache_dir();
+            if let Some(hash) = tune_core::artwork::get_or_extract(
+                std::path::Path::new(file_path),
+                &cache_dir,
+            ) {
+                return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response();
+            }
+        }
+    }
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn artwork_cache_dir() -> std::path::PathBuf {
+    let dir = std::env::var("TUNE_ARTWORK_DIR")
+        .unwrap_or_else(|_| "artwork_cache".into());
+    std::path::PathBuf::from(dir)
 }

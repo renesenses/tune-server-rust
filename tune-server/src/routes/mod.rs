@@ -23,11 +23,14 @@ pub mod zones;
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
     let streamer_sessions = state.streamer.sessions_state();
+
+    let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
 
     Router::new()
         .nest("/api/v1/system", system::router())
@@ -52,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/ws", ws::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
+        .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
 }
