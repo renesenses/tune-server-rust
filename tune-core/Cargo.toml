@@ -24,3 +24,5 @@ axum = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+async-trait = { workspace = true }
+urlencoding = { workspace = true }

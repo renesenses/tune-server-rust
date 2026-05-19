@@ -4,8 +4,10 @@ pub mod db;
 pub mod discovery;
 pub mod http;
 pub mod metadata;
+pub mod outputs;
 pub mod playback;
 pub mod scanner;
+pub mod streaming;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
