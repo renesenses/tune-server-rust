@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info};
 
 const FOLDER_COVER_NAMES: &[&str] = &[
     "cover.jpg", "cover.png", "folder.jpg", "folder.png",

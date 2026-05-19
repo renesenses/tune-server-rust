@@ -73,12 +73,19 @@ async fn service_auth(
     let credentials = body.map(|j| j.0).unwrap_or(json!({"device_flow": true}));
 
     match svc.authenticate(&credentials).await {
-        Ok(status) => Json(json!({
-            "service": service,
-            "authenticated": status.authenticated,
-            "username": status.username,
-            "verification_url": status.expires_at,
-        })).into_response(),
+        Ok(status) => {
+            if status.authenticated {
+                drop(svc);
+                drop(registry);
+                state.save_tokens().await;
+            }
+            Json(json!({
+                "service": service,
+                "authenticated": status.authenticated,
+                "username": status.username,
+                "verification_url": status.expires_at,
+            })).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }

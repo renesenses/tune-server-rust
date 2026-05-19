@@ -458,7 +458,7 @@ async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn restore_backup(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let backup_dir = backup_dir_path();

@@ -223,7 +223,7 @@ async fn get_track(
 async fn stream_track_audio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    req_headers: HeaderMap,
+    _req_headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = match repo.get(id) {
@@ -263,7 +263,7 @@ async fn stream_track_audio(
                     match file.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
-                        Err(e) => { break; }
+                        Err(_e) => { break; }
                     }
                 }
             }

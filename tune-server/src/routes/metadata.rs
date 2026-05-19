@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::album_repo::AlbumRepo;

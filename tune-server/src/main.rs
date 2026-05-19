@@ -25,6 +25,8 @@ async fn main() {
 
     let state = AppState::new(&config.db_path, config.port).expect("failed to init app state");
 
+    state.restore_tokens().await;
+
     if !config.music_dirs.is_empty() {
         let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
         settings

@@ -1,10 +1,7 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::traits::*;
 
@@ -295,6 +292,26 @@ impl StreamingService for QobuzService {
             .map(|items| items.iter().map(Self::map_artist).collect())
             .unwrap_or_default();
         Ok(artists)
+    }
+
+    fn save_tokens(&self) -> Option<serde_json::Value> {
+        let token = self.user_auth_token.as_ref()?;
+        Some(serde_json::json!({
+            "user_auth_token": token,
+            "username": self.username,
+            "subscription": self.subscription,
+        }))
+    }
+
+    fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
+        if let Some(t) = tokens["user_auth_token"].as_str() {
+            self.user_auth_token = Some(t.into());
+            self.username = tokens["username"].as_str().map(Into::into);
+            self.subscription = tokens["subscription"].as_str().map(Into::into);
+            true
+        } else {
+            false
+        }
     }
 }
 

@@ -1,8 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::sync::{Arc, Mutex};
 
-use tune_core::db::models::{Album, Artist, Track};
+use tune_core::db::models::{Artist, Track};
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;

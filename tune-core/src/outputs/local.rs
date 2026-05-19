@@ -104,7 +104,7 @@ impl OutputTarget for LocalOutput {
         &self,
         _url: &str,
         _mime_type: &str,
-        title: Option<&str>,
+        _title: Option<&str>,
         _artist: Option<&str>,
     ) -> Result<(), String> {
         self.stop().await.ok();

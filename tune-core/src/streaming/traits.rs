@@ -104,4 +104,11 @@ pub trait StreamingService: Send + Sync {
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
         Ok(vec![])
     }
+
+    fn save_tokens(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn restore_tokens(&mut self, _tokens: &serde_json::Value) -> bool {
+        false
+    }
 }

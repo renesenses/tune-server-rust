@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tracing::info;
 
 use super::traits::StreamingService;
+use crate::db::settings_repo::SettingsRepo;
+use crate::db::sqlite::SqliteDb;
 
 pub struct ServiceRegistry {
     services: HashMap<String, Arc<Mutex<Box<dyn StreamingService>>>>,
@@ -43,5 +46,32 @@ impl ServiceRegistry {
             }));
         }
         results
+    }
+
+    pub async fn save_all_tokens(&self, db: &SqliteDb) {
+        let settings = SettingsRepo::new(db.clone());
+        for (name, svc) in &self.services {
+            let svc = svc.lock().await;
+            if let Some(tokens) = svc.save_tokens() {
+                let key = format!("auth_tokens_{name}");
+                settings.set(&key, &tokens.to_string()).ok();
+                info!(service = %name, "tokens_saved");
+            }
+        }
+    }
+
+    pub async fn restore_all_tokens(&self, db: &SqliteDb) {
+        let settings = SettingsRepo::new(db.clone());
+        for (name, svc) in &self.services {
+            let key = format!("auth_tokens_{name}");
+            if let Some(json_str) = settings.get(&key).ok().flatten() {
+                if let Ok(tokens) = serde_json::from_str(&json_str) {
+                    let mut svc = svc.lock().await;
+                    if svc.restore_tokens(&tokens) {
+                        info!(service = %name, "tokens_restored");
+                    }
+                }
+            }
+        }
     }
 }

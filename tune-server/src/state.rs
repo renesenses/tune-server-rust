@@ -63,4 +63,14 @@ impl AppState {
             started_at: Instant::now(),
         })
     }
+
+    pub async fn restore_tokens(&self) {
+        let registry = self.services.lock().await;
+        registry.restore_all_tokens(&self.db).await;
+    }
+
+    pub async fn save_tokens(&self) {
+        let registry = self.services.lock().await;
+        registry.save_all_tokens(&self.db).await;
+    }
 }

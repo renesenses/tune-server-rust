@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::traits::*;
 
@@ -440,6 +440,28 @@ impl StreamingService for TidalService {
             }).collect())
             .unwrap_or_default();
         Ok(artists)
+    }
+
+    fn save_tokens(&self) -> Option<serde_json::Value> {
+        let token = self.access_token.as_ref()?;
+        Some(serde_json::json!({
+            "access_token": token,
+            "refresh_token": self.refresh_token,
+            "username": self.username,
+            "country_code": self.country_code,
+        }))
+    }
+
+    fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
+        if let Some(at) = tokens["access_token"].as_str() {
+            self.access_token = Some(at.into());
+            self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
+            self.username = tokens["username"].as_str().map(Into::into);
+            self.country_code = tokens["country_code"].as_str().unwrap_or("US").into();
+            true
+        } else {
+            false
+        }
     }
 }
 

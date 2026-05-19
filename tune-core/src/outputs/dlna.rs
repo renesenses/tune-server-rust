@@ -1,5 +1,5 @@
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 

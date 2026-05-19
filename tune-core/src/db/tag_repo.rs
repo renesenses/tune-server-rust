@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
