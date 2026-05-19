@@ -1,10 +1,15 @@
+pub mod dashboard;
 pub mod devices;
 pub mod export;
 pub mod history;
 pub mod library;
 pub mod metadata;
+pub mod network;
 pub mod playback;
 pub mod playlists;
+pub mod plugins;
+pub mod podcasts;
+pub mod peers;
 pub mod profiles;
 pub mod radios;
 pub mod search;
@@ -39,6 +44,11 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/metadata", metadata::router())
         .nest("/api/v1/smart-collections", smart_playlists::router())
         .nest("/api/v1/export", export::router())
+        .nest("/api/v1/network", network::router())
+        .nest("/api/v1/dashboard", dashboard::router())
+        .nest("/api/v1/peers", peers::router())
+        .nest("/api/v1/podcasts", podcasts::router())
+        .nest("/api/v1/plugins", plugins::router())
         .nest("/ws", ws::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))

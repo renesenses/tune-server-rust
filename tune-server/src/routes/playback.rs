@@ -78,6 +78,13 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/jump", post(queue_jump))
         .route("/{id}/queue/clear", post(queue_clear))
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
+        .route("/{id}/eq", get(get_eq).post(set_eq))
+        .route("/{id}/dsp", post(set_dsp))
+        .route("/{id}/crossfade", post(set_crossfade))
+        .route("/{id}/normalization", post(set_normalization))
+        .route("/{id}/transfer/{target_id}", post(transfer_playback))
+        .route("/{id}/alarm", get(get_alarms).post(create_alarm))
+        .route("/{id}/alarm/{alarm_id}", axum::routing::delete(delete_alarm))
 }
 
 async fn now_listening(State(state): State<AppState>) -> Json<Value> {
@@ -433,4 +440,178 @@ async fn get_sleep(
         "active": false,
         "remaining_seconds": null,
     }))
+}
+
+#[derive(Deserialize)]
+struct EqSettings {
+    enabled: Option<bool>,
+    preset: Option<String>,
+    bands: Option<Vec<Value>>,
+}
+
+async fn get_eq(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "enabled": false,
+        "preset": "flat",
+        "bands": [],
+    }))
+}
+
+async fn set_eq(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<EqSettings>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "enabled": body.enabled.unwrap_or(false),
+        "preset": body.preset.unwrap_or_else(|| "custom".into()),
+        "bands": body.bands.unwrap_or_default(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct DspSettings {
+    crossfeed: Option<String>,
+}
+
+async fn set_dsp(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<DspSettings>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "crossfeed": body.crossfeed,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CrossfadeSettings {
+    enabled: bool,
+    duration: Option<f64>,
+}
+
+async fn set_crossfade(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<CrossfadeSettings>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "crossfade_enabled": body.enabled,
+        "crossfade_duration": body.duration.unwrap_or(3.0),
+    }))
+}
+
+#[derive(Deserialize)]
+struct NormSettings {
+    enabled: bool,
+    target_lufs: Option<f64>,
+}
+
+async fn set_normalization(
+    State(_state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<NormSettings>,
+) -> Json<Value> {
+    Json(json!({
+        "zone_id": zone_id,
+        "normalization_enabled": body.enabled,
+        "target_lufs": body.target_lufs.unwrap_or(-14.0),
+    }))
+}
+
+async fn transfer_playback(
+    State(state): State<AppState>,
+    Path((from_zone, target_zone)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    let current = state.playback.get_state(from_zone).await;
+    if let Some(np) = current.now_playing {
+        state.playback.stop(from_zone).await;
+        state.playback.play(target_zone, np).await;
+        state.playback.set_volume(target_zone, current.volume).await;
+        Json(json!({
+            "from_zone": from_zone,
+            "target_zone": target_zone,
+            "status": "transferred",
+        })).into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, "nothing playing to transfer").into_response()
+    }
+}
+
+async fn get_alarms(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let items: Vec<Value> = conn
+        .prepare("SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds FROM alarms WHERE zone_id = ? ORDER BY time")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![zone_id], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "zone_id": row.get::<_, Option<i64>>(1).ok().flatten(),
+                    "time": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "enabled": row.get::<_, i32>(3).unwrap_or(1) != 0,
+                    "days": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "source_type": row.get::<_, Option<String>>(5).ok().flatten(),
+                    "source_id": row.get::<_, Option<i64>>(6).ok().flatten(),
+                    "volume": row.get::<_, Option<f64>>(7).ok().flatten(),
+                    "fade_in_seconds": row.get::<_, Option<i32>>(8).ok().flatten(),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+    Json(json!({ "items": items, "total": items.len() }))
+}
+
+#[derive(Deserialize)]
+struct CreateAlarm {
+    time: String,
+    days: Option<String>,
+    source_type: Option<String>,
+    source_id: Option<i64>,
+    volume: Option<f64>,
+    fade_in_seconds: Option<i32>,
+}
+
+async fn create_alarm(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<CreateAlarm>,
+) -> impl IntoResponse {
+    match state.db.execute(
+        "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        &[
+            &zone_id as &dyn rusqlite::types::ToSql,
+            &body.time,
+            &body.days.unwrap_or_else(|| "1,2,3,4,5,6,7".into()),
+            &body.source_type.unwrap_or_else(|| "playlist".into()),
+            &body.source_id,
+            &body.volume.unwrap_or(0.3),
+            &body.fade_in_seconds.unwrap_or(30),
+        ],
+    ) {
+        Ok(_) => {
+            let id = state.db.last_insert_rowid();
+            (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn delete_alarm(
+    State(state): State<AppState>,
+    Path((_zone_id, alarm_id)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    state.db.execute("DELETE FROM alarms WHERE id = ?", &[&alarm_id]).ok();
+    StatusCode::NO_CONTENT
 }

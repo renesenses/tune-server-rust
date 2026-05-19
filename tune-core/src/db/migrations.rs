@@ -144,6 +144,47 @@ CREATE TABLE IF NOT EXISTS smart_playlists (
 INSERT OR IGNORE INTO profiles (id, username, display_name, is_admin) VALUES (1, 'default', 'Default', 1);
 ",
     },
+    Migration {
+        version: 7,
+        name: "add_alarms_network_mounts_podcasts",
+        up: "
+CREATE TABLE IF NOT EXISTS alarms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id INTEGER REFERENCES zones(id) ON DELETE CASCADE,
+    time TEXT NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    days TEXT DEFAULT '1,2,3,4,5,6,7',
+    source_type TEXT DEFAULT 'playlist',
+    source_id INTEGER,
+    volume REAL DEFAULT 0.3,
+    fade_in_seconds INTEGER DEFAULT 30,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS network_mounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mount_type TEXT NOT NULL DEFAULT 'smb',
+    server TEXT NOT NULL,
+    share TEXT NOT NULL,
+    mount_path TEXT NOT NULL,
+    username TEXT,
+    password TEXT,
+    active INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS podcast_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feed_url TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    author TEXT,
+    image_url TEXT,
+    description TEXT,
+    last_checked TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+",
+    },
 ];
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
