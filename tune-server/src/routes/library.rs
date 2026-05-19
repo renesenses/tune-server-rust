@@ -53,6 +53,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}", get(get_track))
         .route("/tracks/{id}/audio", get(stream_track_audio))
         .route("/tracks/{id}/rescan", post(rescan_track))
+        .route("/genre-tree", get(genre_tree))
         .route("/albums/top-rated", get(top_rated_albums))
         .route("/albums/{id}/rate", post(rate_album))
         .route("/albums/{id}/rating", get(get_album_rating))
@@ -416,4 +417,33 @@ async fn top_rated_albums(
         .collect();
 
     Json(json!({ "items": items, "total": items.len() }))
+}
+
+async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let genres: Vec<String> = conn
+        .prepare("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL AND genre != '' ORDER BY genre COLLATE NOCASE")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+
+    let mut tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for genre in &genres {
+        let parts: Vec<&str> = genre.splitn(2, '/').collect();
+        let parent = parts[0].trim().to_string();
+        if parts.len() > 1 {
+            tree.entry(parent).or_default().push(parts[1].trim().to_string());
+        } else {
+            tree.entry(parent).or_default();
+        }
+    }
+
+    Json(json!({
+        "tree": tree,
+        "genres": genres,
+        "total": genres.len(),
+    }))
 }

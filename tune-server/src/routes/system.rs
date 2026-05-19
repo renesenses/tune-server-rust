@@ -35,6 +35,10 @@ pub fn router() -> Router<AppState> {
         .route("/diagnostics", get(diagnostics))
         .route("/cleanup", post(cleanup))
         .route("/logs", get(logs))
+        .route("/backups", get(list_backups).post(create_backup))
+        .route("/backups/{filename}/restore", post(restore_backup))
+        .route("/database/export", get(export_database))
+        .route("/update/check", get(update_check))
 }
 
 async fn version() -> Json<Value> {
@@ -395,4 +399,127 @@ async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         "logs": "log retrieval not yet implemented (journalctl/file)",
         "lines": 0,
     }))
+}
+
+async fn list_backups() -> Json<Value> {
+    let backup_dir = backup_dir_path();
+    let mut items = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "db").unwrap_or(false) {
+                let meta = std::fs::metadata(&path).ok();
+                items.push(json!({
+                    "filename": path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+                    "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                    "created_at": meta.and_then(|m| m.created().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs()),
+                }));
+            }
+        }
+    }
+
+    items.sort_by(|a, b| {
+        b.get("created_at").and_then(|v| v.as_u64())
+            .cmp(&a.get("created_at").and_then(|v| v.as_u64()))
+    });
+
+    Json(json!({ "items": items, "total": items.len() }))
+}
+
+async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
+    let backup_dir = backup_dir_path();
+    std::fs::create_dir_all(&backup_dir).ok();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let filename = format!("tune_backup_{now}.db");
+    let dest = format!("{backup_dir}/{filename}");
+
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    if db_path == ":memory:" {
+        return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
+    }
+
+    state.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+    match std::fs::copy(&db_path, &dest) {
+        Ok(size) => Json(json!({
+            "filename": filename,
+            "size": size,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("backup failed: {e}")).into_response(),
+    }
+}
+
+async fn restore_backup(
+    State(state): State<AppState>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let backup_dir = backup_dir_path();
+    let source = format!("{backup_dir}/{filename}");
+
+    if !std::path::Path::new(&source).exists() {
+        return (StatusCode::NOT_FOUND, "backup not found").into_response();
+    }
+
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    if db_path == ":memory:" {
+        return (StatusCode::BAD_REQUEST, "cannot restore to in-memory database").into_response();
+    }
+
+    match std::fs::copy(&source, &db_path) {
+        Ok(_) => Json(json!({
+            "restored": true,
+            "filename": filename,
+            "message": "restart required to apply",
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("restore failed: {e}")).into_response(),
+    }
+}
+
+async fn export_database(State(state): State<AppState>) -> impl IntoResponse {
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    if db_path == ":memory:" {
+        return (StatusCode::BAD_REQUEST, "cannot export in-memory database").into_response();
+    }
+
+    state.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+    match tokio::fs::read(&db_path).await {
+        Ok(bytes) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/x-sqlite3"));
+            headers.insert(
+                "Content-Disposition",
+                axum::http::HeaderValue::from_str("attachment; filename=\"tune_server.db\"").unwrap(),
+            );
+            (StatusCode::OK, headers, bytes).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("export failed: {e}")).into_response(),
+    }
+}
+
+async fn update_check() -> Json<Value> {
+    Json(json!({
+        "current_version": tune_core::version(),
+        "latest_version": null,
+        "update_available": false,
+        "engine": "rust",
+        "message": "auto-update not yet implemented",
+    }))
+}
+
+fn backup_dir_path() -> String {
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    let parent = std::path::Path::new(&db_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    format!("{}/backups", parent.display())
 }

@@ -39,6 +39,10 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/name", put(rename_zone))
+        .route("/groups", get(list_groups).post(create_group))
+        .route("/groups/{group_id}", axum::routing::delete(delete_group))
+        .route("/stereo-pairs", get(list_stereo_pairs).post(create_stereo_pair))
+        .route("/stereo-pairs/{pair_id}", axum::routing::delete(delete_stereo_pair))
 }
 
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
@@ -115,4 +119,120 @@ async fn rename_zone(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct CreateGroup {
+    name: String,
+    zone_ids: Vec<i64>,
+}
+
+async fn list_groups(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(json!({ "items": groups, "total": groups.len() }))
+}
+
+async fn create_group(
+    State(state): State<AppState>,
+    Json(body): Json<CreateGroup>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let id = groups.len() as i64 + 1;
+    groups.push(json!({
+        "id": id,
+        "name": body.name,
+        "zone_ids": body.zone_ids,
+    }));
+
+    settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+    (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+}
+
+async fn delete_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    groups.retain(|g| g.get("id").and_then(|v| v.as_i64()) != Some(group_id));
+    settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+    StatusCode::NO_CONTENT
+}
+
+async fn list_stereo_pairs(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let pairs: Vec<Value> = settings
+        .get("stereo_pairs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(json!({ "items": pairs, "total": pairs.len() }))
+}
+
+#[derive(Deserialize)]
+struct CreateStereoPair {
+    name: String,
+    left_device_id: String,
+    right_device_id: String,
+}
+
+async fn create_stereo_pair(
+    State(state): State<AppState>,
+    Json(body): Json<CreateStereoPair>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut pairs: Vec<Value> = settings
+        .get("stereo_pairs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let id = pairs.len() as i64 + 1;
+    pairs.push(json!({
+        "id": id,
+        "name": body.name,
+        "left_device_id": body.left_device_id,
+        "right_device_id": body.right_device_id,
+    }));
+
+    settings.set("stereo_pairs", &serde_json::to_string(&pairs).unwrap()).ok();
+    (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+}
+
+async fn delete_stereo_pair(
+    State(state): State<AppState>,
+    Path(pair_id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut pairs: Vec<Value> = settings
+        .get("stereo_pairs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    pairs.retain(|p| p.get("id").and_then(|v| v.as_i64()) != Some(pair_id));
+    settings.set("stereo_pairs", &serde_json::to_string(&pairs).unwrap()).ok();
+    StatusCode::NO_CONTENT
 }

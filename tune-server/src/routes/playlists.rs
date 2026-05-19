@@ -48,6 +48,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
+        .route("/import/m3u-url", post(import_m3u_url))
 }
 
 async fn list_playlists(
@@ -202,4 +203,56 @@ async fn export_m3u(
     );
 
     (axum::http::StatusCode::OK, headers, m3u).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportM3uUrl {
+    url: String,
+    name: Option<String>,
+}
+
+async fn import_m3u_url(
+    State(state): State<AppState>,
+    Json(body): Json<ImportM3uUrl>,
+) -> impl IntoResponse {
+    let m3u_content = match reqwest::get(&body.url).await {
+        Ok(resp) => match resp.text().await {
+            Ok(text) => text,
+            Err(e) => return (StatusCode::BAD_GATEWAY, format!("read failed: {e}")).into_response(),
+        },
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")).into_response(),
+    };
+
+    let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
+    let repo = PlaylistRepo::new(state.db.clone());
+    let playlist_id = match repo.create(&name, None) {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let track_repo = TrackRepo::new(state.db);
+    let mut matched = 0i64;
+
+    for line in m3u_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Ok(Some(track)) = track_repo.get_by_path(line) {
+            if let Some(id) = track.id {
+                repo.add_tracks(playlist_id, &[id], None).ok();
+                matched += 1;
+            }
+        }
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "id": playlist_id,
+            "name": name,
+            "matched_tracks": matched,
+        })),
+    )
+        .into_response()
 }
