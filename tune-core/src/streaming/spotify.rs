@@ -1,0 +1,50 @@
+use super::traits::*;
+
+pub struct SpotifyService {
+    authenticated: bool,
+    username: Option<String>,
+}
+
+impl SpotifyService {
+    pub fn new() -> Self {
+        Self {
+            authenticated: false,
+            username: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamingService for SpotifyService {
+    fn name(&self) -> &str { "spotify" }
+    fn enabled(&self) -> bool { true }
+
+    async fn authenticate(&mut self, _credentials: &serde_json::Value) -> Result<AuthStatus, String> {
+        Err("Spotify PKCE OAuth not yet implemented — requires redirect flow".into())
+    }
+
+    async fn auth_status(&self) -> AuthStatus {
+        AuthStatus { authenticated: self.authenticated, username: self.username.clone(), subscription: None, expires_at: None }
+    }
+
+    async fn logout(&mut self) -> Result<(), String> {
+        self.authenticated = false;
+        self.username = None;
+        Ok(())
+    }
+
+    async fn search(&self, _query: &str, _limit: usize) -> Result<SearchResults, String> {
+        Err("not authenticated".into())
+    }
+
+    async fn get_track(&self, _track_id: &str) -> Result<StreamTrack, String> { Err("not authenticated".into()) }
+    async fn get_track_url(&self, _track_id: &str, _quality: Option<&str>) -> Result<StreamUrl, String> { Err("not authenticated".into()) }
+    async fn get_album(&self, _album_id: &str) -> Result<StreamAlbum, String> { Err("not authenticated".into()) }
+    async fn get_album_tracks(&self, _album_id: &str) -> Result<Vec<StreamTrack>, String> { Err("not authenticated".into()) }
+    async fn get_artist(&self, _artist_id: &str) -> Result<StreamArtist, String> { Err("not authenticated".into()) }
+    async fn get_playlist(&self, _playlist_id: &str) -> Result<StreamPlaylist, String> { Err("not authenticated".into()) }
+    async fn get_playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<StreamTrack>, String> { Err("not authenticated".into()) }
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> { Err("not authenticated".into()) }
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> { Err("not authenticated".into()) }
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> { Err("not authenticated".into()) }
+}

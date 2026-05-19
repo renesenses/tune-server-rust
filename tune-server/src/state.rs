@@ -35,6 +35,9 @@ impl AppState {
             std::env::var("QOBUZ_APP_ID").unwrap_or_default(),
             std::env::var("QOBUZ_APP_SECRET").unwrap_or_default(),
         )));
+        services.register(Box::new(tune_core::streaming::spotify::SpotifyService::new()));
+        services.register(Box::new(tune_core::streaming::deezer::DeezerService::new()));
+        services.register(Box::new(tune_core::streaming::youtube::YouTubeService::new()));
 
         let outputs = OutputRegistry::new();
 
