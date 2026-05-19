@@ -1,5 +1,8 @@
+pub mod history;
 pub mod library;
 pub mod playlists;
+pub mod radios;
+pub mod search;
 pub mod system;
 pub mod zones;
 
@@ -13,8 +16,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .nest("/api/v1/system", system::router())
         .nest("/api/v1/library", library::router())
+        .nest("/api/v1/library/history", history::router())
         .nest("/api/v1/zones", zones::router())
         .nest("/api/v1/playlists", playlists::router())
+        .nest("/api/v1/radios", radios::router())
+        .nest("/api/v1/search", search::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
 }

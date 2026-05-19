@@ -7,3 +7,6 @@ pub mod track_repo;
 pub mod playlist_repo;
 pub mod play_queue_repo;
 pub mod zone_repo;
+pub mod radio_repo;
+pub mod history_repo;
+pub mod settings_repo;
