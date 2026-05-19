@@ -1,7 +1,6 @@
-mod config;
-mod error;
-mod routes;
-mod state;
+use tune_server::config;
+use tune_server::routes;
+use tune_server::state;
 
 use std::net::SocketAddr;
 
