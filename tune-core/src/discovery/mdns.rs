@@ -1,0 +1,333 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info};
+
+use super::device::{DiscoveredDevice, OutputType};
+
+pub const AIRPLAY_SERVICE: &str = "_raop._tcp.local.";
+pub const AIRPLAY2_SERVICE: &str = "_airplay._tcp.local.";
+pub const BLUOS_SERVICE: &str = "_musc._tcp.local.";
+pub const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
+pub const SQUEEZEBOX_SERVICE: &str = "_slimcli._tcp.local.";
+pub const TUNE_SERVICE: &str = "_tune-server._tcp.local.";
+
+#[derive(Debug, Clone)]
+pub enum MdnsEvent {
+    DeviceDiscovered(DiscoveredDevice),
+    DeviceLost(String),
+    DeviceUpdated(DiscoveredDevice),
+}
+
+#[derive(Debug, Clone)]
+pub struct MdnsServiceConfig {
+    pub service_type: String,
+    pub output_type: OutputType,
+    pub default_port: u16,
+}
+
+pub struct MdnsScanner {
+    daemon: ServiceDaemon,
+    configs: Vec<MdnsServiceConfig>,
+    state: Arc<Mutex<MdnsState>>,
+    event_tx: mpsc::Sender<MdnsEvent>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+struct MdnsState {
+    devices: HashMap<String, DiscoveredDevice>,
+    service_to_device: HashMap<String, String>,
+}
+
+impl MdnsState {
+    fn new() -> Self {
+        Self {
+            devices: HashMap::new(),
+            service_to_device: HashMap::new(),
+        }
+    }
+}
+
+impl MdnsScanner {
+    pub fn new(event_tx: mpsc::Sender<MdnsEvent>) -> Result<Self, String> {
+        let daemon = ServiceDaemon::new()
+            .map_err(|e| format!("mDNS daemon: {e}"))?;
+
+        Ok(Self {
+            daemon,
+            configs: Vec::new(),
+            state: Arc::new(Mutex::new(MdnsState::new())),
+            event_tx,
+            tasks: Vec::new(),
+        })
+    }
+
+    pub fn with_airplay(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: AIRPLAY_SERVICE.to_string(),
+            output_type: OutputType::Airplay,
+            default_port: 7000,
+        });
+        self.configs.push(MdnsServiceConfig {
+            service_type: AIRPLAY2_SERVICE.to_string(),
+            output_type: OutputType::Airplay,
+            default_port: 7000,
+        });
+        self
+    }
+
+    pub fn with_bluos(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: BLUOS_SERVICE.to_string(),
+            output_type: OutputType::Bluos,
+            default_port: 11000,
+        });
+        self
+    }
+
+    pub fn with_chromecast(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: CHROMECAST_SERVICE.to_string(),
+            output_type: OutputType::Chromecast,
+            default_port: 8009,
+        });
+        self
+    }
+
+    pub fn with_squeezebox(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: SQUEEZEBOX_SERVICE.to_string(),
+            output_type: OutputType::Squeezebox,
+            default_port: 9090,
+        });
+        self
+    }
+
+    pub fn with_tune_peers(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: TUNE_SERVICE.to_string(),
+            output_type: OutputType::Local,
+            default_port: 8888,
+        });
+        self
+    }
+
+    pub fn with_service(mut self, service_type: String, output_type: OutputType, default_port: u16) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type,
+            output_type,
+            default_port,
+        });
+        self
+    }
+
+    pub fn start(&mut self) -> Result<(), String> {
+        for config in &self.configs {
+            let receiver = self.daemon
+                .browse(&config.service_type)
+                .map_err(|e| format!("browse {}: {e}", config.service_type))?;
+
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            let output_type = config.output_type;
+            let default_port = config.default_port;
+            let service_type = config.service_type.clone();
+
+            let task = tokio::spawn(async move {
+                browse_loop(receiver, state, event_tx, output_type, default_port, &service_type).await;
+            });
+            self.tasks.push(task);
+
+            info!(service = %config.service_type, "mdns_browse_started");
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        for config in &self.configs {
+            let _ = self.daemon.stop_browse(&config.service_type);
+        }
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        let _ = self.daemon.shutdown();
+        info!("mdns_scanner_stopped");
+    }
+
+    pub async fn devices(&self) -> Vec<DiscoveredDevice> {
+        let state = self.state.lock().await;
+        state.devices.values().cloned().collect()
+    }
+
+    pub async fn device_count(&self) -> usize {
+        let state = self.state.lock().await;
+        state.devices.len()
+    }
+}
+
+async fn browse_loop(
+    receiver: mdns_sd::Receiver<ServiceEvent>,
+    state: Arc<Mutex<MdnsState>>,
+    event_tx: mpsc::Sender<MdnsEvent>,
+    output_type: OutputType,
+    default_port: u16,
+    service_type: &str,
+) {
+    loop {
+        match receiver.recv_async().await {
+            Ok(event) => {
+                handle_event(event, &state, &event_tx, output_type, default_port, service_type).await;
+            }
+            Err(e) => {
+                debug!(error = %e, service = service_type, "mdns_recv_error");
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_event(
+    event: ServiceEvent,
+    state: &Arc<Mutex<MdnsState>>,
+    event_tx: &mpsc::Sender<MdnsEvent>,
+    output_type: OutputType,
+    default_port: u16,
+    service_type: &str,
+) {
+    match event {
+        ServiceEvent::ServiceResolved(info) => {
+            let device = service_to_device(&info, output_type, default_port);
+            let dev_id = device.id.clone();
+
+            let mut st = state.lock().await;
+            let is_new = !st.devices.contains_key(&dev_id);
+            st.service_to_device.insert(info.get_fullname().to_string(), dev_id.clone());
+            st.devices.insert(dev_id.clone(), device.clone());
+            drop(st);
+
+            if is_new {
+                info!(id = %dev_id, name = %device.name, service = service_type, "mdns_device_discovered");
+                let _ = event_tx.send(MdnsEvent::DeviceDiscovered(device)).await;
+            } else {
+                debug!(id = %dev_id, "mdns_device_updated");
+                let _ = event_tx.send(MdnsEvent::DeviceUpdated(device)).await;
+            }
+        }
+        ServiceEvent::ServiceRemoved(_, fullname) => {
+            let mut st = state.lock().await;
+            if let Some(dev_id) = st.service_to_device.remove(&fullname) {
+                if let Some(device) = st.devices.remove(&dev_id) {
+                    info!(id = %dev_id, name = %device.name, "mdns_device_lost");
+                    drop(st);
+                    let _ = event_tx.send(MdnsEvent::DeviceLost(dev_id)).await;
+                }
+            }
+        }
+        ServiceEvent::SearchStarted(stype) => {
+            debug!(service = %stype, "mdns_search_started");
+        }
+        ServiceEvent::SearchStopped(stype) => {
+            debug!(service = %stype, "mdns_search_stopped");
+        }
+        _ => {}
+    }
+}
+
+fn service_to_device(info: &ServiceInfo, output_type: OutputType, default_port: u16) -> DiscoveredDevice {
+    let name = info.get_fullname()
+        .split('.')
+        .next()
+        .unwrap_or(info.get_fullname())
+        .replace('_', " ")
+        .trim()
+        .to_string();
+
+    let friendly_name = info.get_property_val_str("fn")
+        .or_else(|| info.get_property_val_str("n"))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| name.clone());
+
+    let host = info.get_addresses()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| {
+            info.get_addresses()
+                .iter()
+                .next()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
+        });
+
+    let port = info.get_port();
+    let port = if port > 0 { port } else { default_port };
+
+    let dev_id = format!("{}-{}-{}", output_type, host, port);
+
+    let mut device = DiscoveredDevice::new(dev_id, friendly_name, output_type, host, port);
+
+    // Extract capabilities from TXT records
+    let mut caps = HashMap::new();
+    if let Some(model) = info.get_property_val_str("md") {
+        device.model = Some(model.to_string());
+        caps.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    }
+    if let Some(manufacturer) = info.get_property_val_str("manufacturer") {
+        device.manufacturer = Some(manufacturer.to_string());
+    }
+    if let Some(mac) = info.get_property_val_str("deviceid")
+        .or_else(|| info.get_property_val_str("id")) {
+        device.mac_address = Some(mac.to_string());
+    }
+
+    // AirPlay version detection
+    if output_type == OutputType::Airplay {
+        let version = if info.get_property_val_str("features").is_some() {
+            "2"
+        } else {
+            "1"
+        };
+        device.airplay_version = Some(version.to_string());
+        caps.insert("airplay".to_string(), serde_json::Value::Bool(true));
+        caps.insert("airplay_version".to_string(), serde_json::Value::String(version.to_string()));
+    }
+
+    // BluOS capabilities
+    if output_type == OutputType::Bluos {
+        caps.insert("bluos".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // Chromecast model
+    if output_type == OutputType::Chromecast {
+        caps.insert("chromecast".to_string(), serde_json::Value::Bool(true));
+    }
+
+    // Tune peer info
+    if output_type == OutputType::Local {
+        if let Some(version) = info.get_property_val_str("version") {
+            caps.insert("version".to_string(), serde_json::Value::String(version.to_string()));
+        }
+        if let Some(tracks) = info.get_property_val_str("tracks") {
+            caps.insert("tracks".to_string(), serde_json::Value::String(tracks.to_string()));
+        }
+    }
+
+    device.capabilities = caps;
+    device
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_constants_end_with_local() {
+        assert!(AIRPLAY_SERVICE.ends_with(".local."));
+        assert!(BLUOS_SERVICE.ends_with(".local."));
+        assert!(CHROMECAST_SERVICE.ends_with(".local."));
+        assert!(SQUEEZEBOX_SERVICE.ends_with(".local."));
+        assert!(TUNE_SERVICE.ends_with(".local."));
+    }
+}

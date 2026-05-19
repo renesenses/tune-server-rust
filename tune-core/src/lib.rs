@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod buffer;
+pub mod discovery;
 pub mod metadata;
 
 pub fn version() -> &'static str {

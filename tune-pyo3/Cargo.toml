@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 tune-core = { path = "../tune-core" }
 pyo3 = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }

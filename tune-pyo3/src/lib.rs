@@ -1,3 +1,4 @@
+mod discovery_wrapper;
 mod pipeline_wrapper;
 
 use pyo3::prelude::*;
@@ -116,5 +117,7 @@ fn tune_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(format_from_extension, m)?)?;
     m.add_function(wrap_pyfunction!(mime_type_for_format, m)?)?;
     m.add_class::<pipeline_wrapper::RustPipeline>()?;
+    m.add_class::<discovery_wrapper::RustSsdpScanner>()?;
+    m.add_class::<discovery_wrapper::RustMdnsScanner>()?;
     Ok(())
 }

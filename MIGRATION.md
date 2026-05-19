@@ -63,7 +63,7 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 
 ---
 
-## Phase 3 — Discovery Layer (v1.2.0) — 5-7 semaines
+## Phase 3 — Discovery Layer (v1.2.0) — 5-7 semaines ✅ CORE DONE (2026-05-19)
 
 **But** : SSDP multicast, mDNS, et parsing XML device en Rust natif.
 
@@ -72,12 +72,25 @@ Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichier
 - `discovery/openhome.py` (~300), `bluos.py` (~200), `cast.py` (~200), `squeezebox.py` (~200)
 
 **Implémentation** :
-- `tune_native.SsdpScanner` : M-SEARCH + NOTIFY + unicast probe + grace period
-- `tune_native.MdnsScanner` : `_airplay._tcp`, `_googlecast._tcp`, `_musc._tcp`, `_cli._tcp`
-- Parsing XML device descriptions via `quick-xml` (10x plus rapide qu'ElementTree)
+- ✅ `tune_native.RustSsdpScanner` : M-SEARCH + NOTIFY + unicast probe + grace period
+- ✅ `tune_native.RustMdnsScanner` : `_airplay._tcp`, `_googlecast._tcp`, `_musc._tcp`, `_cli._tcp`, `_tune-server._tcp`
+- ✅ XML device description parser via `quick-xml` (10x plus rapide qu'ElementTree)
+- ✅ `DiscoveredDevice` model + dedup by host with priority + alternatives
+- ✅ PyO3 bindings : `RustSsdpScanner` + `RustMdnsScanner` classes avec `poll_event()`
+- ✅ Python integration shim : `tune_server/discovery/rust_discovery.py`
+- ✅ Intégration dans `DiscoveryManager` (toggle via `TUNE_DISCOVERY_ENGINE`)
+- ✅ Diagnostics endpoint `/system/diagnostics` expose `rust_engines` status
+- ⬜ Benchmark comparison Python vs Rust discovery
 
-**Crates** : `rupnp`, `mdns-sd`, `quick-xml`, `reqwest`
-**LOC Rust** : ~2 000 | **Remplace** : 2 202 Python
+**Fichiers Rust** :
+- `tune-core/src/discovery/device.rs` — DiscoveredDevice + OutputType + dedup
+- `tune-core/src/discovery/ssdp.rs` — SSDP M-SEARCH + grace period + unicast probe
+- `tune-core/src/discovery/mdns.rs` — mDNS multi-service browsing (mdns-sd)
+- `tune-core/src/discovery/xml_parser.rs` — UPnP device description XML parsing
+- `tune-pyo3/src/discovery_wrapper.rs` — PyO3 bindings
+
+**Crates** : `mdns-sd`, `quick-xml`, `reqwest`, `socket2`, `uuid`
+**LOC Rust** : ~1 100 | **Remplace** : 2 202 Python (discovery core)
 **Gains** : discovery 2-3x plus rapide, -50% mémoire discovery, -0.5s startup
 
 ---
