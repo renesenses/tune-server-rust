@@ -193,6 +193,47 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id)
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_play_queue_zone_id ON play_queue(zone_id);
+
+-- FTS5 virtual tables for full-text search (accent-insensitive)
+CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(title, tokenize='unicode61 remove_diacritics 2', content='tracks', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(title, tokenize='unicode61 remove_diacritics 2', content='albums', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(name, tokenize='unicode61 remove_diacritics 2', content='artists', content_rowid='id');
+
+-- FTS sync triggers: tracks
+CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
+    INSERT INTO tracks_fts(rowid, title) VALUES (new.id, new.title);
+END;
+CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE OF title ON tracks BEGIN
+    INSERT INTO tracks_fts(tracks_fts, rowid, title) VALUES ('delete', old.id, old.title);
+    INSERT INTO tracks_fts(rowid, title) VALUES (new.id, new.title);
+END;
+CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
+    INSERT INTO tracks_fts(tracks_fts, rowid, title) VALUES ('delete', old.id, old.title);
+END;
+
+-- FTS sync triggers: albums
+CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN
+    INSERT INTO albums_fts(rowid, title) VALUES (new.id, new.title);
+END;
+CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE OF title ON albums BEGIN
+    INSERT INTO albums_fts(albums_fts, rowid, title) VALUES ('delete', old.id, old.title);
+    INSERT INTO albums_fts(rowid, title) VALUES (new.id, new.title);
+END;
+CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN
+    INSERT INTO albums_fts(albums_fts, rowid, title) VALUES ('delete', old.id, old.title);
+END;
+
+-- FTS sync triggers: artists
+CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN
+    INSERT INTO artists_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE OF name ON artists BEGIN
+    INSERT INTO artists_fts(artists_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO artists_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
+    INSERT INTO artists_fts(artists_fts, rowid, name) VALUES ('delete', old.id, old.name);
+END;
 ";
 
 #[cfg(test)]

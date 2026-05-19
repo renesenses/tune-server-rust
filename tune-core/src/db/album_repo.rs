@@ -164,13 +164,14 @@ impl AlbumRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
+        let fts_query = format!("{query}*");
         let like = format!("%{query}%");
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE LIMIT ?"))
+            .prepare(&format!("{SELECT_ALBUM} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR a.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR a.genre LIKE ? COLLATE NOCASE OR CAST(a.year AS TEXT) = ? OR a.label LIKE ? COLLATE NOCASE LIMIT ?"))
             .map_err(|e| e.to_string())?;
         let albums = stmt
-            .query_map(params![like, like, limit], |row| Ok(row_to_album(row)))
+            .query_map(params![fts_query, like, like, like, query.trim(), like, limit], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();

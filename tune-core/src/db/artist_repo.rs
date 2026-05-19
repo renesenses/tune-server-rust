@@ -124,13 +124,14 @@ impl ArtistRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
+        let fts_query = format!("{query}*");
         let like = format!("%{query}%");
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name LIKE ? COLLATE NOCASE LIMIT ?")
+            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?) OR name LIKE ? COLLATE NOCASE LIMIT ?")
             .map_err(|e| e.to_string())?;
         let artists = stmt
-            .query_map(params![like, limit], |row| Ok(row_to_artist(row)))
+            .query_map(params![fts_query, like, limit], |row| Ok(row_to_artist(row)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();

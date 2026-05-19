@@ -147,13 +147,16 @@ impl TrackRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
+        let fts_query = format!("{query}*");
         let like = format!("%{query}%");
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR al.title LIKE ? COLLATE NOCASE LIMIT ?"))
+            .prepare(&format!(
+                "{SELECT_TRACK} WHERE t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?) OR ar.name LIKE ? COLLATE NOCASE OR t.genre LIKE ? COLLATE NOCASE OR t.composer LIKE ? COLLATE NOCASE OR CAST(al.year AS TEXT) = ? LIMIT ?"
+            ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
-            .query_map(params![like, like, like, limit], |row| Ok(row_to_track(row)))
+            .query_map(params![fts_query, like, like, like, query.trim(), limit], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
