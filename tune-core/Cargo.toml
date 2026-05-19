@@ -26,5 +26,9 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
 urlencoding = { workspace = true }
-cpal = { workspace = true }
+cpal = { version = "0.15", optional = true }
 sha2 = { workspace = true }
+
+[features]
+default = ["local-audio"]
+local-audio = ["cpal"]

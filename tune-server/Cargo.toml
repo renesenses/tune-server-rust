@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tune-core = { path = "../tune-core" }
+tune-core = { path = "../tune-core", features = ["local-audio"] }
 tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }

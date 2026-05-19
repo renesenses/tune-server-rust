@@ -90,11 +90,13 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_audio_devices() -> Json<Value> {
-    let devices = tune_core::outputs::local::list_audio_devices();
-    Json(json!({
-        "items": devices,
-        "total": devices.len(),
-    }))
+    #[cfg(feature = "local-audio")]
+    {
+        let devices = tune_core::outputs::local::list_audio_devices();
+        return Json(json!({ "items": devices, "total": devices.len() }));
+    }
+    #[cfg(not(feature = "local-audio"))]
+    Json(json!({ "items": [], "total": 0, "message": "local-audio feature not enabled" }))
 }
 
 async fn device_status(
