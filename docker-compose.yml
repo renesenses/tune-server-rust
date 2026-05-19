@@ -1,0 +1,23 @@
+services:
+  tune:
+    build: .
+    image: renesenses/tune:latest
+    container_name: tune-server
+    restart: unless-stopped
+    ports:
+      - "8085:8085"
+    volumes:
+      - tune-data:/data
+      - /path/to/music:/music:ro
+      # - ./web:/app/web:ro  # Uncomment to serve web client
+    environment:
+      - TUNE_PORT=8085
+      - TUNE_DB_PATH=/data/tune.db
+      - TUNE_ARTWORK_DIR=/data/artwork_cache
+      - TUNE_AUTO_SCAN=true
+      # - QOBUZ_APP_ID=
+      # - QOBUZ_APP_SECRET=
+    network_mode: host  # Required for DLNA/SSDP multicast discovery
+
+volumes:
+  tune-data:
