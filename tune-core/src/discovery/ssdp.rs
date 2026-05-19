@@ -451,7 +451,7 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
     }
 }
 
-fn get_local_ip() -> Option<Ipv4Addr> {
+pub fn get_local_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;

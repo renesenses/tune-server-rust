@@ -15,6 +15,7 @@ use crate::state::AppState;
 struct SearchParams {
     q: String,
     limit: Option<i64>,
+    sources: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -40,6 +41,36 @@ async fn federated_search(
         .search(&p.q)
         .unwrap_or_default();
 
+    let requested_sources: Option<Vec<String>> = p.sources.map(|s| {
+        s.split(',').map(|s| s.trim().to_string()).collect()
+    });
+
+    let mut service_results: serde_json::Map<String, Value> = serde_json::Map::new();
+
+    {
+        let registry = state.services.lock().await;
+        for svc_name in registry.list() {
+            if let Some(ref sources) = requested_sources {
+                if !sources.contains(&svc_name) && !sources.contains(&"all".to_string()) {
+                    continue;
+                }
+            }
+
+            if let Some(svc) = registry.get(&svc_name) {
+                let svc = svc.lock().await;
+                if !svc.auth_status().await.authenticated {
+                    continue;
+                }
+                match svc.search(&p.q, limit as usize).await {
+                    Ok(results) => {
+                        service_results.insert(svc_name, json!(results));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
     Json(json!({
         "local": {
             "artists": artists,
@@ -47,6 +78,6 @@ async fn federated_search(
             "tracks": tracks,
         },
         "radios": radios,
-        "services": {},
+        "services": service_results,
     }))
 }

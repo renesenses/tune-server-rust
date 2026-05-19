@@ -4,6 +4,7 @@ pub mod db;
 pub mod discovery;
 pub mod http;
 pub mod metadata;
+pub mod orchestrator;
 pub mod outputs;
 pub mod playback;
 pub mod scanner;

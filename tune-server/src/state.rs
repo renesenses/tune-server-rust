@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::http::streamer::AudioStreamer;
+use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
 use tune_core::streaming::ServiceRegistry;
