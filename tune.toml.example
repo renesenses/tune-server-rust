@@ -1,0 +1,20 @@
+# Tune Server Configuration
+# Copy to tune.toml and adjust as needed.
+# Environment variables override these values (TUNE_PORT, TUNE_DB_PATH, etc.)
+
+port = 8085
+db_path = "tune.db"
+web_dir = "web"
+artwork_dir = "artwork_cache"
+auto_scan = false
+log_level = "info"
+
+# Music directories to scan
+music_dirs = [
+    # "/path/to/music",
+    # "/mnt/nas/music",
+]
+
+# Qobuz credentials (optional)
+# qobuz_app_id = ""
+# qobuz_app_secret = ""

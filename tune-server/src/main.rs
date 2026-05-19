@@ -1,3 +1,5 @@
+mod config;
+mod error;
 mod routes;
 mod state;
 
@@ -6,28 +8,31 @@ use std::net::SocketAddr;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::config::TuneConfig;
 use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    let config = TuneConfig::load();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("tune_server=info".parse().unwrap())
-                .add_directive("tune_core=info".parse().unwrap()),
+                .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
+                .add_directive(format!("tune_core={}", config.log_level).parse().unwrap()),
         )
         .init();
 
-    let port: u16 = std::env::var("TUNE_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8085);
+    let state = AppState::new(&config.db_path, config.port).expect("failed to init app state");
 
-    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    if !config.music_dirs.is_empty() {
+        let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+        settings
+            .set("music_dirs", &serde_json::to_string(&config.music_dirs).unwrap())
+            .ok();
+    }
 
-    let state = AppState::new(&db_path, port).expect("failed to init app state");
-
-    if std::env::var("TUNE_AUTO_SCAN").unwrap_or_default() == "true" {
+    if config.auto_scan {
         let db = state.db.clone();
         tokio::spawn(async move {
             info!("auto_scan_starting");
@@ -47,7 +52,8 @@ async fn main() {
             let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
             info!(files = files.len(), "auto_scan_files_found");
 
-            let (scanned, stats) = tune_core::scanner::walker::scan_files_parallel(&files, false, None);
+            let (_scanned, stats) =
+                tune_core::scanner::walker::scan_files_parallel(&files, false, None);
             info!(
                 total = stats.total_files,
                 ok = stats.metadata_ok,
@@ -59,14 +65,15 @@ async fn main() {
 
     info!(
         version = tune_core::version(),
-        port,
-        db = %db_path,
+        port = config.port,
+        db = %config.db_path,
+        web = %config.web_dir,
         "tune_server_starting"
     );
 
     let app = routes::router(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     info!(%addr, "listening");
 
