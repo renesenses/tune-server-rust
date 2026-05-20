@@ -11,8 +11,8 @@ use super::traits::*;
 
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
-const CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
-const CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
+const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
+const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg==";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,6 +205,8 @@ impl StreamingService for TidalService {
             });
         }
 
+        info!(has_pending = self.pending_device_auth.is_some(), "tidal_auth_poll");
+
         if let Some(ref pending) = self.pending_device_auth.clone() {
             let resp = self.client
                 .post(&format!("{AUTH_BASE}/token"))
@@ -219,7 +221,10 @@ impl StreamingService for TidalService {
                 .await
                 .map_err(|e| format!("token: {e}"))?;
 
-            if resp.status() == 400 {
+            let status_code = resp.status().as_u16();
+            if status_code != 200 {
+                let body = resp.text().await.unwrap_or_default();
+                info!(status = status_code, body = %body, "tidal_token_exchange");
                 return Ok(AuthStatus {
                     authenticated: false,
                     ..Default::default()
