@@ -81,14 +81,19 @@ async fn service_status(
 async fn service_auth(
     State(state): State<AppState>,
     Path(service): Path<String>,
-    body: Option<Json<Value>>,
+    raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let body: Option<Value> = if raw_body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&raw_body).ok()
+    };
     let registry = state.services.lock().await;
     let Some(svc) = registry.get(&service) else {
         return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
     };
     let mut svc = svc.lock().await;
-    let credentials = body.map(|j| j.0).unwrap_or(json!({"device_flow": true}));
+    let credentials = body.unwrap_or(json!({"device_flow": true}));
 
     match svc.authenticate(&credentials).await {
         Ok(status) => {
