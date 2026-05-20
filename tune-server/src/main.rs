@@ -235,6 +235,53 @@ async fn main() {
         });
     }
 
+    {
+        let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
+        if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
+            let mut mdns = mdns.with_chromecast().with_airplay();
+            if let Err(e) = mdns.start() {
+                tracing::warn!(error = %e, "mdns_start_failed");
+            }
+        }
+
+        let outputs = state.outputs.clone();
+        let db_for_mdns = state.db.clone();
+        tokio::spawn(async move {
+            use tune_core::discovery::mdns::MdnsEvent;
+            use tune_core::discovery::device::OutputType;
+            while let Some(event) = mdns_rx.recv().await {
+                match event {
+                    MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
+                        if dev.device_type == OutputType::Chromecast {
+                            let cast = tune_core::outputs::chromecast::ChromecastOutput::new(
+                                dev.name.clone(),
+                                dev.id.clone(),
+                                dev.host.clone(),
+                                dev.port,
+                            );
+                            let mut reg = outputs.lock().await;
+                            reg.register(Box::new(cast));
+                            info!(name = %dev.name, host = %dev.host, port = dev.port, "chromecast_output_registered");
+
+                            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_mdns.clone());
+                            let existing = zone_repo.list().unwrap_or_default();
+                            let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
+                            if !already
+                                && let Ok(zid) = zone_repo.create(&dev.name, Some("chromecast"), Some(&dev.id))
+                            {
+                                info!(name = %dev.name, zone_id = zid, "chromecast_zone_auto_created");
+                            }
+                        }
+                    }
+                    MdnsEvent::DeviceLost(id) => {
+                        let mut reg = outputs.lock().await;
+                        reg.remove(&id);
+                    }
+                }
+            }
+        });
+    }
+
     let poller = tune_core::poller::PositionPoller::new(
         state.orchestrator.clone(),
         state.playback.clone(),

@@ -37,6 +37,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 urlencoding = "2"
 toml = "0.8"
 cpal = "0.15"
+rust_cast = "0.21"
 sha2 = "0.10"
 
 [profile.release]

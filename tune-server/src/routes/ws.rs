@@ -43,12 +43,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 }
             }
             msg = socket.recv() => {
+                #[allow(clippy::collapsible_match)]
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(Message::Ping(data)))
-                        if socket.send(Message::Pong(data)).await.is_err() => {
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
                             break;
                         }
+                    }
                     _ => {}
                 }
             }
