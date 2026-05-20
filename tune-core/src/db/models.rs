@@ -70,7 +70,7 @@ impl Album {
         if fmt.contains("dsf") || fmt.contains("dff") || fmt.contains("dsd") {
             Some("dsd".into())
         } else if sr > 48000 || bd > 16 {
-            Some("hires".into())
+            Some("hi-res".into())
         } else if fmt == "mp3" || fmt == "ogg" || fmt == "opus" || fmt == "wma" || fmt == "aac" {
             Some("lossy".into())
         } else if !fmt.is_empty() {
