@@ -84,8 +84,8 @@ async fn zone_crud() {
 
     let (status, body) = get(&app, "/api/v1/zones").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["items"][0]["name"], "Salon");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["name"], "Salon");
 
     let (status, body) = get(&app, &format!("/api/v1/zones/{zone_id}")).await;
     assert_eq!(status, StatusCode::OK);
@@ -110,8 +110,8 @@ async fn library_empty() {
 
     let (status, body) = get(&app, "/api/v1/library/tracks?limit=10").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 0);
-    assert!(body["items"].as_array().unwrap().is_empty());
+    assert_eq!(body.as_array().unwrap().len(), 0);
+    assert!(body.as_array().unwrap().is_empty());
 
     let (status, body) = get(&app, "/api/v1/library/albums/count").await;
     assert_eq!(status, StatusCode::OK);
@@ -135,8 +135,8 @@ async fn profiles_default() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/profiles").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["items"][0]["username"], "default");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["name"], "default");
 }
 
 #[tokio::test]
@@ -149,8 +149,8 @@ async fn tags_crud() {
 
     let (status, body) = get(&app, "/api/v1/tags").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["items"][0]["name"], "Jazz");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["name"], "Jazz");
 }
 
 #[tokio::test]
@@ -171,12 +171,11 @@ async fn streaming_services_list() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/streaming/services").await;
     assert_eq!(status, StatusCode::OK);
-    let services = body["services"].as_array().unwrap();
+    let services = body.as_object().unwrap();
     assert!(services.len() >= 5);
-    let names: Vec<&str> = services.iter().filter_map(|s| s["name"].as_str()).collect();
-    assert!(names.contains(&"tidal"));
-    assert!(names.contains(&"qobuz"));
-    assert!(names.contains(&"spotify"));
+    assert!(services.contains_key("tidal"));
+    assert!(services.contains_key("qobuz"));
+    assert!(services.contains_key("spotify"));
 }
 
 #[tokio::test]
@@ -192,8 +191,8 @@ async fn radio_crud() {
 
     let (status, body) = get(&app, "/api/v1/radios").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 1);
-    assert_eq!(body["items"][0]["name"], "FIP");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["name"], "FIP");
 }
 
 #[tokio::test]
@@ -211,7 +210,7 @@ async fn genre_tree_empty() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/library/genre-tree").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["total"], 0);
+    assert!(body["genres"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

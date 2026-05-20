@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -5,8 +7,23 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
+use tune_core::streaming::traits::StreamingService;
 
 use crate::state::AppState;
+
+/// Look up a service by name. Locks the registry only long enough to clone
+/// the Arc, so callers never hold the registry lock across await points.
+async fn get_svc(
+    state: &AppState,
+    name: &str,
+) -> Result<Arc<Mutex<Box<dyn StreamingService>>>, (StatusCode, String)> {
+    let registry = state.services.lock().await;
+    registry
+        .get(name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown service: {name}")))
+    // registry lock drops here
+}
 
 #[derive(Deserialize)]
 struct SearchQuery {
@@ -53,10 +70,11 @@ async fn service_status(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
+
     let mut svc = svc.lock().await;
     let mut status = svc.auth_status().await;
     if !status.authenticated {
@@ -64,7 +82,6 @@ async fn service_status(
             if poll_status.authenticated {
                 status = poll_status;
                 drop(svc);
-                drop(registry);
                 state.save_tokens().await;
             }
         }
@@ -88,10 +105,12 @@ async fn service_auth(
     } else {
         serde_json::from_slice(&raw_body).ok()
     };
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
+
     let mut svc = svc.lock().await;
     let credentials = body.unwrap_or(json!({"device_flow": true}));
 
@@ -99,7 +118,6 @@ async fn service_auth(
         Ok(status) => {
             if status.authenticated {
                 drop(svc);
-                drop(registry);
                 state.save_tokens().await;
             }
             Json(json!({
@@ -118,19 +136,27 @@ async fn auth_poll_status(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
 
     let mut svc = svc.lock().await;
     let poll_creds = json!({"poll": true});
     match svc.authenticate(&poll_creds).await {
-        Ok(status) => Json(json!({
-            "service": service,
-            "authenticated": status.authenticated,
-            "username": status.username,
-        })).into_response(),
+        Ok(status) => {
+            let authenticated = status.authenticated;
+            let username = status.username.clone();
+            if authenticated {
+                drop(svc);
+                state.save_tokens().await;
+            }
+            Json(json!({
+                "service": service,
+                "authenticated": authenticated,
+                "username": username,
+            })).into_response()
+        }
         Err(e) => Json(json!({
             "service": service,
             "authenticated": false,
@@ -143,12 +169,14 @@ async fn service_logout(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let mut svc = svc.lock().await;
     svc.logout().await.ok();
+    drop(svc);
+    state.save_tokens().await;
     Json(json!({ "service": service, "status": "logged_out" })).into_response()
 }
 
@@ -157,9 +185,9 @@ async fn service_search(
     Path(service): Path<String>,
     Query(q): Query<SearchQuery>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
     let limit = q.limit.unwrap_or(20);
@@ -174,9 +202,9 @@ async fn service_albums(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -190,9 +218,9 @@ async fn service_album(
     State(state): State<AppState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -206,9 +234,9 @@ async fn service_album_tracks(
     State(state): State<AppState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -222,9 +250,9 @@ async fn service_artist(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -238,9 +266,9 @@ async fn service_playlists(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -254,9 +282,9 @@ async fn service_playlist(
     State(state): State<AppState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -270,9 +298,9 @@ async fn service_playlist_tracks(
     State(state): State<AppState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -286,9 +314,9 @@ async fn service_track(
     State(state): State<AppState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -302,9 +330,9 @@ async fn service_track_url(
     State(state): State<AppState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -318,9 +346,9 @@ async fn service_featured(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 
@@ -334,9 +362,9 @@ async fn service_new_releases(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.services.lock().await;
-    let Some(svc) = registry.get(&service) else {
-        return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let svc = svc.lock().await;
 

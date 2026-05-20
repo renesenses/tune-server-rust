@@ -184,7 +184,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 let album_id = album.as_ref().and_then(|a| a.id);
 
                 if let Some(aid) = album_id {
-                    if meta.has_cover && !albums_with_cover.contains(&aid) {
+                    if !albums_with_cover.contains(&aid) {
                         if let Some(hash) = tune_core::artwork::get_or_extract(
                             std::path::Path::new(&sf.path),
                             &cache_dir,
