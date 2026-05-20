@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/auth", post(service_auth))
         .route("/{service}/auth/status", get(auth_poll_status))
         .route("/{service}/logout", post(service_logout))
+        .route("/{service}/disconnect", post(service_logout))
         .route("/{service}/search", get(service_search))
         .route("/{service}/albums", get(service_albums))
         .route("/{service}/albums/{album_id}", get(service_album))
@@ -90,7 +91,8 @@ async fn service_auth(
                 "service": service,
                 "authenticated": status.authenticated,
                 "username": status.username,
-                "verification_url": status.expires_at,
+                "verification_url": status.verification_url,
+                "user_code": status.user_code,
             })).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),

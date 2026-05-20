@@ -143,7 +143,7 @@ impl StreamingService for QobuzService {
             authenticated: self.user_auth_token.is_some(),
             username: self.username.clone(),
             subscription: self.subscription.clone(),
-            expires_at: None,
+            ..Default::default()
         }
     }
 

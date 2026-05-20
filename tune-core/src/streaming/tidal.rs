@@ -15,6 +15,7 @@ const CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
 const CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
@@ -23,6 +24,7 @@ struct TokenResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DeviceAuthResponse {
     device_code: String,
     user_code: String,
@@ -192,9 +194,9 @@ impl StreamingService for TidalService {
 
             return Ok(AuthStatus {
                 authenticated: false,
-                username: None,
-                subscription: None,
-                expires_at: Some(device_auth.verification_uri_complete),
+                verification_url: Some(device_auth.verification_uri_complete),
+                user_code: Some(device_auth.user_code),
+                ..Default::default()
             });
         }
 
@@ -215,9 +217,7 @@ impl StreamingService for TidalService {
             if resp.status() == 400 {
                 return Ok(AuthStatus {
                     authenticated: false,
-                    username: None,
-                    subscription: None,
-                    expires_at: None,
+                    ..Default::default()
                 });
             }
 
@@ -249,6 +249,7 @@ impl StreamingService for TidalService {
                 let remaining = t.duration_since(Instant::now()).as_secs();
                 format!("{remaining}s")
             }),
+            ..Default::default()
         }
     }
 

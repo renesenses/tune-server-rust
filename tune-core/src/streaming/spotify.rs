@@ -155,14 +155,13 @@ impl StreamingService for SpotifyService {
         self.code_verifier = Some(verifier);
         Ok(AuthStatus {
             authenticated: false,
-            username: None,
-            subscription: None,
-            expires_at: Some(self.auth_url(&challenge)),
+            verification_url: Some(self.auth_url(&challenge)),
+            ..Default::default()
         })
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        AuthStatus { authenticated: self.access_token.is_some(), username: self.username.clone(), subscription: None, expires_at: None }
+        AuthStatus { authenticated: self.access_token.is_some(), username: self.username.clone(), ..Default::default() }
     }
 
     async fn logout(&mut self) -> Result<(), String> {

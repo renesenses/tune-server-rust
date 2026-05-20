@@ -24,7 +24,7 @@ impl StreamingService for DeezerService {
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        AuthStatus { authenticated: self.authenticated, username: self.username.clone(), subscription: None, expires_at: None }
+        AuthStatus { authenticated: self.authenticated, username: self.username.clone(), ..Default::default() }
     }
 
     async fn logout(&mut self) -> Result<(), String> {

@@ -20,7 +20,7 @@ impl StreamingService for YouTubeService {
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        AuthStatus { authenticated: self.authenticated, username: None, subscription: None, expires_at: None }
+        AuthStatus { authenticated: self.authenticated, ..Default::default() }
     }
 
     async fn logout(&mut self) -> Result<(), String> {

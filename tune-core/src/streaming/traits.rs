@@ -68,12 +68,14 @@ pub struct SearchResults {
     pub playlists: Vec<StreamPlaylist>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub authenticated: bool,
     pub username: Option<String>,
     pub subscription: Option<String>,
     pub expires_at: Option<String>,
+    pub verification_url: Option<String>,
+    pub user_code: Option<String>,
 }
 
 #[async_trait::async_trait]
