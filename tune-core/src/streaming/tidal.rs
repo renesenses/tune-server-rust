@@ -192,9 +192,14 @@ impl StreamingService for TidalService {
             );
             self.pending_device_auth = Some(device_auth.clone());
 
+            let url = if device_auth.verification_uri_complete.starts_with("http") {
+                device_auth.verification_uri_complete
+            } else {
+                format!("https://{}", device_auth.verification_uri_complete)
+            };
             return Ok(AuthStatus {
                 authenticated: false,
-                verification_url: Some(device_auth.verification_uri_complete),
+                verification_url: Some(url),
                 user_code: Some(device_auth.user_code),
                 ..Default::default()
             });
