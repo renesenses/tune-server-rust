@@ -76,7 +76,22 @@ async fn get_zone(
 ) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db);
     match repo.get(id) {
-        Ok(Some(zone)) => Json(json!(zone)).into_response(),
+        Ok(Some(zone)) => {
+            let ps = state.playback.get_state(id).await;
+            let mut v = serde_json::to_value(&zone).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("state".into(), json!(match ps.state {
+                    tune_core::playback::PlayState::Playing => "playing",
+                    tune_core::playback::PlayState::Paused => "paused",
+                    tune_core::playback::PlayState::Stopped => "stopped",
+                }));
+                obj.insert("current_track".into(), json!(ps.now_playing));
+                obj.insert("position_ms".into(), json!(ps.position_ms));
+                obj.insert("queue_length".into(), json!(ps.queue_length));
+                obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
+            }
+            Json(v).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }

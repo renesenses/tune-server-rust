@@ -25,7 +25,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             event = rx.recv() => {
                 match event {
                     Ok(ev) => {
-                        let json = serde_json::to_string(&ev).unwrap_or_default();
+                        let mut data = ev.data.clone();
+                        if let Some(obj) = data.as_object_mut() {
+                            obj.insert("zone_id".into(), serde_json::json!(ev.zone_id));
+                        }
+                        let ws_event = serde_json::json!({
+                            "type": format!("playback.{}", ev.event),
+                            "data": data,
+                        });
+                        let json = serde_json::to_string(&ws_event).unwrap_or_default();
                         if socket.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
