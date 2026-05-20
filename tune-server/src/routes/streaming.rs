@@ -57,11 +57,21 @@ async fn service_status(
     let Some(svc) = registry.get(&service) else {
         return (StatusCode::NOT_FOUND, format!("unknown service: {service}")).into_response();
     };
-    let svc = svc.lock().await;
-    let status = svc.auth_status().await;
+    let mut svc = svc.lock().await;
+    let mut status = svc.auth_status().await;
+    if !status.authenticated {
+        if let Ok(poll_status) = svc.authenticate(&json!({})).await {
+            if poll_status.authenticated {
+                status = poll_status;
+                drop(svc);
+                drop(registry);
+                state.save_tokens().await;
+            }
+        }
+    }
     Json(json!({
         "service": service,
-        "enabled": svc.enabled(),
+        "enabled": true,
         "authenticated": status.authenticated,
         "username": status.username,
         "subscription": status.subscription,
