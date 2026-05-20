@@ -95,6 +95,9 @@ impl PositionPoller {
             self.playback
                 .update_position(zone_id, status.position_ms as i64)
                 .await;
+            if (status.volume - zone_state.volume).abs() > 0.005 {
+                self.playback.set_volume(zone_id, status.volume).await;
+            }
             self.playback
                 .emit_position(zone_id, status.position_ms as i64);
 

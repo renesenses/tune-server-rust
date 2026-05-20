@@ -26,6 +26,20 @@ async fn main() {
 
     state.restore_tokens().await;
 
+    // Initialize PlaybackManager volume from DB-stored zone volumes
+    {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        if let Ok(zones) = zone_repo.list() {
+            for zone in &zones {
+                if let Some(id) = zone.id {
+                    let vol = (zone.volume as f64) / 100.0;
+                    state.playback.set_volume(id, vol).await;
+                    info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
+                }
+            }
+        }
+    }
+
     if !config.music_dirs.is_empty() {
         let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
         settings
