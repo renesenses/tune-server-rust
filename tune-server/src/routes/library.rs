@@ -28,6 +28,7 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AlbumFilters {
     limit: Option<i64>,
     offset: Option<i64>,
@@ -71,7 +72,7 @@ async fn list_artists(
     let repo = ArtistRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let total = repo.count().unwrap_or(0);
+    let _total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
     Json(json!(items))
 }
@@ -183,7 +184,7 @@ async fn list_tracks(
     let repo = TrackRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let total = repo.count().unwrap_or(0);
+    let _total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
     Json(json!(items))
 }
@@ -229,7 +230,7 @@ async fn stream_track_audio(
     let mime = track
         .format
         .as_deref()
-        .and_then(|f| tune_core::audio::formats::AudioFormat::from_extension(f))
+        .and_then(tune_core::audio::formats::AudioFormat::from_extension)
         .map(|f| f.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".into());
 
@@ -240,19 +241,16 @@ async fn stream_track_audio(
 
     let path_owned = file_path.clone();
     let body = Body::from_stream(async_stream::stream! {
-        match tokio::fs::File::open(&path_owned).await {
-            Ok(mut file) => {
-                use tokio::io::AsyncReadExt;
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match file.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
-                        Err(_e) => { break; }
-                    }
+        if let Ok(mut file) = tokio::fs::File::open(&path_owned).await {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
+                    Err(_e) => { break; }
                 }
             }
-            Err(_) => {}
         }
     });
 
@@ -440,15 +438,14 @@ async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
     for ext in &["jpg", "png"] {
         let path = cache_dir.join(format!("{hash}.{ext}"));
-        if path.exists() {
-            if let Ok(data) = tokio::fs::read(&path).await {
+        if path.exists()
+            && let Ok(data) = tokio::fs::read(&path).await {
                 let mime = if *ext == "png" { "image/png" } else { "image/jpeg" };
                 let mut headers = axum::http::HeaderMap::new();
                 headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
                 headers.insert("Cache-Control", axum::http::HeaderValue::from_static("public, max-age=86400"));
                 return (StatusCode::OK, headers, data).into_response();
             }
-        }
     }
     StatusCode::NOT_FOUND.into_response()
 }
@@ -473,8 +470,8 @@ async fn album_artwork(
 
     let track_repo = TrackRepo::new(state.db);
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
-    if let Some(track) = tracks.first() {
-        if let Some(ref file_path) = track.file_path {
+    if let Some(track) = tracks.first()
+        && let Some(ref file_path) = track.file_path {
             let cache_dir = artwork_cache_dir();
             if let Some(hash) = tune_core::artwork::get_or_extract(
                 std::path::Path::new(file_path),
@@ -483,7 +480,6 @@ async fn album_artwork(
                 return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response();
             }
         }
-    }
 
     StatusCode::NOT_FOUND.into_response()
 }

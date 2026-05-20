@@ -22,7 +22,7 @@ async fn main() {
         )
         .init();
 
-    let state = AppState::new(&config.db_path, config.port).expect("failed to init app state");
+    let state = AppState::new(&config.db_path, config.port, config.clone()).expect("failed to init app state");
 
     state.restore_tokens().await;
 
@@ -102,17 +102,15 @@ async fn main() {
                 });
                 let album_id = album.as_ref().and_then(|a| a.id);
 
-                if let Some(aid) = album_id {
-                    if !albums_with_cover.contains(&aid) {
-                        if let Some(hash) = tune_core::artwork::get_or_extract(
-                            std::path::Path::new(&sf.path),
-                            &cache_dir,
-                        ) {
-                            album_repo.update_cover_path(aid, &hash).ok();
-                            albums_with_cover.insert(aid);
-                        }
+                if let Some(aid) = album_id
+                    && !albums_with_cover.contains(&aid)
+                    && let Some(hash) = tune_core::artwork::get_or_extract(
+                        std::path::Path::new(&sf.path),
+                        &cache_dir,
+                    ) {
+                        album_repo.update_cover_path(aid, &hash).ok();
+                        albums_with_cover.insert(aid);
                     }
-                }
 
                 if track_repo.get_by_path(&sf.path).ok().flatten().is_some() {
                     continue;
@@ -180,6 +178,7 @@ async fn main() {
 
         let outputs = state.outputs.clone();
         let db_for_ssdp = state.db.clone();
+        let config_for_ssdp = config.clone();
         tokio::spawn(async move {
             use tune_core::discovery::ssdp::SsdpEvent;
             while let Some(event) = ssdp_rx.recv().await {
@@ -196,13 +195,14 @@ async fn main() {
                             let rc_url = svc_urls.get("renderingcontrol")
                                 .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
                             if let (Some(av), Some(rc)) = (av_url, rc_url) {
+                                let delay = config_for_ssdp.play_delay_for(&dev.name);
                                 let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                                     dev.name.clone(),
                                     dev.id.clone(),
                                     dev.host.clone(),
                                     av,
                                     rc,
-                                );
+                                ).with_play_delay(delay);
                                 let mut reg = outputs.lock().await;
                                 reg.register(Box::new(dlna));
                                 info!(name = %dev.name, id = %dev.id, "dlna_output_registered");

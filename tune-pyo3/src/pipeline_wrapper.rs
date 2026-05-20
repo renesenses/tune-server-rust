@@ -61,7 +61,7 @@ impl RustPipeline {
             pyo3::exceptions::PyRuntimeError::new_err("pipeline already stopped")
         })?;
         inner.runtime.block_on(inner.pipeline.start())
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     #[pyo3(signature = (timeout_ms=5000))]

@@ -18,6 +18,7 @@ struct CreateSmartPlaylist {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct UpdateSmartPlaylist {
     name: Option<String>,
     rules: Option<Value>,

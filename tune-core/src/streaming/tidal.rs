@@ -75,6 +75,12 @@ pub struct TidalService {
     pending_device_auth: Option<DeviceAuthResponse>,
 }
 
+impl Default for TidalService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TidalService {
     pub fn new() -> Self {
         Self {
@@ -86,7 +92,7 @@ impl TidalService {
             refresh_token: None,
             token_expires: None,
             country_code: "US".into(),
-            quality: "LOSSLESS".into(),
+            quality: "HI_RES_LOSSLESS".into(),
             username: None,
             subscription: None,
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
@@ -113,6 +119,18 @@ impl TidalService {
     }
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
+        let tags = item["mediaMetadata"]["tags"].as_array();
+        let is_hires = tags
+            .map(|t| t.iter().any(|v| v.as_str() == Some("HIRES_LOSSLESS")))
+            .unwrap_or(false);
+        let audio_quality = item["audioQuality"].as_str().unwrap_or(
+            if is_hires { "HI_RES_LOSSLESS" } else { "LOSSLESS" }
+        );
+        let (sample_rate, bit_depth) = match audio_quality {
+            "HI_RES_LOSSLESS" => (96000, 24),
+            _ => (44100, 16),
+        };
+
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
@@ -130,8 +148,8 @@ impl TidalService {
             explicit: item["explicit"].as_bool().unwrap_or(false),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
-                sample_rate: 44100,
-                bit_depth: 16,
+                sample_rate,
+                bit_depth,
                 bitrate: None,
             }),
         }
@@ -151,6 +169,39 @@ impl TidalService {
             year: item["releaseDate"].as_str().and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
             quality: None,
+        }
+    }
+
+    async fn fetch_playback_info(&self, track_id: &str, quality: &str) -> Result<serde_json::Value, String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let resp = self.client
+            .get(format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall"))
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[
+                ("audioquality", quality),
+                ("playbackmode", "STREAM"),
+                ("assetpresentation", "FULL"),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("stream url: {e}"))?;
+
+        if resp.status() == 429 {
+            return Err("tidal rate limited".into());
+        }
+
+        resp.json().await.map_err(|e| format!("parse: {e}"))
+    }
+
+    fn parse_quality_metadata(data: &serde_json::Value, audio_quality: &str) -> (u32, u16) {
+        if let Some(bit_depth) = data["bitDepth"].as_u64() {
+            let sample_rate = data["sampleRate"].as_u64().unwrap_or(44100) as u32;
+            return (sample_rate, bit_depth as u16);
+        }
+        match audio_quality {
+            "HI_RES_LOSSLESS" => (96000, 24),
+            "LOSSLESS" | "HI_RES" => (44100, 16),
+            _ => (44100, 16),
         }
     }
 
@@ -178,7 +229,7 @@ impl StreamingService for TidalService {
     async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
             let resp = self.client
-                .post(&format!("{AUTH_BASE}/device_authorization"))
+                .post(format!("{AUTH_BASE}/device_authorization"))
                 .form(&[("client_id", CLIENT_ID), ("scope", "r_usr+w_usr+w_sub")])
                 .send()
                 .await
@@ -209,7 +260,7 @@ impl StreamingService for TidalService {
 
         if let Some(ref pending) = self.pending_device_auth.clone() {
             let resp = self.client
-                .post(&format!("{AUTH_BASE}/token"))
+                .post(format!("{AUTH_BASE}/token"))
                 .form(&[
                     ("client_id", CLIENT_ID),
                     ("client_secret", CLIENT_SECRET),
@@ -299,7 +350,7 @@ impl StreamingService for TidalService {
         Ok(Self::map_track(&data))
     }
 
-    async fn get_track_url(&self, track_id: &str, _quality: Option<&str>) -> Result<StreamUrl, String> {
+    async fn get_track_url(&self, track_id: &str, quality: Option<&str>) -> Result<StreamUrl, String> {
         {
             let cache = self.url_cache.lock().await;
             if let Some(url) = cache.get(track_id) {
@@ -317,20 +368,16 @@ impl StreamingService for TidalService {
             }
         }
 
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
-        let resp = self.client
-            .get(&format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall"))
-            .header("Authorization", format!("Bearer {token}"))
-            .query(&[
-                ("audioquality", self.quality.as_str()),
-                ("playbackmode", "STREAM"),
-                ("assetpresentation", "FULL"),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("stream url: {e}"))?;
+        let requested_quality = quality.unwrap_or(self.quality.as_str());
+        let data = self.fetch_playback_info(track_id, requested_quality).await?;
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
+        let data = if manifest_mime == "application/dash+xml" && requested_quality != "LOSSLESS" {
+            info!(track_id, "tidal_hires_dash_fallback_to_lossless");
+            self.fetch_playback_info(track_id, "LOSSLESS").await?
+        } else {
+            data
+        };
 
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
         let decoded = String::from_utf8(
@@ -347,26 +394,29 @@ impl StreamingService for TidalService {
             decoded
         };
 
-        let codec = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
-        let (sample_rate, bit_depth) = match codec {
-            "HI_RES_LOSSLESS" => (96000, 24),
-            "LOSSLESS" | "HIGH" => (44100, 16),
-            _ => (44100, 16),
-        };
+        let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
+        let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
+        let mime_type = data["manifestMimeType"].as_str()
+            .and_then(|m| if m.contains("dash") { None } else { Some(m) })
+            .unwrap_or("audio/flac");
 
         {
             let mut cache = self.url_cache.lock().await;
             cache.set(track_id.to_string(), url.clone());
         }
 
+        info!(track_id, audio_quality, sample_rate, bit_depth, "tidal_stream_url");
+
         Ok(StreamUrl {
             url,
-            mime_type: "audio/flac".into(),
+            mime_type: mime_type.to_string(),
             quality: StreamQuality {
-                codec: "FLAC".into(),
+                codec: if audio_quality.contains("LOSSLESS") { "FLAC" } else { "AAC" }.into(),
                 sample_rate,
                 bit_depth,
-                bitrate: None,
+                bitrate: data["bitDepth"].as_u64().map(|_| {
+                    sample_rate * (bit_depth as u32) * 2
+                }),
             },
             expires_at: None,
         })
@@ -474,7 +524,7 @@ impl StreamingService for TidalService {
 
         let resp = self
             .client
-            .post(&format!("{AUTH_BASE}/token"))
+            .post(format!("{AUTH_BASE}/token"))
             .form(&[
                 ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),

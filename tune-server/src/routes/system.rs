@@ -183,18 +183,16 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
                 let album_id = album.as_ref().and_then(|a| a.id);
 
-                if let Some(aid) = album_id {
-                    if !albums_with_cover.contains(&aid) {
-                        if let Some(hash) = tune_core::artwork::get_or_extract(
-                            std::path::Path::new(&sf.path),
-                            &cache_dir,
-                        ) {
-                            album_repo.update_cover_path(aid, &hash).ok();
-                            albums_with_cover.insert(aid);
-                            artwork_extracted += 1;
-                        }
+                if let Some(aid) = album_id
+                    && !albums_with_cover.contains(&aid)
+                    && let Some(hash) = tune_core::artwork::get_or_extract(
+                        std::path::Path::new(&sf.path),
+                        &cache_dir,
+                    ) {
+                        album_repo.update_cover_path(aid, &hash).ok();
+                        albums_with_cover.insert(aid);
+                        artwork_extracted += 1;
                     }
-                }
 
                 let existing = track_repo.get_by_path(&sf.path).ok().flatten();
                 if existing.is_some() {
@@ -230,7 +228,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     .find(|c| c.role == "composer")
                     .map(|c| c.name.clone());
                 track.year = meta.year.map(|y| y as i32);
-                track.bpm = meta.bpm.map(|b| b as f64);
+                track.bpm = meta.bpm;
                 track.label = meta.label.clone();
                 track.isrc = meta.isrc.clone();
                 track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();

@@ -9,31 +9,36 @@ const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingContr
 pub struct DlnaOutput {
     name: String,
     device_id: String,
-    host: String,
     av_transport_url: String,
     rendering_control_url: String,
     client: Client,
+    play_delay_ms: u64,
 }
 
 impl DlnaOutput {
     pub fn new(
         name: String,
         device_id: String,
-        host: String,
+        _host: String,
         av_transport_url: String,
         rendering_control_url: String,
     ) -> Self {
         Self {
             name,
             device_id,
-            host,
             av_transport_url,
             rendering_control_url,
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
+            play_delay_ms: 0,
         }
+    }
+
+    pub fn with_play_delay(mut self, delay_ms: u64) -> Self {
+        self.play_delay_ms = delay_ms;
+        self
     }
 
     async fn soap_action(&self, url: &str, service: &str, action: &str, body: &str) -> Result<String, String> {
@@ -121,8 +126,12 @@ impl OutputTarget for DlnaOutput {
             "<InstanceID>0</InstanceID><CurrentURI>{url}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>"
         )).await?;
 
+        if self.play_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
+        }
+
         self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").await?;
-        info!(device = %self.name, url, "dlna_play");
+        info!(device = %self.name, url, delay_ms = self.play_delay_ms, "dlna_play");
         Ok(())
     }
 

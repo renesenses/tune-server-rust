@@ -85,9 +85,7 @@ impl QobuzService {
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_url: item["image"]["large"].as_str().map(Into::into),
             year: item["released_at"].as_u64().map(|ts| {
-                let secs = ts;
-                let year = 1970 + (secs / 31_536_000) as u32;
-                year
+                1970 + (ts / 31_536_000) as u32
             }).or_else(|| item["release_date_original"].as_str().and_then(|d| d.get(..4)?.parse().ok())),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             quality: None,
@@ -118,7 +116,7 @@ impl StreamingService for QobuzService {
         let password = credentials["password"].as_str().ok_or("password required")?;
 
         let resp = self.client
-            .post(&format!("{API_BASE}/user/login"))
+            .post(format!("{API_BASE}/user/login"))
             .query(&[("app_id", self.app_id.as_str())])
             .form(&[("username", username), ("password", password)])
             .send()

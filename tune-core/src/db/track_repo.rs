@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::album_repo::AlbumRepo;
-    use crate::db::models::{Artist, Album};
+    use crate::db::models::Artist;
 
     fn test_db() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();

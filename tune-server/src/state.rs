@@ -11,6 +11,8 @@ use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
 use tune_core::streaming::ServiceRegistry;
 
+use crate::config::TuneConfig;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqliteDb,
@@ -20,12 +22,13 @@ pub struct AppState {
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
     pub scanner: Arc<Mutex<SsdpScanner>>,
+    pub config: Arc<TuneConfig>,
     pub port: u16,
     pub started_at: Instant,
 }
 
 impl AppState {
-    pub fn new(db_path: &str, port: u16) -> Result<Self, String> {
+    pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
         let db = SqliteDb::open(db_path)?;
         db.init_schema()?;
         tune_core::db::migrations::run_migrations(&db)?;
@@ -65,6 +68,7 @@ impl AppState {
             outputs,
             orchestrator,
             scanner,
+            config: Arc::new(tune_config),
             port,
             started_at: Instant::now(),
         })

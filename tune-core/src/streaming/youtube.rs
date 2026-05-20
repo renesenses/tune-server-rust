@@ -4,6 +4,12 @@ pub struct YouTubeService {
     authenticated: bool,
 }
 
+impl Default for YouTubeService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl YouTubeService {
     pub fn new() -> Self {
         Self { authenticated: false }

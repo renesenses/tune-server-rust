@@ -18,3 +18,13 @@ music_dirs = [
 # Qobuz credentials (optional)
 # qobuz_app_id = ""
 # qobuz_app_secret = ""
+
+# DLNA play delay (ms) — for slow renderers (Atoll, Micromega, Wiim)
+# that need a pause between SetAVTransportURI and Play
+# dlna_play_delay_ms = 0
+
+# Per-device delays (pattern matched against device name, case-insensitive)
+# [device_delays]
+# atoll = 2000
+# micromega = 1500
+# wiim = 500

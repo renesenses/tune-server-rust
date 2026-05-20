@@ -217,13 +217,12 @@ async fn handle_event(
         }
         ServiceEvent::ServiceRemoved(_, fullname) => {
             let mut st = state.lock().await;
-            if let Some(dev_id) = st.service_to_device.remove(&fullname) {
-                if let Some(device) = st.devices.remove(&dev_id) {
+            if let Some(dev_id) = st.service_to_device.remove(&fullname)
+                && let Some(device) = st.devices.remove(&dev_id) {
                     info!(id = %dev_id, name = %device.name, "mdns_device_lost");
                     drop(st);
                     let _ = event_tx.send(MdnsEvent::DeviceLost(dev_id)).await;
                 }
-            }
         }
         ServiceEvent::SearchStarted(stype) => {
             debug!(service = %stype, "mdns_search_started");

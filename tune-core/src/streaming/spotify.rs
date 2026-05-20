@@ -20,6 +20,12 @@ pub struct SpotifyService {
     redirect_uri: String,
 }
 
+impl Default for SpotifyService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpotifyService {
     pub fn new() -> Self {
         Self {
@@ -70,7 +76,7 @@ impl SpotifyService {
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.access_token.as_deref().ok_or("not authenticated")?;
         let resp = self.client
-            .get(&format!("{API_BASE}{path}"))
+            .get(format!("{API_BASE}{path}"))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await

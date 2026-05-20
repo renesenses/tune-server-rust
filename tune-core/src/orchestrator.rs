@@ -85,11 +85,10 @@ impl PlaybackOrchestrator {
     }
 
     async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
-        if let Some(ref source) = req.source {
-            if source != "local" {
+        if let Some(ref source) = req.source
+            && source != "local" {
                 return self.resolve_streaming_url(source, req).await;
             }
-        }
 
         self.resolve_local_track(req).await
     }

@@ -9,6 +9,12 @@ pub struct OutputRegistry {
     outputs: HashMap<String, Arc<Mutex<Box<dyn OutputTarget>>>>,
 }
 
+impl Default for OutputRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutputRegistry {
     pub fn new() -> Self {
         Self {

@@ -194,7 +194,7 @@ impl RustMdnsScanner {
 
         let (event_tx, event_rx) = mpsc::channel(256);
         let mut scanner = MdnsScanner::new(event_tx)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         if airplay { scanner = scanner.with_airplay(); }
         if bluos { scanner = scanner.with_bluos(); }
@@ -217,7 +217,7 @@ impl RustMdnsScanner {
             pyo3::exceptions::PyRuntimeError::new_err("scanner already stopped")
         })?;
         inner.scanner.start()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     fn stop(&self) -> PyResult<()> {

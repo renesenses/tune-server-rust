@@ -50,22 +50,18 @@ async fn federated_search(
     {
         let registry = state.services.lock().await;
         for svc_name in registry.list() {
-            if let Some(ref sources) = requested_sources {
-                if !sources.contains(&svc_name) && !sources.contains(&"all".to_string()) {
+            if let Some(ref sources) = requested_sources
+                && !sources.contains(&svc_name) && !sources.contains(&"all".to_string()) {
                     continue;
                 }
-            }
 
             if let Some(svc) = registry.get(&svc_name) {
                 let svc = svc.lock().await;
                 if !svc.auth_status().await.authenticated {
                     continue;
                 }
-                match svc.search(&p.q, limit as usize).await {
-                    Ok(results) => {
-                        service_results.insert(svc_name, json!(results));
-                    }
-                    Err(_) => {}
+                if let Ok(results) = svc.search(&p.q, limit as usize).await {
+                    service_results.insert(svc_name, json!(results));
                 }
             }
         }

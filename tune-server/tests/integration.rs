@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn make_app() -> axum::Router {
-    let state = tune_server::state::AppState::new(":memory:", 0).unwrap();
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
     tune_server::routes::router(state)
 }
 
@@ -182,7 +182,7 @@ async fn streaming_services_list() {
 async fn radio_crud() {
     let app = make_app();
 
-    let (status, body) = post_json(
+    let (status, _body) = post_json(
         &app,
         "/api/v1/radios",
         json!({"name": "FIP", "url": "http://icecast.radiofrance.fr/fip-hifi.aac"}),

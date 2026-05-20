@@ -12,6 +12,12 @@ pub struct ServiceRegistry {
     services: HashMap<String, Arc<Mutex<Box<dyn StreamingService>>>>,
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
@@ -64,14 +70,13 @@ impl ServiceRegistry {
         let settings = SettingsRepo::new(db.clone());
         for (name, svc) in &self.services {
             let key = format!("auth_tokens_{name}");
-            if let Some(json_str) = settings.get(&key).ok().flatten() {
-                if let Ok(tokens) = serde_json::from_str(&json_str) {
+            if let Some(json_str) = settings.get(&key).ok().flatten()
+                && let Ok(tokens) = serde_json::from_str(&json_str) {
                     let mut svc = svc.lock().await;
                     if svc.restore_tokens(&tokens) {
                         info!(service = %name, "tokens_restored");
                     }
                 }
-            }
         }
     }
 }

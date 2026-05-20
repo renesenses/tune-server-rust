@@ -6,7 +6,6 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use tune_core::discovery::device::dedup_devices;
-use tune_core::discovery::ssdp::SsdpScanner;
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::outputs::dlna::DlnaOutput;
 
@@ -59,26 +58,26 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
             let location = d.location.as_deref().unwrap_or("");
             if location.is_empty() { continue; }
 
-            if let Ok(desc) = fetch_device_description(location).await {
-                if desc.is_media_renderer() {
+            if let Ok(desc) = fetch_device_description(location).await
+                && desc.is_media_renderer() {
                     let service_urls = desc.service_urls();
                     let av_url = service_urls.get("avtransport");
                     let rc_url = service_urls.get("renderingcontrol");
 
                     if let (Some(av), Some(rc)) = (av_url, rc_url) {
                         let base = format!("http://{}:{}", d.host, d.port);
+                        let delay = state.config.play_delay_for(&d.name);
                         let dlna = DlnaOutput::new(
                             d.name.clone(),
                             d.id.clone(),
                             d.host.clone(),
                             format!("{base}{av}"),
                             format!("{base}{rc}"),
-                        );
+                        ).with_play_delay(delay);
                         outputs.register(Box::new(dlna));
                         registered += 1;
                     }
                 }
-            }
         }
     }
 
@@ -107,7 +106,7 @@ async fn list_audio_devices() -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
         let devices = tune_core::outputs::local::list_audio_devices();
-        return Json(json!(devices));
+        Json(json!(devices))
     }
     #[cfg(not(feature = "local-audio"))]
     Json(json!([]))

@@ -136,7 +136,7 @@ impl RustFileWatcher {
     #[new]
     fn new(dirs: Vec<String>) -> PyResult<Self> {
         let watcher = FileWatcher::new(dirs)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(WatcherInner { watcher }))),

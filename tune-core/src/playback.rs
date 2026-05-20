@@ -76,6 +76,12 @@ pub struct PlaybackManager {
     event_tx: broadcast::Sender<PlaybackEvent>,
 }
 
+impl Default for PlaybackManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlaybackManager {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);

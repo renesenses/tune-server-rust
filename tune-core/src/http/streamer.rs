@@ -218,11 +218,8 @@ pub async fn handle_stream(
             let hdr = build_wav_header(ch, sr, bd);
             yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
         }
-        loop {
-            match session.recv_chunk().await {
-                Some(chunk) => yield Ok(bytes::Bytes::from(chunk)),
-                None => break,
-            }
+        while let Some(chunk) = session.recv_chunk().await {
+            yield Ok(bytes::Bytes::from(chunk));
         }
     });
 

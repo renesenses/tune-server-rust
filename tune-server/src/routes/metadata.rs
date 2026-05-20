@@ -28,6 +28,7 @@ struct TrackEdit {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AlbumEdit {
     title: Option<String>,
     artist_name: Option<String>,

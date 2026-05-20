@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::Deserialize;
 use tracing::info;
 
@@ -13,6 +14,19 @@ pub struct TuneConfig {
     pub qobuz_app_id: String,
     pub qobuz_app_secret: String,
     pub log_level: String,
+    pub dlna_play_delay_ms: u64,
+    #[serde(default)]
+    pub device_delays: HashMap<String, u64>,
+}
+
+impl TuneConfig {
+    pub fn play_delay_for(&self, device_name: &str) -> u64 {
+        self.device_delays
+            .iter()
+            .find(|(pattern, _)| device_name.to_lowercase().contains(&pattern.to_lowercase()))
+            .map(|(_, delay)| *delay)
+            .unwrap_or(self.dlna_play_delay_ms)
+    }
 }
 
 impl Default for TuneConfig {
@@ -27,6 +41,8 @@ impl Default for TuneConfig {
             qobuz_app_id: String::new(),
             qobuz_app_secret: String::new(),
             log_level: "info".into(),
+            dlna_play_delay_ms: 0,
+            device_delays: HashMap::new(),
         }
     }
 }
@@ -36,24 +52,22 @@ impl TuneConfig {
         let mut config = Self::default();
 
         for path in &["tune.toml", "/etc/tune/tune.toml"] {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(file_config) = toml::from_str::<TuneConfig>(&content) {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(file_config) = toml::from_str::<TuneConfig>(&content) {
                     info!(path, "config_loaded");
                     config = file_config;
                     break;
                 }
-            }
         }
 
-        if let Ok(v) = std::env::var("TUNE_PORT") {
-            if let Ok(p) = v.parse() { config.port = p; }
-        }
+        if let Ok(v) = std::env::var("TUNE_PORT")
+            && let Ok(p) = v.parse() { config.port = p; }
         if let Ok(v) = std::env::var("TUNE_DB_PATH") { config.db_path = v; }
         if let Ok(v) = std::env::var("TUNE_WEB_DIR") { config.web_dir = v; }
         if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") { config.artwork_dir = v; }
         if let Ok(v) = std::env::var("TUNE_AUTO_SCAN") { config.auto_scan = v == "true"; }
-        if let Ok(v) = std::env::var("QOBUZ_APP_ID") { if !v.is_empty() { config.qobuz_app_id = v; } }
-        if let Ok(v) = std::env::var("QOBUZ_APP_SECRET") { if !v.is_empty() { config.qobuz_app_secret = v; } }
+        if let Ok(v) = std::env::var("QOBUZ_APP_ID") && !v.is_empty() { config.qobuz_app_id = v; }
+        if let Ok(v) = std::env::var("QOBUZ_APP_SECRET") && !v.is_empty() { config.qobuz_app_secret = v; }
         if let Ok(v) = std::env::var("TUNE_LOG_LEVEL") { config.log_level = v; }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             config.music_dirs = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();

@@ -5,6 +5,12 @@ pub struct DeezerService {
     username: Option<String>,
 }
 
+impl Default for DeezerService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeezerService {
     pub fn new() -> Self {
         Self {

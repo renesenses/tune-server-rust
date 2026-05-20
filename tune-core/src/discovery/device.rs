@@ -94,7 +94,7 @@ pub fn dedup_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
 
     let mut result = Vec::new();
     for (_host, mut group) in by_host {
-        group.sort_by(|a, b| b.device_type.priority().cmp(&a.device_type.priority()));
+        group.sort_by_key(|b| std::cmp::Reverse(b.device_type.priority()));
         let mut primary = group.remove(0);
         if !group.is_empty() {
             let alts: Vec<Alternative> = group

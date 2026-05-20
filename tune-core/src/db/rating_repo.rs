@@ -93,9 +93,9 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let album_repo = AlbumRepo::new(db.clone());
-        let mut a1 = Album::new("Kind of Blue".into());
+        let a1 = Album::new("Kind of Blue".into());
         let id1 = album_repo.create(&a1).unwrap();
-        let mut a2 = Album::new("A Love Supreme".into());
+        let a2 = Album::new("A Love Supreme".into());
         let id2 = album_repo.create(&a2).unwrap();
 
         let repo = RatingRepo::new(db);

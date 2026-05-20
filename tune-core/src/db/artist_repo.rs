@@ -65,11 +65,10 @@ impl ArtistRepo {
     }
 
     pub fn get_or_create(&self, name: &str, musicbrainz_id: Option<&str>, sort_name: Option<&str>) -> Result<Artist, String> {
-        if let Some(mbid) = musicbrainz_id {
-            if let Some(artist) = self.get_by_musicbrainz_id(mbid)? {
+        if let Some(mbid) = musicbrainz_id
+            && let Some(artist) = self.get_by_musicbrainz_id(mbid)? {
                 return Ok(artist);
             }
-        }
         if let Some(artist) = self.get_by_name(name)? {
             return Ok(artist);
         }

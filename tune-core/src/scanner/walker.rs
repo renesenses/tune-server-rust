@@ -61,11 +61,10 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
                 continue;
             }
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.contains(ext.to_lowercase().as_str()) {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && extensions.contains(ext.to_lowercase().as_str()) {
                     files.push(path.to_path_buf());
                 }
-            }
         }
     }
 
@@ -85,11 +84,10 @@ pub fn scan_files_parallel(
         .par_iter()
         .map(|path| {
             let idx = counter.fetch_add(1, Ordering::Relaxed);
-            if let Some(ref cb) = progress_callback {
-                if idx % 100 == 0 {
+            if let Some(ref cb) = progress_callback
+                && idx.is_multiple_of(100) {
                     cb(idx, total);
                 }
-            }
 
             let path_str = path.to_string_lossy().to_string();
 

@@ -178,8 +178,8 @@ mod tests {
     fn ffmpeg_detection() {
         // Should find ffmpeg on dev machines
         let result = find_ffmpeg();
-        if result.is_some() {
-            println!("Found FFmpeg: {}", result.unwrap());
+        if let Some(path) = result {
+            println!("Found FFmpeg: {}", path);
         }
     }
 }

@@ -59,7 +59,7 @@ async fn list_playlists(
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    let total = repo.count().unwrap_or(0);
+    let _total = repo.count().unwrap_or(0);
     Json(json!(items))
 }
 
@@ -238,12 +238,11 @@ async fn import_m3u_url(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Ok(Some(track)) = track_repo.get_by_path(line) {
-            if let Some(id) = track.id {
+        if let Ok(Some(track)) = track_repo.get_by_path(line)
+            && let Some(id) = track.id {
                 repo.add_tracks(playlist_id, &[id], None).ok();
                 matched += 1;
             }
-        }
     }
 
     (

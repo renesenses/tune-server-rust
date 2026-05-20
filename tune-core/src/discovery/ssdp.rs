@@ -31,7 +31,7 @@ const OPENHOME_SEARCH_TARGETS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub enum SsdpEvent {
-    DeviceDiscovered(DiscoveredDevice),
+    DeviceDiscovered(Box<DiscoveredDevice>),
     DeviceLost(String),
 }
 
@@ -39,8 +39,8 @@ pub enum SsdpEvent {
 struct SsdpResponse {
     location: String,
     usn: String,
-    server: Option<String>,
-    st: Option<String>,
+    _server: Option<String>,
+    _st: Option<String>,
 }
 
 pub struct SsdpScanner {
@@ -273,8 +273,8 @@ fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
     Some(SsdpResponse {
         location: location?,
         usn: usn.unwrap_or_default(),
-        server,
-        st,
+        _server: server,
+        _st: st,
     })
 }
 
@@ -375,7 +375,7 @@ async fn process_responses(
                 drop(st);
 
                 info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
-                let _ = event_tx.send(SsdpEvent::DeviceDiscovered(device)).await;
+                let _ = event_tx.send(SsdpEvent::DeviceDiscovered(Box::new(device))).await;
             }
             Err(e) => {
                 let mut st = state.lock().await;
@@ -408,7 +408,7 @@ async fn process_responses(
 
     // Unicast probe before declaring lost
     for dev_id in lost_ids {
-        let probe_ok = unicast_probe(&state, &dev_id).await;
+        let probe_ok = unicast_probe(state, &dev_id).await;
         if probe_ok {
             let mut st = state.lock().await;
             st.miss_count.remove(&dev_id);
@@ -477,7 +477,7 @@ mod tests {
         let resp = parse_ssdp_response(data).unwrap();
         assert_eq!(resp.location, "http://192.168.1.50:1400/xml/device_description.xml");
         assert!(resp.usn.contains("RINCON_12345"));
-        assert!(resp.server.unwrap().contains("Sonos"));
+        assert!(resp._server.unwrap().contains("Sonos"));
     }
 
     #[test]

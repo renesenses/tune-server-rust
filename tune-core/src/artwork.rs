@@ -70,13 +70,12 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
         return Some(hash);
     }
 
-    if let Some(folder_cover) = find_folder_cover(audio_path) {
-        if let Ok(data) = std::fs::read(&folder_cover) {
+    if let Some(folder_cover) = find_folder_cover(audio_path)
+        && let Ok(data) = std::fs::read(&folder_cover) {
             let ext = folder_cover.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
             save_to_cache(&data, cache_dir, &hash, ext);
             return Some(hash);
         }
-    }
 
     None
 }

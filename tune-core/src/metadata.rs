@@ -171,8 +171,8 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
     }
 
     for item in tag.items() {
-        if item.key() == &ItemKey::Performer {
-            if let Some(val) = item.value().text() {
+        if item.key() == &ItemKey::Performer
+            && let Some(val) = item.value().text() {
                 let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
                     (n.trim().to_string(), Some(i.trim_end_matches(')').trim().to_string()))
                 } else {
@@ -184,7 +184,6 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
                     instrument,
                 });
             }
-        }
     }
 
     credits

@@ -55,8 +55,8 @@ impl RustDatabase {
             SqliteDb::open_in_memory()
         } else {
             SqliteDb::open(path)
-        }.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        db.init_schema().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        }.map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        db.init_schema().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(Self { db })
     }
 
@@ -64,7 +64,7 @@ impl RustDatabase {
 
     fn artist_get<'py>(&self, py: Python<'py>, id: i64) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let repo = ArtistRepo::new(self.db.clone());
-        match repo.get(id).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))? {
+        match repo.get(id).map_err(pyo3::exceptions::PyRuntimeError::new_err)? {
             Some(a) => Ok(Some(artist_to_dict(py, &a)?)),
             None => Ok(None),
         }
@@ -72,7 +72,7 @@ impl RustDatabase {
 
     fn artist_get_by_name<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let repo = ArtistRepo::new(self.db.clone());
-        match repo.get_by_name(name).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))? {
+        match repo.get_by_name(name).map_err(pyo3::exceptions::PyRuntimeError::new_err)? {
             Some(a) => Ok(Some(artist_to_dict(py, &a)?)),
             None => Ok(None),
         }
@@ -81,19 +81,19 @@ impl RustDatabase {
     fn artist_get_or_create<'py>(&self, py: Python<'py>, name: &str, musicbrainz_id: Option<&str>, sort_name: Option<&str>) -> PyResult<pyo3::Bound<'py, PyDict>> {
         let repo = ArtistRepo::new(self.db.clone());
         let a = repo.get_or_create(name, musicbrainz_id, sort_name)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         artist_to_dict(py, &a)
     }
 
     fn artist_count(&self) -> PyResult<i64> {
         let repo = ArtistRepo::new(self.db.clone());
-        repo.count().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        repo.count().map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     fn artist_search<'py>(&self, py: Python<'py>, query: &str, limit: i64) -> PyResult<Vec<pyo3::PyObject>> {
         let repo = ArtistRepo::new(self.db.clone());
         let artists = repo.search(query, limit)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         artists.iter().map(|a| Ok(artist_to_dict(py, a)?.into())).collect()
     }
 
@@ -101,7 +101,7 @@ impl RustDatabase {
 
     fn track_get<'py>(&self, py: Python<'py>, id: i64) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let repo = TrackRepo::new(self.db.clone());
-        match repo.get(id).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))? {
+        match repo.get(id).map_err(pyo3::exceptions::PyRuntimeError::new_err)? {
             Some(t) => Ok(Some(track_to_dict(py, &t)?)),
             None => Ok(None),
         }
@@ -109,7 +109,7 @@ impl RustDatabase {
 
     fn track_get_by_path<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let repo = TrackRepo::new(self.db.clone());
-        match repo.get_by_path(path).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))? {
+        match repo.get_by_path(path).map_err(pyo3::exceptions::PyRuntimeError::new_err)? {
             Some(t) => Ok(Some(track_to_dict(py, &t)?)),
             None => Ok(None),
         }
@@ -117,20 +117,20 @@ impl RustDatabase {
 
     fn track_count(&self) -> PyResult<i64> {
         let repo = TrackRepo::new(self.db.clone());
-        repo.count().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        repo.count().map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     fn track_search<'py>(&self, py: Python<'py>, query: &str, limit: i64) -> PyResult<Vec<pyo3::PyObject>> {
         let repo = TrackRepo::new(self.db.clone());
         let tracks = repo.search(query, limit)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         tracks.iter().map(|t| Ok(track_to_dict(py, t)?.into())).collect()
     }
 
     fn track_get_all_paths(&self) -> PyResult<Vec<String>> {
         let repo = TrackRepo::new(self.db.clone());
         let paths = repo.get_all_paths()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(paths.into_iter().collect())
     }
 
@@ -138,12 +138,12 @@ impl RustDatabase {
 
     fn album_count(&self) -> PyResult<i64> {
         let repo = AlbumRepo::new(self.db.clone());
-        repo.count().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        repo.count().map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     fn album_delete_orphans(&self) -> PyResult<i64> {
         let repo = AlbumRepo::new(self.db.clone());
-        repo.delete_orphans().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        repo.delete_orphans().map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 }
 

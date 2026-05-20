@@ -294,7 +294,7 @@ mod tests {
         let artist_repo = ArtistRepo::new(db.clone());
         let repo = AlbumRepo::new(db);
 
-        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
+        let _aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
         repo.create(&Album::new("Orphan Album".into())).unwrap();
         let deleted = repo.delete_orphans().unwrap();
         assert_eq!(deleted, 1);

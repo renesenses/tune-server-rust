@@ -77,15 +77,13 @@ async fn service_status(
 
     let mut svc = svc.lock().await;
     let mut status = svc.auth_status().await;
-    if !status.authenticated {
-        if let Ok(poll_status) = svc.authenticate(&json!({})).await {
-            if poll_status.authenticated {
-                status = poll_status;
-                drop(svc);
-                state.save_tokens().await;
-            }
+    if !status.authenticated
+        && let Ok(poll_status) = svc.authenticate(&json!({})).await
+        && poll_status.authenticated {
+            status = poll_status;
+            drop(svc);
+            state.save_tokens().await;
         }
-    }
     Json(json!({
         "service": service,
         "enabled": true,
