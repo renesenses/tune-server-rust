@@ -208,10 +208,14 @@ async fn main() {
                                 info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
                             }
 
+                            let skip_keywords = ["tv", "décodeur", "decoder", "kdl-", "bravia", "samsung", "lg ", "philips tv", "chromecast"];
+                            let name_lower = dev.name.to_lowercase();
+                            let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
+
                             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
                             let existing = zone_repo.list().unwrap_or_default();
                             let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
-                            if !already {
+                            if !already && !is_tv {
                                 let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
                                 let name_taken = existing.iter().any(|z| z.name == short_name);
                                 let zone_name = if name_taken { dev.name.clone() } else { short_name.to_string() };

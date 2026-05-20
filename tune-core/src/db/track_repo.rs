@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 
-const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
+const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
 
 pub struct TrackRepo {
     db: SqliteDb,
@@ -250,6 +250,7 @@ fn row_to_track(row: &rusqlite::Row) -> Track {
         bpm: row.get(24).ok(),
         label: row.get(25).ok(),
         musicbrainz_recording_id: row.get(26).ok(),
+        cover_path: row.get(27).ok(),
     }
 }
 

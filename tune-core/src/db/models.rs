@@ -138,6 +138,7 @@ pub struct Track {
     pub bpm: Option<f64>,
     pub label: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
+    pub cover_path: Option<String>,
 }
 
 impl Track {
@@ -170,6 +171,7 @@ impl Track {
             bpm: None,
             label: None,
             musicbrainz_recording_id: None,
+            cover_path: None,
         }
     }
 }
