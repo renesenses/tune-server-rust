@@ -40,15 +40,34 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/name", put(rename_zone))
         .route("/groups", get(list_groups).post(create_group))
+        .route("/groups/list", get(list_groups))
         .route("/groups/{group_id}", axum::routing::delete(delete_group))
         .route("/stereo-pairs", get(list_stereo_pairs).post(create_stereo_pair))
         .route("/stereo-pairs/{pair_id}", axum::routing::delete(delete_stereo_pair))
 }
 
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::new(state.db.clone());
     let zones = repo.list().unwrap_or_default();
-    Json(json!({ "items": zones, "total": zones.len() }))
+    let mut result = Vec::new();
+    for z in &zones {
+        let zone_id = z.id.unwrap_or(0);
+        let ps = state.playback.get_state(zone_id).await;
+        let mut v = serde_json::to_value(z).unwrap_or_default();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("state".into(), json!(match ps.state {
+                tune_core::playback::PlayState::Playing => "playing",
+                tune_core::playback::PlayState::Paused => "paused",
+                tune_core::playback::PlayState::Stopped => "stopped",
+            }));
+            obj.insert("current_track".into(), json!(ps.now_playing));
+            obj.insert("position_ms".into(), json!(ps.position_ms));
+            obj.insert("queue_length".into(), json!(ps.queue_length));
+            obj.insert("volume".into(), json!(z.volume as f64 / 100.0));
+        }
+        result.push(v);
+    }
+    Json(json!(result))
 }
 
 async fn get_zone(
@@ -135,7 +154,7 @@ async fn list_groups(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    Json(json!({ "items": groups, "total": groups.len() }))
+    Json(json!(groups))
 }
 
 async fn create_group(
@@ -186,7 +205,7 @@ async fn list_stereo_pairs(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    Json(json!({ "items": pairs, "total": pairs.len() }))
+    Json(json!(pairs))
 }
 
 #[derive(Deserialize)]

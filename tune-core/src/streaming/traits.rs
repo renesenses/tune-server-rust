@@ -111,4 +111,8 @@ pub trait StreamingService: Send + Sync {
     fn restore_tokens(&mut self, _tokens: &serde_json::Value) -> bool {
         false
     }
+
+    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
 }

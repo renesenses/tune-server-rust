@@ -4,8 +4,10 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
+use crate::db::play_queue_repo::PlayQueueRepo;
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
+use crate::db::zone_repo::ZoneRepo;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
 use crate::playback::{NowPlaying, PlaybackManager};
@@ -254,5 +256,74 @@ impl PlaybackOrchestrator {
                 output.lock().await.set_volume(volume).await.ok();
             }
         }
+    }
+
+    pub async fn play_from_queue(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<PlayResult, String> {
+        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        queue_repo.set_current(zone_id, position)?;
+
+        let queue = queue_repo.get_queue(zone_id)?;
+        let item = queue
+            .iter()
+            .find(|i| i.is_current)
+            .ok_or("no queue item at position")?;
+
+        let output_device_id = ZoneRepo::new(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+
+        let req = PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: Some(item.track_id),
+            source: None,
+            source_id: None,
+            title: item.title.clone(),
+            artist_name: item.artist_name.clone(),
+            album_title: item.album_title.clone(),
+            cover_url: item.cover_path.clone(),
+            duration_ms: item.duration_ms,
+        };
+
+        let result = self.play(req).await?;
+        self.playback
+            .update_queue_info(zone_id, position, queue.len() as i64)
+            .await;
+        Ok(result)
+    }
+
+    pub async fn resolve_queue_item_url(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<(String, String, String, Option<String>), String> {
+        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        let queue = queue_repo.get_queue(zone_id)?;
+        let item = queue
+            .iter()
+            .find(|i| i.position == position)
+            .ok_or("no queue item at position")?;
+
+        let req = PlayRequest {
+            zone_id,
+            output_device_id: None,
+            track_id: Some(item.track_id),
+            source: None,
+            source_id: None,
+            title: item.title.clone(),
+            artist_name: item.artist_name.clone(),
+            album_title: item.album_title.clone(),
+            cover_url: item.cover_path.clone(),
+            duration_ms: item.duration_ms,
+        };
+
+        let (url, mime, title, artist, _, _) = self.resolve_stream(&req).await?;
+        Ok((url, mime, title, artist))
     }
 }

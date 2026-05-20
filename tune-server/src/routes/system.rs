@@ -39,6 +39,10 @@ pub fn router() -> Router<AppState> {
         .route("/backups/{filename}/restore", post(restore_backup))
         .route("/database/export", get(export_database))
         .route("/update/check", get(update_check))
+        .route("/changelog", get(changelog))
+        .route("/peers", get(system_peers))
+        .route("/scan/schedule", get(scan_schedule).post(set_scan_schedule))
+        .route("/diagnostics/bundle", get(diagnostics_bundle))
 }
 
 async fn version() -> Json<Value> {
@@ -49,7 +53,15 @@ async fn version() -> Json<Value> {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({
+        "status": "ok",
+        "components": {
+            "database": true,
+            "scanner": true,
+            "streamer": true,
+            "discovery": true
+        }
+    }))
 }
 
 async fn stats(State(state): State<AppState>) -> Json<Value> {
@@ -67,7 +79,7 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::new(state.db.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
@@ -76,6 +88,28 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
         } else {
             config.insert(k, Value::String(v));
         }
+    }
+    let defaults: Vec<(&str, Value)> = vec![
+        ("api_port", json!(state.port)),
+        ("stream_port", json!(state.port)),
+        ("tidal_enabled", json!(true)),
+        ("qobuz_enabled", json!(true)),
+        ("youtube_enabled", json!(true)),
+        ("spotify_enabled", json!(false)),
+        ("deezer_enabled", json!(true)),
+        ("amazon_music_enabled", json!(false)),
+        ("discovery_enabled", json!(true)),
+        ("squeezebox_enabled", json!(false)),
+        ("db_engine", json!("sqlite")),
+        ("db_connected", json!(true)),
+        ("metadata_readonly", json!(false)),
+        ("enrich_on_scan", json!(false)),
+        ("resample_policy", json!("none")),
+        ("audio_buffer_kb", json!(256)),
+        ("prebuffer_seconds", json!(1.0)),
+    ];
+    for (k, v) in defaults {
+        config.entry(k.to_string()).or_insert(v);
     }
     Json(Value::Object(config))
 }
@@ -121,8 +155,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
         let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
 
+        let cache_dir = super::library::artwork_cache_dir();
+        let mut albums_with_cover: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut inserted = 0i64;
         let mut updated = 0i64;
+        let mut artwork_extracted = 0i64;
 
         for sf in &scanned {
             if let Some(ref meta) = sf.metadata {
@@ -145,6 +182,19 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 };
 
                 let album_id = album.as_ref().and_then(|a| a.id);
+
+                if let Some(aid) = album_id {
+                    if meta.has_cover && !albums_with_cover.contains(&aid) {
+                        if let Some(hash) = tune_core::artwork::get_or_extract(
+                            std::path::Path::new(&sf.path),
+                            &cache_dir,
+                        ) {
+                            album_repo.update_cover_path(aid, &hash).ok();
+                            albums_with_cover.insert(aid);
+                            artwork_extracted += 1;
+                        }
+                    }
+                }
 
                 let existing = track_repo.get_by_path(&sf.path).ok().flatten();
                 if existing.is_some() {
@@ -194,6 +244,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         for album in album_repo.list(99999, 0).unwrap_or_default() {
             if let Some(id) = album.id {
                 album_repo.update_track_count(id).ok();
+                album_repo.update_quality_from_tracks(id).ok();
             }
         }
 
@@ -208,6 +259,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     "metadata_failed": scan_stats.metadata_failed,
                     "inserted": inserted,
                     "updated": updated,
+                    "artwork_extracted": artwork_extracted,
                 })
                 .to_string(),
             )
@@ -220,6 +272,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let scanning = status == "scanning";
     let result = settings
         .get("scan_result")
         .ok()
@@ -228,6 +281,7 @@ async fn scan_status(State(state): State<AppState>) -> Json<Value> {
 
     Json(json!({
         "status": status,
+        "scanning": scanning,
         "result": result,
     }))
 }
@@ -426,7 +480,7 @@ async fn list_backups() -> Json<Value> {
             .cmp(&a.get("created_at").and_then(|v| v.as_u64()))
     });
 
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
@@ -514,6 +568,43 @@ async fn update_check() -> Json<Value> {
         "engine": "rust",
         "message": "auto-update not yet implemented",
     }))
+}
+
+async fn system_peers() -> Json<Value> {
+    Json(json!([]))
+}
+
+async fn changelog() -> Json<Value> {
+    Json(json!({ "entries": [], "version": tune_core::version() }))
+}
+
+async fn scan_schedule(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let time = settings.get("scan_schedule_time").ok().flatten().unwrap_or_else(|| "03:00".into());
+    let enabled = settings.get("scan_schedule_enabled").ok().flatten().map(|v| v == "true").unwrap_or(false);
+    Json(json!({ "enabled": enabled, "time": time }))
+}
+
+#[derive(Deserialize)]
+struct ScanScheduleReq {
+    enabled: bool,
+    time: Option<String>,
+}
+
+async fn set_scan_schedule(
+    State(state): State<AppState>,
+    Json(body): Json<ScanScheduleReq>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set("scan_schedule_enabled", if body.enabled { "true" } else { "false" }).ok();
+    if let Some(ref t) = body.time {
+        settings.set("scan_schedule_time", t).ok();
+    }
+    Json(json!({ "enabled": body.enabled, "time": body.time }))
+}
+
+async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {
+    diagnostics(State(state)).await
 }
 
 fn backup_dir_path() -> String {

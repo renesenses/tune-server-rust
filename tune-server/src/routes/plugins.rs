@@ -23,7 +23,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    Json(json!({ "items": plugins, "total": plugins.len() }))
+    Json(json!(plugins))
 }
 
 async fn get_plugin(Path(name): Path<String>) -> Json<Value> {

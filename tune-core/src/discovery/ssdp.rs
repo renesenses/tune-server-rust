@@ -359,12 +359,12 @@ async fn process_responses(
                 device.model = if desc.model_name.is_empty() { None } else { Some(desc.model_name.clone()) };
                 device.location = Some(resp.location.clone());
 
+                device.capabilities.insert(
+                    "service_urls".into(),
+                    serde_json::to_value(desc.service_urls()).unwrap_or_default(),
+                );
                 if desc.is_openhome() {
                     device.capabilities.insert("openhome".into(), serde_json::Value::Bool(true));
-                    device.capabilities.insert(
-                        "service_urls".into(),
-                        serde_json::to_value(desc.service_urls()).unwrap_or_default(),
-                    );
                 }
 
                 let mut st = state.lock().await;

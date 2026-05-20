@@ -57,6 +57,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/top-rated", get(top_rated_albums))
         .route("/albums/{id}/rate", post(rate_album))
         .route("/albums/{id}/rating", get(get_album_rating))
+        .route("/browse", get(browse_roots))
         .route("/search", get(search))
         .route("/stats", get(library_stats))
         .route("/artwork/{hash}", get(serve_artwork))
@@ -72,7 +73,7 @@ async fn list_artists(
     let offset = p.offset.unwrap_or(0);
     let total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset }))
+    Json(json!(items))
 }
 
 async fn get_artist(
@@ -93,7 +94,8 @@ async fn artist_albums(
 ) -> Json<Value> {
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    Json(json!(items))
 }
 
 async fn artist_tracks(
@@ -102,7 +104,7 @@ async fn artist_tracks(
 ) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn list_albums(
@@ -112,9 +114,9 @@ async fn list_albums(
     let repo = AlbumRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset }))
+    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    Json(json!(items))
 }
 
 async fn album_count(State(state): State<AppState>) -> Json<Value> {
@@ -147,27 +149,10 @@ async fn recent_albums(
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
-    let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare("SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.format, a.sample_rate, a.bit_depth FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id ORDER BY a.id DESC LIMIT ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "year": row.get::<_, Option<i32>>(3).ok().flatten(),
-                    "cover_path": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "format": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "sample_rate": row.get::<_, Option<i32>>(6).ok().flatten(),
-                    "bit_depth": row.get::<_, Option<i32>>(7).ok().flatten(),
-                }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-    drop(conn);
-    Json(json!({ "items": items, "total": items.len() }))
+    let repo = AlbumRepo::new(state.db);
+    let items = repo.list_recent(limit).unwrap_or_default();
+    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    Json(json!(items))
 }
 
 async fn get_album(
@@ -176,7 +161,7 @@ async fn get_album(
 ) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db);
     match repo.get(id) {
-        Ok(Some(album)) => Json(json!(album)).into_response(),
+        Ok(Some(album)) => Json(album.to_json()).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -188,7 +173,7 @@ async fn album_tracks(
 ) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_album(id).unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn list_tracks(
@@ -200,7 +185,7 @@ async fn list_tracks(
     let offset = p.offset.unwrap_or(0);
     let total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset }))
+    Json(json!(items))
 }
 
 async fn track_count(State(state): State<AppState>) -> Json<Value> {
@@ -314,6 +299,7 @@ async fn search(
     let albums = AlbumRepo::new(state.db.clone())
         .search(&q.q, limit)
         .unwrap_or_default();
+    let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     let tracks = TrackRepo::new(state.db)
         .search(&q.q, limit)
         .unwrap_or_default();
@@ -418,7 +404,7 @@ async fn top_rated_albums(
         })
         .collect();
 
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
@@ -502,7 +488,22 @@ async fn album_artwork(
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn artwork_cache_dir() -> std::path::PathBuf {
+async fn browse_roots(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let dirs: Vec<String> = settings
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let roots: Vec<Value> = dirs
+        .iter()
+        .map(|d| json!({ "path": d, "name": d, "track_count": 0 }))
+        .collect();
+    Json(json!({ "roots": roots }))
+}
+
+pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     let dir = std::env::var("TUNE_ARTWORK_DIR")
         .unwrap_or_else(|_| "artwork_cache".into());
     std::path::PathBuf::from(dir)

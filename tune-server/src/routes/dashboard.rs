@@ -46,7 +46,7 @@ async fn top_artists(
         .into_iter()
         .map(|(name, plays)| json!({ "name": name, "plays": plays }))
         .collect();
-    Json(json!({ "items": items }))
+    Json(json!(items))
 }
 
 async fn top_tracks(
@@ -61,7 +61,7 @@ async fn top_tracks(
         .into_iter()
         .map(|(title, artist, plays)| json!({ "title": title, "artist_name": artist, "plays": plays }))
         .collect();
-    Json(json!({ "items": items }))
+    Json(json!(items))
 }
 
 async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
@@ -79,5 +79,5 @@ async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!({ "items": items }))
+    Json(json!(items))
 }

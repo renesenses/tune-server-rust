@@ -55,7 +55,7 @@ async fn list_subscriptions(State(state): State<AppState>) -> Json<Value> {
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn subscribe(

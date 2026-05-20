@@ -100,10 +100,32 @@ impl AlbumRepo {
         Ok(())
     }
 
+    pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE albums SET cover_path = ? WHERE id = ? AND (cover_path IS NULL OR cover_path = '')",
+            &[&cover_path as &dyn rusqlite::types::ToSql, &album_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_track_count(&self, album_id: i64) -> Result<(), String> {
         self.db.execute(
             "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?) WHERE id = ?",
             &[&album_id, &album_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE albums SET
+                format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = ? AND t.format IS NOT NULL LIMIT 1)),
+                sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = ?)),
+                bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = ?)),
+                genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = ? AND t.genre IS NOT NULL LIMIT 1)),
+                disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = ?))
+            WHERE id = ?",
+            &[&album_id, &album_id, &album_id, &album_id, &album_id, &album_id],
         )?;
         Ok(())
     }
@@ -135,6 +157,19 @@ impl AlbumRepo {
         let conn = self.db.connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
             .map_err(|e| e.to_string())
+    }
+
+    pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_ALBUM} ORDER BY a.id DESC LIMIT ?"))
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![limit], |row| Ok(row_to_album(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, String> {

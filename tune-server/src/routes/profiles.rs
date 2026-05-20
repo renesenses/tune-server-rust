@@ -12,14 +12,18 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 struct CreateProfile {
-    username: String,
-    display_name: Option<String>,
+    #[serde(alias = "username")]
+    name: String,
+    #[serde(alias = "display_name")]
+    avatar_color: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UpdateProfile {
-    display_name: Option<String>,
-    avatar_path: Option<String>,
+    #[serde(alias = "display_name")]
+    name: Option<String>,
+    #[serde(alias = "avatar_path")]
+    avatar_color: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -45,7 +49,7 @@ pub fn router() -> Router<AppState> {
 async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let repo = ProfileRepo::new(state.db);
     let items = repo.list().unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn get_profile(
@@ -65,7 +69,7 @@ async fn create_profile(
     Json(body): Json<CreateProfile>,
 ) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
-    match repo.create(&body.username, body.display_name.as_deref()) {
+    match repo.create(&body.name, body.avatar_color.as_deref()) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -77,7 +81,7 @@ async fn update_profile(
     Json(body): Json<UpdateProfile>,
 ) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
-    match repo.update(id, body.display_name.as_deref(), body.avatar_path.as_deref()) {
+    match repo.update(id, body.name.as_deref(), body.avatar_color.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -103,7 +107,7 @@ async fn list_favorites(
     let items = repo
         .list_favorites(id, q.item_type.as_deref())
         .unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn add_favorite(

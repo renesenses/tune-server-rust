@@ -45,7 +45,7 @@ async fn list_mounts(State(state): State<AppState>) -> Json<Value> {
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn create_mount(

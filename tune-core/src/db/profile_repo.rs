@@ -6,8 +6,11 @@ use super::sqlite::SqliteDb;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub id: Option<i64>,
-    pub username: String,
+    #[serde(alias = "username")]
+    pub name: String,
+    #[serde(alias = "display_name")]
     pub display_name: Option<String>,
+    #[serde(alias = "avatar_path", rename = "avatar_color")]
     pub avatar_path: Option<String>,
     pub is_admin: bool,
     pub created_at: Option<String>,
@@ -142,7 +145,7 @@ impl ProfileRepo {
 fn row_to_profile(row: &rusqlite::Row) -> Profile {
     Profile {
         id: row.get(0).ok(),
-        username: row.get(1).unwrap_or_default(),
+        name: row.get(1).unwrap_or_default(),
         display_name: row.get(2).ok().flatten(),
         avatar_path: row.get(3).ok().flatten(),
         is_admin: row.get::<_, i32>(4).unwrap_or(0) != 0,
@@ -165,7 +168,7 @@ mod tests {
 
         let profiles = repo.list().unwrap();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].username, "default");
+        assert_eq!(profiles[0].name, "default");
 
         let id = repo.create("bertrand", Some("Bertrand")).unwrap();
         assert!(id > 1);

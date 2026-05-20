@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::playback::NowPlaying;
 
 use crate::state::AppState;
 
@@ -102,7 +101,7 @@ async fn now_listening(State(state): State<AppState>) -> Json<Value> {
         .filter(|s| s.state == tune_core::playback::PlayState::Playing)
         .map(|s| json!(s))
         .collect();
-    Json(json!({ "zones": playing }))
+    Json(json!(playing))
 }
 
 async fn zone_status(
@@ -222,35 +221,18 @@ async fn next(
     let next_pos = current.queue_position + 1;
 
     if next_pos >= current.queue_length {
-        state.playback.stop(zone_id).await;
+        let device_id = get_zone_device_id(&state, zone_id);
+        state.orchestrator.stop(zone_id, device_id.as_deref()).await;
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
     }
 
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
-    queue_repo.set_current(zone_id, next_pos).ok();
-
-    let queue = queue_repo.get_queue(zone_id).unwrap_or_default();
-    if let Some(item) = queue.iter().find(|i| i.is_current) {
-        let np = NowPlaying {
-            track_id: Some(item.track_id),
-            title: item.title.clone().unwrap_or_default(),
-            artist_name: item.artist_name.clone(),
-            album_title: item.album_title.clone(),
-            cover_path: item.cover_path.clone(),
-            duration_ms: item.duration_ms.unwrap_or(0),
-            source: "local".into(),
-            source_id: None,
-            stream_id: None,
-        };
-        state.playback.play(zone_id, np).await;
-        state
-            .playback
-            .update_queue_info(zone_id, next_pos, current.queue_length)
-            .await;
+    match state.orchestrator.play_from_queue(zone_id, next_pos).await {
+        Ok(_) => {
+            let zone_state = state.playback.get_state(zone_id).await;
+            Json(json!(zone_state)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-
-    let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!(zone_state)).into_response()
 }
 
 async fn previous(
@@ -260,36 +242,20 @@ async fn previous(
     let current = state.playback.get_state(zone_id).await;
 
     if current.position_ms > 3000 {
-        state.playback.seek(zone_id, 0).await;
+        let device_id = get_zone_device_id(&state, zone_id);
+        state.orchestrator.seek(zone_id, 0, device_id.as_deref()).await;
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
     let prev_pos = (current.queue_position - 1).max(0);
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
-    queue_repo.set_current(zone_id, prev_pos).ok();
 
-    let queue = queue_repo.get_queue(zone_id).unwrap_or_default();
-    if let Some(item) = queue.iter().find(|i| i.is_current) {
-        let np = NowPlaying {
-            track_id: Some(item.track_id),
-            title: item.title.clone().unwrap_or_default(),
-            artist_name: item.artist_name.clone(),
-            album_title: item.album_title.clone(),
-            cover_path: item.cover_path.clone(),
-            duration_ms: item.duration_ms.unwrap_or(0),
-            source: "local".into(),
-            source_id: None,
-            stream_id: None,
-        };
-        state.playback.play(zone_id, np).await;
-        state
-            .playback
-            .update_queue_info(zone_id, prev_pos, current.queue_length)
-            .await;
+    match state.orchestrator.play_from_queue(zone_id, prev_pos).await {
+        Ok(_) => {
+            let zone_state = state.playback.get_state(zone_id).await;
+            Json(json!(zone_state)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-
-    let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!(zone_state)).into_response()
 }
 
 async fn seek(
@@ -343,8 +309,9 @@ async fn get_queue(
 ) -> Json<Value> {
     let queue_repo = PlayQueueRepo::new(state.db);
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let current = items.iter().find(|i| i.is_current).cloned();
-    Json(json!({ "items": items, "current": current, "total": items.len() }))
+    let position = items.iter().position(|i| i.is_current).unwrap_or(0);
+    let length = items.len();
+    Json(json!({ "tracks": items, "position": position, "length": length }))
 }
 
 async fn queue_add(
@@ -389,31 +356,13 @@ async fn queue_jump(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
-    queue_repo.set_current(zone_id, body.position).ok();
-
-    let queue = queue_repo.get_queue(zone_id).unwrap_or_default();
-    if let Some(item) = queue.iter().find(|i| i.is_current) {
-        let np = NowPlaying {
-            track_id: Some(item.track_id),
-            title: item.title.clone().unwrap_or_default(),
-            artist_name: item.artist_name.clone(),
-            album_title: item.album_title.clone(),
-            cover_path: item.cover_path.clone(),
-            duration_ms: item.duration_ms.unwrap_or(0),
-            source: "local".into(),
-            source_id: None,
-            stream_id: None,
-        };
-        state.playback.play(zone_id, np).await;
-        state
-            .playback
-            .update_queue_info(zone_id, body.position, queue.len() as i64)
-            .await;
+    match state.orchestrator.play_from_queue(zone_id, body.position).await {
+        Ok(_) => {
+            let zone_state = state.playback.get_state(zone_id).await;
+            Json(json!(zone_state)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
-
-    let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!(zone_state)).into_response()
 }
 
 async fn queue_clear(
@@ -591,7 +540,7 @@ async fn get_alarms(
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 #[derive(Deserialize)]

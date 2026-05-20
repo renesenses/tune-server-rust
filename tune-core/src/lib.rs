@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod orchestrator;
 pub mod outputs;
 pub mod playback;
+pub mod poller;
 pub mod scanner;
 pub mod streaming;
 

@@ -4,6 +4,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use tune_core::db::sqlite::SqliteDb;
+use tune_core::discovery::ssdp::SsdpScanner;
 use tune_core::http::streamer::AudioStreamer;
 use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
@@ -18,6 +19,7 @@ pub struct AppState {
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
+    pub scanner: Arc<Mutex<SsdpScanner>>,
     pub port: u16,
     pub started_at: Instant,
 }
@@ -52,6 +54,9 @@ impl AppState {
             outputs: outputs.clone(),
         });
 
+        let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
+        let scanner = Arc::new(Mutex::new(SsdpScanner::new(ssdp_tx)));
+
         Ok(Self {
             db,
             streamer,
@@ -59,6 +64,7 @@ impl AppState {
             services,
             outputs,
             orchestrator,
+            scanner,
             port,
             started_at: Instant::now(),
         })

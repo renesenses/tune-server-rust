@@ -17,6 +17,7 @@ struct SearchQuery {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/services", get(list_services))
+        .route("/status", get(list_services))
         .route("/{service}/status", get(service_status))
         .route("/{service}/auth", post(service_auth))
         .route("/{service}/auth/status", get(auth_poll_status))
@@ -38,7 +39,13 @@ pub fn router() -> Router<AppState> {
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
     let registry = state.services.lock().await;
     let services = registry.status_all().await;
-    Json(json!({ "services": services }))
+    let mut map = serde_json::Map::new();
+    for svc in services {
+        if let Some(name) = svc.get("name").and_then(|n| n.as_str()) {
+            map.insert(name.to_string(), svc);
+        }
+    }
+    Json(Value::Object(map))
 }
 
 async fn service_status(
@@ -157,7 +164,7 @@ async fn service_albums(
     let svc = svc.lock().await;
 
     match svc.get_user_albums().await {
-        Ok(albums) => Json(json!({ "items": albums, "total": albums.len() })).into_response(),
+        Ok(albums) => Json(json!(albums)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -189,7 +196,7 @@ async fn service_album_tracks(
     let svc = svc.lock().await;
 
     match svc.get_album_tracks(&album_id).await {
-        Ok(tracks) => Json(json!({ "items": tracks, "total": tracks.len() })).into_response(),
+        Ok(tracks) => Json(json!(tracks)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -221,7 +228,7 @@ async fn service_playlists(
     let svc = svc.lock().await;
 
     match svc.get_user_playlists().await {
-        Ok(playlists) => Json(json!({ "items": playlists, "total": playlists.len() })).into_response(),
+        Ok(playlists) => Json(json!(playlists)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -253,7 +260,7 @@ async fn service_playlist_tracks(
     let svc = svc.lock().await;
 
     match svc.get_playlist_tracks(&playlist_id).await {
-        Ok(tracks) => Json(json!({ "items": tracks, "total": tracks.len() })).into_response(),
+        Ok(tracks) => Json(json!(tracks)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -301,7 +308,7 @@ async fn service_featured(
     let svc = svc.lock().await;
 
     match svc.get_featured().await {
-        Ok(items) => Json(json!({ "items": items, "total": items.len() })).into_response(),
+        Ok(items) => Json(json!(items)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -317,7 +324,7 @@ async fn service_new_releases(
     let svc = svc.lock().await;
 
     match svc.get_new_releases().await {
-        Ok(items) => Json(json!({ "items": items, "total": items.len() })).into_response(),
+        Ok(items) => Json(json!(items)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }

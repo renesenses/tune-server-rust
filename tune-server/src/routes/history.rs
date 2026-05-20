@@ -28,7 +28,7 @@ async fn recent_history(
     let limit = p.limit.unwrap_or(50);
     let repo = HistoryRepo::new(state.db);
     let items = repo.recent(limit).unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn top_tracks(
@@ -45,7 +45,7 @@ async fn top_tracks(
             json!({ "title": title, "artist_name": artist, "plays": plays })
         })
         .collect();
-    Json(json!({ "items": items }))
+    Json(json!(items))
 }
 
 async fn top_artists(
@@ -60,7 +60,7 @@ async fn top_artists(
         .into_iter()
         .map(|(name, plays)| json!({ "name": name, "plays": plays }))
         .collect();
-    Json(json!({ "items": items }))
+    Json(json!(items))
 }
 
 async fn dashboard(State(state): State<AppState>) -> Json<Value> {

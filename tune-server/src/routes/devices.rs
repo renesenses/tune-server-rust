@@ -15,26 +15,40 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
+        .route("/list", get(list_devices))
         .route("/scan", post(scan_devices))
         .route("/audio", get(list_audio_devices))
         .route("/{device_id}/status", get(device_status))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
+    let scanner = state.scanner.lock().await;
+    let discovered = scanner.devices().await;
+    drop(scanner);
+
     let outputs = state.outputs.lock().await;
-    let items = outputs.status_all().await;
-    Json(json!({ "items": items, "total": items.len() }))
+    let registered_ids: std::collections::HashSet<String> = outputs.list().into_iter().collect();
+
+    let items: Vec<Value> = discovered
+        .iter()
+        .map(|d| {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("available".into(), json!(true));
+                obj.insert("registered".into(), json!(registered_ids.contains(&d.id)));
+                obj.insert("type".into(), json!(d.device_type.to_string()));
+            }
+            v
+        })
+        .collect();
+
+    Json(json!(items))
 }
 
 async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
-    let (ssdp_tx, _ssdp_rx) = tokio::sync::mpsc::channel(64);
-    let mut ssdp = SsdpScanner::new(ssdp_tx);
-    ssdp.start().await;
-
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-    let devices = ssdp.devices().await;
-    ssdp.stop().await;
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.rescan().await;
+    drop(scanner);
 
     let deduped = dedup_devices(devices);
 
@@ -93,10 +107,10 @@ async fn list_audio_devices() -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
         let devices = tune_core::outputs::local::list_audio_devices();
-        return Json(json!({ "items": devices, "total": devices.len() }));
+        return Json(json!(devices));
     }
     #[cfg(not(feature = "local-audio"))]
-    Json(json!({ "items": [], "total": 0, "message": "local-audio feature not enabled" }))
+    Json(json!([]))
 }
 
 async fn device_status(

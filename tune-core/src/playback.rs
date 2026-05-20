@@ -213,6 +213,14 @@ impl PlaybackManager {
         }
     }
 
+    pub fn emit_position(&self, zone_id: i64, position_ms: i64) {
+        self.emit(PlaybackEvent {
+            event: "position".into(),
+            zone_id,
+            data: serde_json::json!({ "position_ms": position_ms }),
+        });
+    }
+
     fn emit(&self, event: PlaybackEvent) {
         let _ = self.event_tx.send(event);
     }

@@ -212,6 +212,21 @@ impl OutputTarget for DlnaOutput {
             .await
             .is_ok()
     }
+
+    async fn set_next_url(
+        &self,
+        url: &str,
+        mime_type: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> Result<(), String> {
+        let metadata = Self::didl_metadata(title, artist, mime_type, url);
+        self.av_action("SetNextAVTransportURI", &format!(
+            "<InstanceID>0</InstanceID><NextURI>{url}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>"
+        )).await?;
+        info!(device = %self.name, url, "dlna_set_next");
+        Ok(())
+    }
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {

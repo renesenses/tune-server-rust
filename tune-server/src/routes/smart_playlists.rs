@@ -55,7 +55,7 @@ async fn list_smart_playlists(State(state): State<AppState>) -> Json<Value> {
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn create_smart_playlist(
@@ -249,5 +249,5 @@ async fn resolve_tracks(
         .unwrap_or_default();
     drop(conn);
 
-    Json(json!({ "items": items, "total": items.len() })).into_response()
+    Json(json!(items)).into_response()
 }

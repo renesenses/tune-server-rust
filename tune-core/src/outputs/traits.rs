@@ -51,4 +51,14 @@ pub trait OutputTarget: Send + Sync {
     async fn set_mute(&self, muted: bool) -> Result<(), String>;
     async fn get_status(&self) -> Result<OutputStatus, String>;
     async fn is_available(&self) -> bool;
+
+    async fn set_next_url(
+        &self,
+        _url: &str,
+        _mime_type: &str,
+        _title: Option<&str>,
+        _artist: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }

@@ -60,7 +60,7 @@ async fn list_playlists(
     let offset = p.offset.unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
     let total = repo.count().unwrap_or(0);
-    Json(json!({ "items": items, "total": total, "limit": limit, "offset": offset }))
+    Json(json!(items))
 }
 
 async fn get_playlist(
@@ -116,7 +116,7 @@ async fn get_tracks(
     let repo = PlaylistRepo::new(state.db.clone());
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
     let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
-    Json(json!({ "items": tracks, "total": tracks.len() }))
+    Json(json!(tracks))
 }
 
 async fn add_tracks(

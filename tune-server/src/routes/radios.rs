@@ -40,7 +40,7 @@ pub fn router() -> Router<AppState> {
 async fn list_radios(State(state): State<AppState>) -> Json<Value> {
     let repo = RadioRepo::new(state.db);
     let items = repo.list().unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn get_radio(
@@ -98,13 +98,13 @@ async fn search_radios(
 ) -> Json<Value> {
     let repo = RadioRepo::new(state.db);
     let items = repo.search(&q.q).unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn list_favorites(State(state): State<AppState>) -> Json<Value> {
     let repo = RadioRepo::new(state.db);
     let items = repo.favorites().unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 #[derive(Deserialize)]

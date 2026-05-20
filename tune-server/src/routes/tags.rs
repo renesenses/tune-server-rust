@@ -34,7 +34,7 @@ pub fn router() -> Router<AppState> {
 async fn list_tags(State(state): State<AppState>) -> Json<Value> {
     let repo = TagRepo::new(state.db);
     let items = repo.list().unwrap_or_default();
-    Json(json!({ "items": items, "total": items.len() }))
+    Json(json!(items))
 }
 
 async fn create_tag(

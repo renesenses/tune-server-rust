@@ -20,6 +20,8 @@ pub mod tags;
 pub mod ws;
 pub mod zones;
 
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -27,31 +29,43 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn api_fallback(uri: axum::http::Uri) -> impl IntoResponse {
+    tracing::debug!(path = %uri, "api_not_found");
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!([])),
+    )
+}
+
 pub fn router(state: AppState) -> Router {
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
 
+    let api = Router::new()
+        .nest("/system", system::router())
+        .nest("/library", library::router())
+        .nest("/library/history", history::router())
+        .nest("/zones", zones::router().merge(playback::router()))
+        .nest("/playlists", playlists::router())
+        .nest("/radios", radios::router())
+        .nest("/search", search::router())
+        .nest("/devices", devices::router())
+        .nest("/streaming", streaming::router())
+        .nest("/profiles", profiles::router())
+        .nest("/tags", tags::router())
+        .nest("/metadata", metadata::router())
+        .nest("/smart-collections", smart_playlists::router())
+        .nest("/export", export::router())
+        .nest("/network", network::router())
+        .nest("/dashboard", dashboard::router())
+        .nest("/peers", peers::router())
+        .nest("/podcasts", podcasts::router())
+        .nest("/plugins", plugins::router())
+        .fallback(api_fallback);
+
     Router::new()
-        .nest("/api/v1/system", system::router())
-        .nest("/api/v1/library", library::router())
-        .nest("/api/v1/library/history", history::router())
-        .nest("/api/v1/zones", zones::router().merge(playback::router()))
-        .nest("/api/v1/playlists", playlists::router())
-        .nest("/api/v1/radios", radios::router())
-        .nest("/api/v1/search", search::router())
-        .nest("/api/v1/devices", devices::router())
-        .nest("/api/v1/streaming", streaming::router())
-        .nest("/api/v1/profiles", profiles::router())
-        .nest("/api/v1/tags", tags::router())
-        .nest("/api/v1/metadata", metadata::router())
-        .nest("/api/v1/smart-collections", smart_playlists::router())
-        .nest("/api/v1/export", export::router())
-        .nest("/api/v1/network", network::router())
-        .nest("/api/v1/dashboard", dashboard::router())
-        .nest("/api/v1/peers", peers::router())
-        .nest("/api/v1/podcasts", podcasts::router())
-        .nest("/api/v1/plugins", plugins::router())
+        .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))

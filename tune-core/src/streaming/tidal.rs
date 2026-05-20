@@ -442,6 +442,52 @@ impl StreamingService for TidalService {
         Ok(artists)
     }
 
+    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        let needs_refresh = self
+            .token_expires
+            .map(|exp| {
+                exp.checked_duration_since(Instant::now())
+                    .map(|d| d.as_secs() < 300)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+
+        if !needs_refresh {
+            return Ok(false);
+        }
+
+        let refresh_token = match self.refresh_token.as_ref() {
+            Some(rt) => rt.clone(),
+            None => return Ok(false),
+        };
+
+        let resp = self
+            .client
+            .post(&format!("{AUTH_BASE}/token"))
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("client_secret", CLIENT_SECRET),
+                ("refresh_token", refresh_token.as_str()),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("refresh: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err("refresh token rejected".into());
+        }
+
+        let token: TokenResponse = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        self.access_token = Some(token.access_token);
+        if let Some(rt) = token.refresh_token {
+            self.refresh_token = Some(rt);
+        }
+        self.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
+        info!("tidal_token_refreshed");
+        Ok(true)
+    }
+
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let token = self.access_token.as_ref()?;
         Some(serde_json::json!({
