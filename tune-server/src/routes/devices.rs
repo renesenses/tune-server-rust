@@ -62,8 +62,8 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
             if let Ok(desc) = fetch_device_description(location).await {
                 if desc.is_media_renderer() {
                     let service_urls = desc.service_urls();
-                    let av_url = service_urls.get("urn:schemas-upnp-org:service:AVTransport:1");
-                    let rc_url = service_urls.get("urn:schemas-upnp-org:service:RenderingControl:1");
+                    let av_url = service_urls.get("avtransport");
+                    let rc_url = service_urls.get("renderingcontrol");
 
                     if let (Some(av), Some(rc)) = (av_url, rc_url) {
                         let base = format!("http://{}:{}", d.host, d.port);

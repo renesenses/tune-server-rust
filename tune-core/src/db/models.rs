@@ -68,15 +68,13 @@ impl Album {
         let sr = self.sample_rate.unwrap_or(0);
         let bd = self.bit_depth.unwrap_or(0);
         if fmt.contains("dsf") || fmt.contains("dff") || fmt.contains("dsd") {
-            Some("DSD".into())
-        } else if sr > 44100 || bd > 16 {
-            Some("Hi-Res".into())
-        } else if fmt == "flac" || fmt == "alac" || fmt == "wav" || fmt == "aiff" || fmt == "wv" {
-            Some("CD".into())
-        } else if fmt == "mp3" || fmt == "ogg" || fmt == "opus" || fmt == "wma" || fmt == "m4a" {
-            Some("Lossy".into())
+            Some("dsd".into())
+        } else if sr > 48000 || bd > 16 {
+            Some("hires".into())
+        } else if fmt == "mp3" || fmt == "ogg" || fmt == "opus" || fmt == "wma" || fmt == "aac" {
+            Some("lossy".into())
         } else if !fmt.is_empty() {
-            Some("CD".into())
+            Some("cd".into())
         } else {
             None
         }
