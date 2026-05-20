@@ -49,7 +49,7 @@ impl OutputTarget for ChromecastOutput {
         let port = self.port;
         let name = self.name.clone();
 
-        let device = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
                 .map_err(|e| format!("chromecast connect: {e}"))?;
 

@@ -117,7 +117,20 @@ impl PositionPoller {
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
 
-                    if !ps.gapless_sent
+                    let track_duration = zone_state
+                        .now_playing
+                        .as_ref()
+                        .map(|np| np.duration_ms as u64)
+                        .unwrap_or(0);
+
+                    if ps.gapless_sent
+                        && track_duration > 0
+                        && status.duration_ms != track_duration
+                    {
+                        info!(zone_id, "gapless_transition_detected");
+                        ps.gapless_sent = false;
+                        self.handle_track_end(zone_id, zone_state).await;
+                    } else if !ps.gapless_sent
                         && status.duration_ms > GAPLESS_WINDOW_MS
                         && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
                     {
