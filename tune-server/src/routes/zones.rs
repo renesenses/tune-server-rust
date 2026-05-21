@@ -11,7 +11,7 @@ use tune_core::db::zone_repo::ZoneRepo;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
-struct CreateZone {
+pub struct CreateZone {
     name: String,
     output_type: Option<String>,
     output_device_id: Option<String>,
@@ -35,7 +35,6 @@ struct RenameZone {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_zones).post(create_zone))
-        .route("", get(list_zones).post(create_zone))
         .route("/{id}", get(get_zone).delete(delete_zone))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
@@ -45,6 +44,17 @@ pub fn router() -> Router<AppState> {
         .route("/groups/{group_id}", axum::routing::delete(delete_group))
         .route("/stereo-pairs", get(list_stereo_pairs).post(create_stereo_pair))
         .route("/stereo-pairs/{pair_id}", axum::routing::delete(delete_stereo_pair))
+}
+
+pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
+    list_zones(State(state)).await
+}
+
+pub async fn create_zone_handler(
+    state: State<AppState>,
+    body: Json<CreateZone>,
+) -> impl IntoResponse {
+    create_zone(state, body).await
 }
 
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {

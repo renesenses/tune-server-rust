@@ -342,7 +342,15 @@ async fn main() {
     let app = routes::router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => break l,
+            Err(e) => {
+                tracing::warn!(addr = %addr, error = %e, "port_busy_retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
     info!(%addr, "listening");
 
     axum::serve(listener, app)

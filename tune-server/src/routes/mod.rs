@@ -22,6 +22,7 @@ pub mod zones;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -49,11 +50,13 @@ pub fn router(state: AppState) -> Router {
 
     let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
 
+    let zones_and_playback = zones::router().merge(playback::router());
     let api = Router::new()
         .nest("/system", system::router())
         .nest("/library", library::router())
         .nest("/library/history", history::router())
-        .nest("/zones", zones::router().merge(playback::router()))
+        .route("/zones/", get(zones::list_zones_handler).post(zones::create_zone_handler))
+        .nest("/zones", zones_and_playback)
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/search", search::router())
