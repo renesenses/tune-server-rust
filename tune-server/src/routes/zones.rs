@@ -35,6 +35,7 @@ struct RenameZone {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_zones).post(create_zone))
+        .route("", get(list_zones).post(create_zone))
         .route("/{id}", get(get_zone).delete(delete_zone))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))

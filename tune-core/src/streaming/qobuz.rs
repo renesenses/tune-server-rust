@@ -17,6 +17,8 @@ pub struct QobuzService {
     username: Option<String>,
     subscription: Option<String>,
     use_proxy: bool,
+    stored_username: Option<String>,
+    stored_password: Option<String>,
 }
 
 impl QobuzService {
@@ -33,6 +35,8 @@ impl QobuzService {
             username: None,
             subscription: None,
             use_proxy: true,
+            stored_username: None,
+            stored_password: None,
         }
     }
 
@@ -123,6 +127,52 @@ impl QobuzService {
         }
     }
 
+    async fn login_internal(&mut self, username: &str, password: &str) -> Result<AuthStatus, String> {
+        self.refresh_credentials().await;
+
+        let base = self.api_base();
+        let resp = self.client
+            .post(format!("{base}/user/login"))
+            .query(&[("app_id", self.app_id.as_str())])
+            .form(&[("username", username), ("password", password)])
+            .send()
+            .await
+            .map_err(|e| format!("qobuz login: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            info!(status, body = %body, "qobuz_login_failed");
+            return Err(format!("qobuz login {status}: {body}"));
+        }
+
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
+        self.username = data["user"]["display_name"].as_str().map(Into::into);
+        self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
+
+        info!(username = ?self.username, "qobuz_authenticated");
+        Ok(self.auth_status_internal())
+    }
+
+    fn auth_status_internal(&self) -> AuthStatus {
+        AuthStatus {
+            authenticated: self.user_auth_token.is_some(),
+            username: self.username.clone(),
+            subscription: self.subscription.clone(),
+            ..Default::default()
+        }
+    }
+
+    async fn auto_relogin(&mut self) -> bool {
+        if let (Some(u), Some(p)) = (self.stored_username.clone(), self.stored_password.clone()) {
+            info!("qobuz_auto_relogin");
+            self.login_internal(&u, &p).await.is_ok()
+        } else {
+            false
+        }
+    }
+
     fn map_artist(item: &serde_json::Value) -> StreamArtist {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
@@ -146,40 +196,14 @@ impl StreamingService for QobuzService {
         let username = credentials["username"].as_str().ok_or("username required")?;
         let password = credentials["password"].as_str().ok_or("password required")?;
 
-        self.refresh_credentials().await;
+        self.stored_username = Some(username.to_string());
+        self.stored_password = Some(password.to_string());
 
-        let base = self.api_base();
-        let resp = self.client
-            .post(format!("{base}/user/login"))
-            .query(&[("app_id", self.app_id.as_str())])
-            .form(&[("username", username), ("password", password)])
-            .send()
-            .await
-            .map_err(|e| format!("qobuz login: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            info!(status, body = %body, app_id = %self.app_id, "qobuz_login_failed");
-            return Err(format!("qobuz login {status}: {body}"));
-        }
-
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        self.user_auth_token = data["user_auth_token"].as_str().map(Into::into);
-        self.username = data["user"]["display_name"].as_str().map(Into::into);
-        self.subscription = data["user"]["credential"]["label"].as_str().map(Into::into);
-
-        info!(username = ?self.username, "qobuz_authenticated");
-        Ok(self.auth_status().await)
+        self.login_internal(username, password).await
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        AuthStatus {
-            authenticated: self.user_auth_token.is_some(),
-            username: self.username.clone(),
-            subscription: self.subscription.clone(),
-            ..Default::default()
-        }
+        self.auth_status_internal()
     }
 
     async fn logout(&mut self) -> Result<(), String> {
@@ -331,6 +355,22 @@ impl StreamingService for QobuzService {
         Ok(artists)
     }
 
+    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        if self.user_auth_token.is_none() {
+            return Ok(false);
+        }
+        let test = self.api_get("/user/get", &[]).await;
+        if let Err(ref e) = test {
+            if e.contains("401") || e.contains("403") {
+                if self.auto_relogin().await {
+                    info!("qobuz_token_refreshed_via_relogin");
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let token = self.user_auth_token.as_ref()?;
         Some(serde_json::json!({
@@ -339,6 +379,8 @@ impl StreamingService for QobuzService {
             "subscription": self.subscription,
             "app_id": self.app_id,
             "app_secret": self.app_secret,
+            "stored_username": self.stored_username,
+            "stored_password": self.stored_password,
         }))
     }
 
@@ -353,6 +395,8 @@ impl StreamingService for QobuzService {
             if let Some(secret) = tokens["app_secret"].as_str() {
                 self.app_secret = secret.into();
             }
+            self.stored_username = tokens["stored_username"].as_str().map(Into::into);
+            self.stored_password = tokens["stored_password"].as_str().map(Into::into);
             true
         } else {
             false
