@@ -235,14 +235,18 @@ async fn main() {
         });
     }
 
+    let _mdns_handle;
     {
         let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
-        if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
+        _mdns_handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
             let mut mdns = mdns.with_chromecast().with_airplay();
             if let Err(e) = mdns.start() {
                 tracing::warn!(error = %e, "mdns_start_failed");
             }
-        }
+            Some(mdns)
+        } else {
+            None
+        };
 
         let outputs = state.outputs.clone();
         let db_for_mdns = state.db.clone();
