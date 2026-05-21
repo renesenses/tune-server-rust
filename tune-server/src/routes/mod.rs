@@ -20,12 +20,32 @@ pub mod tags;
 pub mod ws;
 pub mod zones;
 
+use axum::extract::Request;
 use axum::http::StatusCode;
+use axum::middleware;
+use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+
+async fn normalize_trailing_slash(req: Request, next: Next) -> impl IntoResponse {
+    let (mut parts, body) = req.into_parts();
+    let path = parts.uri.path();
+    if path.len() > 1 && path.ends_with('/') {
+        let new_path = path.trim_end_matches('/');
+        let new_uri = if let Some(q) = parts.uri.query() {
+            format!("{new_path}?{q}")
+        } else {
+            new_path.to_string()
+        };
+        if let Ok(uri) = new_uri.parse() {
+            parts.uri = uri;
+        }
+    }
+    next.run(Request::from_parts(parts, body)).await
+}
 
 use crate::state::AppState;
 
@@ -70,6 +90,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
         .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
+        .layer(middleware::from_fn(normalize_trailing_slash))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
 }
