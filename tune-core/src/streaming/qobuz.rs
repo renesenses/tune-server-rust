@@ -6,6 +6,8 @@ use tracing::info;
 use super::traits::*;
 
 const API_BASE: &str = "https://www.qobuz.com/api.json/0.2";
+const API_PROXY: &str = "https://mozaiklabs.fr/qobuz-api";
+const REMOTE_CONFIG_URL: &str = "https://mozaiklabs.fr/storage/api/v1/streaming-config.json";
 
 pub struct QobuzService {
     client: Client,
@@ -14,6 +16,7 @@ pub struct QobuzService {
     user_auth_token: Option<String>,
     username: Option<String>,
     subscription: Option<String>,
+    use_proxy: bool,
 }
 
 impl QobuzService {
@@ -21,6 +24,7 @@ impl QobuzService {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
                 .build()
                 .unwrap(),
             app_id,
@@ -28,15 +32,39 @@ impl QobuzService {
             user_auth_token: None,
             username: None,
             subscription: None,
+            use_proxy: true,
+        }
+    }
+
+    fn api_base(&self) -> &str {
+        if self.use_proxy { API_PROXY } else { API_BASE }
+    }
+
+    async fn refresh_credentials(&mut self) {
+        match self.client.get(REMOTE_CONFIG_URL).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    let qobuz = &data["qobuz"];
+                    if let (Some(id), Some(secret)) = (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str()) {
+                        info!(old_id = %&self.app_id, new_id = %id, "qobuz_credentials_refreshed");
+                        self.app_id = id.to_string();
+                        self.app_secret = secret.to_string();
+                    }
+                }
+            }
+            _ => info!("qobuz_remote_config_unavailable"),
         }
     }
 
     async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value, String> {
-        let url = format!("{API_BASE}{path}");
+        let base = self.api_base();
+        let url = format!("{base}{path}");
+        let app_id = self.app_id.as_str();
         let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("app_id", &self.app_id));
+        query.push(("app_id", app_id));
 
-        let mut req = self.client.get(&url).query(&query);
+        let mut req = self.client.get(&url).query(&query)
+            .header("X-App-Id", app_id);
 
         if let Some(ref token) = self.user_auth_token {
             req = req.header("X-User-Auth-Token", token.as_str());
@@ -44,7 +72,10 @@ impl QobuzService {
 
         let resp = req.send().await.map_err(|e| format!("qobuz api: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("qobuz {}: {}", path, resp.status()));
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            info!(path, status, body = %body, "qobuz_api_error");
+            return Err(format!("qobuz {path}: {status} {body}"));
         }
 
         resp.json().await.map_err(|e| format!("qobuz json: {e}"))
@@ -115,8 +146,11 @@ impl StreamingService for QobuzService {
         let username = credentials["username"].as_str().ok_or("username required")?;
         let password = credentials["password"].as_str().ok_or("password required")?;
 
+        self.refresh_credentials().await;
+
+        let base = self.api_base();
         let resp = self.client
-            .post(format!("{API_BASE}/user/login"))
+            .post(format!("{base}/user/login"))
             .query(&[("app_id", self.app_id.as_str())])
             .form(&[("username", username), ("password", password)])
             .send()
@@ -124,7 +158,10 @@ impl StreamingService for QobuzService {
             .map_err(|e| format!("qobuz login: {e}"))?;
 
         if !resp.status().is_success() {
-            return Err("invalid credentials".into());
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            info!(status, body = %body, app_id = %self.app_id, "qobuz_login_failed");
+            return Err(format!("qobuz login {status}: {body}"));
         }
 
         let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
@@ -182,19 +219,21 @@ impl StreamingService for QobuzService {
             _ => "27",
         };
 
-        let timestamp = std::time::SystemTime::now()
+        let dur = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .unwrap();
+        let timestamp = format!("{}.{}", dur.as_secs(), dur.subsec_millis());
 
         let sig_input = format!("trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{timestamp}{}", self.app_secret);
         let sig = md5_hex(&sig_input);
+
+        info!(track_id, format_id, timestamp = %timestamp, sig = %sig, "qobuz_get_file_url");
 
         let data = self.api_get("/track/getFileUrl", &[
             ("track_id", track_id),
             ("format_id", format_id),
             ("intent", "stream"),
-            ("request_ts", &timestamp.to_string()),
+            ("request_ts", &timestamp),
             ("request_sig", &sig),
         ]).await?;
 

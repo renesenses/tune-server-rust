@@ -114,10 +114,8 @@ async fn service_auth(
 
     match svc.authenticate(&credentials).await {
         Ok(status) => {
-            if status.authenticated {
-                drop(svc);
-                state.save_tokens().await;
-            }
+            drop(svc);
+            state.save_tokens().await;
             Json(json!({
                 "service": service,
                 "authenticated": status.authenticated,

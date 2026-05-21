@@ -583,25 +583,46 @@ impl StreamingService for TidalService {
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
-        let token = self.access_token.as_ref()?;
-        Some(serde_json::json!({
-            "access_token": token,
-            "refresh_token": self.refresh_token,
-            "username": self.username,
-            "country_code": self.country_code,
-        }))
+        let mut obj = serde_json::json!({});
+        if let Some(ref token) = self.access_token {
+            obj["access_token"] = serde_json::json!(token);
+            obj["refresh_token"] = serde_json::json!(self.refresh_token);
+            obj["username"] = serde_json::json!(self.username);
+            obj["country_code"] = serde_json::json!(self.country_code);
+        }
+        if let Some(ref pending) = self.pending_device_auth {
+            obj["pending_device_code"] = serde_json::json!(pending.device_code);
+            obj["pending_user_code"] = serde_json::json!(pending.user_code);
+            obj["pending_uri"] = serde_json::json!(pending.verification_uri_complete);
+        }
+        if obj.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            None
+        } else {
+            Some(obj)
+        }
     }
 
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
+        let mut restored = false;
         if let Some(at) = tokens["access_token"].as_str() {
             self.access_token = Some(at.into());
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
             self.country_code = tokens["country_code"].as_str().unwrap_or("US").into();
-            true
-        } else {
-            false
+            restored = true;
         }
+        if let Some(dc) = tokens["pending_device_code"].as_str() {
+            self.pending_device_auth = Some(DeviceAuthResponse {
+                device_code: dc.into(),
+                user_code: tokens["pending_user_code"].as_str().unwrap_or("").into(),
+                verification_uri: "link.tidal.com".into(),
+                verification_uri_complete: tokens["pending_uri"].as_str().unwrap_or("").into(),
+                expires_in: 300,
+                interval: 2,
+            });
+            restored = true;
+        }
+        restored
     }
 }
 
