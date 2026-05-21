@@ -337,6 +337,8 @@ impl StreamingService for QobuzService {
             "user_auth_token": token,
             "username": self.username,
             "subscription": self.subscription,
+            "app_id": self.app_id,
+            "app_secret": self.app_secret,
         }))
     }
 
@@ -345,6 +347,12 @@ impl StreamingService for QobuzService {
             self.user_auth_token = Some(t.into());
             self.username = tokens["username"].as_str().map(Into::into);
             self.subscription = tokens["subscription"].as_str().map(Into::into);
+            if let Some(id) = tokens["app_id"].as_str() {
+                self.app_id = id.into();
+            }
+            if let Some(secret) = tokens["app_secret"].as_str() {
+                self.app_secret = secret.into();
+            }
             true
         } else {
             false
