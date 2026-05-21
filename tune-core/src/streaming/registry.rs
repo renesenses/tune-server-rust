@@ -75,6 +75,7 @@ impl ServiceRegistry {
                     let mut svc = svc.lock().await;
                     if svc.restore_tokens(&tokens) {
                         info!(service = %name, "tokens_restored");
+                        svc.post_restore().await;
                     }
                 }
         }

@@ -120,6 +120,34 @@ async fn play(
     let track_repo = TrackRepo::new(state.db.clone());
     let queue_repo = PlayQueueRepo::new(state.db.clone());
 
+    if body.source.is_some() && body.source_id.is_some() && body.track_id.is_none() && body.track_ids.is_none() {
+        let output_device_id = body.output_device_id.or_else(|| {
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+        });
+        let orch_req = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: None,
+            source: body.source,
+            source_id: body.source_id,
+            title: body.title,
+            artist_name: body.artist_name,
+            album_title: body.album_title,
+            cover_url: body.cover_path,
+            duration_ms: body.duration_ms,
+        };
+        return match state.orchestrator.play(orch_req).await {
+            Ok(result) => Json(json!({
+                "status": "playing",
+                "stream_url": result.stream_url,
+                "output_sent": result.output_sent,
+                "source": result.source,
+            })).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+
     let track_ids: Vec<i64> = if let Some(ids) = body.track_ids {
         ids
     } else if let Some(id) = body.track_id {

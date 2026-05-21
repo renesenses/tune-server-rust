@@ -12,24 +12,29 @@ use super::traits::*;
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg==";
+const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
-    token_type: String,
+    token_type: Option<String>,
     expires_in: u64,
+    #[serde(default)]
+    user_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DeviceAuthResponse {
+    #[serde(alias = "deviceCode")]
     device_code: String,
+    #[serde(alias = "userCode")]
     user_code: String,
+    #[serde(alias = "verificationUri")]
     verification_uri: String,
+    #[serde(alias = "verificationUriComplete")]
     verification_uri_complete: String,
+    #[serde(alias = "expiresIn")]
     expires_in: u64,
     interval: u64,
 }
@@ -190,7 +195,13 @@ impl TidalService {
             return Err("tidal rate limited".into());
         }
 
-        resp.json().await.map_err(|e| format!("parse: {e}"))
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+        if status != 200 {
+            info!(track_id, quality, status, body = %body, "tidal_playback_info_error");
+            return Err(format!("tidal playback {status}: {body}"));
+        }
+        serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))
     }
 
     fn parse_quality_metadata(data: &serde_json::Value, audio_quality: &str) -> (u32, u16) {
@@ -202,6 +213,16 @@ impl TidalService {
             "HI_RES_LOSSLESS" => (96000, 24),
             "LOSSLESS" | "HI_RES" => (44100, 16),
             _ => (44100, 16),
+        }
+    }
+
+    async fn refresh_user_info(&mut self) {
+        if let Ok(me) = self.api_get("/users/me").await {
+            self.username = me["username"].as_str().map(Into::into);
+            if let Some(cc) = me["countryCode"].as_str() {
+                self.country_code = cc.into();
+            }
+            info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
         }
     }
 
@@ -230,7 +251,7 @@ impl StreamingService for TidalService {
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
             let resp = self.client
                 .post(format!("{AUTH_BASE}/device_authorization"))
-                .form(&[("client_id", CLIENT_ID), ("scope", "r_usr+w_usr+w_sub")])
+                .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
                 .send()
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
@@ -256,7 +277,7 @@ impl StreamingService for TidalService {
             });
         }
 
-        info!(has_pending = self.pending_device_auth.is_some(), "tidal_auth_poll");
+        info!(has_pending = self.pending_device_auth.is_some(), device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
 
         if let Some(ref pending) = self.pending_device_auth.clone() {
             let resp = self.client
@@ -266,7 +287,7 @@ impl StreamingService for TidalService {
                     ("client_secret", CLIENT_SECRET),
                     ("device_code", &pending.device_code),
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ("scope", "r_usr+w_usr+w_sub"),
+                    ("scope", "r_usr w_usr w_sub"),
                 ])
                 .send()
                 .await
@@ -372,9 +393,17 @@ impl StreamingService for TidalService {
         let data = self.fetch_playback_info(track_id, requested_quality).await?;
 
         let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
-        let data = if manifest_mime == "application/dash+xml" && requested_quality != "LOSSLESS" {
-            info!(track_id, "tidal_hires_dash_fallback_to_lossless");
-            self.fetch_playback_info(track_id, "LOSSLESS").await?
+        let has_manifest = data["manifest"].as_str().is_some();
+
+        let data = if (!has_manifest || manifest_mime == "application/dash+xml") && requested_quality != "LOSSLESS" {
+            info!(track_id, manifest_mime, has_manifest, "tidal_fallback_to_lossless");
+            let fallback = self.fetch_playback_info(track_id, "LOSSLESS").await?;
+            if fallback["manifest"].as_str().is_none() && requested_quality != "HIGH" {
+                info!(track_id, "tidal_fallback_to_high");
+                self.fetch_playback_info(track_id, "HIGH").await?
+            } else {
+                fallback
+            }
         } else {
             data
         };
@@ -501,6 +530,10 @@ impl StreamingService for TidalService {
             }).collect())
             .unwrap_or_default();
         Ok(artists)
+    }
+
+    async fn post_restore(&mut self) {
+        self.refresh_user_info().await;
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, String> {
