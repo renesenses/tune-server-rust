@@ -75,6 +75,7 @@ pub struct TidalService {
     country_code: String,
     quality: String,
     username: Option<String>,
+    user_id: Option<u64>,
     subscription: Option<String>,
     url_cache: Arc<Mutex<UrlCache>>,
     pending_device_auth: Option<DeviceAuthResponse>,
@@ -99,6 +100,7 @@ impl TidalService {
             country_code: "US".into(),
             quality: "HI_RES_LOSSLESS".into(),
             username: None,
+            user_id: None,
             subscription: None,
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
             pending_device_auth: None,
@@ -306,17 +308,12 @@ impl StreamingService for TidalService {
             let token: TokenResponse = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
             self.access_token = Some(token.access_token);
             self.refresh_token = token.refresh_token;
+            self.user_id = token.user_id;
             self.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
             self.pending_device_auth = None;
+            self.country_code = "FR".into();
 
-            let me = self.api_get("/users/me").await.ok();
-            self.username = me.as_ref().and_then(|v| v["username"].as_str().map(Into::into));
-            self.country_code = me
-                .as_ref()
-                .and_then(|v| v["countryCode"].as_str().map(Into::into))
-                .unwrap_or_else(|| "US".into());
-
-            info!(username = ?self.username, "tidal_authenticated");
+            info!(user_id = ?self.user_id, "tidal_authenticated");
         }
 
         Ok(self.auth_status().await)
@@ -492,8 +489,8 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
-        let me = self.api_get("/users/me").await?;
-        let user_id = me["userId"].as_u64().ok_or("no userId")?;
+        // Use stored user_id instead of /users/me
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self.api_get(&format!("/users/{user_id}/playlists?limit=50")).await?;
         let playlists = data["items"].as_array()
             .map(|items| items.iter().map(|item| StreamPlaylist {
@@ -509,8 +506,8 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
-        let me = self.api_get("/users/me").await?;
-        let user_id = me["userId"].as_u64().ok_or("no userId")?;
+        // Use stored user_id instead of /users/me
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self.api_get(&format!("/users/{user_id}/favorites/albums?limit=100")).await?;
         let albums = data["items"].as_array()
             .map(|items| items.iter().filter_map(|item| {
@@ -521,8 +518,8 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
-        let me = self.api_get("/users/me").await?;
-        let user_id = me["userId"].as_u64().ok_or("no userId")?;
+        // Use stored user_id instead of /users/me
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self.api_get(&format!("/users/{user_id}/favorites/artists?limit=100")).await?;
         let artists = data["items"].as_array()
             .map(|items| items.iter().filter_map(|item| {
@@ -608,7 +605,8 @@ impl StreamingService for TidalService {
             self.access_token = Some(at.into());
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
-            self.country_code = tokens["country_code"].as_str().unwrap_or("US").into();
+            self.country_code = tokens["country_code"].as_str().unwrap_or("FR").into();
+            self.user_id = tokens["user_id"].as_u64();
             restored = true;
         }
         if let Some(dc) = tokens["pending_device_code"].as_str() {
