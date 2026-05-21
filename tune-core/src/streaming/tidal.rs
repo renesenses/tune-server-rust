@@ -228,6 +228,15 @@ impl TidalService {
         }
     }
 
+    fn extract_uid_from_jwt(token: &str) -> Option<u64> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() < 2 { return None; }
+        let payload = parts[1];
+        let decoded = base64_decode_url(payload).ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        claims["uid"].as_u64()
+    }
+
     fn map_artist(item: &serde_json::Value) -> StreamArtist {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
@@ -602,6 +611,7 @@ impl StreamingService for TidalService {
             obj["refresh_token"] = serde_json::json!(self.refresh_token);
             obj["username"] = serde_json::json!(self.username);
             obj["country_code"] = serde_json::json!(self.country_code);
+            obj["user_id"] = serde_json::json!(self.user_id);
         }
         if let Some(ref pending) = self.pending_device_auth {
             obj["pending_device_code"] = serde_json::json!(pending.device_code);
@@ -622,7 +632,9 @@ impl StreamingService for TidalService {
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
             self.country_code = tokens["country_code"].as_str().unwrap_or("FR").into();
-            self.user_id = tokens["user_id"].as_u64();
+            self.user_id = tokens["user_id"].as_u64().or_else(|| {
+                self.refresh_token.as_deref().and_then(Self::extract_uid_from_jwt)
+            });
             restored = true;
         }
         if let Some(dc) = tokens["pending_device_code"].as_str() {
@@ -638,6 +650,16 @@ impl StreamingService for TidalService {
         }
         restored
     }
+}
+
+fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
+    let padded = match input.len() % 4 {
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => input.to_string(),
+    };
+    let standard = padded.replace('-', "+").replace('_', "/");
+    base64_decode(&standard)
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
