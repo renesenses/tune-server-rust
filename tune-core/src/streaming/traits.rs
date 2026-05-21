@@ -93,6 +93,14 @@ pub trait StreamingService: Send + Sync {
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String>;
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String>;
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String>;
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let _ = artist_id;
+        Ok(vec![])
+    }
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+        let _ = artist_id;
+        Ok(vec![])
+    }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String>;
 

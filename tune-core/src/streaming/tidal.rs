@@ -466,6 +466,22 @@ impl StreamingService for TidalService {
         Ok(Self::map_artist(&data))
     }
 
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get(&format!("/artists/{artist_id}/albums?limit=50")).await?;
+        let albums = data["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+        let data = self.api_get(&format!("/artists/{artist_id}/toptracks?limit=20")).await?;
+        let tracks = data["items"].as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default();
+        Ok(tracks)
+    }
+
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
         let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
         Ok(StreamPlaylist {

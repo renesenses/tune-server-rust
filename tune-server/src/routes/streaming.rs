@@ -45,6 +45,8 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/albums/{album_id}", get(service_album))
         .route("/{service}/albums/{album_id}/tracks", get(service_album_tracks))
         .route("/{service}/artists/{artist_id}", get(service_artist))
+        .route("/{service}/artists/{artist_id}/albums", get(service_artist_albums))
+        .route("/{service}/artists/{artist_id}/top-tracks", get(service_artist_top_tracks))
         .route("/{service}/playlists", get(service_playlists))
         .route("/{service}/playlists/{playlist_id}", get(service_playlist))
         .route("/{service}/playlists/{playlist_id}/tracks", get(service_playlist_tracks))
@@ -254,6 +256,36 @@ async fn service_artist(
 
     match svc.get_artist(&artist_id).await {
         Ok(artist) => Json(json!(artist)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_artist_albums(
+    State(state): State<AppState>,
+    Path((service, artist_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match svc.get_artist_albums(&artist_id).await {
+        Ok(albums) => Json(json!(albums)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_artist_top_tracks(
+    State(state): State<AppState>,
+    Path((service, artist_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match svc.get_artist_top_tracks(&artist_id).await {
+        Ok(tracks) => Json(json!(tracks)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }

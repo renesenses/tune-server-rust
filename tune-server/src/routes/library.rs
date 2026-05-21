@@ -62,6 +62,7 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search))
         .route("/stats", get(library_stats))
         .route("/artwork/{hash}", get(serve_artwork))
+        .route("/artwork/proxy", get(proxy_artwork))
         .route("/albums/{id}/artwork", get(album_artwork))
 }
 
@@ -497,6 +498,38 @@ async fn browse_roots(State(state): State<AppState>) -> Json<Value> {
         .map(|d| json!({ "path": d, "name": d, "track_count": 0 }))
         .collect();
     Json(json!({ "roots": roots }))
+}
+
+#[derive(Deserialize)]
+struct ProxyQuery {
+    url: String,
+}
+
+async fn proxy_artwork(Query(q): Query<ProxyQuery>) -> impl IntoResponse {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    match client.get(&q.url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let content_type = resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .to_string();
+            match resp.bytes().await {
+                Ok(data) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert("Content-Type", HeaderValue::from_str(&content_type).unwrap_or(HeaderValue::from_static("image/jpeg")));
+                    headers.insert("Cache-Control", HeaderValue::from_static("public, max-age=86400"));
+                    (StatusCode::OK, headers, data.to_vec()).into_response()
+                }
+                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+        _ => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
