@@ -11,6 +11,34 @@ use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
+async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
+    let zone_state = state.playback.get_state(zone_id).await;
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_db = zone_repo.get(zone_id).ok().flatten();
+    json!({
+        "id": zone_id,
+        "name": zone_db.as_ref().map(|z| &z.name),
+        "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
+        "output_device_id": zone_db.as_ref().and_then(|z| z.output_device_id.as_ref()),
+        "volume": zone_state.volume,
+        "state": zone_state.state,
+        "current_track": zone_state.now_playing.as_ref().map(|np| json!({
+            "id": np.track_id,
+            "title": np.title,
+            "artist_name": np.artist_name,
+            "album_title": np.album_title,
+            "cover_path": np.cover_path,
+            "duration_ms": np.duration_ms,
+            "source": np.source,
+            "source_id": np.source_id,
+        })),
+        "position_ms": zone_state.position_ms,
+        "queue_length": zone_state.queue_length,
+        "queue_position": zone_state.queue_position,
+        "muted": zone_state.muted,
+    })
+}
+
 #[derive(Deserialize)]
 struct PlayRequest {
     track_id: Option<i64>,
@@ -138,12 +166,7 @@ async fn play(
             duration_ms: body.duration_ms,
         };
         return match state.orchestrator.play(orch_req).await {
-            Ok(result) => Json(json!({
-                "status": "playing",
-                "stream_url": result.stream_url,
-                "output_sent": result.output_sent,
-                "source": result.source,
-            })).into_response(),
+            Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }
@@ -200,15 +223,9 @@ async fn play(
     };
 
     match state.orchestrator.play(orch_req).await {
-        Ok(result) => {
+        Ok(_result) => {
             state.playback.update_queue_info(zone_id, start, track_ids.len() as i64).await;
-            let zone_state = state.playback.get_state(zone_id).await;
-            Json(json!({
-                "zone": zone_state,
-                "stream_url": result.stream_url,
-                "output_sent": result.output_sent,
-                "source": result.source,
-            })).into_response()
+            Json(build_zone_json(&state, zone_id).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -220,7 +237,7 @@ async fn pause(
 ) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
     state.orchestrator.pause(zone_id, device_id.as_deref()).await;
-    Json(json!({ "status": "paused" }))
+    Json(build_zone_json(&state, zone_id).await)
 }
 
 async fn resume(
@@ -229,7 +246,7 @@ async fn resume(
 ) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
     state.orchestrator.resume(zone_id, device_id.as_deref()).await;
-    Json(json!({ "status": "playing" }))
+    Json(build_zone_json(&state, zone_id).await)
 }
 
 async fn stop(
@@ -238,7 +255,7 @@ async fn stop(
 ) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
-    Json(json!({ "status": "stopped" }))
+    Json(build_zone_json(&state, zone_id).await)
 }
 
 async fn next(
