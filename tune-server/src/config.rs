@@ -70,7 +70,17 @@ impl TuneConfig {
         if let Ok(v) = std::env::var("QOBUZ_APP_SECRET") && !v.is_empty() { config.qobuz_app_secret = v; }
         if let Ok(v) = std::env::var("TUNE_LOG_LEVEL") { config.log_level = v; }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
-            config.music_dirs = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let trimmed = v.trim();
+            if trimmed.starts_with('[') {
+                // JSON array format: ["/path1", "/path2"] (compatible with v1 Python config)
+                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+                    config.music_dirs = parsed;
+                } else {
+                    config.music_dirs = trimmed.split(',').map(|s| s.trim().trim_matches(|c| c == '[' || c == ']' || c == '"').to_string()).filter(|s| !s.is_empty()).collect();
+                }
+            } else {
+                config.music_dirs = trimmed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
         }
 
         config
