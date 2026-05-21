@@ -62,11 +62,13 @@ pub fn router(state: AppState) -> Router {
 
     let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
 
+    let zones_router = zones::router().merge(playback::router());
     let api = Router::new()
         .nest("/system", system::router())
         .nest("/library", library::router())
         .nest("/library/history", history::router())
-        .nest("/zones", zones::router().merge(playback::router()))
+        .nest("/zones", zones_router.clone())
+        .nest("/zones/", zones_router)
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/search", search::router())
