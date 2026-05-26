@@ -165,9 +165,14 @@ impl PlaybackOrchestrator {
             stream_data.url.clone()
         };
 
-        let title = req.title.clone().unwrap_or_else(|| "Unknown".into());
-        let artist = req.artist_name.clone();
-        let duration_ms = req.duration_ms;
+        let (title, artist, duration_ms) = if req.title.is_some() {
+            (req.title.clone().unwrap(), req.artist_name.clone(), req.duration_ms)
+        } else {
+            match svc.get_track(source_id).await {
+                Ok(track) => (track.title, Some(track.artist), Some(track.duration_ms as i64)),
+                Err(_) => ("Unknown".into(), None, req.duration_ms),
+            }
+        };
 
         Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into()))
     }
