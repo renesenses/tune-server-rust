@@ -11,14 +11,17 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 struct DashParams {
     limit: Option<i64>,
+    days: Option<i64>,
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/stats", get(dashboard_stats))
         .route("/top-artists", get(top_artists))
+        .route("/top-albums", get(top_albums))
         .route("/top-tracks", get(top_tracks))
         .route("/genre-breakdown", get(genre_breakdown))
+        .route("/listening-history", get(listening_history))
 }
 
 async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
@@ -60,6 +63,41 @@ async fn top_tracks(
         .unwrap_or_default()
         .into_iter()
         .map(|(title, artist, plays)| json!({ "title": title, "artist_name": artist, "plays": plays }))
+        .collect();
+    Json(json!(items))
+}
+
+async fn top_albums(
+    State(state): State<AppState>,
+    Query(p): Query<DashParams>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(20);
+    let repo = HistoryRepo::new(state.db);
+    let items: Vec<Value> = repo
+        .top_albums(limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(title, artist, plays)| json!({ "album_title": title, "artist_name": artist, "plays": plays }))
+        .collect();
+    Json(json!(items))
+}
+
+async fn listening_history(
+    State(state): State<AppState>,
+    Query(p): Query<DashParams>,
+) -> Json<Value> {
+    let days = p.days.unwrap_or(30);
+    let repo = HistoryRepo::new(state.db);
+    let items: Vec<Value> = repo
+        .listening_history(days)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(day, play_count, total_ms)| json!({
+            "day": day,
+            "play_count": play_count,
+            "total_listened_ms": total_ms,
+            "hours": (total_ms as f64 / 3_600_000.0 * 100.0).round() / 100.0,
+        }))
         .collect();
     Json(json!(items))
 }

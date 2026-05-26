@@ -91,6 +91,44 @@ impl HistoryRepo {
         Ok(items)
     }
 
+    pub fn top_albums(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?")
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, Option<String>>(1).ok().flatten(),
+                    row.get::<_, i64>(2).unwrap_or(0),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
+    pub fn listening_history(&self, days: i64) -> Result<Vec<(String, i64, i64)>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DATE(listened_at) as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms FROM listen_history WHERE DATE(listened_at) >= DATE('now', '-' || ? || ' days') GROUP BY day ORDER BY day")
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![days], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                    row.get::<_, i64>(2).unwrap_or(0),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))

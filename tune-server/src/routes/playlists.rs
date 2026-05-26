@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -58,6 +58,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
+        .route("/import/m3u", post(import_m3u_file))
         .route("/import/m3u-url", post(import_m3u_url))
 }
 
@@ -237,6 +238,109 @@ async fn export_m3u(
     );
 
     (axum::http::StatusCode::OK, headers, m3u).into_response()
+}
+
+async fn import_m3u_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut file_content = String::new();
+    let mut playlist_name: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                if playlist_name.is_none() {
+                    playlist_name = field.file_name().map(|f| {
+                        f.trim_end_matches(".m3u8")
+                            .trim_end_matches(".m3u")
+                            .to_string()
+                    });
+                }
+                file_content = field.text().await.unwrap_or_default();
+            }
+            "name" => {
+                playlist_name = Some(field.text().await.unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
+    if file_content.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no file provided"}))).into_response();
+    }
+
+    let name = playlist_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Imported Playlist".into());
+
+    // Parse M3U and match tracks
+    let mut track_ids: Vec<i64> = Vec::new();
+    let mut total_entries = 0u32;
+    let mut matched = 0u32;
+    let mut not_found_paths: Vec<String> = Vec::new();
+
+    let track_repo = TrackRepo::new(state.db.clone());
+
+    for line in file_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        total_entries += 1;
+
+        // Try exact path match first
+        if let Ok(Some(track)) = track_repo.get_by_path(line) {
+            if let Some(id) = track.id {
+                track_ids.push(id);
+                matched += 1;
+                continue;
+            }
+        }
+
+        // Try matching by filename (stem) via search
+        let filename = std::path::Path::new(line)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(line);
+        if let Ok(results) = track_repo.search(filename, 1) {
+            if let Some(track) = results.first() {
+                if let Some(id) = track.id {
+                    track_ids.push(id);
+                    matched += 1;
+                    continue;
+                }
+            }
+        }
+
+        not_found_paths.push(line.to_string());
+    }
+
+    // Create playlist and add tracks
+    let repo = PlaylistRepo::new(state.db);
+    match repo.create(&name, None) {
+        Ok(playlist_id) => {
+            if !track_ids.is_empty() {
+                repo.add_tracks(playlist_id, &track_ids, None).ok();
+            }
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": playlist_id,
+                    "name": name,
+                    "total_entries": total_entries,
+                    "matched": matched,
+                    "not_found": not_found_paths.len(),
+                    "not_found_paths": not_found_paths,
+                    "track_count": track_ids.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

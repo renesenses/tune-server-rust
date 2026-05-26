@@ -50,7 +50,10 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/name", put(rename_zone))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
-        .route("/groups/{group_id}", axum::routing::delete(delete_group))
+        .route("/groups/{group_id}", axum::routing::patch(patch_group).delete(delete_group))
+        .route("/groups/{group_id}/volume", axum::routing::post(group_volume))
+        .route("/groups/{group_id}/calibrate", axum::routing::post(calibrate_group))
+        .route("/groups/{group_id}/health", get(group_health))
         .route("/stereo-pairs", get(list_stereo_pairs).post(create_stereo_pair))
         .route("/stereo-pairs/{pair_id}", axum::routing::delete(delete_stereo_pair))
 }
@@ -247,6 +250,158 @@ async fn create_group(
 
     settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
     (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct PatchGroup {
+    name: Option<String>,
+    zone_ids: Option<Vec<i64>>,
+}
+
+#[derive(Deserialize)]
+struct GroupVolumeRequest {
+    master_volume: Option<f64>,
+    offsets: Option<std::collections::HashMap<String, f64>>,
+}
+
+async fn patch_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(body): Json<PatchGroup>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let idx = groups.iter().position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    match idx {
+        Some(i) => {
+            if let Some(ref name) = body.name {
+                groups[i]["name"] = json!(name);
+            }
+            if let Some(ref zone_ids) = body.zone_ids {
+                groups[i]["zone_ids"] = json!(zone_ids);
+            }
+            let result = groups[i].clone();
+            settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+            Json(result).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn group_volume(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(body): Json<GroupVolumeRequest>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let mut groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let idx = groups.iter().position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    match idx {
+        Some(i) => {
+            let master = body.master_volume.unwrap_or(
+                groups[i]["master_volume"].as_f64().unwrap_or(0.5)
+            );
+            groups[i]["master_volume"] = json!(master);
+            if let Some(ref offsets) = body.offsets {
+                groups[i]["offsets"] = json!(offsets);
+            }
+            let zone_ids: Vec<i64> = groups[i]["zone_ids"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+
+            let repo = ZoneRepo::new(state.db.clone());
+            for zid in &zone_ids {
+                let offset = body.offsets.as_ref()
+                    .and_then(|o| o.get(&zid.to_string()))
+                    .copied()
+                    .unwrap_or(0.0);
+                let effective = (master + offset).clamp(0.0, 1.0);
+                let vol_int = (effective * 100.0) as i32;
+                repo.update_volume(*zid, vol_int).ok();
+                state.orchestrator.set_volume(*zid, effective, None).await;
+            }
+            Json(json!({"group_id": group_id, "master_volume": master})).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn calibrate_group(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let group = groups.iter().find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    match group {
+        Some(group) => {
+            let zone_ids: Vec<i64> = group["zone_ids"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let mut calibration = serde_json::Map::new();
+            for zid in &zone_ids {
+                calibration.insert(zid.to_string(), json!(0));
+            }
+            Json(json!({"group_id": group_id, "calibration": calibration})).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn group_health(
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let group = groups.iter().find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    match group {
+        Some(group) => {
+            let zone_ids: Vec<i64> = group["zone_ids"].as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let repo = ZoneRepo::new(state.db);
+            let mut zones_health = Vec::new();
+            for zid in &zone_ids {
+                let ps = state.playback.get_state(*zid).await;
+                let zone = repo.get(*zid).ok().flatten();
+                let name = zone.map(|z| z.name).unwrap_or_else(|| format!("Zone {zid}"));
+                let online = ps.state != tune_core::playback::PlayState::Stopped || ps.now_playing.is_some();
+                zones_health.push(json!({
+                    "zone_id": zid,
+                    "name": name,
+                    "status": if online { "online" } else { "offline" },
+                }));
+            }
+            Json(json!(zones_health)).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn delete_group(

@@ -444,6 +444,31 @@ impl StreamingService for QobuzService {
         Ok(playlists)
     }
 
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get("/artist/get", &[
+            ("artist_id", artist_id),
+            ("extra", "albums"),
+            ("limit", "50"),
+        ]).await?;
+        let albums = data["albums"]["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+        let data = self.api_get("/artist/get", &[
+            ("artist_id", artist_id),
+            ("extra", "tracks_appears_on"),
+            ("limit", "20"),
+        ]).await?;
+        let tracks = data["tracks_appears_on"]["items"].as_array()
+            .or_else(|| data["tracks"]["items"].as_array())
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default();
+        Ok(tracks)
+    }
+
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         let data = self.api_get("/favorite/getUserFavorites", &[("type", "albums"), ("limit", "500")]).await?;
         let albums = data["albums"]["items"].as_array()

@@ -1,10 +1,12 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::process::Command;
 
 use crate::state::AppState;
 
@@ -18,11 +20,31 @@ struct CreateMount {
     password: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ScanHostQuery {
+    host: String,
+    protocol: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MountRequest {
+    host: String,
+    share_name: String,
+    username: Option<String>,
+    password: Option<String>,
+    mount_path: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/mounts", get(list_mounts).post(create_mount))
         .route("/mounts/{id}", axum::routing::delete(delete_mount))
         .route("/media-servers", get(list_media_servers))
+        .route("/shares", get(list_shares))
+        .route("/scan-host", get(scan_host))
+        .route("/smb/discover", get(list_smb_shares).post(trigger_smb_scan))
+        .route("/smb/mounts", get(list_smb_mounts))
+        .route("/smb/mount", post(mount_smb_share))
 }
 
 async fn list_mounts(State(state): State<AppState>) -> Json<Value> {
@@ -85,4 +107,268 @@ async fn list_media_servers() -> Json<Value> {
         "total": 0,
         "message": "UPnP media server discovery pending",
     }))
+}
+
+// ---------------------------------------------------------------------------
+// SMB discovery and mount management
+// ---------------------------------------------------------------------------
+
+/// Return discovered network shares (stub — real mDNS scanning is a future feature).
+async fn list_shares() -> Json<Value> {
+    Json(json!({
+        "items": [],
+        "total": 0,
+        "message": "Network share discovery pending (mDNS not yet implemented)",
+    }))
+}
+
+/// Scan a specific host for SMB or NFS shares.
+async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
+    let host = &q.host;
+    let protocol = q.protocol.as_deref().unwrap_or("smb");
+
+    let raw_output = if protocol == "smb" {
+        // Try smbutil (macOS) first, then smbclient (Linux)
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("smbutil")
+                .args(["view", &format!("//guest@{host}")])
+                .output(),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(out)) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            }
+            _ => {
+                // Fallback to smbclient (Linux)
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    Command::new("smbclient")
+                        .args(["-N", "-L", &format!("//{host}")])
+                        .output(),
+                )
+                .await;
+                match result {
+                    Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+                    Ok(Err(e)) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": format!("scan failed: {e}") })),
+                        )
+                            .into_response();
+                    }
+                    Err(_) => {
+                        return (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            Json(json!({ "error": "scan timed out" })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    } else {
+        // NFS: showmount -e host
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            Command::new("showmount").args(["-e", host]).output(),
+        )
+        .await;
+        match result {
+            Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+            Ok(Err(e)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("scan failed: {e}") })),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({ "error": "scan timed out" })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Parse share names from command output
+    let shares: Vec<Value> = raw_output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("Sharing")
+                && !trimmed.starts_with("---")
+                && !trimmed.starts_with("Export")
+        })
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "name": parts[0],
+                "type": if parts.len() > 1 { parts[1] } else { "Disk" },
+                "host": host,
+                "protocol": protocol,
+                "path": format!("//{host}/{}", parts[0]),
+            }))
+        })
+        .collect();
+
+    Json(json!(shares)).into_response()
+}
+
+/// Return cached SMB shares (stub — future mDNS integration).
+async fn list_smb_shares() -> Json<Value> {
+    Json(json!({
+        "items": [],
+        "total": 0,
+        "message": "SMB share discovery pending",
+    }))
+}
+
+/// Trigger an SMB network scan (stub — returns accepted status).
+async fn trigger_smb_scan() -> impl IntoResponse {
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "scan_queued",
+            "message": "SMB network scan not yet implemented",
+        })),
+    )
+}
+
+/// List all stored SMB mounts from the network_mounts table.
+async fn list_smb_mounts(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let items: Vec<Value> = conn
+        .prepare(
+            "SELECT id, server, share, mount_path, username, active \
+             FROM network_mounts WHERE mount_type = 'smb' ORDER BY id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "server": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "share": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "mount_path": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "username": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "active": row.get::<_, i32>(5).unwrap_or(1) != 0,
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+    Json(json!(items))
+}
+
+/// Mount an SMB share: execute the OS mount command, then persist in the database.
+async fn mount_smb_share(
+    State(state): State<AppState>,
+    Json(body): Json<MountRequest>,
+) -> impl IntoResponse {
+    let share_safe = body.share_name.replace(['/', '\\', ' '], "_");
+    let mount_path = body
+        .mount_path
+        .unwrap_or_else(|| format!("/mnt/{}_{}", body.host, share_safe));
+
+    // Create mount directory
+    if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to create mount dir: {e}") })),
+        )
+            .into_response();
+    }
+
+    // Build the mount command depending on the platform
+    let mount_result = if cfg!(target_os = "macos") {
+        let credentials = match (&body.username, &body.password) {
+            (Some(u), Some(p)) => format!("{u}:{p}@"),
+            (Some(u), None) => format!("{u}@"),
+            _ => "guest@".to_string(),
+        };
+        let unc = format!("//{credentials}{}/{}", body.host, body.share_name);
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("mount_smbfs").args([&unc, &mount_path]).output(),
+        )
+        .await
+    } else {
+        // Linux: mount.cifs
+        let user = body.username.as_deref().unwrap_or("guest");
+        let pass = body.password.as_deref().unwrap_or("");
+        let unc = format!("//{}/{}", body.host, body.share_name);
+        let opts = format!("username={user},password={pass},vers=3.0");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("mount.cifs")
+                .args([&unc, &mount_path, "-o", &opts])
+                .output(),
+        )
+        .await
+    };
+
+    let mount_ok = match mount_result {
+        Ok(Ok(out)) if out.status.success() => true,
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("mount failed: {stderr}") })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("mount command failed: {e}") })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({ "error": "mount timed out" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Persist to database
+    match state.db.execute(
+        "INSERT INTO network_mounts (mount_type, server, share, mount_path, username) VALUES (?, ?, ?, ?, ?)",
+        &[
+            &"smb" as &dyn rusqlite::types::ToSql,
+            &body.host,
+            &body.share_name,
+            &mount_path,
+            &body.username,
+        ],
+    ) {
+        Ok(_) => {
+            let id = state.db.last_insert_rowid();
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": id,
+                    "mounted": mount_ok,
+                    "mount_path": mount_path,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("db error: {e}") })),
+        )
+            .into_response(),
+    }
 }
