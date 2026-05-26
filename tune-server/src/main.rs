@@ -86,18 +86,46 @@ async fn main() {
                     continue;
                 };
 
-                let artist = artist_repo
+                // Determine if this is a compilation (Various Artists)
+                let is_compilation = meta.compilation
+                    || meta.album_artist.as_deref().map(|s| s.to_lowercase())
+                        .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
+                        .unwrap_or(false);
+
+                // Album artist: use album_artist tag, fall back to track artist
+                let album_artist_name = meta.album_artist.as_deref()
+                    .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
+
+                // Track artist: always from track-level artist tag
+                let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
+
+                // For the album, use album_artist (so compilations group under "Various Artists")
+                let album_artist_entry = artist_repo
                     .get_or_create(
-                        meta.artist.as_deref().unwrap_or("Unknown Artist"),
-                        meta.musicbrainz_artist_id.as_deref(),
+                        album_artist_name,
+                        if is_compilation { None } else { meta.musicbrainz_artist_id.as_deref() },
                         meta.album_artist_sort.as_deref(),
                     )
                     .ok();
-                let artist_id = artist.as_ref().and_then(|a| a.id);
+                let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
+
+                // For the track, use track-level artist (important for compilations)
+                let track_artist = if is_compilation && track_artist_name != album_artist_name {
+                    artist_repo
+                        .get_or_create(
+                            track_artist_name,
+                            meta.musicbrainz_artist_id.as_deref(),
+                            None,
+                        )
+                        .ok()
+                } else {
+                    album_artist_entry.clone()
+                };
+                let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
                 let album = meta.album.as_ref().and_then(|title| {
                     album_repo
-                        .get_or_create(title, artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
+                        .get_or_create(title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
                         .ok()
                 });
                 let album_id = album.as_ref().and_then(|a| a.id);
@@ -126,7 +154,8 @@ async fn main() {
                 );
                 track.album_id = album_id;
                 track.artist_id = artist_id;
-                track.artist_name = meta.artist.clone();
+                track.artist_name = Some(track_artist_name.to_string());
+                track.album_artist = meta.album_artist.clone();
                 track.album_title = meta.album.clone();
                 track.disc_number = meta.disc_number.unwrap_or(1) as i32;
                 track.track_number = meta.track_number.unwrap_or(0) as i32;
@@ -221,24 +250,50 @@ async fn main() {
                                                 track_repo.delete_by_path(&sf.path).ok();
                                             }
 
-                                            let artist = artist_repo
+                                            // Determine if this is a compilation
+                                            let is_compilation = meta.compilation
+                                                || meta.album_artist.as_deref().map(|s| s.to_lowercase())
+                                                    .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
+                                                    .unwrap_or(false);
+
+                                            // Album artist: use album_artist tag, fall back to track artist
+                                            let album_artist_name = meta.album_artist.as_deref()
+                                                .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
+
+                                            let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
+
+                                            // For the album, use album_artist (so compilations group under "Various Artists")
+                                            let album_artist_entry = artist_repo
                                                 .get_or_create(
-                                                    meta.artist
-                                                        .as_deref()
-                                                        .unwrap_or("Unknown Artist"),
-                                                    meta.musicbrainz_artist_id.as_deref(),
+                                                    album_artist_name,
+                                                    if is_compilation { None } else { meta.musicbrainz_artist_id.as_deref() },
                                                     meta.album_artist_sort.as_deref(),
                                                 )
                                                 .ok();
+                                            let album_artist_id =
+                                                album_artist_entry.as_ref().and_then(|a| a.id);
+
+                                            // For the track, use track-level artist (important for compilations)
+                                            let track_artist = if is_compilation && track_artist_name != album_artist_name {
+                                                artist_repo
+                                                    .get_or_create(
+                                                        track_artist_name,
+                                                        meta.musicbrainz_artist_id.as_deref(),
+                                                        None,
+                                                    )
+                                                    .ok()
+                                            } else {
+                                                album_artist_entry.clone()
+                                            };
                                             let artist_id =
-                                                artist.as_ref().and_then(|a| a.id);
+                                                track_artist.as_ref().and_then(|a| a.id);
 
                                             let album =
                                                 meta.album.as_ref().and_then(|title| {
                                                     album_repo
                                                         .get_or_create(
                                                             title,
-                                                            artist_id.unwrap_or(0),
+                                                            album_artist_id.unwrap_or(0),
                                                             meta.year.map(|y| y as i32),
                                                         )
                                                         .ok()
@@ -281,7 +336,8 @@ async fn main() {
                                                 );
                                             track.album_id = album_id;
                                             track.artist_id = artist_id;
-                                            track.artist_name = meta.artist.clone();
+                                            track.artist_name = Some(track_artist_name.to_string());
+                                            track.album_artist = meta.album_artist.clone();
                                             track.album_title = meta.album.clone();
                                             track.disc_number =
                                                 meta.disc_number.unwrap_or(1) as i32;
