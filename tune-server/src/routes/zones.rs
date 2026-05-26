@@ -357,10 +357,36 @@ async fn calibrate_group(
             let zone_ids: Vec<i64> = group["zone_ids"].as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
-            let mut calibration = serde_json::Map::new();
+
+            // For each zone, measure round-trip latency to its output device
+            let outputs = state.outputs.lock().await;
+            let mut latencies = Vec::new();
             for zid in &zone_ids {
-                calibration.insert(zid.to_string(), json!(0));
+                let zone = ZoneRepo::new(state.db.clone()).get(*zid).ok().flatten();
+                if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
+                    if let Some(output) = outputs.get(device_id) {
+                        let output = output.lock().await;
+                        let start = std::time::Instant::now();
+                        let _ = output.get_status().await;
+                        let rtt_ms = start.elapsed().as_millis() as i64;
+                        latencies.push((*zid, rtt_ms / 2));
+                    } else {
+                        latencies.push((*zid, 0));
+                    }
+                } else {
+                    latencies.push((*zid, 0));
+                }
             }
+            drop(outputs);
+
+            // First zone is the leader; compute sync delays relative to it
+            let leader_latency = latencies.first().map(|(_, l)| *l).unwrap_or(0);
+            let mut calibration = serde_json::Map::new();
+            for (zid, lat) in &latencies {
+                let sync_delay = leader_latency - lat;
+                calibration.insert(zid.to_string(), json!(sync_delay));
+            }
+
             Json(json!({"group_id": group_id, "calibration": calibration})).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),

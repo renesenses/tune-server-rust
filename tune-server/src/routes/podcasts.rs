@@ -26,6 +26,8 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search_podcasts))
         .route("/subscriptions", get(list_subscriptions).post(subscribe))
         .route("/subscriptions/{id}", axum::routing::delete(unsubscribe))
+        .route("/radiofrance", get(radiofrance_podcasts))
+        .route("/episodes/{podcast_id}", get(podcast_episodes))
 }
 
 async fn search_podcasts(Query(q): Query<SearchQuery>) -> Json<Value> {
@@ -85,4 +87,25 @@ async fn unsubscribe(
 ) -> impl IntoResponse {
     state.db.execute("DELETE FROM podcast_subscriptions WHERE id = ?", &[&id]).ok();
     StatusCode::NO_CONTENT
+}
+
+async fn radiofrance_podcasts() -> Json<Value> {
+    Json(json!([
+        {"id": "fip-a-la-carte", "name": "FIP \u{00e0} la carte", "station": "FIP"},
+        {"id": "club-jazzafip", "name": "Club Jazzafip", "station": "FIP"},
+        {"id": "monde-imaginaire", "name": "Le monde imaginaire de...", "station": "FIP"},
+        {"id": "fip-pop", "name": "FIP Pop", "station": "FIP"},
+        {"id": "france-musique-classique", "name": "Classique mais pas ringard", "station": "France Musique"},
+        {"id": "france-culture-fictions", "name": "Fictions", "station": "France Culture"}
+    ]))
+}
+
+async fn podcast_episodes(Path(podcast_id): Path<String>) -> Json<Value> {
+    // Look up the podcast's RSS feed URL from subscriptions, then parse RSS
+    // For now, return a stub until RSS parsing is connected
+    Json(json!({
+        "podcast_id": podcast_id,
+        "episodes": [],
+        "message": "Episode fetching from RSS not yet implemented"
+    }))
 }

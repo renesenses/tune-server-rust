@@ -1,10 +1,12 @@
 pub mod dashboard;
 pub mod devices;
+pub mod dj;
 pub mod export;
 pub mod history;
 pub mod library;
 pub mod metadata;
 pub mod network;
+pub mod party;
 pub mod playback;
 pub mod playlists;
 pub mod plugins;
@@ -74,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/peers", peers::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
+        .nest("/dj", dj::router())
+        .nest("/party", party::router())
         .fallback(api_fallback);
 
     let app = Router::new()

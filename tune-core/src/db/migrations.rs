@@ -208,6 +208,23 @@ ALTER TABLE alarms ADD COLUMN fade_duration_s INTEGER DEFAULT 60;
 ALTER TABLE alarms ADD COLUMN last_fired_at DATETIME;
 ",
     },
+    Migration {
+        version: 9,
+        name: "add_track_credits",
+        up: "
+CREATE TABLE IF NOT EXISTS track_credits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL,
+    artist_id INTEGER,
+    artist_name TEXT NOT NULL,
+    role TEXT DEFAULT 'performer',
+    instrument TEXT,
+    position INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_track_credits_track ON track_credits(track_id);
+CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_name);
+",
+    },
 ];
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {

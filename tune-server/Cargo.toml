@@ -23,6 +23,7 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
+lofty = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

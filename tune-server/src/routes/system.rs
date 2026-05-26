@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -52,6 +52,15 @@ pub fn router() -> Router<AppState> {
         .route("/discover-servers", get(discover_servers))
         .route("/config/export", get(export_config))
         .route("/config/import", post(import_config))
+        // Import routes
+        .route("/import/roon", post(import_roon))
+        .route("/import/plex", post(import_plex))
+        .route("/import/playlists", post(import_playlists_file))
+        .route("/import/status/{task_id}", get(import_status))
+        // Admin routes
+        .route("/admin/errors", get(admin_errors))
+        .route("/admin/connections", get(admin_connections))
+        .route("/admin/discovery", get(admin_discovery))
 }
 
 async fn version() -> Json<Value> {
@@ -733,4 +742,142 @@ fn backup_dir_path() -> String {
         .parent()
         .unwrap_or(std::path::Path::new("."));
     format!("{}/backups", parent.display())
+}
+
+// ---------------------------------------------------------------------------
+// Import: Roon / Plex / Playlists
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportRoonRequest {
+    #[allow(dead_code)]
+    roon_db_path: String,
+}
+
+async fn import_roon(Json(_body): Json<ImportRoonRequest>) -> Json<Value> {
+    let task_id = uuid_v4();
+    Json(json!({
+        "status": "accepted",
+        "message": "Roon import not yet implemented",
+        "task_id": task_id,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ImportPlexRequest {
+    #[allow(dead_code)]
+    plex_token: String,
+    #[allow(dead_code)]
+    plex_url: String,
+}
+
+async fn import_plex(Json(_body): Json<ImportPlexRequest>) -> Json<Value> {
+    let task_id = uuid_v4();
+    Json(json!({
+        "status": "accepted",
+        "message": "Plex import not yet implemented",
+        "task_id": task_id,
+    }))
+}
+
+async fn import_playlists_file() -> Json<Value> {
+    let task_id = uuid_v4();
+    Json(json!({
+        "status": "accepted",
+        "message": "Playlist file import not yet implemented (M3U/CSV)",
+        "task_id": task_id,
+    }))
+}
+
+async fn import_status(Path(task_id): Path<String>) -> Json<Value> {
+    Json(json!({
+        "task_id": task_id,
+        "status": "pending",
+        "progress": 0,
+    }))
+}
+
+/// Simple UUID v4 generator (no external crate needed).
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // Pseudo-random but unique enough for task IDs
+    let a = (seed & 0xFFFF_FFFF) as u32;
+    let b = ((seed >> 32) & 0xFFFF) as u16;
+    let c = ((seed >> 48) & 0x0FFF) as u16 | 0x4000; // version 4
+    let d = ((seed >> 60) & 0x3FFF) as u16 | 0x8000; // variant
+    let e = (seed.wrapping_mul(6364136223846793005) & 0xFFFF_FFFF_FFFF) as u64;
+    format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
+}
+
+// ---------------------------------------------------------------------------
+// Admin: Errors / Connections / Discovery
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AdminErrorsQuery {
+    lines: Option<usize>,
+}
+
+async fn admin_errors(Query(q): Query<AdminErrorsQuery>) -> Json<Value> {
+    let max_lines = q.lines.unwrap_or(100);
+
+    // Try reading from TUNE_LOG_FILE if set
+    if let Ok(log_path) = std::env::var("TUNE_LOG_FILE") {
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            let all_lines: Vec<&str> = content.lines().collect();
+            let error_lines: Vec<&str> = all_lines
+                .iter()
+                .filter(|l| {
+                    let lower = l.to_lowercase();
+                    lower.contains("error") || lower.contains("panic") || lower.contains("fatal")
+                })
+                .copied()
+                .collect();
+            let recent: Vec<&str> = error_lines.into_iter().rev().take(max_lines).collect();
+            return Json(json!({
+                "errors": recent,
+                "count": recent.len(),
+                "source": log_path,
+            }));
+        }
+    }
+
+    Json(json!({
+        "errors": [],
+        "count": 0,
+        "source": null,
+        "message": "Set TUNE_LOG_FILE to enable error log viewing",
+    }))
+}
+
+async fn admin_connections(State(state): State<AppState>) -> Json<Value> {
+    let streamer_sessions = state.streamer.sessions_state();
+    let active_streams = streamer_sessions.lock().await.len();
+    let outputs = state.outputs.lock().await;
+    let registered_outputs = outputs.list().len();
+
+    Json(json!({
+        "websocket_connections": 0,
+        "active_streams": active_streams,
+        "registered_outputs": registered_outputs,
+    }))
+}
+
+async fn admin_discovery(State(state): State<AppState>) -> Json<Value> {
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.devices().await;
+
+    Json(json!({
+        "device_count": devices.len(),
+        "devices": devices.iter().map(|d| json!({
+            "id": d.id,
+            "name": d.name,
+            "host": d.host,
+            "type": format!("{:?}", d.device_type),
+        })).collect::<Vec<_>>(),
+    }))
 }
