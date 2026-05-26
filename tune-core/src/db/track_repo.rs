@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 
-const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
+const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
 
 pub struct TrackRepo {
     db: SqliteDb,
@@ -38,10 +38,10 @@ impl TrackRepo {
 
     pub fn create(&self, track: &Track) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO tracks (title, album_id, artist_id, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id, &track.artist_id,
+                &track.album_id, &track.artist_id, &track.album_artist,
                 &track.disc_number, &track.disc_subtitle,
                 &track.track_number, &track.duration_ms,
                 &track.file_path, &track.format,
@@ -58,10 +58,10 @@ impl TrackRepo {
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
         self.db.execute(
-            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
+            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id, &track.artist_id,
+                &track.album_id, &track.artist_id, &track.album_artist,
                 &track.disc_number, &track.disc_subtitle,
                 &track.track_number, &track.duration_ms,
                 &track.file_path, &track.format,
@@ -229,28 +229,29 @@ fn row_to_track(row: &rusqlite::Row) -> Track {
         album_title: row.get(3).ok(),
         artist_id: row.get(4).ok(),
         artist_name: row.get(5).ok(),
-        disc_number: row.get(6).unwrap_or(1),
-        disc_subtitle: row.get(7).ok(),
-        track_number: row.get(8).unwrap_or(0),
-        duration_ms: row.get(9).unwrap_or(0),
-        file_path: row.get(10).ok(),
-        format: row.get(11).ok(),
-        sample_rate: row.get(12).ok(),
-        bit_depth: row.get(13).ok(),
-        channels: row.get(14).unwrap_or(2),
-        file_mtime: row.get(15).ok(),
-        file_size: row.get(16).ok(),
-        audio_hash: row.get(17).ok(),
-        source: row.get(18).unwrap_or_else(|_| "local".into()),
-        source_id: row.get(19).ok(),
-        isrc: row.get(20).ok(),
-        genre: row.get(21).ok(),
-        composer: row.get(22).ok(),
-        year: row.get(23).ok(),
-        bpm: row.get(24).ok(),
-        label: row.get(25).ok(),
-        musicbrainz_recording_id: row.get(26).ok(),
-        cover_path: row.get(27).ok(),
+        album_artist: row.get(6).ok(),
+        disc_number: row.get(7).unwrap_or(1),
+        disc_subtitle: row.get(8).ok(),
+        track_number: row.get(9).unwrap_or(0),
+        duration_ms: row.get(10).unwrap_or(0),
+        file_path: row.get(11).ok(),
+        format: row.get(12).ok(),
+        sample_rate: row.get(13).ok(),
+        bit_depth: row.get(14).ok(),
+        channels: row.get(15).unwrap_or(2),
+        file_mtime: row.get(16).ok(),
+        file_size: row.get(17).ok(),
+        audio_hash: row.get(18).ok(),
+        source: row.get(19).unwrap_or_else(|_| "local".into()),
+        source_id: row.get(20).ok(),
+        isrc: row.get(21).ok(),
+        genre: row.get(22).ok(),
+        composer: row.get(23).ok(),
+        year: row.get(24).ok(),
+        bpm: row.get(25).ok(),
+        label: row.get(26).ok(),
+        musicbrainz_recording_id: row.get(27).ok(),
+        cover_path: row.get(28).ok(),
     }
 }
 

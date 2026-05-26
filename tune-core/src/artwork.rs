@@ -52,6 +52,21 @@ pub fn artwork_hash(file_path: &str) -> String {
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
+pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
+    let url = format!("https://coverartarchive.org/release/{mbid}/front-500");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if resp.status().is_success() {
+        resp.bytes().await.ok().map(|b| b.to_vec())
+    } else {
+        None
+    }
+}
+
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 

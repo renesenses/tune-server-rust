@@ -17,6 +17,8 @@ pub struct TrackMetadata {
     pub album_artist_sort: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    pub total_tracks: Option<u32>,
+    pub total_discs: Option<u32>,
     pub disc_subtitle: Option<String>,
     pub year: Option<u32>,
     pub original_year: Option<u32>,
@@ -61,6 +63,11 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
     let original_year = get(&ItemKey::OriginalReleaseDate)
         .and_then(|s| s.get(..4)?.parse::<u32>().ok());
 
+    let total_tracks = tag.track_total()
+        .or_else(|| get(&ItemKey::TrackTotal).and_then(|s| s.parse::<u32>().ok()));
+    let total_discs = tag.disk_total()
+        .or_else(|| get(&ItemKey::DiscTotal).and_then(|s| s.parse::<u32>().ok()));
+
     let credits = parse_credits(tag);
 
     Some(TrackMetadata {
@@ -71,6 +78,8 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
         album_artist_sort: get(&ItemKey::AlbumArtistSortOrder),
         track_number: tag.track(),
         disc_number: tag.disk(),
+        total_tracks,
+        total_discs,
         disc_subtitle: get(&ItemKey::SetSubtitle),
         year: tag.year(),
         original_year,

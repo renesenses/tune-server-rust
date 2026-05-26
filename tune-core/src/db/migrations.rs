@@ -225,7 +225,27 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_track ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_name);
 ",
     },
+    Migration {
+        version: 10,
+        name: "add_album_artist_to_tracks",
+        up: "", // Column included in CORE_SCHEMA; for existing DBs, applied programmatically
+    },
 ];
+
+fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
+    let conn = db.connection().lock().unwrap();
+    let has_column = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
+        })
+        .unwrap_or(false);
+    drop(conn);
+    if !has_column {
+        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};")).ok();
+    }
+}
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
@@ -266,13 +286,17 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version <= current_version.max(if tables_exist { 1 } else { 0 }) {
             continue;
         }
-        if migration.up.is_empty() {
-            continue;
-        }
 
         info!(version = migration.version, name = migration.name, "migration_applying");
 
-        db.execute_batch(migration.up)?;
+        if !migration.up.is_empty() {
+            db.execute_batch(migration.up)?;
+        }
+
+        // Programmatic migrations for column additions (safe if column already exists)
+        if migration.version == 10 {
+            add_column_if_missing(db, "tracks", "album_artist", "TEXT");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",

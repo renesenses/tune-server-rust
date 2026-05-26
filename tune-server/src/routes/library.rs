@@ -79,6 +79,7 @@ pub fn router() -> Router<AppState> {
         .route("/artwork/{hash}", get(serve_artwork))
         .route("/artwork/proxy", get(proxy_artwork))
         .route("/albums/{id}/artwork", get(album_artwork))
+        .route("/albums/{id}/artwork/enrich", post(enrich_album_artwork))
 }
 
 async fn list_artists(
@@ -1010,6 +1011,42 @@ async fn track_all_tags(
     }
 
     Json(result).into_response()
+}
+
+async fn enrich_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "album not found"}))).into_response(),
+    };
+
+    // Skip if album already has a cover
+    if album.cover_path.is_some() {
+        return Json(json!({"enriched": false, "reason": "album already has cover art"})).into_response();
+    }
+
+    let Some(ref mbid) = album.musicbrainz_release_id else {
+        return Json(json!({"enriched": false, "reason": "no MusicBrainz release ID"})).into_response();
+    };
+
+    match tune_core::artwork::fetch_cover_art(mbid).await {
+        Some(data) => {
+            let cache_dir = artwork_cache_dir();
+            let hash = tune_core::artwork::artwork_hash(mbid);
+            if tune_core::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                repo.update_cover_path(id, &hash).ok();
+                Json(json!({"enriched": true, "hash": hash, "size": data.len()})).into_response()
+            } else {
+                Json(json!({"enriched": false, "reason": "failed to save to cache"})).into_response()
+            }
+        }
+        None => {
+            Json(json!({"enriched": false, "reason": "no cover art found on Cover Art Archive"})).into_response()
+        }
+    }
 }
 
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {

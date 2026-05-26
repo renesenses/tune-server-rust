@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     title TEXT NOT NULL,
     album_id INTEGER REFERENCES albums(id),
     artist_id INTEGER REFERENCES artists(id),
+    album_artist TEXT,
     disc_number INTEGER DEFAULT 1,
     disc_subtitle TEXT,
     track_number INTEGER DEFAULT 0,
