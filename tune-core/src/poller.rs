@@ -65,6 +65,59 @@ impl PositionPoller {
                 .any(|s| s.zone_id == *zone_id && s.state == PlayState::Playing)
         });
 
+        // Also poll stopped zones to detect externally-started playback and sync volume
+        let all_zones = crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+            .list().unwrap_or_default();
+
+        for zone in &all_zones {
+            let zone_id = zone.id.unwrap_or(0);
+            if zone_id == 0 { continue; }
+            let device_id = match zone.output_device_id.as_deref() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => continue,
+            };
+
+            let in_states = states.iter().any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+            if in_states { continue; } // already handled below
+
+            let status = {
+                let outputs = self.outputs.lock().await;
+                let output = match outputs.get(&device_id) {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let output = output.lock().await;
+                match output.get_status().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                }
+            };
+
+            // Sync volume from device regardless of state
+            if status.volume > 0.001 {
+                self.playback.set_volume(zone_id, status.volume).await;
+                let vol_int = (status.volume * 100.0) as i32;
+                crate::db::zone_repo::ZoneRepo::new(self.db.clone()).update_volume(zone_id, vol_int).ok();
+            }
+
+            // Recover playing state from device
+            if status.state == TransportState::Playing {
+                let np = crate::playback::NowPlaying {
+                    track_id: None,
+                    title: status.track_title.unwrap_or_else(|| "Recovering...".into()),
+                    artist_name: status.track_artist,
+                    album_title: None,
+                    cover_path: None,
+                    duration_ms: status.duration_ms as i64,
+                    source: "recovered".into(),
+                    source_id: None,
+                    stream_id: None,
+                };
+                self.playback.play(zone_id, np).await;
+                info!(zone_id, device = %device_id, "playback_recovered_from_device");
+            }
+        }
+
         for zone_state in &states {
             if zone_state.state != PlayState::Playing {
                 continue;
