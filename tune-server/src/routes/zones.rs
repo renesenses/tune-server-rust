@@ -5,8 +5,11 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::{info, warn};
 
 use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::discovery::xml_parser::fetch_device_description;
+use tune_core::outputs::dlna::DlnaOutput;
 
 use crate::state::AppState;
 
@@ -158,11 +161,143 @@ async fn create_zone(
     State(state): State<AppState>,
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
-    match repo.create(&body.name, body.output_type.as_deref(), body.output_device_id.as_deref()) {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let output_type = body.output_type.as_deref();
+    let output_device_id = body.output_device_id.as_deref();
+
+    // For DLNA/OpenHome zones, ensure the output is registered before persisting
+    if let Some(device_id) = output_device_id {
+        let is_dlna = matches!(output_type, Some("dlna") | Some("openhome"));
+        if is_dlna {
+            let already_registered = {
+                let outputs = state.outputs.lock().await;
+                outputs.get(device_id).is_some()
+            };
+            if !already_registered {
+                // Look up the discovered device and register its DLNA output
+                let scanner = state.scanner.lock().await;
+                let devices = scanner.devices().await;
+                drop(scanner);
+
+                let disc = devices.iter().find(|d| d.id == device_id);
+                if let Some(dev) = disc {
+                    let registered = register_dlna_output_from_device(
+                        dev, &state,
+                    ).await;
+                    if !registered {
+                        warn!(device_id, "create_zone_output_registration_failed");
+                    }
+                } else {
+                    warn!(device_id, "create_zone_device_not_discovered");
+                }
+            }
+        }
     }
+
+    // Check for duplicate device assignment
+    if let Some(device_id) = output_device_id {
+        let repo = ZoneRepo::new(state.db.clone());
+        if let Ok(zones) = repo.list() {
+            if zones.iter().any(|z| z.output_device_id.as_deref() == Some(device_id)) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"detail": "Device already assigned to another zone"})),
+                ).into_response();
+            }
+        }
+    }
+
+    let repo = ZoneRepo::new(state.db.clone());
+    match repo.create(&body.name, output_type, output_device_id) {
+        Ok(id) => {
+            info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
+
+            // Return the full zone object so the web client can use it directly
+            let zone = repo.get(id).ok().flatten();
+            let mut v = zone
+                .as_ref()
+                .and_then(|z| serde_json::to_value(z).ok())
+                .unwrap_or_else(|| json!({"id": id, "name": body.name}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("state".into(), json!("stopped"));
+                obj.insert("current_track".into(), json!(null));
+                obj.insert("position_ms".into(), json!(0));
+                obj.insert("queue_length".into(), json!(0));
+                let vol = zone.as_ref().map(|z| z.volume).unwrap_or(50);
+                obj.insert("volume".into(), json!(vol as f64 / 100.0));
+            }
+
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": e}))).into_response(),
+    }
+}
+
+/// Register a DLNA output from a discovered device.
+/// Fetches the device description XML to find AVTransport/RenderingControl URLs,
+/// then registers the output in the global registry.
+/// Returns true if registration succeeded.
+async fn register_dlna_output_from_device(
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    state: &AppState,
+) -> bool {
+    // First, try to get service URLs from the device's cached capabilities
+    let svc_urls = dev.capabilities.get("service_urls")
+        .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    let av_url = svc_urls.get("avtransport")
+        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+    let rc_url = svc_urls.get("renderingcontrol")
+        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+
+    // If cached service URLs are available, use them
+    if let (Some(av), Some(rc)) = (av_url, rc_url) {
+        let delay = state.config.play_delay_for(&dev.name);
+        let dlna = DlnaOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            av,
+            rc,
+        ).with_play_delay(delay);
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(dlna));
+        info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
+        return true;
+    }
+
+    // Fallback: fetch device description from location URL
+    if let Some(ref location) = dev.location {
+        match fetch_device_description(location).await {
+            Ok(desc) => {
+                if desc.is_media_renderer() || desc.is_openhome() {
+                    let service_urls = desc.service_urls();
+                    let av = service_urls.get("avtransport");
+                    let rc = service_urls.get("renderingcontrol");
+                    if let (Some(av_path), Some(rc_path)) = (av, rc) {
+                        let base = format!("http://{}:{}", dev.host, dev.port);
+                        let delay = state.config.play_delay_for(&dev.name);
+                        let dlna = DlnaOutput::new(
+                            dev.name.clone(),
+                            dev.id.clone(),
+                            dev.host.clone(),
+                            format!("{base}{av_path}"),
+                            format!("{base}{rc_path}"),
+                        ).with_play_delay(delay);
+                        let mut outputs = state.outputs.lock().await;
+                        outputs.register(Box::new(dlna));
+                        info!(name = %dev.name, id = %dev.id, "dlna_output_registered_via_description");
+                        return true;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(device = %dev.name, error = %e, "dlna_description_fetch_failed");
+            }
+        }
+    }
+
+    false
 }
 
 async fn delete_zone(
