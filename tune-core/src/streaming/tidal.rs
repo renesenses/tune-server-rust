@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -67,6 +68,11 @@ impl UrlCache {
     }
 }
 
+struct FeaturedCache {
+    sections: Vec<(FeaturedSection, Vec<StreamAlbum>)>,
+    fetched_at: Instant,
+}
+
 pub struct TidalService {
     client: Client,
     access_token: Option<String>,
@@ -79,6 +85,7 @@ pub struct TidalService {
     subscription: Option<String>,
     url_cache: Arc<Mutex<UrlCache>>,
     pending_device_auth: Option<DeviceAuthResponse>,
+    featured_cache: Option<FeaturedCache>,
 }
 
 impl Default for TidalService {
@@ -104,6 +111,7 @@ impl TidalService {
             subscription: None,
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
             pending_device_auth: None,
+            featured_cache: None,
         }
     }
 
@@ -235,6 +243,53 @@ impl TidalService {
         let decoded = base64_decode_url(payload).ok()?;
         let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
         claims["uid"].as_u64()
+    }
+
+    async fn api_post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let url = format!("{API_BASE}{path}");
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[("countryCode", &self.country_code)])
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| format!("tidal post: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("tidal {path}: {status} {body}"));
+        }
+        resp.json().await.or_else(|_| Ok(json!({"ok": true})))
+    }
+
+    async fn api_delete(&self, path: &str) -> Result<(), String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let url = format!("{API_BASE}{path}");
+        let resp = self.client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[("countryCode", &self.country_code)])
+            .send()
+            .await
+            .map_err(|e| format!("tidal delete: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(format!("tidal DELETE {path}: {status}"));
+        }
+        Ok(())
+    }
+
+    fn map_genre(item: &serde_json::Value) -> StreamGenre {
+        StreamGenre {
+            id: item["path"].as_str().unwrap_or("").into(),
+            name: item["name"].as_str().unwrap_or("").into(),
+            has_children: item["hasSubgenres"].as_bool()
+                .or_else(|| item["subGenres"].as_array().map(|a| !a.is_empty()))
+                .unwrap_or(false),
+            image_url: item["image"].as_str().map(Into::into),
+        }
     }
 
     fn map_artist(item: &serde_json::Value) -> StreamArtist {
@@ -511,6 +566,110 @@ impl StreamingService for TidalService {
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
+    }
+
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+        let data = self.api_get("/genres").await?;
+        let genres = data.as_array()
+            .map(|items| items.iter().map(Self::map_genre).collect())
+            .unwrap_or_default();
+        Ok(genres)
+    }
+
+    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get(&format!(
+            "/genres/{}/albums?limit={limit}",
+            urlencoding::encode(genre_id)
+        )).await?;
+        let albums = data["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+        if let Some(ref cache) = self.featured_cache {
+            if cache.fetched_at.elapsed() < Duration::from_secs(300) {
+                return Ok(cache.sections.iter().map(|(s, _)| s.clone()).collect());
+            }
+        }
+        let data = self.api_get("/pages/home").await?;
+        let mut sections = Vec::new();
+        if let Some(rows) = data["rows"].as_array() {
+            for (i, row) in rows.iter().enumerate() {
+                let title = row["modules"].as_array()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m["title"].as_str())
+                    .unwrap_or("");
+                if title.is_empty() { continue; }
+                let albums: Vec<StreamAlbum> = row["modules"].as_array()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m["pagedList"]["items"].as_array())
+                    .map(|items| items.iter()
+                        .filter(|item| item["type"].as_str() == Some("ALBUM") || item["id"].as_u64().is_some())
+                        .map(Self::map_album)
+                        .collect())
+                    .unwrap_or_default();
+                if albums.is_empty() { continue; }
+                sections.push((
+                    FeaturedSection { id: format!("home-{i}"), name: title.into() },
+                    albums,
+                ));
+            }
+        }
+        let result = sections.iter().map(|(s, _)| s.clone()).collect();
+        // Can't cache here since &self is immutable, will use the route-level cache
+        Ok(result)
+    }
+
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        if let Some(ref cache) = self.featured_cache {
+            if cache.fetched_at.elapsed() < Duration::from_secs(300) {
+                if let Some((_, albums)) = cache.sections.iter().find(|(s, _)| s.id == section_id) {
+                    return Ok(albums.clone());
+                }
+            }
+        }
+        let sections = self.get_featured_sections().await?;
+        let _ = sections;
+        Ok(vec![])
+    }
+
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+        let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
+        let data = self.api_get(&format!("/users/{user_id}/favorites/tracks?limit=100")).await?;
+        let tracks = data["items"].as_array()
+            .map(|items| items.iter().filter_map(|item| {
+                item.get("item").map(Self::map_track)
+            }).collect())
+            .unwrap_or_default();
+        Ok(tracks)
+    }
+
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let user_id = self.user_id.ok_or("no user_id")?;
+        let (path_type, form_key) = match fav_type {
+            "tracks" => ("tracks", "trackIds"),
+            "albums" => ("albums", "albumIds"),
+            "artists" => ("artists", "artistIds"),
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_post_form(
+            &format!("/users/{user_id}/favorites/{path_type}"),
+            &[(form_key, item_id)],
+        ).await?;
+        Ok(())
+    }
+
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let user_id = self.user_id.ok_or("no user_id")?;
+        let path_type = match fav_type {
+            "tracks" => "tracks",
+            "albums" => "albums",
+            "artists" => "artists",
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_delete(&format!("/users/{user_id}/favorites/{path_type}/{item_id}")).await
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {

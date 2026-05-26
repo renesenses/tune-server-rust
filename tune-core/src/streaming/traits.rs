@@ -68,6 +68,20 @@ pub struct SearchResults {
     pub playlists: Vec<StreamPlaylist>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamGenre {
+    pub id: String,
+    pub name: String,
+    pub has_children: bool,
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeaturedSection {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub authenticated: bool,
@@ -113,6 +127,32 @@ pub trait StreamingService: Send + Sync {
     }
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
         Ok(vec![])
+    }
+
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+        Ok(vec![])
+    }
+    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+        let _ = (genre_id, limit);
+        Ok(vec![])
+    }
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+        Ok(vec![])
+    }
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let _ = section_id;
+        Ok(vec![])
+    }
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+        Ok(vec![])
+    }
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let _ = (fav_type, item_id);
+        Err("not supported".into())
+    }
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let _ = (fav_type, item_id);
+        Err("not supported".into())
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {

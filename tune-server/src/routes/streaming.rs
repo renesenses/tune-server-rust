@@ -8,9 +8,15 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::streaming::traits::StreamingService;
 
 use crate::state::AppState;
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
 
 /// Look up a service by name. Locks the registry only long enough to clone
 /// the Arc, so callers never hold the registry lock across await points.
@@ -53,7 +59,15 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
         .route("/{service}/featured", get(service_featured))
+        .route("/{service}/featured/sections", get(service_featured_sections))
+        .route("/{service}/featured/{section}", get(service_featured_section))
         .route("/{service}/new-releases", get(service_new_releases))
+        .route("/{service}/genres", get(service_genres))
+        .route("/{service}/genres/{genre_id}/albums", get(service_genre_albums))
+        .route("/{service}/favorites/{fav_type}", get(service_favorites))
+        .route("/{service}/favorites/{fav_type}/{item_id}", post(service_add_favorite).delete(service_remove_favorite))
+        .route("/{service}/enable", post(service_enable))
+        .route("/{service}/disable", post(service_disable))
 }
 
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
@@ -400,4 +414,135 @@ async fn service_new_releases(
         Ok(items) => Json(json!(items)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
+}
+
+async fn service_genres(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match svc.get_genres().await {
+        Ok(genres) => Json(json!(genres)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_genre_albums(
+    State(state): State<AppState>,
+    Path((service, genre_id)): Path<(String, String)>,
+    Query(q): Query<LimitQuery>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    let limit = q.limit.unwrap_or(50);
+    match svc.get_genre_albums(&genre_id, limit).await {
+        Ok(albums) => Json(json!(albums)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_featured_sections(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match svc.get_featured_sections().await {
+        Ok(sections) => Json(json!(sections)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_featured_section(
+    State(state): State<AppState>,
+    Path((service, section)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match svc.get_featured_section(&section).await {
+        Ok(albums) => Json(json!(albums)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_favorites(
+    State(state): State<AppState>,
+    Path((service, fav_type)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    let result = match fav_type.as_str() {
+        "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
+        "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
+        "artists" => svc.get_user_artists().await.map(|a| json!({ "artists": a })),
+        _ => Err(format!("unknown favorite type: {fav_type}")),
+    };
+    match result {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn service_add_favorite(
+    State(state): State<AppState>,
+    Path((service, fav_type, item_id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match svc.add_favorite(&fav_type, &item_id).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_remove_favorite(
+    State(state): State<AppState>,
+    Path((service, fav_type, item_id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match svc.remove_favorite(&fav_type, &item_id).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+async fn service_enable(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set(&format!("streaming_{service}_enabled"), "true").ok();
+    Json(json!({"service": service, "enabled": true}))
+}
+
+async fn service_disable(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set(&format!("streaming_{service}_enabled"), "false").ok();
+    Json(json!({"service": service, "enabled": false}))
 }

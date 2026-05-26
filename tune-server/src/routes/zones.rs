@@ -32,10 +32,19 @@ struct RenameZone {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct PatchZone {
+    name: Option<String>,
+    volume: Option<i32>,
+    muted: Option<bool>,
+    output_device_id: Option<String>,
+    output_type: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_zones).post(create_zone))
-        .route("/{id}", get(get_zone).delete(delete_zone))
+        .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/name", put(rename_zone))
@@ -106,6 +115,40 @@ async fn get_zone(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+async fn patch_zone(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<PatchZone>,
+) -> impl IntoResponse {
+    let repo = ZoneRepo::new(state.db.clone());
+    if let Some(ref name) = body.name {
+        if let Err(e) = repo.update_name(id, name) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(vol) = body.volume {
+        if let Err(e) = repo.update_volume(id, vol) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(muted) = body.muted {
+        if let Err(e) = repo.update_muted(id, muted) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(ref device_id) = body.output_device_id {
+        if let Err(e) = repo.update_output_device(id, device_id) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(ref ot) = body.output_type {
+        if let Err(e) = repo.update_output_type(id, ot) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    get_zone(State(state), Path(id)).await.into_response()
 }
 
 async fn create_zone(

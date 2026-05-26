@@ -173,6 +173,38 @@ impl QobuzService {
         }
     }
 
+    async fn api_post(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+        let base = self.api_base();
+        let url = format!("{base}{path}");
+        let app_id = self.app_id.as_str();
+        let mut query: Vec<(&str, &str)> = params.to_vec();
+        query.push(("app_id", app_id));
+
+        let mut req = self.client.post(&url).query(&query)
+            .header("X-App-Id", app_id);
+
+        if let Some(ref token) = self.user_auth_token {
+            req = req.header("X-User-Auth-Token", token.as_str());
+        }
+
+        let resp = req.send().await.map_err(|e| format!("qobuz post: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("qobuz {path}: {status} {body}"));
+        }
+        resp.json().await.or_else(|_| Ok(serde_json::json!({"ok": true})))
+    }
+
+    fn map_genre(item: &serde_json::Value) -> StreamGenre {
+        StreamGenre {
+            id: item["id"].as_u64().unwrap_or(0).to_string(),
+            name: item["name"].as_str().unwrap_or("").into(),
+            has_children: item["subgenres"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            image_url: item["image"].as_str().map(Into::into),
+        }
+    }
+
     fn map_artist(item: &serde_json::Value) -> StreamArtist {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
@@ -322,6 +354,79 @@ impl StreamingService for QobuzService {
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
+    }
+
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+        let data = self.api_get("/genre/list", &[]).await?;
+        let genres = data["genres"]["items"].as_array()
+            .or_else(|| data["genres"].as_array())
+            .or_else(|| data.as_array())
+            .map(|items| items.iter().map(Self::map_genre).collect())
+            .unwrap_or_default();
+        Ok(genres)
+    }
+
+    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+        let limit_str = limit.to_string();
+        let data = self.api_get("/genre/get", &[
+            ("genre_id", genre_id),
+            ("type", "albums"),
+            ("limit", &limit_str),
+        ]).await?;
+        let albums = data["albums"]["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+        Ok(vec![
+            FeaturedSection { id: "new-releases".into(), name: "New Releases".into() },
+            FeaturedSection { id: "best-sellers".into(), name: "Best Sellers".into() },
+            FeaturedSection { id: "press-awards".into(), name: "Press Awards".into() },
+            FeaturedSection { id: "editor-picks".into(), name: "Editor Picks".into() },
+        ])
+    }
+
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get("/album/getFeatured", &[
+            ("type", section_id),
+            ("limit", "50"),
+        ]).await?;
+        let albums = data["albums"]["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+        let data = self.api_get("/favorite/getUserFavorites", &[("type", "tracks"), ("limit", "500")]).await?;
+        let tracks = data["tracks"]["items"].as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default();
+        Ok(tracks)
+    }
+
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let key = match fav_type {
+            "tracks" => "track_ids",
+            "albums" => "album_ids",
+            "artists" => "artist_ids",
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_post("/favorite/create", &[(key, item_id)]).await?;
+        Ok(())
+    }
+
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let key = match fav_type {
+            "tracks" => "track_ids",
+            "albums" => "album_ids",
+            "artists" => "artist_ids",
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_post("/favorite/delete", &[(key, item_id)]).await?;
+        Ok(())
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {

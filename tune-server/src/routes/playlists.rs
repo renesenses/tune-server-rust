@@ -40,11 +40,21 @@ struct RemoveTrack {
     position: i64,
 }
 
+#[derive(Deserialize)]
+struct RemoveTracksBody {
+    positions: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct ReorderTracksBody {
+    track_ids: Vec<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_playlists).post(create_playlist))
         .route("/{id}", get(get_playlist).put(update_playlist).delete(delete_playlist))
-        .route("/{id}/tracks", get(get_tracks).post(add_tracks))
+        .route("/{id}/tracks", get(get_tracks).post(add_tracks).delete(remove_tracks_batch).put(reorder_tracks))
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
@@ -139,6 +149,30 @@ async fn remove_track(
     let repo = PlaylistRepo::new(state.db);
     match repo.remove_track(id, body.position) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn remove_tracks_batch(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<RemoveTracksBody>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db);
+    match repo.remove_tracks_at_positions(id, &body.positions) {
+        Ok(removed) => Json(json!({"removed": removed})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn reorder_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ReorderTracksBody>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db);
+    match repo.reorder_tracks(id, &body.track_ids) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

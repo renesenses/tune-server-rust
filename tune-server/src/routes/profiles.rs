@@ -37,10 +37,22 @@ struct FavoritesQuery {
     item_type: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct SwitchProfile {
+    profile_id: i64,
+    pin: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_profiles).post(create_profile))
+        .route("/active", get(get_active_profile))
+        .route("/current", get(get_active_profile))
+        .route("/switch", post(switch_profile))
+        .route("/deactivate", post(deactivate_profile))
         .route("/{id}", get(get_profile).put(update_profile).delete(delete_profile))
+        .route("/{id}/activate", post(activate_profile))
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
@@ -50,6 +62,66 @@ async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let repo = ProfileRepo::new(state.db);
     let items = repo.list().unwrap_or_default();
     Json(json!(items))
+}
+
+async fn get_active_profile(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let profile_id: i64 = settings
+        .get("active_profile_id")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let repo = ProfileRepo::new(state.db);
+    let profile = repo.get(profile_id).ok().flatten();
+    Json(json!({
+        "active_profile_id": profile_id,
+        "profile": profile,
+    }))
+}
+
+async fn switch_profile(
+    State(state): State<AppState>,
+    Json(body): Json<SwitchProfile>,
+) -> impl IntoResponse {
+    let repo = ProfileRepo::new(state.db.clone());
+    match repo.get(body.profile_id) {
+        Ok(Some(profile)) => {
+            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+            settings.set("active_profile_id", &body.profile_id.to_string()).ok();
+            Json(json!({
+                "active_profile_id": body.profile_id,
+                "profile": profile,
+            })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "profile not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn deactivate_profile(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("active_profile_id", "1").ok();
+    Json(json!({ "active_profile_id": serde_json::Value::Null }))
+}
+
+async fn activate_profile(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ProfileRepo::new(state.db.clone());
+    match repo.get(id) {
+        Ok(Some(profile)) => {
+            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+            settings.set("active_profile_id", &id.to_string()).ok();
+            Json(json!({
+                "active_profile_id": id,
+                "profile": profile,
+            })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "profile not found").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn get_profile(

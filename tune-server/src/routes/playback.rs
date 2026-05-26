@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
+use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
@@ -83,6 +84,11 @@ struct QueueAddRequest {
 }
 
 #[derive(Deserialize)]
+struct SaveAsPlaylistRequest {
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct QueueMoveRequest {
     from_position: i64,
     to_position: i64,
@@ -112,6 +118,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/move", post(queue_move))
         .route("/{id}/queue/jump", post(queue_jump))
         .route("/{id}/queue/clear", post(queue_clear))
+        .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
         .route("/{id}/dsp", post(set_dsp))
@@ -418,6 +425,28 @@ async fn queue_clear(
     queue_repo.clear(zone_id).ok();
     state.playback.stop(zone_id).await;
     StatusCode::NO_CONTENT
+}
+
+async fn save_queue_as_playlist(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<SaveAsPlaylistRequest>,
+) -> impl IntoResponse {
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let items = queue_repo.get_queue(zone_id).unwrap_or_default();
+    if items.is_empty() {
+        return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
+    }
+    let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
+    let name = body.name.unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
+    let playlist_repo = PlaylistRepo::new(state.db);
+    match playlist_repo.create(&name, None) {
+        Ok(id) => {
+            playlist_repo.add_tracks(id, &track_ids, None).ok();
+            (StatusCode::CREATED, Json(json!({"id": id, "name": name, "track_count": track_ids.len()}))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

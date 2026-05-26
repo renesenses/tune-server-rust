@@ -103,6 +103,21 @@ impl PlaylistRepo {
         Ok(inserted)
     }
 
+    pub fn remove_tracks_at_positions(&self, playlist_id: i64, positions: &[i64]) -> Result<usize, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut removed = 0usize;
+        for pos in positions {
+            let n = conn
+                .execute(
+                    "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND position = ?2",
+                    params![playlist_id, pos],
+                )
+                .map_err(|e| e.to_string())?;
+            removed += n;
+        }
+        Ok(removed)
+    }
+
     pub fn remove_track(&self, playlist_id: i64, position: i64) -> Result<(), String> {
         self.db.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ? AND position = ?",

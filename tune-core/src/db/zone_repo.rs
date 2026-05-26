@@ -79,6 +79,22 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_output_device(&self, id: i64, device_id: &str) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET output_device_id = ? WHERE id = ?",
+            &[&device_id as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_output_type(&self, id: i64, output_type: &str) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET output_type = ? WHERE id = ?",
+            &[&output_type as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete(&self, id: i64) -> Result<(), String> {
         self.db.execute("DELETE FROM zones WHERE id = ?", &[&id])?;
         Ok(())
