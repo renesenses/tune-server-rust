@@ -58,7 +58,8 @@ impl AudioFormat {
             Self::Ogg => "libvorbis",
             Self::Opus => "libopus",
             Self::Aiff => "pcm_s16be",
-            Self::Dsd | Self::WavPack | Self::Ape => "pcm_s16le",
+            Self::Dsd => "pcm_s24le",
+            Self::WavPack | Self::Ape => "pcm_s24le",
         }
     }
 
@@ -107,6 +108,49 @@ pub fn can_passthrough(
         && source_bit_depth <= target.max_bit_depth
 }
 
+impl AudioFormat {
+    /// Returns true if this format needs FFmpeg transcoding before DLNA streaming.
+    /// FLAC, WAV, MP3, AAC can be served as raw files; everything else must be transcoded.
+    pub fn needs_transcode_for_dlna(&self) -> bool {
+        matches!(self, Self::Aiff | Self::Dsd | Self::WavPack | Self::Ape)
+    }
+
+    /// Returns the target output format for DLNA transcoding.
+    /// AIFF -> FLAC (lossless PCM container widely supported by DLNA renderers)
+    /// DSD/WavPack/APE -> WAV (universal PCM, avoids re-encoding overhead)
+    pub fn dlna_transcode_target(&self) -> AudioFormat {
+        match self {
+            Self::Aiff => AudioFormat::Flac,
+            Self::Dsd | Self::WavPack | Self::Ape => AudioFormat::Wav,
+            other => *other,
+        }
+    }
+
+    /// For DSD sources, compute the appropriate PCM output sample rate.
+    /// DSD64 (2.8224 MHz) -> 176400 Hz (4x44100)
+    /// DSD128 (5.6448 MHz) -> 352800 Hz (8x44100)
+    /// DSD256 (11.2896 MHz) -> 352800 Hz (capped for compatibility)
+    /// DSD512 (22.5792 MHz) -> 352800 Hz (capped for compatibility)
+    /// For non-DSD formats, returns the source sample rate unchanged.
+    pub fn dsd_output_sample_rate(&self, source_sample_rate: u32) -> u32 {
+        if *self != Self::Dsd {
+            return source_sample_rate;
+        }
+        // DSD sample rates are in the MHz range (e.g. 2_822_400 for DSD64)
+        // Some scanners store them divided (e.g. 2822400 or 5644800)
+        match source_sample_rate {
+            r if r >= 11_000_000 => 352_800,  // DSD256/512 -> cap at 352.8kHz
+            r if r >= 5_000_000 => 352_800,   // DSD128 -> 352.8kHz
+            r if r >= 2_000_000 => 176_400,   // DSD64 -> 176.4kHz
+            // If scanner stored a lower value (some report 2822 or 5644), scale up
+            r if r >= 5000 => 352_800,         // DSD128-ish
+            r if r >= 2000 => 176_400,         // DSD64-ish
+            // Fallback: safe default for DSD
+            _ => 176_400,
+        }
+    }
+}
+
 pub fn best_output_format(
     source_format: AudioFormat,
     source_sample_rate: u32,
@@ -123,4 +167,152 @@ pub fn best_output_format(
         }
     }
     *target.formats.first().unwrap_or(&AudioFormat::Wav)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aiff_needs_transcode() {
+        assert!(AudioFormat::Aiff.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn dsd_needs_transcode() {
+        assert!(AudioFormat::Dsd.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn wavpack_needs_transcode() {
+        assert!(AudioFormat::WavPack.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn ape_needs_transcode() {
+        assert!(AudioFormat::Ape.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn flac_no_transcode() {
+        assert!(!AudioFormat::Flac.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn wav_no_transcode() {
+        assert!(!AudioFormat::Wav.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn mp3_no_transcode() {
+        assert!(!AudioFormat::Mp3.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn aiff_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Aiff.dlna_transcode_target(), AudioFormat::Flac);
+    }
+
+    #[test]
+    fn dsd_transcodes_to_wav() {
+        assert_eq!(AudioFormat::Dsd.dlna_transcode_target(), AudioFormat::Wav);
+    }
+
+    #[test]
+    fn wavpack_transcodes_to_wav() {
+        assert_eq!(AudioFormat::WavPack.dlna_transcode_target(), AudioFormat::Wav);
+    }
+
+    #[test]
+    fn ape_transcodes_to_wav() {
+        assert_eq!(AudioFormat::Ape.dlna_transcode_target(), AudioFormat::Wav);
+    }
+
+    #[test]
+    fn flac_target_is_self() {
+        assert_eq!(AudioFormat::Flac.dlna_transcode_target(), AudioFormat::Flac);
+    }
+
+    #[test]
+    fn dsd64_sample_rate() {
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(2_822_400), 176_400);
+    }
+
+    #[test]
+    fn dsd128_sample_rate() {
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(5_644_800), 352_800);
+    }
+
+    #[test]
+    fn dsd256_sample_rate() {
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(11_289_600), 352_800);
+    }
+
+    #[test]
+    fn non_dsd_passthrough_rate() {
+        assert_eq!(AudioFormat::Flac.dsd_output_sample_rate(96000), 96000);
+        assert_eq!(AudioFormat::Aiff.dsd_output_sample_rate(44100), 44100);
+    }
+
+    #[test]
+    fn dsd_fallback_rate() {
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(0), 176_400);
+    }
+
+    #[test]
+    fn dsd_codec_is_24bit() {
+        assert_eq!(AudioFormat::Dsd.ffmpeg_codec_arg(), "pcm_s24le");
+    }
+
+    #[test]
+    fn from_extension_dsf() {
+        assert_eq!(AudioFormat::from_extension("dsf"), Some(AudioFormat::Dsd));
+    }
+
+    #[test]
+    fn from_extension_dff() {
+        assert_eq!(AudioFormat::from_extension("dff"), Some(AudioFormat::Dsd));
+    }
+
+    #[test]
+    fn from_extension_aiff() {
+        assert_eq!(AudioFormat::from_extension("aiff"), Some(AudioFormat::Aiff));
+    }
+
+    #[test]
+    fn from_extension_aif() {
+        assert_eq!(AudioFormat::from_extension("aif"), Some(AudioFormat::Aiff));
+    }
+
+    #[test]
+    fn passthrough_flac() {
+        let caps = dlna_capabilities();
+        assert!(can_passthrough(AudioFormat::Flac, 96000, 24, &caps));
+    }
+
+    #[test]
+    fn no_passthrough_aiff() {
+        let caps = dlna_capabilities();
+        assert!(!can_passthrough(AudioFormat::Aiff, 44100, 16, &caps));
+    }
+
+    #[test]
+    fn no_passthrough_dsd() {
+        let caps = dlna_capabilities();
+        assert!(!can_passthrough(AudioFormat::Dsd, 2_822_400, 1, &caps));
+    }
+
+    #[test]
+    fn best_output_for_aiff() {
+        let caps = dlna_capabilities();
+        let result = best_output_format(AudioFormat::Aiff, 44100, 16, &caps);
+        assert_eq!(result, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn best_output_for_dsd() {
+        let caps = dlna_capabilities();
+        let result = best_output_format(AudioFormat::Dsd, 2_822_400, 1, &caps);
+        assert_eq!(result, AudioFormat::Flac);
+    }
 }
