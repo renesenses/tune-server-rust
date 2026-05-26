@@ -104,6 +104,72 @@ impl PlayQueueRepo {
         Ok(())
     }
 
+    pub fn set_streaming_queue(&self, zone_id: i64, tracks: &[(String, String, String, Option<String>, Option<String>, i64)]) -> Result<(), String> {
+        let conn = self.db.connection().lock().unwrap();
+        conn.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS streaming_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zone_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                source TEXT,
+                source_id TEXT,
+                title TEXT,
+                artist TEXT,
+                album TEXT,
+                cover_url TEXT,
+                duration_ms INTEGER DEFAULT 0
+            )"
+        ).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM streaming_queue WHERE zone_id = ?", params![zone_id])
+            .map_err(|e| e.to_string())?;
+        for (i, (source_id, title, artist, album, cover_url, duration_ms)) in tracks.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![zone_id, i as i64, source_id, title, artist, album, cover_url, duration_ms],
+            ).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn get_streaming_queue(&self, zone_id: i64) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS streaming_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zone_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                source TEXT,
+                source_id TEXT,
+                title TEXT,
+                artist TEXT,
+                album TEXT,
+                cover_url TEXT,
+                duration_ms INTEGER DEFAULT 0
+            )"
+        ).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT source_id, title, artist, album, cover_url, duration_ms, position FROM streaming_queue WHERE zone_id = ? ORDER BY position")
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![zone_id], |row| {
+                Ok(serde_json::json!({
+                    "source_id": row.get::<_, Option<String>>(0).ok().flatten(),
+                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "cover_path": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "duration_ms": row.get::<_, i64>(5).unwrap_or(0),
+                    "position": row.get::<_, i64>(6).unwrap_or(0),
+                }))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
     pub fn count(&self, zone_id: i64) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         conn.query_row(

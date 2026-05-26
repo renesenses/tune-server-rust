@@ -199,6 +199,11 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
+                let queue_items: Vec<_> = tracks.iter().map(|t| (
+                    t.id.clone(), t.title.clone(), t.artist.clone(),
+                    t.album.clone(), t.cover_url.clone(), t.duration_ms as i64,
+                )).collect();
+                queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
                 state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
                 Json(build_zone_json(&state, zone_id).await).into_response()
             }
@@ -248,6 +253,11 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
+                let queue_items: Vec<_> = tracks.iter().map(|t| (
+                    t.id.clone(), t.title.clone(), t.artist.clone(),
+                    t.album.clone(), t.cover_url.clone(), t.duration_ms as i64,
+                )).collect();
+                queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
                 state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
                 Json(build_zone_json(&state, zone_id).await).into_response()
             }
@@ -462,9 +472,14 @@ async fn get_queue(
 ) -> Json<Value> {
     let queue_repo = PlayQueueRepo::new(state.db);
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    let position = items.iter().position(|i| i.is_current).unwrap_or(0);
-    let length = items.len();
-    Json(json!({ "tracks": items, "position": position, "length": length }))
+    if !items.is_empty() {
+        let position = items.iter().position(|i| i.is_current).unwrap_or(0);
+        let length = items.len();
+        return Json(json!({ "tracks": items, "position": position, "length": length }));
+    }
+    let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
+    let ps = state.playback.get_state(zone_id).await;
+    Json(json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }))
 }
 
 async fn queue_add(
