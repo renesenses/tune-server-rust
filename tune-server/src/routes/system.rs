@@ -601,8 +601,9 @@ async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
 async fn cleanup(State(state): State<AppState>) -> Json<Value> {
     let album_repo = AlbumRepo::new(state.db.clone());
-    let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
 
+    let merged_albums = merge_duplicate_albums(&state.db);
+    let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
     let tracks = TrackRepo::new(state.db.clone()).deduplicate().unwrap_or(0);
 
     let db_optimized = state
@@ -611,10 +612,49 @@ async fn cleanup(State(state): State<AppState>) -> Json<Value> {
         .is_ok();
 
     Json(json!({
+        "duplicate_albums_merged": merged_albums,
         "orphan_albums_deleted": orphan_albums,
         "duplicate_tracks_removed": tracks,
         "db_optimized": db_optimized,
     }))
+}
+
+fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> i64 {
+    let conn = db.connection().lock().unwrap();
+    let dupes: Vec<(String, String)> = conn
+        .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut deleted = 0i64;
+    for (_title, ids_str) in &dupes {
+        let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
+        if ids.len() < 2 { continue; }
+        let mut best_id = ids[0];
+        let mut best_count = 0i64;
+        for &aid in &ids {
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                rusqlite::params![aid], |r| r.get(0),
+            ).unwrap_or(0);
+            if cnt > best_count { best_count = cnt; best_id = aid; }
+        }
+        for &aid in &ids {
+            if aid != best_id {
+                conn.execute("UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    rusqlite::params![best_id, aid]).ok();
+                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid]).ok();
+                deleted += 1;
+            }
+        }
+    }
+    conn.execute_batch(
+        "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
+    ).ok();
+    deleted
 }
 
 #[derive(Deserialize)]
