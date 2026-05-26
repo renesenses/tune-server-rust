@@ -22,6 +22,7 @@ reqwest = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 rusqlite = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

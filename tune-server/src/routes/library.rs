@@ -60,7 +60,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/rescan", post(rescan_track))
         .route("/tracks/{id}/quick-fav", post(quick_fav_track))
         .route("/albums/{id}/quick-fav", post(quick_fav_album))
-        .route("/genre-tree", get(genre_tree))
+        .route("/genre-tree", get(genre_tree).put(update_genre_tree))
         .route("/albums/top-rated", get(top_rated_albums))
         .route("/albums/{id}/rate", post(rate_album))
         .route("/albums/{id}/rating", get(get_album_rating))
@@ -543,6 +543,15 @@ async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
         "genres": genres,
         "total": genres.len(),
     }))
+}
+
+async fn update_genre_tree(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("genre_tree", &body.to_string()).ok();
+    Json(json!({"updated": true}))
 }
 
 async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {

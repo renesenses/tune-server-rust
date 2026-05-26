@@ -24,6 +24,8 @@ pub fn router() -> Router<AppState> {
         .route("/{device_id}/status", get(device_status))
         .route("/{device_id}/buffer-stats", get(device_buffer_stats))
         .route("/{device_id}/buffer", axum::routing::patch(set_device_buffer))
+        .route("/clear", post(clear_devices))
+        .route("/{device_id}", axum::routing::delete(delete_device))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
@@ -229,4 +231,26 @@ async fn set_device_buffer(
         "manual_override": !new_auto,
     }))
     .into_response()
+}
+
+async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
+    let outputs = state.outputs.lock().await;
+    let ids: Vec<String> = outputs.list();
+    drop(outputs);
+    let mut removed = 0;
+    for id in ids {
+        let mut outputs = state.outputs.lock().await;
+        outputs.remove(&id);
+        removed += 1;
+    }
+    Json(json!({"cleared": removed}))
+}
+
+async fn delete_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    let mut outputs = state.outputs.lock().await;
+    outputs.remove(&device_id);
+    StatusCode::NO_CONTENT
 }

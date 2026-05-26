@@ -68,6 +68,12 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/favorites/{fav_type}/{item_id}", post(service_add_favorite).delete(service_remove_favorite))
         .route("/{service}/enable", post(service_enable))
         .route("/{service}/disable", post(service_disable))
+        .route("/{service}/auth/url", get(service_auth_url))
+        .route("/youtube/home", get(youtube_home))
+        .route("/youtube/charts", get(youtube_charts))
+        .route("/youtube/moods", get(youtube_moods))
+        .route("/youtube/library", get(youtube_library))
+        .route("/spotify/callback", get(spotify_callback))
 }
 
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
@@ -545,4 +551,73 @@ async fn service_disable(
     let settings = SettingsRepo::new(state.db);
     settings.set(&format!("streaming_{service}_enabled"), "false").ok();
     Json(json!({"service": service, "enabled": false}))
+}
+
+async fn service_auth_url(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> impl IntoResponse {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match svc.authenticate(&json!({"device_flow": true})).await {
+        Ok(status) => Json(json!({
+            "url": status.verification_url,
+            "user_code": status.user_code,
+        })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn youtube_home() -> Json<Value> {
+    Json(json!({"sections": [], "message": "YouTube home not yet implemented"}))
+}
+
+async fn youtube_charts() -> Json<Value> {
+    Json(json!({"charts": [], "message": "YouTube charts not yet implemented"}))
+}
+
+async fn youtube_moods() -> Json<Value> {
+    Json(json!({"moods": [], "message": "YouTube moods not yet implemented"}))
+}
+
+async fn youtube_library() -> Json<Value> {
+    Json(json!({"playlists": [], "albums": [], "artists": []}))
+}
+
+#[derive(Deserialize)]
+struct SpotifyCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn spotify_callback(
+    State(state): State<AppState>,
+    Query(q): Query<SpotifyCallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(ref error) = q.error {
+        return Json(json!({"error": error})).into_response();
+    }
+    let Some(code) = q.code else {
+        return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
+    };
+    let svc = match get_svc(&state, "spotify").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match svc.authenticate(&json!({"code": code, "state": q.state})).await {
+        Ok(status) => {
+            drop(svc);
+            state.save_tokens().await;
+            Json(json!({
+                "authenticated": status.authenticated,
+                "username": status.username,
+            })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }

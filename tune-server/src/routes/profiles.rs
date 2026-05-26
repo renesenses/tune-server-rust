@@ -6,7 +6,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
+use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
@@ -44,6 +46,22 @@ struct SwitchProfile {
     pin: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CheckFavoritesBody {
+    item_type: String,
+    item_ids: Vec<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_profiles).post(create_profile))
@@ -51,11 +69,16 @@ pub fn router() -> Router<AppState> {
         .route("/current", get(get_active_profile))
         .route("/switch", post(switch_profile))
         .route("/deactivate", post(deactivate_profile))
+        .route("/search", get(search_profiles))
         .route("/{id}", get(get_profile).put(update_profile).delete(delete_profile))
         .route("/{id}/activate", post(activate_profile))
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
+        .route("/{id}/settings", get(profile_settings).post(update_profile_settings))
+        .route("/{id}/stats", get(profile_stats))
+        .route("/{id}/history", get(profile_history))
+        .route("/{id}/favorites/check", post(check_favorites))
 }
 
 async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
@@ -204,4 +227,114 @@ async fn remove_favorite(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+// --- Advanced profile routes ---
+
+async fn profile_settings(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("profile_{id}_settings");
+    let value = settings.get(&key).ok().flatten().unwrap_or_else(|| "{}".to_string());
+    let parsed: Value = serde_json::from_str(&value).unwrap_or(json!({}));
+    Json(parsed)
+}
+
+async fn update_profile_settings(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("profile_{id}_settings");
+    let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+    match settings.set(&key, &serialized) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn profile_stats(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let result: Result<Vec<(String, i64)>, String> = (|| {
+        let conn = state.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![id], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })();
+
+    match result {
+        Ok(rows) => {
+            let mut stats = json!({});
+            for (item_type, count) in &rows {
+                stats[item_type] = json!(count);
+            }
+            Json(json!({
+                "profile_id": id,
+                "favorites_by_type": stats,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn profile_history(
+    State(state): State<AppState>,
+    Path(_id): Path<i64>,
+    Query(q): Query<HistoryQuery>,
+) -> Json<Value> {
+    let repo = HistoryRepo::new(state.db);
+    let limit = q.limit.unwrap_or(50);
+    let items = repo.recent(limit).unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn search_profiles(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Json<Value> {
+    let repo = ProfileRepo::new(state.db);
+    let all = repo.list().unwrap_or_default();
+    let query = q.q.unwrap_or_default().to_lowercase();
+    if query.is_empty() {
+        return Json(json!(all));
+    }
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|p| p.name.to_lowercase().contains(&query))
+        .collect();
+    Json(json!(filtered))
+}
+
+async fn check_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CheckFavoritesBody>,
+) -> Json<Value> {
+    let repo = ProfileRepo::new(state.db);
+    let results: Vec<Value> = body
+        .item_ids
+        .iter()
+        .map(|&item_id| {
+            let is_fav = repo.is_favorite(id, &body.item_type, item_id).unwrap_or(false);
+            json!({ "item_id": item_id, "is_favorite": is_fav })
+        })
+        .collect();
+    Json(json!(results))
 }

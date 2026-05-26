@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -6,7 +8,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
@@ -53,13 +57,19 @@ struct ReorderTracksBody {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_playlists).post(create_playlist))
+        .route("/all", get(list_all_playlists))
+        .route("/shared/{token}", get(get_shared_playlist))
+        .route("/transfer", post(transfer_playlist))
+        .route("/diff", post(diff_playlists))
+        .route("/import/m3u", post(import_m3u_file))
+        .route("/import/m3u-url", post(import_m3u_url))
         .route("/{id}", get(get_playlist).put(update_playlist).delete(delete_playlist))
         .route("/{id}/tracks", get(get_tracks).post(add_tracks).delete(remove_tracks_batch).put(reorder_tracks))
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
-        .route("/import/m3u", post(import_m3u_file))
-        .route("/import/m3u-url", post(import_m3u_url))
+        .route("/{id}/share", post(share_playlist))
+        .route("/{id}/recover", post(recover_playlist))
 }
 
 async fn list_playlists(
@@ -344,6 +354,20 @@ async fn import_m3u_file(
 }
 
 #[derive(Deserialize)]
+struct TransferPlaylist {
+    playlist_id: i64,
+    #[allow(dead_code)]
+    target_service: Option<String>,
+    zone_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct DiffPlaylists {
+    playlist_id_a: i64,
+    playlist_id_b: i64,
+}
+
+#[derive(Deserialize)]
 struct ImportM3uUrl {
     url: String,
     name: Option<String>,
@@ -392,4 +416,137 @@ async fn import_m3u_url(
         })),
     )
         .into_response()
+}
+
+// --- Advanced playlist routes ---
+
+async fn list_all_playlists(State(state): State<AppState>) -> Json<Value> {
+    let repo = PlaylistRepo::new(state.db);
+    let items = repo.list(99999, 0).unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn share_playlist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db.clone());
+    match repo.get(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+
+    // Generate a pseudo-random token from high-resolution clock
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let token = format!("{:032x}", nanos ^ (id as u128 * 0x517cc1b727220a95));
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("playlist_share_{id}");
+    if let Err(e) = settings.set(&key, &token) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
+    Json(json!({
+        "token": token,
+        "url": format!("/api/v1/playlists/shared/{token}"),
+    }))
+    .into_response()
+}
+
+async fn get_shared_playlist(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db.clone());
+    let all = settings.all().unwrap_or_default();
+
+    let playlist_id = all
+        .iter()
+        .find(|(k, v)| k.starts_with("playlist_share_") && v == &token)
+        .and_then(|(k, _)| k.strip_prefix("playlist_share_").and_then(|s| s.parse::<i64>().ok()));
+
+    let playlist_id = match playlist_id {
+        Some(id) => id,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let repo = PlaylistRepo::new(state.db.clone());
+    let playlist = match repo.get(playlist_id) {
+        Ok(Some(p)) => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let track_ids = repo.get_track_ids(playlist_id).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
+
+    Json(json!({
+        "playlist": playlist,
+        "tracks": tracks,
+    }))
+    .into_response()
+}
+
+async fn recover_playlist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db);
+    match repo.get(id) {
+        Ok(Some(pl)) => Json(json!(pl)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn transfer_playlist(
+    State(state): State<AppState>,
+    Json(body): Json<TransferPlaylist>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db.clone());
+    let track_ids = match repo.get_track_ids(body.playlist_id) {
+        Ok(ids) => ids,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let zone_id = body.zone_id.unwrap_or(1);
+    let queue = PlayQueueRepo::new(state.db);
+    if let Err(e) = queue.add_tracks(zone_id, &track_ids, None) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
+    Json(json!({ "transferred": track_ids.len() })).into_response()
+}
+
+async fn diff_playlists(
+    State(state): State<AppState>,
+    Json(body): Json<DiffPlaylists>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db);
+    let ids_a: HashSet<i64> = repo
+        .get_track_ids(body.playlist_id_a)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let ids_b: HashSet<i64> = repo
+        .get_track_ids(body.playlist_id_b)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let only_a: Vec<i64> = ids_a.difference(&ids_b).copied().collect();
+    let only_b: Vec<i64> = ids_b.difference(&ids_a).copied().collect();
+    let common: Vec<i64> = ids_a.intersection(&ids_b).copied().collect();
+
+    Json(json!({
+        "only_in_a": only_a,
+        "only_in_b": only_b,
+        "common": common,
+        "count_only_a": only_a.len(),
+        "count_only_b": only_b.len(),
+        "count_common": common.len(),
+    }))
+    .into_response()
 }

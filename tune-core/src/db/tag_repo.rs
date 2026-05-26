@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -46,9 +46,60 @@ impl TagRepo {
         Ok(self.db.last_insert_rowid())
     }
 
+    pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, color FROM tags WHERE id = ?",
+            params![id],
+            |row| {
+                Ok(Tag {
+                    id: row.get(0).ok(),
+                    name: row.get(1).unwrap_or_default(),
+                    color: row.get(2).unwrap_or_else(|_| "#808080".into()),
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
+        if let Some(name) = name {
+            self.db.execute(
+                "UPDATE tags SET name = ? WHERE id = ?",
+                &[&name as &dyn rusqlite::types::ToSql, &id],
+            )?;
+        }
+        if let Some(color) = color {
+            self.db.execute(
+                "UPDATE tags SET color = ? WHERE id = ?",
+                &[&color as &dyn rusqlite::types::ToSql, &id],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: i64) -> Result<(), String> {
         self.db.execute("DELETE FROM tags WHERE id = ?", &[&id])?;
         Ok(())
+    }
+
+    pub fn all_items_by_tag(&self, tag_id: i64) -> Result<Vec<(String, i64)>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT item_type, item_id FROM item_tags WHERE tag_id = ? ORDER BY item_type, item_id")
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![tag_id], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
     }
 
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {

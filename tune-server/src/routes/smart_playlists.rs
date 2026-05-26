@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,11 +27,21 @@ struct UpdateSmartPlaylist {
     max_tracks: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct PreviewRequest {
+    rules: Value,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_tracks: Option<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_smart_playlists).post(create_smart_playlist))
         .route("/{id}", get(get_smart_playlist).put(update_smart_playlist).delete(delete_smart_playlist))
         .route("/{id}/tracks", get(resolve_tracks))
+        .route("/{id}/albums", get(smart_collection_albums))
+        .route("/preview", post(preview_smart_collection))
 }
 
 async fn list_smart_playlists(State(state): State<AppState>) -> Json<Value> {
@@ -152,31 +162,14 @@ async fn delete_smart_playlist(
     StatusCode::NO_CONTENT
 }
 
-async fn resolve_tracks(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
-    let rules_result = conn.query_row(
-        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
-                row.get::<_, String>(1).unwrap_or_else(|_| "title".into()),
-                row.get::<_, String>(2).unwrap_or_else(|_| "asc".into()),
-                row.get::<_, Option<i64>>(3).ok().flatten(),
-            ))
-        },
-    );
-    drop(conn);
-
-    let (rules_json, sort_by, sort_order, max_tracks) = match rules_result {
-        Ok(v) => v,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let rules: Vec<Value> = serde_json::from_str(&rules_json).unwrap_or_default();
+/// Build WHERE, ORDER, LIMIT clauses from smart playlist criteria.
+fn build_smart_query(
+    rules_json: &str,
+    sort_by: &str,
+    sort_order: &str,
+    max_tracks: Option<i64>,
+) -> (String, String, String) {
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
 
     let mut conditions = Vec::new();
     for rule in &rules {
@@ -210,7 +203,7 @@ async fn resolve_tracks(
 
     let order = format!(
         "ORDER BY {} {}",
-        match sort_by.as_str() {
+        match sort_by {
             "artist" => "ar.name",
             "album" => "al.title",
             "year" => "t.year",
@@ -224,14 +217,27 @@ async fn resolve_tracks(
         .map(|n| format!("LIMIT {n}"))
         .unwrap_or_default();
 
+    (where_clause, order, limit_clause)
+}
+
+/// Execute a smart query and return track rows as JSON values.
+fn execute_smart_track_query(
+    state: &AppState,
+    where_clause: &str,
+    order: &str,
+    limit_clause: &str,
+) -> Vec<Value> {
     let sql = format!(
-        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id {} {} {}",
+        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         {} {} {}",
         where_clause, order, limit_clause
     );
 
     let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare(&sql)
+    conn.prepare(&sql)
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
                 Ok(json!({
@@ -243,12 +249,93 @@ async fn resolve_tracks(
                     "format": row.get::<_, Option<String>>(5).ok().flatten(),
                     "genre": row.get::<_, Option<String>>(6).ok().flatten(),
                     "year": row.get::<_, Option<i32>>(7).ok().flatten(),
+                    "album_id": row.get::<_, Option<i64>>(8).ok().flatten(),
+                    "album_cover": row.get::<_, Option<String>>(9).ok().flatten(),
                 }))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .unwrap_or_default()
+}
+
+/// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
+fn load_smart_criteria(state: &AppState, id: i64) -> Option<(String, String, String, Option<i64>)> {
+    let conn = state.db.connection().lock().unwrap();
+    conn.query_row(
+        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
+        rusqlite::params![id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
+                row.get::<_, String>(1).unwrap_or_else(|_| "title".into()),
+                row.get::<_, String>(2).unwrap_or_else(|_| "asc".into()),
+                row.get::<_, Option<i64>>(3).ok().flatten(),
+            ))
+        },
+    )
+    .ok()
+}
+
+async fn resolve_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let (where_clause, order, limit_clause) =
+        build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
+    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
 
     Json(json!(items)).into_response()
+}
+
+async fn smart_collection_albums(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let (where_clause, order, limit_clause) =
+        build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
+    let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
+
+    // Group tracks by album_id, dedup albums
+    let mut seen = std::collections::HashSet::new();
+    let mut albums: Vec<Value> = Vec::new();
+    for track in &tracks {
+        if let Some(album_id) = track.get("album_id").and_then(|v| v.as_i64()) {
+            if seen.insert(album_id) {
+                albums.push(json!({
+                    "album_id": album_id,
+                    "album_title": track.get("album_title"),
+                    "artist_name": track.get("artist_name"),
+                    "album_cover": track.get("album_cover"),
+                    "year": track.get("year"),
+                }));
+            }
+        }
+    }
+
+    Json(json!({"albums": albums, "total": albums.len()})).into_response()
+}
+
+async fn preview_smart_collection(
+    State(state): State<AppState>,
+    Json(body): Json<PreviewRequest>,
+) -> impl IntoResponse {
+    let rules_json = body.rules.to_string();
+    let sort_by = body.sort_by.as_deref().unwrap_or("title");
+    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+
+    let (where_clause, order, limit_clause) =
+        build_smart_query(&rules_json, sort_by, sort_order, body.max_tracks);
+    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
+
+    Json(json!({"tracks": items, "total": items.len()}))
 }
