@@ -168,6 +168,168 @@ async fn main() {
         });
     }
 
+    // File watcher: watch music dirs and rescan/remove tracks on changes
+    {
+        let db_for_watcher = state.db.clone();
+        let settings = tune_core::db::settings_repo::SettingsRepo::new(db_for_watcher.clone());
+        let music_dirs: Vec<String> = settings
+            .get("music_dirs")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        if !music_dirs.is_empty() {
+            match tune_core::scanner::watcher::FileWatcher::new(music_dirs) {
+                Ok(watcher) => {
+                    info!("file_watcher_started");
+                    tokio::task::spawn_blocking(move || {
+                        let db = db_for_watcher;
+                        loop {
+                            let changes = watcher.poll_debounced(
+                                std::time::Duration::from_secs(2),
+                                std::time::Duration::from_millis(500),
+                            );
+                            for change in changes {
+                                match change.change_type {
+                                    tune_core::scanner::watcher::ChangeType::Added
+                                    | tune_core::scanner::watcher::ChangeType::Modified => {
+                                        let files: Vec<std::path::PathBuf> =
+                                            vec![std::path::PathBuf::from(&change.path)];
+                                        let (scanned, _) =
+                                            tune_core::scanner::walker::scan_files_parallel(
+                                                &files, true, None,
+                                            );
+                                        let track_repo =
+                                            tune_core::db::track_repo::TrackRepo::new(db.clone());
+                                        let artist_repo =
+                                            tune_core::db::artist_repo::ArtistRepo::new(
+                                                db.clone(),
+                                            );
+                                        let album_repo =
+                                            tune_core::db::album_repo::AlbumRepo::new(db.clone());
+
+                                        for sf in &scanned {
+                                            let Some(ref meta) = sf.metadata else {
+                                                continue;
+                                            };
+
+                                            // Remove existing entry if modified
+                                            if change.change_type
+                                                == tune_core::scanner::watcher::ChangeType::Modified
+                                            {
+                                                track_repo.delete_by_path(&sf.path).ok();
+                                            }
+
+                                            let artist = artist_repo
+                                                .get_or_create(
+                                                    meta.artist
+                                                        .as_deref()
+                                                        .unwrap_or("Unknown Artist"),
+                                                    meta.musicbrainz_artist_id.as_deref(),
+                                                    meta.album_artist_sort.as_deref(),
+                                                )
+                                                .ok();
+                                            let artist_id =
+                                                artist.as_ref().and_then(|a| a.id);
+
+                                            let album =
+                                                meta.album.as_ref().and_then(|title| {
+                                                    album_repo
+                                                        .get_or_create(
+                                                            title,
+                                                            artist_id.unwrap_or(0),
+                                                            meta.year.map(|y| y as i32),
+                                                        )
+                                                        .ok()
+                                                });
+                                            let album_id =
+                                                album.as_ref().and_then(|a| a.id);
+
+                                            if let Some(aid) = album_id {
+                                                let cache_dir = std::env::var("TUNE_ARTWORK_DIR")
+                                                    .map(std::path::PathBuf::from)
+                                                    .unwrap_or_else(|_| {
+                                                        std::path::PathBuf::from("artwork_cache")
+                                                    });
+                                                if let Some(hash) =
+                                                    tune_core::artwork::get_or_extract(
+                                                        std::path::Path::new(&sf.path),
+                                                        &cache_dir,
+                                                    )
+                                                {
+                                                    album_repo
+                                                        .update_cover_path(aid, &hash)
+                                                        .ok();
+                                                }
+                                                album_repo.update_track_count(aid).ok();
+                                                album_repo
+                                                    .update_quality_from_tracks(aid)
+                                                    .ok();
+                                            }
+
+                                            let mut track =
+                                                tune_core::db::models::Track::new(
+                                                    meta.title.clone().unwrap_or_else(|| {
+                                                        std::path::Path::new(&sf.path)
+                                                            .file_stem()
+                                                            .map(|s| {
+                                                                s.to_string_lossy().to_string()
+                                                            })
+                                                            .unwrap_or_default()
+                                                    }),
+                                                );
+                                            track.album_id = album_id;
+                                            track.artist_id = artist_id;
+                                            track.artist_name = meta.artist.clone();
+                                            track.album_title = meta.album.clone();
+                                            track.disc_number =
+                                                meta.disc_number.unwrap_or(1) as i32;
+                                            track.track_number =
+                                                meta.track_number.unwrap_or(0) as i32;
+                                            track.duration_ms =
+                                                meta.duration_ms.unwrap_or(0) as i64;
+                                            track.file_path = Some(sf.path.clone());
+                                            track.format = meta.format.clone();
+                                            track.sample_rate =
+                                                meta.sample_rate.map(|s| s as i32);
+                                            track.bit_depth =
+                                                meta.bit_depth.map(|b| b as i32);
+                                            track.channels = meta.channels.unwrap_or(2) as i32;
+                                            track.file_size = Some(sf.file_size as i64);
+                                            track.file_mtime = Some(sf.mtime as f64);
+                                            track.audio_hash = sf.audio_hash.clone();
+                                            track.genre = meta.genre.clone();
+                                            track.year = meta.year.map(|y| y as i32);
+                                            track.label = meta.label.clone();
+                                            track.isrc = meta.isrc.clone();
+                                            track.musicbrainz_recording_id =
+                                                meta.musicbrainz_recording_id.clone();
+
+                                            if track_repo.create(&track).is_ok() {
+                                                info!(path = %sf.path, "watcher_track_added");
+                                            }
+                                        }
+                                    }
+                                    tune_core::scanner::watcher::ChangeType::Deleted => {
+                                        let track_repo =
+                                            tune_core::db::track_repo::TrackRepo::new(db.clone());
+                                        if track_repo.delete_by_path(&change.path).is_ok() {
+                                            info!(path = %change.path, "watcher_track_removed");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "file_watcher_init_failed");
+                }
+            }
+        }
+    }
+
     {
         let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
         {

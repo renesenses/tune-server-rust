@@ -18,6 +18,7 @@ pub struct SpotifyService {
     username: Option<String>,
     code_verifier: Option<String>,
     redirect_uri: String,
+    token_expires: Option<std::time::Instant>,
 }
 
 impl Default for SpotifyService {
@@ -40,6 +41,7 @@ impl SpotifyService {
             code_verifier: None,
             redirect_uri: std::env::var("SPOTIFY_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:8085/api/v1/streaming/spotify/callback".into()),
+            token_expires: None,
         }
     }
 
@@ -151,6 +153,8 @@ impl StreamingService for SpotifyService {
 
             self.access_token = data["access_token"].as_str().map(Into::into);
             self.refresh_token = data["refresh_token"].as_str().map(Into::into);
+            let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+            self.token_expires = Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
             let me = self.api_get("/me").await.ok();
             self.username = me.and_then(|v| v["display_name"].as_str().map(Into::into));
             info!(username = ?self.username, "spotify_authenticated");
@@ -206,6 +210,83 @@ impl StreamingService for SpotifyService {
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
         self.api_get("/me/following?type=artist&limit=50").await.map(|d| d["artists"]["items"].as_array().map(|i| i.iter().map(Self::map_artist).collect()).unwrap_or_default())
+    }
+
+    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+        let needs_refresh = self
+            .token_expires
+            .map(|exp| {
+                exp.checked_duration_since(std::time::Instant::now())
+                    .map(|d| d.as_secs() < 300)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+
+        if !needs_refresh {
+            return Ok(false);
+        }
+
+        let refresh_token = self
+            .refresh_token
+            .as_ref()
+            .ok_or("no refresh token")?
+            .clone();
+
+        let resp = self
+            .client
+            .post(TOKEN_URL)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", self.client_id.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("refresh: {e}"))?;
+
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        if let Some(at) = data["access_token"].as_str() {
+            self.access_token = Some(at.into());
+            if let Some(rt) = data["refresh_token"].as_str() {
+                self.refresh_token = Some(rt.into());
+            }
+            let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+            self.token_expires =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
+            info!("spotify_token_refreshed");
+            Ok(true)
+        } else {
+            Err("refresh failed".into())
+        }
+    }
+
+    fn save_tokens(&self) -> Option<serde_json::Value> {
+        self.access_token.as_ref().map(|t| {
+            serde_json::json!({
+                "access_token": t,
+                "refresh_token": self.refresh_token,
+                "username": self.username,
+            })
+        })
+    }
+
+    fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
+        if let Some(at) = tokens["access_token"].as_str() {
+            self.access_token = Some(at.into());
+            self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
+            self.username = tokens["username"].as_str().map(Into::into);
+            self.token_expires =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn post_restore(&mut self) {
+        if let Ok(me) = self.api_get("/me").await {
+            self.username = me["display_name"].as_str().map(Into::into);
+        }
     }
 }
 
