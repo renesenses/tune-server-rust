@@ -198,6 +198,19 @@ impl AlbumRepo {
         Ok(albums)
     }
 
+    pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_ALBUM} WHERE a.genre = ? ORDER BY a.title COLLATE NOCASE"))
+            .map_err(|e| e.to_string())?;
+        let albums = stmt
+            .query_map(params![genre], |row| Ok(row_to_album(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(albums)
+    }
+
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");

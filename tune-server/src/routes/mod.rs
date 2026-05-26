@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/system", system::router())
         .nest("/library", library::router())
         .nest("/library/history", history::router())
+        .nest("/history", history::router())
         .route("/zones/", get(zones::list_zones_handler).post(zones::create_zone_handler))
         .nest("/zones", zones_and_playback)
         .nest("/playlists", playlists::router())

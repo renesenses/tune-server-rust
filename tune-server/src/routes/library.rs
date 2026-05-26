@@ -74,6 +74,12 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-credits", post(enrich_all_credits))
         .route("/tracks/{id}/all-tags", get(track_all_tags))
         .route("/browse", get(browse_roots))
+        .route("/browse/dir", get(browse_directory))
+        .route("/folders", get(browse_folders))
+        .route("/genres", get(list_genres))
+        .route("/genres/{name}/albums", get(genre_albums))
+        .route("/recommendations", get(recommendations))
+        .route("/stats/completeness", get(completeness_stats))
         .route("/search", get(search))
         .route("/stats", get(library_stats))
         .route("/artwork/{hash}", get(serve_artwork))
@@ -615,18 +621,242 @@ async fn album_artwork(
 }
 
 async fn browse_roots(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+        .unwrap_or_else(|| state.config.music_dirs.clone());
+    let conn = state.db.connection().lock().unwrap();
     let roots: Vec<Value> = dirs
         .iter()
-        .map(|d| json!({ "path": d, "name": d, "track_count": 0 }))
+        .map(|d| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?",
+                    rusqlite::params![format!("{d}%")],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let name = std::path::Path::new(d)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(d);
+            json!({ "path": d, "name": name, "track_count": count })
+        })
         .collect();
+    drop(conn);
     Json(json!({ "roots": roots }))
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    path: String,
+}
+
+async fn browse_directory(
+    State(state): State<AppState>,
+    Query(q): Query<BrowseQuery>,
+) -> impl IntoResponse {
+    let resolved = std::path::Path::new(&q.path);
+    if !resolved.is_absolute() || !resolved.exists() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid path"}))).into_response();
+    }
+
+    // Verify path is under a configured music dir
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let dirs: Vec<String> = settings
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| state.config.music_dirs.clone());
+    let music_root = dirs.iter().find(|d| q.path.starts_with(d.as_str()));
+    if music_root.is_none() {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "path not under a configured music directory"}))).into_response();
+    }
+    let music_root = music_root.unwrap().clone();
+
+    // List subdirectories
+    let mut subdirs: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&q.path) {
+        let conn = state.db.connection().lock().unwrap();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let dir_path = path.to_string_lossy().to_string();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                if name.starts_with('.') { continue; }
+                let track_count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?",
+                        rusqlite::params![format!("{dir_path}%")],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
+            }
+        }
+        drop(conn);
+    }
+    subdirs.sort_by(|a, b| {
+        a.get("name").and_then(|v| v.as_str()).unwrap_or("")
+            .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+
+    // List tracks in this directory (not recursive — only direct children)
+    let conn = state.db.connection().lock().unwrap();
+    // Use a LIKE pattern that matches the directory prefix and filter in app
+    // for direct children only.
+    let dir_prefix = format!("{}%", q.path);
+    let tracks: Vec<Value> = conn
+        .prepare("SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.disc_number, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id WHERE t.file_path LIKE ? ORDER BY t.disc_number, t.track_number, t.title")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![dir_prefix], |row| {
+                let file_path: Option<String> = row.get(9).ok();
+                let is_direct = file_path.as_ref().map(|fp| {
+                    let parent = std::path::Path::new(fp).parent().and_then(|p| p.to_str()).unwrap_or("");
+                    parent == q.path
+                }).unwrap_or(false);
+                Ok((is_direct, json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "album_id": row.get::<_, Option<i64>>(2).ok().flatten(),
+                    "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "artist_id": row.get::<_, Option<i64>>(4).ok().flatten(),
+                    "artist_name": row.get::<_, Option<String>>(5).ok().flatten(),
+                    "disc_number": row.get::<_, Option<i32>>(6).ok().flatten(),
+                    "track_number": row.get::<_, Option<i32>>(7).ok().flatten(),
+                    "duration_ms": row.get::<_, Option<i64>>(8).ok().flatten(),
+                    "file_path": file_path,
+                    "format": row.get::<_, Option<String>>(10).ok().flatten(),
+                    "sample_rate": row.get::<_, Option<i32>>(11).ok().flatten(),
+                    "bit_depth": row.get::<_, Option<i32>>(12).ok().flatten(),
+                    "genre": row.get::<_, Option<String>>(13).ok().flatten(),
+                    "year": row.get::<_, Option<i32>>(14).ok().flatten(),
+                    "cover_path": row.get::<_, Option<String>>(15).ok().flatten(),
+                })))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).filter(|(direct, _)| *direct).map(|(_, v)| v).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+
+    // Parent path
+    let parent = if q.path != music_root {
+        resolved.parent().map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    Json(json!({
+        "path": q.path,
+        "parent": parent,
+        "music_root": music_root,
+        "directories": subdirs,
+        "tracks": tracks,
+    })).into_response()
+}
+
+#[derive(Deserialize)]
+struct FolderQuery {
+    path: Option<String>,
+}
+
+async fn browse_folders(
+    State(state): State<AppState>,
+    Query(q): Query<FolderQuery>,
+) -> axum::response::Response {
+    // /library/folders?path=... is an alias for browse_directory
+    // Without a path param, return browse roots
+    match q.path {
+        Some(ref p) if !p.is_empty() => {
+            browse_directory(State(state), Query(BrowseQuery { path: p.clone() })).await.into_response()
+        }
+        _ => {
+            let roots_json = browse_roots(State(state)).await;
+            roots_json.into_response()
+        }
+    }
+}
+
+async fn list_genres(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    // Get genre counts from both albums and tracks
+    let genres: Vec<(String, i64)> = conn
+        .prepare("SELECT genre, COUNT(*) as cnt FROM albums WHERE genre IS NOT NULL AND genre != '' GROUP BY genre ORDER BY genre COLLATE NOCASE")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+
+    let items: Vec<Value> = genres
+        .iter()
+        .map(|(name, count)| json!({ "name": name, "count": count }))
+        .collect();
+
+    Json(json!(items))
+}
+
+async fn genre_albums(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
+    let decoded = urlencoding::decode(&name).unwrap_or_else(|_| name.clone().into());
+    let repo = AlbumRepo::new(state.db);
+    let items = repo.list_by_genre(&decoded).unwrap_or_default();
+    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    Json(json!(items))
+}
+
+async fn recommendations(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
+    // Return recently added albums the user hasn't listened to
+    let limit = p.limit.unwrap_or(20);
+    let repo = AlbumRepo::new(state.db);
+    let items = repo.list_recent(limit).unwrap_or_default();
+    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    Json(json!({ "albums": items }))
+}
+
+async fn completeness_stats(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
+    let with_genre: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''", [], |row| row.get(0)).unwrap_or(0);
+    let with_year: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
+    let with_artist: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE artist_id IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
+    let with_album: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE album_id IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
+    let with_cover: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a WHERE a.cover_path IS NOT NULL AND a.cover_path != ''", [], |row| row.get(0)).unwrap_or(0);
+    let total_albums: i64 = conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0)).unwrap_or(0);
+    let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
+    drop(conn);
+
+    Json(json!({
+        "total_tracks": total_tracks,
+        "total_albums": total_albums,
+        "with_genre": with_genre,
+        "with_year": with_year,
+        "with_artist": with_artist,
+        "with_album": with_album,
+        "with_cover": with_cover,
+        "with_musicbrainz_id": with_mbid,
+        "genre_pct": if total_tracks > 0 { (with_genre as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "year_pct": if total_tracks > 0 { (with_year as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "artist_pct": if total_tracks > 0 { (with_artist as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "album_pct": if total_tracks > 0 { (with_album as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "cover_pct": if total_albums > 0 { (with_cover as f64 / total_albums as f64 * 100.0).round() } else { 0.0 },
+        "mbid_pct": if total_tracks > 0 { (with_mbid as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+    }))
 }
 
 #[derive(Deserialize)]

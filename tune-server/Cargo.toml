@@ -26,6 +26,7 @@ uuid = { workspace = true }
 lofty = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

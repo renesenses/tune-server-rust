@@ -11,6 +11,8 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 struct HistoryParams {
     limit: Option<i64>,
+    #[allow(dead_code)]
+    period: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -18,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(recent_history))
         .route("/top-tracks", get(top_tracks))
         .route("/top-artists", get(top_artists))
+        .route("/top-albums", get(top_albums))
         .route("/dashboard", get(dashboard))
 }
 
@@ -28,6 +31,23 @@ async fn recent_history(
     let limit = p.limit.unwrap_or(50);
     let repo = HistoryRepo::new(state.db);
     let items = repo.recent(limit).unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn top_albums(
+    State(state): State<AppState>,
+    Query(p): Query<HistoryParams>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(20);
+    let repo = HistoryRepo::new(state.db);
+    let items: Vec<Value> = repo
+        .top_albums(limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(title, artist, plays)| {
+            json!({ "album_title": title, "artist_name": artist, "plays": plays })
+        })
+        .collect();
     Json(json!(items))
 }
 

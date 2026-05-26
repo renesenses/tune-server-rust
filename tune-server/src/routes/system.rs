@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/config", get(get_config).patch(update_config))
+        .route("/settings", get(get_settings))
         .route("/scan", post(trigger_scan))
         .route("/scan/status", get(scan_status))
         .route("/scan/cancel", post(scan_cancel))
@@ -141,6 +142,28 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
     config.entry("server_version".to_string()).or_insert(json!(tune_core::version()));
     config.entry("server_engine".to_string()).or_insert(json!("rust"));
     Json(Value::Object(config))
+}
+
+async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db.clone());
+    let music_dirs: Vec<String> = settings
+        .get("music_dirs")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| state.config.music_dirs.clone());
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| state.config.db_path.clone());
+
+    Json(json!({
+        "music_dirs": music_dirs,
+        "db_path": db_path,
+        "web_dir": state.config.web_dir,
+        "artwork_dir": state.config.artwork_dir,
+        "port": state.port,
+        "auto_scan": state.config.auto_scan,
+        "server_version": tune_core::version(),
+        "server_engine": "rust",
+    }))
 }
 
 #[derive(Deserialize)]
