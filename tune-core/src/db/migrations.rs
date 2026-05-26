@@ -185,6 +185,29 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
 );
 ",
     },
+    Migration {
+        version: 8,
+        name: "add_radio_favorites_and_alarm_extras",
+        up: "
+CREATE TABLE IF NOT EXISTS radio_favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    artist TEXT DEFAULT '',
+    station_name TEXT DEFAULT '',
+    cover_url TEXT,
+    stream_url TEXT,
+    saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(title, artist)
+);
+
+ALTER TABLE alarms ADD COLUMN name TEXT DEFAULT 'Alarm';
+ALTER TABLE alarms ADD COLUMN one_shot INTEGER DEFAULT 0;
+ALTER TABLE alarms ADD COLUMN skip_holidays INTEGER DEFAULT 0;
+ALTER TABLE alarms ADD COLUMN source_name TEXT;
+ALTER TABLE alarms ADD COLUMN fade_duration_s INTEGER DEFAULT 60;
+ALTER TABLE alarms ADD COLUMN last_fired_at DATETIME;
+",
+    },
 ];
 
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {

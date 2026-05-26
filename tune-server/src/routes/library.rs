@@ -11,6 +11,7 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 
 use crate::state::AppState;
@@ -43,6 +44,9 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}", get(get_artist))
         .route("/artists/{id}/albums", get(artist_albums))
         .route("/artists/{id}/tracks", get(artist_tracks))
+        .route("/artists/{id}/bio", get(artist_bio))
+        .route("/artists/{id}/similar", get(artist_similar))
+        .route("/artists/{id}/metadata", get(artist_metadata))
         .route("/albums", get(list_albums))
         .route("/albums/count", get(album_count))
         .route("/albums/filters", get(album_filters))
@@ -54,6 +58,8 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}", get(get_track))
         .route("/tracks/{id}/audio", get(stream_track_audio))
         .route("/tracks/{id}/rescan", post(rescan_track))
+        .route("/tracks/{id}/quick-fav", post(quick_fav_track))
+        .route("/albums/{id}/quick-fav", post(quick_fav_album))
         .route("/genre-tree", get(genre_tree))
         .route("/albums/top-rated", get(top_rated_albums))
         .route("/albums/{id}/rate", post(rate_album))
@@ -88,6 +94,110 @@ async fn get_artist(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct LangQuery {
+    lang: Option<String>,
+}
+
+async fn artist_bio(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<LangQuery>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::new(state.db);
+    let artist = repo.get(id).ok().flatten();
+    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(ref mbid) = artist.musicbrainz_id else {
+        return Json(json!({"artist": artist.name, "bio": null, "error": "no MusicBrainz ID"})).into_response();
+    };
+    let lang = q.lang.as_deref().unwrap_or("fr");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Json(data).into_response()
+        }
+        _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
+    }
+}
+
+async fn artist_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::new(state.db);
+    let artist = repo.get(id).ok().flatten();
+    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(ref mbid) = artist.musicbrainz_id else {
+        return Json(json!({"artist": artist.name, "artists": []})).into_response();
+    };
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/similar")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Json(data).into_response()
+        }
+        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
+    }
+}
+
+async fn artist_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::new(state.db);
+    let artist = repo.get(id).ok().flatten();
+    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(ref mbid) = artist.musicbrainz_id else {
+        return Json(json!(artist)).into_response();
+    };
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    match client.get(format!("https://mozaiklabs.fr/api/{mbid}")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Json(data).into_response()
+        }
+        _ => Json(json!(artist)).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct QuickFavQuery {
+    profile_id: Option<i64>,
+}
+
+async fn quick_fav_track(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<QuickFavQuery>,
+) -> Json<Value> {
+    let profile_id = q.profile_id.unwrap_or(1);
+    let repo = ProfileRepo::new(state.db);
+    let is_fav = repo.is_favorite(profile_id, "track", id).unwrap_or(false);
+    if is_fav {
+        repo.remove_favorite(profile_id, "track", id).ok();
+    } else {
+        repo.add_favorite(profile_id, "track", id).ok();
+    }
+    Json(json!({"is_favorite": !is_fav, "track_id": id}))
+}
+
+async fn quick_fav_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<QuickFavQuery>,
+) -> Json<Value> {
+    let profile_id = q.profile_id.unwrap_or(1);
+    let repo = ProfileRepo::new(state.db);
+    let is_fav = repo.is_favorite(profile_id, "album", id).unwrap_or(false);
+    if is_fav {
+        repo.remove_favorite(profile_id, "album", id).ok();
+    } else {
+        repo.add_favorite(profile_id, "album", id).ok();
+    }
+    Json(json!({"is_favorite": !is_fav, "album_id": id}))
 }
 
 async fn artist_albums(

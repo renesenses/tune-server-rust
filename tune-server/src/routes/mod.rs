@@ -59,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/zones", zones_and_playback)
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
+        .nest("/radio-favorites", radios::radio_favorites_router())
+        .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())
         .nest("/streaming", streaming::router())

@@ -43,6 +43,15 @@ pub fn router() -> Router<AppState> {
         .route("/peers", get(system_peers))
         .route("/scan/schedule", get(scan_schedule).post(set_scan_schedule))
         .route("/diagnostics/bundle", get(diagnostics_bundle))
+        .route("/diagnostics/network", get(diagnostics_network))
+        .route("/health/monitor", get(health_monitor))
+        .route("/health/alerts", get(health_alerts))
+        .route("/clear-cache", post(clear_cache))
+        .route("/mode", get(get_mode).post(set_mode))
+        .route("/stats/listening", get(listening_stats))
+        .route("/discover-servers", get(discover_servers))
+        .route("/config/export", get(export_config))
+        .route("/config/import", post(import_config))
 }
 
 async fn version() -> Json<Value> {
@@ -603,6 +612,119 @@ async fn set_scan_schedule(
 
 async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {
     diagnostics(State(state)).await
+}
+
+async fn diagnostics_network(State(state): State<AppState>) -> Json<Value> {
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.devices().await;
+    let outputs = state.outputs.lock().await;
+    let output_count = outputs.list().len();
+    Json(json!({
+        "discovered_devices": devices.len(),
+        "registered_outputs": output_count,
+        "devices": devices.iter().map(|d| json!({
+            "id": d.id,
+            "name": d.name,
+            "host": d.host,
+            "type": format!("{:?}", d.device_type),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
+    let uptime = state.started_at.elapsed().as_secs();
+    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let settings = SettingsRepo::new(state.db);
+    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    Json(json!({
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "tracks": tracks,
+        "scan_status": scan_status,
+        "engine": "rust",
+        "memory_mb": null,
+    }))
+}
+
+async fn health_alerts() -> Json<Value> {
+    Json(json!({ "alerts": [] }))
+}
+
+async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set("scan_result", "{}").ok();
+    Json(json!({ "cleared": true }))
+}
+
+async fn get_mode(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let mode = settings.get("server_mode").ok().flatten().unwrap_or_else(|| "server".into());
+    Json(json!({ "mode": mode }))
+}
+
+#[derive(Deserialize)]
+struct SetMode {
+    mode: String,
+}
+
+async fn set_mode(
+    State(state): State<AppState>,
+    Json(body): Json<SetMode>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set("server_mode", &body.mode).ok();
+    Json(json!({ "mode": body.mode }))
+}
+
+async fn listening_stats(State(state): State<AppState>) -> Json<Value> {
+    let repo = HistoryRepo::new(state.db);
+    let history = repo.listening_history(30).unwrap_or_default();
+    let total_listens = repo.count().unwrap_or(0);
+    let total_hours: f64 = history.iter().map(|(_, _, ms)| *ms as f64 / 3_600_000.0).sum();
+    Json(json!({
+        "total_listens": total_listens,
+        "total_hours_30d": (total_hours * 100.0).round() / 100.0,
+        "daily": history.iter().map(|(day, plays, ms)| json!({
+            "day": day, "plays": plays, "hours": (*ms as f64 / 3_600_000.0 * 100.0).round() / 100.0,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn discover_servers() -> Json<Value> {
+    Json(json!({ "servers": [], "message": "peer discovery not yet implemented" }))
+}
+
+async fn export_config(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let all = settings.all().unwrap_or_default();
+    let mut config = serde_json::Map::new();
+    for (k, v) in all {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
+            config.insert(k, parsed);
+        } else {
+            config.insert(k, Value::String(v));
+        }
+    }
+    Json(Value::Object(config))
+}
+
+async fn import_config(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let mut imported = 0;
+    for (key, value) in body {
+        let str_val = if value.is_string() {
+            value.as_str().unwrap().to_string()
+        } else {
+            value.to_string()
+        };
+        if settings.set(&key, &str_val).is_ok() {
+            imported += 1;
+        }
+    }
+    Json(json!({ "imported": imported }))
 }
 
 fn backup_dir_path() -> String {

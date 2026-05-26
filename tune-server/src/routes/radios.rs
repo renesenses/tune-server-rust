@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -184,6 +185,390 @@ async fn toggle_favorite(
         .unwrap_or(!current.is_favorite);
     match repo.set_favorite(id, new_state) {
         Ok(_) => Json(json!({ "is_favorite": new_state })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Radio Favorites
+// ---------------------------------------------------------------------------
+
+pub fn radio_favorites_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(list_radio_favorites).post(save_radio_favorite))
+        .route("/count", get(radio_favorites_count))
+        .route("/is-favorite", get(is_radio_favorite))
+        .route("/save-current", post(save_current_as_favorite))
+        .route("/{fav_id}", axum::routing::delete(delete_radio_favorite))
+}
+
+#[derive(Deserialize)]
+struct RadioFavPagination {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+async fn list_radio_favorites(
+    State(state): State<AppState>,
+    Query(q): Query<RadioFavPagination>,
+) -> Json<Value> {
+    let limit = q.limit.unwrap_or(100);
+    let offset = q.offset.unwrap_or(0);
+    let conn = state.db.connection().lock().unwrap();
+    let items: Vec<Value> = conn
+        .prepare("SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?")
+        .and_then(|mut stmt| {
+            stmt.query_map(params![limit, offset], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "artist": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "station_name": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "cover_url": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "stream_url": row.get::<_, Option<String>>(5).ok().flatten(),
+                    "saved_at": row.get::<_, Option<String>>(6).ok().flatten(),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+    Json(json!(items))
+}
+
+async fn radio_favorites_count(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM radio_favorites", [], |row| row.get(0))
+        .unwrap_or(0);
+    drop(conn);
+    Json(json!({ "count": count }))
+}
+
+#[derive(Deserialize)]
+struct IsFavoriteQuery {
+    title: String,
+    artist: Option<String>,
+}
+
+async fn is_radio_favorite(
+    State(state): State<AppState>,
+    Query(q): Query<IsFavoriteQuery>,
+) -> Json<Value> {
+    let artist = q.artist.unwrap_or_default();
+    let conn = state.db.connection().lock().unwrap();
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?)",
+            params![q.title, artist],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    drop(conn);
+    Json(json!({ "is_favorite": exists }))
+}
+
+#[derive(Deserialize)]
+struct SaveRadioFavorite {
+    title: String,
+    artist: Option<String>,
+    station_name: Option<String>,
+    cover_url: Option<String>,
+    stream_url: Option<String>,
+}
+
+async fn save_radio_favorite(
+    State(state): State<AppState>,
+    Json(body): Json<SaveRadioFavorite>,
+) -> impl IntoResponse {
+    let artist = body.artist.unwrap_or_default();
+    match state.db.execute(
+        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?)",
+        &[
+            &body.title as &dyn rusqlite::types::ToSql,
+            &artist,
+            &body.station_name.unwrap_or_default(),
+            &body.cover_url,
+            &body.stream_url,
+        ],
+    ) {
+        Ok(_) => {
+            let id = state.db.last_insert_rowid();
+            (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn delete_radio_favorite(
+    State(state): State<AppState>,
+    Path(fav_id): Path<i64>,
+) -> impl IntoResponse {
+    state.db.execute("DELETE FROM radio_favorites WHERE id = ?", &[&fav_id]).ok();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct SaveCurrentBody {
+    zone_id: i64,
+}
+
+async fn save_current_as_favorite(
+    State(state): State<AppState>,
+    Json(body): Json<SaveCurrentBody>,
+) -> impl IntoResponse {
+    let zone_state = state.playback.get_state(body.zone_id).await;
+    let Some(np) = zone_state.now_playing else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "nothing playing" }))).into_response();
+    };
+
+    let title = np.title.clone();
+    let artist = np.artist_name.clone().unwrap_or_default();
+    let station_name = if np.source == "radio" {
+        np.album_title.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let cover_url = np.cover_path.clone();
+
+    match state.db.execute(
+        "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?)",
+        &[
+            &title as &dyn rusqlite::types::ToSql,
+            &artist,
+            &station_name,
+            &cover_url,
+        ],
+    ) {
+        Ok(_) => {
+            let id = state.db.last_insert_rowid();
+            (StatusCode::CREATED, Json(json!({ "id": id, "title": title, "artist": artist }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global Alarms CRUD
+// ---------------------------------------------------------------------------
+
+pub fn alarms_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(list_alarms).post(create_alarm_global))
+        .route("/{id}", axum::routing::put(update_alarm).delete(delete_alarm_global))
+        .route("/{id}/snooze", post(snooze_alarm))
+}
+
+async fn list_alarms(State(state): State<AppState>) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let items: Vec<Value> = conn
+        .prepare(
+            "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time"
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "name": row.get::<_, Option<String>>(1).ok().flatten().unwrap_or_else(|| "Alarm".into()),
+                    "time": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "days": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "one_shot": row.get::<_, i32>(4).unwrap_or(0) != 0,
+                    "skip_holidays": row.get::<_, i32>(5).unwrap_or(0) != 0,
+                    "zone_id": row.get::<_, Option<i64>>(6).ok().flatten(),
+                    "source_type": row.get::<_, Option<String>>(7).ok().flatten(),
+                    "source_id": row.get::<_, Option<String>>(8).ok().flatten(),
+                    "source_name": row.get::<_, Option<String>>(9).ok().flatten(),
+                    "volume": row.get::<_, Option<i32>>(10).ok().flatten(),
+                    "fade_duration_s": row.get::<_, Option<i32>>(11).ok().flatten(),
+                    "enabled": row.get::<_, i32>(12).unwrap_or(1) != 0,
+                    "last_fired_at": row.get::<_, Option<String>>(13).ok().flatten(),
+                    "created_at": row.get::<_, Option<String>>(14).ok().flatten(),
+                    "fade_in_seconds": row.get::<_, Option<i32>>(15).ok().flatten(),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+    Json(json!(items))
+}
+
+#[derive(Deserialize)]
+struct CreateAlarmGlobal {
+    name: Option<String>,
+    time: String,
+    days: Option<String>,
+    one_shot: Option<bool>,
+    skip_holidays: Option<bool>,
+    zone_id: Option<i64>,
+    source_type: Option<String>,
+    source_id: Option<String>,
+    source_name: Option<String>,
+    volume: Option<f64>,
+    fade_duration_s: Option<i32>,
+    fade_in_seconds: Option<i32>,
+    enabled: Option<bool>,
+}
+
+async fn create_alarm_global(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAlarmGlobal>,
+) -> impl IntoResponse {
+    let enabled_int: i32 = if body.enabled.unwrap_or(true) { 1 } else { 0 };
+    let one_shot_int: i32 = if body.one_shot.unwrap_or(false) { 1 } else { 0 };
+    let skip_holidays_int: i32 = if body.skip_holidays.unwrap_or(false) { 1 } else { 0 };
+
+    match state.db.execute(
+        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            &body.name.unwrap_or_else(|| "Alarm".into()) as &dyn rusqlite::types::ToSql,
+            &body.time,
+            &body.days.unwrap_or_else(|| "0,1,2,3,4".into()),
+            &one_shot_int,
+            &skip_holidays_int,
+            &body.zone_id,
+            &body.source_type,
+            &body.source_id,
+            &body.source_name,
+            &body.volume.unwrap_or(0.3),
+            &body.fade_duration_s.unwrap_or(60),
+            &body.fade_in_seconds.unwrap_or(30),
+            &enabled_int,
+        ],
+    ) {
+        Ok(_) => {
+            let id = state.db.last_insert_rowid();
+            (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateAlarm {
+    name: Option<String>,
+    time: Option<String>,
+    days: Option<String>,
+    one_shot: Option<bool>,
+    skip_holidays: Option<bool>,
+    zone_id: Option<i64>,
+    source_type: Option<String>,
+    source_id: Option<String>,
+    source_name: Option<String>,
+    volume: Option<f64>,
+    fade_duration_s: Option<i32>,
+    fade_in_seconds: Option<i32>,
+    enabled: Option<bool>,
+}
+
+async fn update_alarm(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateAlarm>,
+) -> impl IntoResponse {
+    // Build SET clause dynamically from provided fields
+    let mut sets: Vec<String> = Vec::new();
+    let mut values: Vec<Box<dyn rusqlite::types::ToSql + Send>> = Vec::new();
+
+    if let Some(ref name) = body.name {
+        sets.push("name = ?".into());
+        values.push(Box::new(name.clone()));
+    }
+    if let Some(ref time) = body.time {
+        sets.push("time = ?".into());
+        values.push(Box::new(time.clone()));
+    }
+    if let Some(ref days) = body.days {
+        sets.push("days = ?".into());
+        values.push(Box::new(days.clone()));
+    }
+    if let Some(one_shot) = body.one_shot {
+        sets.push("one_shot = ?".into());
+        values.push(Box::new(one_shot as i32));
+    }
+    if let Some(skip_holidays) = body.skip_holidays {
+        sets.push("skip_holidays = ?".into());
+        values.push(Box::new(skip_holidays as i32));
+    }
+    if let Some(zone_id) = body.zone_id {
+        sets.push("zone_id = ?".into());
+        values.push(Box::new(zone_id));
+    }
+    if let Some(ref source_type) = body.source_type {
+        sets.push("source_type = ?".into());
+        values.push(Box::new(source_type.clone()));
+    }
+    if let Some(ref source_id) = body.source_id {
+        sets.push("source_id = ?".into());
+        values.push(Box::new(source_id.clone()));
+    }
+    if let Some(ref source_name) = body.source_name {
+        sets.push("source_name = ?".into());
+        values.push(Box::new(source_name.clone()));
+    }
+    if let Some(volume) = body.volume {
+        sets.push("volume = ?".into());
+        values.push(Box::new(volume));
+    }
+    if let Some(fade_duration_s) = body.fade_duration_s {
+        sets.push("fade_duration_s = ?".into());
+        values.push(Box::new(fade_duration_s));
+    }
+    if let Some(fade_in_seconds) = body.fade_in_seconds {
+        sets.push("fade_in_seconds = ?".into());
+        values.push(Box::new(fade_in_seconds));
+    }
+    if let Some(enabled) = body.enabled {
+        sets.push("enabled = ?".into());
+        values.push(Box::new(enabled as i32));
+    }
+
+    if sets.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no fields to update").into_response();
+    }
+
+    let sql = format!("UPDATE alarms SET {} WHERE id = ?", sets.join(", "));
+    values.push(Box::new(id));
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref() as &dyn rusqlite::types::ToSql).collect();
+    let conn = state.db.connection().lock().unwrap();
+    match conn.execute(&sql, params_ref.as_slice()) {
+        Ok(0) => {
+            drop(conn);
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(_) => {
+            drop(conn);
+            Json(json!({ "id": id, "updated": true })).into_response()
+        }
+        Err(e) => {
+            drop(conn);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+async fn delete_alarm_global(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.execute("DELETE FROM alarms WHERE id = ?", &[&id]) {
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn snooze_alarm(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.execute(
+        "UPDATE alarms SET last_fired_at = NULL WHERE id = ?",
+        &[&id],
+    ) {
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => Json(json!({ "id": id, "snoozed": true })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
