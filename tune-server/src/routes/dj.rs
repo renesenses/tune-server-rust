@@ -1,4 +1,5 @@
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -6,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
@@ -157,19 +159,141 @@ async fn dj_sync_tempo(Path(zone_id): Path<i64>) -> Json<Value> {
     }))
 }
 
-async fn dj_waveform(Path(track_id): Path<i64>) -> impl IntoResponse {
-    Json(json!({
-        "track_id": track_id,
-        "waveform": null,
-        "message": "waveform generation not yet implemented",
-    }))
+async fn dj_waveform(
+    State(state): State<AppState>,
+    Path(track_id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::new(state.db);
+    let track = repo.get(track_id).ok().flatten();
+    let Some(track) = track else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+    };
+    let Some(ref path) = track.file_path else {
+        return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
+    };
+
+    // Use FFmpeg to extract mono PCM at 8 kHz for waveform visualization
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-i", path, "-ac", "1", "-ar", "8000", "-f", "f32le", "-v", "quiet", "-"])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() && out.stdout.len() >= 4 => {
+            let samples: Vec<f32> = out
+                .stdout
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            // Downsample to ~200 points (peak amplitude per chunk)
+            let target_points = 200usize;
+            let chunk_size = (samples.len() / target_points).max(1);
+            let waveform: Vec<f32> = samples
+                .chunks(chunk_size)
+                .map(|chunk| chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max))
+                .collect();
+
+            Json(json!({
+                "track_id": track_id,
+                "points": waveform.len(),
+                "waveform": waveform,
+            }))
+            .into_response()
+        }
+        _ => Json(json!({
+            "track_id": track_id,
+            "waveform": null,
+            "error": "FFmpeg not available or failed",
+        }))
+        .into_response(),
+    }
 }
 
-async fn dj_analyze(Path(track_id): Path<i64>) -> impl IntoResponse {
-    Json(json!({
-        "track_id": track_id,
-        "bpm": null,
-        "key": null,
-        "message": "audio analysis not yet implemented",
-    }))
+async fn dj_analyze(
+    State(state): State<AppState>,
+    Path(track_id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::new(state.db);
+    let track = repo.get(track_id).ok().flatten();
+    let Some(track) = track else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+    };
+    let Some(ref path) = track.file_path else {
+        return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
+    };
+
+    // Extract mono PCM at 22050 Hz for energy-based beat detection
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-i", path, "-ac", "1", "-ar", "22050", "-f", "f32le", "-v", "quiet", "-"])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() && out.stdout.len() >= 4 => {
+            let samples: Vec<f32> = out
+                .stdout
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            let sample_rate: usize = 22050;
+            // 250 ms windows for energy computation
+            let window_size = sample_rate / 4;
+            let energies: Vec<f32> = samples
+                .chunks(window_size)
+                .map(|chunk| chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32)
+                .collect();
+
+            if energies.len() < 4 {
+                return Json(json!({
+                    "track_id": track_id,
+                    "bpm": null,
+                    "error": "audio too short for analysis",
+                }))
+                .into_response();
+            }
+
+            let avg_energy: f32 = energies.iter().sum::<f32>() / energies.len() as f32;
+            let threshold = avg_energy * 1.3;
+
+            // Count onset peaks (energy crossing above threshold)
+            let mut beats = 0u32;
+            let mut prev_above = false;
+            for &e in &energies {
+                let above = e > threshold;
+                if above && !prev_above {
+                    beats += 1;
+                }
+                prev_above = above;
+            }
+
+            let duration_secs = samples.len() as f64 / sample_rate as f64;
+            let bpm_raw = if duration_secs > 0.0 {
+                (beats as f64 / duration_secs * 60.0).round()
+            } else {
+                0.0
+            };
+            // Only report BPM in plausible range
+            let bpm = if (60.0..=200.0).contains(&bpm_raw) {
+                Some(bpm_raw)
+            } else {
+                None
+            };
+
+            Json(json!({
+                "track_id": track_id,
+                "bpm": bpm,
+                "duration_s": duration_secs.round(),
+                "beats_detected": beats,
+            }))
+            .into_response()
+        }
+        _ => Json(json!({
+            "track_id": track_id,
+            "bpm": null,
+            "error": "FFmpeg not available or analysis failed",
+        }))
+        .into_response(),
+    }
 }

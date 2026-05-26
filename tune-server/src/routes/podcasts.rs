@@ -100,12 +100,180 @@ async fn radiofrance_podcasts() -> Json<Value> {
     ]))
 }
 
-async fn podcast_episodes(Path(podcast_id): Path<String>) -> Json<Value> {
-    // Look up the podcast's RSS feed URL from subscriptions, then parse RSS
-    // For now, return a stub until RSS parsing is connected
+async fn podcast_episodes(
+    State(state): State<AppState>,
+    Path(podcast_id): Path<String>,
+) -> impl IntoResponse {
+    // Try to find feed URL from subscriptions (by ID first, then by title slug)
+    let feed_url = {
+        let conn = state.db.connection().lock().unwrap();
+        if let Ok(id) = podcast_id.parse::<i64>() {
+            conn.query_row(
+                "SELECT feed_url FROM podcast_subscriptions WHERE id = ?",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        } else {
+            conn.query_row(
+                "SELECT feed_url FROM podcast_subscriptions WHERE title LIKE ?",
+                rusqlite::params![format!("%{}%", podcast_id.replace('-', " "))],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        }
+    };
+
+    let Some(feed_url) = feed_url else {
+        return Json(json!({
+            "podcast_id": podcast_id,
+            "episodes": [],
+            "error": "podcast not found in subscriptions"
+        }))
+        .into_response();
+    };
+
+    // Fetch RSS feed
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap();
+
+    let xml = match client.get(&feed_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+        _ => {
+            return Json(json!({"error": "failed to fetch RSS feed"})).into_response();
+        }
+    };
+
+    // Parse RSS XML using quick-xml
+    let episodes = parse_rss_episodes(&xml);
+    let count = episodes.len();
+
     Json(json!({
         "podcast_id": podcast_id,
-        "episodes": [],
-        "message": "Episode fetching from RSS not yet implemented"
+        "feed_url": feed_url,
+        "episodes": episodes,
+        "count": count,
     }))
+    .into_response()
+}
+
+fn parse_rss_episodes(xml: &str) -> Vec<Value> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut episodes = Vec::new();
+    let mut in_item = false;
+    let mut current_tag = String::new();
+    let mut title = String::new();
+    let mut description = String::new();
+    let mut pub_date = String::new();
+    let mut audio_url = String::new();
+    let mut duration = String::new();
+    let mut image_url = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if tag == "item" || tag == "entry" {
+                    in_item = true;
+                    title.clear();
+                    description.clear();
+                    pub_date.clear();
+                    audio_url.clear();
+                    duration.clear();
+                    image_url.clear();
+                }
+                if in_item {
+                    current_tag = tag.clone();
+                    // Check for enclosure tag (audio URL)
+                    if tag == "enclosure" {
+                        for attr in e.attributes().flatten() {
+                            let key =
+                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            if key == "url" {
+                                audio_url = val;
+                            }
+                        }
+                    }
+                    // itunes:image
+                    if tag == "itunes:image" {
+                        for attr in e.attributes().flatten() {
+                            let key =
+                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            if key == "href" {
+                                image_url =
+                                    String::from_utf8_lossy(&attr.value).to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(ref e)) if in_item => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                match current_tag.as_str() {
+                    "title" => title = text,
+                    "description" | "summary" => {
+                        if description.is_empty() {
+                            description = text;
+                        }
+                    }
+                    "pubDate" | "published" => pub_date = text,
+                    "itunes:duration" => duration = text,
+                    _ => {}
+                }
+            }
+            Ok(Event::Empty(ref e)) if in_item => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                // Handle self-closing <enclosure ... /> tags
+                if tag == "enclosure" {
+                    for attr in e.attributes().flatten() {
+                        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                        let val = String::from_utf8_lossy(&attr.value).to_string();
+                        if key == "url" {
+                            audio_url = val;
+                        }
+                    }
+                }
+                // Handle self-closing <itunes:image ... /> tags
+                if tag == "itunes:image" {
+                    for attr in e.attributes().flatten() {
+                        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                        if key == "href" {
+                            image_url =
+                                String::from_utf8_lossy(&attr.value).to_string();
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if (tag == "item" || tag == "entry") && in_item {
+                    if !title.is_empty() {
+                        episodes.push(json!({
+                            "title": title,
+                            "description": description.chars().take(500).collect::<String>(),
+                            "published": pub_date,
+                            "audio_url": audio_url,
+                            "duration": duration,
+                            "image_url": if image_url.is_empty() { Value::Null } else { Value::String(image_url.clone()) },
+                        }));
+                    }
+                    in_item = false;
+                }
+                current_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    episodes
 }

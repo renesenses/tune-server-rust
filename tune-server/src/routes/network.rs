@@ -232,15 +232,57 @@ async fn list_smb_shares() -> Json<Value> {
     }))
 }
 
-/// Trigger an SMB network scan (stub — returns accepted status).
+/// Trigger an SMB network scan using mDNS service discovery.
 async fn trigger_smb_scan() -> impl IntoResponse {
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "scan_queued",
-            "message": "SMB network scan not yet implemented",
-        })),
-    )
+    let result = tokio::task::spawn_blocking(|| {
+        let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+        let receiver = daemon.browse("_smb._tcp.local.").ok()?;
+        let mut shares = Vec::new();
+
+        // Collect discoveries for 3 seconds
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                    shares.push(json!({
+                        "name": info.get_fullname(),
+                        "host": info.get_hostname(),
+                        "port": info.get_port(),
+                        "addresses": info.get_addresses()
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>(),
+                        "properties": info.get_properties()
+                            .iter()
+                            .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    }));
+                }
+                Ok(_) => {} // other events (SearchStarted, ServiceFound, etc.)
+                Err(_) => {} // recv timeout, continue until deadline
+            }
+        }
+        daemon.shutdown().ok();
+        Some(shares)
+    })
+    .await;
+
+    match result {
+        Ok(Some(shares)) => {
+            let count = shares.len();
+            Json(json!({
+                "status": "scan_complete",
+                "shares": shares,
+                "count": count,
+            }))
+            .into_response()
+        }
+        _ => Json(json!({
+            "status": "scan_failed",
+            "shares": [],
+        }))
+        .into_response(),
+    }
 }
 
 /// List all stored SMB mounts from the network_mounts table.
