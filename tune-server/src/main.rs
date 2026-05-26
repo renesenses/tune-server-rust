@@ -12,6 +12,11 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    // Install rustls CryptoProvider before any TLS operation (reqwest, etc.)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     let config = TuneConfig::load();
 
     tracing_subscriber::fmt()
