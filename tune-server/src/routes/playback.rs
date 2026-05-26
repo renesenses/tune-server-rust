@@ -49,6 +49,8 @@ struct PlayRequest {
     start_index: Option<i64>,
     source: Option<String>,
     source_id: Option<String>,
+    streaming_album_id: Option<String>,
+    streaming_playlist_id: Option<String>,
     output_device_id: Option<String>,
     title: Option<String>,
     artist_name: Option<String>,
@@ -155,6 +157,105 @@ async fn play(
     let track_repo = TrackRepo::new(state.db.clone());
     let queue_repo = PlayQueueRepo::new(state.db.clone());
 
+    // --- Streaming album: fetch tracks from the service, queue them, play first ---
+    if let (Some(source), Some(album_id)) = (&body.source, &body.streaming_album_id) {
+        let registry = state.services.lock().await;
+        let svc = match registry.get(source) {
+            Some(s) => s,
+            None => return (StatusCode::BAD_REQUEST, format!("unknown service: {source}")).into_response(),
+        };
+        let svc = svc.lock().await;
+        let tracks = match svc.get_album_tracks(album_id).await {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+        };
+        drop(svc);
+        drop(registry);
+
+        if tracks.is_empty() {
+            return (StatusCode::BAD_REQUEST, "album has no tracks").into_response();
+        }
+
+        let start = body.start_index.unwrap_or(0) as usize;
+        let start = start.min(tracks.len() - 1);
+        let first = &tracks[start];
+
+        let output_device_id = body.output_device_id.clone().or_else(|| {
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+        });
+
+        let orch_req = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: None,
+            source: Some(source.clone()),
+            source_id: Some(first.id.clone()),
+            title: Some(first.title.clone()),
+            artist_name: Some(first.artist.clone()),
+            album_title: first.album.clone(),
+            cover_url: first.cover_url.clone(),
+            duration_ms: Some(first.duration_ms as i64),
+        };
+        return match state.orchestrator.play(orch_req).await {
+            Ok(_) => {
+                state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
+                Json(build_zone_json(&state, zone_id).await).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+
+    // --- Streaming playlist: fetch tracks from the service, queue them, play first ---
+    if let (Some(source), Some(playlist_id)) = (&body.source, &body.streaming_playlist_id) {
+        let registry = state.services.lock().await;
+        let svc = match registry.get(source) {
+            Some(s) => s,
+            None => return (StatusCode::BAD_REQUEST, format!("unknown service: {source}")).into_response(),
+        };
+        let svc = svc.lock().await;
+        let tracks = match svc.get_playlist_tracks(playlist_id).await {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+        };
+        drop(svc);
+        drop(registry);
+
+        if tracks.is_empty() {
+            return (StatusCode::BAD_REQUEST, "playlist has no tracks").into_response();
+        }
+
+        let start = body.start_index.unwrap_or(0) as usize;
+        let start = start.min(tracks.len() - 1);
+        let first = &tracks[start];
+
+        let output_device_id = body.output_device_id.clone().or_else(|| {
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+        });
+
+        let orch_req = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: None,
+            source: Some(source.clone()),
+            source_id: Some(first.id.clone()),
+            title: Some(first.title.clone()),
+            artist_name: Some(first.artist.clone()),
+            album_title: first.album.clone(),
+            cover_url: first.cover_url.clone(),
+            duration_ms: Some(first.duration_ms as i64),
+        };
+        return match state.orchestrator.play(orch_req).await {
+            Ok(_) => {
+                state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
+                Json(build_zone_json(&state, zone_id).await).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+
+    // --- Single streaming track (source + source_id, no track_id/track_ids) ---
     if body.source.is_some() && body.source_id.is_some() && body.track_id.is_none() && body.track_ids.is_none() {
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
