@@ -86,6 +86,8 @@ pub fn router() -> Router<AppState> {
         .route("/artwork/proxy", get(proxy_artwork))
         .route("/albums/{id}/artwork", get(album_artwork))
         .route("/albums/{id}/artwork/enrich", post(enrich_album_artwork))
+        .route("/artwork/enrich", post(batch_enrich_artwork))
+        .route("/artwork/enrich/status", get(batch_enrich_artwork_status))
 }
 
 async fn list_artists(
@@ -1278,6 +1280,59 @@ async fn enrich_album_artwork(
             Json(json!({"enriched": false, "reason": "no cover art found on Cover Art Archive"})).into_response()
         }
     }
+}
+
+async fn batch_enrich_artwork(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.db.clone();
+
+    // Check how many albums are missing covers
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let missing = album_repo.list_without_cover().unwrap_or_default();
+
+    if missing.is_empty() {
+        return Json(json!({
+            "status": "skipped",
+            "message": "all albums already have cover art",
+            "missing": 0,
+        })).into_response();
+    }
+
+    // Store initial status
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("artwork_enrich_status", "running").ok();
+    settings.set("artwork_enrich_result", &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string()).ok();
+
+    tokio::spawn(async move {
+        tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({
+        "status": "accepted",
+        "message": "batch artwork enrichment started",
+        "albums_to_process": missing.len(),
+    }))).into_response()
+}
+
+async fn batch_enrich_artwork_status(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let result = settings
+        .get("artwork_enrich_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let album_repo = AlbumRepo::new(state.db);
+    let still_missing = album_repo.list_without_cover().unwrap_or_default().len();
+
+    Json(json!({
+        "result": result,
+        "albums_without_cover": still_missing,
+    }))
 }
 
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {

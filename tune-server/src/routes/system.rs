@@ -395,7 +395,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
 
-        let settings = SettingsRepo::new(db);
+        let settings = SettingsRepo::new(db.clone());
         settings.set("scan_status", "idle").ok();
         tracing::info!(
             scanned = scan_stats.total_files,
@@ -421,6 +421,14 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 .to_string(),
             )
             .ok();
+
+        // Launch batch artwork enrichment as a background task
+        // This fetches covers from MusicBrainz Cover Art Archive for albums
+        // that don't have embedded cover art.
+        let enrich_db = db.clone();
+        tokio::spawn(async move {
+            tune_core::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
+        });
     });
 
     (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))

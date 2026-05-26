@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use tracing::{info, warn, debug};
 
 const FOLDER_COVER_NAMES: &[&str] = &[
     "cover.jpg", "cover.png", "folder.jpg", "folder.png",
@@ -7,6 +8,8 @@ const FOLDER_COVER_NAMES: &[&str] = &[
     "Cover.jpg", "Cover.png", "Folder.jpg", "Folder.png",
     "Front.jpg", "Front.png",
 ];
+
+const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
@@ -56,15 +59,169 @@ pub fn artwork_hash(file_path: &str) -> String {
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     let url = format!("https://coverartarchive.org/release/{mbid}/front-500");
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
     let resp = client.get(&url).send().await.ok()?;
     if resp.status().is_success() {
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        let bytes = resp.bytes().await.ok()?;
+        // Reject tiny responses (likely error pages)
+        if bytes.len() < 1000 {
+            return None;
+        }
+        Some(bytes.to_vec())
     } else {
         None
     }
+}
+
+/// Search MusicBrainz for a release MBID by artist name and album title.
+/// Returns the first matching release ID, or None.
+pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<String> {
+    let query = format!(
+        "release:\"{}\" AND artist:\"{}\"",
+        title.replace('"', ""),
+        artist.replace('"', "")
+    );
+    let url = format!(
+        "https://musicbrainz.org/ws/2/release/?query={}&fmt=json&limit=1",
+        urlencoding::encode(&query)
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let releases = data.get("releases")?.as_array()?;
+    let first = releases.first()?;
+    first.get("id")?.as_str().map(|s| s.to_string())
+}
+
+/// Run batch artwork enrichment for all albums missing cover art.
+///
+/// Iterates over albums without a `cover_path`, tries Cover Art Archive
+/// (by existing MBID or by searching MusicBrainz), saves the image to the
+/// artwork cache, and updates the album's `cover_path` in the database.
+///
+/// Respects MusicBrainz rate limit: max 1 request/second.
+pub async fn batch_enrich_artwork(
+    db: crate::db::sqlite::SqliteDb,
+    cache_dir: PathBuf,
+) {
+    let album_repo = crate::db::album_repo::AlbumRepo::new(db.clone());
+    let albums = match album_repo.list_without_cover() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(error = %e, "batch_artwork_list_failed");
+            return;
+        }
+    };
+
+    if albums.is_empty() {
+        info!("batch_artwork_skip_all_have_covers");
+        return;
+    }
+
+    info!(count = albums.len(), "batch_artwork_enrichment_started");
+
+    let mut enriched = 0u32;
+    let mut searched = 0u32;
+    let mut failed = 0u32;
+
+    for (album_id, title, artist_name, mbid) in &albums {
+        let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
+
+        // Step 1: Determine MBID — use existing or search MusicBrainz
+        let resolved_mbid = if let Some(id) = mbid {
+            if !id.is_empty() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mbid_to_use = if let Some(id) = resolved_mbid {
+            Some(id)
+        } else {
+            // Search MusicBrainz for the release
+            searched += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            let found = search_musicbrainz_release(artist, title).await;
+            if let Some(ref id) = found {
+                // Store the discovered MBID on the album for future use
+                db.execute(
+                    "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
+                    &[id as &dyn rusqlite::types::ToSql, album_id],
+                ).ok();
+                debug!(album_id, mbid = %id, album = %title, "batch_artwork_mbid_found");
+            }
+            found
+        };
+
+        let Some(ref mbid_val) = mbid_to_use else {
+            debug!(album_id, album = %title, artist = %artist, "batch_artwork_no_mbid");
+            failed += 1;
+            continue;
+        };
+
+        // Step 2: Fetch cover from Cover Art Archive
+        // Rate limit: wait 1.1s between CAA requests
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        match fetch_cover_art(mbid_val).await {
+            Some(data) => {
+                let hash = artwork_hash(mbid_val);
+                std::fs::create_dir_all(&cache_dir).ok();
+                if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                    album_repo.update_cover_path(*album_id, &hash).ok();
+                    enriched += 1;
+                    info!(
+                        album_id,
+                        album = %title,
+                        artist = %artist,
+                        hash = %hash,
+                        size = data.len(),
+                        "batch_artwork_enriched"
+                    );
+                } else {
+                    failed += 1;
+                    warn!(album_id, album = %title, "batch_artwork_save_failed");
+                }
+            }
+            None => {
+                failed += 1;
+                debug!(album_id, album = %title, mbid = %mbid_val, "batch_artwork_caa_not_found");
+            }
+        }
+    }
+
+    info!(
+        total = albums.len(),
+        enriched,
+        searched,
+        failed,
+        "batch_artwork_enrichment_complete"
+    );
+
+    // Store result in settings for status reporting
+    let settings = crate::db::settings_repo::SettingsRepo::new(db);
+    settings.set(
+        "artwork_enrich_result",
+        &serde_json::json!({
+            "total": albums.len(),
+            "enriched": enriched,
+            "searched": searched,
+            "failed": failed,
+        }).to_string(),
+    ).ok();
 }
 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {

@@ -211,6 +211,34 @@ impl AlbumRepo {
         Ok(albums)
     }
 
+    /// Return all local albums that have no cover art set.
+    /// Each entry is (album_id, title, artist_name, musicbrainz_release_id).
+    pub fn list_without_cover(&self) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id \
+                 FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
+                 WHERE (a.cover_path IS NULL OR a.cover_path = '') \
+                 AND a.source = 'local' \
+                 ORDER BY a.id"
+            )
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
