@@ -32,18 +32,20 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
-async fn api_fallback(uri: axum::http::Uri) -> impl IntoResponse {
-    let path = uri.path();
+async fn api_fallback(
+    axum::extract::OriginalUri(original): axum::extract::OriginalUri,
+) -> impl IntoResponse {
+    let path = original.path();
     if path.len() > 1 && path.ends_with('/') {
         let trimmed = path.trim_end_matches('/');
-        let redirect_to = if let Some(q) = uri.query() {
+        let redirect_to = if let Some(q) = original.query() {
             format!("{trimmed}?{q}")
         } else {
             trimmed.to_string()
         };
         return axum::response::Redirect::permanent(&redirect_to).into_response();
     }
-    tracing::debug!(path = %uri, "api_not_found");
+    tracing::debug!(path = %path, "api_not_found");
     (StatusCode::OK, axum::Json(serde_json::json!([]))).into_response()
 }
 
