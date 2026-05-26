@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::traits::*;
 
@@ -38,6 +38,13 @@ struct DeviceAuthResponse {
     #[serde(alias = "expiresIn")]
     expires_in: u64,
     interval: u64,
+}
+
+/// Mutable token state behind a Mutex so `&self` methods can refresh on 401.
+struct TokenState {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    token_expires: Option<Instant>,
 }
 
 struct UrlCache {
@@ -75,9 +82,7 @@ struct FeaturedCache {
 
 pub struct TidalService {
     client: Client,
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    token_expires: Option<Instant>,
+    tokens: Mutex<TokenState>,
     country_code: String,
     quality: String,
     username: Option<String>,
@@ -101,9 +106,11 @@ impl TidalService {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            access_token: None,
-            refresh_token: None,
-            token_expires: None,
+            tokens: Mutex::new(TokenState {
+                access_token: None,
+                refresh_token: None,
+                token_expires: None,
+            }),
             country_code: "US".into(),
             quality: "HI_RES_LOSSLESS".into(),
             username: None,
@@ -115,8 +122,61 @@ impl TidalService {
         }
     }
 
+    /// Get current access token from the token state.
+    async fn get_access_token(&self) -> Result<String, String> {
+        let ts = self.tokens.lock().await;
+        ts.access_token.clone().ok_or_else(|| "not authenticated".into())
+    }
+
+    /// Attempt to refresh the access token using the refresh_token.
+    /// Returns Ok(true) if refresh succeeded, Ok(false) if no refresh_token available,
+    /// Err if the refresh call itself failed (token revoked, etc.).
+    async fn do_refresh_token(&self) -> Result<bool, String> {
+        let refresh_token = {
+            let ts = self.tokens.lock().await;
+            match ts.refresh_token.clone() {
+                Some(rt) => rt,
+                None => return Ok(false),
+            }
+        };
+
+        info!("tidal_auto_refresh: attempting token refresh after 401");
+
+        let resp = self
+            .client
+            .post(format!("{AUTH_BASE}/token"))
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("client_secret", CLIENT_SECRET),
+                ("refresh_token", refresh_token.as_str()),
+                ("grant_type", "refresh_token"),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("refresh: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(status, body = %body, "tidal_refresh_token_rejected");
+            return Err("refresh token rejected".into());
+        }
+
+        let token: TokenResponse = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        {
+            let mut ts = self.tokens.lock().await;
+            ts.access_token = Some(token.access_token);
+            if let Some(rt) = token.refresh_token {
+                ts.refresh_token = Some(rt);
+            }
+            ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
+        }
+        info!("tidal_token_refreshed_after_401");
+        Ok(true)
+    }
+
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
         let resp = self.client
             .get(&url)
@@ -127,7 +187,25 @@ impl TidalService {
             .map_err(|e| format!("tidal api: {e}"))?;
 
         if resp.status() == 401 {
-            return Err("token expired".into());
+            // Token expired — try to refresh and retry once
+            match self.do_refresh_token().await {
+                Ok(true) => {
+                    let new_token = self.get_access_token().await?;
+                    let retry_resp = self.client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {new_token}"))
+                        .query(&[("countryCode", &self.country_code)])
+                        .send()
+                        .await
+                        .map_err(|e| format!("tidal api retry: {e}"))?;
+                    if retry_resp.status() == 401 {
+                        return Err("token expired after refresh".into());
+                    }
+                    return retry_resp.json().await.map_err(|e| format!("tidal json: {e}"));
+                }
+                Ok(false) => return Err("token expired, no refresh token".into()),
+                Err(e) => return Err(format!("token expired, refresh failed: {e}")),
+            }
         }
 
         resp.json().await.map_err(|e| format!("tidal json: {e}"))
@@ -188,21 +266,51 @@ impl TidalService {
     }
 
     async fn fetch_playback_info(&self, track_id: &str, quality: &str) -> Result<serde_json::Value, String> {
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let token = self.get_access_token().await?;
+        let url = format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall");
+        let params = [
+            ("audioquality", quality),
+            ("playbackmode", "STREAM"),
+            ("assetpresentation", "FULL"),
+        ];
         let resp = self.client
-            .get(format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall"))
+            .get(&url)
             .header("Authorization", format!("Bearer {token}"))
-            .query(&[
-                ("audioquality", quality),
-                ("playbackmode", "STREAM"),
-                ("assetpresentation", "FULL"),
-            ])
+            .query(&params)
             .send()
             .await
             .map_err(|e| format!("stream url: {e}"))?;
 
         if resp.status() == 429 {
             return Err("tidal rate limited".into());
+        }
+
+        if resp.status() == 401 {
+            // Token expired — try to refresh and retry once
+            match self.do_refresh_token().await {
+                Ok(true) => {
+                    let new_token = self.get_access_token().await?;
+                    let retry_resp = self.client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {new_token}"))
+                        .query(&params)
+                        .send()
+                        .await
+                        .map_err(|e| format!("stream url retry: {e}"))?;
+                    if retry_resp.status() == 429 {
+                        return Err("tidal rate limited".into());
+                    }
+                    let status = retry_resp.status().as_u16();
+                    let body = retry_resp.text().await.map_err(|e| format!("read body: {e}"))?;
+                    if status != 200 {
+                        info!(track_id, quality, status, body = %body, "tidal_playback_info_error_after_refresh");
+                        return Err(format!("tidal playback {status}: {body}"));
+                    }
+                    return serde_json::from_str(&body).map_err(|e| format!("parse: {e}"));
+                }
+                Ok(false) => return Err("token expired, no refresh token".into()),
+                Err(e) => return Err(format!("token expired, refresh failed: {e}")),
+            }
         }
 
         let status = resp.status().as_u16();
@@ -246,7 +354,7 @@ impl TidalService {
     }
 
     async fn api_post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
         let resp = self.client
             .post(&url)
@@ -256,6 +364,28 @@ impl TidalService {
             .send()
             .await
             .map_err(|e| format!("tidal post: {e}"))?;
+
+        if resp.status() == 401 {
+            if let Ok(true) = self.do_refresh_token().await {
+                let new_token = self.get_access_token().await?;
+                let retry_resp = self.client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {new_token}"))
+                    .query(&[("countryCode", &self.country_code)])
+                    .form(form)
+                    .send()
+                    .await
+                    .map_err(|e| format!("tidal post retry: {e}"))?;
+                if !retry_resp.status().is_success() {
+                    let status = retry_resp.status().as_u16();
+                    let body = retry_resp.text().await.unwrap_or_default();
+                    return Err(format!("tidal {path}: {status} {body}"));
+                }
+                return retry_resp.json().await.or_else(|_| Ok(json!({"ok": true})));
+            }
+            return Err(format!("tidal {path}: 401 token expired"));
+        }
+
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -265,7 +395,7 @@ impl TidalService {
     }
 
     async fn api_delete(&self, path: &str) -> Result<(), String> {
-        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
         let resp = self.client
             .delete(&url)
@@ -274,6 +404,26 @@ impl TidalService {
             .send()
             .await
             .map_err(|e| format!("tidal delete: {e}"))?;
+
+        if resp.status() == 401 {
+            if let Ok(true) = self.do_refresh_token().await {
+                let new_token = self.get_access_token().await?;
+                let retry_resp = self.client
+                    .delete(&url)
+                    .header("Authorization", format!("Bearer {new_token}"))
+                    .query(&[("countryCode", &self.country_code)])
+                    .send()
+                    .await
+                    .map_err(|e| format!("tidal delete retry: {e}"))?;
+                if !retry_resp.status().is_success() {
+                    let status = retry_resp.status().as_u16();
+                    return Err(format!("tidal DELETE {path}: {status}"));
+                }
+                return Ok(());
+            }
+            return Err(format!("tidal DELETE {path}: 401 token expired"));
+        }
+
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             return Err(format!("tidal DELETE {path}: {status}"));
@@ -370,10 +520,13 @@ impl StreamingService for TidalService {
             }
 
             let token: TokenResponse = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
-            self.access_token = Some(token.access_token);
-            self.refresh_token = token.refresh_token;
+            {
+                let mut ts = self.tokens.lock().await;
+                ts.access_token = Some(token.access_token);
+                ts.refresh_token = token.refresh_token;
+                ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
+            }
             self.user_id = token.user_id;
-            self.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
             self.pending_device_auth = None;
             self.country_code = "FR".into();
 
@@ -384,11 +537,12 @@ impl StreamingService for TidalService {
     }
 
     async fn auth_status(&self) -> AuthStatus {
+        let ts = self.tokens.lock().await;
         AuthStatus {
-            authenticated: self.access_token.is_some(),
+            authenticated: ts.access_token.is_some(),
             username: self.username.clone(),
             subscription: self.subscription.clone(),
-            expires_at: self.token_expires.map(|t| {
+            expires_at: ts.token_expires.map(|t| {
                 let remaining = t.duration_since(Instant::now()).as_secs();
                 format!("{remaining}s")
             }),
@@ -397,8 +551,11 @@ impl StreamingService for TidalService {
     }
 
     async fn logout(&mut self) -> Result<(), String> {
-        self.access_token = None;
-        self.refresh_token = None;
+        {
+            let mut ts = self.tokens.lock().await;
+            ts.access_token = None;
+            ts.refresh_token = None;
+        }
         self.username = None;
         Ok(())
     }
@@ -718,59 +875,40 @@ impl StreamingService for TidalService {
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, String> {
-        let needs_refresh = self
-            .token_expires
-            .map(|exp| {
-                exp.checked_duration_since(Instant::now())
-                    .map(|d| d.as_secs() < 300)
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false);
+        let needs_refresh = {
+            let ts = self.tokens.lock().await;
+            ts.token_expires
+                .map(|exp| {
+                    exp.checked_duration_since(Instant::now())
+                        .map(|d| d.as_secs() < 300)
+                        .unwrap_or(true)
+                })
+                .unwrap_or_else(|| {
+                    // No expiry tracked (e.g. restored from DB) — proactively refresh
+                    // if we have both an access_token and a refresh_token
+                    ts.access_token.is_some() && ts.refresh_token.is_some()
+                })
+        };
 
         if !needs_refresh {
             return Ok(false);
         }
 
-        let refresh_token = match self.refresh_token.as_ref() {
-            Some(rt) => rt.clone(),
-            None => return Ok(false),
-        };
-
-        let resp = self
-            .client
-            .post(format!("{AUTH_BASE}/token"))
-            .form(&[
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
-                ("refresh_token", refresh_token.as_str()),
-                ("grant_type", "refresh_token"),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("refresh: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err("refresh token rejected".into());
-        }
-
-        let token: TokenResponse = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-        self.access_token = Some(token.access_token);
-        if let Some(rt) = token.refresh_token {
-            self.refresh_token = Some(rt);
-        }
-        self.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
-        info!("tidal_token_refreshed");
-        Ok(true)
+        // Delegate to do_refresh_token which handles the Mutex internally
+        self.do_refresh_token().await
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let mut obj = serde_json::json!({});
-        if let Some(ref token) = self.access_token {
-            obj["access_token"] = serde_json::json!(token);
-            obj["refresh_token"] = serde_json::json!(self.refresh_token);
-            obj["username"] = serde_json::json!(self.username);
-            obj["country_code"] = serde_json::json!(self.country_code);
-            obj["user_id"] = serde_json::json!(self.user_id);
+        // Use try_lock since save_tokens is sync — if the mutex is held, skip saving
+        if let Ok(ts) = self.tokens.try_lock() {
+            if let Some(ref token) = ts.access_token {
+                obj["access_token"] = serde_json::json!(token);
+                obj["refresh_token"] = serde_json::json!(ts.refresh_token);
+                obj["username"] = serde_json::json!(self.username);
+                obj["country_code"] = serde_json::json!(self.country_code);
+                obj["user_id"] = serde_json::json!(self.user_id);
+            }
         }
         if let Some(ref pending) = self.pending_device_auth {
             obj["pending_device_code"] = serde_json::json!(pending.device_code);
@@ -787,12 +925,19 @@ impl StreamingService for TidalService {
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
         let mut restored = false;
         if let Some(at) = tokens["access_token"].as_str() {
-            self.access_token = Some(at.into());
-            self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
+            let refresh_token = tokens["refresh_token"].as_str().map(String::from);
+            // Use try_lock since restore_tokens is sync
+            if let Ok(mut ts) = self.tokens.try_lock() {
+                ts.access_token = Some(at.into());
+                ts.refresh_token = refresh_token.clone();
+                // token_expires stays None — refresh_if_needed will proactively
+                // refresh on the first 5-minute tick, and api_get will refresh
+                // on-demand if a 401 comes back before then
+            }
             self.username = tokens["username"].as_str().map(Into::into);
             self.country_code = tokens["country_code"].as_str().unwrap_or("FR").into();
             self.user_id = tokens["user_id"].as_u64().or_else(|| {
-                self.refresh_token.as_deref().and_then(Self::extract_uid_from_jwt)
+                refresh_token.as_deref().and_then(Self::extract_uid_from_jwt)
             });
             restored = true;
         }
