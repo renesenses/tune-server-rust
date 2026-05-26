@@ -80,6 +80,11 @@ async fn main() {
             let mut albums_with_cover: std::collections::HashSet<i64> =
                 std::collections::HashSet::new();
             let mut inserted = 0u64;
+            let mut updated = 0u64;
+            let mut skipped = 0u64;
+
+            // Load all existing local tracks in one query for efficient change detection
+            let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
 
             for sf in &scanned {
                 let Some(ref meta) = sf.metadata else {
@@ -140,18 +145,58 @@ async fn main() {
                         albums_with_cover.insert(aid);
                     }
 
-                if track_repo.get_by_path(&sf.path).ok().flatten().is_some() {
+                // Build the title (shared between insert and update)
+                let title = meta.title.clone().unwrap_or_else(|| {
+                    std::path::Path::new(&sf.path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
+
+                // Check if this file already exists in the DB
+                if let Some(&(existing_id, existing_mtime, existing_size)) = existing_tracks.get(&sf.path) {
+                    // File exists — check if it has changed (different mtime or size)
+                    let file_changed = existing_mtime.map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                        || existing_size.map_or(true, |s| s != sf.file_size as i64);
+
+                    if !file_changed {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    // File changed — update metadata
+                    let mut track = tune_core::db::models::Track::new(title);
+                    track.id = Some(existing_id);
+                    track.album_id = album_id;
+                    track.artist_id = artist_id;
+                    track.artist_name = Some(track_artist_name.to_string());
+                    track.album_artist = meta.album_artist.clone();
+                    track.album_title = meta.album.clone();
+                    track.disc_number = meta.disc_number.unwrap_or(1) as i32;
+                    track.track_number = meta.track_number.unwrap_or(0) as i32;
+                    track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
+                    track.file_path = Some(sf.path.clone());
+                    track.format = meta.format.clone();
+                    track.sample_rate = meta.sample_rate.map(|s| s as i32);
+                    track.bit_depth = meta.bit_depth.map(|b| b as i32);
+                    track.channels = meta.channels.unwrap_or(2) as i32;
+                    track.file_size = Some(sf.file_size as i64);
+                    track.file_mtime = Some(sf.mtime as f64);
+                    track.audio_hash = sf.audio_hash.clone();
+                    track.genre = meta.genre.clone();
+                    track.year = meta.year.map(|y| y as i32);
+                    track.label = meta.label.clone();
+                    track.isrc = meta.isrc.clone();
+                    track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
+
+                    if track_repo.update(&track).is_ok() {
+                        updated += 1;
+                    }
                     continue;
                 }
 
-                let mut track = tune_core::db::models::Track::new(
-                    meta.title.clone().unwrap_or_else(|| {
-                        std::path::Path::new(&sf.path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    }),
-                );
+                // New file — insert
+                let mut track = tune_core::db::models::Track::new(title);
                 track.album_id = album_id;
                 track.artist_id = artist_id;
                 track.artist_name = Some(track_artist_name.to_string());
@@ -191,6 +236,8 @@ async fn main() {
                 ok = stats.metadata_ok,
                 failed = stats.metadata_failed,
                 inserted,
+                updated,
+                skipped,
                 artwork = albums_with_cover.len(),
                 "auto_scan_complete"
             );

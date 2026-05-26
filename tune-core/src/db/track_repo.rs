@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, OptionalExtension};
 
@@ -115,6 +115,30 @@ impl TrackRepo {
             .filter_map(|r| r.ok())
             .collect();
         Ok(paths)
+    }
+
+    /// Returns a map of file_path -> (track_id, file_mtime, file_size) for all local tracks.
+    /// Used by the scanner to efficiently detect which files have changed without per-file queries.
+    pub fn get_all_local_file_info(&self) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
+            .map_err(|e| e.to_string())?;
+        let map = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    (
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(map)
     }
 
     pub fn update_mtime_and_size(&self, file_path: &str, mtime: f64, file_size: i64) -> Result<(), String> {
