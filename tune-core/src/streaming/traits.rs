@@ -10,7 +10,7 @@ pub struct StreamTrack {
     pub album: Option<String>,
     pub album_id: Option<String>,
     pub duration_ms: u64,
-    #[serde(rename = "cover_path")]
+    #[serde(rename(serialize = "cover_path"))]
     pub cover_url: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
@@ -26,7 +26,7 @@ pub struct StreamAlbum {
     #[serde(alias = "artist_name")]
     pub artist: String,
     pub artist_id: Option<String>,
-    #[serde(rename = "cover_path")]
+    #[serde(rename(serialize = "cover_path"))]
     pub cover_url: Option<String>,
     pub year: Option<u32>,
     pub track_count: u32,
@@ -37,7 +37,7 @@ pub struct StreamAlbum {
 pub struct StreamArtist {
     pub id: String,
     pub name: String,
-    #[serde(rename = "image_path")]
+    #[serde(rename(serialize = "image_path"))]
     pub image_url: Option<String>,
 }
 
@@ -47,7 +47,7 @@ pub struct StreamPlaylist {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    #[serde(rename = "cover_path")]
+    #[serde(rename(serialize = "cover_path"))]
     pub cover_url: Option<String>,
     pub track_count: u32,
     pub owner: Option<String>,
