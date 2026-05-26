@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamTrack {
+    #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
     pub title: String,
     pub artist: String,
@@ -17,6 +18,7 @@ pub struct StreamTrack {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamAlbum {
+    #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
     pub title: String,
     pub artist: String,
@@ -36,6 +38,7 @@ pub struct StreamArtist {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPlaylist {
+    #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
     pub name: String,
     pub description: Option<String>,
