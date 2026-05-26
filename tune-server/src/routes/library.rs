@@ -579,7 +579,8 @@ async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
                 let mime = if *ext == "png" { "image/png" } else { "image/jpeg" };
                 let mut headers = axum::http::HeaderMap::new();
                 headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
-                headers.insert("Cache-Control", axum::http::HeaderValue::from_static("public, max-age=86400"));
+                headers.insert("Cache-Control", axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"));
+                headers.insert("ETag", axum::http::HeaderValue::from_str(&format!("\"{hash}\"")).unwrap_or(axum::http::HeaderValue::from_static("\"artwork\"")));
                 return (StatusCode::OK, headers, data).into_response();
             }
     }
