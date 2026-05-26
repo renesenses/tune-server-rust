@@ -89,7 +89,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert("current_track".into(), json!(ps.now_playing));
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
-            obj.insert("volume".into(), json!(z.volume as f64 / 100.0));
+            obj.insert("volume".into(), json!(if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 }));
         }
         result.push(v);
     }

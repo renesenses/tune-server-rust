@@ -97,6 +97,9 @@ impl PositionPoller {
                 .await;
             if (status.volume - zone_state.volume).abs() > 0.005 {
                 self.playback.set_volume(zone_id, status.volume).await;
+                let vol_int = (status.volume * 100.0) as i32;
+                let db = self.db.clone();
+                crate::db::zone_repo::ZoneRepo::new(db).update_volume(zone_id, vol_int).ok();
             }
             self.playback
                 .emit_position(zone_id, status.position_ms as i64);
