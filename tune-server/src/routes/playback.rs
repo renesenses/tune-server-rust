@@ -194,14 +194,14 @@ async fn play(
             title: Some(first.title.clone()),
             artist_name: Some(first.artist.clone()),
             album_title: first.album.clone(),
-            cover_url: first.cover_url.clone(),
+            cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
                 let queue_items: Vec<_> = tracks.iter().map(|t| (
                     t.id.clone(), t.title.clone(), t.artist.clone(),
-                    t.album.clone(), t.cover_url.clone(), t.duration_ms as i64,
+                    t.album.clone(), t.cover_path.clone(), t.duration_ms as i64,
                 )).collect();
                 queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
                 state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
@@ -248,14 +248,14 @@ async fn play(
             title: Some(first.title.clone()),
             artist_name: Some(first.artist.clone()),
             album_title: first.album.clone(),
-            cover_url: first.cover_url.clone(),
+            cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
                 let queue_items: Vec<_> = tracks.iter().map(|t| (
                     t.id.clone(), t.title.clone(), t.artist.clone(),
-                    t.album.clone(), t.cover_url.clone(), t.duration_ms as i64,
+                    t.album.clone(), t.cover_path.clone(), t.duration_ms as i64,
                 )).collect();
                 queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
                 state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;

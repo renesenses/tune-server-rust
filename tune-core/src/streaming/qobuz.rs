@@ -97,7 +97,7 @@ impl QobuzService {
             album_id: album["id"].as_str().map(Into::into)
                 .or_else(|| album["id"].as_u64().map(|id| id.to_string())),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
-            cover_url: album["image"]["large"].as_str().map(Into::into),
+            cover_path: album["image"]["large"].as_str().map(Into::into),
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
@@ -118,7 +118,7 @@ impl QobuzService {
             title: item["title"].as_str().unwrap_or("").into(),
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
-            cover_url: item["image"]["large"].as_str().map(Into::into),
+            cover_path: item["image"]["large"].as_str().map(Into::into),
             year: item["released_at"].as_u64().map(|ts| {
                 1970 + (ts / 31_536_000) as u32
             }).or_else(|| item["release_date_original"].as_str().and_then(|d| d.get(..4)?.parse().ok())),
@@ -209,7 +209,7 @@ impl QobuzService {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            image_url: item["image"]["large"].as_str().map(Into::into),
+            image_path: item["image"]["large"].as_str().map(Into::into),
         }
     }
 }
@@ -335,7 +335,7 @@ impl StreamingService for QobuzService {
             id: data["id"].as_u64().unwrap_or(0).to_string(),
             name: data["name"].as_str().unwrap_or("").into(),
             description: data["description"].as_str().map(Into::into),
-            cover_url: data["image_rectangle_mini"].as_array()
+            cover_path: data["image_rectangle_mini"].as_array()
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .map(Into::into),
@@ -436,7 +436,7 @@ impl StreamingService for QobuzService {
                 id: item["id"].as_u64().unwrap_or(0).to_string(),
                 name: item["name"].as_str().unwrap_or("").into(),
                 description: item["description"].as_str().map(Into::into),
-                cover_url: None,
+                cover_path: None,
                 track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
                 owner: None,
             }).collect())

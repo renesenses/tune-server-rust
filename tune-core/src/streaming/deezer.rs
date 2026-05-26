@@ -79,7 +79,7 @@ impl DeezerService {
             album: album["title"].as_str().map(Into::into),
             album_id: album["id"].as_u64().map(|id| id.to_string()),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
-            cover_url: album["cover_big"]
+            cover_path: album["cover_big"]
                 .as_str()
                 .or_else(|| album["cover_medium"].as_str())
                 .map(Into::into),
@@ -101,7 +101,7 @@ impl DeezerService {
             title: item["title"].as_str().unwrap_or("").into(),
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
-            cover_url: item["cover_big"]
+            cover_path: item["cover_big"]
                 .as_str()
                 .or_else(|| item["cover_medium"].as_str())
                 .map(Into::into),
@@ -117,7 +117,7 @@ impl DeezerService {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            image_url: item["picture_big"]
+            image_path: item["picture_big"]
                 .as_str()
                 .or_else(|| item["picture_medium"].as_str())
                 .map(Into::into),
@@ -129,7 +129,7 @@ impl DeezerService {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["title"].as_str().unwrap_or("").into(),
             description: item["description"].as_str().map(Into::into),
-            cover_url: item["picture_big"]
+            cover_path: item["picture_big"]
                 .as_str()
                 .or_else(|| item["picture_medium"].as_str())
                 .map(Into::into),
@@ -142,7 +142,7 @@ impl DeezerService {
         StreamGenre {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            has_children: false, // Deezer genre API is flat
+            has_children: false,
             image_url: item["picture_big"]
                 .as_str()
                 .or_else(|| item["picture_medium"].as_str())

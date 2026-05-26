@@ -233,7 +233,7 @@ impl TidalService {
             album: item["album"]["title"].as_str().map(Into::into),
             album_id: item["album"]["id"].as_u64().map(|id| id.to_string()),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
-            cover_url: item["album"]["cover"].as_str().map(|c| {
+            cover_path: item["album"]["cover"].as_str().map(|c| {
                 format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
             }),
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
@@ -256,7 +256,7 @@ impl TidalService {
                 .or_else(|| item["artists"].as_array().and_then(|a| a.first()).and_then(|a| a["name"].as_str()))
                 .unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
-            cover_url: item["cover"].as_str().map(|c| {
+            cover_path: item["cover"].as_str().map(|c| {
                 format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
             }),
             year: item["releaseDate"].as_str().and_then(|d| d.get(..4)?.parse().ok()),
@@ -446,7 +446,7 @@ impl TidalService {
         StreamArtist {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            image_url: item["picture"].as_str().map(|p| {
+            image_path: item["picture"].as_str().map(|p| {
                 format!("https://resources.tidal.com/images/{}/480x480.jpg", p.replace('-', "/"))
             }),
         }
@@ -709,7 +709,7 @@ impl StreamingService for TidalService {
             id: data["uuid"].as_str().unwrap_or(playlist_id).into(),
             name: data["title"].as_str().unwrap_or("").into(),
             description: data["description"].as_str().map(Into::into),
-            cover_url: data["squareImage"].as_str().map(|c| {
+            cover_path: data["squareImage"].as_str().map(|c| {
                 format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
             }),
             track_count: data["numberOfTracks"].as_u64().unwrap_or(0) as u32,
@@ -838,7 +838,7 @@ impl StreamingService for TidalService {
                 id: item["uuid"].as_str().unwrap_or("").into(),
                 name: item["title"].as_str().unwrap_or("").into(),
                 description: item["description"].as_str().map(Into::into),
-                cover_url: None,
+                cover_path: None,
                 track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
                 owner: None,
             }).collect())

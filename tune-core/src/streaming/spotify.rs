@@ -98,7 +98,7 @@ impl SpotifyService {
             album: album["name"].as_str().map(Into::into),
             album_id: album["id"].as_str().map(Into::into),
             duration_ms: item["duration_ms"].as_u64().unwrap_or(0),
-            cover_url: album["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
+            cover_path: album["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["disc_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
@@ -112,7 +112,7 @@ impl SpotifyService {
             title: item["name"].as_str().unwrap_or("").into(),
             artist: item["artists"].as_array().and_then(|a| a.first()).and_then(|a| a["name"].as_str()).unwrap_or("").into(),
             artist_id: item["artists"].as_array().and_then(|a| a.first()).and_then(|a| a["id"].as_str()).map(Into::into),
-            cover_url: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
+            cover_path: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
             year: item["release_date"].as_str().and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
             quality: None,
@@ -123,7 +123,7 @@ impl SpotifyService {
         StreamArtist {
             id: item["id"].as_str().unwrap_or("").into(),
             name: item["name"].as_str().unwrap_or("").into(),
-            image_url: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
+            image_path: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
         }
     }
 }
@@ -197,13 +197,13 @@ impl StreamingService for SpotifyService {
     async fn get_artist(&self, id: &str) -> Result<StreamArtist, String> { self.api_get(&format!("/artists/{id}")).await.map(|d| Self::map_artist(&d)) }
     async fn get_playlist(&self, id: &str) -> Result<StreamPlaylist, String> {
         let d = self.api_get(&format!("/playlists/{id}")).await?;
-        Ok(StreamPlaylist { id: d["id"].as_str().unwrap_or("").into(), name: d["name"].as_str().unwrap_or("").into(), description: d["description"].as_str().map(Into::into), cover_url: d["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into), track_count: d["tracks"]["total"].as_u64().unwrap_or(0) as u32, owner: d["owner"]["display_name"].as_str().map(Into::into) })
+        Ok(StreamPlaylist { id: d["id"].as_str().unwrap_or("").into(), name: d["name"].as_str().unwrap_or("").into(), description: d["description"].as_str().map(Into::into), cover_path: d["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into), track_count: d["tracks"]["total"].as_u64().unwrap_or(0) as u32, owner: d["owner"]["display_name"].as_str().map(Into::into) })
     }
     async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, String> {
         self.api_get(&format!("/playlists/{id}/tracks?limit=100")).await.map(|d| d["items"].as_array().map(|i| i.iter().filter_map(|item| item.get("track").map(Self::map_track)).collect()).unwrap_or_default())
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
-        self.api_get("/me/playlists?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().map(|item| StreamPlaylist { id: item["id"].as_str().unwrap_or("").into(), name: item["name"].as_str().unwrap_or("").into(), description: None, cover_url: item["images"].as_array().and_then(|imgs| imgs.first()).and_then(|img| img["url"].as_str()).map(Into::into), track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32, owner: None }).collect()).unwrap_or_default())
+        self.api_get("/me/playlists?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().map(|item| StreamPlaylist { id: item["id"].as_str().unwrap_or("").into(), name: item["name"].as_str().unwrap_or("").into(), description: None, cover_path: item["images"].as_array().and_then(|imgs| imgs.first()).and_then(|img| img["url"].as_str()).map(Into::into), track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32, owner: None }).collect()).unwrap_or_default())
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         self.api_get("/me/albums?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().filter_map(|item| item.get("album").map(Self::map_album)).collect()).unwrap_or_default())
