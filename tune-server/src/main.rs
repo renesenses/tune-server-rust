@@ -111,9 +111,9 @@ async fn main() {
                         .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
                         .unwrap_or(false);
 
-                // Album artist: use album_artist tag, fall back to track artist
+                // Album artist: use album_artist tag, fall back to "Various Artists" for compilations
                 let album_artist_name = meta.album_artist.as_deref()
-                    .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
+                    .unwrap_or_else(|| if is_compilation { "Various Artists" } else { meta.artist.as_deref().unwrap_or("Unknown Artist") });
 
                 // Track artist: always from track-level artist tag
                 let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");

@@ -255,7 +255,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 };
                 let album_artist_name = meta.album_artist.as_deref()
                     .or(existing_album_artist.as_deref())
-                    .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
+                    .unwrap_or_else(|| if is_compilation { "Various Artists" } else { meta.artist.as_deref().unwrap_or("Unknown Artist") });
 
                 // Track artist: always from track-level artist tag
                 let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
