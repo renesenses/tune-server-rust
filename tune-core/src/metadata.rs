@@ -81,14 +81,114 @@ pub fn normalize_format(raw: &str) -> String {
     }
 }
 
+/// Fallback metadata extraction for DSF/DFF files when lofty fails.
+///
+/// Reads the DSF file header to extract sample rate, channel count, and
+/// duration.  For DFF files (or if DSF header parsing fails), returns a
+/// minimal `TrackMetadata` with at least the title, format, and file size.
+fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext != "dsf" && ext != "dff" {
+        return None;
+    }
+
+    let title = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    // Try to read DSF header for audio properties.
+    // DSF spec: bytes 0-3 = "DSD ", 28-31 = fmt chunk size,
+    //   fmt+16..fmt+20 = channel type, fmt+20..fmt+24 = channel count,
+    //   fmt+24..fmt+28 = sample rate, fmt+28..fmt+30 = bits per sample,
+    //   fmt+32..fmt+40 = sample count per channel.
+    let (sample_rate, channels, duration_ms) = if ext == "dsf" {
+        parse_dsf_header(path).unwrap_or((None, None, None))
+    } else {
+        (None, None, None)
+    };
+
+    Some(TrackMetadata {
+        title: Some(title),
+        format: Some("dsd".to_string()),
+        file_size,
+        sample_rate,
+        channels,
+        duration_ms: duration_ms.or(Some(0)),
+        ..Default::default()
+    })
+}
+
+/// Parse a DSF file header to extract sample rate, channel count, and duration.
+fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64>), ()> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path).map_err(|_| ())?;
+    let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
+    f.read_exact(&mut header).map_err(|_| ())?;
+
+    // Verify "DSD " magic
+    if &header[0..4] != b"DSD " {
+        return Err(());
+    }
+
+    // DSD chunk size (bytes 4-11, little-endian u64) — should be 28
+    // Total file size at bytes 12-19
+    // Metadata offset at bytes 20-27
+
+    // fmt chunk should start at offset 28
+    if &header[28..32] != b"fmt " {
+        return Err(());
+    }
+
+    // fmt chunk: offset 28 is "fmt ", 32-39 is chunk size (u64 LE)
+    // 40-43: format version
+    // 44-47: format ID
+    // 48-51: channel type
+    // 52-55: channel count (u32 LE)
+    // 56-59: sample rate (u32 LE)
+    // 60-61: bits per sample (u16? actually u32 at 60-63)
+    // 64-71: sample count per channel (u64 LE)
+
+    let channels = u32::from_le_bytes([header[52], header[53], header[54], header[55]]);
+    let sample_rate = u32::from_le_bytes([header[56], header[57], header[58], header[59]]);
+    let bits_per_sample = u32::from_le_bytes([header[60], header[61], header[62], header[63]]);
+    let sample_count = u64::from_le_bytes([
+        header[64], header[65], header[66], header[67],
+        header[68], header[69], header[70], header[71],
+    ]);
+
+    let duration_ms = if sample_rate > 0 {
+        // DSD sample rate is 1-bit rate (e.g. 2_822_400 for DSD64).
+        // Duration = sample_count / sample_rate * 1000
+        Some(sample_count * 1000 / sample_rate as u64)
+    } else {
+        None
+    };
+
+    let _ = bits_per_sample; // typically 1 for DSD
+
+    Ok((
+        Some(sample_rate),
+        Some(channels as u16),
+        duration_ms,
+    ))
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
 
-    let tagged = lofty::read_from_path(path).map_err(|e| format!("{e}"))?;
+    let tagged = match lofty::read_from_path(path) {
+        Ok(t) => t,
+        Err(e) => return dsf_dff_fallback(path).ok_or_else(|| format!("{e}")),
+    };
     let props = tagged.properties();
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())
-        .ok_or_else(|| "no tags found".to_string())?;
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return dsf_dff_fallback(path).ok_or_else(|| "no tags found".to_string()),
+    };
 
     let get = |key: &ItemKey| tag.get_string(key).map(|s| s.to_string());
 
@@ -410,5 +510,96 @@ mod tests {
     #[test]
     fn normalize_format_aiff_unchanged() {
         assert_eq!(normalize_format("aiff"), "aiff");
+    }
+
+    #[test]
+    fn dsf_dff_fallback_returns_none_for_non_dsd() {
+        assert!(dsf_dff_fallback(Path::new("/tmp/test.flac")).is_none());
+        assert!(dsf_dff_fallback(Path::new("/tmp/test.mp3")).is_none());
+    }
+
+    #[test]
+    fn dsf_dff_fallback_returns_dsd_format() {
+        // Even if the file does not exist, the fallback should return
+        // a minimal metadata with format "dsd" for .dsf / .dff extensions.
+        let meta = dsf_dff_fallback(Path::new("/tmp/nonexistent_track.dsf"));
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        assert_eq!(meta.title.as_deref(), Some("nonexistent_track"));
+        assert_eq!(meta.duration_ms, Some(0));
+
+        let meta2 = dsf_dff_fallback(Path::new("/tmp/test_track.dff"));
+        assert!(meta2.is_some());
+        let meta2 = meta2.unwrap();
+        assert_eq!(meta2.format.as_deref(), Some("dsd"));
+        assert_eq!(meta2.title.as_deref(), Some("test_track"));
+    }
+
+    #[test]
+    fn dsf_fallback_with_valid_header() {
+        use std::io::Write;
+        // Build a minimal DSF file header to test header parsing.
+        // DSD chunk (28 bytes) + fmt chunk (52 bytes)
+        let tmp = std::env::temp_dir().join("tune_test_dsf_fallback.dsf");
+        let mut buf = vec![0u8; 92];
+        // DSD chunk
+        buf[0..4].copy_from_slice(b"DSD ");
+        // DSD chunk size = 28 (LE u64)
+        buf[4..12].copy_from_slice(&28u64.to_le_bytes());
+        // total file size (doesn't matter for test)
+        buf[12..20].copy_from_slice(&92u64.to_le_bytes());
+        // metadata offset = 0
+        buf[20..28].copy_from_slice(&0u64.to_le_bytes());
+        // fmt chunk
+        buf[28..32].copy_from_slice(b"fmt ");
+        // fmt chunk size = 52 (LE u64)
+        buf[32..40].copy_from_slice(&52u64.to_le_bytes());
+        // format version = 1
+        buf[40..44].copy_from_slice(&1u32.to_le_bytes());
+        // format ID = 0
+        buf[44..48].copy_from_slice(&0u32.to_le_bytes());
+        // channel type = 2 (stereo)
+        buf[48..52].copy_from_slice(&2u32.to_le_bytes());
+        // channel count = 2
+        buf[52..56].copy_from_slice(&2u32.to_le_bytes());
+        // sample rate = 2_822_400 (DSD64)
+        buf[56..60].copy_from_slice(&2_822_400u32.to_le_bytes());
+        // bits per sample = 1
+        buf[60..64].copy_from_slice(&1u32.to_le_bytes());
+        // sample count per channel = 2_822_400 * 180 (= 3 minutes at DSD64)
+        let samples: u64 = 2_822_400 * 180;
+        buf[64..72].copy_from_slice(&samples.to_le_bytes());
+
+        std::fs::File::create(&tmp).unwrap().write_all(&buf).unwrap();
+
+        let meta = dsf_dff_fallback(&tmp);
+        std::fs::remove_file(&tmp).ok();
+
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        assert_eq!(meta.sample_rate, Some(2_822_400));
+        assert_eq!(meta.channels, Some(2));
+        // Duration should be approximately 180_000 ms (3 minutes)
+        let dur = meta.duration_ms.unwrap();
+        assert!(dur >= 179_000 && dur <= 181_000, "unexpected duration: {dur}ms");
+    }
+
+    #[test]
+    fn try_read_metadata_dsf_fallback() {
+        // A nonexistent .dsf file should trigger the fallback and return Ok
+        // (not an error), since we recognize the extension.
+        let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.dsf"));
+        assert!(result.is_ok());
+        let meta = result.unwrap();
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
+    }
+
+    #[test]
+    fn try_read_metadata_non_dsd_still_errors() {
+        // A nonexistent .flac file should still return Err
+        let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.flac"));
+        assert!(result.is_err());
     }
 }
