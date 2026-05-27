@@ -70,6 +70,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/export", get(export_m3u))
         .route("/{id}/share", post(share_playlist))
         .route("/{id}/recover", post(recover_playlist))
+        .route("/{id}/recover/apply", post(apply_recovery))
+        .route("/collaborative", get(list_collaborative).post(create_collaborative))
+        .route("/collaborative/{id}", get(get_collaborative))
+        .route("/collaborative/{id}/add", post(add_to_collaborative))
+        .route("/collaborative/{id}/tracks", get(collaborative_tracks))
+        .route("/match", post(match_tracks))
 }
 
 async fn list_playlists(
@@ -549,4 +555,206 @@ async fn diff_playlists(
         "count_common": common.len(),
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Recovery apply
+// ---------------------------------------------------------------------------
+
+async fn apply_recovery(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = PlaylistRepo::new(state.db.clone());
+    let track_repo = TrackRepo::new(state.db);
+    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let mut recovered = 0i64;
+    let mut missing = 0i64;
+
+    for tid in &track_ids {
+        match track_repo.get(*tid) {
+            Ok(Some(t)) if t.file_path.is_some() => {
+                let path = t.file_path.as_ref().unwrap();
+                if std::path::Path::new(path).exists() {
+                    recovered += 1;
+                } else {
+                    missing += 1;
+                }
+            }
+            _ => missing += 1,
+        }
+    }
+
+    Json(json!({
+        "playlist_id": id,
+        "total_tracks": track_ids.len(),
+        "recovered": recovered,
+        "still_missing": missing,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Collaborative playlists (stored in settings as JSON)
+// ---------------------------------------------------------------------------
+
+async fn list_collaborative(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let items: Vec<Value> = settings
+        .get("collaborative_playlists")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(json!(items))
+}
+
+#[derive(Deserialize)]
+struct CreateCollaborative {
+    name: String,
+    description: Option<String>,
+}
+
+async fn create_collaborative(
+    State(state): State<AppState>,
+    Json(body): Json<CreateCollaborative>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let mut items: Vec<Value> = settings
+        .get("collaborative_playlists")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let id = format!("collab_{:016x}", nanos);
+
+    let entry = json!({
+        "id": id,
+        "name": body.name,
+        "description": body.description,
+        "tracks": [],
+        "created_at": nanos / 1_000_000_000,
+    });
+    items.push(entry.clone());
+    settings.set("collaborative_playlists", &serde_json::to_string(&items).unwrap_or_default()).ok();
+    (StatusCode::CREATED, Json(entry)).into_response()
+}
+
+async fn get_collaborative(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let items: Vec<Value> = settings
+        .get("collaborative_playlists")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match items.iter().find(|i| i["id"].as_str() == Some(&id)) {
+        Some(item) => Json(item.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddToCollaborative {
+    track_ids: Vec<i64>,
+}
+
+async fn add_to_collaborative(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AddToCollaborative>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let mut items: Vec<Value> = settings
+        .get("collaborative_playlists")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let Some(entry) = items.iter_mut().find(|i| i["id"].as_str() == Some(&id)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let tracks = entry.get_mut("tracks").and_then(|t| t.as_array_mut());
+    if let Some(tracks) = tracks {
+        for tid in &body.track_ids {
+            tracks.push(json!(tid));
+        }
+    }
+    settings.set("collaborative_playlists", &serde_json::to_string(&items).unwrap_or_default()).ok();
+    Json(json!({ "added": body.track_ids.len() })).into_response()
+}
+
+async fn collaborative_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db.clone());
+    let items: Vec<Value> = settings
+        .get("collaborative_playlists")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let Some(entry) = items.iter().find(|i| i["id"].as_str() == Some(&id)) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let track_ids: Vec<i64> = entry["tracks"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+
+    let track_repo = TrackRepo::new(state.db);
+    let tracks = track_repo.get_multiple(&track_ids).unwrap_or_default();
+    Json(json!(tracks)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Match tracks (fuzzy search)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MatchEntry {
+    title: String,
+    artist: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MatchRequest {
+    tracks: Vec<MatchEntry>,
+}
+
+async fn match_tracks(
+    State(state): State<AppState>,
+    Json(body): Json<MatchRequest>,
+) -> impl IntoResponse {
+    let track_repo = TrackRepo::new(state.db);
+    let mut results: Vec<Value> = Vec::new();
+
+    for entry in &body.tracks {
+        let q = if let Some(ref artist) = entry.artist {
+            format!("{} {}", artist, entry.title)
+        } else {
+            entry.title.clone()
+        };
+        let matched = track_repo.search(&q, 3).unwrap_or_default();
+        results.push(json!({
+            "query_title": entry.title,
+            "query_artist": entry.artist,
+            "matches": matched,
+        }));
+    }
+
+    Json(json!({ "results": results, "total": body.tracks.len() })).into_response()
 }

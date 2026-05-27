@@ -225,6 +225,19 @@ impl TrackRepo {
         Ok(ordered)
     }
 
+    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM tracks ORDER BY RANDOM() LIMIT ?")
+            .map_err(|e| e.to_string())?;
+        let ids = stmt
+            .query_map(rusqlite::params![limit], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
     pub fn deduplicate(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i64 = conn

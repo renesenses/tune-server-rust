@@ -75,6 +75,10 @@ pub fn router() -> Router<AppState> {
         .route("/update/apply", post(update_apply))
         .route("/update/status", get(update_status))
         .route("/bug-report", get(generate_bug_report))
+        .route("/audio-check", get(audio_check))
+        .route("/enrich", post(system_enrich))
+        .route("/database/import", post(database_import))
+        .route("/plugins", get(list_system_plugins))
 }
 
 async fn version() -> Json<Value> {
@@ -1845,4 +1849,122 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
         },
         "markdown": md,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Audio check, Enrich, Database import, Plugins alias
+// ---------------------------------------------------------------------------
+
+async fn audio_check() -> Json<Value> {
+    let ffmpeg_path = tune_core::audio::pipeline::find_ffmpeg();
+    let ffprobe = if ffmpeg_path.is_some() {
+        // If ffmpeg is found, ffprobe is likely available too
+        which_cmd("ffprobe")
+    } else {
+        None
+    };
+
+    let formats = if ffmpeg_path.is_some() {
+        vec!["flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wma"]
+    } else {
+        vec![]
+    };
+
+    Json(json!({
+        "ffmpeg_available": ffmpeg_path.is_some(),
+        "ffmpeg_path": ffmpeg_path,
+        "ffprobe_available": ffprobe.is_some(),
+        "ffprobe_path": ffprobe,
+        "supported_formats": formats,
+        "lofty_available": true,
+        "engine": "rust",
+    }))
+}
+
+fn which_cmd(name: &str) -> Option<String> {
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
+    let db = state.db.clone();
+    let cache_dir = super::library::artwork_cache_dir();
+    tokio::spawn(async move {
+        tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "status": "enrichment_started" })))
+}
+
+async fn database_import(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    let mut file_bytes: Option<Vec<u8>> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" || name == "database" {
+            file_bytes = field.bytes().await.ok().map(|b| b.to_vec());
+        }
+    }
+
+    let Some(bytes) = file_bytes else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no file provided"}))).into_response();
+    };
+
+    // Write to a temp file
+    let tmp_path = "/tmp/tune_import.db";
+    if let Err(e) = std::fs::write(tmp_path, &bytes) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))).into_response();
+    }
+
+    // Open the imported DB and count rows
+    let import_db = match rusqlite::Connection::open_with_flags(
+        tmp_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("not a valid SQLite file: {e}")}))).into_response(),
+    };
+
+    let track_count: i64 = import_db
+        .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+        .unwrap_or(0);
+    let album_count: i64 = import_db
+        .query_row("SELECT COUNT(*) FROM albums", [], |r| r.get(0))
+        .unwrap_or(0);
+    let artist_count: i64 = import_db
+        .query_row("SELECT COUNT(*) FROM artists", [], |r| r.get(0))
+        .unwrap_or(0);
+    drop(import_db);
+
+    // Store the import path for potential restore
+    let settings = SettingsRepo::new(state.db);
+    settings.set("last_imported_db", tmp_path).ok();
+
+    Json(json!({
+        "status": "imported",
+        "temp_path": tmp_path,
+        "tracks": track_count,
+        "albums": album_count,
+        "artists": artist_count,
+        "message": "Database file received. Use /system/backups to restore or merge manually.",
+    }))
+    .into_response()
+}
+
+async fn list_system_plugins(State(state): State<AppState>) -> Json<Value> {
+    // Alias for /plugins list
+    let settings = SettingsRepo::new(state.db);
+    let plugins: Vec<Value> = settings
+        .get("plugins")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(json!(plugins))
 }

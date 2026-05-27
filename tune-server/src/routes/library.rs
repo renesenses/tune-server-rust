@@ -1,6 +1,6 @@
 use axum::body::Body;
 use lofty::file::TaggedFileExt;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -91,6 +91,25 @@ pub fn router() -> Router<AppState> {
         .route("/artwork/enrich/status", get(batch_enrich_artwork_status))
         .route("/duplicates", get(list_duplicates))
         .route("/duplicates/resolve", post(resolve_duplicate))
+        .route("/activity", get(library_activity))
+        .route("/albums/{id}/bio", get(album_bio))
+        .route("/albums/{id}/similar", get(album_similar))
+        .route("/albums/{id}/artwork/rescan", post(rescan_album_artwork))
+        .route("/albums/merge-duplicates", post(merge_duplicate_albums_route))
+        .route("/artists/{id}/timeline", get(artist_timeline))
+        .route("/artists/{id}/image/upload", post(artist_image_upload))
+        .route("/artists/{id}/image/report", post(artist_image_report))
+        .route("/tracks/{id}/lyrics", get(track_lyrics))
+        .route("/ratings/export", get(export_ratings))
+        .route("/ratings/import", post(import_ratings))
+        .route("/enrich-all", post(enrich_all_library))
+        .route("/enrich-all/status", get(enrich_all_status))
+        .route("/artwork/rescan", post(rescan_all_artwork))
+        .route("/duplicates/smart", get(smart_duplicates))
+        .route("/collections", get(list_collections).post(create_collection))
+        .route("/collections/{id}", get(get_collection).delete(delete_collection))
+        .route("/collections/{id}/albums", get(collection_albums))
+        .route("/collections/{id}/albums/{album_id}", post(add_album_to_collection).delete(remove_album_from_collection))
 }
 
 async fn list_artists(
@@ -1387,6 +1406,34 @@ async fn batch_enrich_artwork_status(
     }))
 }
 
+fn now_iso_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Approximate date from days since epoch
+    let mut y = 1970i64;
+    let mut d = days as i64;
+    loop {
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if d < ylen { break; }
+        d -= ylen;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 0usize;
+    for (i, &ml) in mdays.iter().enumerate() {
+        if d < ml as i64 { mo = i; break; }
+        d -= ml as i64;
+    }
+    format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
+}
+
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     let dir = std::env::var("TUNE_ARTWORK_DIR")
         .unwrap_or_else(|_| "artwork_cache".into());
@@ -1547,4 +1594,710 @@ async fn resolve_duplicate(
         "kept": body.keep_id,
         "deleted": body.delete_id,
     })).into_response()
+}
+
+// --- New routes ---
+
+async fn library_activity(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(20);
+    let repo = HistoryRepo::new(state.db);
+    let items = repo.recent(limit).unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn album_bio(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<LangQuery>,
+) -> impl IntoResponse {
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let album = match album_repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    // Resolve artist MBID for the API call
+    let mbid = if let Some(aid) = album.artist_id {
+        let artist_repo = ArtistRepo::new(state.db);
+        artist_repo.get(aid).ok().flatten().and_then(|a| a.musicbrainz_id)
+    } else {
+        None
+    };
+    let Some(mbid) = mbid else {
+        return Json(json!({"album": album.title, "bio": null, "error": "no artist MusicBrainz ID"})).into_response();
+    };
+    let lang = q.lang.as_deref().unwrap_or("fr");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Json(data).into_response()
+        }
+        _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
+    }
+}
+
+async fn album_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let album = match album_repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mbid = if let Some(aid) = album.artist_id {
+        let artist_repo = ArtistRepo::new(state.db);
+        artist_repo.get(aid).ok().flatten().and_then(|a| a.musicbrainz_id)
+    } else {
+        None
+    };
+    let Some(mbid) = mbid else {
+        return Json(json!({"album": album.title, "artists": []})).into_response();
+    };
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/similar")).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: Value = resp.json().await.unwrap_or(json!({}));
+            Json(data).into_response()
+        }
+        _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
+    }
+}
+
+async fn rescan_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let track_repo = TrackRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::new(state.db);
+    let tracks = track_repo.list_by_album(id).unwrap_or_default();
+    if tracks.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "no tracks in album"}))).into_response();
+    }
+    let cache_dir = artwork_cache_dir();
+    let mut found_hash: Option<String> = None;
+    for track in &tracks {
+        if let Some(ref file_path) = track.file_path {
+            if let Some(hash) = tune_core::artwork::get_or_extract(
+                std::path::Path::new(file_path),
+                &cache_dir,
+            ) {
+                found_hash = Some(hash);
+                break;
+            }
+        }
+    }
+    if let Some(ref hash) = found_hash {
+        album_repo.update_cover_path(id, hash).ok();
+    }
+    Json(json!({
+        "album_id": id,
+        "rescanned_tracks": tracks.len(),
+        "artwork_found": found_hash.is_some(),
+        "hash": found_hash,
+    })).into_response()
+}
+
+async fn merge_duplicate_albums_route(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let conn = state.db.connection().lock().unwrap();
+    let dupes: Vec<(String, String)> = conn
+        .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut deleted = 0i64;
+    for (_title, ids_str) in &dupes {
+        let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
+        if ids.len() < 2 { continue; }
+        let mut best_id = ids[0];
+        let mut best_count = 0i64;
+        for &aid in &ids {
+            let cnt: i64 = conn.query_row(
+                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                rusqlite::params![aid], |r| r.get(0),
+            ).unwrap_or(0);
+            if cnt > best_count { best_count = cnt; best_id = aid; }
+        }
+        for &aid in &ids {
+            if aid != best_id {
+                conn.execute("UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    rusqlite::params![best_id, aid]).ok();
+                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid]).ok();
+                deleted += 1;
+            }
+        }
+    }
+    conn.execute_batch(
+        "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
+    ).ok();
+    drop(conn);
+    Json(json!({ "merged": deleted }))
+}
+
+async fn artist_timeline(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let artist_repo = ArtistRepo::new(state.db);
+    let artist = match artist_repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut albums = repo.list_by_artist(id).unwrap_or_default();
+    albums.sort_by(|a, b| a.year.unwrap_or(0).cmp(&b.year.unwrap_or(0)));
+    let items: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
+    Json(json!({
+        "artist": artist.name,
+        "artist_id": id,
+        "albums": items,
+    })).into_response()
+}
+
+async fn artist_image_upload(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let artist_repo = ArtistRepo::new(state.db);
+    let mut artist = match artist_repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "artist not found"}))).into_response(),
+    };
+    let mut image_data: Option<Vec<u8>> = None;
+    let mut ext = "jpg".to_string();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "image" || name == "file" {
+            if let Some(ct) = field.content_type() {
+                if ct.contains("png") { ext = "png".to_string(); }
+            }
+            image_data = field.bytes().await.ok().map(|b| b.to_vec());
+        }
+    }
+    let Some(data) = image_data else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no image provided"}))).into_response();
+    };
+    let cache_dir = artwork_cache_dir();
+    std::fs::create_dir_all(&cache_dir).ok();
+    let hash = tune_core::artwork::artwork_hash(&format!("artist-{id}"));
+    let path = cache_dir.join(format!("{hash}.{ext}"));
+    if std::fs::write(&path, &data).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to save image"}))).into_response();
+    }
+    artist.image_path = Some(hash.clone());
+    artist.image_source = Some("upload".into());
+    artist_repo.update(&artist).ok();
+    Json(json!({
+        "artist_id": id,
+        "hash": hash,
+        "size": data.len(),
+    })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImageReportBody {
+    reason: Option<String>,
+}
+
+async fn artist_image_report(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ImageReportBody>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let key = format!("reported_artist_image_{id}");
+    let val = json!({
+        "artist_id": id,
+        "reason": body.reason,
+        "reported_at": now_iso_utc(),
+    });
+    settings.set(&key, &val.to_string()).ok();
+    Json(json!({"reported": true, "artist_id": id}))
+}
+
+async fn track_lyrics(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::new(state.db.clone());
+    let track = match repo.get(id) {
+        Ok(Some(t)) => t,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let genius_token = settings.get("genius_api_token").ok().flatten();
+    let Some(token) = genius_token else {
+        return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"})).into_response();
+    };
+    let title = &track.title;
+    let artist = track.artist_name.as_deref().unwrap_or("");
+    let q = format!("{title} {artist}");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    let search_url = format!("https://api.genius.com/search?q={}", urlencoding::encode(&q));
+    let resp = client.get(&search_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let data: Value = r.json().await.unwrap_or(json!({}));
+            let hits = data.pointer("/response/hits").and_then(|v| v.as_array());
+            let url = hits
+                .and_then(|arr| arr.first())
+                .and_then(|h| h.pointer("/result/url"))
+                .and_then(|v| v.as_str());
+            Json(json!({
+                "track_id": id,
+                "title": title,
+                "artist": artist,
+                "genius_url": url,
+                "lyrics": null,
+            })).into_response()
+        }
+        _ => Json(json!({"track_id": id, "lyrics": null, "error": "Genius API request failed"})).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExportRatingQuery {
+    profile_id: Option<i64>,
+}
+
+async fn export_ratings(
+    State(state): State<AppState>,
+    Query(q): Query<ExportRatingQuery>,
+) -> Json<Value> {
+    let profile_id = q.profile_id.unwrap_or(1);
+    let conn = state.db.connection().lock().unwrap();
+    let items: Vec<Value> = conn
+        .prepare(
+            "SELECT r.album_id, a.title, ar.name, r.rating, r.note, r.created_at \
+             FROM album_ratings r \
+             LEFT JOIN albums a ON r.album_id = a.id \
+             LEFT JOIN artists ar ON a.artist_id = ar.id \
+             WHERE r.profile_id = ? \
+             ORDER BY r.rating DESC"
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![profile_id], |row| {
+                Ok(json!({
+                    "album_id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "album_title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "rating": row.get::<_, Option<i32>>(3).ok().flatten(),
+                    "note": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "created_at": row.get::<_, Option<String>>(5).ok().flatten(),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+    Json(json!({
+        "profile_id": profile_id,
+        "ratings": items,
+        "count": items.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ImportRatingItem {
+    album_id: i64,
+    rating: i32,
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportRatingsBody {
+    profile_id: Option<i64>,
+    ratings: Vec<ImportRatingItem>,
+}
+
+async fn import_ratings(
+    State(state): State<AppState>,
+    Json(body): Json<ImportRatingsBody>,
+) -> Json<Value> {
+    let profile_id = body.profile_id.unwrap_or(1);
+    let repo = RatingRepo::new(state.db);
+    let mut imported = 0i32;
+    let mut failed = 0i32;
+    for item in &body.ratings {
+        match repo.rate_album(item.album_id, profile_id, item.rating, item.note.as_deref()) {
+            Ok(_) => imported += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    Json(json!({
+        "imported": imported,
+        "failed": failed,
+        "total": body.ratings.len(),
+    }))
+}
+
+async fn enrich_all_library(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let db = state.db.clone();
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("enrich_all_status", &json!({"status": "running", "task_id": task_id, "enriched": 0}).to_string()).ok();
+
+    let db2 = db.clone();
+    let task_id_clone = task_id.clone();
+    tokio::spawn(async move {
+        let track_ids: Vec<(i64, Option<String>)> = {
+            let conn = db2.connection().lock().unwrap();
+            conn.prepare("SELECT id, file_path FROM tracks WHERE (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '') AND file_path IS NOT NULL")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        };
+
+        let total = track_ids.len();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent(MB_USER_AGENT)
+            .build()
+            .unwrap();
+
+        let mut enriched = 0i32;
+        for (track_id, file_path) in &track_ids {
+            if let Some(fp) = file_path {
+                let meta = tune_core::metadata::read_metadata(std::path::Path::new(fp));
+                if let Some(m) = meta {
+                    if let Some(ref mbid) = m.musicbrainz_recording_id {
+                        db2.execute(
+                            "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
+                            &[mbid as &dyn rusqlite::types::ToSql, track_id],
+                        ).ok();
+                        enriched += 1;
+                    } else {
+                        // Try MusicBrainz lookup by title+artist
+                        let title = m.title.as_deref().unwrap_or("");
+                        let artist = m.artist.as_deref().unwrap_or("");
+                        if !title.is_empty() && !artist.is_empty() {
+                            let url = format!(
+                                "https://musicbrainz.org/ws/2/recording/?query=recording:{}&artist:{}&fmt=json&limit=1",
+                                urlencoding::encode(title),
+                                urlencoding::encode(artist),
+                            );
+                            if let Ok(r) = client.get(&url).send().await {
+                                if r.status().is_success() {
+                                    if let Ok(data) = r.json::<Value>().await {
+                                        if let Some(mbid) = data.pointer("/recordings/0/id").and_then(|v| v.as_str()) {
+                                            db2.execute(
+                                                "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
+                                                &[&mbid as &dyn rusqlite::types::ToSql, track_id],
+                                            ).ok();
+                                            enriched += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            // MusicBrainz rate limit
+                            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                        }
+                    }
+                }
+            }
+
+            // Update status periodically
+            if enriched % 50 == 0 {
+                let settings = tune_core::db::settings_repo::SettingsRepo::new(db2.clone());
+                settings.set("enrich_all_status", &json!({
+                    "status": "running",
+                    "task_id": task_id_clone,
+                    "enriched": enriched,
+                    "total": total,
+                }).to_string()).ok();
+            }
+        }
+
+        let settings = tune_core::db::settings_repo::SettingsRepo::new(db2);
+        settings.set("enrich_all_status", &json!({
+            "status": "done",
+            "task_id": task_id_clone,
+            "enriched": enriched,
+            "total": total,
+        }).to_string()).ok();
+        tracing::info!(task_id = %task_id_clone, enriched, total, "enrich_all_library done");
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({"status": "accepted", "task_id": task_id})))
+}
+
+async fn enrich_all_status(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let result = settings
+        .get("enrich_all_status")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(json!({"status": "idle"}));
+    Json(result)
+}
+
+async fn rescan_all_artwork(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.db.clone();
+
+    tokio::spawn(async move {
+        let albums: Vec<(i64,)> = {
+            let conn = db.connection().lock().unwrap();
+            conn.prepare("SELECT id FROM albums")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?,)))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        };
+
+        let track_repo = TrackRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db);
+        let mut updated = 0i32;
+        for (album_id,) in &albums {
+            let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+            for track in &tracks {
+                if let Some(ref file_path) = track.file_path {
+                    if let Some(hash) = tune_core::artwork::get_or_extract(
+                        std::path::Path::new(file_path),
+                        &cache_dir,
+                    ) {
+                        album_repo.update_cover_path(*album_id, &hash).ok();
+                        updated += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!(updated, total = albums.len(), "rescan_all_artwork done");
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({"status": "accepted", "message": "artwork rescan started"})))
+}
+
+async fn smart_duplicates(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(100);
+    let offset = p.offset.unwrap_or(0);
+
+    let conn = state.db.connection().lock().unwrap();
+    // Find tracks with same title (case-insensitive), same artist, and similar duration (within 3 seconds)
+    let items: Vec<Value> = conn
+        .prepare(
+            "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms, t1.format, t1.sample_rate, t1.bit_depth, \
+                    t2.id, t2.file_path, t2.duration_ms, t2.format, t2.sample_rate, t2.bit_depth, ar2.name \
+             FROM tracks t1 \
+             JOIN tracks t2 ON t1.title = t2.title COLLATE NOCASE AND t1.id < t2.id \
+             LEFT JOIN artists ar1 ON t1.artist_id = ar1.id \
+             LEFT JOIN artists ar2 ON t2.artist_id = ar2.id \
+             WHERE ar1.name = ar2.name COLLATE NOCASE \
+               AND ABS(COALESCE(t1.duration_ms,0) - COALESCE(t2.duration_ms,0)) < 3000 \
+             LIMIT ? OFFSET ?"
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![limit, offset], |row| {
+                Ok(json!({
+                    "track_a": {
+                        "id": row.get::<_, i64>(0).unwrap_or(0),
+                        "title": row.get::<_, String>(1).unwrap_or_default(),
+                        "artist": row.get::<_, Option<String>>(2).unwrap_or(None),
+                        "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
+                        "duration_ms": row.get::<_, Option<i64>>(4).unwrap_or(None),
+                        "format": row.get::<_, Option<String>>(5).unwrap_or(None),
+                        "sample_rate": row.get::<_, Option<i32>>(6).unwrap_or(None),
+                        "bit_depth": row.get::<_, Option<i32>>(7).unwrap_or(None),
+                    },
+                    "track_b": {
+                        "id": row.get::<_, i64>(8).unwrap_or(0),
+                        "file_path": row.get::<_, Option<String>>(9).unwrap_or(None),
+                        "duration_ms": row.get::<_, Option<i64>>(10).unwrap_or(None),
+                        "format": row.get::<_, Option<String>>(11).unwrap_or(None),
+                        "sample_rate": row.get::<_, Option<i32>>(12).unwrap_or(None),
+                        "bit_depth": row.get::<_, Option<i32>>(13).unwrap_or(None),
+                        "artist": row.get::<_, Option<String>>(14).unwrap_or(None),
+                    },
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+
+    Json(json!({
+        "duplicates": items,
+        "count": items.len(),
+    }))
+}
+
+// --- Collections CRUD ---
+
+#[derive(Deserialize)]
+struct CreateCollectionBody {
+    name: String,
+    description: Option<String>,
+}
+
+async fn list_collections(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let data = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+        .unwrap_or_default();
+    Json(json!(data))
+}
+
+async fn create_collection(
+    State(state): State<AppState>,
+    Json(body): Json<CreateCollectionBody>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let id = collections.iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_i64()))
+        .max()
+        .unwrap_or(0) + 1;
+
+    let collection = json!({
+        "id": id,
+        "name": body.name,
+        "description": body.description,
+        "album_ids": [],
+        "created_at": now_iso_utc(),
+    });
+    collections.push(collection.clone());
+    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+
+    (StatusCode::CREATED, Json(collection)).into_response()
+}
+
+async fn get_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let found = collections.iter().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
+    match found {
+        Some(c) => Json(c.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn delete_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let before = collections.len();
+    collections.retain(|c| c.get("id").and_then(|v| v.as_i64()) != Some(id));
+    if collections.len() == before {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn collection_albums(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let found = collections.iter().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
+    let Some(collection) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let album_ids: Vec<i64> = collection.get("album_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    let album_repo = AlbumRepo::new(state.db);
+    let albums: Vec<Value> = album_ids.iter()
+        .filter_map(|&aid| album_repo.get(aid).ok().flatten().map(|a| a.to_json()))
+        .collect();
+    Json(json!(albums)).into_response()
+}
+
+#[derive(Deserialize)]
+struct CollectionAlbumPath {
+    id: i64,
+    album_id: i64,
+}
+
+async fn add_album_to_collection(
+    State(state): State<AppState>,
+    Path(path): Path<CollectionAlbumPath>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let found = collections.iter_mut().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
+    let Some(collection) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let album_ids = collection.get_mut("album_ids")
+        .and_then(|v| v.as_array_mut());
+    match album_ids {
+        Some(arr) => {
+            let already = arr.iter().any(|v| v.as_i64() == Some(path.album_id));
+            if !already {
+                arr.push(json!(path.album_id));
+            }
+        }
+        None => {
+            collection.as_object_mut().unwrap().insert("album_ids".into(), json!([path.album_id]));
+        }
+    }
+    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+    Json(json!({"added": true, "collection_id": path.id, "album_id": path.album_id})).into_response()
+}
+
+async fn remove_album_from_collection(
+    State(state): State<AppState>,
+    Path(path): Path<CollectionAlbumPath>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let found = collections.iter_mut().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
+    let Some(collection) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(arr) = collection.get_mut("album_ids").and_then(|v| v.as_array_mut()) {
+        arr.retain(|v| v.as_i64() != Some(path.album_id));
+    }
+    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+    Json(json!({"removed": true, "collection_id": path.id, "album_id": path.album_id})).into_response()
 }

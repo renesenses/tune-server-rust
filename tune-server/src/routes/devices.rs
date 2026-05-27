@@ -26,6 +26,8 @@ pub fn router() -> Router<AppState> {
         .route("/{device_id}/buffer", axum::routing::patch(set_device_buffer))
         .route("/clear", post(clear_devices))
         .route("/{device_id}", axum::routing::delete(delete_device))
+        .route("/{device_id}/pair", post(pair_device))
+        .route("/{device_id}/pair/pin", post(pair_device_pin))
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
@@ -253,4 +255,68 @@ async fn delete_device(
     let mut outputs = state.outputs.lock().await;
     outputs.remove(&device_id);
     StatusCode::NO_CONTENT
+}
+
+// ---------------------------------------------------------------------------
+// Device Pairing
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PairRequest {
+    friendly_name: Option<String>,
+}
+
+async fn pair_device(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    Json(body): Json<PairRequest>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("device_pair_{device_id}");
+    let data = json!({
+        "device_id": device_id,
+        "friendly_name": body.friendly_name,
+        "paired_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "status": "paired",
+    });
+    settings.set(&key, &data.to_string()).ok();
+    (StatusCode::CREATED, Json(data)).into_response()
+}
+
+#[derive(Deserialize)]
+struct PairPinRequest {
+    pin: String,
+}
+
+async fn pair_device_pin(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+    Json(body): Json<PairPinRequest>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    // Check if there's a pending pin
+    let pending_key = format!("device_pair_pin_{device_id}");
+    let expected = settings.get(&pending_key).ok().flatten();
+    if let Some(ref expected_pin) = expected {
+        if expected_pin != &body.pin {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": "invalid PIN"}))).into_response();
+        }
+    }
+    // Mark device as paired
+    let key = format!("device_pair_{device_id}");
+    let data = json!({
+        "device_id": device_id,
+        "paired_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "status": "paired",
+        "pin_verified": true,
+    });
+    settings.set(&key, &data.to_string()).ok();
+    settings.delete(&pending_key).ok();
+    Json(data).into_response()
 }

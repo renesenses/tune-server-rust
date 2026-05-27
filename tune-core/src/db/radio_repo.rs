@@ -119,6 +119,28 @@ impl RadioRepo {
         Ok(items)
     }
 
+    pub fn update(&self, station: &RadioStation) -> Result<(), String> {
+        let Some(id) = station.id else {
+            return Err("station has no id".into());
+        };
+        self.db.execute(
+            "UPDATE radio_stations SET name = ?, url = ?, homepage = ?, logo_url = ?, country = ?, language = ?, genre = ?, codec = ?, bitrate = ? WHERE id = ?",
+            &[
+                &station.name as &dyn rusqlite::types::ToSql,
+                &station.url,
+                &station.homepage,
+                &station.logo_url,
+                &station.country,
+                &station.language,
+                &station.genre,
+                &station.codec,
+                &station.bitrate,
+                &id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |row| row.get(0))

@@ -49,6 +49,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/edit", post(edit_track))
         .route("/albums/{id}/edit", post(edit_album))
         .route("/artists/{id}/edit", post(edit_artist))
+        .route("/doubtful", axum::routing::get(list_doubtful_metadata))
 }
 
 async fn edit_track(
@@ -135,4 +136,44 @@ async fn edit_artist(
     repo.update(&artist).ok();
 
     Json(json!({ "status": "ok", "artist_id": id })).into_response()
+}
+
+async fn list_doubtful_metadata(State(state): State<AppState>) -> impl IntoResponse {
+    let track_repo = TrackRepo::new(state.db);
+    // Find tracks with suspicious metadata: missing artist, very short duration, etc.
+    let all_tracks = track_repo.search("", 99999).unwrap_or_default();
+    let doubtful: Vec<serde_json::Value> = all_tracks
+        .iter()
+        .filter(|t| {
+            let no_artist = t.artist_name.as_ref().map(|a| a.is_empty() || a == "Unknown Artist").unwrap_or(true);
+            let very_short = t.duration_ms > 0 && t.duration_ms < 5000;
+            let no_album = t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true);
+            no_artist || very_short || no_album
+        })
+        .map(|t| {
+            let mut reasons = Vec::new();
+            if t.artist_name.as_ref().map(|a| a.is_empty() || a == "Unknown Artist").unwrap_or(true) {
+                reasons.push("missing_artist");
+            }
+            if t.duration_ms > 0 && t.duration_ms < 5000 {
+                reasons.push("very_short");
+            }
+            if t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
+                reasons.push("missing_album");
+            }
+            json!({
+                "id": t.id,
+                "title": t.title,
+                "artist_name": t.artist_name,
+                "album_title": t.album_title,
+                "duration_ms": t.duration_ms,
+                "reasons": reasons,
+            })
+        })
+        .collect();
+    Json(json!({
+        "items": doubtful,
+        "total": doubtful.len(),
+    }))
+    .into_response()
 }

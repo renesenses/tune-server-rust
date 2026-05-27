@@ -45,6 +45,11 @@ pub fn router() -> Router<AppState> {
         .route("/smb/discover", get(list_smb_shares).post(trigger_smb_scan))
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
+        .route("/media-servers/{id}/browse", get(browse_media_server))
+        .route("/media-servers/{id}/item/{item_id}/stream-url", get(media_server_stream_url))
+        .route("/media-servers/{id}/item/{item_id}/play/{zone_id}", post(play_media_server_item))
+        .route("/mounts/test", post(test_mount))
+        .route("/shares/{id}", get(get_share_detail))
 }
 
 async fn list_mounts(State(state): State<AppState>) -> Json<Value> {
@@ -412,5 +417,109 @@ async fn mount_smb_share(
             Json(json!({ "error": format!("db error: {e}") })),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Media Server browsing / streaming
+// ---------------------------------------------------------------------------
+
+async fn browse_media_server(
+    Path(id): Path<String>,
+    Query(q): Query<BrowseQuery>,
+) -> Json<Value> {
+    let object_id = q.object_id.as_deref().unwrap_or("0");
+    Json(json!({
+        "server_id": id,
+        "object_id": object_id,
+        "items": [],
+        "total": 0,
+        "message": "UPnP ContentDirectory Browse not yet implemented",
+    }))
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    object_id: Option<String>,
+}
+
+async fn media_server_stream_url(
+    Path((id, item_id)): Path<(String, String)>,
+) -> Json<Value> {
+    Json(json!({
+        "server_id": id,
+        "item_id": item_id,
+        "stream_url": null,
+        "message": "UPnP stream URL resolution not yet implemented",
+    }))
+}
+
+async fn play_media_server_item(
+    Path((id, item_id, zone_id)): Path<(String, String, i64)>,
+) -> Json<Value> {
+    Json(json!({
+        "server_id": id,
+        "item_id": item_id,
+        "zone_id": zone_id,
+        "status": "not_implemented",
+        "message": "UPnP media server playback not yet implemented",
+    }))
+}
+
+#[derive(Deserialize)]
+struct TestMountRequest {
+    path: String,
+}
+
+async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
+    let path = std::path::Path::new(&body.path);
+    let exists = path.exists();
+    let is_dir = path.is_dir();
+    let readable = if exists {
+        std::fs::read_dir(path).is_ok()
+    } else {
+        false
+    };
+    let file_count = if readable {
+        std::fs::read_dir(path)
+            .map(|rd| rd.count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    Json(json!({
+        "path": body.path,
+        "exists": exists,
+        "is_directory": is_dir,
+        "readable": readable,
+        "file_count": file_count,
+    }))
+}
+
+async fn get_share_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let conn = state.db.connection().lock().unwrap();
+    let result = conn.query_row(
+        "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts WHERE id = ?",
+        rusqlite::params![id],
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                "mount_type": row.get::<_, Option<String>>(1).ok().flatten(),
+                "server": row.get::<_, Option<String>>(2).ok().flatten(),
+                "share": row.get::<_, Option<String>>(3).ok().flatten(),
+                "mount_path": row.get::<_, Option<String>>(4).ok().flatten(),
+                "username": row.get::<_, Option<String>>(5).ok().flatten(),
+                "active": row.get::<_, i32>(6).unwrap_or(1) != 0,
+            }))
+        },
+    );
+    drop(conn);
+    match result {
+        Ok(val) => Json(val).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

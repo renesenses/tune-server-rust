@@ -38,6 +38,9 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_radio).delete(delete_radio))
         .route("/{id}/favorite", post(toggle_favorite))
         .route("/{id}/play/{zone_id}", post(play_radio))
+        .route("/{id}/artwork", post(set_radio_artwork))
+        .route("/export.m3u", get(export_radios_m3u))
+        .route("/import", post(import_radios))
 }
 
 async fn list_radios(State(state): State<AppState>) -> Json<Value> {
@@ -190,6 +193,84 @@ async fn toggle_favorite(
 }
 
 // ---------------------------------------------------------------------------
+// Radio artwork / export / import
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SetArtworkBody {
+    logo_url: String,
+}
+
+async fn set_radio_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SetArtworkBody>,
+) -> impl IntoResponse {
+    let repo = RadioRepo::new(state.db);
+    let Some(mut radio) = repo.get(id).ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    radio.logo_url = Some(body.logo_url.clone());
+    repo.update(&radio).ok();
+    Json(json!({ "id": id, "logo_url": body.logo_url })).into_response()
+}
+
+async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
+    let repo = RadioRepo::new(state.db);
+    let stations = repo.list().unwrap_or_default();
+
+    let mut m3u = String::from("#EXTM3U\n");
+    for s in &stations {
+        m3u.push_str(&format!("#EXTINF:-1,{}\n{}\n", s.name, s.url));
+    }
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        axum::http::HeaderValue::from_static("audio/x-mpegurl; charset=utf-8"),
+    );
+    headers.insert(
+        "Content-Disposition",
+        axum::http::HeaderValue::from_static("attachment; filename=\"radios.m3u\""),
+    );
+    (axum::http::StatusCode::OK, headers, m3u).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportRadiosBody {
+    stations: Vec<CreateRadio>,
+}
+
+async fn import_radios(
+    State(state): State<AppState>,
+    Json(body): Json<ImportRadiosBody>,
+) -> impl IntoResponse {
+    let repo = RadioRepo::new(state.db);
+    let mut imported = 0i64;
+    for s in &body.stations {
+        let station = RadioStation {
+            id: None,
+            name: s.name.clone(),
+            url: s.url.clone(),
+            homepage: s.homepage.clone(),
+            logo_url: s.logo_url.clone(),
+            country: s.country.clone(),
+            language: s.language.clone(),
+            genre: s.genre.clone(),
+            codec: s.codec.clone(),
+            bitrate: s.bitrate,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        };
+        if repo.create(&station).is_ok() {
+            imported += 1;
+        }
+    }
+    (StatusCode::CREATED, Json(json!({ "imported": imported }))).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Radio Favorites
 // ---------------------------------------------------------------------------
 
@@ -199,6 +280,7 @@ pub fn radio_favorites_router() -> Router<AppState> {
         .route("/count", get(radio_favorites_count))
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
+        .route("/create-playlist", post(create_playlist_from_favorites))
         .route("/{fav_id}", axum::routing::delete(delete_radio_favorite))
 }
 
@@ -346,6 +428,74 @@ async fn save_current_as_favorite(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Create playlist from radio favorites
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreatePlaylistFromFavBody {
+    name: Option<String>,
+}
+
+async fn create_playlist_from_favorites(
+    State(state): State<AppState>,
+    body: Option<Json<CreatePlaylistFromFavBody>>,
+) -> impl IntoResponse {
+    let conn = state.db.connection().lock().unwrap();
+    let favorites: Vec<(String, String)> = conn
+        .prepare("SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    drop(conn);
+
+    if favorites.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no favorites to create playlist from"}))).into_response();
+    }
+
+    let name = body
+        .and_then(|b| b.name.clone())
+        .unwrap_or_else(|| "Radio Favorites".into());
+
+    let repo = tune_core::db::playlist_repo::PlaylistRepo::new(state.db.clone());
+    let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db);
+    let playlist_id = match repo.create(&name, None) {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    };
+
+    let mut matched = 0i64;
+    for (title, artist) in &favorites {
+        let q = if artist.is_empty() {
+            title.clone()
+        } else {
+            format!("{artist} {title}")
+        };
+        if let Ok(results) = track_repo.search(&q, 1) {
+            if let Some(track) = results.first() {
+                if let Some(id) = track.id {
+                    repo.add_tracks(playlist_id, &[id], None).ok();
+                    matched += 1;
+                }
+            }
+        }
+    }
+
+    (StatusCode::CREATED, Json(json!({
+        "id": playlist_id,
+        "name": name,
+        "favorites_count": favorites.len(),
+        "matched_tracks": matched,
+    }))).into_response()
 }
 
 // ---------------------------------------------------------------------------

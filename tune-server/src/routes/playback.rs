@@ -129,6 +129,14 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
         .route("/{id}/alarm", get(get_alarms).post(create_alarm))
         .route("/{id}/alarm/{alarm_id}", axum::routing::delete(delete_alarm))
+        .route("/{id}/pins", get(get_zone_pins).post(set_zone_pin))
+        .route("/{id}/pins/{index}", axum::routing::delete(clear_zone_pin))
+        .route("/{id}/pins/{index}/invoke", post(invoke_zone_pin))
+        .route("/{id}/pins/from-queue", post(save_queue_as_pin))
+        .route("/{id}/audiophile", get(get_audiophile).post(set_audiophile))
+        .route("/{id}/quality", get(get_quality).post(set_quality))
+        .route("/{id}/share", post(share_now_playing))
+        .route("/{id}/audio-profile", get(get_audio_profile).post(set_audio_profile))
 }
 
 async fn now_listening(State(state): State<AppState>) -> Json<Value> {
@@ -782,4 +790,284 @@ fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|z| z.output_device_id)
+}
+
+// ---------------------------------------------------------------------------
+// Zone Pins
+// ---------------------------------------------------------------------------
+
+use tune_core::db::settings_repo::SettingsRepo;
+
+#[derive(Deserialize, serde::Serialize, Clone)]
+struct ZonePin {
+    index: usize,
+    title: String,
+    uri: String,
+    #[serde(rename = "type")]
+    pin_type: String,
+}
+
+fn pins_key(zone_id: i64) -> String {
+    format!("zone_{zone_id}_pins")
+}
+
+fn load_pins(state: &AppState, zone_id: i64) -> Vec<ZonePin> {
+    let settings = SettingsRepo::new(state.db.clone());
+    settings
+        .get(&pins_key(zone_id))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
+    let settings = SettingsRepo::new(state.db.clone());
+    settings
+        .set(&pins_key(zone_id), &serde_json::to_string(pins).unwrap_or_default())
+        .ok();
+}
+
+async fn get_zone_pins(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let pins = load_pins(&state, zone_id);
+    Json(json!(pins))
+}
+
+async fn set_zone_pin(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<ZonePin>,
+) -> impl IntoResponse {
+    let mut pins = load_pins(&state, zone_id);
+    // Replace at index or append
+    if let Some(existing) = pins.iter_mut().find(|p| p.index == body.index) {
+        *existing = body.clone();
+    } else {
+        pins.push(body.clone());
+    }
+    save_pins(&state, zone_id, &pins);
+    (StatusCode::CREATED, Json(json!(body))).into_response()
+}
+
+async fn clear_zone_pin(
+    State(state): State<AppState>,
+    Path((zone_id, index)): Path<(i64, usize)>,
+) -> impl IntoResponse {
+    let mut pins = load_pins(&state, zone_id);
+    pins.retain(|p| p.index != index);
+    save_pins(&state, zone_id, &pins);
+    StatusCode::NO_CONTENT
+}
+
+async fn invoke_zone_pin(
+    State(state): State<AppState>,
+    Path((zone_id, index)): Path<(i64, usize)>,
+) -> impl IntoResponse {
+    let pins = load_pins(&state, zone_id);
+    let Some(pin) = pins.iter().find(|p| p.index == index) else {
+        return (StatusCode::NOT_FOUND, "pin not found").into_response();
+    };
+
+    // Build a play request from the pin
+    let output_device_id = get_zone_device_id(&state, zone_id);
+    let orch_req = tune_core::orchestrator::PlayRequest {
+        zone_id,
+        output_device_id,
+        track_id: None,
+        source: Some(pin.pin_type.clone()),
+        source_id: Some(pin.uri.clone()),
+        title: Some(pin.title.clone()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: None,
+    };
+    match state.orchestrator.play(orch_req).await {
+        Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn save_queue_as_pin(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<ZonePin>,
+) -> impl IntoResponse {
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let items = queue_repo.get_queue(zone_id).unwrap_or_default();
+    if items.is_empty() {
+        return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
+    }
+    let mut pins = load_pins(&state, zone_id);
+    let pin = ZonePin {
+        index: body.index,
+        title: body.title,
+        uri: format!("queue:zone:{zone_id}"),
+        pin_type: "queue".into(),
+    };
+    if let Some(existing) = pins.iter_mut().find(|p| p.index == pin.index) {
+        *existing = pin.clone();
+    } else {
+        pins.push(pin.clone());
+    }
+    save_pins(&state, zone_id, &pins);
+    (StatusCode::CREATED, Json(json!(pin))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Audiophile / Quality / Audio-Profile per-zone settings
+// ---------------------------------------------------------------------------
+
+async fn get_audiophile(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_audiophile");
+    let val = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(json!({ "enabled": false }));
+    Json(val)
+}
+
+async fn set_audiophile(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_audiophile");
+    settings.set(&key, &body.to_string()).ok();
+    Json(body)
+}
+
+async fn get_quality(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_quality");
+    let val = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(json!({ "max_sample_rate": null, "max_bit_depth": null, "prefer_hires": true }));
+    Json(val)
+}
+
+async fn set_quality(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_quality");
+    settings.set(&key, &body.to_string()).ok();
+    Json(body)
+}
+
+async fn share_now_playing(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> impl IntoResponse {
+    let ps = state.playback.get_state(zone_id).await;
+    let Some(np) = ps.now_playing else {
+        return (StatusCode::BAD_REQUEST, "nothing playing").into_response();
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let token = format!("{:032x}", nanos ^ (zone_id as u128 * 0x9e3779b97f4a7c15));
+    let settings = SettingsRepo::new(state.db);
+    let data = json!({
+        "title": np.title,
+        "artist_name": np.artist_name,
+        "album_title": np.album_title,
+        "cover_path": np.cover_path,
+        "source": np.source,
+    });
+    settings.set(&format!("share_{token}"), &data.to_string()).ok();
+    Json(json!({
+        "token": token,
+        "url": format!("/shared/{token}"),
+        "track": data,
+    }))
+    .into_response()
+}
+
+async fn get_audio_profile(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_audio_profile");
+    let val = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(json!({ "name": "default" }));
+    Json(val)
+}
+
+async fn set_audio_profile(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let key = format!("zone_{zone_id}_audio_profile");
+    settings.set(&key, &body.to_string()).ok();
+    Json(body)
+}
+
+// ---------------------------------------------------------------------------
+// Shuffle All (global playback)
+// ---------------------------------------------------------------------------
+
+pub async fn shuffle_all(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let track_repo = TrackRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
+
+    let all_ids = track_repo.random_ids(100).unwrap_or_default();
+    if all_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "library is empty").into_response();
+    }
+
+    let zone_id = 1i64; // default zone
+    queue_repo.set_queue(zone_id, &all_ids).ok();
+
+    let first_id = all_ids[0];
+    let track = track_repo.get(first_id).ok().flatten();
+    let output_device_id = get_zone_device_id(&state, zone_id);
+
+    let orch_req = tune_core::orchestrator::PlayRequest {
+        zone_id,
+        output_device_id,
+        track_id: Some(first_id),
+        source: None,
+        source_id: None,
+        title: track.as_ref().map(|t| t.title.clone()),
+        artist_name: track.as_ref().and_then(|t| t.artist_name.clone()),
+        album_title: track.as_ref().and_then(|t| t.album_title.clone()),
+        cover_url: None,
+        duration_ms: track.as_ref().map(|t| t.duration_ms),
+    };
+    match state.orchestrator.play(orch_req).await {
+        Ok(_) => {
+            state.playback.update_queue_info(zone_id, 0, all_ids.len() as i64).await;
+            Json(json!({ "zone_id": zone_id, "tracks_queued": all_ids.len() })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }

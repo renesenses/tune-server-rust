@@ -226,6 +226,7 @@ pub fn router(state: AppState) -> Router {
 
     let zones_and_playback = zones::router().merge(playback::router());
     let api = Router::new()
+        .route("/playback/shuffle-all", axum::routing::post(playback::shuffle_all))
         .nest("/system", system::router())
         .nest("/library", library::router())
         .nest("/library/history", history::router())
