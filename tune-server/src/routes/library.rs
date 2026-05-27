@@ -836,7 +836,15 @@ async fn browse_folders(
     }
 }
 
-async fn list_genres(State(state): State<AppState>) -> Json<Value> {
+#[derive(Deserialize)]
+struct GenreQuery {
+    query: Option<String>,
+}
+
+async fn list_genres(
+    State(state): State<AppState>,
+    Query(params): Query<GenreQuery>,
+) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
     // Collect genre + genres columns from all albums
     let raw: Vec<(Option<String>, Option<String>)> = conn
@@ -874,8 +882,17 @@ async fn list_genres(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
+    // Filter by query parameter (case-insensitive LIKE match)
+    let filter = params.query.map(|q| q.to_lowercase());
+
     let items: Vec<Value> = counts
         .iter()
+        .filter(|(name, _)| {
+            match &filter {
+                Some(q) => name.to_lowercase().contains(q),
+                None => true,
+            }
+        })
         .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();
 

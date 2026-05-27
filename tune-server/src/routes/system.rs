@@ -211,11 +211,13 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             return;
         }
 
+        let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
+
         event_bus.emit("library.scan.started", json!({
             "music_dirs": &music_dirs,
+            "total": files.len(),
         }));
 
-        let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let (scanned, scan_stats) = tune_core::scanner::walker::scan_files_parallel(&files, true, None);
 
         let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
@@ -228,6 +230,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         let mut updated = 0i64;
         let mut skipped = 0i64;
         let mut artwork_extracted = 0i64;
+        let total = scanned.len() as i64;
+        let mut last_progress_emit = std::time::Instant::now();
 
         // Load all existing local tracks in one query for efficient change detection
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
@@ -413,12 +417,15 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 }
             }
 
-            // Emit progress every 100 processed files
+            // Emit progress every 500 processed files or every 2 seconds
             let processed = inserted + updated + skipped;
-            if processed > 0 && processed % 100 == 0 {
+            let elapsed = last_progress_emit.elapsed();
+            if processed > 0 && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2)) {
+                last_progress_emit = std::time::Instant::now();
                 event_bus.emit("library.scan.progress", json!({
-                    "scanned": scanned.len(),
-                    "processed": processed,
+                    "scanned": processed,
+                    "total": total,
+                    "current_file": sf.path,
                     "inserted": inserted,
                     "updated": updated,
                     "skipped": skipped,
@@ -460,7 +467,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             )
             .ok();
 
-        event_bus.emit("library.scan.complete", json!({
+        event_bus.emit("library.scan.completed", json!({
             "total_files": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "inserted": inserted,

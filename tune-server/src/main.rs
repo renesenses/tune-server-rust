@@ -54,6 +54,7 @@ async fn main() {
 
     if config.auto_scan {
         let db = state.db.clone();
+        let event_bus = state.event_bus.clone();
         tokio::spawn(async move {
             info!("auto_scan_starting");
             let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
@@ -72,6 +73,12 @@ async fn main() {
             let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
             info!(files = files.len(), "auto_scan_files_found");
 
+            event_bus.emit("library.scan.started", serde_json::json!({
+                "music_dirs": &music_dirs,
+                "total": files.len(),
+                "auto": true,
+            }));
+
             let (scanned, stats) =
                 tune_core::scanner::walker::scan_files_parallel(&files, true, None);
 
@@ -87,6 +94,8 @@ async fn main() {
             let mut inserted = 0u64;
             let mut updated = 0u64;
             let mut skipped = 0u64;
+            let total = scanned.len() as u64;
+            let mut last_progress_emit = std::time::Instant::now();
 
             // Load all existing local tracks in one query for efficient change detection
             let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
@@ -227,6 +236,21 @@ async fn main() {
                 if track_repo.create(&track).is_ok() {
                     inserted += 1;
                 }
+
+                // Emit progress every 500 processed files or every 2 seconds
+                let processed = inserted + updated + skipped;
+                let elapsed = last_progress_emit.elapsed();
+                if processed > 0 && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2)) {
+                    last_progress_emit = std::time::Instant::now();
+                    event_bus.emit("library.scan.progress", serde_json::json!({
+                        "scanned": processed,
+                        "total": total,
+                        "current_file": sf.path,
+                        "inserted": inserted,
+                        "updated": updated,
+                        "skipped": skipped,
+                    }));
+                }
             }
 
             for album in album_repo.list(99999, 0).unwrap_or_default() {
@@ -246,6 +270,16 @@ async fn main() {
                 artwork = albums_with_cover.len(),
                 "auto_scan_complete"
             );
+
+            event_bus.emit("library.scan.completed", serde_json::json!({
+                "total_files": stats.total_files,
+                "metadata_ok": stats.metadata_ok,
+                "metadata_failed": stats.metadata_failed,
+                "inserted": inserted,
+                "updated": updated,
+                "skipped": skipped,
+                "artwork_extracted": albums_with_cover.len(),
+            }));
         });
     }
 
