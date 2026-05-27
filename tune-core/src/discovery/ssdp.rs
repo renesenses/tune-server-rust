@@ -188,14 +188,59 @@ async fn search_all(targets: &[String]) -> Vec<SsdpResponse> {
 }
 
 async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
-    let local_ip = get_local_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
-    send_msearch_from(target, local_ip).await
+    // Send M-SEARCH on all private LAN interfaces to handle VPN setups
+    let mut all_responses = Vec::new();
+    let mut tried = std::collections::HashSet::new();
+
+    // Try all network interfaces with private IPv4 addresses
+    if let Ok(ifaces) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|_| Ok(()))
+    {
+        // Enumerate private IPs by probing common subnets
+        for subnet in &["192.168.1.1", "192.168.0.1", "10.0.0.1", "172.16.0.1"] {
+            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if s.connect(format!("{subnet}:80")).is_ok() {
+                    if let Ok(addr) = s.local_addr() {
+                        if let SocketAddr::V4(v4) = addr {
+                            let ip = *v4.ip();
+                            if !ip.is_loopback() && !tried.contains(&ip) {
+                                tried.insert(ip);
+                                if let Ok(resps) = send_msearch_from(target, ip).await {
+                                    all_responses.extend(resps);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: also try 0.0.0.0 if nothing found
+    if all_responses.is_empty() {
+        if let Ok(resps) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await {
+            all_responses.extend(resps);
+        }
+    }
+
+    Ok(all_responses)
 }
 
-async fn send_msearch_from(target: &str, bind_addr: Ipv4Addr) -> Result<Vec<SsdpResponse>, String> {
-    let socket = UdpSocket::bind(SocketAddrV4::new(bind_addr, 0))
-        .await
-        .map_err(|e| format!("bind: {e}"))?;
+async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpResponse>, String> {
+    // Use socket2 with explicit multicast interface binding for VPN compat
+    let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .map_err(|e| format!("socket2 new: {e}"))?;
+    sock2.set_reuse_address(true).ok();
+    // Bind to the specific LAN IP so responses come back on the right interface
+    sock2.bind(&socket2::SockAddr::from(SocketAddrV4::new(bind_ip, 0)))
+        .map_err(|e| format!("bind {bind_ip}: {e}"))?;
+    sock2.set_multicast_if_v4(&bind_ip)
+        .map_err(|e| format!("multicast_if: {e}"))?;
+    sock2.join_multicast_v4(&SSDP_MULTICAST_ADDR, &bind_ip).ok();
+    sock2.set_multicast_ttl_v4(4).ok();
+    sock2.set_nonblocking(true).map_err(|e| format!("nonblock: {e}"))?;
+    let socket = UdpSocket::from_std(std::net::UdpSocket::from(sock2))
+        .map_err(|e| format!("from_std: {e}"))?;
 
     let msg = format!(
         "M-SEARCH * HTTP/1.1\r\n\
