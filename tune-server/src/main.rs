@@ -601,6 +601,24 @@ async fn main() {
         });
     }
 
+    // Start UPnP MediaServer SSDP advertiser
+    if let Some(ref upnp) = state.upnp {
+        let location = format!(
+            "http://{}:{}/upnp/description.xml",
+            tune_core::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into()),
+            config.port,
+        );
+        tune_core::upnp_server::spawn_ssdp_advertiser(upnp.uuid.clone(), location).await;
+        info!("upnp_mediaserver_advertiser_started");
+    }
+
+    state.event_bus.emit("system.started", serde_json::json!({
+        "version": tune_core::version(),
+        "port": config.port,
+    }));
+
     info!(
         version = tune_core::version(),
         port = config.port,

@@ -66,6 +66,69 @@ impl ServiceRegistry {
         }
     }
 
+    pub async fn get_stream_url(
+        &self,
+        service_name: &str,
+        track_id: &str,
+        quality: Option<&str>,
+    ) -> Result<String, String> {
+        let svc = self
+            .services
+            .get(service_name)
+            .ok_or_else(|| format!("service not found: {service_name}"))?;
+        let svc = svc.lock().await;
+        let stream_url = svc.get_track_url(track_id, quality).await?;
+        Ok(stream_url.url)
+    }
+
+    pub async fn get_album_tracks(
+        &self,
+        service_name: &str,
+        album_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let svc = self
+            .services
+            .get(service_name)
+            .ok_or_else(|| format!("service not found: {service_name}"))?;
+        let svc = svc.lock().await;
+        let tracks = svc.get_album_tracks(album_id).await?;
+        Ok(tracks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "artist": t.artist,
+                    "album": t.album,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn get_playlist_tracks(
+        &self,
+        service_name: &str,
+        playlist_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let svc = self
+            .services
+            .get(service_name)
+            .ok_or_else(|| format!("service not found: {service_name}"))?;
+        let svc = svc.lock().await;
+        let tracks = svc.get_playlist_tracks(playlist_id).await?;
+        Ok(tracks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "artist": t.artist,
+                    "album": t.album,
+                })
+            })
+            .collect())
+    }
+
     pub async fn restore_all_tokens(&self, db: &SqliteDb) {
         let settings = SettingsRepo::new(db.clone());
         for (name, svc) in &self.services {

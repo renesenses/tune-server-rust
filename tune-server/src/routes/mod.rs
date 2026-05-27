@@ -10,9 +10,11 @@ pub mod eq_pro;
 pub mod export;
 pub mod graphql;
 pub mod history;
+pub mod home;
 pub mod homeassistant;
 pub mod hqplayer;
 pub mod hue;
+pub mod i18n;
 pub mod kiosk;
 pub mod lastfm_social;
 pub mod library;
@@ -21,6 +23,8 @@ pub mod mediasync;
 pub mod metadata;
 pub mod mqa;
 pub mod network;
+pub mod offline;
+pub mod onboarding;
 pub mod party;
 pub mod playback;
 pub mod playlist_manager;
@@ -37,6 +41,7 @@ pub mod search;
 pub mod setlistfm;
 pub mod shazam;
 pub mod siri;
+pub mod smart_ai;
 pub mod smart_playlists;
 pub mod snapcast;
 pub mod sonos;
@@ -47,6 +52,7 @@ pub mod streaming;
 pub mod system;
 pub mod tags;
 pub mod tagger;
+pub mod upnp;
 pub mod visualizer;
 pub mod widget;
 pub mod ws;
@@ -308,17 +314,38 @@ pub fn router(state: AppState) -> Router {
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
         .nest("/shazam", shazam::router())
+        .nest("/home", home::router())
+        .nest("/onboarding", onboarding::router())
+        .nest("/i18n", i18n::router())
+        .nest("/upnp", upnp::router())
+        .nest("/auth", crate::auth::router())
+        .nest("/offline", offline::router())
+        .nest("/smart-ai", smart_ai::router())
         .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
         .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
         .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))
         .route("/services/lastfm/auth", axum::routing::post(lastfm_auth))
-        .fallback(api_fallback);
+        .fallback(api_fallback)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::auth_middleware));
 
-    let app = Router::new()
+    // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
+    let upnp_routes = if let Some(ref upnp_state) = state.upnp {
+        Some(tune_core::upnp_server::standalone_router(upnp_state.clone()))
+    } else {
+        None
+    };
+
+    let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .with_state(state)
-        .merge(tune_core::http::streamer::router(streamer_sessions))
+        .merge(tune_core::http::streamer::router(streamer_sessions));
+
+    if let Some(upnp) = upnp_routes {
+        app = app.nest("/upnp", upnp);
+    }
+
+    let app = app
         .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive());

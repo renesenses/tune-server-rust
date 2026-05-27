@@ -5,11 +5,13 @@ use tokio::sync::Mutex;
 
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::discovery::ssdp::SsdpScanner;
+use tune_core::event_bus::EventBus;
 use tune_core::http::streamer::AudioStreamer;
 use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
 use tune_core::streaming::ServiceRegistry;
+use tune_core::upnp_server::UpnpState;
 
 use crate::config::TuneConfig;
 
@@ -22,6 +24,8 @@ pub struct AppState {
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub orchestrator: Arc<PlaybackOrchestrator>,
     pub scanner: Arc<Mutex<SsdpScanner>>,
+    pub event_bus: Arc<EventBus>,
+    pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub port: u16,
     pub started_at: Instant,
@@ -60,6 +64,10 @@ impl AppState {
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
         let scanner = Arc::new(Mutex::new(SsdpScanner::new(ssdp_tx)));
 
+        let event_bus = Arc::new(EventBus::new());
+
+        let upnp = UpnpState::new(db.clone(), port);
+
         Ok(Self {
             db,
             streamer,
@@ -68,6 +76,8 @@ impl AppState {
             outputs,
             orchestrator,
             scanner,
+            event_bus,
+            upnp: Some(upnp),
             config: Arc::new(tune_config),
             port,
             started_at: Instant::now(),

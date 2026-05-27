@@ -30,6 +30,7 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut rx = state.playback.subscribe();
+    let mut event_rx = state.event_bus.subscribe();
     let mut patterns: Vec<String> = vec!["*".to_string()];
 
     loop {
@@ -50,6 +51,25 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let ws_event = serde_json::json!({
                             "type": event_type,
                             "data": data,
+                        });
+                        let json = serde_json::to_string(&ws_event).unwrap_or_default();
+                        if socket.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Ok(ev) => {
+                        if !patterns.iter().any(|p| matches_pattern(&ev.event_type, p)) {
+                            continue;
+                        }
+                        let ws_event = serde_json::json!({
+                            "type": ev.event_type,
+                            "data": ev.data,
                         });
                         let json = serde_json::to_string(&ws_event).unwrap_or_default();
                         if socket.send(Message::Text(json.into())).await.is_err() {

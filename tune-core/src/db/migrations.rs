@@ -240,6 +240,31 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_name
         name: "enhance_fts5_multi_column",
         up: "", // Applied programmatically to rebuild FTS with extra columns
     },
+    Migration {
+        version: 13,
+        name: "add_offline_cache",
+        up: "
+CREATE TABLE IF NOT EXISTS offline_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    track_title TEXT,
+    artist_name TEXT,
+    album_title TEXT,
+    file_path TEXT,
+    file_size INTEGER,
+    duration_ms INTEGER,
+    quality TEXT,
+    downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    status TEXT DEFAULT 'pending',
+    error TEXT,
+    UNIQUE(source, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offline_cache_source ON offline_cache(source, source_id);
+CREATE INDEX IF NOT EXISTS idx_offline_cache_status ON offline_cache(status);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
