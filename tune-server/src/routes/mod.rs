@@ -17,6 +17,10 @@ pub mod profiles;
 pub mod radios;
 pub mod search;
 pub mod smart_playlists;
+pub mod snapcast;
+pub mod sonos;
+pub mod spotify_connect;
+pub mod squeezebox;
 pub mod streaming;
 pub mod system;
 pub mod tags;
@@ -172,6 +176,32 @@ async fn service_token_delete(
     StatusCode::NO_CONTENT
 }
 
+async fn lastfm_auth(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let token = match body["token"].as_str() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "missing token"}))).into_response(),
+    };
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let api_key = match settings.get("lastfm_api_key").ok().flatten() {
+        Some(k) if !k.is_empty() => k,
+        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "lastfm_api_key not configured"}))).into_response(),
+    };
+    let api_secret = match settings.get("lastfm_api_secret").ok().flatten() {
+        Some(s) if !s.is_empty() => s,
+        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "lastfm_api_secret not configured"}))).into_response(),
+    };
+    match tune_core::scrobble::get_session(&api_key, &api_secret, &token).await {
+        Ok(session_key) => {
+            settings.set("lastfm_session_key", &session_key).ok();
+            axum::Json(serde_json::json!({"session_key": session_key})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, axum::Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
 async fn api_fallback(
     axum::extract::OriginalUri(original): axum::extract::OriginalUri,
 ) -> impl IntoResponse {
@@ -223,9 +253,14 @@ pub fn router(state: AppState) -> Router {
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
         .nest("/zone-manager", zone_manager::router())
+        .nest("/snapcast", snapcast::router())
+        .nest("/sonos", sonos::router())
+        .nest("/squeezebox", squeezebox::router())
+        .nest("/spotify-connect", spotify_connect::router())
         .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
         .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
         .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))
+        .route("/services/lastfm/auth", axum::routing::post(lastfm_auth))
         .fallback(api_fallback);
 
     let app = Router::new()

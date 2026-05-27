@@ -235,6 +235,11 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_name
         name: "add_genres_column",
         up: "", // Applied programmatically via add_column_if_missing
     },
+    Migration {
+        version: 12,
+        name: "enhance_fts5_multi_column",
+        up: "", // Applied programmatically to rebuild FTS with extra columns
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -249,6 +254,120 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
     drop(conn);
     if !has_column {
         db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};")).ok();
+    }
+}
+
+/// Upgrade FTS5 tables from single-column (title only) to multi-column
+/// (artist_name, genre, composer, etc.) for richer full-text search.
+fn upgrade_fts5_tables(db: &SqliteDb) {
+    let sql = "
+        -- Drop old triggers
+        DROP TRIGGER IF EXISTS tracks_fts_insert;
+        DROP TRIGGER IF EXISTS tracks_fts_update;
+        DROP TRIGGER IF EXISTS tracks_fts_delete;
+        DROP TRIGGER IF EXISTS albums_fts_insert;
+        DROP TRIGGER IF EXISTS albums_fts_update;
+        DROP TRIGGER IF EXISTS albums_fts_delete;
+        DROP TRIGGER IF EXISTS artists_fts_insert;
+        DROP TRIGGER IF EXISTS artists_fts_update;
+        DROP TRIGGER IF EXISTS artists_fts_delete;
+
+        -- Drop old FTS tables
+        DROP TABLE IF EXISTS tracks_fts;
+        DROP TABLE IF EXISTS albums_fts;
+        DROP TABLE IF EXISTS artists_fts;
+
+        -- Recreate with multiple columns
+        CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+            title, artist_name, album_title, genre, composer,
+            tokenize='unicode61 remove_diacritics 2',
+            content='tracks', content_rowid='id'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
+            title, artist_name, genre,
+            tokenize='unicode61 remove_diacritics 2',
+            content='albums', content_rowid='id'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
+            name, sort_name,
+            tokenize='unicode61 remove_diacritics 2',
+            content='artists', content_rowid='id'
+        );
+
+        -- Rebuild (populate from content tables)
+        INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');
+        INSERT INTO albums_fts(albums_fts) VALUES('rebuild');
+        INSERT INTO artists_fts(artists_fts) VALUES('rebuild');
+
+        -- Auto-sync triggers: tracks
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
+            INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
+            VALUES (new.id, new.title,
+                    (SELECT name FROM artists WHERE id = new.artist_id),
+                    (SELECT title FROM albums WHERE id = new.album_id),
+                    new.genre, new.composer);
+        END;
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN
+            INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
+            VALUES ('delete', old.id, old.title,
+                    (SELECT name FROM artists WHERE id = old.artist_id),
+                    (SELECT title FROM albums WHERE id = old.album_id),
+                    old.genre, old.composer);
+            INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
+            VALUES (new.id, new.title,
+                    (SELECT name FROM artists WHERE id = new.artist_id),
+                    (SELECT title FROM albums WHERE id = new.album_id),
+                    new.genre, new.composer);
+        END;
+        CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
+            INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
+            VALUES ('delete', old.id, old.title,
+                    (SELECT name FROM artists WHERE id = old.artist_id),
+                    (SELECT title FROM albums WHERE id = old.album_id),
+                    old.genre, old.composer);
+        END;
+
+        -- Auto-sync triggers: albums
+        CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN
+            INSERT INTO albums_fts(rowid, title, artist_name, genre)
+            VALUES (new.id, new.title,
+                    (SELECT name FROM artists WHERE id = new.artist_id),
+                    new.genre);
+        END;
+        CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN
+            INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
+            VALUES ('delete', old.id, old.title,
+                    (SELECT name FROM artists WHERE id = old.artist_id),
+                    old.genre);
+            INSERT INTO albums_fts(rowid, title, artist_name, genre)
+            VALUES (new.id, new.title,
+                    (SELECT name FROM artists WHERE id = new.artist_id),
+                    new.genre);
+        END;
+        CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN
+            INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
+            VALUES ('delete', old.id, old.title,
+                    (SELECT name FROM artists WHERE id = old.artist_id),
+                    old.genre);
+        END;
+
+        -- Auto-sync triggers: artists
+        CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN
+            INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN
+            INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
+            INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
+            INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
+        END;
+    ";
+
+    if let Err(e) = db.execute_batch(sql) {
+        tracing::warn!(error = %e, "fts5_upgrade_failed");
+    } else {
+        info!("fts5_tables_upgraded_to_multi_column");
     }
 }
 
@@ -305,6 +424,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 11 {
             add_column_if_missing(db, "albums", "genres", "TEXT");
             add_column_if_missing(db, "tracks", "genres", "TEXT");
+        }
+        if migration.version == 12 {
+            upgrade_fts5_tables(db);
         }
 
         db.execute(

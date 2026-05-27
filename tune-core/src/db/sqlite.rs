@@ -196,45 +196,85 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_i
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_play_queue_zone_id ON play_queue(zone_id);
 
--- FTS5 virtual tables for full-text search (accent-insensitive)
-CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(title, tokenize='unicode61 remove_diacritics 2', content='tracks', content_rowid='id');
-CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(title, tokenize='unicode61 remove_diacritics 2', content='albums', content_rowid='id');
-CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(name, tokenize='unicode61 remove_diacritics 2', content='artists', content_rowid='id');
+-- FTS5 virtual tables for full-text search (accent-insensitive, multi-column)
+CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
+    title, artist_name, album_title, genre, composer,
+    tokenize='unicode61 remove_diacritics 2',
+    content='tracks', content_rowid='id'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
+    title, artist_name, genre,
+    tokenize='unicode61 remove_diacritics 2',
+    content='albums', content_rowid='id'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
+    name, sort_name,
+    tokenize='unicode61 remove_diacritics 2',
+    content='artists', content_rowid='id'
+);
 
 -- FTS sync triggers: tracks
 CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
-    INSERT INTO tracks_fts(rowid, title) VALUES (new.id, new.title);
+    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
+    VALUES (new.id, new.title,
+            (SELECT name FROM artists WHERE id = new.artist_id),
+            (SELECT title FROM albums WHERE id = new.album_id),
+            new.genre, new.composer);
 END;
-CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE OF title ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title) VALUES ('delete', old.id, old.title);
-    INSERT INTO tracks_fts(rowid, title) VALUES (new.id, new.title);
+CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN
+    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
+    VALUES ('delete', old.id, old.title,
+            (SELECT name FROM artists WHERE id = old.artist_id),
+            (SELECT title FROM albums WHERE id = old.album_id),
+            old.genre, old.composer);
+    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
+    VALUES (new.id, new.title,
+            (SELECT name FROM artists WHERE id = new.artist_id),
+            (SELECT title FROM albums WHERE id = new.album_id),
+            new.genre, new.composer);
 END;
 CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title) VALUES ('delete', old.id, old.title);
+    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
+    VALUES ('delete', old.id, old.title,
+            (SELECT name FROM artists WHERE id = old.artist_id),
+            (SELECT title FROM albums WHERE id = old.album_id),
+            old.genre, old.composer);
 END;
 
 -- FTS sync triggers: albums
 CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN
-    INSERT INTO albums_fts(rowid, title) VALUES (new.id, new.title);
+    INSERT INTO albums_fts(rowid, title, artist_name, genre)
+    VALUES (new.id, new.title,
+            (SELECT name FROM artists WHERE id = new.artist_id),
+            new.genre);
 END;
-CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE OF title ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title) VALUES ('delete', old.id, old.title);
-    INSERT INTO albums_fts(rowid, title) VALUES (new.id, new.title);
+CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN
+    INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
+    VALUES ('delete', old.id, old.title,
+            (SELECT name FROM artists WHERE id = old.artist_id),
+            old.genre);
+    INSERT INTO albums_fts(rowid, title, artist_name, genre)
+    VALUES (new.id, new.title,
+            (SELECT name FROM artists WHERE id = new.artist_id),
+            new.genre);
 END;
 CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title) VALUES ('delete', old.id, old.title);
+    INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
+    VALUES ('delete', old.id, old.title,
+            (SELECT name FROM artists WHERE id = old.artist_id),
+            old.genre);
 END;
 
 -- FTS sync triggers: artists
 CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN
-    INSERT INTO artists_fts(rowid, name) VALUES (new.id, new.name);
+    INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
 END;
-CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE OF name ON artists BEGIN
-    INSERT INTO artists_fts(artists_fts, rowid, name) VALUES ('delete', old.id, old.name);
-    INSERT INTO artists_fts(rowid, name) VALUES (new.id, new.name);
+CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN
+    INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
+    INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
 END;
 CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
-    INSERT INTO artists_fts(artists_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
 END;
 ";
 

@@ -9,6 +9,7 @@ use crate::audio::formats::AudioFormat;
 use crate::audio::pipeline::find_ffmpeg;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
 use crate::db::play_queue_repo::PlayQueueRepo;
+use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
 use crate::db::zone_repo::ZoneRepo;
@@ -64,6 +65,9 @@ impl PlaybackOrchestrator {
         };
 
         self.playback.play(req.zone_id, np).await;
+
+        // Last.fm Now Playing
+        self.lastfm_now_playing(&title, artist.as_deref());
 
         let output_sent = if let Some(ref device_id) = req.output_device_id {
             self.send_to_output(device_id, &stream_url, &mime_type, Some(&title), artist.as_deref()).await
@@ -328,6 +332,56 @@ impl PlaybackOrchestrator {
             listened_at: None,
             zone_id: Some(zone_id),
         }).ok();
+
+        // Last.fm scrobble
+        self.lastfm_scrobble(title, artist);
+    }
+
+    fn lastfm_keys(&self) -> Option<(String, String, String)> {
+        let settings = SettingsRepo::new(self.db.clone());
+        let api_key = settings.get("lastfm_api_key").ok().flatten()?;
+        let api_secret = settings.get("lastfm_api_secret").ok().flatten()?;
+        let session_key = settings.get("lastfm_session_key").ok().flatten()?;
+        if api_key.is_empty() || api_secret.is_empty() || session_key.is_empty() {
+            return None;
+        }
+        Some((api_key, api_secret, session_key))
+    }
+
+    fn lastfm_scrobble(&self, title: &str, artist: Option<&str>) {
+        let artist = match artist {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => return,
+        };
+        let Some((api_key, api_secret, session_key)) = self.lastfm_keys() else {
+            return;
+        };
+        let title = title.to_string();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        tokio::spawn(async move {
+            if let Err(e) = crate::scrobble::scrobble(&api_key, &api_secret, &session_key, &artist, &title, timestamp).await {
+                warn!("lastfm_scrobble_error: {e}");
+            }
+        });
+    }
+
+    fn lastfm_now_playing(&self, title: &str, artist: Option<&str>) {
+        let artist = match artist {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => return,
+        };
+        let Some((api_key, api_secret, session_key)) = self.lastfm_keys() else {
+            return;
+        };
+        let title = title.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = crate::scrobble::update_now_playing(&api_key, &api_secret, &session_key, &artist, &title).await {
+                warn!("lastfm_now_playing_error: {e}");
+            }
+        });
     }
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) {

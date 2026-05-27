@@ -71,6 +71,10 @@ pub fn router() -> Router<AppState> {
         .route("/admin/discovery", get(admin_discovery))
         .route("/admin/health", get(admin_health))
         .route("/admin/zones", get(admin_zones))
+        .route("/update/install", post(update_install))
+        .route("/update/apply", post(update_apply))
+        .route("/update/status", get(update_status))
+        .route("/bug-report", get(generate_bug_report))
 }
 
 async fn version() -> Json<Value> {
@@ -794,6 +798,79 @@ async fn update_check() -> Json<Value> {
         "update_available": false,
         "engine": "rust",
         "message": "auto-update not yet implemented",
+    }))
+}
+
+async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let task_id = uuid::Uuid::new_v4().to_string();
+    settings.set("update_task_id", &task_id).ok();
+    settings.set("update_status", "downloading").ok();
+
+    let tid = task_id.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap();
+        let arch = std::env::consts::ARCH;
+        let os = std::env::consts::OS;
+        let url = format!(
+            "https://github.com/renesenses/tune-server-rust/releases/latest/download/tune-server-{os}-{arch}"
+        );
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(bytes) = resp.bytes().await {
+                    let update_path = "/tmp/tune-server-update";
+                    if tokio::fs::write(update_path, &bytes).await.is_ok() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(update_path, std::fs::Permissions::from_mode(0o755)).ok();
+                        }
+                        tracing::info!(task_id = %tid, size = bytes.len(), "update_downloaded");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(task_id = %tid, "update_download_failed");
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({"task_id": task_id, "status": "downloading"})))
+}
+
+async fn update_apply() -> impl IntoResponse {
+    let update_path = "/tmp/tune-server-update";
+    if !std::path::Path::new(update_path).exists() {
+        return Json(json!({"error": "no update downloaded"})).into_response();
+    }
+    let current_exe = std::env::current_exe().unwrap_or_default();
+    let backup = format!("{}.old", current_exe.display());
+    std::fs::rename(&current_exe, &backup).ok();
+    if std::fs::rename(update_path, &current_exe).is_ok() {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            std::process::exit(0);
+        });
+        Json(json!({"status": "applied", "message": "restarting with new binary"})).into_response()
+    } else {
+        std::fs::rename(&backup, &current_exe).ok();
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to replace binary"}))).into_response()
+    }
+}
+
+async fn update_status(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let status = settings.get("update_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let task_id = settings.get("update_task_id").ok().flatten();
+    let update_exists = std::path::Path::new("/tmp/tune-server-update").exists();
+    Json(json!({
+        "status": status,
+        "task_id": task_id,
+        "update_ready": update_exists,
+        "current_version": tune_core::version(),
     }))
 }
 
@@ -1656,4 +1733,116 @@ async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
         }));
     }
     Json(json!(result))
+}
+
+/// Generate a bug report with comprehensive diagnostic data.
+/// Returns JSON that can also be rendered as markdown by the client.
+async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
+    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let db_version = migrations::current_version(&state.db).unwrap_or(0);
+    let settings = SettingsRepo::new(state.db.clone());
+    let music_dirs = get_music_dirs_list(&state.db);
+    let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
+    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+
+    // Zones
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_count = zone_repo.count().unwrap_or(0);
+    let zones: Vec<Value> = zone_repo.list().unwrap_or_default().iter().map(|z| {
+        json!({ "id": z.id, "name": z.name, "output_type": z.output_type })
+    }).collect();
+
+    // Streaming services status
+    let registry = state.services.lock().await;
+    let service_status = registry.status_all().await;
+    drop(registry);
+
+    // Discovered devices
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.devices().await;
+    drop(scanner);
+    let outputs = state.outputs.lock().await;
+    let output_count = outputs.list().len();
+    drop(outputs);
+
+    let uptime_str = format!(
+        "{}d {}h {}m {}s",
+        uptime_secs / 86400,
+        (uptime_secs % 86400) / 3600,
+        (uptime_secs % 3600) / 60,
+        uptime_secs % 60,
+    );
+
+    // Build markdown text
+    let mut md = String::new();
+    md.push_str(&format!("# Tune Bug Report\n\n"));
+    md.push_str(&format!("**Version**: {} (engine: rust)\n", tune_core::version()));
+    md.push_str(&format!("**Platform**: {} ({})\n", std::env::consts::OS, std::env::consts::ARCH));
+    md.push_str(&format!("**Uptime**: {uptime_str}\n"));
+    md.push_str(&format!("**PID**: {}\n\n", std::process::id()));
+
+    md.push_str("## Library\n");
+    md.push_str(&format!("- Tracks: {tracks}\n"));
+    md.push_str(&format!("- Albums: {albums}\n"));
+    md.push_str(&format!("- Artists: {artists}\n"));
+    md.push_str(&format!("- Music dirs: {}\n", music_dirs.join(", ")));
+    md.push_str(&format!("- Scan status: {scan_status}\n\n"));
+
+    md.push_str(&format!("## Zones ({zone_count})\n"));
+    for z in &zones {
+        md.push_str(&format!("- {} ({})\n", z["name"].as_str().unwrap_or("?"), z["output_type"].as_str().unwrap_or("?")));
+    }
+    md.push_str("\n");
+
+    md.push_str("## Streaming Services\n");
+    for s in &service_status {
+        let auth = if s["authenticated"].as_bool().unwrap_or(false) { "authenticated" } else { "not authenticated" };
+        let enabled = if s["enabled"].as_bool().unwrap_or(false) { "enabled" } else { "disabled" };
+        md.push_str(&format!("- {}: {}, {}\n", s["name"].as_str().unwrap_or("?"), enabled, auth));
+    }
+    md.push_str("\n");
+
+    md.push_str(&format!("## Network\n"));
+    md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
+    md.push_str(&format!("- Registered outputs: {output_count}\n"));
+    md.push_str(&format!("- FFmpeg: {}\n\n", ffmpeg.as_deref().unwrap_or("not found")));
+
+    md.push_str(&format!("## Database\n"));
+    md.push_str(&format!("- Engine: sqlite\n"));
+    md.push_str(&format!("- Migration version: {db_version}\n"));
+
+    Json(json!({
+        "version": tune_core::version(),
+        "engine": "rust",
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "uptime_seconds": uptime_secs,
+        "uptime": uptime_str,
+        "pid": std::process::id(),
+        "library": {
+            "tracks": tracks,
+            "albums": albums,
+            "artists": artists,
+            "music_dirs": music_dirs,
+            "scan_status": scan_status,
+        },
+        "zones": {
+            "count": zone_count,
+            "items": zones,
+        },
+        "streaming_services": service_status,
+        "network": {
+            "discovered_devices": devices.len(),
+            "registered_outputs": output_count,
+        },
+        "ffmpeg": ffmpeg,
+        "database": {
+            "engine": "sqlite",
+            "migration_version": db_version,
+        },
+        "markdown": md,
+    }))
 }

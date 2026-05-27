@@ -10,6 +10,7 @@ pub mod outputs;
 pub mod playback;
 pub mod poller;
 pub mod scanner;
+pub mod scrobble;
 pub mod streaming;
 
 pub fn version() -> &'static str {

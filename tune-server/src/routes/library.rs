@@ -89,6 +89,8 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/artwork/enrich", post(enrich_album_artwork))
         .route("/artwork/enrich", post(batch_enrich_artwork))
         .route("/artwork/enrich/status", get(batch_enrich_artwork_status))
+        .route("/duplicates", get(list_duplicates))
+        .route("/duplicates/resolve", post(resolve_duplicate))
 }
 
 async fn list_artists(
@@ -1389,4 +1391,160 @@ pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     let dir = std::env::var("TUNE_ARTWORK_DIR")
         .unwrap_or_else(|_| "artwork_cache".into());
     std::path::PathBuf::from(dir)
+}
+
+// --- Duplicate detection ---
+
+async fn list_duplicates(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
+    let limit = p.limit.unwrap_or(100);
+    let offset = p.offset.unwrap_or(0);
+
+    let (hash_dups, meta_dups) = {
+        let conn = state.db.connection().lock().unwrap();
+
+        // Duplicates by audio_hash
+        let hash_dups: Vec<Value> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.audio_hash, t1.duration_ms,
+                            t2.id, t2.file_path, ar2.name
+                     FROM tracks t1
+                     JOIN tracks t2 ON t1.audio_hash = t2.audio_hash AND t1.id < t2.id
+                     LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+                     LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+                     WHERE t1.audio_hash IS NOT NULL AND t1.audio_hash != ''
+                     LIMIT ? OFFSET ?",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![limit, offset], |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0).unwrap_or(0),
+                    "title": row.get::<_, String>(1).unwrap_or_default(),
+                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
+                    "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
+                    "audio_hash": row.get::<_, Option<String>>(4).unwrap_or(None),
+                    "duration_ms": row.get::<_, i64>(5).unwrap_or(0),
+                    "dup_id": row.get::<_, i64>(6).unwrap_or(0),
+                    "dup_path": row.get::<_, Option<String>>(7).unwrap_or(None),
+                    "dup_artist_name": row.get::<_, Option<String>>(8).unwrap_or(None),
+                    "match_type": "audio_hash",
+                }))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        // Duplicates by (title + artist_name + duration_ms) where no hash match
+        let meta_dups: Vec<Value> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms,
+                            t2.id, t2.file_path, ar2.name
+                     FROM tracks t1
+                     JOIN tracks t2 ON t1.title = t2.title COLLATE NOCASE
+                                   AND t1.duration_ms = t2.duration_ms
+                                   AND t1.id < t2.id
+                     LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+                     LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+                     WHERE ar1.name = ar2.name COLLATE NOCASE
+                       AND (t1.audio_hash IS NULL OR t2.audio_hash IS NULL OR t1.audio_hash != t2.audio_hash)
+                     LIMIT ? OFFSET ?",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![limit, offset], |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0).unwrap_or(0),
+                    "title": row.get::<_, String>(1).unwrap_or_default(),
+                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
+                    "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
+                    "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
+                    "dup_id": row.get::<_, i64>(5).unwrap_or(0),
+                    "dup_path": row.get::<_, Option<String>>(6).unwrap_or(None),
+                    "dup_artist_name": row.get::<_, Option<String>>(7).unwrap_or(None),
+                    "match_type": "metadata",
+                }))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        (hash_dups, meta_dups)
+    };
+
+    Json(json!({
+        "duplicates": {
+            "by_hash": hash_dups,
+            "by_metadata": meta_dups,
+        },
+        "total": hash_dups.len() + meta_dups.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ResolveDuplicate {
+    keep_id: i64,
+    delete_id: i64,
+}
+
+async fn resolve_duplicate(
+    State(state): State<AppState>,
+    Json(body): Json<ResolveDuplicate>,
+) -> impl IntoResponse {
+    let conn = state.db.connection().lock().unwrap();
+
+    // Verify both tracks exist
+    let keep_exists: bool = conn
+        .query_row("SELECT COUNT(*) FROM tracks WHERE id = ?", [body.keep_id], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) > 0;
+    let delete_exists: bool = conn
+        .query_row("SELECT COUNT(*) FROM tracks WHERE id = ?", [body.delete_id], |row| row.get::<_, i64>(0))
+        .unwrap_or(0) > 0;
+
+    if !keep_exists || !delete_exists {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+    }
+
+    // Reassign playlist references from deleted track to kept track
+    conn.execute(
+        "UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?",
+        rusqlite::params![body.keep_id, body.delete_id],
+    ).ok();
+
+    // Reassign play queue references
+    conn.execute(
+        "UPDATE play_queue SET track_id = ? WHERE track_id = ?",
+        rusqlite::params![body.keep_id, body.delete_id],
+    ).ok();
+
+    // Reassign listen history references
+    conn.execute(
+        "UPDATE listen_history SET track_id = ? WHERE track_id = ?",
+        rusqlite::params![body.keep_id, body.delete_id],
+    ).ok();
+
+    // Reassign bookmarks
+    conn.execute(
+        "UPDATE bookmarks SET track_id = ? WHERE track_id = ?",
+        rusqlite::params![body.keep_id, body.delete_id],
+    ).ok();
+
+    // Reassign favorites
+    conn.execute(
+        "UPDATE favorites SET item_id = ? WHERE item_type = 'track' AND item_id = ?",
+        rusqlite::params![body.keep_id, body.delete_id],
+    ).ok();
+
+    // Delete the duplicate track
+    conn.execute("DELETE FROM tracks WHERE id = ?", [body.delete_id]).ok();
+    drop(conn);
+
+    Json(json!({
+        "kept": body.keep_id,
+        "deleted": body.delete_id,
+    })).into_response()
 }
