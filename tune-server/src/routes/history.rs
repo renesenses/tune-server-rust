@@ -15,6 +15,14 @@ struct HistoryParams {
     period: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DashboardParams {
+    period: Option<String>,
+    zone_id: Option<i64>,
+    profile_id: Option<i64>,
+    top_n: Option<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(recent_history))
@@ -83,15 +91,27 @@ async fn top_artists(
     Json(json!(items))
 }
 
-async fn dashboard(State(state): State<AppState>) -> Json<Value> {
+async fn dashboard(
+    State(state): State<AppState>,
+    Query(p): Query<DashboardParams>,
+) -> Json<Value> {
+    let period = p.period.as_deref().unwrap_or("30d");
+    let top_n = p.top_n.unwrap_or(10);
     let repo = HistoryRepo::new(state.db);
-    match repo.dashboard() {
-        Ok(stats) => Json(json!(stats)),
+    match repo.full_dashboard(period, p.zone_id, p.profile_id, top_n) {
+        Ok(data) => Json(json!(data)),
         Err(_) => Json(json!({
-            "total_listens": 0,
-            "total_duration_ms": 0,
-            "unique_tracks": 0,
-            "unique_artists": 0,
+            "period": period,
+            "range": { "from": null, "to": "" },
+            "totals": { "plays": 0, "listening_ms": 0, "unique_tracks": 0, "unique_artists": 0 },
+            "top_artists": [],
+            "top_albums": [],
+            "top_tracks": [],
+            "trend": [],
+            "hourly": [],
+            "by_zone": [],
+            "by_source": [],
+            "completion": { "completed": 0, "skipped": 0, "avg_listened_ms": 0, "avg_track_duration_ms": 0 }
         })),
     }
 }
