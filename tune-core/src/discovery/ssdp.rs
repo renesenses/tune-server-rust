@@ -498,6 +498,21 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
 
 pub fn get_local_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
+    // Try LAN gateway first (avoids returning VPN tunnel IP)
+    for target in &["192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80", "8.8.8.8:80"] {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(target).is_ok() {
+                if let Ok(SocketAddr::V4(addr)) = socket.local_addr() {
+                    let ip = *addr.ip();
+                    // Prefer private LAN IPs (192.168.x, not 10.x VPN)
+                    if ip.octets()[0] == 192 || ip.octets()[0] == 172 {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback to any reachable IP
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     match socket.local_addr().ok()? {
