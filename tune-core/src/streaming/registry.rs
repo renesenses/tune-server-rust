@@ -69,6 +69,19 @@ impl ServiceRegistry {
     pub async fn restore_all_tokens(&self, db: &SqliteDb) {
         let settings = SettingsRepo::new(db.clone());
         for (name, svc) in &self.services {
+            // Restore enabled/disabled state
+            let enabled_key = format!("streaming_{name}_enabled");
+            if let Some(val) = settings.get(&enabled_key).ok().flatten() {
+                let mut svc_locked = svc.lock().await;
+                match val.as_str() {
+                    "true" => svc_locked.set_enabled(true),
+                    "false" => svc_locked.set_enabled(false),
+                    _ => {}
+                }
+                drop(svc_locked);
+            }
+
+            // Restore auth tokens
             let key = format!("auth_tokens_{name}");
             if let Some(json_str) = settings.get(&key).ok().flatten()
                 && let Ok(tokens) = serde_json::from_str(&json_str) {
