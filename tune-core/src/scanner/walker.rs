@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 use walkdir::WalkDir;
 
-use crate::metadata::{read_metadata, TrackMetadata};
+use crate::metadata::{try_read_metadata, TrackMetadata};
 use super::hasher::compute_audio_hash;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -79,6 +79,7 @@ pub fn scan_files_parallel(
 ) -> (Vec<ScannedFile>, ScanStats) {
     let counter = AtomicUsize::new(0);
     let total = files.len();
+    let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let results: Vec<ScannedFile> = files
         .par_iter()
@@ -100,7 +101,18 @@ pub fn scan_files_parallel(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let metadata = read_metadata(path);
+            let metadata = match try_read_metadata(path) {
+                Ok(meta) => Some(meta),
+                Err(err) => {
+                    warn!(
+                        path = %path_str,
+                        error = %err,
+                        "scan_file_failed"
+                    );
+                    failed_files.lock().unwrap().push((path_str.clone(), err));
+                    None
+                }
+            };
 
             let audio_hash = if with_hash {
                 compute_audio_hash(path)
@@ -124,6 +136,20 @@ pub fn scan_files_parallel(
         metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
     };
+
+    let failed = failed_files.lock().unwrap();
+    if !failed.is_empty() {
+        let listing: Vec<String> = failed
+            .iter()
+            .map(|(p, e)| format!("  {} ({})", p, e))
+            .collect();
+        warn!(
+            count = failed.len(),
+            "scan_metadata_failed_summary\n{}",
+            listing.join("\n")
+        );
+    }
+    drop(failed);
 
     info!(
         total = stats.total_files,

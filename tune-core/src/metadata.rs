@@ -24,7 +24,10 @@ pub struct TrackMetadata {
     pub original_year: Option<u32>,
     pub release_date: Option<String>,
     pub original_date: Option<String>,
+    /// Primary genre (first after splitting multi-genre tags)
     pub genre: Option<String>,
+    /// All genres parsed from the tag (split by `;`, `/`, `\\`)
+    pub genres: Vec<String>,
     pub duration_ms: Option<u64>,
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u16>,
@@ -45,13 +48,32 @@ pub struct TrackMetadata {
     pub credits: Vec<TrackCredit>,
 }
 
-pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
+/// Split a multi-genre tag string into individual genres.
+///
+/// Handles common separators: `;`, `/`, `\\`, and `\0` (null byte, used by
+/// some ID3v2 implementations for multi-value frames).
+///
+/// Examples:
+///   "Jazz; Fusion; Progressive" -> ["Jazz", "Fusion", "Progressive"]
+///   "Jazz/Fusion/Progressive"   -> ["Jazz", "Fusion", "Progressive"]
+///   "Rock"                      -> ["Rock"]
+///   ""                          -> []
+pub fn split_genre_tag(raw: &str) -> Vec<String> {
+    // Split by semicolon, forward-slash, backslash, or null byte
+    raw.split(&[';', '/', '\\', '\0'][..])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
 
-    let tagged = lofty::read_from_path(path).ok()?;
+    let tagged = lofty::read_from_path(path).map_err(|e| format!("{e}"))?;
     let props = tagged.properties();
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())
+        .ok_or_else(|| "no tags found".to_string())?;
 
     let get = |key: &ItemKey| tag.get_string(key).map(|s| s.to_string());
 
@@ -70,7 +92,11 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
 
     let credits = parse_credits(tag);
 
-    Some(TrackMetadata {
+    let raw_genre = tag.genre().map(|s| s.to_string());
+    let genres = raw_genre.as_deref().map(split_genre_tag).unwrap_or_default();
+    let genre = genres.first().cloned().or(raw_genre);
+
+    Ok(TrackMetadata {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
         album: tag.album().map(|s| s.to_string()),
@@ -85,7 +111,8 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
         original_year,
         release_date: get(&ItemKey::ReleaseDate),
         original_date: get(&ItemKey::OriginalReleaseDate),
-        genre: tag.genre().map(|s| s.to_string()),
+        genre,
+        genres,
         duration_ms: Some(props.duration().as_millis() as u64),
         sample_rate: props.sample_rate(),
         bit_depth: props.bit_depth().map(|b| b as u16),
@@ -105,6 +132,10 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
         has_cover: !tag.pictures().is_empty(),
         credits,
     })
+}
+
+pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
+    try_read_metadata(path).ok()
 }
 
 pub struct MetadataUpdate {
@@ -205,5 +236,53 @@ mod tests {
     #[test]
     fn nonexistent_file_returns_none() {
         assert!(read_metadata(Path::new("/tmp/nonexistent.flac")).is_none());
+    }
+
+    #[test]
+    fn split_genre_semicolon() {
+        let genres = split_genre_tag("Jazz; Fusion; Progressive");
+        assert_eq!(genres, vec!["Jazz", "Fusion", "Progressive"]);
+    }
+
+    #[test]
+    fn split_genre_slash() {
+        let genres = split_genre_tag("Jazz/Fusion/Progressive");
+        assert_eq!(genres, vec!["Jazz", "Fusion", "Progressive"]);
+    }
+
+    #[test]
+    fn split_genre_backslash() {
+        let genres = split_genre_tag("Rock\\Metal\\Punk");
+        assert_eq!(genres, vec!["Rock", "Metal", "Punk"]);
+    }
+
+    #[test]
+    fn split_genre_null_byte() {
+        let genres = split_genre_tag("Jazz\0Blues\0Soul");
+        assert_eq!(genres, vec!["Jazz", "Blues", "Soul"]);
+    }
+
+    #[test]
+    fn split_genre_single() {
+        let genres = split_genre_tag("Jazz");
+        assert_eq!(genres, vec!["Jazz"]);
+    }
+
+    #[test]
+    fn split_genre_empty() {
+        let genres = split_genre_tag("");
+        assert!(genres.is_empty());
+    }
+
+    #[test]
+    fn split_genre_mixed_separators() {
+        let genres = split_genre_tag("Jazz; Rock/Blues");
+        assert_eq!(genres, vec!["Jazz", "Rock", "Blues"]);
+    }
+
+    #[test]
+    fn split_genre_trims_whitespace() {
+        let genres = split_genre_tag("  Jazz ;  Fusion  ; Progressive  ");
+        assert_eq!(genres, vec!["Jazz", "Fusion", "Progressive"]);
     }
 }
