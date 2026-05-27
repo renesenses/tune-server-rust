@@ -32,6 +32,94 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn service_tokens_list(axum::extract::State(state): axum::extract::State<crate::state::AppState>) -> axum::Json<serde_json::Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let services = vec![
+        serde_json::json!({
+            "id": "lastfm", "name": "Last.fm", "description": "Scrobbling et recommandations",
+            "configured": settings.get("lastfm_api_key").ok().flatten().is_some(),
+            "fields": [
+                {"key": "api_key", "label": "API Key", "type": "text", "required": true},
+                {"key": "api_secret", "label": "API Secret", "type": "password", "required": true},
+                {"key": "session_key", "label": "Session Key", "type": "password", "required": false},
+            ]
+        }),
+        serde_json::json!({
+            "id": "discogs", "name": "Discogs", "description": "Enrichissement métadonnées",
+            "configured": settings.get("discogs_token").ok().flatten().is_some(),
+            "fields": [
+                {"key": "token", "label": "Personal Access Token", "type": "password", "required": true},
+            ]
+        }),
+        serde_json::json!({
+            "id": "musicbrainz", "name": "MusicBrainz", "description": "Identification et crédits",
+            "configured": true,
+            "fields": [
+                {"key": "user_agent", "label": "User-Agent (email)", "type": "text", "required": false},
+            ]
+        }),
+        serde_json::json!({
+            "id": "genius", "name": "Genius", "description": "Paroles",
+            "configured": settings.get("genius_token").ok().flatten().is_some(),
+            "fields": [
+                {"key": "token", "label": "Access Token", "type": "password", "required": true},
+            ]
+        }),
+    ];
+    axum::Json(serde_json::json!(services))
+}
+
+async fn service_token_save(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    if let Some(obj) = body.as_object() {
+        for (key, value) in obj {
+            let skey = format!("{}_{}", id, key);
+            let sval = value.as_str().unwrap_or("");
+            if !sval.is_empty() {
+                settings.set(&skey, sval).ok();
+            }
+        }
+    }
+    axum::Json(serde_json::json!({"valid": true, "validation_message": "Token enregistré"}))
+}
+
+async fn service_token_test(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let configured = match id.as_str() {
+        "lastfm" => settings.get("lastfm_api_key").ok().flatten().is_some(),
+        "discogs" => settings.get("discogs_token").ok().flatten().is_some(),
+        "genius" => settings.get("genius_token").ok().flatten().is_some(),
+        "musicbrainz" => true,
+        _ => false,
+    };
+    axum::Json(serde_json::json!({
+        "valid": configured,
+        "validation_message": if configured { "Token valide" } else { "Token manquant" },
+    }))
+}
+
+async fn service_token_delete(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let keys: Vec<String> = settings.all().unwrap_or_default().into_iter()
+        .filter(|(k, _)| k.starts_with(&format!("{}_", id)))
+        .map(|(k, _)| k)
+        .collect();
+    for k in &keys {
+        settings.delete(k).ok();
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn api_fallback(
     axum::extract::OriginalUri(original): axum::extract::OriginalUri,
 ) -> impl IntoResponse {
@@ -81,6 +169,9 @@ pub fn router(state: AppState) -> Router {
         .nest("/plugins", plugins::router())
         .nest("/dj", dj::router())
         .nest("/party", party::router())
+        .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
+        .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
+        .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))
         .fallback(api_fallback);
 
     let app = Router::new()
