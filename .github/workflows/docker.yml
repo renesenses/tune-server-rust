@@ -39,6 +39,16 @@ jobs:
             echo "version=dev" >> $GITHUB_OUTPUT
           fi
 
+      - name: Fetch web client
+        run: |
+          curl -sL "https://github.com/renesenses/tune-server-linux/releases/latest/download/tune-server-0.7.132-linux.tar.gz" | tar xz --strip-components=1 "*/web" || true
+          if [ ! -d web ]; then
+            git clone --depth 1 https://github.com/renesenses/tune-web-client.git _web
+            cd _web && npm ci && npm run build && cd ..
+            mv _web/dist web
+            rm -rf _web
+          fi
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -46,6 +56,7 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:v2-alpha
+            ${{ env.IMAGE_NAME }}:dev
           cache-from: type=gha
           cache-to: type=gha,mode=max

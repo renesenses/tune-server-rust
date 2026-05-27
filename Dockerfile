@@ -17,16 +17,22 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/tune-server /usr/local/bin/tune-server
+WORKDIR /app
 
-ENV TUNE_PORT=8085
-ENV TUNE_DB_PATH=/data/tune.db
-ENV TUNE_WEB_DIR=/app/web
-ENV TUNE_ARTWORK_DIR=/data/artwork_cache
-ENV TUNE_AUTO_SCAN=true
+COPY --from=builder /build/target/release/tune-server /app/tune-server
+COPY web/ /app/web/
 
-EXPOSE 8085
+ENV TUNE_MUSIC_DIRS='["/music"]' \
+    TUNE_DB_PATH=/data/tune_v2.db \
+    TUNE_ARTWORK_CACHE=/data/artwork_cache \
+    TUNE_WEB_DIR=/app/web \
+    TUNE_API_PORT=9888 \
+    TUNE_STREAM_PORT=9080 \
+    TUNE_LOG=info \
+    TUNE_AUTO_SCAN=true
+
+EXPOSE 9888 9080
 
 VOLUME ["/data", "/music"]
 
-ENTRYPOINT ["tune-server"]
+ENTRYPOINT ["/app/tune-server"]
