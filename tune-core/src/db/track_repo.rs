@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 
-const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
+const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
 
 pub struct TrackRepo {
     db: SqliteDb,
@@ -38,7 +38,7 @@ impl TrackRepo {
 
     pub fn create(&self, track: &Track) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
                 &track.album_id, &track.artist_id, &track.album_artist,
@@ -48,7 +48,7 @@ impl TrackRepo {
                 &track.sample_rate, &track.bit_depth, &track.channels,
                 &track.file_mtime, &track.file_size, &track.audio_hash,
                 &track.source, &track.source_id, &track.isrc,
-                &track.genre, &track.composer, &track.year,
+                &track.genre, &track.genres, &track.composer, &track.year,
                 &track.bpm, &track.label, &track.musicbrainz_recording_id,
             ],
         )?;
@@ -58,7 +58,7 @@ impl TrackRepo {
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
         self.db.execute(
-            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
+            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, genres = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
                 &track.album_id, &track.artist_id, &track.album_artist,
@@ -67,7 +67,7 @@ impl TrackRepo {
                 &track.file_path, &track.format,
                 &track.sample_rate, &track.bit_depth, &track.channels,
                 &track.file_mtime, &track.file_size, &track.audio_hash,
-                &track.genre, &track.composer, &track.year,
+                &track.genre, &track.genres, &track.composer, &track.year,
                 &track.bpm, &track.label, &track.musicbrainz_recording_id,
                 &id,
             ],
@@ -276,6 +276,7 @@ fn row_to_track(row: &rusqlite::Row) -> Track {
         label: row.get(26).ok(),
         musicbrainz_recording_id: row.get(27).ok(),
         cover_path: row.get(28).ok(),
+        genres: row.get(29).ok().flatten(),
     }
 }
 

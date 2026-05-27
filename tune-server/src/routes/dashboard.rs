@@ -104,18 +104,49 @@ async fn listening_history(
 
 async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare("SELECT genre, COUNT(*) as count FROM tracks WHERE genre IS NOT NULL AND genre != '' GROUP BY genre ORDER BY count DESC LIMIT 30")
+    // Collect raw genre + genres columns from tracks
+    let raw: Vec<(Option<String>, Option<String>)> = conn
+        .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
-                Ok(json!({
-                    "genre": row.get::<_, Option<String>>(0).ok().flatten(),
-                    "count": row.get::<_, i64>(1).unwrap_or(0),
-                }))
+                Ok((
+                    row.get::<_, Option<String>>(0).unwrap_or(None),
+                    row.get::<_, Option<String>>(1).unwrap_or(None),
+                ))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+
+    // Split multi-genre values and count individual genres
+    let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (genre_col, genres_col) in &raw {
+        let mut genres_for_track: Vec<String> = Vec::new();
+        if let Some(json_str) = genres_col {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
+                genres_for_track = arr.into_iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+            }
+        }
+        if genres_for_track.is_empty() {
+            if let Some(raw_genre) = genre_col {
+                genres_for_track = tune_core::metadata::split_genre_tag(raw_genre);
+            }
+        }
+        for g in genres_for_track {
+            *counts.entry(g).or_insert(0) += 1;
+        }
+    }
+
+    // Sort by count descending, limit to 30
+    let mut sorted: Vec<(String, i64)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.truncate(30);
+
+    let items: Vec<serde_json::Value> = sorted
+        .iter()
+        .map(|(genre, count)| serde_json::json!({ "genre": genre, "count": count }))
+        .collect();
+
+    Json(serde_json::json!(items))
 }

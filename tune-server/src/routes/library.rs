@@ -463,17 +463,12 @@ async fn library_stats(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     drop(conn);
 
-    let scanner = state.scanner.lock().await;
-    let devices = scanner.devices().await.len() as i64;
-    drop(scanner);
-
     Json(json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
         "listens": listens,
         "zones": zones,
-        "devices": devices,
         "total_duration_ms": total_duration_ms,
         "total_size_bytes": total_size_bytes,
     }))
@@ -544,24 +539,50 @@ async fn top_rated_albums(
 
 async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
-    let genres: Vec<String> = conn
-        .prepare("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL AND genre != '' ORDER BY genre COLLATE NOCASE")
+    // Collect all individual genres from both the `genres` JSON array
+    // and the legacy `genre` text column (splitting multi-genre strings).
+    let raw_genres: Vec<(Option<String>, Option<String>)> = conn
+        .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '') GROUP BY genre, genres")
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0).unwrap_or(None),
+                    row.get::<_, Option<String>>(1).unwrap_or(None),
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
         })
         .unwrap_or_default();
     drop(conn);
 
+    let mut genre_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (genre_col, genres_col) in &raw_genres {
+        // Prefer the structured genres JSON array if present
+        if let Some(json_str) = genres_col {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
+                for g in arr {
+                    let trimmed = g.trim().to_string();
+                    if !trimmed.is_empty() {
+                        genre_set.insert(trimmed);
+                    }
+                }
+                continue;
+            }
+        }
+        // Fall back to splitting the legacy genre column
+        if let Some(raw) = genre_col {
+            for g in tune_core::metadata::split_genre_tag(raw) {
+                if !g.is_empty() {
+                    genre_set.insert(g);
+                }
+            }
+        }
+    }
+
+    let genres: Vec<String> = genre_set.into_iter().collect();
     let mut tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for genre in &genres {
-        let parts: Vec<&str> = genre.splitn(2, '/').collect();
-        let parent = parts[0].trim().to_string();
-        if parts.len() > 1 {
-            tree.entry(parent).or_default().push(parts[1].trim().to_string());
-        } else {
-            tree.entry(parent).or_default();
-        }
+        tree.entry(genre.clone()).or_default();
     }
 
     Json(json!({
@@ -794,14 +815,14 @@ async fn browse_folders(
 
 async fn list_genres(State(state): State<AppState>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
-    // Get genre counts from both albums and tracks
-    let genres: Vec<(String, i64)> = conn
-        .prepare("SELECT genre, COUNT(*) as cnt FROM albums WHERE genre IS NOT NULL AND genre != '' GROUP BY genre ORDER BY genre COLLATE NOCASE")
+    // Collect genre + genres columns from all albums
+    let raw: Vec<(Option<String>, Option<String>)> = conn
+        .prepare("SELECT genre, genres FROM albums WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
+                    row.get::<_, Option<String>>(0).unwrap_or(None),
+                    row.get::<_, Option<String>>(1).unwrap_or(None),
                 ))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -809,7 +830,28 @@ async fn list_genres(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or_default();
     drop(conn);
 
-    let items: Vec<Value> = genres
+    // Split multi-genre values and count individual genres
+    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (genre_col, genres_col) in &raw {
+        let mut genres_for_album: Vec<String> = Vec::new();
+        // Prefer the structured genres JSON array if present
+        if let Some(json_str) = genres_col {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
+                genres_for_album = arr.into_iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+            }
+        }
+        // Fall back to splitting the legacy genre column
+        if genres_for_album.is_empty() {
+            if let Some(raw_genre) = genre_col {
+                genres_for_album = tune_core::metadata::split_genre_tag(raw_genre);
+            }
+        }
+        for g in genres_for_album {
+            *counts.entry(g).or_insert(0) += 1;
+        }
+    }
+
+    let items: Vec<Value> = counts
         .iter()
         .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();

@@ -3,7 +3,7 @@ use rusqlite::{params, OptionalExtension};
 use super::models::Album;
 use super::sqlite::SqliteDb;
 
-const SELECT_ALBUM: &str = "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id";
+const SELECT_ALBUM: &str = "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id";
 
 pub struct AlbumRepo {
     db: SqliteDb,
@@ -55,11 +55,11 @@ impl AlbumRepo {
 
     pub fn create(&self, album: &Album) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO albums (title, artist_id, year, original_year, genre, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             &[
                 &album.title as &dyn rusqlite::types::ToSql,
                 &album.artist_id, &album.year, &album.original_year,
-                &album.genre, &album.disc_count, &album.track_count,
+                &album.genre, &album.genres, &album.disc_count, &album.track_count,
                 &album.cover_path, &album.source, &album.source_id,
                 &album.label, &album.catalog_number, &album.barcode,
                 &album.format, &album.sample_rate, &album.bit_depth,
@@ -86,11 +86,11 @@ impl AlbumRepo {
     pub fn update(&self, album: &Album) -> Result<(), String> {
         let id = album.id.ok_or("album has no id")?;
         self.db.execute(
-            "UPDATE albums SET title = ?, artist_id = ?, year = ?, original_year = ?, genre = ?, disc_count = ?, track_count = ?, cover_path = ?, label = ?, catalog_number = ?, format = ?, sample_rate = ?, bit_depth = ?, bio = ?, musicbrainz_release_id = ?, musicbrainz_release_group_id = ? WHERE id = ?",
+            "UPDATE albums SET title = ?, artist_id = ?, year = ?, original_year = ?, genre = ?, genres = ?, disc_count = ?, track_count = ?, cover_path = ?, label = ?, catalog_number = ?, format = ?, sample_rate = ?, bit_depth = ?, bio = ?, musicbrainz_release_id = ?, musicbrainz_release_group_id = ? WHERE id = ?",
             &[
                 &album.title as &dyn rusqlite::types::ToSql,
                 &album.artist_id, &album.year, &album.original_year,
-                &album.genre, &album.disc_count, &album.track_count,
+                &album.genre, &album.genres, &album.disc_count, &album.track_count,
                 &album.cover_path, &album.label, &album.catalog_number,
                 &album.format, &album.sample_rate, &album.bit_depth,
                 &album.bio, &album.musicbrainz_release_id,
@@ -123,9 +123,10 @@ impl AlbumRepo {
                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = ?)),
                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = ?)),
                 genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = ? AND t.genre IS NOT NULL LIMIT 1)),
+                genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = ? AND t.genres IS NOT NULL LIMIT 1)),
                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = ?))
             WHERE id = ?",
-            &[&album_id, &album_id, &album_id, &album_id, &album_id, &album_id],
+            &[&album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id],
         )?;
         Ok(())
     }
@@ -200,11 +201,16 @@ impl AlbumRepo {
 
     pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
+        // Match against primary genre OR any genre in the JSON genres array.
+        // The JSON pattern matches `"Jazz"` as an element inside `["Jazz","Fusion"]`.
+        let json_pattern = format!("%\"{}%", genre.replace('"', ""));
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.genre = ? ORDER BY a.title COLLATE NOCASE"))
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.genre = ? OR a.genres LIKE ? COLLATE NOCASE ORDER BY a.title COLLATE NOCASE"
+            ))
             .map_err(|e| e.to_string())?;
         let albums = stmt
-            .query_map(params![genre], |row| Ok(row_to_album(row)))
+            .query_map(params![genre, json_pattern], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
@@ -264,6 +270,7 @@ fn row_to_album(row: &rusqlite::Row) -> Album {
         year: row.get(4).ok(),
         original_year: row.get(5).ok(),
         genre: row.get(6).ok(),
+        genres: row.get::<_, Option<String>>(23).ok().flatten(),
         disc_count: row.get(7).ok(),
         track_count: row.get(8).ok(),
         cover_path: row.get(9).ok(),

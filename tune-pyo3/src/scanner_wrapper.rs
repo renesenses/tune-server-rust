@@ -58,6 +58,13 @@ fn scan_directories<'py>(
             set_opt!("year", meta.year);
             set_opt!("original_year", meta.original_year);
             set_opt!("genre", meta.genre);
+            if !meta.genres.is_empty() {
+                let genres_list = PyList::empty(py);
+                for g in &meta.genres {
+                    genres_list.append(g)?;
+                }
+                meta_dict.set_item("genres", genres_list)?;
+            }
             set_opt!("duration_ms", meta.duration_ms);
             set_opt!("sample_rate", meta.sample_rate);
             set_opt!("bit_depth", meta.bit_depth);

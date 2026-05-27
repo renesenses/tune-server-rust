@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod network;
 pub mod party;
 pub mod playback;
+pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -20,6 +21,7 @@ pub mod streaming;
 pub mod system;
 pub mod tags;
 pub mod ws;
+pub mod zone_manager;
 pub mod zones;
 
 use axum::http::StatusCode;
@@ -219,6 +221,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/plugins", plugins::router())
         .nest("/dj", dj::router())
         .nest("/party", party::router())
+        .nest("/playlist-manager", playlist_manager::router())
+        .nest("/zone-manager", zone_manager::router())
         .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
         .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
         .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))

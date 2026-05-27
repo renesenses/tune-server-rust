@@ -69,6 +69,8 @@ pub fn router() -> Router<AppState> {
         .route("/admin/errors", get(admin_errors))
         .route("/admin/connections", get(admin_connections))
         .route("/admin/discovery", get(admin_discovery))
+        .route("/admin/health", get(admin_health))
+        .route("/admin/zones", get(admin_zones))
 }
 
 async fn version() -> Json<Value> {
@@ -339,6 +341,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     track.file_mtime = Some(sf.mtime as f64);
                     track.audio_hash = sf.audio_hash.clone();
                     track.genre = meta.genre.clone();
+                    track.genres = if meta.genres.is_empty() { None } else { Some(serde_json::to_string(&meta.genres).unwrap_or_default()) };
                     track.composer = meta.credits.iter()
                         .find(|c| c.role == "composer")
                         .map(|c| c.name.clone());
@@ -373,6 +376,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 track.file_mtime = Some(sf.mtime as f64);
                 track.audio_hash = sf.audio_hash.clone();
                 track.genre = meta.genre.clone();
+                track.genres = if meta.genres.is_empty() { None } else { Some(serde_json::to_string(&meta.genres).unwrap_or_default()) };
                 track.composer = meta.credits.iter()
                     .find(|c| c.role == "composer")
                     .map(|c| c.name.clone());
@@ -1590,4 +1594,66 @@ async fn admin_discovery(State(state): State<AppState>) -> Json<Value> {
             "type": format!("{:?}", d.device_type),
         })).collect::<Vec<_>>(),
     }))
+}
+
+async fn admin_health(State(state): State<AppState>) -> Json<Value> {
+    let uptime = state.started_at.elapsed().as_secs();
+    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
+    let settings = SettingsRepo::new(state.db.clone());
+    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let zones = state.playback.all_states().await;
+    let playing = zones.iter().filter(|z| z.state == tune_core::playback::PlayState::Playing).count();
+    let outputs = state.outputs.lock().await;
+    let output_count = outputs.list().len();
+    drop(outputs);
+    let services = state.services.lock().await;
+    let service_count = services.list().len();
+    drop(services);
+
+    Json(json!({
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "engine": "rust",
+        "version": tune_core::version(),
+        "database": {
+            "tracks": tracks,
+            "albums": albums,
+            "engine": "sqlite",
+        },
+        "playback": {
+            "zones_total": zones.len(),
+            "zones_playing": playing,
+        },
+        "outputs": output_count,
+        "streaming_services": service_count,
+        "scan_status": scan_status,
+    }))
+}
+
+async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
+    let repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zones = repo.list().unwrap_or_default();
+    let mut result = Vec::new();
+    for z in &zones {
+        let zone_id = z.id.unwrap_or(0);
+        let ps = state.playback.get_state(zone_id).await;
+        result.push(json!({
+            "id": zone_id,
+            "name": z.name,
+            "output_type": z.output_type,
+            "output_device_id": z.output_device_id,
+            "state": match ps.state {
+                tune_core::playback::PlayState::Playing => "playing",
+                tune_core::playback::PlayState::Paused => "paused",
+                tune_core::playback::PlayState::Stopped => "stopped",
+            },
+            "volume": if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 },
+            "muted": z.muted,
+            "current_track": ps.now_playing,
+            "position_ms": ps.position_ms,
+            "queue_length": ps.queue_length,
+        }));
+    }
+    Json(json!(result))
 }

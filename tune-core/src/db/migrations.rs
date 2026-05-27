@@ -230,6 +230,11 @@ CREATE INDEX IF NOT EXISTS idx_track_credits_artist ON track_credits(artist_name
         name: "add_album_artist_to_tracks",
         up: "", // Column included in CORE_SCHEMA; for existing DBs, applied programmatically
     },
+    Migration {
+        version: 11,
+        name: "add_genres_column",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -296,6 +301,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         // Programmatic migrations for column additions (safe if column already exists)
         if migration.version == 10 {
             add_column_if_missing(db, "tracks", "album_artist", "TEXT");
+        }
+        if migration.version == 11 {
+            add_column_if_missing(db, "albums", "genres", "TEXT");
+            add_column_if_missing(db, "tracks", "genres", "TEXT");
         }
 
         db.execute(

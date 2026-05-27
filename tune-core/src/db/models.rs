@@ -36,6 +36,9 @@ pub struct Album {
     pub year: Option<i32>,
     pub original_year: Option<i32>,
     pub genre: Option<String>,
+    /// JSON array of all genres (e.g. `["Jazz","Fusion","Progressive"]`)
+    #[serde(default)]
+    pub genres: Option<String>,
     pub disc_count: Option<i32>,
     pub track_count: Option<i32>,
     pub cover_path: Option<String>,
@@ -89,6 +92,7 @@ impl Album {
             year: None,
             original_year: None,
             genre: None,
+            genres: None,
             disc_count: None,
             track_count: None,
             cover_path: None,
@@ -134,6 +138,9 @@ pub struct Track {
     pub source_id: Option<String>,
     pub isrc: Option<String>,
     pub genre: Option<String>,
+    /// JSON array of all genres (e.g. `["Jazz","Fusion","Progressive"]`)
+    #[serde(default)]
+    pub genres: Option<String>,
     pub composer: Option<String>,
     pub year: Option<i32>,
     pub bpm: Option<f64>,
@@ -168,6 +175,7 @@ impl Track {
             source_id: None,
             isrc: None,
             genre: None,
+            genres: None,
             composer: None,
             year: None,
             bpm: None,
