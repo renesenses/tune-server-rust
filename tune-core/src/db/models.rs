@@ -196,3 +196,208 @@ pub struct TrackCredit {
     pub instrument: Option<String>,
     pub position: i32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artist_new() {
+        let artist = Artist::new("Miles Davis".into());
+        assert_eq!(artist.name, "Miles Davis");
+        assert!(artist.id.is_none());
+        assert!(artist.sort_name.is_none());
+        assert!(artist.musicbrainz_id.is_none());
+    }
+
+    #[test]
+    fn artist_serialization() {
+        let artist = Artist {
+            id: Some(1),
+            name: "Miles Davis".into(),
+            sort_name: Some("Davis, Miles".into()),
+            musicbrainz_id: Some("mbid-123".into()),
+            discogs_id: None,
+            bio: Some("Jazz trumpeter".into()),
+            image_path: None,
+            image_source: None,
+        };
+        let json = serde_json::to_value(&artist).unwrap();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["name"], "Miles Davis");
+        assert_eq!(json["sort_name"], "Davis, Miles");
+    }
+
+    #[test]
+    fn album_new() {
+        let album = Album::new("Kind of Blue".into());
+        assert_eq!(album.title, "Kind of Blue");
+        assert_eq!(album.source, "local");
+        assert!(album.id.is_none());
+        assert!(album.year.is_none());
+    }
+
+    #[test]
+    fn album_quality_dsd() {
+        let mut a = Album::new("DSD Album".into());
+        a.format = Some("dsf".into());
+        assert_eq!(a.quality(), Some("dsd".into()));
+    }
+
+    #[test]
+    fn album_quality_dff() {
+        let mut a = Album::new("DFF Album".into());
+        a.format = Some("dff".into());
+        assert_eq!(a.quality(), Some("dsd".into()));
+    }
+
+    #[test]
+    fn album_quality_hires_by_sample_rate() {
+        let mut a = Album::new("HR".into());
+        a.format = Some("flac".into());
+        a.sample_rate = Some(96000);
+        assert_eq!(a.quality(), Some("hi-res".into()));
+    }
+
+    #[test]
+    fn album_quality_hires_by_bit_depth() {
+        let mut a = Album::new("HR".into());
+        a.format = Some("flac".into());
+        a.bit_depth = Some(24);
+        assert_eq!(a.quality(), Some("hi-res".into()));
+    }
+
+    #[test]
+    fn album_quality_lossy_formats() {
+        for fmt in ["mp3", "ogg", "opus", "wma", "aac"] {
+            let mut a = Album::new("Test".into());
+            a.format = Some(fmt.into());
+            assert_eq!(a.quality(), Some("lossy".into()), "Expected lossy for {fmt}");
+        }
+    }
+
+    #[test]
+    fn album_quality_cd() {
+        let mut a = Album::new("CD".into());
+        a.format = Some("flac".into());
+        a.sample_rate = Some(44100);
+        a.bit_depth = Some(16);
+        assert_eq!(a.quality(), Some("cd".into()));
+    }
+
+    #[test]
+    fn album_quality_none() {
+        let a = Album::new("Unknown".into());
+        assert_eq!(a.quality(), None);
+    }
+
+    #[test]
+    fn album_to_json_includes_quality() {
+        let mut a = Album::new("Test".into());
+        a.format = Some("mp3".into());
+        let json = a.to_json();
+        assert_eq!(json["quality"], "lossy");
+    }
+
+    #[test]
+    fn album_serialization() {
+        let album = Album {
+            id: Some(1),
+            title: "Kind of Blue".into(),
+            artist_id: Some(42),
+            artist_name: Some("Miles Davis".into()),
+            year: Some(1959),
+            original_year: Some(1959),
+            genre: Some("Jazz".into()),
+            genres: Some(r#"["Jazz","Modal Jazz"]"#.into()),
+            disc_count: Some(1),
+            track_count: Some(5),
+            cover_path: Some("hash123".into()),
+            source: "local".into(),
+            source_id: None,
+            label: Some("Columbia".into()),
+            catalog_number: None,
+            barcode: None,
+            format: Some("flac".into()),
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            bio: None,
+            musicbrainz_release_id: None,
+            musicbrainz_release_group_id: None,
+            release_date: None,
+            original_date: None,
+        };
+        let json = serde_json::to_value(&album).unwrap();
+        assert_eq!(json["title"], "Kind of Blue");
+        assert_eq!(json["year"], 1959);
+        assert_eq!(json["label"], "Columbia");
+    }
+
+    #[test]
+    fn track_new() {
+        let track = Track::new("So What".into());
+        assert_eq!(track.title, "So What");
+        assert_eq!(track.disc_number, 1);
+        assert_eq!(track.track_number, 0);
+        assert_eq!(track.duration_ms, 0);
+        assert_eq!(track.channels, 2);
+        assert_eq!(track.source, "local");
+    }
+
+    #[test]
+    fn track_serialization() {
+        let track = Track {
+            id: Some(1),
+            title: "So What".into(),
+            album_id: Some(10),
+            album_title: Some("Kind of Blue".into()),
+            artist_id: Some(42),
+            artist_name: Some("Miles Davis".into()),
+            album_artist: None,
+            disc_number: 1,
+            disc_subtitle: None,
+            track_number: 1,
+            duration_ms: 562_000,
+            file_path: Some("/music/so_what.flac".into()),
+            format: Some("flac".into()),
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            channels: 2,
+            file_mtime: None,
+            file_size: None,
+            audio_hash: None,
+            source: "local".into(),
+            source_id: None,
+            isrc: None,
+            genre: Some("Jazz".into()),
+            genres: None,
+            composer: None,
+            year: Some(1959),
+            bpm: None,
+            label: None,
+            musicbrainz_recording_id: None,
+            cover_path: None,
+        };
+        let json = serde_json::to_value(&track).unwrap();
+        assert_eq!(json["title"], "So What");
+        assert_eq!(json["duration_ms"], 562_000);
+        assert_eq!(json["disc_number"], 1);
+    }
+
+    #[test]
+    fn track_credit_struct() {
+        let credit = TrackCredit {
+            id: Some(1),
+            track_id: 100,
+            artist_id: Some(42),
+            artist_name: "Miles Davis".into(),
+            role: "performer".into(),
+            instrument: Some("trumpet".into()),
+            position: 0,
+        };
+        let json = serde_json::to_value(&credit).unwrap();
+        assert_eq!(json["artist_name"], "Miles Davis");
+        assert_eq!(json["role"], "performer");
+        assert_eq!(json["instrument"], "trumpet");
+    }
+}

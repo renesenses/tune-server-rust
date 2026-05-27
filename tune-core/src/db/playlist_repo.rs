@@ -214,4 +214,176 @@ mod tests {
         let reordered = repo.get_track_ids(plid).unwrap();
         assert_eq!(reordered, vec![tid2, tid1]);
     }
+
+    #[test]
+    fn playlist_count() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        assert_eq!(repo.count().unwrap(), 0);
+        repo.create("Playlist 1", None).unwrap();
+        repo.create("Playlist 2", None).unwrap();
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn playlist_list() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        repo.create("Zebra", None).unwrap();
+        repo.create("Alpha", None).unwrap();
+        repo.create("Middle", None).unwrap();
+
+        let all = repo.list(100, 0).unwrap();
+        assert_eq!(all.len(), 3);
+        // Sorted by name NOCASE
+        assert_eq!(all[0].name, "Alpha");
+        assert_eq!(all[2].name, "Zebra");
+    }
+
+    #[test]
+    fn playlist_list_pagination() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        for i in 0..10 {
+            repo.create(&format!("PL {i:02}"), None).unwrap();
+        }
+
+        let page1 = repo.list(3, 0).unwrap();
+        assert_eq!(page1.len(), 3);
+        let page2 = repo.list(3, 3).unwrap();
+        assert_eq!(page2.len(), 3);
+        assert_ne!(page1[0].name, page2[0].name);
+    }
+
+    #[test]
+    fn playlist_update_description() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        let id = repo.create("Test", Some("Initial")).unwrap();
+        repo.update(id, None, Some("Updated desc")).unwrap();
+        let pl = repo.get(id).unwrap().unwrap();
+        assert_eq!(pl.name, "Test"); // Name unchanged
+        assert_eq!(pl.description.as_deref(), Some("Updated desc"));
+    }
+
+    #[test]
+    fn playlist_add_tracks_at_position() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t1 = TrackModel::new("A".into());
+        t1.file_path = Some("/a.flac".into());
+        let mut t2 = TrackModel::new("B".into());
+        t2.file_path = Some("/b.flac".into());
+        let mut t3 = TrackModel::new("C".into());
+        t3.file_path = Some("/c.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+        let tid2 = track_repo.create(&t2).unwrap();
+        let tid3 = track_repo.create(&t3).unwrap();
+
+        let plid = repo.create("Test", None).unwrap();
+        repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
+        // Insert tid3 at position 1
+        repo.add_tracks(plid, &[tid3], Some(1)).unwrap();
+
+        let pl = repo.get(plid).unwrap().unwrap();
+        assert_eq!(pl.track_count, 3);
+    }
+
+    #[test]
+    fn playlist_remove_track() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t1 = TrackModel::new("A".into());
+        t1.file_path = Some("/a.flac".into());
+        let mut t2 = TrackModel::new("B".into());
+        t2.file_path = Some("/b.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+        let tid2 = track_repo.create(&t2).unwrap();
+
+        let plid = repo.create("Test", None).unwrap();
+        repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
+        repo.remove_track(plid, 0).unwrap();
+
+        let ids = repo.get_track_ids(plid).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], tid2);
+    }
+
+    #[test]
+    fn playlist_remove_tracks_at_positions() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t1 = TrackModel::new("A".into());
+        t1.file_path = Some("/1.flac".into());
+        let mut t2 = TrackModel::new("B".into());
+        t2.file_path = Some("/2.flac".into());
+        let mut t3 = TrackModel::new("C".into());
+        t3.file_path = Some("/3.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+        let tid2 = track_repo.create(&t2).unwrap();
+        let tid3 = track_repo.create(&t3).unwrap();
+
+        let plid = repo.create("Test", None).unwrap();
+        repo.add_tracks(plid, &[tid1, tid2, tid3], None).unwrap();
+        let removed = repo.remove_tracks_at_positions(plid, &[0, 2]).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = repo.get_track_ids(plid).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], tid2);
+    }
+
+    #[test]
+    fn playlist_empty_name() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+        // Empty name should still work
+        let id = repo.create("", None).unwrap();
+        let pl = repo.get(id).unwrap().unwrap();
+        assert_eq!(pl.name, "");
+    }
+
+    #[test]
+    fn playlist_unicode_name() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+        let id = repo.create("Ma playlist preferee", Some("Musique francaise")).unwrap();
+        let pl = repo.get(id).unwrap().unwrap();
+        assert_eq!(pl.name, "Ma playlist preferee");
+    }
+
+    #[test]
+    fn playlist_delete_cascade() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t = TrackModel::new("Track".into());
+        t.file_path = Some("/t.flac".into());
+        let tid = track_repo.create(&t).unwrap();
+
+        let plid = repo.create("Test", None).unwrap();
+        repo.add_tracks(plid, &[tid], None).unwrap();
+        repo.delete(plid).unwrap();
+
+        // Playlist tracks should also be deleted (CASCADE)
+        assert!(repo.get(plid).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_nonexistent_playlist() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+        assert!(repo.get(999).unwrap().is_none());
+    }
 }

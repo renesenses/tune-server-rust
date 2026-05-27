@@ -540,6 +540,212 @@ impl StreamingService for QobuzService {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn map_track_basic() {
+        let json = json!({
+            "id": 12345,
+            "title": "Take Five",
+            "performer": {"name": "Dave Brubeck"},
+            "album": {
+                "title": "Time Out",
+                "id": 678,
+                "image": {"large": "http://img.qobuz.com/large.jpg"},
+            },
+            "duration": 324,
+            "track_number": 2,
+            "media_number": 1,
+            "parental_warning": false,
+            "maximum_sampling_rate": 192.0,
+            "maximum_bit_depth": 24,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.id, "12345");
+        assert_eq!(track.title, "Take Five");
+        assert_eq!(track.artist, "Dave Brubeck");
+        assert_eq!(track.album.as_deref(), Some("Time Out"));
+        assert_eq!(track.album_id.as_deref(), Some("678"));
+        assert_eq!(track.duration_ms, 324_000);
+        assert_eq!(track.track_number, Some(2));
+        assert_eq!(track.disc_number, Some(1));
+        assert!(!track.explicit);
+        assert_eq!(track.cover_path.as_deref(), Some("http://img.qobuz.com/large.jpg"));
+        let q = track.quality.unwrap();
+        assert_eq!(q.sample_rate, 192000);
+        assert_eq!(q.bit_depth, 24);
+    }
+
+    #[test]
+    fn map_track_artist_fallback() {
+        let json = json!({
+            "id": 1,
+            "title": "Test",
+            "artist": {"name": "Fallback Artist"},
+            "album": {},
+            "duration": 100,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.artist, "Fallback Artist");
+    }
+
+    #[test]
+    fn map_track_missing_fields() {
+        let json = json!({
+            "id": 0,
+            "title": null,
+            "album": {},
+            "duration": null,
+        });
+        let track = QobuzService::map_track(&json);
+        assert_eq!(track.title, "");
+        assert_eq!(track.artist, "");
+        assert_eq!(track.duration_ms, 0);
+        let q = track.quality.unwrap();
+        assert_eq!(q.sample_rate, 44100);
+        assert_eq!(q.bit_depth, 16);
+    }
+
+    #[test]
+    fn map_album_basic() {
+        let json = json!({
+            "id": 999,
+            "title": "Time Out",
+            "artist": {"name": "Dave Brubeck", "id": 42},
+            "image": {"large": "http://img.qobuz.com/album.jpg"},
+            "release_date_original": "1959-12-14",
+            "tracks_count": 7,
+        });
+        let album = QobuzService::map_album(&json);
+        assert_eq!(album.id, "999");
+        assert_eq!(album.title, "Time Out");
+        assert_eq!(album.artist, "Dave Brubeck");
+        assert_eq!(album.artist_id.as_deref(), Some("42"));
+        assert_eq!(album.year, Some(1959));
+        assert_eq!(album.track_count, 7);
+        assert_eq!(album.cover_path.as_deref(), Some("http://img.qobuz.com/album.jpg"));
+    }
+
+    #[test]
+    fn map_album_with_released_at_timestamp() {
+        let json = json!({
+            "id": "abc",
+            "title": "Test",
+            "artist": {"name": "Test"},
+            "released_at": 1580515200, // ~2020
+            "tracks_count": 10,
+        });
+        let album = QobuzService::map_album(&json);
+        assert!(album.year.is_some());
+        assert!(album.year.unwrap() >= 2019 && album.year.unwrap() <= 2021);
+    }
+
+    #[test]
+    fn map_album_string_id() {
+        let json = json!({
+            "id": "abc123",
+            "title": "Test",
+            "artist": {},
+            "tracks_count": 0,
+        });
+        let album = QobuzService::map_album(&json);
+        assert_eq!(album.id, "abc123");
+    }
+
+    #[test]
+    fn map_artist_basic() {
+        let json = json!({
+            "id": 42,
+            "name": "Dave Brubeck",
+            "image": {"large": "http://img.qobuz.com/artist.jpg"},
+        });
+        let artist = QobuzService::map_artist(&json);
+        assert_eq!(artist.id, "42");
+        assert_eq!(artist.name, "Dave Brubeck");
+        assert_eq!(artist.image_path.as_deref(), Some("http://img.qobuz.com/artist.jpg"));
+    }
+
+    #[test]
+    fn map_genre_basic() {
+        let json = json!({
+            "id": 10,
+            "name": "Jazz",
+            "subgenres": [{"id": 11, "name": "Bebop"}],
+            "image": "http://img.qobuz.com/jazz.jpg",
+        });
+        let genre = QobuzService::map_genre(&json);
+        assert_eq!(genre.id, "10");
+        assert_eq!(genre.name, "Jazz");
+        assert!(genre.has_children);
+    }
+
+    #[test]
+    fn map_genre_no_subgenres() {
+        let json = json!({
+            "id": 20,
+            "name": "Blues",
+            "subgenres": [],
+        });
+        let genre = QobuzService::map_genre(&json);
+        assert!(!genre.has_children);
+    }
+
+    #[test]
+    fn qobuz_service_name() {
+        let svc = QobuzService::new("app123".into(), "secret".into());
+        assert_eq!(svc.name(), "qobuz");
+    }
+
+    #[test]
+    fn qobuz_save_tokens_no_auth() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn qobuz_restore_tokens() {
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({
+            "user_auth_token": "token123",
+            "username": "testuser",
+            "subscription": "Studio",
+            "app_id": "new_app",
+            "app_secret": "new_secret",
+        });
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.user_auth_token.as_deref(), Some("token123"));
+        assert_eq!(svc.username.as_deref(), Some("testuser"));
+        assert_eq!(svc.app_id, "new_app");
+        assert_eq!(svc.app_secret, "new_secret");
+    }
+
+    #[test]
+    fn qobuz_restore_tokens_invalid() {
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        let tokens = json!({"nothing": "here"});
+        assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn qobuz_set_enabled() {
+        let mut svc = QobuzService::new("app".into(), "secret".into());
+        svc.set_enabled(false);
+        assert!(!svc.enabled());
+        svc.set_enabled(true);
+        assert!(svc.enabled());
+    }
+
+    #[test]
+    fn md5_hex_known_value() {
+        // MD5 of empty string is d41d8cd98f00b204e9800998ecf8427e
+        let result = md5_hex("");
+        assert_eq!(result, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+}
+
 fn md5_hex(input: &str) -> String {
     use md5::{Md5, Digest};
     let mut hasher = Md5::new();

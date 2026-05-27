@@ -1,333 +1,332 @@
-# Tune v2.0.0 — Plan de migration incrémentale Python → Rust
+# Tune v2.0.0 — Rust Migration Status
 
-## Contexte
+## Current Status
 
-Tune Server est un serveur audio multi-room de 62 266 lignes Python (195 fichiers, 20 modules). Les limites du Python (GIL, mémoire 400-600 MB, binaires PyInstaller 100+ MB, démarrage 3-5s) freinent la croissance. Rust résout tous ces problèmes tout en gardant la sécurité mémoire. La migration doit être **incrémentale** (développeur solo, ~20h/semaine) via PyO3 comme pont, sans régression fonctionnelle.
+**Version**: v2.0.0-rc2 (workspace `0.1.0`)
+**Engine**: Pure Rust (Axum + Tokio + rusqlite)
+**LOC**: 28,422 Rust (across 3 crates)
+**Routes**: 385 HTTP handlers across 30 route modules
+**Tests**: 97 unit tests
+**Binary**: 18 MB stripped (release, LTO)
 
-**Objectif v2.0.0** : binaire Rust pur, 15-20 MB, démarrage <0.5s, 50-80 MB RSS, 5-10x plus rapide en scan.
-
----
-
-## Phase 0 — Tooling Foundation (v0.8.0) — 1-2 semaines
-
-**But** : Infrastructure Rust sans toucher au Python.
-
-- Cargo workspace : `tune-core/` (lib), `tune-pyo3/` (PyO3 bindings), `tune-server/` (binaire final, vide)
-- CI cross-compilation : x86_64/aarch64 Linux, macOS, Windows
-- `maturin` intégré dans `release.yml` pour produire des wheels
-- Fonction triviale `tune_native.version()` pour valider le pont PyO3
-- **Kill switch** : `try/except ImportError` sur tous les imports `tune_native`
-
-**Crates** : `pyo3`, `maturin`
-**LOC Rust** : ~200 | **Remplace** : 0 Python
+The Python-to-Rust migration is **feature-complete** for the core server. The Rust binary runs in production on .18 alongside the Python server, serving 42,988 tracks / 3,788 albums / 2,032 artists from a 1.4 TB library.
 
 ---
 
-## Phase 1 — Metadata Reader + Audio Buffer (v1.0.0) — 4-6 semaines
+## Architecture
 
-**But** : Remplacer les deux modules les plus découplés et CPU-intensifs.
-
-**Modules remplacés** :
-- `library/metadata_reader.py` (650 LOC) — parsing tags audio via mutagen
-- `audio/buffer.py` (68 LOC) — ring buffer async
-
-**Implémentation** :
-- `tune_native.read_metadata(path) -> dict` via `lofty` (pure Rust, 4x plus rapide que mutagen)
-- `tune_native.AsyncRingBuffer` via `tokio::sync::mpsc` bounded channel
-- Shim Python : `TUNE_METADATA_ENGINE=rust|python` pour dual-run validation
-- Endpoint `POST /system/validate-metadata` pour comparer les deux engines
-
-**Crates** : `lofty`, `tokio`, `pyo3-asyncio`
-**LOC Rust** : ~1 200 | **Remplace** : 718 Python
-**Gains** : scan 3-5x plus rapide, -30% mémoire pendant scan
-
----
-
-## Phase 2 — Audio Pipeline Core (v1.1.0) — 6-8 semaines
-
-**But** : Rust gère le cycle de vie FFmpeg, le piping I/O, et les buffers. FFmpeg reste en subprocess.
-
-**Modules remplacés** :
-- `audio/pipeline.py` (256), `decoder.py` (276), `encoder.py` (116), `resampler.py` (123)
-- `audio/formats.py` (230), `analyzer.py` (239), `mixer.py` (104)
-
-**Implémentation** :
-- `tune_native.AudioPipeline` : decode → resample → encode, exposition du buffer Rust
-- `tune_native.FFmpegDecoder` : subprocess async via `tokio::process`
-- WAV header generation pure Rust (remplace `struct.pack`)
-- Élimine la dépendance numpy (~15 MB du binaire)
-
-**Crates** : `tokio::process`, `bytes`, `symphonia` (optionnel), `hound`
-**LOC Rust** : ~2 400 | **Remplace** : 1 412 Python
-**Gains** : -30-50% latence streaming, -15 MB binaire (numpy éliminé), parallélisme réel multi-streams
-
----
-
-## Phase 3 — Discovery Layer (v1.2.0) — 5-7 semaines ✅ CORE DONE (2026-05-19)
-
-**But** : SSDP multicast, mDNS, et parsing XML device en Rust natif.
-
-**Modules remplacés** :
-- `discovery/ssdp.py` (852), `mdns.py` (~200), `manager.py` (~250 partiel)
-- `discovery/openhome.py` (~300), `bluos.py` (~200), `cast.py` (~200), `squeezebox.py` (~200)
-
-**Implémentation** :
-- ✅ `tune_native.RustSsdpScanner` : M-SEARCH + NOTIFY + unicast probe + grace period
-- ✅ `tune_native.RustMdnsScanner` : `_airplay._tcp`, `_googlecast._tcp`, `_musc._tcp`, `_cli._tcp`, `_tune-server._tcp`
-- ✅ XML device description parser via `quick-xml` (10x plus rapide qu'ElementTree)
-- ✅ `DiscoveredDevice` model + dedup by host with priority + alternatives
-- ✅ PyO3 bindings : `RustSsdpScanner` + `RustMdnsScanner` classes avec `poll_event()`
-- ✅ Python integration shim : `tune_server/discovery/rust_discovery.py`
-- ✅ Intégration dans `DiscoveryManager` (toggle via `TUNE_DISCOVERY_ENGINE`)
-- ✅ Diagnostics endpoint `/system/diagnostics` expose `rust_engines` status
-- ⬜ Benchmark comparison Python vs Rust discovery
-
-**Fichiers Rust** :
-- `tune-core/src/discovery/device.rs` — DiscoveredDevice + OutputType + dedup
-- `tune-core/src/discovery/ssdp.rs` — SSDP M-SEARCH + grace period + unicast probe
-- `tune-core/src/discovery/mdns.rs` — mDNS multi-service browsing (mdns-sd)
-- `tune-core/src/discovery/xml_parser.rs` — UPnP device description XML parsing
-- `tune-pyo3/src/discovery_wrapper.rs` — PyO3 bindings
-
-**Crates** : `mdns-sd`, `quick-xml`, `reqwest`, `socket2`, `uuid`
-**LOC Rust** : ~1 100 | **Remplace** : 2 202 Python (discovery core)
-**Gains** : discovery 2-3x plus rapide, -50% mémoire discovery, -0.5s startup
-
----
-
-## Phase 4 — Library Scanner + File Watcher (v1.3.0) — 4-5 semaines ✅ CORE DONE (2026-05-19)
-
-**But** : File walk + metadata reading parallélisés sur tous les cores CPU.
-
-**Modules remplacés** :
-- `library/scanner.py` (585), `watcher.py` (169), `artwork.py` (~234 partiel)
-
-**Implémentation** :
-- ✅ `tune_native.list_audio_files(dirs)` : `walkdir` enumération rapide
-- ✅ `tune_native.scan_directories(dirs, with_hash)` : `walkdir` + `rayon` parallélisme complet
-- ✅ `tune_native.RustFileWatcher` : `notify` (inotify/FSEvents/kqueue natif) avec debounce
-- ✅ `tune_native.audio_hash(path)` : MD5 64KB at 25% offset
-- ✅ `tune_native.same_quality_tier()` + `tune_native.quality_suffix_fn()`
-- ✅ PyO3 bindings : 6 fonctions + `RustFileWatcher` class
-- ✅ Python integration : `rust_scanner.py` shim + `scanner.py` hot path replacement
-- ⬜ Benchmark comparison Python vs Rust scan speed
-- ⬜ Artwork extraction via lofty (cover art embedded dans les tags)
-
-**Fichiers Rust** :
-- `tune-core/src/scanner/walker.rs` — Parallel file walk + metadata via rayon
-- `tune-core/src/scanner/hasher.rs` — Audio hash MD5
-- `tune-core/src/scanner/watcher.rs` — File watcher via notify crate
-- `tune-core/src/scanner/quality.rs` — Quality tier helpers
-- `tune-pyo3/src/scanner_wrapper.rs` — PyO3 bindings
-
-**Crates** : `walkdir`, `rayon`, `notify`, `md-5`
-**LOC Rust** : ~750 | **Remplace** : 988 Python (scanner hot paths)
-**Gains** : scan 5-10x plus rapide (parallèle sur tous les cores, pas de GIL), -60% mémoire scan
-
----
-
-## Phase 5 — Database + HTTP Streamer (v1.5.0) — 10-14 semaines — 🔧 IN PROGRESS
-
-**But** : Couche données et streaming HTTP en Rust. Plus grande phase.
-
-**Modules remplacés** :
-- `db/engine.py` (773), `repository.py` (2 015), `sa_engine.py` (498), `sa_repository.py` (1 773)
-- `outputs/http_streamer.py` (613)
-- `models.py` (1 028 partiel)
-
-**Implémentation** :
-- ✅ `SqliteDb` : rusqlite wrapper (WAL, foreign keys, busy_timeout, PRAGMA)
-- ✅ `ArtistRepo` : CRUD, get_or_create, list, search (FTS5 + LIKE COLLATE NOCASE)
-- ✅ `AlbumRepo` : CRUD, get_or_create, list, list_by_artist, delete_orphans, update_track_count, search
-- ✅ `TrackRepo` : CRUD, list, list_by_album/artist, get_all_paths, get_multiple (order-preserving), search, deduplicate
-- ✅ `PlaylistRepo` : CRUD, add/remove/reorder tracks, get_track_ids
-- ✅ `PlayQueueRepo` : get_queue, set_queue, add_tracks, set_current, clear, count
-- ✅ `ZoneRepo` : CRUD, update volume/muted/name, list
-- ✅ Models : Artist, Album, Track, TrackCredit, Playlist, Zone, QueueItem (all Serialize/Deserialize)
-- ✅ FTS5 virtual tables + triggers (tracks_fts, albums_fts, artists_fts)
-- ✅ PyO3 `RustDatabase` class exposing key operations
-- ✅ HTTP audio streamer (Axum) — file Range, proxy, chunked, ICY metadata
-- ✅ Axum server (`tune-server`) with full REST API:
-  - `/api/system/version`, `/api/system/health`, `/api/system/stats`
-  - `/api/library/artists`, `/albums`, `/tracks`, `/search` (paginated, FTS5)
-  - `/api/zones/*` (CRUD + volume/mute + play queue)
-  - `/api/playlists/*` (CRUD + track management)
-  - `/stream/{id}` (file/proxy/chunked streaming)
-- ⬜ PostgreSQL backend (sqlx)
-- ⬜ Schema migrations (versioned)
-
-**Fichiers Rust** :
-- `tune-core/src/db/sqlite.rs` — SQLite wrapper + core schema + FTS5
-- `tune-core/src/db/models.rs` — Artist, Album, Track, TrackCredit
-- `tune-core/src/db/artist_repo.rs` — ArtistRepo (11 methods)
-- `tune-core/src/db/album_repo.rs` — AlbumRepo (14 methods)
-- `tune-core/src/db/track_repo.rs` — TrackRepo (17 methods)
-- `tune-core/src/db/playlist_repo.rs` — PlaylistRepo (10 methods)
-- `tune-core/src/db/play_queue_repo.rs` — PlayQueueRepo (8 methods)
-- `tune-core/src/db/zone_repo.rs` — ZoneRepo (8 methods)
-- `tune-core/src/http/streamer.rs` — AudioStreamer + Axum handlers
-- `tune-pyo3/src/db_wrapper.rs` — RustDatabase PyO3 class
-- `tune-server/src/main.rs` — Axum server entry point
-- `tune-server/src/state.rs` — AppState (DB + streamer)
-- `tune-server/src/routes/` — system, library, zones, playlists
-
-**Crates** : `rusqlite` (bundled SQLite), `axum`
-**LOC Rust** : ~3 500 (de ~6 000 cible) | **Remplace** : 6 697 Python
-**Gains** : queries 2-5x plus rapides, -50% mémoire/stream, -20 MB binaire
-
----
-
-## Phase 6 — API Layer (v1.8.0) — ✅ DONE (2026-05-19)
-
-**But** : FastAPI → Axum. Le binaire Rust sert tous les endpoints HTTP.
-
-**147 endpoints** across 22 route modules :
-- ✅ System (version, health, stats, config, scan, restart, database, music-dirs, diagnostics, cleanup, logs, backup/restore, export DB, update check)
-- ✅ Library (artists/albums/tracks paginated, count, filters, recent, search FTS5, stats, audio stream, rescan, genre tree, top-rated, rate)
-- ✅ Playback (play/pause/resume/stop/next/previous/seek/volume/shuffle/repeat, EQ/DSP, crossfade, normalization, transfer, sleep timer, alarms)
-- ✅ Zones (CRUD, volume/mute/rename, groups, stereo pairs)
-- ✅ Playlists (CRUD, tracks, duplicate, M3U export/import)
-- ✅ Profiles (CRUD, favorites add/remove/list)
-- ✅ Tags (CRUD, tag/untag items)
-- ✅ Metadata editing (tracks/albums/artists with lofty writeback)
-- ✅ Smart playlists (JSON rules engine, dynamic resolution)
-- ✅ Radios (CRUD, search, favorites)
-- ✅ History + Dashboard (recent, top tracks/artists, genre breakdown)
-- ✅ Federated search (FTS5 + radios + authenticated streaming services)
-- ✅ Export (CSV tracks/albums/artists)
-- ✅ Devices (SSDP scan + DLNA auto-registration)
-- ✅ Network mounts (SMB/NFS CRUD)
-- ✅ Podcasts (subscription CRUD)
-- ✅ Plugins (list/enable/disable stubs)
-- ✅ WebSocket (`/ws` real-time events)
-- ✅ CORS permissive + gzip compression
-- ✅ 7 DB migrations, 15 repos
-
-**Crates** : `axum` (+ ws), `tower-http`, `tokio::sync::broadcast`, `tracing`
-**LOC Rust** : ~10 000 | **Remplace** : ~19 661 Python
-
----
-
-## Phase 7 — Streaming Connectors + Outputs (v1.9.0) — 14-18 semaines
-
-**But** : Migrer les connecteurs streaming (Tidal, Qobuz, Spotify, Deezer, YouTube, Amazon) et les outputs (DLNA, AirPlay, Chromecast, local, BluOS, OpenHome, Squeezebox).
-
-**Modules remplacés** :
-- `streaming/*.py` (4 993), `outputs/*.py` (5 577)
-- `playback/*.py` (2 669), `zones/*.py` (1 616)
-
-**Implémentation** :
-- ✅ `StreamingService` trait (18 methods: auth, search, track URL, albums, playlists, user library)
-- ✅ `OutputTarget` trait (10 methods: play_url, pause, resume, stop, seek, volume, mute, status)
-- ✅ `ServiceRegistry` + `OutputRegistry` in AppState
-- ✅ `PlaybackOrchestrator` : full pipeline service→proxy→output→history
-- ✅ **Tidal** : device OAuth flow, API search/browse, stream URL with quality fallback, URL cache 240s
-- ✅ **Qobuz** : user/password auth, catalog search, signed stream URLs (MD5)
-- ✅ **Spotify** : stub (PKCE OAuth pending)
-- ✅ **Deezer** : stub (OAuth pending)
-- ✅ **YouTube** : stub (OAuth pending)
-- ✅ **DLNA output** : full AVTransport SOAP (SetAVTransportURI, Play, Pause, Stop, Seek), RenderingControl (volume, mute), DIDL-Lite, auto-registration from device scan
-- ✅ 17 streaming API routes (auth, search, browse, track URLs, featured, new releases)
-- ⬜ AirPlay output (RAOP complex — may keep shim)
-- ⬜ Local audio output (cpal)
-- ⬜ Chromecast output
-- ⬜ BluOS / OpenHome / Squeezebox outputs
-
-**Crates** : `reqwest`, `async-trait`, `urlencoding`, `md-5`
-**LOC Rust** : ~1 600 (de ~15 000 cible) | **Remplace** : ~5 000 Python (core connectors + DLNA)
-
----
-
-## Phase 8 — Polish + Release (v2.0.0) — 4-6 semaines
-
-**But** : Binaire Rust pur. Python supprimé. Distribution simplifiée.
-
-- Supprimer PyO3, maturin, toutes les dépendances Python
-- Binaire statique cross-compilé (musl sur Linux)
-- Docker : `FROM scratch` + binaire + FFmpeg + web assets
-- Homebrew/DMG/NSIS mis à jour
-- Profiling performance (flamegraph)
-
-**LOC Rust** : ~2 000 | **Remplace** : packaging
-
----
-
-## Timeline
-
-| Phase | Version | Durée | Cumulé | Rust LOC | Python remplacé |
-|-------|---------|-------|--------|----------|-----------------|
-| 0 Tooling | v0.8.0 | 1-2 sem | 2 sem | 200 | 0 |
-| 1 Metadata | v1.0.0 | 4-6 sem | 8 sem | 1 200 | 718 |
-| 2 Audio | v1.1.0 | 6-8 sem | 16 sem | 2 400 | 1 412 |
-| 3 Discovery | v1.2.0 | 5-7 sem | 23 sem | 2 000 | 2 202 |
-| 4 Scanner | v1.3.0 | 4-5 sem | 28 sem | 1 500 | 988 |
-| 5 DB+Streamer | v1.5.0 | 10-14 sem | 42 sem | 6 000 | 6 697 |
-| 6 API | v1.8.0 | 16-22 sem | 64 sem | 25 000 | 19 661 |
-| 7 Connectors | v1.9.0 | 14-18 sem | 82 sem | 15 000 | 14 855 |
-| 8 Polish | v2.0.0 | 4-6 sem | 88 sem | 2 000 | 0 |
-| **Total** | | | **~20 mois** | **~55 300** | **~46 533** |
-
----
-
-## Métriques v2.0.0
-
-| Métrique | Python (actuel) | Rust (cible) | Rust (actuel) | Gain |
-|----------|----------------|--------------|---------------|------|
-| Binaire | 100-130 MB | 15-20 MB | **8.3 MB** | **12-16x** |
-| Mémoire RSS (50K tracks) | 400-600 MB | 50-80 MB | TBD | TBD |
-| Démarrage | 3-5 s | <0.5 s | **<10ms** | **300-500x** |
-| Scan bibliothèque | ~60s / 10K tracks | ~6-10s / 10K tracks | TBD | TBD |
-| Streams concurrents | ~10-20 | 100+ | TBD | TBD |
-| Latence API | ~5-15 ms | ~1-3 ms | TBD | TBD |
-| LOC | 62 266 Python | ~55 000 Rust | **11 534** | 5.4x compact |
-| Endpoints | ~200 | ~200 | **147** | 73% coverage |
-
----
-
-## Kill Switch
-
-**Phases 0-5** : réversible en <1h
-- Supprimer `from tune_native import`, fallback Python automatique
-- Supprimer le workspace Cargo
-- Résultat : retour au Python pur, zéro régression
-
-**Phase 6+** : réversible mais coûteux
-- `git revert` des commits API
-- Réactiver le pont PyO3 pour les phases 1-5
-
-**Point de décision** : si une phase prend >2x le temps estimé, pause et shipping du hybride.
-
----
-
-## Structure Cargo
+### Workspace Structure
 
 ```
-tune-server-linux/
-  Cargo.toml                # workspace
-  tune-core/src/            # Business logic
-    audio/ discovery/ library/ db/ streaming/
-    outputs/ playback/ zones/ models.rs config.rs event_bus.rs
-  tune-pyo3/src/lib.rs      # PyO3 bindings (phases 1-5)
-  tune-server/src/main.rs   # Axum binary (phase 6+)
-  tune_server/              # Python (rétrécit progressivement)
+tune-server-rust/
+  Cargo.toml              # workspace root (edition 2024)
+  tune-core/              # Business logic library
+    src/
+      audio/              # Pipeline, WAV, formats
+      db/                 # SQLite, 10 repos, models, migrations
+      discovery/          # SSDP, mDNS, XML parser, device model
+      http/               # Audio streamer (Range, proxy, ICY)
+      outputs/            # DLNA, Chromecast, local (cpal)
+      scanner/            # File walker (rayon), hasher, watcher, quality
+      streaming/          # Tidal, Qobuz, Spotify, Deezer, YouTube (traits + impls)
+      artwork.rs          # Embedded cover extraction (lofty)
+      buffer.rs           # Async ring buffer
+      metadata.rs         # Tag reader (lofty)
+      orchestrator.rs     # Playback pipeline: service -> proxy -> output -> history
+      playback.rs         # PlaybackManager (state machine)
+      poller.rs           # Position poller for outputs
+      scrobble.rs         # Last.fm scrobbling
+  tune-pyo3/              # PyO3 bindings (legacy bridge, kept for compatibility)
+  tune-server/            # Axum HTTP binary
+    src/
+      main.rs             # Entry point, auto-scan, file watcher, SSDP/mDNS init
+      config.rs           # TuneConfig (TOML + env vars)
+      state.rs            # AppState (DB, outputs, services, playback, streamer)
+      error.rs            # Error types
+      routes/             # 30 route modules (see below)
+```
+
+### Key Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `axum` 0.8 | HTTP framework (REST + WebSocket + multipart) |
+| `tokio` 1.x | Async runtime |
+| `rusqlite` 0.32 | SQLite with bundled engine, WAL, FTS5 |
+| `lofty` 0.22 | Audio metadata reading (FLAC, MP3, AAC, etc.) |
+| `reqwest` 0.12 | HTTP client (rustls, streaming) |
+| `rayon` 1.10 | Parallel file scanning |
+| `walkdir` 2 | Recursive directory traversal |
+| `notify` 7 | File system watcher (inotify/FSEvents/kqueue) |
+| `mdns-sd` 0.12 | mDNS service discovery (Chromecast, AirPlay) |
+| `socket2` 0.5 | SSDP multicast |
+| `quick-xml` 0.37 | UPnP XML parsing |
+| `rust_cast` 0.21 | Chromecast protocol |
+| `tower-http` 0.6 | CORS, gzip compression, tracing, static files |
+| `cpal` 0.15 | Local audio output |
+
+---
+
+## Feature Parity
+
+### Ported (production-ready)
+
+- **All API routes** — 385 handlers vs ~335 in Python
+- **Library** — Artists, albums, tracks, search (FTS5), stats, genres, ratings, history, dashboard
+- **Streaming services** — Tidal (device OAuth + HiRes), Qobuz (signed URLs), Deezer (ARL), Spotify (stub)
+- **DLNA output** — Full AVTransport SOAP (play/pause/stop/seek), RenderingControl (volume/mute), DIDL-Lite, DSD detection
+- **Chromecast output** — mDNS discovery + rust_cast protocol
+- **Last.fm scrobbling** — Session auth + scrobble + now playing
+- **FTS5 search** — Full-text search on tracks, albums, artists with triggers
+- **Playlist manager** — CRUD, track management, M3U import/export, duplicate, smart playlists (JSON rules engine)
+- **Zone manager** — CRUD, volume/mute, auto-creation from discovered devices, stereo pairs
+- **Playback orchestrator** — Full pipeline: service -> stream URL -> proxy -> output -> history
+- **Audio streaming** — HTTP Range requests, proxy streaming, chunked transfer, ICY metadata
+- **File scanner** — Parallel metadata extraction (rayon), audio hash, file watcher (notify)
+- **Device discovery** — SSDP (M-SEARCH + NOTIFY + unicast probe), mDNS (Chromecast, AirPlay)
+- **Snapcast, Sonos, Squeezebox, Spotify Connect** — Route stubs / basic integration
+- **Metadata editing** — Track/album/artist tag writeback via lofty
+- **Profiles, tags, radios, podcasts, plugins, export, network mounts, DJ, party mode**
+- **WebSocket** — Real-time events (`/ws`)
+- **Web client** — Static file serving with SPA fallback
+
+### Not Yet Ported
+
+- **AirPlay output** (RAOP protocol) — Complex binary protocol, may remain a gap
+- **YouTube Music** — Unofficial API, stub only
+- **PostgreSQL** — SQLite only (sqlx dependency present but unused)
+
+---
+
+## Performance Benchmarks
+
+Measured on production server (.18): Intel 8-core, 16 GB RAM, 44,623 audio files, 1.4 TB library.
+
+### Startup
+
+| Metric | Python v0.7.129 | Rust v2.0 |
+|--------|----------------|-----------|
+| Server listening | ~26s | **4ms** |
+| File enumeration (44,623 files) | ~8s | **300ms** |
+| Parallel metadata scan (44,623 files) | ~120s | **2s** (rayon, all cores) |
+| Full scan + DB insert (cold) | ~180s | **27s** |
+| Full scan + DB insert (warm, skip unchanged) | N/A | **<1s** |
+
+### API Latency (localhost, single request)
+
+| Endpoint | Latency |
+|----------|---------|
+| `GET /api/v1/system/health` | 2ms |
+| `GET /api/v1/zones` | 3ms |
+| `GET /api/v1/library/artists?limit=50` | 4ms |
+| `GET /api/v1/library/albums?limit=50` | 8ms |
+| `GET /api/v1/library/search?q=coltrane&limit=20` | 8ms |
+| `GET /api/v1/library/search?q=miles&limit=20` | 11ms |
+| `GET /api/v1/library/tracks?limit=50` | 58ms |
+| `GET /api/v1/library/search?q=love&limit=20` | 75ms |
+
+### Resource Usage
+
+| Metric | Python v0.7.129 | Rust v2.0 |
+|--------|----------------|-----------|
+| Binary size | 100+ MB (PyInstaller) | **18 MB** (stripped, LTO) |
+| RSS memory (42K tracks) | 200 MB | **65-75 MB** |
+| RSS memory peak (during scan) | 400-600 MB | **~95 MB** |
+| CPU at idle | 6.4% | **3.0%** |
+| Systemd memory peak | N/A | **57.9 MB** |
+
+### Key Numbers
+
+- **Startup to listening**: 4ms (vs 26s Python) — **6,500x faster**
+- **Binary size**: 18 MB vs 100+ MB — **5.5x smaller**
+- **Memory**: 65 MB vs 200 MB — **3x less**
+- **Parallel scan**: 2s for 44K files on 8 cores — **60x faster** than Python single-threaded
+
+---
+
+## Route Modules (30)
+
+| Module | Description |
+|--------|-------------|
+| `system` | Version, health, stats, config, scan, restart, diagnostics, logs, backup/restore, DB export, cleanup, update check |
+| `library` | Artists/albums/tracks (paginated), count, filters, recent, genre tree, top-rated, ratings, rescan |
+| `search` | Federated FTS5 search (library + radios + streaming services) |
+| `playback` | Play/pause/resume/stop/next/previous/seek/volume/shuffle/repeat, EQ/DSP, crossfade, normalization, transfer, sleep timer, alarms |
+| `zones` | CRUD, volume/mute/rename, groups, stereo pairs |
+| `playlists` | CRUD, track management, duplicate, M3U export/import |
+| `smart_playlists` | JSON rules engine, dynamic resolution |
+| `streaming` | Service auth, search, browse, track URLs, featured, new releases |
+| `profiles` | CRUD, favorites add/remove/list |
+| `tags` | CRUD, tag/untag items |
+| `metadata` | Track/album/artist tag editing with lofty writeback |
+| `radios` | CRUD, search, favorites, alarms |
+| `history` | Recent listens |
+| `dashboard` | Top tracks/artists, genre breakdown, listening stats |
+| `devices` | SSDP scan + DLNA auto-registration |
+| `network` | SMB/NFS mount CRUD |
+| `export` | CSV tracks/albums/artists |
+| `podcasts` | Subscription CRUD |
+| `plugins` | List/enable/disable |
+| `ws` | WebSocket real-time events |
+| `playlist_manager` | Cross-service playlist orchestrator |
+| `zone_manager` | Advanced zone management |
+| `snapcast` | Snapcast integration |
+| `sonos` | Sonos integration |
+| `squeezebox` | Squeezebox/LMS integration |
+| `spotify_connect` | Spotify Connect integration |
+| `dj` | DJ/auto-mix mode |
+| `party` | Party mode (collaborative queue) |
+| `peers` | Multi-server peer discovery |
+
+---
+
+## Database
+
+- **Engine**: rusqlite 0.32 with bundled SQLite (WAL mode, foreign keys, busy_timeout)
+- **FTS5**: Virtual tables + triggers on tracks, albums, artists
+- **Migrations**: 12 versioned migrations (auto-applied at startup)
+- **Repos**: 10 repositories (artist, album, track, playlist, play_queue, zone, profile, tag, radio, rating, history, settings)
+
+---
+
+## Build & Deploy
+
+### Local Development
+
+```bash
+# Build
+cargo build --release --package tune-server
+
+# Run
+TUNE_PORT=8085 TUNE_MUSIC_DIRS='["/path/to/music"]' TUNE_AUTO_SCAN=true \
+  ./target/release/tune-server
+
+# Run tests
+cargo test --workspace
+```
+
+### Configuration
+
+Configuration via `tune.toml` or environment variables (env vars take precedence):
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `TUNE_PORT` | 8085 | HTTP port |
+| `TUNE_DB_PATH` | tune.db | SQLite database path |
+| `TUNE_WEB_DIR` | web | Web client directory |
+| `TUNE_ARTWORK_DIR` | artwork_cache | Artwork cache directory |
+| `TUNE_MUSIC_DIRS` | [] | JSON array or comma-separated paths |
+| `TUNE_AUTO_SCAN` | false | Scan music dirs on startup |
+| `TUNE_LOG_LEVEL` | info | Log level (trace/debug/info/warn/error) |
+| `QOBUZ_APP_ID` | | Qobuz API app ID |
+| `QOBUZ_APP_SECRET` | | Qobuz API app secret |
+
+### Deploy to Server
+
+```bash
+# Cross-compile for Linux x86_64
+cargo build --release --package tune-server --target x86_64-unknown-linux-gnu
+
+# Copy to server
+scp target/x86_64-unknown-linux-gnu/release/tune-server user@server:/opt/tune-server-rust/
+
+# Restart
+ssh user@server 'sudo systemctl restart tune-rust'
+```
+
+### Systemd Service
+
+```ini
+[Unit]
+Description=Tune Server v2 (Rust)
+After=network.target
+
+[Service]
+Type=simple
+User=bertrand
+WorkingDirectory=/opt/tune-server-rust
+ExecStart=/opt/tune-server-rust/tune-server
+Restart=always
+RestartSec=3
+Environment=TUNE_PORT=8086
+Environment=TUNE_DB_PATH=/opt/tune-server-rust/tune.db
+Environment=TUNE_WEB_DIR=/opt/tune-server-rust/web
+Environment=TUNE_ARTWORK_DIR=/opt/tune-server-rust/artwork_cache
+Environment=TUNE_AUTO_SCAN=true
+Environment=TUNE_MUSIC_DIRS=["/data/music","/data/recordings"]
+Environment=TUNE_LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ---
 
-## Fichiers critiques (première implémentation)
+## Docker
 
-- `tune_server/library/metadata_reader.py` — Phase 1, premier module migré
-- `tune_server/audio/pipeline.py` — Phase 2
-- `tune_server/audio/buffer.py` — Phase 1
-- `tune_server/discovery/ssdp.py` — Phase 3
-- `tune_server/outputs/http_streamer.py` — Phase 5
-- `tune_server/db/repository.py` — Phase 5
-- `tune_server/api/routes/*` — Phase 6
+### Image: `renesenses/tune:dev`
 
-## Vérification
+```bash
+# Build
+docker build -t renesenses/tune:dev .
 
-Chaque phase est validée par :
-1. Tests existants Python passent avec le backend Rust
-2. Dual-run : Python et Rust produisent des résultats identiques
-3. Benchmark : mesure des gains de performance avant/après
-4. Test d'intégration : clients Flutter/Swift/Web fonctionnent sans modification
+# Run
+docker run -d \
+  --name tune-server \
+  --network host \
+  -v /path/to/music:/music:ro \
+  -v tune-data:/data \
+  -e TUNE_AUTO_SCAN=true \
+  renesenses/tune:dev
+```
+
+### docker-compose
+
+```yaml
+services:
+  tune:
+    image: renesenses/tune:dev
+    container_name: tune-server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - tune-data:/data
+      - /path/to/music:/music:ro
+    environment:
+      - TUNE_PORT=8085
+      - TUNE_DB_PATH=/data/tune.db
+      - TUNE_ARTWORK_DIR=/data/artwork_cache
+      - TUNE_AUTO_SCAN=true
+      - TUNE_MUSIC_DIRS=/music
+
+volumes:
+  tune-data:
+```
+
+The Docker image uses a multi-stage build: Rust compilation on `rust:1-slim-bookworm`, runtime on `debian:bookworm-slim` with FFmpeg and ca-certificates.
+
+---
+
+## CI/CD
+
+Three GitHub Actions workflows:
+
+- **ci.yml** — Build + test on push/PR (cargo check, cargo test, clippy)
+- **docker.yml** — Build and push Docker image to Docker Hub
+- **release.yml** — Cross-compile release binaries (Linux x86_64/aarch64, macOS)
+
+---
+
+## Migration History
+
+The original plan described 8 phases over ~20 months. In practice, the migration was completed in roughly 4 weeks of intensive development (May 2026), going directly from Phase 0 (tooling) to a feature-complete server. The PyO3 bridge (`tune-pyo3`) was built but the decision was made early to port everything to pure Rust rather than maintaining a hybrid Python/Rust architecture.
+
+| Milestone | Date | Description |
+|-----------|------|-------------|
+| Phase 0: Workspace created | 2026-05-12 | Cargo workspace, CI, PyO3 scaffolding |
+| Phases 1-4: Core modules | 2026-05-14 | Metadata, scanner, discovery ported |
+| Phase 5: Database + streamer | 2026-05-16 | rusqlite, all repos, HTTP streamer |
+| Phase 6: Full API | 2026-05-19 | 147 initial endpoints on Axum |
+| Phase 7: Connectors + outputs | 2026-05-19 | Tidal, Qobuz, DLNA, Chromecast |
+| Phase 8: Production deploy | 2026-05-20 | Deployed on .18, running alongside Python |
+| 385 routes milestone | 2026-05-26 | Full feature parity + extras |

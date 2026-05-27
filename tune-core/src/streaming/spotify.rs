@@ -296,6 +296,179 @@ impl StreamingService for SpotifyService {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn map_track_basic() {
+        let json = json!({
+            "id": "track123",
+            "name": "Bohemian Rhapsody",
+            "artists": [{"name": "Queen", "id": "artist1"}],
+            "album": {
+                "name": "A Night at the Opera",
+                "id": "album1",
+                "images": [{"url": "http://img.spotify.com/cover.jpg"}],
+            },
+            "duration_ms": 354000,
+            "track_number": 11,
+            "disc_number": 1,
+            "explicit": false,
+        });
+        let track = SpotifyService::map_track(&json);
+        assert_eq!(track.id, "track123");
+        assert_eq!(track.title, "Bohemian Rhapsody");
+        assert_eq!(track.artist, "Queen");
+        assert_eq!(track.album.as_deref(), Some("A Night at the Opera"));
+        assert_eq!(track.album_id.as_deref(), Some("album1"));
+        assert_eq!(track.duration_ms, 354000);
+        assert_eq!(track.track_number, Some(11));
+        assert_eq!(track.disc_number, Some(1));
+        assert!(!track.explicit);
+        assert_eq!(track.cover_path.as_deref(), Some("http://img.spotify.com/cover.jpg"));
+        let q = track.quality.unwrap();
+        assert_eq!(q.codec, "OGG");
+        assert_eq!(q.bitrate, Some(320));
+    }
+
+    #[test]
+    fn map_track_explicit() {
+        let json = json!({
+            "id": "x",
+            "name": "Explicit",
+            "artists": [{"name": "Test"}],
+            "album": {},
+            "duration_ms": 100000,
+            "explicit": true,
+        });
+        let track = SpotifyService::map_track(&json);
+        assert!(track.explicit);
+    }
+
+    #[test]
+    fn map_track_missing_fields() {
+        let json = json!({
+            "id": null,
+            "name": null,
+            "album": {},
+        });
+        let track = SpotifyService::map_track(&json);
+        assert_eq!(track.id, "");
+        assert_eq!(track.title, "");
+        assert_eq!(track.artist, "");
+        assert_eq!(track.duration_ms, 0);
+    }
+
+    #[test]
+    fn map_album_basic() {
+        let json = json!({
+            "id": "album123",
+            "name": "A Night at the Opera",
+            "artists": [{"name": "Queen", "id": "artist1"}],
+            "images": [{"url": "http://img.spotify.com/album.jpg"}],
+            "release_date": "1975-11-21",
+            "total_tracks": 12,
+        });
+        let album = SpotifyService::map_album(&json);
+        assert_eq!(album.id, "album123");
+        assert_eq!(album.title, "A Night at the Opera");
+        assert_eq!(album.artist, "Queen");
+        assert_eq!(album.artist_id.as_deref(), Some("artist1"));
+        assert_eq!(album.year, Some(1975));
+        assert_eq!(album.track_count, 12);
+        assert_eq!(album.cover_path.as_deref(), Some("http://img.spotify.com/album.jpg"));
+    }
+
+    #[test]
+    fn map_album_year_only() {
+        let json = json!({
+            "id": "a",
+            "name": "Test",
+            "artists": [],
+            "release_date": "2023",
+            "total_tracks": 1,
+        });
+        let album = SpotifyService::map_album(&json);
+        assert_eq!(album.year, Some(2023));
+    }
+
+    #[test]
+    fn map_artist_basic() {
+        let json = json!({
+            "id": "artist123",
+            "name": "Queen",
+            "images": [{"url": "http://img.spotify.com/artist.jpg"}],
+        });
+        let artist = SpotifyService::map_artist(&json);
+        assert_eq!(artist.id, "artist123");
+        assert_eq!(artist.name, "Queen");
+        assert_eq!(artist.image_path.as_deref(), Some("http://img.spotify.com/artist.jpg"));
+    }
+
+    #[test]
+    fn map_artist_no_images() {
+        let json = json!({
+            "id": "a",
+            "name": "Unknown",
+            "images": [],
+        });
+        let artist = SpotifyService::map_artist(&json);
+        assert!(artist.image_path.is_none());
+    }
+
+    #[test]
+    fn spotify_service_name() {
+        let svc = SpotifyService::new();
+        assert_eq!(svc.name(), "spotify");
+    }
+
+    #[test]
+    fn spotify_save_tokens_no_auth() {
+        let svc = SpotifyService::new();
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn spotify_restore_tokens() {
+        let mut svc = SpotifyService::new();
+        let tokens = json!({
+            "access_token": "spotify-token",
+            "refresh_token": "refresh-token",
+            "username": "testuser",
+        });
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.access_token.as_deref(), Some("spotify-token"));
+        assert_eq!(svc.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(svc.username.as_deref(), Some("testuser"));
+    }
+
+    #[test]
+    fn spotify_restore_tokens_invalid() {
+        let mut svc = SpotifyService::new();
+        let tokens = json!({"nothing": "here"});
+        assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn spotify_set_enabled() {
+        let mut svc = SpotifyService::new();
+        svc.set_enabled(true);
+        assert!(svc.enabled());
+        svc.set_enabled(false);
+        assert!(!svc.enabled());
+    }
+
+    #[test]
+    fn base64url_encode_known() {
+        let data = b"Hello";
+        let result = base64url_encode(data);
+        // Standard base64 is "SGVsbG8=" but base64url has no padding and uses -_ instead of +/
+        assert_eq!(result, "SGVsbG8");
+    }
+}
+
 fn base64url_encode(data: &[u8]) -> String {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut output = String::new();

@@ -160,4 +160,113 @@ mod tests {
         let zones = repo.list().unwrap();
         assert_eq!(zones.len(), 2);
     }
+
+    #[test]
+    fn zone_count() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        assert_eq!(repo.count().unwrap(), 0);
+        repo.create("Zone A", None, None).unwrap();
+        repo.create("Zone B", None, None).unwrap();
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn zone_update_name() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Old Name", None, None).unwrap();
+        repo.update_name(id, "New Name").unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        assert_eq!(zone.name, "New Name");
+    }
+
+    #[test]
+    fn zone_update_output_device() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Zone", Some("dlna"), Some("uuid:old")).unwrap();
+        repo.update_output_device(id, "uuid:new-device").unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        assert_eq!(zone.output_device_id.as_deref(), Some("uuid:new-device"));
+    }
+
+    #[test]
+    fn zone_update_output_type() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Zone", Some("local"), None).unwrap();
+        repo.update_output_type(id, "dlna").unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        assert_eq!(zone.output_type.as_deref(), Some("dlna"));
+    }
+
+    #[test]
+    fn zone_default_values() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Default Zone", None, None).unwrap();
+        let zone = repo.get(id).unwrap().unwrap();
+        assert_eq!(zone.volume, 50);
+        assert!(!zone.muted);
+        assert!(zone.online);
+        assert!(zone.output_type.is_none());
+        assert!(zone.output_device_id.is_none());
+    }
+
+    #[test]
+    fn zone_mute_unmute() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Zone", None, None).unwrap();
+        assert!(!repo.get(id).unwrap().unwrap().muted);
+
+        repo.update_muted(id, true).unwrap();
+        assert!(repo.get(id).unwrap().unwrap().muted);
+
+        repo.update_muted(id, false).unwrap();
+        assert!(!repo.get(id).unwrap().unwrap().muted);
+    }
+
+    #[test]
+    fn zone_volume_range() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let id = repo.create("Zone", None, None).unwrap();
+
+        repo.update_volume(id, 0).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 0);
+
+        repo.update_volume(id, 100).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().volume, 100);
+    }
+
+    #[test]
+    fn zone_get_nonexistent() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+        assert!(repo.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn zone_list_sorted() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        repo.create("Salon", None, None).unwrap();
+        repo.create("Bureau", None, None).unwrap();
+        repo.create("Chambre", None, None).unwrap();
+
+        let zones = repo.list().unwrap();
+        assert_eq!(zones[0].name, "Bureau");
+        assert_eq!(zones[1].name, "Chambre");
+        assert_eq!(zones[2].name, "Salon");
+    }
 }

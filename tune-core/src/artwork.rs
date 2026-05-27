@@ -268,4 +268,75 @@ mod tests {
     fn nonexistent_file_returns_none() {
         assert!(extract_cover_art(Path::new("/tmp/nonexistent.flac")).is_none());
     }
+
+    #[test]
+    fn artwork_hash_different_for_different_paths() {
+        let h1 = artwork_hash("/music/a.flac");
+        let h2 = artwork_hash("/music/b.flac");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn artwork_hash_hex_chars() {
+        let h = artwork_hash("/test");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn artwork_hash_empty_string() {
+        let h = artwork_hash("");
+        assert_eq!(h.len(), 32);
+        // MD5 of empty string
+        assert_eq!(h, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn artwork_hash_unicode_path() {
+        let h = artwork_hash("/music/Rene/album.flac");
+        assert_eq!(h.len(), 32);
+    }
+
+    #[test]
+    fn find_folder_cover_nonexistent_dir() {
+        let result = find_folder_cover(Path::new("/tmp/nonexistent_dir_12345/track.flac"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn save_to_cache_and_read() {
+        let dir = std::env::temp_dir().join("tune_test_artwork_cache");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let data = b"fake image data";
+        let result = save_to_cache(data, &dir, "test_hash_123", "jpg");
+        assert!(result.is_some());
+
+        let path = result.unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_cache_creates_dir() {
+        let dir = std::env::temp_dir().join("tune_test_artwork_new_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        save_to_cache(b"test", &dir, "hash", "png");
+        assert!(dir.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_or_extract_nonexistent() {
+        let cache_dir = std::env::temp_dir().join("tune_test_extract_ne");
+        let result = get_or_extract(
+            Path::new("/tmp/nonexistent_audio_file.flac"),
+            &cache_dir,
+        );
+        assert!(result.is_none());
+    }
 }

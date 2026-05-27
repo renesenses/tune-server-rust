@@ -118,4 +118,124 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert_eq!(top[0].0, id1);
     }
+
+    #[test]
+    fn delete_rating() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let aid = album_repo.create(&Album::new("Test".into())).unwrap();
+
+        let repo = RatingRepo::new(db);
+        repo.rate_album(aid, 1, 4, None).unwrap();
+        assert!(repo.get_rating(aid, 1).unwrap().is_some());
+
+        repo.delete_rating(aid, 1).unwrap();
+        assert!(repo.get_rating(aid, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn rating_boundary_values() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let aid = album_repo.create(&Album::new("Test".into())).unwrap();
+
+        let repo = RatingRepo::new(db);
+
+        // Rating 1 should work
+        repo.rate_album(aid, 1, 1, None).unwrap();
+        assert_eq!(repo.get_rating(aid, 1).unwrap().unwrap().rating, 1);
+
+        // Rating 5 should work
+        repo.rate_album(aid, 1, 5, None).unwrap();
+        assert_eq!(repo.get_rating(aid, 1).unwrap().unwrap().rating, 5);
+
+        // Rating 0 should fail
+        assert!(repo.rate_album(aid, 1, 0, None).is_err());
+        // Rating 6 should fail
+        assert!(repo.rate_album(aid, 1, 6, None).is_err());
+        // Negative rating should fail
+        assert!(repo.rate_album(aid, 1, -1, None).is_err());
+    }
+
+    #[test]
+    fn rating_with_note() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let aid = album_repo.create(&Album::new("Blue Train".into())).unwrap();
+
+        let repo = RatingRepo::new(db);
+        repo.rate_album(aid, 1, 5, Some("Hard bop chef-d'oeuvre")).unwrap();
+
+        let r = repo.get_rating(aid, 1).unwrap().unwrap();
+        assert_eq!(r.note.as_deref(), Some("Hard bop chef-d'oeuvre"));
+    }
+
+    #[test]
+    fn rating_nonexistent_album() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = RatingRepo::new(db);
+        assert!(repo.get_rating(999, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn top_rated_ordering() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let a1 = album_repo.create(&Album::new("Low rated".into())).unwrap();
+        let a2 = album_repo.create(&Album::new("Mid rated".into())).unwrap();
+        let a3 = album_repo.create(&Album::new("High rated".into())).unwrap();
+
+        let repo = RatingRepo::new(db);
+        repo.rate_album(a1, 1, 2, None).unwrap();
+        repo.rate_album(a2, 1, 3, None).unwrap();
+        repo.rate_album(a3, 1, 5, None).unwrap();
+
+        let top = repo.top_rated(10).unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0].0, a3); // highest first
+        assert_eq!(top[1].0, a2);
+        assert_eq!(top[2].0, a1);
+    }
+
+    #[test]
+    fn rating_multiple_profiles() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let album_repo = AlbumRepo::new(db.clone());
+        let aid = album_repo.create(&Album::new("Test".into())).unwrap();
+
+        // Create second profile
+        let profile_repo = crate::db::profile_repo::ProfileRepo::new(db.clone());
+        let pid2 = profile_repo.create("user2", None).unwrap();
+
+        let repo = RatingRepo::new(db);
+        repo.rate_album(aid, 1, 5, None).unwrap();
+        repo.rate_album(aid, pid2, 3, None).unwrap();
+
+        assert_eq!(repo.get_rating(aid, 1).unwrap().unwrap().rating, 5);
+        assert_eq!(repo.get_rating(aid, pid2).unwrap().unwrap().rating, 3);
+
+        // top_rated should average
+        let top = repo.top_rated(10).unwrap();
+        assert_eq!(top.len(), 1);
+        assert!((top[0].1 - 4.0).abs() < 0.01); // avg of 5 and 3
+        assert_eq!(top[0].2, 2); // 2 ratings
+    }
 }

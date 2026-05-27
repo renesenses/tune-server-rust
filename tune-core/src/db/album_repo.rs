@@ -348,4 +348,315 @@ mod tests {
         assert_eq!(deleted, 1);
         assert_eq!(repo.count().unwrap(), 0);
     }
+
+    #[test]
+    fn update_album() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Coltrane".into())).unwrap();
+        let mut album = Album::new("A Love Supreme".into());
+        album.artist_id = Some(aid);
+        album.year = Some(1965);
+        let id = repo.create(&album).unwrap();
+
+        album.id = Some(id);
+        album.genre = Some("Jazz".into());
+        album.label = Some("Impulse!".into());
+        album.bio = Some("A masterpiece".into());
+        repo.update(&album).unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.genre.as_deref(), Some("Jazz"));
+        assert_eq!(fetched.label.as_deref(), Some("Impulse!"));
+        assert_eq!(fetched.bio.as_deref(), Some("A masterpiece"));
+    }
+
+    #[test]
+    fn update_cover_path() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let id = repo.create(&Album::new("Test Album".into())).unwrap();
+        repo.update_cover_path(id, "abc123").unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
+
+        // Should not overwrite existing cover
+        repo.update_cover_path(id, "new_hash").unwrap();
+        let fetched2 = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched2.cover_path.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn list_albums() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Various".into())).unwrap();
+        for title in ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"] {
+            let mut a = Album::new(title.into());
+            a.artist_id = Some(aid);
+            repo.create(&a).unwrap();
+        }
+
+        let all = repo.list(100, 0).unwrap();
+        assert_eq!(all.len(), 5);
+        // Should be sorted by title (COLLATE NOCASE)
+        assert_eq!(all[0].title, "Alpha");
+        assert_eq!(all[4].title, "Gamma"); // G after E
+
+        let page = repo.list(2, 2).unwrap();
+        assert_eq!(page.len(), 2);
+    }
+
+    #[test]
+    fn list_recent_albums() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        for i in 0..5 {
+            repo.create(&Album::new(format!("Album {i}"))).unwrap();
+        }
+
+        let recent = repo.list_recent(3).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Most recent first (highest id)
+        assert_eq!(recent[0].title, "Album 4");
+    }
+
+    #[test]
+    fn list_by_artist() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid1 = artist_repo.create(&Artist::new("Miles Davis".into())).unwrap();
+        let aid2 = artist_repo.create(&Artist::new("Coltrane".into())).unwrap();
+
+        let mut a1 = Album::new("Kind of Blue".into());
+        a1.artist_id = Some(aid1);
+        a1.year = Some(1959);
+        repo.create(&a1).unwrap();
+
+        let mut a2 = Album::new("Bitches Brew".into());
+        a2.artist_id = Some(aid1);
+        a2.year = Some(1970);
+        repo.create(&a2).unwrap();
+
+        let mut a3 = Album::new("A Love Supreme".into());
+        a3.artist_id = Some(aid2);
+        repo.create(&a3).unwrap();
+
+        let miles_albums = repo.list_by_artist(aid1).unwrap();
+        assert_eq!(miles_albums.len(), 2);
+        // Should be sorted by year
+        assert_eq!(miles_albums[0].title, "Kind of Blue");
+        assert_eq!(miles_albums[1].title, "Bitches Brew");
+    }
+
+    #[test]
+    fn list_by_genre() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let mut a1 = Album::new("Jazz Album".into());
+        a1.genre = Some("Jazz".into());
+        repo.create(&a1).unwrap();
+
+        let mut a2 = Album::new("Rock Album".into());
+        a2.genre = Some("Rock".into());
+        repo.create(&a2).unwrap();
+
+        let mut a3 = Album::new("Fusion Album".into());
+        a3.genres = Some(r#"["Jazz","Fusion"]"#.into());
+        repo.create(&a3).unwrap();
+
+        let jazz = repo.list_by_genre("Jazz").unwrap();
+        assert_eq!(jazz.len(), 2);
+    }
+
+    #[test]
+    fn list_without_cover() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
+
+        let mut a1 = Album::new("No Cover".into());
+        a1.artist_id = Some(aid);
+        repo.create(&a1).unwrap();
+
+        let mut a2 = Album::new("Has Cover".into());
+        a2.artist_id = Some(aid);
+        a2.cover_path = Some("hash123".into());
+        repo.create(&a2).unwrap();
+
+        let without = repo.list_without_cover().unwrap();
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].1, "No Cover");
+    }
+
+    #[test]
+    fn search_albums() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let mut a = Album::new("The Dark Side of the Moon".into());
+        a.artist_id = Some(aid);
+        a.year = Some(1973);
+        repo.create(&a).unwrap();
+
+        let results = repo.search("dark", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "The Dark Side of the Moon");
+    }
+
+    #[test]
+    fn get_by_musicbrainz_release_id() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let mut album = Album::new("Test".into());
+        album.musicbrainz_release_id = Some("12345-abcde".into());
+        let id = repo.create(&album).unwrap();
+
+        let found = repo.get_by_musicbrainz_release_id("12345-abcde").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, Some(id));
+
+        assert!(repo.get_by_musicbrainz_release_id("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn count_albums() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        assert_eq!(repo.count().unwrap(), 0);
+        repo.create(&Album::new("A".into())).unwrap();
+        repo.create(&Album::new("B".into())).unwrap();
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn album_quality_classification() {
+        let mut a = Album::new("DSD Album".into());
+        a.format = Some("dsf".into());
+        assert_eq!(a.quality(), Some("dsd".into()));
+
+        let mut b = Album::new("Hi-Res Album".into());
+        b.sample_rate = Some(96000);
+        b.bit_depth = Some(24);
+        b.format = Some("flac".into());
+        assert_eq!(b.quality(), Some("hi-res".into()));
+
+        let mut c = Album::new("CD Album".into());
+        c.format = Some("flac".into());
+        c.sample_rate = Some(44100);
+        c.bit_depth = Some(16);
+        assert_eq!(c.quality(), Some("cd".into()));
+
+        let mut d = Album::new("Lossy Album".into());
+        d.format = Some("mp3".into());
+        assert_eq!(d.quality(), Some("lossy".into()));
+
+        let e = Album::new("Unknown".into());
+        assert_eq!(e.quality(), None);
+    }
+
+    #[test]
+    fn album_to_json() {
+        let mut a = Album::new("Test".into());
+        a.format = Some("flac".into());
+        a.sample_rate = Some(96000);
+        a.bit_depth = Some(24);
+        let json = a.to_json();
+        assert_eq!(json["quality"], "hi-res");
+        assert_eq!(json["title"], "Test");
+    }
+
+    #[test]
+    fn get_or_create_without_year() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
+        let a1 = repo.get_or_create("Album", aid, None).unwrap();
+        let a2 = repo.get_or_create("Album", aid, None).unwrap();
+        assert_eq!(a1.id, a2.id);
+    }
+
+    #[test]
+    fn update_quality_from_tracks() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let track_repo = crate::db::track_repo::TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
+        let alid = album_repo.get_or_create("Test Album", aid, None).unwrap().id.unwrap();
+
+        let mut t = crate::db::models::Track::new("Track 1".into());
+        t.album_id = Some(alid);
+        t.format = Some("flac".into());
+        t.sample_rate = Some(96000);
+        t.bit_depth = Some(24);
+        t.file_path = Some("/test.flac".into());
+        track_repo.create(&t).unwrap();
+
+        album_repo.update_quality_from_tracks(alid).unwrap();
+        let album = album_repo.get(alid).unwrap().unwrap();
+        assert_eq!(album.format.as_deref(), Some("flac"));
+        assert_eq!(album.sample_rate, Some(96000));
+        assert_eq!(album.bit_depth, Some(24));
+    }
+
+    #[test]
+    fn update_track_count() {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let track_repo = crate::db::track_repo::TrackRepo::new(db);
+
+        let alid = album_repo.create(&Album::new("Test".into())).unwrap();
+        let mut t1 = crate::db::models::Track::new("A".into());
+        t1.album_id = Some(alid);
+        t1.file_path = Some("/a.flac".into());
+        let mut t2 = crate::db::models::Track::new("B".into());
+        t2.album_id = Some(alid);
+        t2.file_path = Some("/b.flac".into());
+        track_repo.create(&t1).unwrap();
+        track_repo.create(&t2).unwrap();
+
+        album_repo.update_track_count(alid).unwrap();
+        let album = album_repo.get(alid).unwrap().unwrap();
+        assert_eq!(album.track_count, Some(2));
+    }
+
+    #[test]
+    fn unicode_album_title() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let mut a = Album::new("Concerto pour clarinette en la majeur".into());
+        a.genre = Some("Classique".into());
+        let id = repo.create(&a).unwrap();
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.title, "Concerto pour clarinette en la majeur");
+    }
+
+    #[test]
+    fn delete_nonexistent_album() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        // Should not error
+        repo.delete(999).unwrap();
+    }
 }

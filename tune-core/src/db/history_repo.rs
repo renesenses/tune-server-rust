@@ -223,4 +223,147 @@ mod tests {
         assert_eq!(dashboard.total_listens, 2);
         assert_eq!(dashboard.unique_tracks, 1);
     }
+
+    #[test]
+    fn history_top_artists() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = HistoryRepo::new(db);
+
+        for _ in 0..5 {
+            repo.record(&ListenRecord {
+                id: None, track_id: None, title: "Song A".into(),
+                artist_name: Some("Miles Davis".into()),
+                album_title: None, source: "local".into(),
+                duration_ms: 300_000, listened_at: None, zone_id: None,
+            }).unwrap();
+        }
+        for _ in 0..3 {
+            repo.record(&ListenRecord {
+                id: None, track_id: None, title: "Song B".into(),
+                artist_name: Some("Coltrane".into()),
+                album_title: None, source: "local".into(),
+                duration_ms: 400_000, listened_at: None, zone_id: None,
+            }).unwrap();
+        }
+
+        let top = repo.top_artists(10).unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "Miles Davis");
+        assert_eq!(top[0].1, 5);
+        assert_eq!(top[1].0, "Coltrane");
+        assert_eq!(top[1].1, 3);
+    }
+
+    #[test]
+    fn history_top_albums() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = HistoryRepo::new(db);
+
+        for _ in 0..3 {
+            repo.record(&ListenRecord {
+                id: None, track_id: None, title: "Track".into(),
+                artist_name: Some("Miles".into()),
+                album_title: Some("Kind of Blue".into()),
+                source: "local".into(), duration_ms: 300_000,
+                listened_at: None, zone_id: None,
+            }).unwrap();
+        }
+
+        let top = repo.top_albums(10).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0, "Kind of Blue");
+        assert_eq!(top[0].2, 3);
+    }
+
+    #[test]
+    fn history_count() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = HistoryRepo::new(db);
+        assert_eq!(repo.count().unwrap(), 0);
+
+        repo.record(&ListenRecord {
+            id: None, track_id: None, title: "A".into(),
+            artist_name: None, album_title: None,
+            source: "local".into(), duration_ms: 0,
+            listened_at: None, zone_id: None,
+        }).unwrap();
+        assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn history_dashboard_total_duration() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = HistoryRepo::new(db);
+        repo.record(&ListenRecord {
+            id: None, track_id: None, title: "A".into(),
+            artist_name: Some("X".into()), album_title: None,
+            source: "local".into(), duration_ms: 300_000,
+            listened_at: None, zone_id: None,
+        }).unwrap();
+        repo.record(&ListenRecord {
+            id: None, track_id: None, title: "B".into(),
+            artist_name: Some("Y".into()), album_title: None,
+            source: "tidal".into(), duration_ms: 200_000,
+            listened_at: None, zone_id: None,
+        }).unwrap();
+
+        let dash = repo.dashboard().unwrap();
+        assert_eq!(dash.total_duration_ms, 500_000);
+        assert_eq!(dash.unique_tracks, 2);
+        assert_eq!(dash.unique_artists, 2);
+    }
+
+    #[test]
+    fn history_recent_order() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = HistoryRepo::new(db);
+        for title in ["First", "Second", "Third"] {
+            repo.record(&ListenRecord {
+                id: None, track_id: None, title: title.into(),
+                artist_name: None, album_title: None,
+                source: "local".into(), duration_ms: 0,
+                listened_at: None, zone_id: None,
+            }).unwrap();
+        }
+
+        let recent = repo.recent(10).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Most recent first
+        assert_eq!(recent[0].title, "Third");
+    }
+
+    #[test]
+    fn history_with_zone_id() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        // Create a zone for the foreign key
+        db.execute("INSERT INTO zones (name) VALUES ('Main')", &[]).unwrap();
+
+        let repo = HistoryRepo::new(db);
+        repo.record(&ListenRecord {
+            id: None, track_id: None, title: "Test".into(),
+            artist_name: None, album_title: None,
+            source: "local".into(), duration_ms: 100_000,
+            listened_at: None, zone_id: Some(1),
+        }).unwrap();
+
+        let recent = repo.recent(1).unwrap();
+        assert_eq!(recent[0].zone_id, Some(1));
+    }
 }

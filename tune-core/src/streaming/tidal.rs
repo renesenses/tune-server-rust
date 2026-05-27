@@ -972,6 +972,258 @@ fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
     base64_decode(&standard)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn map_track_basic() {
+        let json = json!({
+            "id": 123,
+            "title": "So What",
+            "artist": {"name": "Miles Davis"},
+            "album": {"title": "Kind of Blue", "cover": "abc-def-ghi", "id": 456},
+            "duration": 562,
+            "trackNumber": 1,
+            "volumeNumber": 1,
+            "explicit": false,
+            "audioQuality": "LOSSLESS",
+        });
+        let track = TidalService::map_track(&json);
+        assert_eq!(track.id, "123");
+        assert_eq!(track.title, "So What");
+        assert_eq!(track.artist, "Miles Davis");
+        assert_eq!(track.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(track.album_id.as_deref(), Some("456"));
+        assert_eq!(track.duration_ms, 562_000);
+        assert_eq!(track.track_number, Some(1));
+        assert_eq!(track.disc_number, Some(1));
+        assert!(!track.explicit);
+        assert!(track.cover_path.is_some());
+        let cover = track.cover_path.unwrap();
+        assert!(cover.contains("resources.tidal.com"));
+        assert!(cover.contains("abc/def/ghi"));
+    }
+
+    #[test]
+    fn map_track_hires() {
+        let json = json!({
+            "id": 999,
+            "title": "Hi-Res Track",
+            "artist": {"name": "Test"},
+            "album": {"title": "Album", "cover": "xx-yy", "id": 1},
+            "duration": 300,
+            "trackNumber": 1,
+            "volumeNumber": 1,
+            "explicit": true,
+            "audioQuality": "HI_RES_LOSSLESS",
+            "mediaMetadata": {"tags": ["HIRES_LOSSLESS"]},
+        });
+        let track = TidalService::map_track(&json);
+        assert!(track.explicit);
+        let q = track.quality.unwrap();
+        assert_eq!(q.sample_rate, 96000);
+        assert_eq!(q.bit_depth, 24);
+        assert_eq!(q.codec, "FLAC");
+    }
+
+    #[test]
+    fn map_track_missing_fields() {
+        let json = json!({
+            "id": 0,
+            "title": null,
+            "artist": {},
+            "album": {},
+            "duration": null,
+        });
+        let track = TidalService::map_track(&json);
+        assert_eq!(track.id, "0");
+        assert_eq!(track.title, "");
+        assert_eq!(track.artist, "");
+        assert_eq!(track.duration_ms, 0);
+        assert!(track.album.is_none());
+        assert!(track.cover_path.is_none());
+    }
+
+    #[test]
+    fn map_track_artists_array() {
+        let json = json!({
+            "id": 1,
+            "title": "Test",
+            "artists": [{"name": "First Artist"}, {"name": "Second"}],
+            "album": {"title": "A", "id": 1},
+            "duration": 100,
+        });
+        let track = TidalService::map_track(&json);
+        assert_eq!(track.artist, "First Artist");
+    }
+
+    #[test]
+    fn map_album_basic() {
+        let json = json!({
+            "id": 789,
+            "title": "Kind of Blue",
+            "artist": {"name": "Miles Davis", "id": 42},
+            "cover": "abc-def-ghi",
+            "releaseDate": "1959-08-17",
+            "numberOfTracks": 5,
+        });
+        let album = TidalService::map_album(&json);
+        assert_eq!(album.id, "789");
+        assert_eq!(album.title, "Kind of Blue");
+        assert_eq!(album.artist, "Miles Davis");
+        assert_eq!(album.artist_id.as_deref(), Some("42"));
+        assert_eq!(album.year, Some(1959));
+        assert_eq!(album.track_count, 5);
+        assert!(album.cover_path.is_some());
+    }
+
+    #[test]
+    fn map_album_missing_fields() {
+        let json = json!({
+            "id": 0,
+            "title": null,
+            "artist": {},
+        });
+        let album = TidalService::map_album(&json);
+        assert_eq!(album.id, "0");
+        assert_eq!(album.title, "");
+        assert_eq!(album.artist, "");
+        assert!(album.year.is_none());
+        assert_eq!(album.track_count, 0);
+    }
+
+    #[test]
+    fn map_artist_basic() {
+        let json = json!({
+            "id": 42,
+            "name": "Miles Davis",
+            "picture": "aa-bb-cc-dd",
+        });
+        let artist = TidalService::map_artist(&json);
+        assert_eq!(artist.id, "42");
+        assert_eq!(artist.name, "Miles Davis");
+        assert!(artist.image_path.is_some());
+        let img = artist.image_path.unwrap();
+        assert!(img.contains("480x480"));
+    }
+
+    #[test]
+    fn map_artist_no_picture() {
+        let json = json!({
+            "id": 1,
+            "name": "Unknown",
+        });
+        let artist = TidalService::map_artist(&json);
+        assert!(artist.image_path.is_none());
+    }
+
+    #[test]
+    fn map_genre_basic() {
+        let json = json!({
+            "path": "jazz",
+            "name": "Jazz",
+            "hasSubgenres": true,
+            "image": "http://example.com/jazz.jpg",
+        });
+        let genre = TidalService::map_genre(&json);
+        assert_eq!(genre.id, "jazz");
+        assert_eq!(genre.name, "Jazz");
+        assert!(genre.has_children);
+        assert_eq!(genre.image_url.as_deref(), Some("http://example.com/jazz.jpg"));
+    }
+
+    #[test]
+    fn map_genre_no_subgenres() {
+        let json = json!({
+            "path": "rock",
+            "name": "Rock",
+            "hasSubgenres": false,
+        });
+        let genre = TidalService::map_genre(&json);
+        assert!(!genre.has_children);
+    }
+
+    #[test]
+    fn parse_quality_metadata_from_response() {
+        let data = json!({"bitDepth": 24, "sampleRate": 96000});
+        let (sr, bd) = TidalService::parse_quality_metadata(&data, "LOSSLESS");
+        assert_eq!(sr, 96000);
+        assert_eq!(bd, 24);
+    }
+
+    #[test]
+    fn parse_quality_metadata_fallback_hires() {
+        let data = json!({});
+        let (sr, bd) = TidalService::parse_quality_metadata(&data, "HI_RES_LOSSLESS");
+        assert_eq!(sr, 96000);
+        assert_eq!(bd, 24);
+    }
+
+    #[test]
+    fn parse_quality_metadata_fallback_lossless() {
+        let data = json!({});
+        let (sr, bd) = TidalService::parse_quality_metadata(&data, "LOSSLESS");
+        assert_eq!(sr, 44100);
+        assert_eq!(bd, 16);
+    }
+
+    #[test]
+    fn base64_decode_roundtrip() {
+        let result = base64_decode("SGVsbG8gV29ybGQ=").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "Hello World");
+    }
+
+    #[test]
+    fn base64_decode_url_variant() {
+        // "Hello" in base64url without padding
+        let result = base64_decode_url("SGVsbG8").unwrap();
+        assert_eq!(String::from_utf8(result).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn tidal_service_default() {
+        let svc = TidalService::new();
+        assert_eq!(svc.name(), "tidal");
+        assert!(svc.enabled());
+        assert_eq!(svc.country_code, "US");
+    }
+
+    #[test]
+    fn tidal_save_tokens_no_auth() {
+        let svc = TidalService::new();
+        let tokens = svc.save_tokens();
+        assert!(tokens.is_none());
+    }
+
+    #[test]
+    fn tidal_restore_tokens() {
+        let mut svc = TidalService::new();
+        let tokens = json!({
+            "access_token": "test-token",
+            "refresh_token": "refresh-token",
+            "username": "testuser",
+            "country_code": "FR",
+            "user_id": 12345,
+        });
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.username.as_deref(), Some("testuser"));
+        assert_eq!(svc.country_code, "FR");
+        assert_eq!(svc.user_id, Some(12345));
+    }
+
+    #[test]
+    fn tidal_set_enabled() {
+        let mut svc = TidalService::new();
+        assert!(svc.enabled());
+        svc.set_enabled(false);
+        assert!(!svc.enabled());
+        svc.set_enabled(true);
+        assert!(svc.enabled());
+    }
+}
+
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = Vec::new();

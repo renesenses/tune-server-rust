@@ -37,4 +37,54 @@ mod tests {
         let byte_rate = u32::from_le_bytes([h[28], h[29], h[30], h[31]]);
         assert_eq!(byte_rate, 176400);
     }
+
+    #[test]
+    fn wav_header_mono() {
+        let h = build_wav_header(1, 44100, 16);
+        let channels = u16::from_le_bytes([h[22], h[23]]);
+        assert_eq!(channels, 1);
+        let byte_rate = u32::from_le_bytes([h[28], h[29], h[30], h[31]]);
+        assert_eq!(byte_rate, 88200); // 44100 * 1 * 2
+        let block_align = u16::from_le_bytes([h[32], h[33]]);
+        assert_eq!(block_align, 2); // 1 * 2
+    }
+
+    #[test]
+    fn wav_header_24bit() {
+        let h = build_wav_header(2, 96000, 24);
+        let byte_rate = u32::from_le_bytes([h[28], h[29], h[30], h[31]]);
+        assert_eq!(byte_rate, 576000); // 96000 * 2 * 3
+        let block_align = u16::from_le_bytes([h[32], h[33]]);
+        assert_eq!(block_align, 6); // 2 * 3
+        let bit_depth = u16::from_le_bytes([h[34], h[35]]);
+        assert_eq!(bit_depth, 24);
+    }
+
+    #[test]
+    fn wav_header_hires() {
+        let h = build_wav_header(2, 192000, 24);
+        let sample_rate = u32::from_le_bytes([h[24], h[25], h[26], h[27]]);
+        assert_eq!(sample_rate, 192000);
+    }
+
+    #[test]
+    fn wav_header_pcm_format() {
+        let h = build_wav_header(2, 44100, 16);
+        let format = u16::from_le_bytes([h[20], h[21]]);
+        assert_eq!(format, 1); // PCM
+    }
+
+    #[test]
+    fn wav_header_fmt_chunk_size() {
+        let h = build_wav_header(2, 44100, 16);
+        let chunk_size = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+        assert_eq!(chunk_size, 16);
+    }
+
+    #[test]
+    fn wav_header_data_size() {
+        let h = build_wav_header(2, 44100, 16);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        assert_eq!(data_size, 0x7FFF_FFFF);
+    }
 }

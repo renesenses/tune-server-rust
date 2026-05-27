@@ -184,4 +184,128 @@ mod tests {
         repo.delete(id).unwrap();
         assert!(repo.list().unwrap().is_empty());
     }
+
+    #[test]
+    fn tag_update() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let id = repo.create("Rock", Some("#FF0000")).unwrap();
+
+        repo.update(id, Some("Rock & Roll"), Some("#00FF00")).unwrap();
+        let tag = repo.get(id).unwrap().unwrap();
+        assert_eq!(tag.name, "Rock & Roll");
+        assert_eq!(tag.color, "#00FF00");
+    }
+
+    #[test]
+    fn tag_default_color() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let id = repo.create("NoColor", None).unwrap();
+        let tag = repo.get(id).unwrap().unwrap();
+        assert_eq!(tag.color, "#808080");
+    }
+
+    #[test]
+    fn tag_get_nonexistent() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        assert!(repo.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn tag_all_items_by_tag() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Favorites", None).unwrap();
+
+        repo.tag_item(tag_id, "album", 1).unwrap();
+        repo.tag_item(tag_id, "album", 2).unwrap();
+        repo.tag_item(tag_id, "track", 10).unwrap();
+        repo.tag_item(tag_id, "artist", 5).unwrap();
+
+        let all_items = repo.all_items_by_tag(tag_id).unwrap();
+        assert_eq!(all_items.len(), 4);
+        // Should be sorted by item_type, item_id
+        assert_eq!(all_items[0].0, "album");
+        assert_eq!(all_items[0].1, 1);
+    }
+
+    #[test]
+    fn tag_item_idempotent() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Test", None).unwrap();
+
+        repo.tag_item(tag_id, "album", 1).unwrap();
+        repo.tag_item(tag_id, "album", 1).unwrap(); // Should not error
+
+        let items = repo.items_by_tag(tag_id, "album").unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn tag_multiple_tags_per_item() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let jazz = repo.create("Jazz", Some("#FFD700")).unwrap();
+        let fav = repo.create("Favorites", Some("#FF0000")).unwrap();
+
+        repo.tag_item(jazz, "album", 1).unwrap();
+        repo.tag_item(fav, "album", 1).unwrap();
+
+        let album_tags = repo.tags_for_item("album", 1).unwrap();
+        assert_eq!(album_tags.len(), 2);
+    }
+
+    #[test]
+    fn tag_delete_cascades_items() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("ToDelete", None).unwrap();
+        repo.tag_item(tag_id, "album", 1).unwrap();
+        repo.tag_item(tag_id, "album", 2).unwrap();
+
+        repo.delete(tag_id).unwrap();
+        // After deleting the tag, item_tags should be cascade-deleted
+        assert!(repo.get(tag_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn tag_list_sorted() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        repo.create("Zebra", None).unwrap();
+        repo.create("Alpha", None).unwrap();
+        repo.create("Middle", None).unwrap();
+
+        let tags = repo.list().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0].name, "Alpha");
+        assert_eq!(tags[2].name, "Zebra");
+    }
 }

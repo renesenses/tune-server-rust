@@ -174,3 +174,197 @@ pub trait StreamingService: Send + Sync {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_track_serialization() {
+        let track = StreamTrack {
+            id: "123".into(),
+            title: "So What".into(),
+            artist: "Miles Davis".into(),
+            album: Some("Kind of Blue".into()),
+            album_id: Some("456".into()),
+            duration_ms: 562000,
+            cover_path: Some("http://example.com/cover.jpg".into()),
+            track_number: Some(1),
+            disc_number: Some(1),
+            explicit: false,
+            quality: Some(StreamQuality {
+                codec: "FLAC".into(),
+                sample_rate: 96000,
+                bit_depth: 24,
+                bitrate: None,
+            }),
+        };
+        let json = serde_json::to_value(&track).unwrap();
+        // id should serialize as "source_id" due to rename
+        assert_eq!(json["source_id"], "123");
+        assert_eq!(json["title"], "So What");
+        assert_eq!(json["artist"], "Miles Davis");
+        assert_eq!(json["cover_path"], "http://example.com/cover.jpg");
+        assert_eq!(json["duration_ms"], 562000);
+    }
+
+    #[test]
+    fn stream_track_deserialization_with_source_id() {
+        let json = serde_json::json!({
+            "source_id": "abc",
+            "title": "Test",
+            "artist": "Test Artist",
+            "duration_ms": 1000,
+            "explicit": false,
+        });
+        let track: StreamTrack = serde_json::from_value(json).unwrap();
+        assert_eq!(track.id, "abc");
+        assert_eq!(track.title, "Test");
+    }
+
+    #[test]
+    fn stream_album_serialization() {
+        let album = StreamAlbum {
+            id: "789".into(),
+            title: "Kind of Blue".into(),
+            artist: "Miles Davis".into(),
+            artist_id: Some("42".into()),
+            cover_path: Some("http://cover.jpg".into()),
+            year: Some(1959),
+            track_count: 5,
+            quality: None,
+        };
+        let json = serde_json::to_value(&album).unwrap();
+        assert_eq!(json["source_id"], "789");
+        assert_eq!(json["title"], "Kind of Blue");
+        assert_eq!(json["year"], 1959);
+        assert_eq!(json["track_count"], 5);
+    }
+
+    #[test]
+    fn stream_artist_serialization() {
+        let artist = StreamArtist {
+            id: "42".into(),
+            name: "Miles Davis".into(),
+            image_path: Some("http://img.jpg".into()),
+        };
+        let json = serde_json::to_value(&artist).unwrap();
+        assert_eq!(json["id"], "42");
+        assert_eq!(json["name"], "Miles Davis");
+        assert_eq!(json["image_path"], "http://img.jpg");
+    }
+
+    #[test]
+    fn stream_playlist_serialization() {
+        let playlist = StreamPlaylist {
+            id: "pl-1".into(),
+            name: "My Playlist".into(),
+            description: Some("A great playlist".into()),
+            cover_path: None,
+            track_count: 10,
+            owner: Some("testuser".into()),
+        };
+        let json = serde_json::to_value(&playlist).unwrap();
+        assert_eq!(json["source_id"], "pl-1");
+        assert_eq!(json["name"], "My Playlist");
+        assert_eq!(json["track_count"], 10);
+        assert!(json["cover_path"].is_null());
+    }
+
+    #[test]
+    fn stream_quality_serialization() {
+        let quality = StreamQuality {
+            codec: "FLAC".into(),
+            sample_rate: 192000,
+            bit_depth: 24,
+            bitrate: Some(9216),
+        };
+        let json = serde_json::to_value(&quality).unwrap();
+        assert_eq!(json["codec"], "FLAC");
+        assert_eq!(json["sample_rate"], 192000);
+        assert_eq!(json["bit_depth"], 24);
+        assert_eq!(json["bitrate"], 9216);
+    }
+
+    #[test]
+    fn stream_url_serialization() {
+        let url = StreamUrl {
+            url: "https://stream.example.com/track.flac".into(),
+            mime_type: "audio/flac".into(),
+            quality: StreamQuality {
+                codec: "FLAC".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                bitrate: None,
+            },
+            expires_at: Some(1700000000),
+        };
+        let json = serde_json::to_value(&url).unwrap();
+        assert_eq!(json["url"], "https://stream.example.com/track.flac");
+        assert_eq!(json["mime_type"], "audio/flac");
+        assert_eq!(json["expires_at"], 1700000000);
+    }
+
+    #[test]
+    fn search_results_serialization() {
+        let results = SearchResults {
+            tracks: vec![],
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        };
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json["tracks"].as_array().unwrap().is_empty());
+        assert!(json["albums"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auth_status_default() {
+        let status = AuthStatus::default();
+        assert!(!status.authenticated);
+        assert!(status.username.is_none());
+        assert!(status.subscription.is_none());
+        assert!(status.verification_url.is_none());
+        assert!(status.user_code.is_none());
+    }
+
+    #[test]
+    fn auth_status_serialization() {
+        let status = AuthStatus {
+            authenticated: true,
+            username: Some("testuser".into()),
+            subscription: Some("Premium".into()),
+            expires_at: Some("3600s".into()),
+            verification_url: None,
+            user_code: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["authenticated"], true);
+        assert_eq!(json["username"], "testuser");
+        assert_eq!(json["subscription"], "Premium");
+    }
+
+    #[test]
+    fn stream_genre_serialization() {
+        let genre = StreamGenre {
+            id: "jazz".into(),
+            name: "Jazz".into(),
+            has_children: true,
+            image_url: Some("http://img.jpg".into()),
+        };
+        let json = serde_json::to_value(&genre).unwrap();
+        assert_eq!(json["id"], "jazz");
+        assert_eq!(json["has_children"], true);
+    }
+
+    #[test]
+    fn featured_section_serialization() {
+        let section = FeaturedSection {
+            id: "new-releases".into(),
+            name: "New Releases".into(),
+        };
+        let json = serde_json::to_value(&section).unwrap();
+        assert_eq!(json["id"], "new-releases");
+        assert_eq!(json["name"], "New Releases");
+    }
+}

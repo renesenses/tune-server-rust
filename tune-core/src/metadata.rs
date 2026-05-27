@@ -285,4 +285,85 @@ mod tests {
         let genres = split_genre_tag("  Jazz ;  Fusion  ; Progressive  ");
         assert_eq!(genres, vec!["Jazz", "Fusion", "Progressive"]);
     }
+
+    #[test]
+    fn split_genre_consecutive_separators() {
+        let genres = split_genre_tag("Jazz;;Rock");
+        assert_eq!(genres, vec!["Jazz", "Rock"]);
+    }
+
+    #[test]
+    fn split_genre_only_separators() {
+        let genres = split_genre_tag(";;;");
+        assert!(genres.is_empty());
+    }
+
+    #[test]
+    fn split_genre_unicode() {
+        let genres = split_genre_tag("Musique classique; Musique experimentale");
+        assert_eq!(genres, vec!["Musique classique", "Musique experimentale"]);
+    }
+
+    #[test]
+    fn split_genre_single_char() {
+        let genres = split_genre_tag("A");
+        assert_eq!(genres, vec!["A"]);
+    }
+
+    #[test]
+    fn track_metadata_default() {
+        let md = TrackMetadata::default();
+        assert!(md.title.is_none());
+        assert!(md.artist.is_none());
+        assert!(md.genres.is_empty());
+        assert!(!md.compilation);
+        assert!(!md.has_cover);
+        assert!(md.credits.is_empty());
+    }
+
+    #[test]
+    fn track_metadata_serialization() {
+        let md = TrackMetadata {
+            title: Some("Test".into()),
+            artist: Some("Artist".into()),
+            album: Some("Album".into()),
+            genre: Some("Jazz".into()),
+            genres: vec!["Jazz".into(), "Fusion".into()],
+            duration_ms: Some(300_000),
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            format: Some("flac".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&md).unwrap();
+        assert_eq!(json["title"], "Test");
+        assert_eq!(json["genres"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn track_credit_default() {
+        let credit = TrackCredit::default();
+        assert_eq!(credit.name, "");
+        assert_eq!(credit.role, "");
+        assert!(credit.instrument.is_none());
+    }
+
+    #[test]
+    fn metadata_update_fields() {
+        let update = MetadataUpdate {
+            title: Some("New Title".into()),
+            artist: Some("New Artist".into()),
+            album: None,
+            album_artist: None,
+            genre: Some("Rock".into()),
+            track_number: Some(1),
+            disc_number: Some(1),
+            year: Some(2024),
+            composer: Some("Composer".into()),
+            label: None,
+        };
+        assert_eq!(update.title.as_deref(), Some("New Title"));
+        assert_eq!(update.year, Some(2024));
+    }
 }

@@ -315,4 +315,171 @@ mod tests {
         let result = best_output_format(AudioFormat::Dsd, 2_822_400, 1, &caps);
         assert_eq!(result, AudioFormat::Flac);
     }
+
+    #[test]
+    fn from_extension_flac() {
+        assert_eq!(AudioFormat::from_extension("flac"), Some(AudioFormat::Flac));
+        assert_eq!(AudioFormat::from_extension("FLAC"), Some(AudioFormat::Flac));
+        assert_eq!(AudioFormat::from_extension(".flac"), Some(AudioFormat::Flac));
+    }
+
+    #[test]
+    fn from_extension_wav() {
+        assert_eq!(AudioFormat::from_extension("wav"), Some(AudioFormat::Wav));
+    }
+
+    #[test]
+    fn from_extension_mp3() {
+        assert_eq!(AudioFormat::from_extension("mp3"), Some(AudioFormat::Mp3));
+    }
+
+    #[test]
+    fn from_extension_m4a() {
+        assert_eq!(AudioFormat::from_extension("m4a"), Some(AudioFormat::Aac));
+        assert_eq!(AudioFormat::from_extension("aac"), Some(AudioFormat::Aac));
+    }
+
+    #[test]
+    fn from_extension_ogg() {
+        assert_eq!(AudioFormat::from_extension("ogg"), Some(AudioFormat::Ogg));
+        assert_eq!(AudioFormat::from_extension("oga"), Some(AudioFormat::Ogg));
+    }
+
+    #[test]
+    fn from_extension_opus() {
+        assert_eq!(AudioFormat::from_extension("opus"), Some(AudioFormat::Opus));
+    }
+
+    #[test]
+    fn from_extension_wavpack() {
+        assert_eq!(AudioFormat::from_extension("wv"), Some(AudioFormat::WavPack));
+    }
+
+    #[test]
+    fn from_extension_ape() {
+        assert_eq!(AudioFormat::from_extension("ape"), Some(AudioFormat::Ape));
+    }
+
+    #[test]
+    fn from_extension_dst() {
+        assert_eq!(AudioFormat::from_extension("dst"), Some(AudioFormat::Dsd));
+    }
+
+    #[test]
+    fn from_extension_unknown() {
+        assert!(AudioFormat::from_extension("txt").is_none());
+        assert!(AudioFormat::from_extension("pdf").is_none());
+        assert!(AudioFormat::from_extension("").is_none());
+    }
+
+    #[test]
+    fn mime_types() {
+        assert_eq!(AudioFormat::Flac.mime_type(), "audio/flac");
+        assert_eq!(AudioFormat::Wav.mime_type(), "audio/wav");
+        assert_eq!(AudioFormat::Mp3.mime_type(), "audio/mpeg");
+        assert_eq!(AudioFormat::Aac.mime_type(), "audio/aac");
+        assert_eq!(AudioFormat::Ogg.mime_type(), "audio/ogg");
+        assert_eq!(AudioFormat::Opus.mime_type(), "audio/opus");
+        assert_eq!(AudioFormat::Aiff.mime_type(), "audio/aiff");
+        assert_eq!(AudioFormat::Dsd.mime_type(), "application/x-dsd");
+        assert_eq!(AudioFormat::WavPack.mime_type(), "audio/x-wavpack");
+        assert_eq!(AudioFormat::Ape.mime_type(), "audio/x-ape");
+        assert_eq!(AudioFormat::Alac.mime_type(), "audio/mp4");
+    }
+
+    #[test]
+    fn ffmpeg_format_args() {
+        assert_eq!(AudioFormat::Flac.ffmpeg_format_arg(), "flac");
+        assert_eq!(AudioFormat::Wav.ffmpeg_format_arg(), "wav");
+        assert_eq!(AudioFormat::Mp3.ffmpeg_format_arg(), "mp3");
+        assert_eq!(AudioFormat::Aac.ffmpeg_format_arg(), "adts");
+        assert_eq!(AudioFormat::Alac.ffmpeg_format_arg(), "ipod");
+        assert_eq!(AudioFormat::Ogg.ffmpeg_format_arg(), "ogg");
+        assert_eq!(AudioFormat::Opus.ffmpeg_format_arg(), "opus");
+        assert_eq!(AudioFormat::Aiff.ffmpeg_format_arg(), "aiff");
+        assert_eq!(AudioFormat::Dsd.ffmpeg_format_arg(), "wav");
+        assert_eq!(AudioFormat::WavPack.ffmpeg_format_arg(), "wav");
+        assert_eq!(AudioFormat::Ape.ffmpeg_format_arg(), "wav");
+    }
+
+    #[test]
+    fn ffmpeg_codec_args() {
+        assert_eq!(AudioFormat::Flac.ffmpeg_codec_arg(), "flac");
+        assert_eq!(AudioFormat::Wav.ffmpeg_codec_arg(), "pcm_s16le");
+        assert_eq!(AudioFormat::Mp3.ffmpeg_codec_arg(), "libmp3lame");
+        assert_eq!(AudioFormat::Aac.ffmpeg_codec_arg(), "aac");
+        assert_eq!(AudioFormat::Alac.ffmpeg_codec_arg(), "alac");
+        assert_eq!(AudioFormat::Ogg.ffmpeg_codec_arg(), "libvorbis");
+        assert_eq!(AudioFormat::Opus.ffmpeg_codec_arg(), "libopus");
+        assert_eq!(AudioFormat::Aiff.ffmpeg_codec_arg(), "pcm_s16be");
+        assert_eq!(AudioFormat::WavPack.ffmpeg_codec_arg(), "pcm_s24le");
+        assert_eq!(AudioFormat::Ape.ffmpeg_codec_arg(), "pcm_s24le");
+    }
+
+    #[test]
+    fn dlna_capabilities_check() {
+        let caps = dlna_capabilities();
+        assert!(caps.formats.contains(&AudioFormat::Flac));
+        assert!(caps.formats.contains(&AudioFormat::Wav));
+        assert!(caps.formats.contains(&AudioFormat::Mp3));
+        assert!(caps.formats.contains(&AudioFormat::Aac));
+        assert!(!caps.formats.contains(&AudioFormat::Ogg));
+        assert_eq!(caps.max_sample_rate, 192000);
+        assert_eq!(caps.max_bit_depth, 24);
+        assert!(caps.supports_gapless);
+    }
+
+    #[test]
+    fn passthrough_wav() {
+        let caps = dlna_capabilities();
+        assert!(can_passthrough(AudioFormat::Wav, 44100, 16, &caps));
+        assert!(can_passthrough(AudioFormat::Wav, 192000, 24, &caps));
+    }
+
+    #[test]
+    fn no_passthrough_over_max_rate() {
+        let caps = dlna_capabilities();
+        assert!(!can_passthrough(AudioFormat::Flac, 384000, 24, &caps));
+    }
+
+    #[test]
+    fn best_output_for_wavpack() {
+        let caps = dlna_capabilities();
+        let result = best_output_format(AudioFormat::WavPack, 44100, 16, &caps);
+        assert_eq!(result, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn best_output_for_ape() {
+        let caps = dlna_capabilities();
+        let result = best_output_format(AudioFormat::Ape, 96000, 24, &caps);
+        assert_eq!(result, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn passthrough_mp3() {
+        let caps = dlna_capabilities();
+        assert!(can_passthrough(AudioFormat::Mp3, 44100, 16, &caps));
+    }
+
+    #[test]
+    fn audio_format_serialization() {
+        let fmt = AudioFormat::Flac;
+        let json = serde_json::to_string(&fmt).unwrap();
+        assert_eq!(json, "\"flac\"");
+
+        let deserialized: AudioFormat = serde_json::from_str("\"mp3\"").unwrap();
+        assert_eq!(deserialized, AudioFormat::Mp3);
+    }
+
+    #[test]
+    fn audio_format_equality() {
+        assert_eq!(AudioFormat::Flac, AudioFormat::Flac);
+        assert_ne!(AudioFormat::Flac, AudioFormat::Mp3);
+    }
+
+    #[test]
+    fn dsd512_sample_rate() {
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(22_579_200), 352_800);
+    }
 }

@@ -187,4 +187,111 @@ mod tests {
         assert!(repo.delete(1).is_err());
         repo.delete(id).unwrap();
     }
+
+    #[test]
+    fn profile_update() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        let id = repo.create("alice", Some("Alice")).unwrap();
+        repo.update(id, Some("Alice Updated"), Some("/avatars/alice.png")).unwrap();
+
+        let p = repo.get(id).unwrap().unwrap();
+        assert_eq!(p.display_name.as_deref(), Some("Alice Updated"));
+        assert_eq!(p.avatar_path.as_deref(), Some("/avatars/alice.png"));
+    }
+
+    #[test]
+    fn profile_get_default() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        let default = repo.get(1).unwrap().unwrap();
+        assert_eq!(default.name, "default");
+        assert!(default.is_admin);
+    }
+
+    #[test]
+    fn profile_favorites_multiple_types() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+
+        repo.add_favorite(1, "track", 1).unwrap();
+        repo.add_favorite(1, "track", 2).unwrap();
+        repo.add_favorite(1, "album", 10).unwrap();
+        repo.add_favorite(1, "artist", 5).unwrap();
+
+        let all = repo.list_favorites(1, None).unwrap();
+        assert_eq!(all.len(), 4);
+
+        let tracks = repo.list_favorites(1, Some("track")).unwrap();
+        assert_eq!(tracks.len(), 2);
+
+        let albums = repo.list_favorites(1, Some("album")).unwrap();
+        assert_eq!(albums.len(), 1);
+    }
+
+    #[test]
+    fn profile_duplicate_favorite_ignored() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        repo.add_favorite(1, "track", 42).unwrap();
+        // Inserting same favorite again should be idempotent (INSERT OR IGNORE)
+        repo.add_favorite(1, "track", 42).unwrap();
+
+        let favs = repo.list_favorites(1, Some("track")).unwrap();
+        assert_eq!(favs.len(), 1);
+    }
+
+    #[test]
+    fn profile_get_nonexistent() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        assert!(repo.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn profile_multiple_users_separate_favorites() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        let user2 = repo.create("bob", Some("Bob")).unwrap();
+
+        repo.add_favorite(1, "track", 100).unwrap();
+        repo.add_favorite(user2, "track", 200).unwrap();
+
+        assert!(repo.is_favorite(1, "track", 100).unwrap());
+        assert!(!repo.is_favorite(1, "track", 200).unwrap());
+        assert!(!repo.is_favorite(user2, "track", 100).unwrap());
+        assert!(repo.is_favorite(user2, "track", 200).unwrap());
+    }
+
+    #[test]
+    fn profile_list_all() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = ProfileRepo::new(db);
+        repo.create("alice", None).unwrap();
+        repo.create("bob", None).unwrap();
+
+        let all = repo.list().unwrap();
+        assert_eq!(all.len(), 3); // default + alice + bob
+    }
 }

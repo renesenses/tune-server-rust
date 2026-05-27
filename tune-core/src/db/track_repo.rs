@@ -390,4 +390,290 @@ mod tests {
         let results = repo.search("comfort", 10).unwrap();
         assert_eq!(results.len(), 1);
     }
+
+    #[test]
+    fn track_count() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        assert_eq!(repo.count().unwrap(), 0);
+        let mut t = Track::new("A".into());
+        t.file_path = Some("/a.flac".into());
+        repo.create(&t).unwrap();
+        assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn track_list() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        for i in 0..5 {
+            let mut t = Track::new(format!("Track {i}"));
+            t.file_path = Some(format!("/{i}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        let all = repo.list(100, 0).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn track_list_pagination() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        for i in 0..10 {
+            let mut t = Track::new(format!("Track {i:02}"));
+            t.file_path = Some(format!("/{i}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        let page1 = repo.list(3, 0).unwrap();
+        assert_eq!(page1.len(), 3);
+        let page2 = repo.list(3, 3).unwrap();
+        assert_eq!(page2.len(), 3);
+    }
+
+    #[test]
+    fn track_list_by_album() {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let alid = album_repo.create(&crate::db::models::Album::new("Album".into())).unwrap();
+
+        let mut t1 = Track::new("Track 1".into());
+        t1.album_id = Some(alid);
+        t1.disc_number = 1;
+        t1.track_number = 2;
+        t1.file_path = Some("/1-2.flac".into());
+        repo.create(&t1).unwrap();
+
+        let mut t2 = Track::new("Track 2".into());
+        t2.album_id = Some(alid);
+        t2.disc_number = 1;
+        t2.track_number = 1;
+        t2.file_path = Some("/1-1.flac".into());
+        repo.create(&t2).unwrap();
+
+        let tracks = repo.list_by_album(alid).unwrap();
+        assert_eq!(tracks.len(), 2);
+        // Should be sorted by disc, then track number
+        assert_eq!(tracks[0].track_number, 1);
+        assert_eq!(tracks[1].track_number, 2);
+    }
+
+    #[test]
+    fn track_list_by_artist() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
+
+        let mut t1 = Track::new("Song A".into());
+        t1.artist_id = Some(aid);
+        t1.file_path = Some("/a.flac".into());
+        repo.create(&t1).unwrap();
+
+        let mut t2 = Track::new("Song B".into());
+        t2.artist_id = Some(aid);
+        t2.file_path = Some("/b.flac".into());
+        repo.create(&t2).unwrap();
+
+        let tracks = repo.list_by_artist(aid).unwrap();
+        assert_eq!(tracks.len(), 2);
+    }
+
+    #[test]
+    fn track_update() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Original".into());
+        t.file_path = Some("/orig.flac".into());
+        let id = repo.create(&t).unwrap();
+
+        let mut fetched = repo.get(id).unwrap().unwrap();
+        fetched.title = "Updated".into();
+        fetched.genre = Some("Jazz".into());
+        fetched.composer = Some("Miles Davis".into());
+        fetched.year = Some(1959);
+        fetched.bpm = Some(120.5);
+        repo.update(&fetched).unwrap();
+
+        let updated = repo.get(id).unwrap().unwrap();
+        assert_eq!(updated.title, "Updated");
+        assert_eq!(updated.genre.as_deref(), Some("Jazz"));
+        assert_eq!(updated.composer.as_deref(), Some("Miles Davis"));
+        assert_eq!(updated.year, Some(1959));
+    }
+
+    #[test]
+    fn track_delete_by_path() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Test".into());
+        t.file_path = Some("/test.flac".into());
+        let id = repo.create(&t).unwrap();
+
+        repo.delete_by_path("/test.flac").unwrap();
+        assert!(repo.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn track_get_all_local_file_info() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Test".into());
+        t.file_path = Some("/music/test.flac".into());
+        t.file_mtime = Some(1234567.89);
+        t.file_size = Some(5_000_000);
+        repo.create(&t).unwrap();
+
+        let info = repo.get_all_local_file_info().unwrap();
+        assert_eq!(info.len(), 1);
+        let (tid, mtime, size) = info.get("/music/test.flac").unwrap();
+        assert!(*tid > 0);
+        assert_eq!(*mtime, Some(1234567.89));
+        assert_eq!(*size, Some(5_000_000));
+    }
+
+    #[test]
+    fn track_update_mtime_and_size() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Test".into());
+        t.file_path = Some("/test.flac".into());
+        let id = repo.create(&t).unwrap();
+
+        repo.update_mtime_and_size("/test.flac", 999.99, 1_000_000).unwrap();
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.file_mtime, Some(999.99));
+        assert_eq!(fetched.file_size, Some(1_000_000));
+    }
+
+    #[test]
+    fn track_update_audio_hash() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t = Track::new("Test".into());
+        t.file_path = Some("/test.flac".into());
+        let id = repo.create(&t).unwrap();
+
+        repo.update_audio_hash("/test.flac", "abc123hash").unwrap();
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.audio_hash.as_deref(), Some("abc123hash"));
+    }
+
+    #[test]
+    fn track_deduplicate() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        let mut t1 = Track::new("Song A".into());
+        t1.file_path = Some("/a.flac".into());
+        t1.audio_hash = Some("hash123".into());
+        repo.create(&t1).unwrap();
+
+        let mut t2 = Track::new("Song A Copy".into());
+        t2.file_path = Some("/a_copy.flac".into());
+        t2.audio_hash = Some("hash123".into());
+        repo.create(&t2).unwrap();
+
+        let mut t3 = Track::new("Song B".into());
+        t3.file_path = Some("/b.flac".into());
+        t3.audio_hash = Some("different".into());
+        repo.create(&t3).unwrap();
+
+        let removed = repo.deduplicate().unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn track_random_ids() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+
+        for i in 0..20 {
+            let mut t = Track::new(format!("Track {i}"));
+            t.file_path = Some(format!("/{i}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        let ids = repo.random_ids(5).unwrap();
+        assert_eq!(ids.len(), 5);
+    }
+
+    #[test]
+    fn track_get_multiple_empty() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        let result = repo.get_multiple(&[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn track_get_nonexistent() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        assert!(repo.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn track_get_by_path_nonexistent() {
+        let db = test_db();
+        let repo = TrackRepo::new(db);
+        assert!(repo.get_by_path("/nonexistent.flac").unwrap().is_none());
+    }
+
+    #[test]
+    fn track_with_all_metadata() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Miles Davis".into())).unwrap();
+        let alid = album_repo.get_or_create("Kind of Blue", aid, Some(1959)).unwrap().id.unwrap();
+
+        let mut t = Track::new("So What".into());
+        t.artist_id = Some(aid);
+        t.album_id = Some(alid);
+        t.album_artist = Some("Miles Davis".into());
+        t.disc_number = 1;
+        t.track_number = 1;
+        t.duration_ms = 562_000;
+        t.file_path = Some("/music/miles/kob/so_what.flac".into());
+        t.format = Some("flac".into());
+        t.sample_rate = Some(96000);
+        t.bit_depth = Some(24);
+        t.channels = 2;
+        t.genre = Some("Jazz".into());
+        t.genres = Some(r#"["Jazz","Modal Jazz"]"#.into());
+        t.composer = Some("Miles Davis".into());
+        t.year = Some(1959);
+        t.label = Some("Columbia".into());
+        t.isrc = Some("US1234567890".into());
+        t.source = "local".into();
+        let id = repo.create(&t).unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.title, "So What");
+        assert_eq!(fetched.artist_name.as_deref(), Some("Miles Davis"));
+        assert_eq!(fetched.album_title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(fetched.album_artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(fetched.duration_ms, 562_000);
+        assert_eq!(fetched.sample_rate, Some(96000));
+        assert_eq!(fetched.bit_depth, Some(24));
+        assert_eq!(fetched.genre.as_deref(), Some("Jazz"));
+        assert_eq!(fetched.composer.as_deref(), Some("Miles Davis"));
+        assert_eq!(fetched.label.as_deref(), Some("Columbia"));
+    }
 }
