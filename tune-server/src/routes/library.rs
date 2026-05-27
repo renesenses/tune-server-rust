@@ -917,15 +917,27 @@ async fn completeness_stats(State(state): State<AppState>) -> Json<Value> {
     let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
     drop(conn);
 
+    let total_artists: i64 = {
+        let conn = state.db.connection().lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0)).unwrap_or(0)
+    };
+
     Json(json!({
         "total_tracks": total_tracks,
         "total_albums": total_albums,
+        "total_artists": total_artists,
         "with_genre": with_genre,
         "with_year": with_year,
         "with_artist": with_artist,
         "with_album": with_album,
         "with_cover": with_cover,
         "with_musicbrainz_id": with_mbid,
+        "albums_without_cover": total_albums - with_cover,
+        "albums_without_genre": total_albums - (with_genre * total_albums / total_tracks.max(1)),
+        "albums_without_year": total_albums - (with_year * total_albums / total_tracks.max(1)),
+        "tracks_without_artist": total_tracks - with_artist,
+        "artists_without_image": total_artists,
+        "doubtful_count": 0,
         "genre_pct": if total_tracks > 0 { (with_genre as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
         "year_pct": if total_tracks > 0 { (with_year as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
         "artist_pct": if total_tracks > 0 { (with_artist as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
