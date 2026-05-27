@@ -14,6 +14,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
 
@@ -443,6 +444,7 @@ async fn library_stats(State(state): State<AppState>) -> Json<Value> {
     let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let listens = HistoryRepo::new(state.db.clone()).count().unwrap_or(0);
+    let zones = ZoneRepo::new(state.db.clone()).count().unwrap_or(0);
 
     let conn = state.db.connection().lock().unwrap();
     let total_duration_ms: i64 = conn
@@ -461,11 +463,17 @@ async fn library_stats(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     drop(conn);
 
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.devices().await.len() as i64;
+    drop(scanner);
+
     Json(json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
         "listens": listens,
+        "zones": zones,
+        "devices": devices,
         "total_duration_ms": total_duration_ms,
         "total_size_bytes": total_size_bytes,
     }))

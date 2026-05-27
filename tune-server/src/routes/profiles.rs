@@ -165,7 +165,14 @@ async fn create_profile(
 ) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
     match repo.create(&body.name, body.avatar_color.as_deref()) {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Ok(id) => {
+            // Return the full profile object so the web client can use it directly
+            let profile = repo.get(id).ok().flatten();
+            let value = profile
+                .map(|p| json!(p))
+                .unwrap_or_else(|| json!({"id": id, "name": body.name}));
+            (StatusCode::CREATED, Json(value)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
