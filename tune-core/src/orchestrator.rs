@@ -49,7 +49,7 @@ pub struct PlayResult {
 
 impl PlaybackOrchestrator {
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
-        let (stream_url, mime_type, title, artist, duration_ms, source) =
+        let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover) =
             self.resolve_stream(&req).await?;
 
         let np = NowPlaying {
@@ -57,7 +57,7 @@ impl PlaybackOrchestrator {
             title: title.clone(),
             artist_name: artist.clone(),
             album_title: req.album_title.clone(),
-            cover_path: req.cover_url.clone(),
+            cover_path: req.cover_url.clone().or(resolved_cover),
             duration_ms: duration_ms.unwrap_or(0),
             source: source.clone(),
             source_id: req.source_id.clone(),
@@ -92,7 +92,7 @@ impl PlaybackOrchestrator {
         })
     }
 
-    async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
+    async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
         if let Some(ref source) = req.source
             && source != "local" {
                 return self.resolve_streaming_url(source, req).await;
@@ -101,7 +101,7 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
-    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
+    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::new(self.db.clone());
         let track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
@@ -250,10 +250,11 @@ impl PlaybackOrchestrator {
             track.artist_name,
             Some(track.duration_ms),
             "local".into(),
+            track.cover_path,
         ))
     }
 
-    async fn resolve_streaming_url(&self, service_name: &str, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String), String> {
+    async fn resolve_streaming_url(&self, service_name: &str, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
         let source_id = req.source_id.as_deref().ok_or("source_id required for streaming")?;
 
         let registry = self.services.lock().await;
@@ -287,16 +288,16 @@ impl PlaybackOrchestrator {
             stream_data.url.clone()
         };
 
-        let (title, artist, duration_ms) = if req.title.is_some() {
-            (req.title.clone().unwrap(), req.artist_name.clone(), req.duration_ms)
+        let (title, artist, duration_ms, cover_path) = if req.title.is_some() {
+            (req.title.clone().unwrap(), req.artist_name.clone(), req.duration_ms, None)
         } else {
             match svc.get_track(source_id).await {
-                Ok(track) => (track.title, Some(track.artist), Some(track.duration_ms as i64)),
-                Err(_) => ("Unknown".into(), None, req.duration_ms),
+                Ok(track) => (track.title, Some(track.artist), Some(track.duration_ms as i64), track.cover_path),
+                Err(_) => ("Unknown".into(), None, req.duration_ms, None),
             }
         };
 
-        Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into()))
+        Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into(), cover_path))
     }
 
     async fn send_to_output(&self, device_id: &str, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> bool {
@@ -533,7 +534,7 @@ impl PlaybackOrchestrator {
             duration_ms: item.duration_ms,
         };
 
-        let (url, mime, title, artist, _, _) = self.resolve_stream(&req).await?;
+        let (url, mime, title, artist, _, _, _) = self.resolve_stream(&req).await?;
         Ok((url, mime, title, artist))
     }
 }

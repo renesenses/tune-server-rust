@@ -344,7 +344,7 @@ async fn play(
         title: body.title.or_else(|| track.as_ref().map(|t| t.title.clone())),
         artist_name: body.artist_name.or_else(|| track.as_ref().and_then(|t| t.artist_name.clone())),
         album_title: body.album_title.or_else(|| track.as_ref().and_then(|t| t.album_title.clone())),
-        cover_url: body.cover_path,
+        cover_url: body.cover_path.or_else(|| track.as_ref().and_then(|t| t.cover_path.clone())),
         duration_ms: body.duration_ms.or_else(|| track.as_ref().map(|t| t.duration_ms)),
     };
 
@@ -1060,7 +1060,7 @@ pub async fn shuffle_all(
         title: track.as_ref().map(|t| t.title.clone()),
         artist_name: track.as_ref().and_then(|t| t.artist_name.clone()),
         album_title: track.as_ref().and_then(|t| t.album_title.clone()),
-        cover_url: None,
+        cover_url: track.as_ref().and_then(|t| t.cover_path.clone()),
         duration_ms: track.as_ref().map(|t| t.duration_ms),
     };
     match state.orchestrator.play(orch_req).await {
