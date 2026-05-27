@@ -1,10 +1,25 @@
+pub mod archive;
+pub mod bandcamp;
+pub mod cd_rip;
+pub mod connect;
 pub mod dashboard;
 pub mod devices;
+pub mod discogs;
 pub mod dj;
+pub mod eq_pro;
 pub mod export;
+pub mod graphql;
 pub mod history;
+pub mod homeassistant;
+pub mod hqplayer;
+pub mod hue;
+pub mod kiosk;
+pub mod lastfm_social;
 pub mod library;
+pub mod listenbrainz;
+pub mod mediasync;
 pub mod metadata;
+pub mod mqa;
 pub mod network;
 pub mod party;
 pub mod playback;
@@ -15,15 +30,25 @@ pub mod podcasts;
 pub mod peers;
 pub mod profiles;
 pub mod radios;
+pub mod roon_bridge;
+pub mod room_calibration;
+pub mod sacd_rip;
 pub mod search;
+pub mod setlistfm;
+pub mod shazam;
+pub mod siri;
 pub mod smart_playlists;
 pub mod snapcast;
 pub mod sonos;
+pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
 pub mod streaming;
 pub mod system;
 pub mod tags;
+pub mod tagger;
+pub mod visualizer;
+pub mod widget;
 pub mod ws;
 pub mod zone_manager;
 pub mod zones;
@@ -258,6 +283,31 @@ pub fn router(state: AppState) -> Router {
         .nest("/sonos", sonos::router())
         .nest("/squeezebox", squeezebox::router())
         .nest("/spotify-connect", spotify_connect::router())
+        .nest("/listenbrainz", listenbrainz::router())
+        .nest("/soundcloud", soundcloud::router())
+        .nest("/bandcamp", bandcamp::router())
+        .nest("/archive", archive::router())
+        .nest("/discogs", discogs::router())
+        .nest("/setlistfm", setlistfm::router())
+        .nest("/homeassistant", homeassistant::router())
+        .nest("/hue", hue::router())
+        .nest("/tagger", tagger::router())
+        .nest("/kiosk", kiosk::router())
+        .nest("/widget", widget::router())
+        .nest("/mediasync", mediasync::router())
+        .nest("/cd-rip", cd_rip::router())
+        .nest("/sacd-rip", sacd_rip::router())
+        .nest("/hqplayer", hqplayer::router())
+        .nest("/room-calibration", room_calibration::router())
+        .nest("/visualizer", visualizer::router())
+        .nest("/graphql", graphql::router())
+        .nest("/eq", eq_pro::router())
+        .nest("/siri", siri::router())
+        .nest("/lastfm-social", lastfm_social::router())
+        .nest("/mqa", mqa::router())
+        .nest("/roon-bridge", roon_bridge::router())
+        .nest("/connect", connect::router())
+        .nest("/shazam", shazam::router())
         .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
         .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
         .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))

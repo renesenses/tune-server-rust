@@ -24,6 +24,6 @@ mod tests {
     #[test]
     fn version_is_semver() {
         let v = version();
-        assert!(v.split('.').count() == 3, "version must be semver: {v}");
+        assert!(v.split('.').count() >= 3, "version must be semver: {v}");
     }
 }

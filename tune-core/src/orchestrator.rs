@@ -69,6 +69,9 @@ impl PlaybackOrchestrator {
         // Last.fm Now Playing
         self.lastfm_now_playing(&title, artist.as_deref());
 
+        // ListenBrainz Now Playing
+        self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
+
         let output_sent = if let Some(ref device_id) = req.output_device_id {
             self.send_to_output(device_id, &stream_url, &mime_type, Some(&title), artist.as_deref()).await
         } else {
@@ -336,6 +339,9 @@ impl PlaybackOrchestrator {
 
         // Last.fm scrobble
         self.lastfm_scrobble(title, artist);
+
+        // ListenBrainz scrobble
+        self.listenbrainz_scrobble(title, artist, album);
     }
 
     fn lastfm_keys(&self) -> Option<(String, String, String)> {
@@ -381,6 +387,89 @@ impl PlaybackOrchestrator {
         tokio::spawn(async move {
             if let Err(e) = crate::scrobble::update_now_playing(&api_key, &api_secret, &session_key, &artist, &title).await {
                 warn!("lastfm_now_playing_error: {e}");
+            }
+        });
+    }
+
+    fn listenbrainz_token(&self) -> Option<String> {
+        let settings = SettingsRepo::new(self.db.clone());
+        settings.get("listenbrainz_token").ok().flatten().filter(|t| !t.is_empty())
+    }
+
+    fn listenbrainz_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+        let artist = match artist {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => return,
+        };
+        let Some(token) = self.listenbrainz_token() else {
+            return;
+        };
+        let title = title.to_string();
+        let album = album.map(String::from);
+        tokio::spawn(async move {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let payload = serde_json::json!({
+                "listen_type": "single",
+                "payload": [{
+                    "listened_at": timestamp,
+                    "track_metadata": {
+                        "artist_name": artist,
+                        "track_name": title,
+                        "release_name": album,
+                    }
+                }]
+            });
+
+            let client = reqwest::Client::new();
+            if let Err(e) = client
+                .post("https://api.listenbrainz.org/1/submit-listens")
+                .header("Authorization", format!("Token {token}"))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+            {
+                warn!("listenbrainz_scrobble_error: {e}");
+            }
+        });
+    }
+
+    fn listenbrainz_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+        let artist = match artist {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => return,
+        };
+        let Some(token) = self.listenbrainz_token() else {
+            return;
+        };
+        let title = title.to_string();
+        let album = album.map(String::from);
+        tokio::spawn(async move {
+            let payload = serde_json::json!({
+                "listen_type": "playing_now",
+                "payload": [{
+                    "track_metadata": {
+                        "artist_name": artist,
+                        "track_name": title,
+                        "release_name": album,
+                    }
+                }]
+            });
+
+            let client = reqwest::Client::new();
+            if let Err(e) = client
+                .post("https://api.listenbrainz.org/1/submit-listens")
+                .header("Authorization", format!("Token {token}"))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+            {
+                warn!("listenbrainz_now_playing_error: {e}");
             }
         });
     }
