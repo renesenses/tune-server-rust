@@ -1,5 +1,5 @@
 use reqwest::Client;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 
@@ -121,16 +121,43 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn play_url(&self, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> Result<(), String> {
+        // Always stop the current transport first to reset renderer state.
+        // Many DLNA renderers (Eversolo, Denon, Marantz, etc.) silently reject
+        // SetAVTransportURI if the previous transport is still loaded (even if stopped).
+        let stop_resp = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+        match &stop_resp {
+            Ok(_) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
+            Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+        }
+
+        // Minimum 200ms settling time after Stop for renderers that need it
+        // (observed on Eversolo DMP-A6, some Pioneer/Onkyo models).
+        // User-configured play_delay_ms is added on top.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         let metadata = Self::didl_metadata(title, artist, mime_type, url);
-        self.av_action("SetAVTransportURI", &format!(
+        let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><CurrentURI>{url}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>"
         )).await?;
+
+        // Check for UPnP error in the SetAVTransportURI response
+        if set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>") {
+            warn!(device = %self.name, response = %set_uri_resp, "dlna_set_uri_error");
+            return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
+        }
 
         if self.play_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
         }
 
-        self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").await?;
+        let play_resp = self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").await?;
+
+        // Check for UPnP error in Play response
+        if play_resp.contains("UPnPError") || play_resp.contains("<errorCode>") {
+            warn!(device = %self.name, response = %play_resp, "dlna_play_error");
+            return Err(format!("Play rejected: {play_resp}"));
+        }
+
         info!(device = %self.name, url, delay_ms = self.play_delay_ms, "dlna_play");
         Ok(())
     }
@@ -147,6 +174,7 @@ impl OutputTarget for DlnaOutput {
 
     async fn stop(&self) -> Result<(), String> {
         self.av_action("Stop", "<InstanceID>0</InstanceID>").await?;
+        info!(device = %self.name, "dlna_stop");
         Ok(())
     }
 
