@@ -101,6 +101,7 @@ pub struct AuthStatus {
 pub trait StreamingService: Send + Sync {
     fn name(&self) -> &str;
     fn enabled(&self) -> bool;
+    fn set_enabled(&mut self, enabled: bool);
 
     async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String>;
     async fn auth_status(&self) -> AuthStatus;

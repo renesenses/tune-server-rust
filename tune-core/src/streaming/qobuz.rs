@@ -19,6 +19,7 @@ pub struct QobuzService {
     use_proxy: bool,
     stored_username: Option<String>,
     stored_password: Option<String>,
+    enabled_override: Option<bool>,
 }
 
 impl QobuzService {
@@ -37,6 +38,7 @@ impl QobuzService {
             use_proxy: true,
             stored_username: None,
             stored_password: None,
+            enabled_override: None,
         }
     }
 
@@ -221,7 +223,11 @@ impl StreamingService for QobuzService {
     }
 
     fn enabled(&self) -> bool {
-        !self.app_id.is_empty()
+        self.enabled_override.unwrap_or(!self.app_id.is_empty())
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
     }
 
     async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {

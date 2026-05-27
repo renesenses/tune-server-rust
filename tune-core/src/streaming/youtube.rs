@@ -2,6 +2,7 @@ use super::traits::*;
 
 pub struct YouTubeService {
     authenticated: bool,
+    enabled_override: Option<bool>,
 }
 
 impl Default for YouTubeService {
@@ -12,14 +13,18 @@ impl Default for YouTubeService {
 
 impl YouTubeService {
     pub fn new() -> Self {
-        Self { authenticated: false }
+        Self { authenticated: false, enabled_override: None }
     }
 }
 
 #[async_trait::async_trait]
 impl StreamingService for YouTubeService {
     fn name(&self) -> &str { "youtube" }
-    fn enabled(&self) -> bool { true }
+    fn enabled(&self) -> bool { self.enabled_override.unwrap_or(true) }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
+    }
 
     async fn authenticate(&mut self, _credentials: &serde_json::Value) -> Result<AuthStatus, String> {
         Err("YouTube Music OAuth not yet implemented".into())

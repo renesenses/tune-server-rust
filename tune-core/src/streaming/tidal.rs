@@ -91,6 +91,7 @@ pub struct TidalService {
     url_cache: Arc<Mutex<UrlCache>>,
     pending_device_auth: Option<DeviceAuthResponse>,
     featured_cache: Option<FeaturedCache>,
+    enabled_override: Option<bool>,
 }
 
 impl Default for TidalService {
@@ -119,6 +120,7 @@ impl TidalService {
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
             pending_device_auth: None,
             featured_cache: None,
+            enabled_override: None,
         }
     }
 
@@ -460,7 +462,11 @@ impl StreamingService for TidalService {
     }
 
     fn enabled(&self) -> bool {
-        true
+        self.enabled_override.unwrap_or(true)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
     }
 
     async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {

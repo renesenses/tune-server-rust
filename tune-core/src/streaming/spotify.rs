@@ -19,6 +19,7 @@ pub struct SpotifyService {
     code_verifier: Option<String>,
     redirect_uri: String,
     token_expires: Option<std::time::Instant>,
+    enabled_override: Option<bool>,
 }
 
 impl Default for SpotifyService {
@@ -42,6 +43,7 @@ impl SpotifyService {
             redirect_uri: std::env::var("SPOTIFY_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:8085/api/v1/streaming/spotify/callback".into()),
             token_expires: None,
+            enabled_override: None,
         }
     }
 
@@ -131,7 +133,11 @@ impl SpotifyService {
 #[async_trait::async_trait]
 impl StreamingService for SpotifyService {
     fn name(&self) -> &str { "spotify" }
-    fn enabled(&self) -> bool { self.client_id != DEFAULT_CLIENT_ID }
+    fn enabled(&self) -> bool { self.enabled_override.unwrap_or(self.client_id != DEFAULT_CLIENT_ID) }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
+    }
 
     async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {
         if let Some(code) = credentials.get("code").and_then(|v| v.as_str()) {

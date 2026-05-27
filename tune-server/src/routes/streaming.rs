@@ -538,19 +538,31 @@ async fn service_remove_favorite(
 async fn service_enable(
     State(state): State<AppState>,
     Path(service): Path<String>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    // Apply to in-memory service immediately (no restart needed)
+    if let Ok(svc) = get_svc(&state, &service).await {
+        let mut svc = svc.lock().await;
+        svc.set_enabled(true);
+    }
+
     let settings = SettingsRepo::new(state.db);
     settings.set(&format!("streaming_{service}_enabled"), "true").ok();
-    Json(json!({"service": service, "enabled": true}))
+    Json(json!({"service": service, "enabled": true})).into_response()
 }
 
 async fn service_disable(
     State(state): State<AppState>,
     Path(service): Path<String>,
-) -> Json<Value> {
+) -> impl IntoResponse {
+    // Apply to in-memory service immediately (no restart needed)
+    if let Ok(svc) = get_svc(&state, &service).await {
+        let mut svc = svc.lock().await;
+        svc.set_enabled(false);
+    }
+
     let settings = SettingsRepo::new(state.db);
     settings.set(&format!("streaming_{service}_enabled"), "false").ok();
-    Json(json!({"service": service, "enabled": false}))
+    Json(json!({"service": service, "enabled": false})).into_response()
 }
 
 async fn service_auth_url(

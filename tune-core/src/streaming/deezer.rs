@@ -13,6 +13,7 @@ pub struct DeezerService {
     access_token: Option<String>,
     username: Option<String>,
     user_id: Option<u64>,
+    enabled_override: Option<bool>,
 }
 
 impl Default for DeezerService {
@@ -31,6 +32,7 @@ impl DeezerService {
             access_token: None,
             username: None,
             user_id: None,
+            enabled_override: None,
         }
     }
 
@@ -166,7 +168,11 @@ impl StreamingService for DeezerService {
     }
 
     fn enabled(&self) -> bool {
-        true
+        self.enabled_override.unwrap_or(true)
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled_override = Some(enabled);
     }
 
     // ── auth ─────────────────────────────────────────────────────────
