@@ -100,8 +100,9 @@ impl PositionPoller {
                 crate::db::zone_repo::ZoneRepo::new(self.db.clone()).update_volume(zone_id, vol_int).ok();
             }
 
-            // Recover playing state from device
-            if status.state == TransportState::Playing {
+            // Recover playing state from device (only if not already playing in memory)
+            let already_playing = states.iter().any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+            if status.state == TransportState::Playing && !already_playing {
                 let np = crate::playback::NowPlaying {
                     track_id: None,
                     title: status.track_title.unwrap_or_else(|| "Recovering...".into()),
