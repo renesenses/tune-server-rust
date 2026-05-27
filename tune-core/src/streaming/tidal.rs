@@ -433,6 +433,27 @@ impl TidalService {
         Ok(())
     }
 
+    fn map_playlist(item: &serde_json::Value) -> StreamPlaylist {
+        StreamPlaylist {
+            id: item["uuid"].as_str().unwrap_or("").into(),
+            name: item["title"].as_str().unwrap_or("").into(),
+            description: item["description"].as_str()
+                .filter(|d| !d.is_empty())
+                .map(Into::into),
+            cover_path: item["squareImage"].as_str()
+                .or_else(|| item["image"].as_str())
+                .map(|c| {
+                    if c.starts_with("http") {
+                        c.to_string()
+                    } else {
+                        format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
+                    }
+                }),
+            track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
+            owner: item["creator"]["name"].as_str().map(Into::into),
+        }
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -711,16 +732,7 @@ impl StreamingService for TidalService {
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
         let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
-        Ok(StreamPlaylist {
-            id: data["uuid"].as_str().unwrap_or(playlist_id).into(),
-            name: data["title"].as_str().unwrap_or("").into(),
-            description: data["description"].as_str().map(Into::into),
-            cover_path: data["squareImage"].as_str().map(|c| {
-                format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
-            }),
-            track_count: data["numberOfTracks"].as_u64().unwrap_or(0) as u32,
-            owner: data["creator"]["name"].as_str().map(Into::into),
-        })
+        Ok(Self::map_playlist(&data))
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
@@ -836,18 +848,10 @@ impl StreamingService for TidalService {
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
-        // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self.api_get(&format!("/users/{user_id}/playlists?limit=50")).await?;
         let playlists = data["items"].as_array()
-            .map(|items| items.iter().map(|item| StreamPlaylist {
-                id: item["uuid"].as_str().unwrap_or("").into(),
-                name: item["title"].as_str().unwrap_or("").into(),
-                description: item["description"].as_str().map(Into::into),
-                cover_path: None,
-                track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
-                owner: None,
-            }).collect())
+            .map(|items| items.iter().map(Self::map_playlist).collect())
             .unwrap_or_default();
         Ok(playlists)
     }
@@ -874,6 +878,22 @@ impl StreamingService for TidalService {
             }).collect())
             .unwrap_or_default();
         Ok(artists)
+    }
+
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+        let data = self.api_get("/featured/playlists?limit=50").await?;
+        let playlists = data["items"].as_array()
+            .map(|items| items.iter().map(Self::map_playlist).collect())
+            .unwrap_or_default();
+        Ok(playlists)
+    }
+
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get("/featured/new/albums?limit=50").await?;
+        let albums = data["items"].as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
     }
 
     async fn post_restore(&mut self) {
@@ -1180,6 +1200,70 @@ mod tests {
         // "Hello" in base64url without padding
         let result = base64_decode_url("SGVsbG8").unwrap();
         assert_eq!(String::from_utf8(result).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn map_playlist_basic() {
+        let json = json!({
+            "uuid": "abc-123",
+            "title": "Jazz Essentials",
+            "description": "The best jazz tracks",
+            "squareImage": "aa-bb-cc-dd",
+            "numberOfTracks": 42,
+            "creator": {"name": "TIDAL"},
+        });
+        let playlist = TidalService::map_playlist(&json);
+        assert_eq!(playlist.id, "abc-123");
+        assert_eq!(playlist.name, "Jazz Essentials");
+        assert_eq!(playlist.description.as_deref(), Some("The best jazz tracks"));
+        assert_eq!(playlist.track_count, 42);
+        assert_eq!(playlist.owner.as_deref(), Some("TIDAL"));
+        assert!(playlist.cover_path.is_some());
+        let cover = playlist.cover_path.unwrap();
+        assert!(cover.contains("resources.tidal.com"));
+        assert!(cover.contains("aa/bb/cc/dd"));
+        assert!(cover.contains("640x640"));
+    }
+
+    #[test]
+    fn map_playlist_image_fallback() {
+        let json = json!({
+            "uuid": "xyz",
+            "title": "Test",
+            "image": "ee-ff-gg",
+            "numberOfTracks": 10,
+        });
+        let playlist = TidalService::map_playlist(&json);
+        assert!(playlist.cover_path.is_some());
+        let cover = playlist.cover_path.unwrap();
+        assert!(cover.contains("ee/ff/gg"));
+    }
+
+    #[test]
+    fn map_playlist_http_image() {
+        let json = json!({
+            "uuid": "xyz",
+            "title": "Test",
+            "image": "https://example.com/cover.jpg",
+            "numberOfTracks": 5,
+        });
+        let playlist = TidalService::map_playlist(&json);
+        assert_eq!(playlist.cover_path.as_deref(), Some("https://example.com/cover.jpg"));
+    }
+
+    #[test]
+    fn map_playlist_missing_fields() {
+        let json = json!({
+            "uuid": null,
+            "title": null,
+        });
+        let playlist = TidalService::map_playlist(&json);
+        assert_eq!(playlist.id, "");
+        assert_eq!(playlist.name, "");
+        assert!(playlist.description.is_none());
+        assert!(playlist.cover_path.is_none());
+        assert_eq!(playlist.track_count, 0);
+        assert!(playlist.owner.is_none());
     }
 
     #[test]
