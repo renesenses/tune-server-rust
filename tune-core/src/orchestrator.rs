@@ -495,6 +495,13 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        // Clean up stream session before stopping
+        let state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = state.now_playing {
+            if let Some(ref stream_id) = np.stream_id {
+                self.streamer.remove_session(stream_id).await;
+            }
+        }
         self.playback.stop(zone_id).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
