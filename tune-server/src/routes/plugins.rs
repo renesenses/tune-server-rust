@@ -24,12 +24,29 @@ pub fn router() -> Router<AppState> {
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let plugins: Vec<Value> = settings
+    let mut plugins: Vec<Value> = settings
         .get("plugins")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+
+    // Built-in plugins
+    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
+    let xtune_installed = std::path::Path::new(&xtune_dir).exists();
+    plugins.push(serde_json::json!({
+        "name": "xtune",
+        "display_name": "xTune",
+        "description": "Vinyl turntable player — interface platine vinyle immersive",
+        "version": "1.0.0",
+        "author": "MozAIk Labs",
+        "type": "built-in",
+        "installed": xtune_installed,
+        "enabled": xtune_installed,
+        "url": "/xtune/",
+        "icon": "vinyl",
+    }));
+
     Json(json!(plugins))
 }
 

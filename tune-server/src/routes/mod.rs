@@ -345,6 +345,14 @@ pub fn router(state: AppState) -> Router {
         app = app.nest("/upnp", upnp);
     }
 
+    // xTune plugin — vinyl player UI
+    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
+    let app = if std::path::Path::new(&xtune_dir).exists() {
+        app.nest_service("/xtune", ServeDir::new(&xtune_dir).fallback(ServeFile::new(format!("{xtune_dir}/index.html"))))
+    } else {
+        app
+    };
+
     let app = app
         .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
         .layer(CompressionLayer::new())
