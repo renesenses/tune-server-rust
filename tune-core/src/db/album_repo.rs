@@ -24,6 +24,16 @@ impl AlbumRepo {
             .map_err(|e| e.to_string())
     }
 
+    pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? COLLATE NOCASE LIMIT 1"))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![title], |row| Ok(row_to_album(row)))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn get_by_title_and_artist(&self, title: &str, artist_id: i64, year: Option<i32>) -> Result<Option<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
         if let Some(y) = year {

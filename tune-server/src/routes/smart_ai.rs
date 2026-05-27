@@ -250,7 +250,10 @@ async fn mood_playlist(
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "smart_ai_mood_query_failed");
+            vec![]
+        });
     drop(conn);
 
     // If genre filter returned too few results, fall back to BPM-only

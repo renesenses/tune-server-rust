@@ -240,8 +240,17 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                         .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
                         .unwrap_or(false);
 
-                // Album artist: use album_artist tag, fall back to track artist
+                // Album artist: use album_artist tag, fall back to existing album's artist
+                // (not track artist — that splits compilation albums)
+                let existing_album_artist: Option<String> = if meta.album_artist.is_none() {
+                    meta.album.as_ref().and_then(|title| {
+                        album_repo.get_by_title(title).ok().flatten().and_then(|a| a.artist_name)
+                    })
+                } else {
+                    None
+                };
                 let album_artist_name = meta.album_artist.as_deref()
+                    .or(existing_album_artist.as_deref())
                     .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
 
                 // Track artist: always from track-level artist tag
