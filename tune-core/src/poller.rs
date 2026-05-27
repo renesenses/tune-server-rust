@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
@@ -15,10 +16,12 @@ use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 2;
+const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
+    last_radio_poll: Instant,
 }
 
 pub struct PositionPoller {
@@ -158,9 +161,59 @@ impl PositionPoller {
             self.playback
                 .emit_position(zone_id, status.position_ms as i64);
 
+            // --- Radio metadata polling ---
+            let is_radio = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.source == "radio" || np.source == "recovered")
+                .unwrap_or(false);
+            if is_radio {
+                let should_poll = poll_states
+                    .get(&zone_id)
+                    .map(|ps| ps.last_radio_poll.elapsed() > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS))
+                    .unwrap_or(true);
+
+                if should_poll {
+                    if let Some(ref np) = zone_state.now_playing {
+                        if let Some(ref source_id) = np.source_id {
+                            if let Ok(sid) = source_id.parse::<i64>() {
+                                let radio_repo = crate::db::radio_repo::RadioRepo::new(self.db.clone());
+                                if let Ok(Some(station)) = radio_repo.get(sid) {
+                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(&station.name, &station.url).await {
+                                        // Only update if the metadata actually changed
+                                        let title_changed = np.title != meta.title
+                                            || np.artist_name != meta.artist;
+                                        if title_changed {
+                                            let new_np = crate::playback::NowPlaying {
+                                                track_id: None,
+                                                title: meta.title,
+                                                artist_name: meta.artist,
+                                                album_title: Some(station.name.clone()),
+                                                cover_path: np.cover_path.clone(),
+                                                duration_ms: 0,
+                                                source: "radio".into(),
+                                                source_id: np.source_id.clone(),
+                                                stream_id: np.stream_id.clone(),
+                                            };
+                                            self.playback.update_now_playing(zone_id, new_np).await;
+                                            debug!(zone_id, station = %station.name, "radio_metadata_updated");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Update the timestamp (or create entry if missing)
+                    if let Some(ps) = poll_states.get_mut(&zone_id) {
+                        ps.last_radio_poll = Instant::now();
+                    }
+                }
+            }
+
             let ps = poll_states.entry(zone_id).or_insert(ZonePollState {
                 gapless_sent: false,
                 stopped_ticks: 0,
+                last_radio_poll: Instant::now(),
             });
 
             match status.state {

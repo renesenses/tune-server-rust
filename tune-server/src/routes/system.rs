@@ -203,12 +203,17 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
     settings.set("scan_started_at", &chrono_now()).ok();
 
     let db = state.db.clone();
+    let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
         let music_dirs = get_music_dirs_list(&db);
         if music_dirs.is_empty() {
             SettingsRepo::new(db).set("scan_status", "idle").ok();
             return;
         }
+
+        event_bus.emit("library.scan.started", json!({
+            "music_dirs": &music_dirs,
+        }));
 
         let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let (scanned, scan_stats) = tune_core::scanner::walker::scan_files_parallel(&files, true, None);
@@ -398,6 +403,18 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     inserted += 1;
                 }
             }
+
+            // Emit progress every 100 processed files
+            let processed = inserted + updated + skipped;
+            if processed > 0 && processed % 100 == 0 {
+                event_bus.emit("library.scan.progress", json!({
+                    "scanned": scanned.len(),
+                    "processed": processed,
+                    "inserted": inserted,
+                    "updated": updated,
+                    "skipped": skipped,
+                }));
+            }
         }
 
         for album in album_repo.list(99999, 0).unwrap_or_default() {
@@ -433,6 +450,15 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 .to_string(),
             )
             .ok();
+
+        event_bus.emit("library.scan.complete", json!({
+            "total_files": scan_stats.total_files,
+            "metadata_ok": scan_stats.metadata_ok,
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "artwork_extracted": artwork_extracted,
+        }));
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums

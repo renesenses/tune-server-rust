@@ -91,6 +91,16 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
+    // Emit device.discovered for each found device
+    for d in &deduped {
+        state.event_bus.emit("device.discovered", json!({
+            "id": &d.id,
+            "name": &d.name,
+            "host": &d.host,
+            "type": format!("{:?}", d.device_type),
+        }));
+    }
+
     let items: Vec<Value> = deduped
         .iter()
         .map(|d| json!({

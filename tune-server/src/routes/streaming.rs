@@ -138,6 +138,12 @@ async fn service_auth(
         Ok(status) => {
             drop(svc);
             state.save_tokens().await;
+            if status.authenticated {
+                state.event_bus.emit("streaming.auth.success", json!({
+                    "service": &service,
+                    "username": &status.username,
+                }));
+            }
             Json(json!({
                 "service": service,
                 "authenticated": status.authenticated,
@@ -146,7 +152,13 @@ async fn service_auth(
                 "user_code": status.user_code,
             })).into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => {
+            state.event_bus.emit("streaming.auth.failed", json!({
+                "service": &service,
+                "error": &e,
+            }));
+            (StatusCode::BAD_REQUEST, e).into_response()
+        }
     }
 }
 

@@ -232,6 +232,28 @@ impl PlaybackManager {
         });
     }
 
+    /// Update the NowPlaying metadata for a zone without resetting position.
+    /// Used for radio streams where the track info changes while playing.
+    pub async fn update_now_playing(&self, zone_id: i64, np: NowPlaying) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.now_playing = Some(np.clone());
+        }
+        self.emit(PlaybackEvent {
+            event: "now_playing".into(),
+            zone_id,
+            data: serde_json::json!({
+                "title": np.title,
+                "artist_name": np.artist_name,
+                "album_title": np.album_title,
+                "cover_path": np.cover_path,
+                "duration_ms": np.duration_ms,
+                "source": np.source,
+                "source_id": np.source_id,
+            }),
+        });
+    }
+
     fn emit(&self, event: PlaybackEvent) {
         let _ = self.event_tx.send(event);
     }

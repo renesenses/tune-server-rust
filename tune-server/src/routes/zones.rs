@@ -210,6 +210,12 @@ async fn create_zone(
     match repo.create(&body.name, output_type, output_device_id) {
         Ok(id) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
+            state.event_bus.emit("zone.created", json!({
+                "id": id,
+                "name": &body.name,
+                "output_type": output_type,
+                "output_device_id": output_device_id,
+            }));
 
             // Return the full zone object so the web client can use it directly
             let zone = repo.get(id).ok().flatten();
@@ -304,9 +310,12 @@ async fn delete_zone(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::new(state.db.clone());
     match repo.delete(id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.event_bus.emit("zone.deleted", json!({"id": id}));
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
