@@ -33,13 +33,13 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct AlbumFilters {
     limit: Option<i64>,
     offset: Option<i64>,
     quality: Option<String>,
     format: Option<String>,
     sort: Option<String>,
+    order: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -266,7 +266,9 @@ async fn list_albums(
     let repo = AlbumRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let items = repo.list(limit, offset).unwrap_or_default();
+    let sort = p.sort.as_deref().unwrap_or("added_at");
+    let order = p.order.as_deref().unwrap_or("asc");
+    let items = repo.list_sorted(limit, offset, sort, order).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }

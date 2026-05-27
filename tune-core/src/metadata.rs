@@ -66,6 +66,21 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Normalize a lofty `FileType` debug string into a user-friendly format name.
+///
+/// lofty's `FileType` Debug representation doesn't always match what users expect:
+///   - `Mpeg` -> `mp3`
+///   - `Dsf`  -> `dsd` (DSD over PCM, stored in .dsf container)
+///   - `Dff`  -> `dsd` (DSD Interchange File Format)
+///   - Other values pass through unchanged (already lowercase).
+pub fn normalize_format(raw: &str) -> String {
+    match raw {
+        "mpeg" => "mp3".to_string(),
+        "dsf" | "dff" => "dsd".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
@@ -117,7 +132,7 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         sample_rate: props.sample_rate(),
         bit_depth: props.bit_depth().map(|b| b as u16),
         channels: props.channels().map(|c| c as u16),
-        format: Some(format!("{:?}", tagged.file_type()).to_lowercase()),
+        format: Some(normalize_format(&format!("{:?}", tagged.file_type()).to_lowercase())),
         file_size: std::fs::metadata(path).ok().map(|m| m.len()),
         bpm,
         compilation,
@@ -365,5 +380,35 @@ mod tests {
         };
         assert_eq!(update.title.as_deref(), Some("New Title"));
         assert_eq!(update.year, Some(2024));
+    }
+
+    #[test]
+    fn normalize_format_mpeg_to_mp3() {
+        assert_eq!(normalize_format("mpeg"), "mp3");
+    }
+
+    #[test]
+    fn normalize_format_dsf_to_dsd() {
+        assert_eq!(normalize_format("dsf"), "dsd");
+    }
+
+    #[test]
+    fn normalize_format_dff_to_dsd() {
+        assert_eq!(normalize_format("dff"), "dsd");
+    }
+
+    #[test]
+    fn normalize_format_flac_unchanged() {
+        assert_eq!(normalize_format("flac"), "flac");
+    }
+
+    #[test]
+    fn normalize_format_wav_unchanged() {
+        assert_eq!(normalize_format("wav"), "wav");
+    }
+
+    #[test]
+    fn normalize_format_aiff_unchanged() {
+        assert_eq!(normalize_format("aiff"), "aiff");
     }
 }

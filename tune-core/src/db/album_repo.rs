@@ -174,10 +174,21 @@ impl AlbumRepo {
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, String> {
+        self.list_sorted(limit, offset, "title", "asc")
+    }
+
+    pub fn list_sorted(&self, limit: i64, offset: i64, sort: &str, order: &str) -> Result<Vec<Album>, String> {
+        let dir = if order.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+        let order_clause = match sort {
+            "title" => format!("a.title COLLATE NOCASE {dir}"),
+            "release_date" | "year" => format!("a.year {dir}, a.title COLLATE NOCASE ASC"),
+            "artist" => format!("ar.name COLLATE NOCASE {dir}, a.year ASC, a.title COLLATE NOCASE ASC"),
+            // added_at: use rowid (insertion order)
+            _ => format!("a.id {dir}"),
+        };
+        let sql = format!("{SELECT_ALBUM} ORDER BY {order_clause} LIMIT ? OFFSET ?");
         let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} ORDER BY a.title COLLATE NOCASE LIMIT ? OFFSET ?"))
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
@@ -658,5 +669,97 @@ mod tests {
         let repo = AlbumRepo::new(db);
         // Should not error
         repo.delete(999).unwrap();
+    }
+
+    #[test]
+    fn list_sorted_by_title() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Various".into())).unwrap();
+        for title in ["Gamma", "Alpha", "Beta"] {
+            let mut a = Album::new(title.into());
+            a.artist_id = Some(aid);
+            repo.create(&a).unwrap();
+        }
+
+        let asc = repo.list_sorted(100, 0, "title", "asc").unwrap();
+        assert_eq!(asc[0].title, "Alpha");
+        assert_eq!(asc[2].title, "Gamma");
+
+        let desc = repo.list_sorted(100, 0, "title", "desc").unwrap();
+        assert_eq!(desc[0].title, "Gamma");
+        assert_eq!(desc[2].title, "Alpha");
+    }
+
+    #[test]
+    fn list_sorted_by_year() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid = artist_repo.create(&Artist::new("Artist".into())).unwrap();
+
+        let mut a1 = Album::new("Old".into());
+        a1.artist_id = Some(aid);
+        a1.year = Some(1970);
+        repo.create(&a1).unwrap();
+
+        let mut a2 = Album::new("New".into());
+        a2.artist_id = Some(aid);
+        a2.year = Some(2020);
+        repo.create(&a2).unwrap();
+
+        let asc = repo.list_sorted(100, 0, "year", "asc").unwrap();
+        assert_eq!(asc[0].title, "Old");
+        assert_eq!(asc[1].title, "New");
+
+        let desc = repo.list_sorted(100, 0, "release_date", "desc").unwrap();
+        assert_eq!(desc[0].title, "New");
+        assert_eq!(desc[1].title, "Old");
+    }
+
+    #[test]
+    fn list_sorted_by_artist() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid_z = artist_repo.create(&Artist::new("Zappa".into())).unwrap();
+        let aid_a = artist_repo.create(&Artist::new("Abba".into())).unwrap();
+
+        let mut a1 = Album::new("Hot Rats".into());
+        a1.artist_id = Some(aid_z);
+        repo.create(&a1).unwrap();
+
+        let mut a2 = Album::new("Arrival".into());
+        a2.artist_id = Some(aid_a);
+        repo.create(&a2).unwrap();
+
+        let asc = repo.list_sorted(100, 0, "artist", "asc").unwrap();
+        assert_eq!(asc[0].title, "Arrival"); // Abba first
+        assert_eq!(asc[1].title, "Hot Rats"); // Zappa second
+
+        let desc = repo.list_sorted(100, 0, "artist", "desc").unwrap();
+        assert_eq!(desc[0].title, "Hot Rats"); // Zappa first
+    }
+
+    #[test]
+    fn list_sorted_by_added_at() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        repo.create(&Album::new("First".into())).unwrap();
+        repo.create(&Album::new("Second".into())).unwrap();
+        repo.create(&Album::new("Third".into())).unwrap();
+
+        let asc = repo.list_sorted(100, 0, "added_at", "asc").unwrap();
+        assert_eq!(asc[0].title, "First");
+        assert_eq!(asc[2].title, "Third");
+
+        let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        assert_eq!(desc[0].title, "Third");
+        assert_eq!(desc[2].title, "First");
     }
 }
