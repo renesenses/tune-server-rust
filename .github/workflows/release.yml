@@ -66,6 +66,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           targets: ${{ matrix.target }}
+          rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
