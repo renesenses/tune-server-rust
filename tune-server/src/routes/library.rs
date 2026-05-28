@@ -33,6 +33,7 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct AlbumFilters {
     limit: Option<i64>,
     offset: Option<i64>,
