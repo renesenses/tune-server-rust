@@ -13,11 +13,12 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     cargo build --release --package tune-server --no-default-features 2>/dev/null || true && \
     rm -rf tune-core/src tune-pyo3/src tune-server/src
 
-# Build real source
+# Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
 COPY tune-pyo3/ tune-pyo3/
 COPY tune-server/ tune-server/
-RUN cargo build --release --package tune-server --no-default-features && \
+RUN rm -f target/release/tune-server target/release/deps/tune_server-* target/release/deps/tune_core-* && \
+    cargo build --release --package tune-server --no-default-features && \
     strip target/release/tune-server
 
 FROM debian:bookworm-slim
