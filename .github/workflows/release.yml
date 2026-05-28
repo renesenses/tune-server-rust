@@ -40,27 +40,29 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: tune-server-linux-x86_64
+            platform: linux-x86_64
             ext: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: tune-server-linux-aarch64
+            platform: linux-aarch64
             ext: tar.gz
             cross: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
-            artifact: tune-server-macos-x86_64
+            platform: macos-x86_64
             ext: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: tune-server-macos-aarch64
+            platform: macos-aarch64
             ext: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: tune-server-windows-x86_64
+            platform: windows-x86_64
             ext: zip
 
     runs-on: ${{ matrix.os }}
+    env:
+      ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -98,7 +100,7 @@ jobs:
           mkdir -p package/web
           cp target/${{ matrix.target }}/release/tune-server package/
           cp -r web/* package/web/
-          cd package && tar czf ../${{ matrix.artifact }}.${{ matrix.ext }} tune-server web/
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server web/
           cd ..
 
       - name: Package (windows)
@@ -108,13 +110,13 @@ jobs:
           copy target\${{ matrix.target }}\release\tune-server.exe package\
           xcopy web\* package\web\ /E /I /Q
           cd package
-          7z a ..\${{ matrix.artifact }}.${{ matrix.ext }} tune-server.exe web\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           cd ..
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.${{ matrix.ext }}
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.${{ matrix.ext }}
           retention-days: 1
 
   release:
