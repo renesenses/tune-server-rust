@@ -483,6 +483,7 @@ async fn main() {
         let outputs = state.outputs.clone();
         let db_for_ssdp = state.db.clone();
         let config_for_ssdp = config.clone();
+        let event_bus_for_ssdp = state.event_bus.clone();
         tokio::spawn(async move {
             use tune_core::discovery::ssdp::SsdpEvent;
             while let Some(event) = ssdp_rx.recv().await {
@@ -519,7 +520,14 @@ async fn main() {
                             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
                             let existing = zone_repo.list().unwrap_or_default();
                             let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
-                            if !already && !is_tv {
+                            if already {
+                                info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
+                                event_bus_for_ssdp.emit("device.reconnected", serde_json::json!({
+                                    "device_id": &dev.id,
+                                    "name": &dev.name,
+                                    "host": &dev.host,
+                                }));
+                            } else if !is_tv {
                                 let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
                                 let name_taken = existing.iter().any(|z| z.name == short_name);
                                 let zone_name = if name_taken { dev.name.clone() } else { short_name.to_string() };

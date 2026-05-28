@@ -31,7 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/restart", post(restart))
         .route("/database/status", get(database_status))
         .route("/database/optimize", post(database_optimize))
-        .route("/music-dirs", get(get_music_dirs))
+        .route("/music-dirs", get(get_music_dirs).post(add_music_dir))
         .route("/music-dirs/add", post(add_music_dir))
         .route("/music-dirs/remove", post(remove_music_dir))
         .route("/env", get(get_env))
