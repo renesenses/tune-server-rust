@@ -51,16 +51,19 @@ impl TuneConfig {
     pub fn load() -> Self {
         let mut config = Self::default();
 
-        #[allow(unused_mut)]
-        let mut search_paths = vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
-        #[cfg(target_os = "windows")]
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            search_paths.insert(0, format!("{appdata}\\Tune\\tune.toml"));
-        }
-        #[cfg(target_os = "macos")]
-        if let Ok(home) = std::env::var("HOME") {
-            search_paths.push(format!("{home}/.config/tune/tune.toml"));
-        }
+        let search_paths = {
+            let mut paths =
+                vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
+            #[cfg(target_os = "windows")]
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                paths.insert(0, format!("{appdata}\\Tune\\tune.toml"));
+            }
+            #[cfg(target_os = "macos")]
+            if let Ok(home) = std::env::var("HOME") {
+                paths.push(format!("{home}/.config/tune/tune.toml"));
+            }
+            paths
+        };
 
         for path in &search_paths {
             if let Ok(content) = std::fs::read_to_string(path)

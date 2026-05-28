@@ -1150,6 +1150,31 @@ impl StreamingService for TidalService {
     }
 }
 
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits = 0;
+
+    for &byte in input.as_bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let val = table
+            .iter()
+            .position(|&c| c == byte)
+            .ok_or("invalid base64")? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(output)
+}
+
 fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
     let padded = match input.len() % 4 {
         2 => format!("{input}=="),
@@ -1483,29 +1508,4 @@ mod tests {
         svc.set_enabled(true);
         assert!(svc.enabled());
     }
-}
-
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = Vec::new();
-    let mut buf: u32 = 0;
-    let mut bits = 0;
-
-    for &byte in input.as_bytes() {
-        if byte == b'=' {
-            break;
-        }
-        let val = table
-            .iter()
-            .position(|&c| c == byte)
-            .ok_or("invalid base64")? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Ok(output)
 }
