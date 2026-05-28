@@ -26,7 +26,7 @@ jobs:
             artifact: tune-server-linux-aarch64.tar.gz
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact: tune-server-macos-x86_64.tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
