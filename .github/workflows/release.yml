@@ -113,6 +113,10 @@ jobs:
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           cd ..
 
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        run: choco install nsis -y
+
       - name: Create installer (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -168,7 +172,7 @@ jobs:
             DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
-          makensis installer.nsi
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
 
       - name: Import signing certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
