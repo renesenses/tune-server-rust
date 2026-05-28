@@ -39,6 +39,9 @@ async fn main() {
                 if let Some(id) = zone.id {
                     let vol = (zone.volume as f64) / 100.0;
                     state.playback.set_volume(id, vol).await;
+                    if zone.output_device_id.is_some() {
+                        let _ = zone_repo.update_online(id, false);
+                    }
                     info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
                 }
             }
@@ -521,6 +524,7 @@ async fn main() {
                             let existing = zone_repo.list().unwrap_or_default();
                             let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
                             if already {
+                                let _ = zone_repo.set_online_by_device(&dev.id, true);
                                 info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
                                 event_bus_for_ssdp.emit("device.reconnected", serde_json::json!({
                                     "device_id": &dev.id,
@@ -540,7 +544,9 @@ async fn main() {
                     SsdpEvent::DeviceLost(id) => {
                         let mut reg = outputs.lock().await;
                         reg.remove(&id);
-                        info!(id = %id, "output_removed");
+                        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
+                        let _ = zone_repo.set_online_by_device(&id, false);
+                        info!(id = %id, "output_removed_zone_offline");
                     }
                 }
             }

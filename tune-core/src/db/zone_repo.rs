@@ -95,6 +95,24 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
+        let val = if online { 1i64 } else { 0i64 };
+        self.db.execute(
+            "UPDATE zones SET online = ? WHERE id = ?",
+            &[&val as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
+        let val = if online { 1i64 } else { 0i64 };
+        let conn = self.db.connection().lock().unwrap();
+        conn.execute(
+            "UPDATE zones SET online = ? WHERE output_device_id = ?",
+            rusqlite::params![val, device_id],
+        ).map(|n| n).map_err(|e| e.to_string())
+    }
+
     pub fn delete(&self, id: i64) -> Result<(), String> {
         self.db.execute("DELETE FROM zones WHERE id = ?", &[&id])?;
         Ok(())
