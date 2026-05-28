@@ -98,11 +98,10 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         .unwrap_or_default();
     let file_size = std::fs::metadata(path).ok().map(|m| m.len());
 
-    // Try to read DSF header for audio properties.
-    // DSF spec: bytes 0-3 = "DSD ", 28-31 = fmt chunk size,
-    //   fmt+16..fmt+20 = channel type, fmt+20..fmt+24 = channel count,
-    //   fmt+24..fmt+28 = sample rate, fmt+28..fmt+30 = bits per sample,
-    //   fmt+32..fmt+40 = sample count per channel.
+    // Derive album from parent dir, artist from grandparent (Artist/Album/track.dsf)
+    let album = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string());
+    let artist = path.parent().and_then(|p| p.parent()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string());
+
     let (sample_rate, channels, duration_ms) = if ext == "dsf" {
         parse_dsf_header(path).unwrap_or((None, None, None))
     } else {
@@ -111,6 +110,9 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
 
     Some(TrackMetadata {
         title: Some(title),
+        album,
+        artist: artist.clone(),
+        album_artist: artist,
         format: Some("dsd".to_string()),
         file_size,
         sample_rate,
