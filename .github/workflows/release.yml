@@ -103,7 +103,7 @@ jobs:
           cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server web/
           cd ..
 
-      - name: Package (windows)
+      - name: Package (windows zip)
         if: runner.os == 'Windows'
         run: |
           mkdir package\web
@@ -112,6 +112,63 @@ jobs:
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           cd ..
+
+      - name: Create installer (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          @"
+          !include "MUI2.nsh"
+          Name "Tune Server"
+          OutFile "${{ env.ARTIFACT }}-setup.exe"
+          InstallDir "`$PROGRAMFILES\Tune Server"
+          RequestExecutionLevel admin
+
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "French"
+
+          Section "Install"
+            SetOutPath "`$INSTDIR"
+            File "target\${{ matrix.target }}\release\tune-server.exe"
+            SetOutPath "`$INSTDIR\web"
+            File /r "web\*.*"
+
+            ; Launcher script
+            SetOutPath "`$INSTDIR"
+            FileOpen `$0 "`$INSTDIR\start-tune-server.bat" w
+            FileWrite `$0 '@echo off$\r$\n'
+            FileWrite `$0 'cd /d "%~dp0"$\r$\n'
+            FileWrite `$0 'set "TUNE_WEB_DIR=%~dp0web"$\r$\n'
+            FileWrite `$0 'set "TUNE_PORT=8888"$\r$\n'
+            FileWrite `$0 'start http://localhost:%TUNE_PORT%$\r$\n'
+            FileWrite `$0 'tune-server.exe$\r$\n'
+            FileClose `$0
+
+            ; Start menu
+            CreateDirectory "`$SMPROGRAMS\Tune Server"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+            CreateShortcut "`$SMPROGRAMS\Tune Server\Uninstall.lnk" "`$INSTDIR\uninstall.exe"
+            CreateShortcut "`$DESKTOP\Tune Server.lnk" "`$INSTDIR\start-tune-server.bat" "" "`$INSTDIR\tune-server.exe"
+
+            WriteUninstaller "`$INSTDIR\uninstall.exe"
+
+            ; Registry for Add/Remove Programs
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayVersion" "${version}"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "UninstallString" "`$INSTDIR\uninstall.exe"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "Publisher" "Mozaik Labs"
+          SectionEnd
+
+          Section "Uninstall"
+            RMDir /r "`$INSTDIR"
+            Delete "`$DESKTOP\Tune Server.lnk"
+            RMDir /r "`$SMPROGRAMS\Tune Server"
+            DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+          SectionEnd
+          "@ | Out-File -Encoding ASCII installer.nsi
+          makensis installer.nsi
 
       - name: Import signing certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
@@ -177,6 +234,7 @@ jobs:
           path: |
             ${{ env.ARTIFACT }}.${{ matrix.ext }}
             ${{ env.ARTIFACT }}.dmg
+            ${{ env.ARTIFACT }}-setup.exe
           retention-days: 1
 
   release:
@@ -192,7 +250,7 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.exe' \) -exec sha256sum {} \; > ../SHA256SUMS
           cd ..
 
       - uses: softprops/action-gh-release@v2
@@ -201,5 +259,6 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
             artifacts/**/*.dmg
+            artifacts/**/*.exe
             SHA256SUMS
           generate_release_notes: true
