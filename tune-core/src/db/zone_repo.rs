@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -46,10 +46,19 @@ impl ZoneRepo {
         Ok(zones)
     }
 
-    pub fn create(&self, name: &str, output_type: Option<&str>, output_device_id: Option<&str>) -> Result<i64, String> {
+    pub fn create(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: Option<&str>,
+    ) -> Result<i64, String> {
         self.db.execute(
             "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
-            &[&name as &dyn rusqlite::types::ToSql, &output_type, &output_device_id],
+            &[
+                &name as &dyn rusqlite::types::ToSql,
+                &output_type,
+                &output_device_id,
+            ],
         )?;
         Ok(self.db.last_insert_rowid())
     }
@@ -110,7 +119,9 @@ impl ZoneRepo {
         conn.execute(
             "UPDATE zones SET online = ? WHERE output_device_id = ?",
             rusqlite::params![val, device_id],
-        ).map(|n| n).map_err(|e| e.to_string())
+        )
+        .map(|n| n)
+        .map_err(|e| e.to_string())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -152,7 +163,9 @@ mod tests {
         let db = test_db();
         let repo = ZoneRepo::new(db);
 
-        let id = repo.create("Living Room", Some("dlna"), Some("uuid:123")).unwrap();
+        let id = repo
+            .create("Living Room", Some("dlna"), Some("uuid:123"))
+            .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
         assert_eq!(zone.volume, 50);

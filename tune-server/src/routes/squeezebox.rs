@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -74,20 +74,14 @@ async fn list_players(State(state): State<AppState>) -> impl IntoResponse {
     let host = lms_host(&state);
     match lms_request(&host, "", vec![json!("players"), json!(0), json!(100)]).await {
         Ok(result) => {
-            let players = result
-                .get("players_loop")
-                .cloned()
-                .unwrap_or(json!([]));
+            let players = result.get("players_loop").cloned().unwrap_or(json!([]));
             Json(players).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
 
-async fn play_player(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn play_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let host = lms_host(&state);
     match lms_request(&host, &id, vec![json!("play")]).await {
         Ok(result) => Json(json!({"status": "playing", "result": result})).into_response(),
@@ -95,10 +89,7 @@ async fn play_player(
     }
 }
 
-async fn pause_player(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn pause_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let host = lms_host(&state);
     match lms_request(&host, &id, vec![json!("pause")]).await {
         Ok(result) => Json(json!({"status": "paused", "result": result})).into_response(),
@@ -117,7 +108,13 @@ async fn set_player_volume(
     Json(body): Json<VolumeBody>,
 ) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&host, &id, vec![json!("mixer"), json!("volume"), json!(body.volume)]).await {
+    match lms_request(
+        &host,
+        &id,
+        vec![json!("mixer"), json!("volume"), json!(body.volume)],
+    )
+    .await
+    {
         Ok(result) => Json(json!({"volume": body.volume, "result": result})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }

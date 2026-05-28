@@ -4,10 +4,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use tune_core::discovery::device::DiscoveredDevice;
-use tune_core::discovery::ssdp::{SsdpEvent, SsdpScanner};
 use tune_core::discovery::mdns::{MdnsEvent, MdnsScanner};
+use tune_core::discovery::ssdp::{SsdpEvent, SsdpScanner};
 
-fn device_to_pydict<'py>(py: Python<'py>, dev: &DiscoveredDevice) -> PyResult<pyo3::Bound<'py, PyDict>> {
+fn device_to_pydict<'py>(
+    py: Python<'py>,
+    dev: &DiscoveredDevice,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("id", &dev.id)?;
     dict.set_item("name", &dev.name)?;
@@ -34,11 +37,18 @@ fn device_to_pydict<'py>(py: Python<'py>, dev: &DiscoveredDevice) -> PyResult<py
         let caps = PyDict::new(py);
         for (k, v) in &dev.capabilities {
             match v {
-                serde_json::Value::Bool(b) => { caps.set_item(k, *b)?; }
-                serde_json::Value::String(s) => { caps.set_item(k, s)?; }
+                serde_json::Value::Bool(b) => {
+                    caps.set_item(k, *b)?;
+                }
+                serde_json::Value::String(s) => {
+                    caps.set_item(k, s)?;
+                }
                 serde_json::Value::Number(n) => {
-                    if let Some(i) = n.as_i64() { caps.set_item(k, i)?; }
-                    else if let Some(f) = n.as_f64() { caps.set_item(k, f)?; }
+                    if let Some(i) = n.as_i64() {
+                        caps.set_item(k, i)?;
+                    } else if let Some(f) = n.as_f64() {
+                        caps.set_item(k, f)?;
+                    }
                 }
                 _ => {
                     let s = serde_json::to_string(v).unwrap_or_default();
@@ -88,9 +98,9 @@ impl RustSsdpScanner {
 
     fn start(&self) -> PyResult<()> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner already stopped")
-        })?;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner already stopped"))?;
         inner.runtime.block_on(inner.scanner.start());
         Ok(())
     }
@@ -105,12 +115,10 @@ impl RustSsdpScanner {
 
     fn rescan<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyList>> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
-        let devices = py.allow_threads(|| {
-            inner.runtime.block_on(inner.scanner.rescan())
-        });
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
+        let devices = py.allow_threads(|| inner.runtime.block_on(inner.scanner.rescan()));
         let list = PyList::empty(py);
         for dev in &devices {
             list.append(device_to_pydict(py, dev)?)?;
@@ -120,9 +128,9 @@ impl RustSsdpScanner {
 
     fn devices<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyList>> {
         let guard = self.inner.lock().unwrap();
-        let inner = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         let devices = inner.runtime.block_on(inner.scanner.devices());
         let list = PyList::empty(py);
         for dev in &devices {
@@ -133,21 +141,28 @@ impl RustSsdpScanner {
 
     fn device_count(&self) -> PyResult<usize> {
         let guard = self.inner.lock().unwrap();
-        let inner = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         Ok(inner.runtime.block_on(inner.scanner.device_count()))
     }
 
-    fn poll_event<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
+    fn poll_event<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let event = py.allow_threads(|| {
             inner.runtime.block_on(async {
-                tokio::time::timeout(timeout, inner.event_rx.recv()).await.ok().flatten()
+                tokio::time::timeout(timeout, inner.event_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
             })
         });
         match event {
@@ -185,7 +200,13 @@ pub struct RustMdnsScanner {
 impl RustMdnsScanner {
     #[new]
     #[pyo3(signature = (airplay=true, bluos=true, chromecast=true, squeezebox=true, tune_peers=true))]
-    fn new(airplay: bool, bluos: bool, chromecast: bool, squeezebox: bool, tune_peers: bool) -> PyResult<Self> {
+    fn new(
+        airplay: bool,
+        bluos: bool,
+        chromecast: bool,
+        squeezebox: bool,
+        tune_peers: bool,
+    ) -> PyResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -193,14 +214,24 @@ impl RustMdnsScanner {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tokio: {e}")))?;
 
         let (event_tx, event_rx) = mpsc::channel(256);
-        let mut scanner = MdnsScanner::new(event_tx)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let mut scanner =
+            MdnsScanner::new(event_tx).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-        if airplay { scanner = scanner.with_airplay(); }
-        if bluos { scanner = scanner.with_bluos(); }
-        if chromecast { scanner = scanner.with_chromecast(); }
-        if squeezebox { scanner = scanner.with_squeezebox(); }
-        if tune_peers { scanner = scanner.with_tune_peers(); }
+        if airplay {
+            scanner = scanner.with_airplay();
+        }
+        if bluos {
+            scanner = scanner.with_bluos();
+        }
+        if chromecast {
+            scanner = scanner.with_chromecast();
+        }
+        if squeezebox {
+            scanner = scanner.with_squeezebox();
+        }
+        if tune_peers {
+            scanner = scanner.with_tune_peers();
+        }
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(MdnsInner {
@@ -213,10 +244,12 @@ impl RustMdnsScanner {
 
     fn start(&self) -> PyResult<()> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner already stopped")
-        })?;
-        inner.scanner.start()
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner already stopped"))?;
+        inner
+            .scanner
+            .start()
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
@@ -230,9 +263,9 @@ impl RustMdnsScanner {
 
     fn devices<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyList>> {
         let guard = self.inner.lock().unwrap();
-        let inner = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         let devices = inner.runtime.block_on(inner.scanner.devices());
         let list = PyList::empty(py);
         for dev in &devices {
@@ -243,21 +276,28 @@ impl RustMdnsScanner {
 
     fn device_count(&self) -> PyResult<usize> {
         let guard = self.inner.lock().unwrap();
-        let inner = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         Ok(inner.runtime.block_on(inner.scanner.device_count()))
     }
 
-    fn poll_event<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
+    fn poll_event<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("scanner not running")
-        })?;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("scanner not running"))?;
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let event = py.allow_threads(|| {
             inner.runtime.block_on(async {
-                tokio::time::timeout(timeout, inner.event_rx.recv()).await.ok().flatten()
+                tokio::time::timeout(timeout, inner.event_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
             })
         });
         match event {

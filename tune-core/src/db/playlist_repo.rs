@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -66,21 +66,38 @@ impl PlaylistRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM playlists WHERE id = ?", &[&id])?;
+        self.db
+            .execute("DELETE FROM playlists WHERE id = ?", &[&id])?;
         Ok(())
     }
 
-    pub fn update(&self, id: i64, name: Option<&str>, description: Option<&str>) -> Result<(), String> {
+    pub fn update(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(n) = name {
-            self.db.execute("UPDATE playlists SET name = ? WHERE id = ?", &[&n as &dyn rusqlite::types::ToSql, &id])?;
+            self.db.execute(
+                "UPDATE playlists SET name = ? WHERE id = ?",
+                &[&n as &dyn rusqlite::types::ToSql, &id],
+            )?;
         }
         if let Some(d) = description {
-            self.db.execute("UPDATE playlists SET description = ? WHERE id = ?", &[&d as &dyn rusqlite::types::ToSql, &id])?;
+            self.db.execute(
+                "UPDATE playlists SET description = ? WHERE id = ?",
+                &[&d as &dyn rusqlite::types::ToSql, &id],
+            )?;
         }
         Ok(())
     }
 
-    pub fn add_tracks(&self, playlist_id: i64, track_ids: &[i64], position: Option<i64>) -> Result<Vec<i64>, String> {
+    pub fn add_tracks(
+        &self,
+        playlist_id: i64,
+        track_ids: &[i64],
+        position: Option<i64>,
+    ) -> Result<Vec<i64>, String> {
         let conn = self.db.connection().lock().unwrap();
         let max_pos: i64 = conn
             .query_row(
@@ -97,13 +114,18 @@ impl PlaylistRepo {
             conn.execute(
                 "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
                 params![playlist_id, tid, pos],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
             inserted.push(*tid);
         }
         Ok(inserted)
     }
 
-    pub fn remove_tracks_at_positions(&self, playlist_id: i64, positions: &[i64]) -> Result<usize, String> {
+    pub fn remove_tracks_at_positions(
+        &self,
+        playlist_id: i64,
+        positions: &[i64],
+    ) -> Result<usize, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut removed = 0usize;
         for pos in positions {
@@ -141,13 +163,17 @@ impl PlaylistRepo {
 
     pub fn reorder_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
         let conn = self.db.connection().lock().unwrap();
-        conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", params![playlist_id])
-            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?",
+            params![playlist_id],
+        )
+        .map_err(|e| e.to_string())?;
         for (i, tid) in track_ids.iter().enumerate() {
             conn.execute(
                 "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
                 params![playlist_id, tid, i as i64],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -357,7 +383,9 @@ mod tests {
     fn playlist_unicode_name() {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
-        let id = repo.create("Ma playlist preferee", Some("Musique francaise")).unwrap();
+        let id = repo
+            .create("Ma playlist preferee", Some("Musique francaise"))
+            .unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "Ma playlist preferee");
     }

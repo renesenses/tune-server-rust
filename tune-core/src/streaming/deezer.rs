@@ -74,10 +74,7 @@ impl DeezerService {
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["artist"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .into(),
+            artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             album: album["title"].as_str().map(Into::into),
             album_id: album["id"].as_u64().map(|id| id.to_string()),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
@@ -192,7 +189,10 @@ mod tests {
         assert_eq!(track.track_number, Some(8));
         assert_eq!(track.disc_number, Some(1));
         assert!(!track.explicit);
-        assert_eq!(track.cover_path.as_deref(), Some("https://img.deezer.com/cover_big.jpg"));
+        assert_eq!(
+            track.cover_path.as_deref(),
+            Some("https://img.deezer.com/cover_big.jpg")
+        );
     }
 
     #[test]
@@ -529,9 +529,7 @@ impl StreamingService for DeezerService {
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self
-            .api_get(&format!("/album/{album_id}/tracks"))
-            .await?;
+        let data = self.api_get(&format!("/album/{album_id}/tracks")).await?;
         Ok(Self::collect_data(&data, Self::map_track))
     }
 
@@ -559,9 +557,7 @@ impl StreamingService for DeezerService {
     // ── playlist ─────────────────────────────────────────────────────
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
-        let data = self
-            .api_get(&format!("/playlist/{playlist_id}"))
-            .await?;
+        let data = self.api_get(&format!("/playlist/{playlist_id}")).await?;
         Ok(Self::map_playlist(&data))
     }
 
@@ -623,7 +619,11 @@ impl StreamingService for DeezerService {
         Ok(Self::collect_data(&data, Self::map_genre))
     }
 
-    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_genre_albums(
+        &self,
+        genre_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, String> {
         // Deezer editorial endpoint gives albums for a genre
         let data = self
             .api_get(&format!("/editorial/{genre_id}/releases?limit={limit}"))
@@ -632,9 +632,7 @@ impl StreamingService for DeezerService {
             Ok(d) => Ok(Self::collect_data(&d, Self::map_album)),
             Err(_) => {
                 // Fallback: get genre artists then their albums
-                let artists_data = self
-                    .api_get(&format!("/genre/{genre_id}/artists"))
-                    .await?;
+                let artists_data = self.api_get(&format!("/genre/{genre_id}/artists")).await?;
                 let artists = Self::collect_data(&artists_data, Self::map_artist);
                 let mut albums = Vec::new();
                 for artist in artists.iter().take(5) {

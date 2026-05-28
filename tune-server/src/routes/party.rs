@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -29,13 +29,19 @@ fn load_queue(settings: &SettingsRepo) -> Vec<Value> {
 }
 
 fn save_queue(settings: &SettingsRepo, queue: &[Value]) {
-    settings.set("party_queue", &serde_json::to_string(queue).unwrap()).ok();
+    settings
+        .set("party_queue", &serde_json::to_string(queue).unwrap())
+        .ok();
 }
 
 async fn party_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let enabled = settings.get("party_mode")
-        .ok().flatten().map(|v| v == "true").unwrap_or(false);
+    let enabled = settings
+        .get("party_mode")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
     let queue = load_queue(&settings);
     Json(json!({
         "enabled": enabled,
@@ -97,10 +103,7 @@ struct VoteRequest {
     vote: i32,
 }
 
-async fn party_vote(
-    State(state): State<AppState>,
-    Json(body): Json<VoteRequest>,
-) -> Json<Value> {
+async fn party_vote(State(state): State<AppState>, Json(body): Json<VoteRequest>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let mut queue = load_queue(&settings);
     let mut total_votes = 0;
@@ -113,7 +116,10 @@ async fn party_vote(
         }
     }
     queue.sort_by(|a, b| {
-        b["votes"].as_i64().unwrap_or(0).cmp(&a["votes"].as_i64().unwrap_or(0))
+        b["votes"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["votes"].as_i64().unwrap_or(0))
     });
     save_queue(&settings, &queue);
     Json(json!({"track_id": body.track_id, "vote": body.vote, "total_votes": total_votes}))

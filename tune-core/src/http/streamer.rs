@@ -6,7 +6,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::audio::wav::build_wav_header;
@@ -86,7 +86,10 @@ impl AudioStreamer {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StreamSession::new(id.clone(), info, bit_perfect, buffer_size);
         let tx = session.tx.clone();
-        self.sessions.lock().await.insert(id.clone(), Arc::new(session));
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(session));
         info!(stream_id = %id, "stream_session_created");
         (id, tx)
     }
@@ -100,7 +103,10 @@ impl AudioStreamer {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StreamSession::new(id.clone(), info, bit_perfect, 64);
         *session.file_path.lock().await = Some(file_path);
-        self.sessions.lock().await.insert(id.clone(), Arc::new(session));
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(session));
         info!(stream_id = %id, "file_session_created");
         id
     }
@@ -115,7 +121,10 @@ impl AudioStreamer {
         let mut session = StreamSession::new(id.clone(), info, false, 128);
         session.is_radio = is_radio;
         *session.proxy_url.lock().await = Some(upstream_url);
-        self.sessions.lock().await.insert(id.clone(), Arc::new(session));
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(session));
         info!(stream_id = %id, is_radio, "proxy_session_created");
         id
     }
@@ -154,10 +163,16 @@ pub async fn handle_head(
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_str(&session.info.mime_type).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&session.info.mime_type).unwrap(),
+    );
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-    headers.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
 
     if let Some(size) = session.info.file_size {
         headers.insert("Content-Length", HeaderValue::from(size));
@@ -195,8 +210,14 @@ pub async fn handle_stream(
 
     // Chunked streaming mode
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_str(&session.info.mime_type).unwrap());
-    headers.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&session.info.mime_type).unwrap(),
+    );
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
 
     let wants_icy = req_headers
@@ -244,15 +265,27 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
         let range_str = range.replace("bytes=", "");
         let parts: Vec<&str> = range_str.split('-').collect();
         let start: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let end: u64 = parts.get(1).and_then(|s| if s.is_empty() { None } else { s.parse().ok() }).unwrap_or(file_size - 1);
+        let end: u64 = parts
+            .get(1)
+            .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
+            .unwrap_or(file_size - 1);
         let length = end - start + 1;
 
         let mut headers = HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_str(&info.mime_type).unwrap());
+        headers.insert(
+            "Content-Type",
+            HeaderValue::from_str(&info.mime_type).unwrap(),
+        );
         headers.insert("Content-Length", HeaderValue::from(length));
-        headers.insert("Content-Range", HeaderValue::from_str(&format!("bytes {start}-{end}/{file_size}")).unwrap());
+        headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{file_size}")).unwrap(),
+        );
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-        headers.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+        headers.insert(
+            "transferMode.dlna.org",
+            HeaderValue::from_static("Streaming"),
+        );
 
         let path_owned = path.to_string();
         let body = Body::from_stream(async_stream::stream! {
@@ -289,10 +322,16 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
 
     // Full file
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_str(&info.mime_type).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&info.mime_type).unwrap(),
+    );
     headers.insert("Content-Length", HeaderValue::from(file_size));
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-    headers.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
 
     let path_owned = path.to_string();
     let body = Body::from_stream(async_stream::stream! {
@@ -328,7 +367,11 @@ async fn proxy_stream(upstream_url: &str, info: &StreamInfo, is_radio: bool) -> 
     };
 
     let client = reqwest::Client::builder()
-        .timeout(if is_radio { std::time::Duration::from_secs(86400) } else { timeout })
+        .timeout(if is_radio {
+            std::time::Duration::from_secs(86400)
+        } else {
+            timeout
+        })
         .build();
 
     let Ok(client) = client else {
@@ -357,9 +400,15 @@ async fn proxy_stream(upstream_url: &str, info: &StreamInfo, is_radio: bool) -> 
         .and_then(|s| s.parse::<u64>().ok());
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_str(&upstream_content_type).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&upstream_content_type).unwrap(),
+    );
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-    headers.insert("transferMode.dlna.org", HeaderValue::from_static("Streaming"));
+    headers.insert(
+        "transferMode.dlna.org",
+        HeaderValue::from_static("Streaming"),
+    );
     if let Some(cl) = content_length {
         headers.insert("Content-Length", HeaderValue::from(cl));
     }
@@ -383,7 +432,10 @@ async fn proxy_stream(upstream_url: &str, info: &StreamInfo, is_radio: bool) -> 
 
 pub fn router(sessions: SharedSessions) -> axum::Router {
     axum::Router::new()
-        .route("/stream/{stream_id}", axum::routing::get(handle_stream).head(handle_head))
+        .route(
+            "/stream/{stream_id}",
+            axum::routing::get(handle_stream).head(handle_head),
+        )
         .with_state(sessions)
 }
 
@@ -418,7 +470,9 @@ mod tests {
             channels: 2,
             file_size: Some(50_000_000),
         };
-        let id = streamer.create_file_session(info, "/music/test.flac".into(), true).await;
+        let id = streamer
+            .create_file_session(info, "/music/test.flac".into(), true)
+            .await;
         let url = streamer.get_stream_url(&id, "192.168.1.18", "flac");
         assert!(url.contains(".flac"));
         streamer.remove_session(&id).await;
@@ -435,7 +489,9 @@ mod tests {
             channels: 2,
             file_size: None,
         };
-        let id = streamer.create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false).await;
+        let id = streamer
+            .create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false)
+            .await;
         assert!(!id.is_empty());
         streamer.remove_session(&id).await;
     }

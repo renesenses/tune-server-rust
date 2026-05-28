@@ -32,7 +32,9 @@ pub async fn fetch_radio_metadata(station_name: &str, stream_url: &str) -> Optio
     }
 
     // Radio Paradise
-    if stream_url.contains("radioparadise") || station_name.to_lowercase().contains("radio paradise") {
+    if stream_url.contains("radioparadise")
+        || station_name.to_lowercase().contains("radio paradise")
+    {
         let chan = radioparadise_channel(stream_url);
         return fetch_radio_paradise_metadata(station_name, chan).await;
     }
@@ -88,7 +90,11 @@ async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<
         .get("firstLine")
         .and_then(|v| v.get("title").or(Some(v)))
         .and_then(|v| v.as_str())
-        .or_else(|| now.get("song").and_then(|s| s.get("title")).and_then(|v| v.as_str()))
+        .or_else(|| {
+            now.get("song")
+                .and_then(|s| s.get("title"))
+                .and_then(|v| v.as_str())
+        })
         .unwrap_or("")
         .to_string();
 
@@ -144,8 +150,15 @@ async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<
     }
 
     let body: serde_json::Value = resp.json().await.ok()?;
-    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let artist = body.get("artist").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let artist = body
+        .get("artist")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     if title.is_empty() {
         return None;
@@ -282,17 +295,47 @@ mod tests {
 
     #[test]
     fn radiofrance_channel_detection() {
-        assert_eq!(radiofrance_channel_id("FIP", "https://icecast.radiofrance.fr/fip-hifi.aac"), 7);
-        assert_eq!(radiofrance_channel_id("Inter", "https://icecast.radiofrance.fr/franceinter-hifi.aac"), 1);
-        assert_eq!(radiofrance_channel_id("Musique", "https://icecast.radiofrance.fr/francemusique-hifi.aac"), 4);
-        assert_eq!(radiofrance_channel_id("Mouv", "https://icecast.radiofrance.fr/mouv-hifi.aac"), 6);
+        assert_eq!(
+            radiofrance_channel_id("FIP", "https://icecast.radiofrance.fr/fip-hifi.aac"),
+            7
+        );
+        assert_eq!(
+            radiofrance_channel_id(
+                "Inter",
+                "https://icecast.radiofrance.fr/franceinter-hifi.aac"
+            ),
+            1
+        );
+        assert_eq!(
+            radiofrance_channel_id(
+                "Musique",
+                "https://icecast.radiofrance.fr/francemusique-hifi.aac"
+            ),
+            4
+        );
+        assert_eq!(
+            radiofrance_channel_id("Mouv", "https://icecast.radiofrance.fr/mouv-hifi.aac"),
+            6
+        );
     }
 
     #[test]
     fn radioparadise_channel_detection() {
-        assert_eq!(radioparadise_channel("http://stream.radioparadise.com/aac-320"), 0);
-        assert_eq!(radioparadise_channel("http://stream.radioparadise.com/mellow-320"), 1);
-        assert_eq!(radioparadise_channel("http://stream.radioparadise.com/rock-320"), 2);
-        assert_eq!(radioparadise_channel("http://stream.radioparadise.com/world-320"), 3);
+        assert_eq!(
+            radioparadise_channel("http://stream.radioparadise.com/aac-320"),
+            0
+        );
+        assert_eq!(
+            radioparadise_channel("http://stream.radioparadise.com/mellow-320"),
+            1
+        );
+        assert_eq!(
+            radioparadise_channel("http://stream.radioparadise.com/rock-320"),
+            2
+        );
+        assert_eq!(
+            radioparadise_channel("http://stream.radioparadise.com/world-320"),
+            3
+        );
     }
 }

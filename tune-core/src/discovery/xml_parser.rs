@@ -1,5 +1,5 @@
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -33,7 +33,9 @@ impl DeviceDescription {
     }
 
     pub fn is_openhome(&self) -> bool {
-        self.services.iter().any(|s| s.service_type.contains("av-openhome-org"))
+        self.services
+            .iter()
+            .any(|s| s.service_type.contains("av-openhome-org"))
     }
 
     pub fn service_urls(&self) -> HashMap<String, String> {
@@ -57,8 +59,19 @@ impl DeviceDescription {
 
 fn service_key(service_type: &str) -> String {
     let lower = service_type.to_lowercase();
-    for name in ["avtransport", "renderingcontrol", "connectionmanager", "contentdirectory",
-                  "product", "playlist", "transport", "volume", "info", "time", "pins"] {
+    for name in [
+        "avtransport",
+        "renderingcontrol",
+        "connectionmanager",
+        "contentdirectory",
+        "product",
+        "playlist",
+        "transport",
+        "volume",
+        "info",
+        "time",
+        "pins",
+    ] {
         if lower.contains(name) {
             return name.to_string();
         }

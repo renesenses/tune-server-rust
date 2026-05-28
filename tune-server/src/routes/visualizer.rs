@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -83,7 +83,10 @@ async fn set_viz_config(
     }
 
     settings
-        .set("visualizer_config", &serde_json::to_string(&config).unwrap())
+        .set(
+            "visualizer_config",
+            &serde_json::to_string(&config).unwrap(),
+        )
         .ok();
     Json(json!({"saved": true, "config": config}))
 }
@@ -102,7 +105,11 @@ async fn viz_data(State(state): State<AppState>) -> Json<Value> {
             // Simulated spectrum: bass emphasis, mid dip, treble rolloff
             let base = -10.0 - (freq_ratio * 40.0);
             let bass_bump = if freq_ratio < 0.15 { 8.0 } else { 0.0 };
-            let mid_bump = if (0.3..0.5).contains(&freq_ratio) { 3.0 } else { 0.0 };
+            let mid_bump = if (0.3..0.5).contains(&freq_ratio) {
+                3.0
+            } else {
+                0.0
+            };
             (base + bass_bump + mid_bump).max(-60.0).min(0.0)
         })
         .collect();

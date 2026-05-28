@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -66,7 +66,12 @@ impl ProfileRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn update(&self, id: i64, display_name: Option<&str>, avatar_path: Option<&str>) -> Result<(), String> {
+    pub fn update(
+        &self,
+        id: i64,
+        display_name: Option<&str>,
+        avatar_path: Option<&str>,
+    ) -> Result<(), String> {
         self.db.execute(
             "UPDATE profiles SET display_name = COALESCE(?, display_name), avatar_path = COALESCE(?, avatar_path) WHERE id = ?",
             &[&display_name as &dyn rusqlite::types::ToSql, &avatar_path, &id],
@@ -78,27 +83,51 @@ impl ProfileRepo {
         if id == 1 {
             return Err("cannot delete default profile".into());
         }
-        self.db.execute("DELETE FROM profiles WHERE id = ?", &[&id])?;
+        self.db
+            .execute("DELETE FROM profiles WHERE id = ?", &[&id])?;
         Ok(())
     }
 
-    pub fn add_favorite(&self, profile_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
+    pub fn add_favorite(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        item_id: i64,
+    ) -> Result<(), String> {
         self.db.execute(
             "INSERT OR IGNORE INTO favorites (profile_id, item_type, item_id) VALUES (?, ?, ?)",
-            &[&profile_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
+            &[
+                &profile_id as &dyn rusqlite::types::ToSql,
+                &item_type,
+                &item_id,
+            ],
         )?;
         Ok(())
     }
 
-    pub fn remove_favorite(&self, profile_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
+    pub fn remove_favorite(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        item_id: i64,
+    ) -> Result<(), String> {
         self.db.execute(
             "DELETE FROM favorites WHERE profile_id = ? AND item_type = ? AND item_id = ?",
-            &[&profile_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
+            &[
+                &profile_id as &dyn rusqlite::types::ToSql,
+                &item_type,
+                &item_id,
+            ],
         )?;
         Ok(())
     }
 
-    pub fn is_favorite(&self, profile_id: i64, item_type: &str, item_id: i64) -> Result<bool, String> {
+    pub fn is_favorite(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        item_id: i64,
+    ) -> Result<bool, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i32 = conn
             .query_row(
@@ -110,9 +139,15 @@ impl ProfileRepo {
         Ok(count > 0)
     }
 
-    pub fn list_favorites(&self, profile_id: i64, item_type: Option<&str>) -> Result<Vec<Favorite>, String> {
+    pub fn list_favorites(
+        &self,
+        profile_id: i64,
+        item_type: Option<&str>,
+    ) -> Result<Vec<Favorite>, String> {
         let conn = self.db.connection().lock().unwrap();
-        let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) = item_type {
+        let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) =
+            item_type
+        {
             (
                 "SELECT id, profile_id, item_type, item_id, created_at FROM favorites WHERE profile_id = ? AND item_type = ? ORDER BY created_at DESC".into(),
                 vec![Box::new(profile_id), Box::new(t.to_string())],
@@ -124,7 +159,8 @@ impl ProfileRepo {
             )
         };
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|b| b.as_ref()).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|b| b.as_ref()).collect();
         let items = stmt
             .query_map(params.as_slice(), |row| {
                 Ok(Favorite {
@@ -196,7 +232,8 @@ mod tests {
 
         let repo = ProfileRepo::new(db);
         let id = repo.create("alice", Some("Alice")).unwrap();
-        repo.update(id, Some("Alice Updated"), Some("/avatars/alice.png")).unwrap();
+        repo.update(id, Some("Alice Updated"), Some("/avatars/alice.png"))
+            .unwrap();
 
         let p = repo.get(id).unwrap().unwrap();
         assert_eq!(p.display_name.as_deref(), Some("Alice Updated"));

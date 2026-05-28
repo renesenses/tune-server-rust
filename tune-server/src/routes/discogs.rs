@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -41,7 +41,11 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client error: {e}"))
 }
 
-async fn discogs_get(token: Option<&str>, path: &str, params: &[(&str, &str)]) -> Result<Value, (StatusCode, String)> {
+async fn discogs_get(
+    token: Option<&str>,
+    path: &str,
+    params: &[(&str, &str)],
+) -> Result<Value, (StatusCode, String)> {
     let client = http_client().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let url = format!("{DISCOGS_API}{path}");
@@ -193,16 +197,19 @@ async fn discogs_artist_releases(
         params.push(("sort_order", so.clone()));
     }
     let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match discogs_get(token.as_deref(), &format!("/artists/{id}/releases"), &param_refs).await {
+    match discogs_get(
+        token.as_deref(),
+        &format!("/artists/{id}/releases"),
+        &param_refs,
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
 }
 
-async fn discogs_label(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn discogs_label(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let token = discogs_token(&state);
     match discogs_get(token.as_deref(), &format!("/labels/{id}"), &[]).await {
         Ok(data) => Json(data).into_response(),
@@ -220,8 +227,15 @@ async fn discogs_label_releases(
         ("page", q.page.to_string()),
         ("per_page", q.per_page.to_string()),
     ];
-    let param_refs: Vec<(&str, &str)> = params_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match discogs_get(token.as_deref(), &format!("/labels/{id}/releases"), &param_refs).await {
+    let param_refs: Vec<(&str, &str)> =
+        params_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    match discogs_get(
+        token.as_deref(),
+        &format!("/labels/{id}/releases"),
+        &param_refs,
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }

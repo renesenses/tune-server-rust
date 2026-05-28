@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -47,13 +47,14 @@ async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// Send a Play (resume) command to the given Sonos device via its DLNA output.
-async fn play_room(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn play_room(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let outputs = state.outputs.lock().await;
     let Some(output) = outputs.get(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "room not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "room not found"})),
+        )
+            .into_response();
     };
     let output = output.lock().await;
     match output.resume().await {
@@ -63,13 +64,14 @@ async fn play_room(
 }
 
 /// Send a Pause command to the given Sonos device via its DLNA output.
-async fn pause_room(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn pause_room(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let outputs = state.outputs.lock().await;
     let Some(output) = outputs.get(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "room not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "room not found"})),
+        )
+            .into_response();
     };
     let output = output.lock().await;
     match output.pause().await {
@@ -92,7 +94,11 @@ async fn set_room_volume(
 ) -> impl IntoResponse {
     let outputs = state.outputs.lock().await;
     let Some(output) = outputs.get(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "room not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "room not found"})),
+        )
+            .into_response();
     };
     let output = output.lock().await;
     match output.set_volume(body.volume).await {
@@ -108,10 +114,7 @@ struct GroupBody {
 
 /// Group rooms together. This is a placeholder -- real Sonos grouping
 /// requires the Sonos-specific household/group API or UPnP group rendering.
-async fn group_rooms(
-    Path(id): Path<String>,
-    Json(body): Json<GroupBody>,
-) -> Json<Value> {
+async fn group_rooms(Path(id): Path<String>, Json(body): Json<GroupBody>) -> Json<Value> {
     Json(json!({
         "coordinator": id,
         "members": body.room_ids,

@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -14,7 +14,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(cal_status))
         .route("/profiles", get(list_cal_profiles).post(create_cal_profile))
-        .route("/profiles/{id}", get(get_cal_profile).delete(delete_cal_profile))
+        .route(
+            "/profiles/{id}",
+            get(get_cal_profile).delete(delete_cal_profile),
+        )
         .route("/profiles/{id}/activate", post(activate_cal_profile))
         .route("/measure", post(start_measurement))
         .route("/measure/status", get(measurement_status))
@@ -33,7 +36,10 @@ fn load_profiles(state: &AppState) -> Vec<Value> {
 fn save_profiles(state: &AppState, profiles: &[Value]) {
     let settings = SettingsRepo::new(state.db.clone());
     settings
-        .set("room_cal_profiles", &serde_json::to_string(profiles).unwrap())
+        .set(
+            "room_cal_profiles",
+            &serde_json::to_string(profiles).unwrap(),
+        )
         .ok();
 }
 
@@ -43,9 +49,9 @@ async fn cal_status(State(state): State<AppState>) -> Json<Value> {
     let profiles = load_profiles(&state);
     let active_id = settings.get("room_cal_active_profile").ok().flatten();
 
-    let active_profile = active_id.as_ref().and_then(|id| {
-        profiles.iter().find(|p| p["id"].as_str() == Some(id))
-    });
+    let active_profile = active_id
+        .as_ref()
+        .and_then(|id| profiles.iter().find(|p| p["id"].as_str() == Some(id)));
 
     Json(json!({
         "available": true,
@@ -223,7 +229,10 @@ async fn start_measurement(
     });
 
     settings
-        .set("room_cal_measurement", &serde_json::to_string(&measurement).unwrap())
+        .set(
+            "room_cal_measurement",
+            &serde_json::to_string(&measurement).unwrap(),
+        )
         .ok();
 
     Json(measurement).into_response()

@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -41,7 +41,10 @@ impl TagRepo {
     pub fn create(&self, name: &str, color: Option<&str>) -> Result<i64, String> {
         self.db.execute(
             "INSERT INTO tags (name, color) VALUES (?, ?)",
-            &[&name as &dyn rusqlite::types::ToSql, &color.unwrap_or("#808080")],
+            &[
+                &name as &dyn rusqlite::types::ToSql,
+                &color.unwrap_or("#808080"),
+            ],
         )?;
         Ok(self.db.last_insert_rowid())
     }
@@ -121,7 +124,9 @@ impl TagRepo {
     pub fn items_by_tag(&self, tag_id: i64, item_type: &str) -> Result<Vec<i64>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT item_id FROM item_tags WHERE tag_id = ? AND item_type = ? ORDER BY item_id")
+            .prepare(
+                "SELECT item_id FROM item_tags WHERE tag_id = ? AND item_type = ? ORDER BY item_id",
+            )
             .map_err(|e| e.to_string())?;
         let ids = stmt
             .query_map(params![tag_id, item_type], |row| row.get(0))
@@ -194,7 +199,8 @@ mod tests {
         let repo = TagRepo::new(db);
         let id = repo.create("Rock", Some("#FF0000")).unwrap();
 
-        repo.update(id, Some("Rock & Roll"), Some("#00FF00")).unwrap();
+        repo.update(id, Some("Rock & Roll"), Some("#00FF00"))
+            .unwrap();
         let tag = repo.get(id).unwrap().unwrap();
         assert_eq!(tag.name, "Rock & Roll");
         assert_eq!(tag.color, "#00FF00");

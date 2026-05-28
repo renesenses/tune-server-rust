@@ -3,7 +3,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rusqlite::params;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::radio_repo::RadioRepo;
@@ -132,10 +132,7 @@ fn fetch_continue_listening(state: &AppState, limit: i64) -> Vec<Value> {
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
-async fn recently_added(
-    State(state): State<AppState>,
-    Query(p): Query<HomeParams>,
-) -> Json<Value> {
+async fn recently_added(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let items = fetch_recently_added(&state, limit);
     Json(json!(items))
@@ -263,10 +260,13 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-        top_genres.into_iter().map(|g| Box::new(g) as Box<dyn rusqlite::types::ToSql>).collect();
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = top_genres
+        .into_iter()
+        .map(|g| Box::new(g) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
     param_values.push(Box::new(limit));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
 
     stmt.query_map(param_refs.as_slice(), |row| {
         Ok(json!({
@@ -361,10 +361,7 @@ async fn top_mixes(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// Tracks added in the last scan (newest by file_mtime, recent imports).
-async fn new_in_library(
-    State(state): State<AppState>,
-    Query(p): Query<HomeParams>,
-) -> Json<Value> {
+async fn new_in_library(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(30);
     let conn = state.db.connection().lock().unwrap();
     let sql = "\

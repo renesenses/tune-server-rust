@@ -41,8 +41,8 @@ rust_cast = "0.21"
 sha2 = "0.10"
 
 [profile.release]
-opt-level = 3
-lto = false
+opt-level = "z"
+lto = true
 strip = true
-codegen-units = 4
+codegen-units = 1
 panic = "abort"

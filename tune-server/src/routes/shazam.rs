@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -35,7 +35,11 @@ async fn recognize_audio(
     State(state): State<AppState>,
     Json(body): Json<RecognizeBody>,
 ) -> impl IntoResponse {
-    let has_audio = body.audio_data.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
+    let has_audio = body
+        .audio_data
+        .as_ref()
+        .map(|d| !d.is_empty())
+        .unwrap_or(false);
 
     if !has_audio {
         return (

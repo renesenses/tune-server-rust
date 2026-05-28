@@ -103,13 +103,18 @@ pub trait StreamingService: Send + Sync {
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
 
-    async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String>;
+    async fn authenticate(&mut self, credentials: &serde_json::Value)
+    -> Result<AuthStatus, String>;
     async fn auth_status(&self) -> AuthStatus;
     async fn logout(&mut self) -> Result<(), String>;
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String>;
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String>;
-    async fn get_track_url(&self, track_id: &str, quality: Option<&str>) -> Result<StreamUrl, String>;
+    async fn get_track_url(
+        &self,
+        track_id: &str,
+        quality: Option<&str>,
+    ) -> Result<StreamUrl, String>;
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String>;
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String>;
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String>;
@@ -138,7 +143,11 @@ pub trait StreamingService: Send + Sync {
     async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
         Ok(vec![])
     }
-    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_genre_albums(
+        &self,
+        genre_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, String> {
         let _ = (genre_id, limit);
         Ok(vec![])
     }

@@ -64,11 +64,17 @@ impl ArtistRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn get_or_create(&self, name: &str, musicbrainz_id: Option<&str>, sort_name: Option<&str>) -> Result<Artist, String> {
+    pub fn get_or_create(
+        &self,
+        name: &str,
+        musicbrainz_id: Option<&str>,
+        sort_name: Option<&str>,
+    ) -> Result<Artist, String> {
         if let Some(mbid) = musicbrainz_id
-            && let Some(artist) = self.get_by_musicbrainz_id(mbid)? {
-                return Ok(artist);
-            }
+            && let Some(artist) = self.get_by_musicbrainz_id(mbid)?
+        {
+            return Ok(artist);
+        }
         if let Some(artist) = self.get_by_name(name)? {
             return Ok(artist);
         }
@@ -99,7 +105,8 @@ impl ArtistRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM artists WHERE id = ?", &[&id])?;
+        self.db
+            .execute("DELETE FROM artists WHERE id = ?", &[&id])?;
         Ok(())
     }
 
@@ -130,7 +137,9 @@ impl ArtistRepo {
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?) OR name LIKE ? COLLATE NOCASE LIMIT ?")
             .map_err(|e| e.to_string())?;
         let artists = stmt
-            .query_map(params![fts_query, like, limit], |row| Ok(row_to_artist(row)))
+            .query_map(params![fts_query, like, limit], |row| {
+                Ok(row_to_artist(row))
+            })
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
@@ -270,7 +279,9 @@ mod tests {
         artist.musicbrainz_id = Some("561d854a-6a28-4aa7-8c99-323e6ce46c2a".into());
         repo.create(&artist).unwrap();
 
-        let found = repo.get_by_musicbrainz_id("561d854a-6a28-4aa7-8c99-323e6ce46c2a").unwrap();
+        let found = repo
+            .get_by_musicbrainz_id("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
+            .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "Miles Davis");
     }
@@ -280,8 +291,12 @@ mod tests {
         let db = test_db();
         let repo = ArtistRepo::new(db);
 
-        let a1 = repo.get_or_create("Miles Davis", Some("mbid-123"), None).unwrap();
-        let a2 = repo.get_or_create("Miles Davis", Some("mbid-123"), None).unwrap();
+        let a1 = repo
+            .get_or_create("Miles Davis", Some("mbid-123"), None)
+            .unwrap();
+        let a2 = repo
+            .get_or_create("Miles Davis", Some("mbid-123"), None)
+            .unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
     }
@@ -291,7 +306,9 @@ mod tests {
         let db = test_db();
         let repo = ArtistRepo::new(db);
 
-        let a = repo.get_or_create("The Beatles", None, Some("Beatles, The")).unwrap();
+        let a = repo
+            .get_or_create("The Beatles", None, Some("Beatles, The"))
+            .unwrap();
         assert_eq!(a.sort_name.as_deref(), Some("Beatles, The"));
     }
 

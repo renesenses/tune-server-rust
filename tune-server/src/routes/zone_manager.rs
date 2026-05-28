@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
@@ -17,13 +17,22 @@ pub fn router() -> Router<AppState> {
         .route("/zones", get(list_managed_zones))
         .route("/zones/{id}/hot-swap", post(hot_swap_zone))
         .route("/groups", get(list_groups).post(create_group))
-        .route("/groups/{id}", axum::routing::patch(update_group).delete(delete_group))
+        .route(
+            "/groups/{id}",
+            axum::routing::patch(update_group).delete(delete_group),
+        )
         .route("/groups/{id}/volume", post(group_volume))
         .route("/groups/{id}/calibrate", post(calibrate_group))
         .route("/groups/{id}/gapless", get(gapless_config))
         .route("/groups/{id}/health", get(group_health))
-        .route("/profiles", get(list_zone_profiles).post(create_zone_profile))
-        .route("/profiles/{id}", axum::routing::put(update_zone_profile).delete(delete_zone_profile))
+        .route(
+            "/profiles",
+            get(list_zone_profiles).post(create_zone_profile),
+        )
+        .route(
+            "/profiles/{id}",
+            axum::routing::put(update_zone_profile).delete(delete_zone_profile),
+        )
         .route("/profiles/{id}/activate", post(activate_zone_profile))
         .route("/sync/stats", get(sync_stats))
         .route("/measure-latency", post(measure_latency))
@@ -44,7 +53,10 @@ fn load_json_setting(settings: &SettingsRepo, key: &str) -> Vec<Value> {
 
 fn save_json_setting(settings: &SettingsRepo, key: &str, data: &[Value]) {
     settings
-        .set(key, &serde_json::to_string(data).unwrap_or_else(|_| "[]".into()))
+        .set(
+            key,
+            &serde_json::to_string(data).unwrap_or_else(|_| "[]".into()),
+        )
         .ok();
 }
 
@@ -296,10 +308,7 @@ async fn update_group(
     }
 }
 
-async fn delete_group(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_group(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db);
     let mut groups = load_json_setting(&settings, "zone_groups");
     let before = groups.len();
@@ -334,9 +343,9 @@ async fn group_volume(
         .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(id));
     match idx {
         Some(i) => {
-            let master = body.master_volume.unwrap_or(
-                groups[i]["master_volume"].as_f64().unwrap_or(0.5),
-            );
+            let master = body
+                .master_volume
+                .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5));
             groups[i]["master_volume"] = json!(master);
             if let Some(ref offsets) = body.offsets {
                 groups[i]["offsets"] = json!(offsets);
@@ -359,10 +368,7 @@ async fn group_volume(
                 let effective = (master + offset).clamp(0.0, 1.0);
                 let vol_int = (effective * 100.0) as i32;
                 repo.update_volume(*zid, vol_int).ok();
-                state
-                    .orchestrator
-                    .set_volume(*zid, effective, None)
-                    .await;
+                state.orchestrator.set_volume(*zid, effective, None).await;
             }
 
             Json(json!({"group_id": id, "master_volume": master})).into_response()
@@ -395,10 +401,7 @@ async fn calibrate_group(
             let outputs = state.outputs.lock().await;
             let mut latencies = Vec::new();
             for zid in &zone_ids {
-                let zone = ZoneRepo::new(state.db.clone())
-                    .get(*zid)
-                    .ok()
-                    .flatten();
+                let zone = ZoneRepo::new(state.db.clone()).get(*zid).ok().flatten();
                 if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
                     if let Some(output) = outputs.get(device_id) {
                         let output = output.lock().await;
@@ -508,8 +511,8 @@ async fn group_health(
                 let name = zone
                     .map(|z| z.name)
                     .unwrap_or_else(|| format!("Zone {zid}"));
-                let online = ps.state != tune_core::playback::PlayState::Stopped
-                    || ps.now_playing.is_some();
+                let online =
+                    ps.state != tune_core::playback::PlayState::Stopped || ps.now_playing.is_some();
                 zones_health.push(json!({
                     "zone_id": zid,
                     "name": name,
@@ -713,9 +716,7 @@ async fn activate_zone_profile(
     save_json_setting(&settings, "zone_profiles", &profiles);
 
     // Store active profile id
-    settings
-        .set("active_zone_profile_id", &id.to_string())
-        .ok();
+    settings.set("active_zone_profile_id", &id.to_string()).ok();
 
     Json(json!({
         "profile_id": id,

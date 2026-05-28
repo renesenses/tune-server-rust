@@ -143,11 +143,19 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?;
 
         let total_duration_ms: i64 = conn
-            .query_row("SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history", [], |row| row.get(0))
+            .query_row(
+                "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| e.to_string())?;
 
         let unique_tracks: i64 = conn
-            .query_row("SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| e.to_string())?;
 
         let unique_artists: i64 = conn
@@ -228,16 +236,16 @@ impl HistoryRepo {
             .ok()
             .flatten()
         } else {
-            conn.query_row("SELECT MIN(listened_at) FROM listen_history", [], |row| row.get(0))
-                .ok()
-                .flatten()
+            conn.query_row("SELECT MIN(listened_at) FROM listen_history", [], |row| {
+                row.get(0)
+            })
+            .ok()
+            .flatten()
         };
         let to: String = conn
-            .query_row(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| e.to_string())?;
 
         // ── Totals ──
@@ -263,7 +271,11 @@ impl HistoryRepo {
                      FROM listen_history
                      {simple_where} {and_or} artist_name IS NOT NULL
                      GROUP BY artist_name ORDER BY plays DESC LIMIT ?",
-                    and_or = if simple_where.is_empty() { "WHERE" } else { "AND" },
+                    and_or = if simple_where.is_empty() {
+                        "WHERE"
+                    } else {
+                        "AND"
+                    },
                 ))
                 .map_err(|e| e.to_string())?;
             stmt.query_map(params![top_n], |row| {
@@ -288,7 +300,11 @@ impl HistoryRepo {
                      {where_clause} {and_or} h.album_title IS NOT NULL
                      GROUP BY h.album_title, h.artist_name
                      ORDER BY plays DESC LIMIT ?",
-                    and_or = if where_clause.is_empty() { "WHERE" } else { "AND" },
+                    and_or = if where_clause.is_empty() {
+                        "WHERE"
+                    } else {
+                        "AND"
+                    },
                 ))
                 .map_err(|e| e.to_string())?;
             stmt.query_map(params![top_n], |row| {
@@ -442,9 +458,20 @@ impl HistoryRepo {
                     simple_where_inner = if simple_conditions.is_empty() {
                         String::new()
                     } else {
-                        format!("WHERE {}", simple_conditions.iter().map(|c| format!("lh.{c}")).collect::<Vec<_>>().join(" AND "))
+                        format!(
+                            "WHERE {}",
+                            simple_conditions
+                                .iter()
+                                .map(|c| format!("lh.{c}"))
+                                .collect::<Vec<_>>()
+                                .join(" AND ")
+                        )
                     },
-                    and_or_inner = if simple_conditions.is_empty() { "WHERE" } else { "AND" },
+                    and_or_inner = if simple_conditions.is_empty() {
+                        "WHERE"
+                    } else {
+                        "AND"
+                    },
                 ),
                 [],
                 |row| {
@@ -641,19 +668,31 @@ mod tests {
 
         for _ in 0..5 {
             repo.record(&ListenRecord {
-                id: None, track_id: None, title: "Song A".into(),
+                id: None,
+                track_id: None,
+                title: "Song A".into(),
                 artist_name: Some("Miles Davis".into()),
-                album_title: None, source: "local".into(),
-                duration_ms: 300_000, listened_at: None, zone_id: None,
-            }).unwrap();
+                album_title: None,
+                source: "local".into(),
+                duration_ms: 300_000,
+                listened_at: None,
+                zone_id: None,
+            })
+            .unwrap();
         }
         for _ in 0..3 {
             repo.record(&ListenRecord {
-                id: None, track_id: None, title: "Song B".into(),
+                id: None,
+                track_id: None,
+                title: "Song B".into(),
                 artist_name: Some("Coltrane".into()),
-                album_title: None, source: "local".into(),
-                duration_ms: 400_000, listened_at: None, zone_id: None,
-            }).unwrap();
+                album_title: None,
+                source: "local".into(),
+                duration_ms: 400_000,
+                listened_at: None,
+                zone_id: None,
+            })
+            .unwrap();
         }
 
         let top = repo.top_artists(10).unwrap();
@@ -674,12 +713,17 @@ mod tests {
 
         for _ in 0..3 {
             repo.record(&ListenRecord {
-                id: None, track_id: None, title: "Track".into(),
+                id: None,
+                track_id: None,
+                title: "Track".into(),
                 artist_name: Some("Miles".into()),
                 album_title: Some("Kind of Blue".into()),
-                source: "local".into(), duration_ms: 300_000,
-                listened_at: None, zone_id: None,
-            }).unwrap();
+                source: "local".into(),
+                duration_ms: 300_000,
+                listened_at: None,
+                zone_id: None,
+            })
+            .unwrap();
         }
 
         let top = repo.top_albums(10).unwrap();
@@ -698,11 +742,17 @@ mod tests {
         assert_eq!(repo.count().unwrap(), 0);
 
         repo.record(&ListenRecord {
-            id: None, track_id: None, title: "A".into(),
-            artist_name: None, album_title: None,
-            source: "local".into(), duration_ms: 0,
-            listened_at: None, zone_id: None,
-        }).unwrap();
+            id: None,
+            track_id: None,
+            title: "A".into(),
+            artist_name: None,
+            album_title: None,
+            source: "local".into(),
+            duration_ms: 0,
+            listened_at: None,
+            zone_id: None,
+        })
+        .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
     }
 
@@ -714,17 +764,29 @@ mod tests {
 
         let repo = HistoryRepo::new(db);
         repo.record(&ListenRecord {
-            id: None, track_id: None, title: "A".into(),
-            artist_name: Some("X".into()), album_title: None,
-            source: "local".into(), duration_ms: 300_000,
-            listened_at: None, zone_id: None,
-        }).unwrap();
+            id: None,
+            track_id: None,
+            title: "A".into(),
+            artist_name: Some("X".into()),
+            album_title: None,
+            source: "local".into(),
+            duration_ms: 300_000,
+            listened_at: None,
+            zone_id: None,
+        })
+        .unwrap();
         repo.record(&ListenRecord {
-            id: None, track_id: None, title: "B".into(),
-            artist_name: Some("Y".into()), album_title: None,
-            source: "tidal".into(), duration_ms: 200_000,
-            listened_at: None, zone_id: None,
-        }).unwrap();
+            id: None,
+            track_id: None,
+            title: "B".into(),
+            artist_name: Some("Y".into()),
+            album_title: None,
+            source: "tidal".into(),
+            duration_ms: 200_000,
+            listened_at: None,
+            zone_id: None,
+        })
+        .unwrap();
 
         let dash = repo.dashboard().unwrap();
         assert_eq!(dash.total_duration_ms, 500_000);
@@ -741,11 +803,17 @@ mod tests {
         let repo = HistoryRepo::new(db);
         for title in ["First", "Second", "Third"] {
             repo.record(&ListenRecord {
-                id: None, track_id: None, title: title.into(),
-                artist_name: None, album_title: None,
-                source: "local".into(), duration_ms: 0,
-                listened_at: None, zone_id: None,
-            }).unwrap();
+                id: None,
+                track_id: None,
+                title: title.into(),
+                artist_name: None,
+                album_title: None,
+                source: "local".into(),
+                duration_ms: 0,
+                listened_at: None,
+                zone_id: None,
+            })
+            .unwrap();
         }
 
         let recent = repo.recent(10).unwrap();
@@ -760,15 +828,22 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         // Create a zone for the foreign key
-        db.execute("INSERT INTO zones (name) VALUES ('Main')", &[]).unwrap();
+        db.execute("INSERT INTO zones (name) VALUES ('Main')", &[])
+            .unwrap();
 
         let repo = HistoryRepo::new(db);
         repo.record(&ListenRecord {
-            id: None, track_id: None, title: "Test".into(),
-            artist_name: None, album_title: None,
-            source: "local".into(), duration_ms: 100_000,
-            listened_at: None, zone_id: Some(1),
-        }).unwrap();
+            id: None,
+            track_id: None,
+            title: "Test".into(),
+            artist_name: None,
+            album_title: None,
+            source: "local".into(),
+            duration_ms: 100_000,
+            listened_at: None,
+            zone_id: Some(1),
+        })
+        .unwrap();
 
         let recent = repo.recent(1).unwrap();
         assert_eq!(recent[0].zone_id, Some(1));

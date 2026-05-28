@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -50,10 +50,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     Json(json!(plugins))
 }
 
-async fn get_plugin(
-    Path(name): Path<String>,
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("plugin_{name}_installed");
     let installed = settings
@@ -79,20 +76,14 @@ async fn get_plugin(
     }))
 }
 
-async fn enable_plugin(
-    Path(name): Path<String>,
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
     Json(json!({ "name": name, "enabled": true }))
 }
 
-async fn disable_plugin(
-    Path(name): Path<String>,
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
@@ -119,10 +110,7 @@ async fn install_plugin(
     Json(json!({ "name": name, "status": "installed" }))
 }
 
-async fn update_plugin(
-    Path(name): Path<String>,
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn update_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // Stub: Rust server doesn't use pip. Track state in settings.
     let settings = SettingsRepo::new(state.db);
     let key = format!("plugin_{name}_installed");

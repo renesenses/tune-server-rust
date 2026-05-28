@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
@@ -125,7 +125,9 @@ impl OutputTarget for LocalOutput {
             } else {
                 host.output_devices().ok().and_then(|mut devs| {
                     devs.find(|d| {
-                        d.name().map(|n| n == device_name || n.contains(&device_name)).unwrap_or(false)
+                        d.name()
+                            .map(|n| n == device_name || n.contains(&device_name))
+                            .unwrap_or(false)
                     })
                 })
             };
@@ -213,7 +215,8 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        self.volume.store((volume.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::SeqCst);
+        self.volume
+            .store((volume.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::SeqCst);
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{debug, info, warn};
 
 use crate::db::sqlite::SqliteDb;
@@ -70,18 +70,25 @@ impl PositionPoller {
 
         // Also poll stopped zones to detect externally-started playback and sync volume
         let all_zones = crate::db::zone_repo::ZoneRepo::new(self.db.clone())
-            .list().unwrap_or_default();
+            .list()
+            .unwrap_or_default();
 
         for zone in &all_zones {
             let zone_id = zone.id.unwrap_or(0);
-            if zone_id == 0 { continue; }
+            if zone_id == 0 {
+                continue;
+            }
             let device_id = match zone.output_device_id.as_deref() {
                 Some(id) if !id.is_empty() => id.to_string(),
                 _ => continue,
             };
 
-            let in_states = states.iter().any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
-            if in_states { continue; } // already handled below
+            let in_states = states
+                .iter()
+                .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+            if in_states {
+                continue;
+            } // already handled below
 
             let status = {
                 let outputs = self.outputs.lock().await;
@@ -100,11 +107,15 @@ impl PositionPoller {
             if status.volume > 0.001 {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
-                crate::db::zone_repo::ZoneRepo::new(self.db.clone()).update_volume(zone_id, vol_int).ok();
+                crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+                    .update_volume(zone_id, vol_int)
+                    .ok();
             }
 
             // Recover playing state from device (only if not already playing in memory)
-            let already_playing = states.iter().any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
+            let already_playing = states
+                .iter()
+                .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
             if status.state == TransportState::Playing && !already_playing {
                 let np = crate::playback::NowPlaying {
                     track_id: None,
@@ -156,7 +167,9 @@ impl PositionPoller {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 let db = self.db.clone();
-                crate::db::zone_repo::ZoneRepo::new(db).update_volume(zone_id, vol_int).ok();
+                crate::db::zone_repo::ZoneRepo::new(db)
+                    .update_volume(zone_id, vol_int)
+                    .ok();
             }
             self.playback
                 .emit_position(zone_id, status.position_ms as i64);
@@ -170,19 +183,28 @@ impl PositionPoller {
             if is_radio {
                 let should_poll = poll_states
                     .get(&zone_id)
-                    .map(|ps| ps.last_radio_poll.elapsed() > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS))
+                    .map(|ps| {
+                        ps.last_radio_poll.elapsed()
+                            > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS)
+                    })
                     .unwrap_or(true);
 
                 if should_poll {
                     if let Some(ref np) = zone_state.now_playing {
                         if let Some(ref source_id) = np.source_id {
                             if let Ok(sid) = source_id.parse::<i64>() {
-                                let radio_repo = crate::db::radio_repo::RadioRepo::new(self.db.clone());
+                                let radio_repo =
+                                    crate::db::radio_repo::RadioRepo::new(self.db.clone());
                                 if let Ok(Some(station)) = radio_repo.get(sid) {
-                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(&station.name, &station.url).await {
+                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
+                                        &station.name,
+                                        &station.url,
+                                    )
+                                    .await
+                                    {
                                         // Only update if the metadata actually changed
-                                        let title_changed = np.title != meta.title
-                                            || np.artist_name != meta.artist;
+                                        let title_changed =
+                                            np.title != meta.title || np.artist_name != meta.artist;
                                         if title_changed {
                                             let new_np = crate::playback::NowPlaying {
                                                 track_id: None,
@@ -233,9 +255,7 @@ impl PositionPoller {
                         .map(|np| np.duration_ms as u64)
                         .unwrap_or(0);
 
-                    if ps.gapless_sent
-                        && track_duration > 0
-                        && status.duration_ms != track_duration
+                    if ps.gapless_sent && track_duration > 0 && status.duration_ms != track_duration
                     {
                         info!(zone_id, "gapless_transition_detected");
                         ps.gapless_sent = false;
@@ -244,8 +264,7 @@ impl PositionPoller {
                         && status.duration_ms > GAPLESS_WINDOW_MS
                         && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
                     {
-                        self.prepare_gapless(zone_id, zone_state, &device_id)
-                            .await;
+                        self.prepare_gapless(zone_id, zone_state, &device_id).await;
                         ps.gapless_sent = true;
                     }
                 }
@@ -256,20 +275,14 @@ impl PositionPoller {
         }
     }
 
-    async fn handle_track_end(
-        &self,
-        zone_id: i64,
-        zone_state: &crate::playback::ZoneState,
-    ) {
+    async fn handle_track_end(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
         let device_id = self.get_zone_device_id(zone_id);
 
         let next_pos = match zone_state.repeat {
             RepeatMode::One => zone_state.queue_position,
             RepeatMode::All => {
                 if zone_state.queue_length == 0 {
-                    self.orchestrator
-                        .stop(zone_id, device_id.as_deref())
-                        .await;
+                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
                     return;
                 }
                 (zone_state.queue_position + 1) % zone_state.queue_length
@@ -278,9 +291,7 @@ impl PositionPoller {
                 let next = zone_state.queue_position + 1;
                 if next >= zone_state.queue_length {
                     info!(zone_id, "queue_ended");
-                    self.orchestrator
-                        .stop(zone_id, device_id.as_deref())
-                        .await;
+                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
                     return;
                 }
                 next
@@ -290,9 +301,7 @@ impl PositionPoller {
         info!(zone_id, next_pos, "auto_next");
         if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
             warn!(zone_id, error = %e, "auto_next_failed");
-            self.orchestrator
-                .stop(zone_id, device_id.as_deref())
-                .await;
+            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
         }
     }
 
@@ -304,9 +313,7 @@ impl PositionPoller {
     ) {
         let next_pos = match zone_state.repeat {
             RepeatMode::One => zone_state.queue_position,
-            RepeatMode::All => {
-                (zone_state.queue_position + 1) % zone_state.queue_length.max(1)
-            }
+            RepeatMode::All => (zone_state.queue_position + 1) % zone_state.queue_length.max(1),
             RepeatMode::Off => {
                 let next = zone_state.queue_position + 1;
                 if next >= zone_state.queue_length {

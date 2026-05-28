@@ -60,9 +60,7 @@ impl OutputTarget for ChromecastOutput {
 
             let app = device
                 .receiver
-                .launch_app(
-                    &rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver,
-                )
+                .launch_app(&rust_cast::channels::receiver::CastDeviceApp::DefaultMediaReceiver)
                 .map_err(|e| format!("launch app: {e}"))?;
 
             device
@@ -109,9 +107,8 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -147,9 +144,8 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -185,9 +181,8 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -213,9 +208,8 @@ impl OutputTarget for ChromecastOutput {
         let port = self.port;
         let position_secs = position_ms as f32 / 1000.0;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -256,9 +250,8 @@ impl OutputTarget for ChromecastOutput {
         let port = self.port;
         let level = volume as f32;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -280,9 +273,8 @@ impl OutputTarget for ChromecastOutput {
         let host = self.host.clone();
         let port = self.port;
         tokio::task::spawn_blocking(move || {
-            let device =
-                rust_cast::CastDevice::connect_without_host_verification(&host, port)
-                    .map_err(|e| format!("connect: {e}"))?;
+            let device = rust_cast::CastDevice::connect_without_host_verification(&host, port)
+                .map_err(|e| format!("connect: {e}"))?;
             device
                 .connection
                 .connect("receiver-0")
@@ -344,7 +336,7 @@ impl OutputTarget for ChromecastOutput {
                         volume,
                         muted,
                         ..Default::default()
-                    })
+                    });
                 }
             };
 
@@ -359,13 +351,14 @@ impl OutputTarget for ChromecastOutput {
             let state = match entry.player_state {
                 rust_cast::channels::media::PlayerState::Playing => TransportState::Playing,
                 rust_cast::channels::media::PlayerState::Paused => TransportState::Paused,
-                rust_cast::channels::media::PlayerState::Buffering => {
-                    TransportState::Transitioning
-                }
+                rust_cast::channels::media::PlayerState::Buffering => TransportState::Transitioning,
                 _ => TransportState::Stopped,
             };
 
-            let position_ms = entry.current_time.map(|t| (t as f64 * 1000.0) as u64).unwrap_or(0);
+            let position_ms = entry
+                .current_time
+                .map(|t| (t as f64 * 1000.0) as u64)
+                .unwrap_or(0);
             let duration_ms = entry
                 .media
                 .as_ref()
@@ -373,10 +366,7 @@ impl OutputTarget for ChromecastOutput {
                 .map(|d| (d * 1000.0) as u64)
                 .unwrap_or(0);
 
-            let current_uri = entry
-                .media
-                .as_ref()
-                .map(|m| m.content_id.clone());
+            let current_uri = entry.media.as_ref().map(|m| m.content_id.clone());
 
             Ok(OutputStatus {
                 state,

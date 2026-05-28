@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use serde::Deserialize;
+use std::collections::HashMap;
 use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,10 +51,7 @@ impl TuneConfig {
     pub fn load() -> Self {
         let mut config = Self::default();
 
-        let mut search_paths = vec![
-            "tune.toml".to_string(),
-            "/etc/tune/tune.toml".to_string(),
-        ];
+        let mut search_paths = vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
         #[cfg(target_os = "windows")]
         if let Ok(appdata) = std::env::var("APPDATA") {
             search_paths.insert(0, format!("{appdata}\\Tune\\tune.toml"));
@@ -66,22 +63,44 @@ impl TuneConfig {
 
         for path in &search_paths {
             if let Ok(content) = std::fs::read_to_string(path)
-                && let Ok(file_config) = toml::from_str::<TuneConfig>(&content) {
-                    info!(path, "config_loaded");
-                    config = file_config;
-                    break;
-                }
+                && let Ok(file_config) = toml::from_str::<TuneConfig>(&content)
+            {
+                info!(path, "config_loaded");
+                config = file_config;
+                break;
+            }
         }
 
         if let Ok(v) = std::env::var("TUNE_PORT")
-            && let Ok(p) = v.parse() { config.port = p; }
-        if let Ok(v) = std::env::var("TUNE_DB_PATH") { config.db_path = v; }
-        if let Ok(v) = std::env::var("TUNE_WEB_DIR") { config.web_dir = v; }
-        if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") { config.artwork_dir = v; }
-        if let Ok(v) = std::env::var("TUNE_AUTO_SCAN") { config.auto_scan = v == "true"; }
-        if let Ok(v) = std::env::var("QOBUZ_APP_ID") && !v.is_empty() { config.qobuz_app_id = v; }
-        if let Ok(v) = std::env::var("QOBUZ_APP_SECRET") && !v.is_empty() { config.qobuz_app_secret = v; }
-        if let Ok(v) = std::env::var("TUNE_LOG_LEVEL") { config.log_level = v; }
+            && let Ok(p) = v.parse()
+        {
+            config.port = p;
+        }
+        if let Ok(v) = std::env::var("TUNE_DB_PATH") {
+            config.db_path = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_WEB_DIR") {
+            config.web_dir = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
+            config.artwork_dir = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_AUTO_SCAN") {
+            config.auto_scan = v == "true";
+        }
+        if let Ok(v) = std::env::var("QOBUZ_APP_ID")
+            && !v.is_empty()
+        {
+            config.qobuz_app_id = v;
+        }
+        if let Ok(v) = std::env::var("QOBUZ_APP_SECRET")
+            && !v.is_empty()
+        {
+            config.qobuz_app_secret = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_LOG_LEVEL") {
+            config.log_level = v;
+        }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
             if trimmed.starts_with('[') {
@@ -89,10 +108,22 @@ impl TuneConfig {
                 if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
                     config.music_dirs = parsed;
                 } else {
-                    config.music_dirs = trimmed.split(',').map(|s| s.trim().trim_matches(|c| c == '[' || c == ']' || c == '"').to_string()).filter(|s| !s.is_empty()).collect();
+                    config.music_dirs = trimmed
+                        .split(',')
+                        .map(|s| {
+                            s.trim()
+                                .trim_matches(|c| c == '[' || c == ']' || c == '"')
+                                .to_string()
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             } else {
-                config.music_dirs = trimmed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                config.music_dirs = trimmed
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 

@@ -1,6 +1,6 @@
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 

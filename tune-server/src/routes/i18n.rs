@@ -2,7 +2,7 @@ use axum::extract::Path;
 use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -24,7 +24,12 @@ async fn list_locales() -> Json<Value> {
 /// Return all translations for a locale.
 async fn get_locale(Path(locale): Path<String>) -> Json<Value> {
     let translations = get_translations(&locale);
-    if translations.is_null() || translations.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+    if translations.is_null()
+        || translations
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(true)
+    {
         // Fallback to English
         Json(get_translations("en"))
     } else {
@@ -35,16 +40,13 @@ async fn get_locale(Path(locale): Path<String>) -> Json<Value> {
 /// Return just one namespace (e.g., /locales/fr/common).
 async fn get_namespace(Path((locale, namespace)): Path<(String, String)>) -> Json<Value> {
     let translations = get_translations(&locale);
-    let section = translations
-        .get(&namespace)
-        .cloned()
-        .unwrap_or_else(|| {
-            // Fallback to English namespace
-            get_translations("en")
-                .get(&namespace)
-                .cloned()
-                .unwrap_or(json!({}))
-        });
+    let section = translations.get(&namespace).cloned().unwrap_or_else(|| {
+        // Fallback to English namespace
+        get_translations("en")
+            .get(&namespace)
+            .cloned()
+            .unwrap_or(json!({}))
+    });
     Json(section)
 }
 

@@ -1,19 +1,19 @@
 use axum::body::Body;
-use lofty::file::TaggedFileExt;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use lofty::file::TaggedFileExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;
-use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
+use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
@@ -96,7 +96,10 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/bio", get(album_bio))
         .route("/albums/{id}/similar", get(album_similar))
         .route("/albums/{id}/artwork/rescan", post(rescan_album_artwork))
-        .route("/albums/merge-duplicates", post(merge_duplicate_albums_route))
+        .route(
+            "/albums/merge-duplicates",
+            post(merge_duplicate_albums_route),
+        )
         .route("/artists/{id}/timeline", get(artist_timeline))
         .route("/artists/{id}/image/upload", post(artist_image_upload))
         .route("/artists/{id}/image/report", post(artist_image_report))
@@ -107,16 +110,22 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-all/status", get(enrich_all_status))
         .route("/artwork/rescan", post(rescan_all_artwork))
         .route("/duplicates/smart", get(smart_duplicates))
-        .route("/collections", get(list_collections).post(create_collection))
-        .route("/collections/{id}", get(get_collection).delete(delete_collection))
+        .route(
+            "/collections",
+            get(list_collections).post(create_collection),
+        )
+        .route(
+            "/collections/{id}",
+            get(get_collection).delete(delete_collection),
+        )
         .route("/collections/{id}/albums", get(collection_albums))
-        .route("/collections/{id}/albums/{album_id}", post(add_album_to_collection).delete(remove_album_from_collection))
+        .route(
+            "/collections/{id}/albums/{album_id}",
+            post(add_album_to_collection).delete(remove_album_from_collection),
+        )
 }
 
-async fn list_artists(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Json<Value> {
+async fn list_artists(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
     let repo = ArtistRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -125,10 +134,7 @@ async fn list_artists(
     Json(json!(items))
 }
 
-async fn get_artist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(artist)) => Json(json!(artist)).into_response(),
@@ -149,13 +155,23 @@ async fn artist_bio(
 ) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db);
     let artist = repo.get(id).ok().flatten();
-    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(artist) = artist else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(ref mbid) = artist.musicbrainz_id else {
-        return Json(json!({"artist": artist.name, "bio": null, "error": "no MusicBrainz ID"})).into_response();
+        return Json(json!({"artist": artist.name, "bio": null, "error": "no MusicBrainz ID"}))
+            .into_response();
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}")).send().await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client
+        .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Json(data).into_response()
@@ -164,18 +180,24 @@ async fn artist_bio(
     }
 }
 
-async fn artist_similar(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db);
     let artist = repo.get(id).ok().flatten();
-    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(artist) = artist else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/similar")).send().await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client
+        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Json(data).into_response()
@@ -184,18 +206,24 @@ async fn artist_similar(
     }
 }
 
-async fn artist_metadata(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db);
     let artist = repo.get(id).ok().flatten();
-    let Some(artist) = artist else { return StatusCode::NOT_FOUND.into_response(); };
+    let Some(artist) = artist else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!(artist)).into_response();
     };
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    match client.get(format!("https://mozaiklabs.fr/api/{mbid}")).send().await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client
+        .get(format!("https://mozaiklabs.fr/api/{mbid}"))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Json(data).into_response()
@@ -241,35 +269,35 @@ async fn quick_fav_album(
     Json(json!({"is_favorite": !is_fav, "album_id": id}))
 }
 
-async fn artist_albums(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn artist_albums(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }
 
-async fn artist_tracks(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn artist_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
     Json(json!(items))
 }
 
-async fn list_albums(
-    State(state): State<AppState>,
-    Query(p): Query<AlbumFilters>,
-) -> Json<Value> {
+async fn list_albums(State(state): State<AppState>, Query(p): Query<AlbumFilters>) -> Json<Value> {
     let repo = AlbumRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
-    let items = repo.list_filtered(limit, offset, sort, order, p.format.as_deref(), p.quality.as_deref()).unwrap_or_default();
+    let items = repo
+        .list_filtered(
+            limit,
+            offset,
+            sort,
+            order,
+            p.format.as_deref(),
+            p.quality.as_deref(),
+        )
+        .unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }
@@ -299,10 +327,7 @@ async fn album_filters(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "formats": formats, "sample_rates": sample_rates }))
 }
 
-async fn recent_albums(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Json<Value> {
+async fn recent_albums(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_recent(limit).unwrap_or_default();
@@ -310,10 +335,7 @@ async fn recent_albums(
     Json(json!(items))
 }
 
-async fn get_album(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_album(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(album)) => Json(album.to_json()).into_response(),
@@ -322,19 +344,13 @@ async fn get_album(
     }
 }
 
-async fn album_tracks(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn album_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_album(id).unwrap_or_default();
     Json(json!(items))
 }
 
-async fn list_tracks(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Json<Value> {
+async fn list_tracks(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -348,10 +364,7 @@ async fn track_count(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "count": count }))
 }
 
-async fn get_track(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_track(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(track)) => Json(json!(track)).into_response(),
@@ -411,10 +424,7 @@ async fn stream_track_audio(
     (StatusCode::OK, headers, body).into_response()
 }
 
-async fn rescan_track(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn rescan_track(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
@@ -440,10 +450,7 @@ async fn rescan_track(
     }
 }
 
-async fn search(
-    State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
-) -> Json<Value> {
+async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
     let limit = q.limit.unwrap_or(20);
     let artists = ArtistRepo::new(state.db.clone())
         .search(&q.q, limit)
@@ -604,7 +611,8 @@ async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
     }
 
     let genres: Vec<String> = genre_set.into_iter().collect();
-    let mut tree: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut tree: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for genre in &genres {
         tree.entry(genre.clone()).or_default();
     }
@@ -630,22 +638,31 @@ async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
     for ext in &["jpg", "png"] {
         let path = cache_dir.join(format!("{hash}.{ext}"));
         if path.exists()
-            && let Ok(data) = tokio::fs::read(&path).await {
-                let mime = if *ext == "png" { "image/png" } else { "image/jpeg" };
-                let mut headers = axum::http::HeaderMap::new();
-                headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
-                headers.insert("Cache-Control", axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"));
-                headers.insert("ETag", axum::http::HeaderValue::from_str(&format!("\"{hash}\"")).unwrap_or(axum::http::HeaderValue::from_static("\"artwork\"")));
-                return (StatusCode::OK, headers, data).into_response();
-            }
+            && let Ok(data) = tokio::fs::read(&path).await
+        {
+            let mime = if *ext == "png" {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
+            headers.insert(
+                "Cache-Control",
+                axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            headers.insert(
+                "ETag",
+                axum::http::HeaderValue::from_str(&format!("\"{hash}\""))
+                    .unwrap_or(axum::http::HeaderValue::from_static("\"artwork\"")),
+            );
+            return (StatusCode::OK, headers, data).into_response();
+        }
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn album_artwork(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn album_artwork(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,
@@ -657,21 +674,23 @@ async fn album_artwork(
             return axum::response::Redirect::temporary(cover_path).into_response();
         }
         let hash = tune_core::artwork::artwork_hash(cover_path);
-        return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response();
+        return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
+            .into_response();
     }
 
     let track_repo = TrackRepo::new(state.db);
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
     if let Some(track) = tracks.first()
-        && let Some(ref file_path) = track.file_path {
-            let cache_dir = artwork_cache_dir();
-            if let Some(hash) = tune_core::artwork::get_or_extract(
-                std::path::Path::new(file_path),
-                &cache_dir,
-            ) {
-                return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response();
-            }
+        && let Some(ref file_path) = track.file_path
+    {
+        let cache_dir = artwork_cache_dir();
+        if let Some(hash) =
+            tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
+        {
+            return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
+                .into_response();
         }
+    }
 
     StatusCode::NOT_FOUND.into_response()
 }
@@ -717,7 +736,11 @@ async fn browse_directory(
 ) -> impl IntoResponse {
     let resolved = std::path::Path::new(&q.path);
     if !resolved.is_absolute() || !resolved.exists() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid path"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid path"})),
+        )
+            .into_response();
     }
 
     // Verify path is under a configured music dir
@@ -730,7 +753,11 @@ async fn browse_directory(
         .unwrap_or_else(|| state.config.music_dirs.clone());
     let music_root = dirs.iter().find(|d| q.path.starts_with(d.as_str()));
     if music_root.is_none() {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "path not under a configured music directory"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "path not under a configured music directory"})),
+        )
+            .into_response();
     }
     let music_root = music_root.unwrap().clone();
 
@@ -742,8 +769,14 @@ async fn browse_directory(
             let path = entry.path();
             if path.is_dir() {
                 let dir_path = path.to_string_lossy().to_string();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                if name.starts_with('.') { continue; }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
                 let track_count: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?",
@@ -757,7 +790,9 @@ async fn browse_directory(
         drop(conn);
     }
     subdirs.sort_by(|a, b| {
-        a.get("name").and_then(|v| v.as_str()).unwrap_or("")
+        a.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
             .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
     });
 
@@ -812,7 +847,8 @@ async fn browse_directory(
         "music_root": music_root,
         "directories": subdirs,
         "tracks": tracks,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -828,7 +864,9 @@ async fn browse_folders(
     // Without a path param, return browse roots
     match q.path {
         Some(ref p) if !p.is_empty() => {
-            browse_directory(State(state), Query(BrowseQuery { path: p.clone() })).await.into_response()
+            browse_directory(State(state), Query(BrowseQuery { path: p.clone() }))
+                .await
+                .into_response()
         }
         _ => {
             let roots_json = browse_roots(State(state)).await;
@@ -869,7 +907,11 @@ async fn list_genres(
         // Prefer the structured genres JSON array if present
         if let Some(json_str) = genres_col {
             if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-                genres_for_album = arr.into_iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+                genres_for_album = arr
+                    .into_iter()
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect();
             }
         }
         // Fall back to splitting the legacy genre column
@@ -888,11 +930,9 @@ async fn list_genres(
 
     let items: Vec<Value> = counts
         .iter()
-        .filter(|(name, _)| {
-            match &filter {
-                Some(q) => name.to_lowercase().contains(q),
-                None => true,
-            }
+        .filter(|(name, _)| match &filter {
+            Some(q) => name.to_lowercase().contains(q),
+            None => true,
         })
         .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();
@@ -900,10 +940,7 @@ async fn list_genres(
     Json(json!(items))
 }
 
-async fn genre_albums(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Json<Value> {
+async fn genre_albums(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
     let decoded = urlencoding::decode(&name).unwrap_or_else(|_| name.clone().into());
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_by_genre(&decoded).unwrap_or_default();
@@ -925,19 +962,48 @@ async fn recommendations(
 
 async fn completeness_stats(State(state): State<AppState>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
-    let total_tracks: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)).unwrap_or(0);
-    let with_genre: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''", [], |row| row.get(0)).unwrap_or(0);
-    let with_year: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
-    let with_artist: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE artist_id IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
-    let with_album: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE album_id IS NOT NULL", [], |row| row.get(0)).unwrap_or(0);
+    let total_tracks: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
+        .unwrap_or(0);
+    let with_genre: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let with_year: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let with_artist: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE artist_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let with_album: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE album_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     let with_cover: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a WHERE a.cover_path IS NOT NULL AND a.cover_path != ''", [], |row| row.get(0)).unwrap_or(0);
-    let total_albums: i64 = conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0)).unwrap_or(0);
+    let total_albums: i64 = conn
+        .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
+        .unwrap_or(0);
     let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
     drop(conn);
 
     let total_artists: i64 = {
         let conn = state.db.connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0)).unwrap_or(0)
+        conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))
+            .unwrap_or(0)
     };
 
     Json(json!({
@@ -978,7 +1044,8 @@ async fn proxy_artwork(Query(q): Query<ProxyQuery>) -> impl IntoResponse {
 
     match client.get(&q.url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            let content_type = resp.headers()
+            let content_type = resp
+                .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("image/jpeg")
@@ -986,8 +1053,15 @@ async fn proxy_artwork(Query(q): Query<ProxyQuery>) -> impl IntoResponse {
             match resp.bytes().await {
                 Ok(data) => {
                     let mut headers = HeaderMap::new();
-                    headers.insert("Content-Type", HeaderValue::from_str(&content_type).unwrap_or(HeaderValue::from_static("image/jpeg")));
-                    headers.insert("Cache-Control", HeaderValue::from_static("public, max-age=86400"));
+                    headers.insert(
+                        "Content-Type",
+                        HeaderValue::from_str(&content_type)
+                            .unwrap_or(HeaderValue::from_static("image/jpeg")),
+                    );
+                    headers.insert(
+                        "Cache-Control",
+                        HeaderValue::from_static("public, max-age=86400"),
+                    );
                     (StatusCode::OK, headers, data.to_vec()).into_response()
                 }
                 Err(_) => StatusCode::BAD_GATEWAY.into_response(),
@@ -999,10 +1073,7 @@ async fn proxy_artwork(Query(q): Query<ProxyQuery>) -> impl IntoResponse {
 
 // --- Credit enrichment handlers ---
 
-async fn track_credits(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn track_credits(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
     let items: Vec<Value> = conn
         .prepare("SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position")
@@ -1025,10 +1096,7 @@ async fn track_credits(
     Json(json!(items))
 }
 
-async fn artist_credits(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn artist_credits(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
     let items: Vec<Value> = conn
         .prepare(
@@ -1067,7 +1135,8 @@ async fn enrich_track_credits(
     };
 
     let Some(ref mbid) = track.musicbrainz_recording_id else {
-        return Json(json!({"enriched": false, "reason": "no MusicBrainz recording ID"})).into_response();
+        return Json(json!({"enriched": false, "reason": "no MusicBrainz recording ID"}))
+            .into_response();
     };
 
     let client = reqwest::Client::builder()
@@ -1080,27 +1149,43 @@ async fn enrich_track_credits(
         "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
     );
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-            Ok(data) => data,
-            Err(_) => return Json(json!({"enriched": false, "reason": "invalid MusicBrainz response"})).into_response(),
-        },
-        Ok(r) => return Json(json!({"enriched": false, "reason": format!("MusicBrainz HTTP {}", r.status())})).into_response(),
-        Err(e) => return Json(json!({"enriched": false, "reason": format!("MusicBrainz request failed: {e}")})).into_response(),
-    };
+    let resp =
+        match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(data) => data,
+                Err(_) => {
+                    return Json(
+                        json!({"enriched": false, "reason": "invalid MusicBrainz response"}),
+                    )
+                    .into_response();
+                }
+            },
+            Ok(r) => return Json(
+                json!({"enriched": false, "reason": format!("MusicBrainz HTTP {}", r.status())}),
+            )
+            .into_response(),
+            Err(e) => return Json(
+                json!({"enriched": false, "reason": format!("MusicBrainz request failed: {e}")}),
+            )
+            .into_response(),
+        };
 
     // Clear existing credits for this track
-    state.db.execute(
-        "DELETE FROM track_credits WHERE track_id = ?",
-        &[&id as &dyn rusqlite::types::ToSql],
-    ).ok();
+    state
+        .db
+        .execute(
+            "DELETE FROM track_credits WHERE track_id = ?",
+            &[&id as &dyn rusqlite::types::ToSql],
+        )
+        .ok();
 
     let mut count = 0i32;
 
     // Parse artist-credits
     if let Some(credits) = resp.get("artist-credit").and_then(|v| v.as_array()) {
         for (pos, credit) in credits.iter().enumerate() {
-            let artist_name = credit.get("name")
+            let artist_name = credit
+                .get("name")
                 .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown");
@@ -1116,9 +1201,13 @@ async fn enrich_track_credits(
     if let Some(relations) = resp.get("relations").and_then(|v| v.as_array()) {
         for rel in relations {
             let rel_type = rel.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let artist_name = rel.get("artist").and_then(|a| a.get("name")).and_then(|v| v.as_str());
+            let artist_name = rel
+                .get("artist")
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str());
             if let Some(name) = artist_name {
-                let instrument = rel.get("attributes")
+                let instrument = rel
+                    .get("attributes")
                     .and_then(|v| v.as_array())
                     .and_then(|arr| arr.first())
                     .and_then(|v| v.as_str())
@@ -1156,7 +1245,10 @@ async fn enrich_album_credits(
     for track in &tracks {
         let track_id = match track.id {
             Some(id) => id,
-            None => { skipped += 1; continue; }
+            None => {
+                skipped += 1;
+                continue;
+            }
         };
 
         let Some(ref mbid) = track.musicbrainz_recording_id else {
@@ -1177,19 +1269,29 @@ async fn enrich_album_credits(
         let resp = match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
-                Err(_) => { failed += 1; continue; }
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
             },
-            _ => { failed += 1; continue; }
+            _ => {
+                failed += 1;
+                continue;
+            }
         };
 
-        state.db.execute(
-            "DELETE FROM track_credits WHERE track_id = ?",
-            &[&track_id as &dyn rusqlite::types::ToSql],
-        ).ok();
+        state
+            .db
+            .execute(
+                "DELETE FROM track_credits WHERE track_id = ?",
+                &[&track_id as &dyn rusqlite::types::ToSql],
+            )
+            .ok();
 
         if let Some(credits) = resp.get("artist-credit").and_then(|v| v.as_array()) {
             for (pos, credit) in credits.iter().enumerate() {
-                let artist_name = credit.get("name")
+                let artist_name = credit
+                    .get("name")
                     .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
@@ -1203,9 +1305,13 @@ async fn enrich_album_credits(
         if let Some(relations) = resp.get("relations").and_then(|v| v.as_array()) {
             for rel in relations {
                 let rel_type = rel.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let artist_name = rel.get("artist").and_then(|a| a.get("name")).and_then(|v| v.as_str());
+                let artist_name = rel
+                    .get("artist")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|v| v.as_str());
                 if let Some(name) = artist_name {
-                    let instrument = rel.get("attributes")
+                    let instrument = rel
+                        .get("attributes")
                         .and_then(|v| v.as_array())
                         .and_then(|arr| arr.first())
                         .and_then(|v| v.as_str())
@@ -1233,9 +1339,7 @@ async fn enrich_album_credits(
     }))
 }
 
-async fn enrich_all_credits(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn enrich_all_credits(State(state): State<AppState>) -> impl IntoResponse {
     let task_id = uuid::Uuid::new_v4().to_string();
     let task_id_clone = task_id.clone();
     let db = state.db.clone();
@@ -1272,11 +1376,14 @@ async fn enrich_all_credits(
                         db.execute(
                             "DELETE FROM track_credits WHERE track_id = ?",
                             &[track_id as &dyn rusqlite::types::ToSql],
-                        ).ok();
+                        )
+                        .ok();
 
-                        if let Some(credits) = data.get("artist-credit").and_then(|v| v.as_array()) {
+                        if let Some(credits) = data.get("artist-credit").and_then(|v| v.as_array())
+                        {
                             for (pos, credit) in credits.iter().enumerate() {
-                                let artist_name = credit.get("name")
+                                let artist_name = credit
+                                    .get("name")
                                     .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Unknown");
@@ -1289,10 +1396,15 @@ async fn enrich_all_credits(
 
                         if let Some(relations) = data.get("relations").and_then(|v| v.as_array()) {
                             for rel in relations {
-                                let rel_type = rel.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                let artist_name = rel.get("artist").and_then(|a| a.get("name")).and_then(|v| v.as_str());
+                                let rel_type =
+                                    rel.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                let artist_name = rel
+                                    .get("artist")
+                                    .and_then(|a| a.get("name"))
+                                    .and_then(|v| v.as_str());
                                 if let Some(name) = artist_name {
-                                    let instrument = rel.get("attributes")
+                                    let instrument = rel
+                                        .get("attributes")
                                         .and_then(|v| v.as_array())
                                         .and_then(|arr| arr.first())
                                         .and_then(|v| v.as_str())
@@ -1317,13 +1429,13 @@ async fn enrich_all_credits(
         tracing::info!(task_id = %task_id_clone, enriched, total = track_ids.len(), "enrich_all_credits_done");
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"status": "accepted", "task_id": task_id})))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "accepted", "task_id": task_id})),
+    )
 }
 
-async fn track_all_tags(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn track_all_tags(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
@@ -1336,12 +1448,16 @@ async fn track_all_tags(
     // Try reading raw file tags with lofty
     if let Some(ref path) = track.file_path {
         if let Ok(tagged) = lofty::read_from_path(path) {
-            let tags: Vec<Value> = tagged.tags().iter().map(|tag| {
-                json!({
-                    "tag_type": format!("{:?}", tag.tag_type()),
-                    "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
+            let tags: Vec<Value> = tagged
+                .tags()
+                .iter()
+                .map(|tag| {
+                    json!({
+                        "tag_type": format!("{:?}", tag.tag_type()),
+                        "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
+                    })
                 })
-            }).collect();
+                .collect();
             result["file_tags"] = json!(tags);
         }
     }
@@ -1356,16 +1472,24 @@ async fn enrich_album_artwork(
     let repo = AlbumRepo::new(state.db.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,
-        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "album not found"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "album not found"})),
+            )
+                .into_response();
+        }
     };
 
     // Skip if album already has a cover
     if album.cover_path.is_some() {
-        return Json(json!({"enriched": false, "reason": "album already has cover art"})).into_response();
+        return Json(json!({"enriched": false, "reason": "album already has cover art"}))
+            .into_response();
     }
 
     let Some(ref mbid) = album.musicbrainz_release_id else {
-        return Json(json!({"enriched": false, "reason": "no MusicBrainz release ID"})).into_response();
+        return Json(json!({"enriched": false, "reason": "no MusicBrainz release ID"}))
+            .into_response();
     };
 
     match tune_core::artwork::fetch_cover_art(mbid).await {
@@ -1376,18 +1500,18 @@ async fn enrich_album_artwork(
                 repo.update_cover_path(id, &hash).ok();
                 Json(json!({"enriched": true, "hash": hash, "size": data.len()})).into_response()
             } else {
-                Json(json!({"enriched": false, "reason": "failed to save to cache"})).into_response()
+                Json(json!({"enriched": false, "reason": "failed to save to cache"}))
+                    .into_response()
             }
         }
         None => {
-            Json(json!({"enriched": false, "reason": "no cover art found on Cover Art Archive"})).into_response()
+            Json(json!({"enriched": false, "reason": "no cover art found on Cover Art Archive"}))
+                .into_response()
         }
     }
 }
 
-async fn batch_enrich_artwork(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn batch_enrich_artwork(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
     let db = state.db.clone();
 
@@ -1400,28 +1524,36 @@ async fn batch_enrich_artwork(
             "status": "skipped",
             "message": "all albums already have cover art",
             "missing": 0,
-        })).into_response();
+        }))
+        .into_response();
     }
 
     // Store initial status
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     settings.set("artwork_enrich_status", "running").ok();
-    settings.set("artwork_enrich_result", &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string()).ok();
+    settings
+        .set(
+            "artwork_enrich_result",
+            &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string(),
+        )
+        .ok();
 
     tokio::spawn(async move {
         tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
 
-    (StatusCode::ACCEPTED, Json(json!({
-        "status": "accepted",
-        "message": "batch artwork enrichment started",
-        "albums_to_process": missing.len(),
-    }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "message": "batch artwork enrichment started",
+            "albums_to_process": missing.len(),
+        })),
+    )
+        .into_response()
 }
 
-async fn batch_enrich_artwork_status(
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn batch_enrich_artwork_status(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let result = settings
         .get("artwork_enrich_result")
@@ -1451,24 +1583,45 @@ fn now_iso_utc() -> String {
     let mut y = 1970i64;
     let mut d = days as i64;
     loop {
-        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if d < ylen { break; }
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if d < ylen {
+            break;
+        }
         d -= ylen;
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 0usize;
     for (i, &ml) in mdays.iter().enumerate() {
-        if d < ml as i64 { mo = i; break; }
+        if d < ml as i64 {
+            mo = i;
+            break;
+        }
         d -= ml as i64;
     }
     format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
 }
 
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
-    let dir = std::env::var("TUNE_ARTWORK_DIR")
-        .unwrap_or_else(|_| "artwork_cache".into());
+    let dir = std::env::var("TUNE_ARTWORK_DIR").unwrap_or_else(|_| "artwork_cache".into());
     std::path::PathBuf::from(dir)
 }
 
@@ -1578,54 +1731,75 @@ async fn resolve_duplicate(
 
     // Verify both tracks exist
     let keep_exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM tracks WHERE id = ?", [body.keep_id], |row| row.get::<_, i64>(0))
-        .unwrap_or(0) > 0;
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE id = ?",
+            [body.keep_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
     let delete_exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM tracks WHERE id = ?", [body.delete_id], |row| row.get::<_, i64>(0))
-        .unwrap_or(0) > 0;
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE id = ?",
+            [body.delete_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
 
     if !keep_exists || !delete_exists {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "track not found"})),
+        )
+            .into_response();
     }
 
     // Reassign playlist references from deleted track to kept track
     conn.execute(
         "UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?",
         rusqlite::params![body.keep_id, body.delete_id],
-    ).ok();
+    )
+    .ok();
 
     // Reassign play queue references
     conn.execute(
         "UPDATE play_queue SET track_id = ? WHERE track_id = ?",
         rusqlite::params![body.keep_id, body.delete_id],
-    ).ok();
+    )
+    .ok();
 
     // Reassign listen history references
     conn.execute(
         "UPDATE listen_history SET track_id = ? WHERE track_id = ?",
         rusqlite::params![body.keep_id, body.delete_id],
-    ).ok();
+    )
+    .ok();
 
     // Reassign bookmarks
     conn.execute(
         "UPDATE bookmarks SET track_id = ? WHERE track_id = ?",
         rusqlite::params![body.keep_id, body.delete_id],
-    ).ok();
+    )
+    .ok();
 
     // Reassign favorites
     conn.execute(
         "UPDATE favorites SET item_id = ? WHERE item_type = 'track' AND item_id = ?",
         rusqlite::params![body.keep_id, body.delete_id],
-    ).ok();
+    )
+    .ok();
 
     // Delete the duplicate track
-    conn.execute("DELETE FROM tracks WHERE id = ?", [body.delete_id]).ok();
+    conn.execute("DELETE FROM tracks WHERE id = ?", [body.delete_id])
+        .ok();
     drop(conn);
 
     Json(json!({
         "kept": body.keep_id,
         "deleted": body.delete_id,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // --- New routes ---
@@ -1653,16 +1827,30 @@ async fn album_bio(
     // Resolve artist MBID for the API call
     let mbid = if let Some(aid) = album.artist_id {
         let artist_repo = ArtistRepo::new(state.db);
-        artist_repo.get(aid).ok().flatten().and_then(|a| a.musicbrainz_id)
+        artist_repo
+            .get(aid)
+            .ok()
+            .flatten()
+            .and_then(|a| a.musicbrainz_id)
     } else {
         None
     };
     let Some(mbid) = mbid else {
-        return Json(json!({"album": album.title, "bio": null, "error": "no artist MusicBrainz ID"})).into_response();
+        return Json(
+            json!({"album": album.title, "bio": null, "error": "no artist MusicBrainz ID"}),
+        )
+        .into_response();
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}")).send().await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client
+        .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Json(data).into_response()
@@ -1671,10 +1859,7 @@ async fn album_bio(
     }
 }
 
-async fn album_similar(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn album_similar(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let album_repo = AlbumRepo::new(state.db.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
@@ -1682,15 +1867,26 @@ async fn album_similar(
     };
     let mbid = if let Some(aid) = album.artist_id {
         let artist_repo = ArtistRepo::new(state.db);
-        artist_repo.get(aid).ok().flatten().and_then(|a| a.musicbrainz_id)
+        artist_repo
+            .get(aid)
+            .ok()
+            .flatten()
+            .and_then(|a| a.musicbrainz_id)
     } else {
         None
     };
     let Some(mbid) = mbid else {
         return Json(json!({"album": album.title, "artists": []})).into_response();
     };
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    match client.get(format!("https://mozaiklabs.fr/api/{mbid}/similar")).send().await {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    match client
+        .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
             Json(data).into_response()
@@ -1707,16 +1903,19 @@ async fn rescan_album_artwork(
     let album_repo = AlbumRepo::new(state.db);
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
     if tracks.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no tracks in album"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no tracks in album"})),
+        )
+            .into_response();
     }
     let cache_dir = artwork_cache_dir();
     let mut found_hash: Option<String> = None;
     for track in &tracks {
         if let Some(ref file_path) = track.file_path {
-            if let Some(hash) = tune_core::artwork::get_or_extract(
-                std::path::Path::new(file_path),
-                &cache_dir,
-            ) {
+            if let Some(hash) =
+                tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
+            {
                 found_hash = Some(hash);
                 break;
             }
@@ -1730,12 +1929,11 @@ async fn rescan_album_artwork(
         "rescanned_tracks": tracks.len(),
         "artwork_found": found_hash.is_some(),
         "hash": found_hash,
-    })).into_response()
+    }))
+    .into_response()
 }
 
-async fn merge_duplicate_albums_route(
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn merge_duplicate_albums_route(State(state): State<AppState>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
     let dupes: Vec<(String, String)> = conn
         .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
@@ -1748,21 +1946,33 @@ async fn merge_duplicate_albums_route(
     let mut deleted = 0i64;
     for (_title, ids_str) in &dupes {
         let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if ids.len() < 2 { continue; }
+        if ids.len() < 2 {
+            continue;
+        }
         let mut best_id = ids[0];
         let mut best_count = 0i64;
         for &aid in &ids {
-            let cnt: i64 = conn.query_row(
-                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                rusqlite::params![aid], |r| r.get(0),
-            ).unwrap_or(0);
-            if cnt > best_count { best_count = cnt; best_id = aid; }
+            let cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                    rusqlite::params![aid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if cnt > best_count {
+                best_count = cnt;
+                best_id = aid;
+            }
         }
         for &aid in &ids {
             if aid != best_id {
-                conn.execute("UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                    rusqlite::params![best_id, aid]).ok();
-                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid]).ok();
+                conn.execute(
+                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    rusqlite::params![best_id, aid],
+                )
+                .ok();
+                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid])
+                    .ok();
                 deleted += 1;
             }
         }
@@ -1774,10 +1984,7 @@ async fn merge_duplicate_albums_route(
     Json(json!({ "merged": deleted }))
 }
 
-async fn artist_timeline(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn artist_timeline(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db.clone());
     let artist_repo = ArtistRepo::new(state.db);
     let artist = match artist_repo.get(id) {
@@ -1791,7 +1998,8 @@ async fn artist_timeline(
         "artist": artist.name,
         "artist_id": id,
         "albums": items,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn artist_image_upload(
@@ -1802,7 +2010,13 @@ async fn artist_image_upload(
     let artist_repo = ArtistRepo::new(state.db);
     let mut artist = match artist_repo.get(id) {
         Ok(Some(a)) => a,
-        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "artist not found"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "artist not found"})),
+            )
+                .into_response();
+        }
     };
     let mut image_data: Option<Vec<u8>> = None;
     let mut ext = "jpg".to_string();
@@ -1810,20 +2024,30 @@ async fn artist_image_upload(
         let name = field.name().unwrap_or("").to_string();
         if name == "image" || name == "file" {
             if let Some(ct) = field.content_type() {
-                if ct.contains("png") { ext = "png".to_string(); }
+                if ct.contains("png") {
+                    ext = "png".to_string();
+                }
             }
             image_data = field.bytes().await.ok().map(|b| b.to_vec());
         }
     }
     let Some(data) = image_data else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no image provided"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no image provided"})),
+        )
+            .into_response();
     };
     let cache_dir = artwork_cache_dir();
     std::fs::create_dir_all(&cache_dir).ok();
     let hash = tune_core::artwork::artwork_hash(&format!("artist-{id}"));
     let path = cache_dir.join(format!("{hash}.{ext}"));
     if std::fs::write(&path, &data).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to save image"}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to save image"})),
+        )
+            .into_response();
     }
     artist.image_path = Some(hash.clone());
     artist.image_source = Some("upload".into());
@@ -1832,7 +2056,8 @@ async fn artist_image_upload(
         "artist_id": id,
         "hash": hash,
         "size": data.len(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1856,10 +2081,7 @@ async fn artist_image_report(
     Json(json!({"reported": true, "artist_id": id}))
 }
 
-async fn track_lyrics(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn track_lyrics(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
@@ -1868,14 +2090,22 @@ async fn track_lyrics(
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let genius_token = settings.get("genius_api_token").ok().flatten();
     let Some(token) = genius_token else {
-        return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"})).into_response();
+        return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"}))
+            .into_response();
     };
     let title = &track.title;
     let artist = track.artist_name.as_deref().unwrap_or("");
     let q = format!("{title} {artist}");
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
-    let search_url = format!("https://api.genius.com/search?q={}", urlencoding::encode(&q));
-    let resp = client.get(&search_url)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let search_url = format!(
+        "https://api.genius.com/search?q={}",
+        urlencoding::encode(&q)
+    );
+    let resp = client
+        .get(&search_url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await;
@@ -1893,9 +2123,11 @@ async fn track_lyrics(
                 "artist": artist,
                 "genius_url": url,
                 "lyrics": null,
-            })).into_response()
+            }))
+            .into_response()
         }
-        _ => Json(json!({"track_id": id, "lyrics": null, "error": "Genius API request failed"})).into_response(),
+        _ => Json(json!({"track_id": id, "lyrics": null, "error": "Genius API request failed"}))
+            .into_response(),
     }
 }
 
@@ -1917,7 +2149,7 @@ async fn export_ratings(
              LEFT JOIN albums a ON r.album_id = a.id \
              LEFT JOIN artists ar ON a.artist_id = ar.id \
              WHERE r.profile_id = ? \
-             ORDER BY r.rating DESC"
+             ORDER BY r.rating DESC",
         )
         .and_then(|mut stmt| {
             stmt.query_map(rusqlite::params![profile_id], |row| {
@@ -1975,14 +2207,17 @@ async fn import_ratings(
     }))
 }
 
-async fn enrich_all_library(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse {
     let task_id = uuid::Uuid::new_v4().to_string();
     let db = state.db.clone();
 
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    settings.set("enrich_all_status", &json!({"status": "running", "task_id": task_id, "enriched": 0}).to_string()).ok();
+    settings
+        .set(
+            "enrich_all_status",
+            &json!({"status": "running", "task_id": task_id, "enriched": 0}).to_string(),
+        )
+        .ok();
 
     let db2 = db.clone();
     let task_id_clone = task_id.clone();
@@ -2013,7 +2248,8 @@ async fn enrich_all_library(
                         db2.execute(
                             "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
                             &[mbid as &dyn rusqlite::types::ToSql, track_id],
-                        ).ok();
+                        )
+                        .ok();
                         enriched += 1;
                     } else {
                         // Try MusicBrainz lookup by title+artist
@@ -2028,7 +2264,10 @@ async fn enrich_all_library(
                             if let Ok(r) = client.get(&url).send().await {
                                 if r.status().is_success() {
                                     if let Ok(data) = r.json::<Value>().await {
-                                        if let Some(mbid) = data.pointer("/recordings/0/id").and_then(|v| v.as_str()) {
+                                        if let Some(mbid) = data
+                                            .pointer("/recordings/0/id")
+                                            .and_then(|v| v.as_str())
+                                        {
                                             db2.execute(
                                                 "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
                                                 &[&mbid as &dyn rusqlite::types::ToSql, track_id],
@@ -2048,31 +2287,44 @@ async fn enrich_all_library(
             // Update status periodically
             if enriched % 50 == 0 {
                 let settings = tune_core::db::settings_repo::SettingsRepo::new(db2.clone());
-                settings.set("enrich_all_status", &json!({
-                    "status": "running",
-                    "task_id": task_id_clone,
-                    "enriched": enriched,
-                    "total": total,
-                }).to_string()).ok();
+                settings
+                    .set(
+                        "enrich_all_status",
+                        &json!({
+                            "status": "running",
+                            "task_id": task_id_clone,
+                            "enriched": enriched,
+                            "total": total,
+                        })
+                        .to_string(),
+                    )
+                    .ok();
             }
         }
 
         let settings = tune_core::db::settings_repo::SettingsRepo::new(db2);
-        settings.set("enrich_all_status", &json!({
-            "status": "done",
-            "task_id": task_id_clone,
-            "enriched": enriched,
-            "total": total,
-        }).to_string()).ok();
+        settings
+            .set(
+                "enrich_all_status",
+                &json!({
+                    "status": "done",
+                    "task_id": task_id_clone,
+                    "enriched": enriched,
+                    "total": total,
+                })
+                .to_string(),
+            )
+            .ok();
         tracing::info!(task_id = %task_id_clone, enriched, total, "enrich_all_library done");
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"status": "accepted", "task_id": task_id})))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "accepted", "task_id": task_id})),
+    )
 }
 
-async fn enrich_all_status(
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn enrich_all_status(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let result = settings
         .get("enrich_all_status")
@@ -2083,9 +2335,7 @@ async fn enrich_all_status(
     Json(result)
 }
 
-async fn rescan_all_artwork(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
     let db = state.db.clone();
 
@@ -2121,7 +2371,10 @@ async fn rescan_all_artwork(
         tracing::info!(updated, total = albums.len(), "rescan_all_artwork done");
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"status": "accepted", "message": "artwork rescan started"})))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "accepted", "message": "artwork rescan started"})),
+    )
 }
 
 async fn smart_duplicates(
@@ -2188,11 +2441,12 @@ struct CreateCollectionBody {
     description: Option<String>,
 }
 
-async fn list_collections(
-    State(state): State<AppState>,
-) -> Json<Value> {
+async fn list_collections(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let data = settings.get("collections").ok().flatten()
+    let data = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
         .unwrap_or_default();
     Json(json!(data))
@@ -2203,14 +2457,19 @@ async fn create_collection(
     Json(body): Json<CreateCollectionBody>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let mut collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let id = collections.iter()
+    let id = collections
+        .iter()
         .filter_map(|c| c.get("id").and_then(|v| v.as_i64()))
         .max()
-        .unwrap_or(0) + 1;
+        .unwrap_or(0)
+        + 1;
 
     let collection = json!({
         "id": id,
@@ -2220,20 +2479,24 @@ async fn create_collection(
         "created_at": now_iso_utc(),
     });
     collections.push(collection.clone());
-    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+    settings
+        .set("collections", &serde_json::to_string(&collections).unwrap())
+        .ok();
 
     (StatusCode::CREATED, Json(collection)).into_response()
 }
 
-async fn get_collection(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_collection(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let found = collections.iter().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
+    let found = collections
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
     match found {
         Some(c) => Json(c.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -2245,7 +2508,10 @@ async fn delete_collection(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let mut collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let before = collections.len();
@@ -2253,7 +2519,9 @@ async fn delete_collection(
     if collections.len() == before {
         return StatusCode::NOT_FOUND.into_response();
     }
-    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
+    settings
+        .set("collections", &serde_json::to_string(&collections).unwrap())
+        .ok();
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2262,19 +2530,26 @@ async fn collection_albums(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
-    let collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let found = collections.iter().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
+    let found = collections
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(id));
     let Some(collection) = found else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let album_ids: Vec<i64> = collection.get("album_ids")
+    let album_ids: Vec<i64> = collection
+        .get("album_ids")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default();
     let album_repo = AlbumRepo::new(state.db);
-    let albums: Vec<Value> = album_ids.iter()
+    let albums: Vec<Value> = album_ids
+        .iter()
         .filter_map(|&aid| album_repo.get(aid).ok().flatten().map(|a| a.to_json()))
         .collect();
     Json(json!(albums)).into_response()
@@ -2291,14 +2566,20 @@ async fn add_album_to_collection(
     Path(path): Path<CollectionAlbumPath>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let mut collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let found = collections.iter_mut().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
+    let found = collections
+        .iter_mut()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
     let Some(collection) = found else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let album_ids = collection.get_mut("album_ids")
+    let album_ids = collection
+        .get_mut("album_ids")
         .and_then(|v| v.as_array_mut());
     match album_ids {
         Some(arr) => {
@@ -2308,11 +2589,17 @@ async fn add_album_to_collection(
             }
         }
         None => {
-            collection.as_object_mut().unwrap().insert("album_ids".into(), json!([path.album_id]));
+            collection
+                .as_object_mut()
+                .unwrap()
+                .insert("album_ids".into(), json!([path.album_id]));
         }
     }
-    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
-    Json(json!({"added": true, "collection_id": path.id, "album_id": path.album_id})).into_response()
+    settings
+        .set("collections", &serde_json::to_string(&collections).unwrap())
+        .ok();
+    Json(json!({"added": true, "collection_id": path.id, "album_id": path.album_id}))
+        .into_response()
 }
 
 async fn remove_album_from_collection(
@@ -2320,16 +2607,27 @@ async fn remove_album_from_collection(
     Path(path): Path<CollectionAlbumPath>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let mut collections: Vec<Value> = settings.get("collections").ok().flatten()
+    let mut collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let found = collections.iter_mut().find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
+    let found = collections
+        .iter_mut()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(path.id));
     let Some(collection) = found else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if let Some(arr) = collection.get_mut("album_ids").and_then(|v| v.as_array_mut()) {
+    if let Some(arr) = collection
+        .get_mut("album_ids")
+        .and_then(|v| v.as_array_mut())
+    {
         arr.retain(|v| v.as_i64() != Some(path.album_id));
     }
-    settings.set("collections", &serde_json::to_string(&collections).unwrap()).ok();
-    Json(json!({"removed": true, "collection_id": path.id, "album_id": path.album_id})).into_response()
+    settings
+        .set("collections", &serde_json::to_string(&collections).unwrap())
+        .ok();
+    Json(json!({"removed": true, "collection_id": path.id, "album_id": path.album_id}))
+        .into_response()
 }

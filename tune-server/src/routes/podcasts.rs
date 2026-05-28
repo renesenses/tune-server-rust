@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -81,11 +81,11 @@ async fn subscribe(
     }
 }
 
-async fn unsubscribe(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
-    state.db.execute("DELETE FROM podcast_subscriptions WHERE id = ?", &[&id]).ok();
+async fn unsubscribe(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    state
+        .db
+        .execute("DELETE FROM podcast_subscriptions WHERE id = ?", &[&id])
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -193,8 +193,7 @@ fn parse_rss_episodes(xml: &str) -> Vec<Value> {
                     // Check for enclosure tag (audio URL)
                     if tag == "enclosure" {
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                             let val = String::from_utf8_lossy(&attr.value).to_string();
                             if key == "url" {
                                 audio_url = val;
@@ -204,11 +203,9 @@ fn parse_rss_episodes(xml: &str) -> Vec<Value> {
                     // itunes:image
                     if tag == "itunes:image" {
                         for attr in e.attributes().flatten() {
-                            let key =
-                                String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                             if key == "href" {
-                                image_url =
-                                    String::from_utf8_lossy(&attr.value).to_string();
+                                image_url = String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
                     }
@@ -245,8 +242,7 @@ fn parse_rss_episodes(xml: &str) -> Vec<Value> {
                     for attr in e.attributes().flatten() {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                         if key == "href" {
-                            image_url =
-                                String::from_utf8_lossy(&attr.value).to_string();
+                            image_url = String::from_utf8_lossy(&attr.value).to_string();
                         }
                     }
                 }

@@ -90,7 +90,12 @@ pub struct AudioCapabilities {
 
 pub fn dlna_capabilities() -> AudioCapabilities {
     AudioCapabilities {
-        formats: vec![AudioFormat::Flac, AudioFormat::Wav, AudioFormat::Mp3, AudioFormat::Aac],
+        formats: vec![
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+        ],
         max_sample_rate: 192000,
         max_bit_depth: 24,
         supports_gapless: true,
@@ -139,12 +144,12 @@ impl AudioFormat {
         // DSD sample rates are in the MHz range (e.g. 2_822_400 for DSD64)
         // Some scanners store them divided (e.g. 2822400 or 5644800)
         match source_sample_rate {
-            r if r >= 11_000_000 => 352_800,  // DSD256/512 -> cap at 352.8kHz
-            r if r >= 5_000_000 => 352_800,   // DSD128 -> 352.8kHz
-            r if r >= 2_000_000 => 176_400,   // DSD64 -> 176.4kHz
+            r if r >= 11_000_000 => 352_800, // DSD256/512 -> cap at 352.8kHz
+            r if r >= 5_000_000 => 352_800,  // DSD128 -> 352.8kHz
+            r if r >= 2_000_000 => 176_400,  // DSD64 -> 176.4kHz
             // If scanner stored a lower value (some report 2822 or 5644), scale up
-            r if r >= 5000 => 352_800,         // DSD128-ish
-            r if r >= 2000 => 176_400,         // DSD64-ish
+            r if r >= 5000 => 352_800, // DSD128-ish
+            r if r >= 2000 => 176_400, // DSD64-ish
             // Fallback: safe default for DSD
             _ => 176_400,
         }
@@ -160,7 +165,12 @@ pub fn best_output_format(
     if can_passthrough(source_format, source_sample_rate, source_bit_depth, target) {
         return source_format;
     }
-    let preferred = [AudioFormat::Flac, AudioFormat::Wav, AudioFormat::Aac, AudioFormat::Mp3];
+    let preferred = [
+        AudioFormat::Flac,
+        AudioFormat::Wav,
+        AudioFormat::Aac,
+        AudioFormat::Mp3,
+    ];
     for fmt in preferred {
         if target.formats.contains(&fmt) {
             return fmt;
@@ -220,7 +230,10 @@ mod tests {
 
     #[test]
     fn wavpack_transcodes_to_wav() {
-        assert_eq!(AudioFormat::WavPack.dlna_transcode_target(), AudioFormat::Wav);
+        assert_eq!(
+            AudioFormat::WavPack.dlna_transcode_target(),
+            AudioFormat::Wav
+        );
     }
 
     #[test]
@@ -320,7 +333,10 @@ mod tests {
     fn from_extension_flac() {
         assert_eq!(AudioFormat::from_extension("flac"), Some(AudioFormat::Flac));
         assert_eq!(AudioFormat::from_extension("FLAC"), Some(AudioFormat::Flac));
-        assert_eq!(AudioFormat::from_extension(".flac"), Some(AudioFormat::Flac));
+        assert_eq!(
+            AudioFormat::from_extension(".flac"),
+            Some(AudioFormat::Flac)
+        );
     }
 
     #[test]
@@ -352,7 +368,10 @@ mod tests {
 
     #[test]
     fn from_extension_wavpack() {
-        assert_eq!(AudioFormat::from_extension("wv"), Some(AudioFormat::WavPack));
+        assert_eq!(
+            AudioFormat::from_extension("wv"),
+            Some(AudioFormat::WavPack)
+        );
     }
 
     #[test]

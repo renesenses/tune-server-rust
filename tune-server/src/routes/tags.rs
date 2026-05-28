@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::tag_repo::TagRepo;
 
@@ -56,10 +56,7 @@ async fn create_tag(
     }
 }
 
-async fn get_tag(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_tag(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TagRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(tag)) => Json(json!(tag)).into_response(),
@@ -80,10 +77,7 @@ async fn update_tag(
     }
 }
 
-async fn delete_tag(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_tag(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = TagRepo::new(state.db);
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -91,10 +85,7 @@ async fn delete_tag(
     }
 }
 
-async fn list_tag_items(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn list_tag_items(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let repo = TagRepo::new(state.db);
     let items = repo.all_items_by_tag(id).unwrap_or_default();
     let items: Vec<Value> = items

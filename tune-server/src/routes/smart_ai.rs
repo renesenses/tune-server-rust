@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -186,14 +186,24 @@ async fn mood_playlist(
             50.0,
             90.0,
         ),
-        "energetic" => (&["rock", "electronic", "dance", "punk", "metal"], 120.0, 180.0),
+        "energetic" => (
+            &["rock", "electronic", "dance", "punk", "metal"],
+            120.0,
+            180.0,
+        ),
         "calm" | "relaxed" => (
             &["jazz", "classical", "ambient", "new age", "lounge"],
             50.0,
             90.0,
         ),
         "focus" => (
-            &["ambient", "classical", "electronic", "instrumental", "post-rock"],
+            &[
+                "ambient",
+                "classical",
+                "electronic",
+                "instrumental",
+                "post-rock",
+            ],
             70.0,
             120.0,
         ),
@@ -320,46 +330,42 @@ async fn similar_to_playlist(
     let conn = state.db.connection().lock().unwrap();
 
     // Get the reference track/album attributes
-    let (genre, artist_id, year, bpm): (
-        Option<String>,
-        Option<i64>,
-        Option<i32>,
-        Option<f64>,
-    ) = if let Some(track_id) = body.track_id {
-        conn.query_row(
-            "SELECT genre, artist_id, year, bpm FROM tracks WHERE id = ?",
-            rusqlite::params![track_id],
-            |row| {
-                Ok((
-                    row.get(0).ok().flatten(),
-                    row.get(1).ok().flatten(),
-                    row.get(2).ok().flatten(),
-                    row.get(3).ok().flatten(),
-                ))
-            },
-        )
-        .unwrap_or((None, None, None, None))
-    } else if let Some(album_id) = body.album_id {
-        conn.query_row(
-            "SELECT al.genre, al.artist_id, al.year, NULL FROM albums al WHERE al.id = ?",
-            rusqlite::params![album_id],
-            |row| {
-                Ok((
-                    row.get(0).ok().flatten(),
-                    row.get(1).ok().flatten(),
-                    row.get(2).ok().flatten(),
-                    None,
-                ))
-            },
-        )
-        .unwrap_or((None, None, None, None))
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "provide track_id or album_id"})),
-        )
-            .into_response();
-    };
+    let (genre, artist_id, year, bpm): (Option<String>, Option<i64>, Option<i32>, Option<f64>) =
+        if let Some(track_id) = body.track_id {
+            conn.query_row(
+                "SELECT genre, artist_id, year, bpm FROM tracks WHERE id = ?",
+                rusqlite::params![track_id],
+                |row| {
+                    Ok((
+                        row.get(0).ok().flatten(),
+                        row.get(1).ok().flatten(),
+                        row.get(2).ok().flatten(),
+                        row.get(3).ok().flatten(),
+                    ))
+                },
+            )
+            .unwrap_or((None, None, None, None))
+        } else if let Some(album_id) = body.album_id {
+            conn.query_row(
+                "SELECT al.genre, al.artist_id, al.year, NULL FROM albums al WHERE al.id = ?",
+                rusqlite::params![album_id],
+                |row| {
+                    Ok((
+                        row.get(0).ok().flatten(),
+                        row.get(1).ok().flatten(),
+                        row.get(2).ok().flatten(),
+                        None,
+                    ))
+                },
+            )
+            .unwrap_or((None, None, None, None))
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "provide track_id or album_id"})),
+            )
+                .into_response();
+        };
     drop(conn);
 
     // Build similarity conditions with scoring
@@ -368,8 +374,12 @@ async fn similar_to_playlist(
 
     if let Some(ref g) = genre {
         let escaped = g.replace('\'', "''");
-        conditions.push(format!("(t.genre LIKE '%{escaped}%' OR t.genres LIKE '%{escaped}%')"));
-        score_parts.push(format!("CASE WHEN t.genre LIKE '%{escaped}%' THEN 3 ELSE 0 END"));
+        conditions.push(format!(
+            "(t.genre LIKE '%{escaped}%' OR t.genres LIKE '%{escaped}%')"
+        ));
+        score_parts.push(format!(
+            "CASE WHEN t.genre LIKE '%{escaped}%' THEN 3 ELSE 0 END"
+        ));
     }
     if let Some(aid) = artist_id {
         score_parts.push(format!("CASE WHEN t.artist_id = {aid} THEN 5 ELSE 0 END"));

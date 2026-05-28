@@ -272,7 +272,11 @@ mod tests {
         for fmt in ["mp3", "ogg", "opus", "wma", "aac"] {
             let mut a = Album::new("Test".into());
             a.format = Some(fmt.into());
-            assert_eq!(a.quality(), Some("lossy".into()), "Expected lossy for {fmt}");
+            assert_eq!(
+                a.quality(),
+                Some("lossy".into()),
+                "Expected lossy for {fmt}"
+            );
         }
     }
 

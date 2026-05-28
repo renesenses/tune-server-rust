@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::db::zone_repo::ZoneRepo;
@@ -53,12 +53,27 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/name", put(rename_zone))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
-        .route("/groups/{group_id}", axum::routing::patch(patch_group).delete(delete_group))
-        .route("/groups/{group_id}/volume", axum::routing::post(group_volume))
-        .route("/groups/{group_id}/calibrate", axum::routing::post(calibrate_group))
+        .route(
+            "/groups/{group_id}",
+            axum::routing::patch(patch_group).delete(delete_group),
+        )
+        .route(
+            "/groups/{group_id}/volume",
+            axum::routing::post(group_volume),
+        )
+        .route(
+            "/groups/{group_id}/calibrate",
+            axum::routing::post(calibrate_group),
+        )
         .route("/groups/{group_id}/health", get(group_health))
-        .route("/stereo-pairs", get(list_stereo_pairs).post(create_stereo_pair))
-        .route("/stereo-pairs/{pair_id}", axum::routing::delete(delete_stereo_pair))
+        .route(
+            "/stereo-pairs",
+            get(list_stereo_pairs).post(create_stereo_pair),
+        )
+        .route(
+            "/stereo-pairs/{pair_id}",
+            axum::routing::delete(delete_stereo_pair),
+        )
 }
 
 pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
@@ -81,36 +96,46 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
         let ps = state.playback.get_state(zone_id).await;
         let mut v = serde_json::to_value(z).unwrap_or_default();
         if let Some(obj) = v.as_object_mut() {
-            obj.insert("state".into(), json!(match ps.state {
-                tune_core::playback::PlayState::Playing => "playing",
-                tune_core::playback::PlayState::Paused => "paused",
-                tune_core::playback::PlayState::Stopped => "stopped",
-            }));
+            obj.insert(
+                "state".into(),
+                json!(match ps.state {
+                    tune_core::playback::PlayState::Playing => "playing",
+                    tune_core::playback::PlayState::Paused => "paused",
+                    tune_core::playback::PlayState::Stopped => "stopped",
+                }),
+            );
             obj.insert("current_track".into(), json!(ps.now_playing));
             obj.insert("position_ms".into(), json!(ps.position_ms));
             obj.insert("queue_length".into(), json!(ps.queue_length));
-            obj.insert("volume".into(), json!(if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 }));
+            obj.insert(
+                "volume".into(),
+                json!(if ps.volume > 0.0 {
+                    ps.volume
+                } else {
+                    z.volume as f64 / 100.0
+                }),
+            );
         }
         result.push(v);
     }
     Json(json!(result))
 }
 
-async fn get_zone(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(zone)) => {
             let ps = state.playback.get_state(id).await;
             let mut v = serde_json::to_value(&zone).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("state".into(), json!(match ps.state {
-                    tune_core::playback::PlayState::Playing => "playing",
-                    tune_core::playback::PlayState::Paused => "paused",
-                    tune_core::playback::PlayState::Stopped => "stopped",
-                }));
+                obj.insert(
+                    "state".into(),
+                    json!(match ps.state {
+                        tune_core::playback::PlayState::Playing => "playing",
+                        tune_core::playback::PlayState::Paused => "paused",
+                        tune_core::playback::PlayState::Stopped => "stopped",
+                    }),
+                );
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
@@ -180,9 +205,7 @@ async fn create_zone(
 
                 let disc = devices.iter().find(|d| d.id == device_id);
                 if let Some(dev) = disc {
-                    let registered = register_dlna_output_from_device(
-                        dev, &state,
-                    ).await;
+                    let registered = register_dlna_output_from_device(dev, &state).await;
                     if !registered {
                         warn!(device_id, "create_zone_output_registration_failed");
                     }
@@ -197,11 +220,15 @@ async fn create_zone(
     if let Some(device_id) = output_device_id {
         let repo = ZoneRepo::new(state.db.clone());
         if let Ok(zones) = repo.list() {
-            if zones.iter().any(|z| z.output_device_id.as_deref() == Some(device_id)) {
+            if zones
+                .iter()
+                .any(|z| z.output_device_id.as_deref() == Some(device_id))
+            {
                 return (
                     StatusCode::CONFLICT,
                     Json(json!({"detail": "Device already assigned to another zone"})),
-                ).into_response();
+                )
+                    .into_response();
             }
         }
     }
@@ -210,12 +237,15 @@ async fn create_zone(
     match repo.create(&body.name, output_type, output_device_id) {
         Ok(id) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
-            state.event_bus.emit("zone.created", json!({
-                "id": id,
-                "name": &body.name,
-                "output_type": output_type,
-                "output_device_id": output_device_id,
-            }));
+            state.event_bus.emit(
+                "zone.created",
+                json!({
+                    "id": id,
+                    "name": &body.name,
+                    "output_type": output_type,
+                    "output_device_id": output_device_id,
+                }),
+            );
 
             // Return the full zone object so the web client can use it directly
             let zone = repo.get(id).ok().flatten();
@@ -234,7 +264,11 @@ async fn create_zone(
 
             (StatusCode::CREATED, Json(v)).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail": e})),
+        )
+            .into_response(),
     }
 }
 
@@ -247,25 +281,26 @@ async fn register_dlna_output_from_device(
     state: &AppState,
 ) -> bool {
     // First, try to get service URLs from the device's cached capabilities
-    let svc_urls = dev.capabilities.get("service_urls")
-        .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok())
+    let svc_urls = dev
+        .capabilities
+        .get("service_urls")
+        .and_then(|v| {
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+        })
         .unwrap_or_default();
 
-    let av_url = svc_urls.get("avtransport")
+    let av_url = svc_urls
+        .get("avtransport")
         .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
-    let rc_url = svc_urls.get("renderingcontrol")
+    let rc_url = svc_urls
+        .get("renderingcontrol")
         .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
 
     // If cached service URLs are available, use them
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
         let delay = state.config.play_delay_for(&dev.name);
-        let dlna = DlnaOutput::new(
-            dev.name.clone(),
-            dev.id.clone(),
-            dev.host.clone(),
-            av,
-            rc,
-        ).with_play_delay(delay);
+        let dlna = DlnaOutput::new(dev.name.clone(), dev.id.clone(), dev.host.clone(), av, rc)
+            .with_play_delay(delay);
         let mut outputs = state.outputs.lock().await;
         outputs.register(Box::new(dlna));
         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
@@ -289,7 +324,8 @@ async fn register_dlna_output_from_device(
                             dev.host.clone(),
                             format!("{base}{av_path}"),
                             format!("{base}{rc_path}"),
-                        ).with_play_delay(delay);
+                        )
+                        .with_play_delay(delay);
                         let mut outputs = state.outputs.lock().await;
                         outputs.register(Box::new(dlna));
                         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_via_description");
@@ -306,10 +342,7 @@ async fn register_dlna_output_from_device(
     false
 }
 
-async fn delete_zone(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db.clone());
     match repo.delete(id) {
         Ok(_) => {
@@ -392,7 +425,9 @@ async fn create_group(
         "zone_ids": body.zone_ids,
     }));
 
-    settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+    settings
+        .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+        .ok();
     (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
 }
 
@@ -421,7 +456,9 @@ async fn patch_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let idx = groups.iter().position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    let idx = groups
+        .iter()
+        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match idx {
         Some(i) => {
             if let Some(ref name) = body.name {
@@ -431,7 +468,9 @@ async fn patch_group(
                 groups[i]["zone_ids"] = json!(zone_ids);
             }
             let result = groups[i].clone();
-            settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+            settings
+                .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+                .ok();
             Json(result).into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
@@ -451,24 +490,31 @@ async fn group_volume(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let idx = groups.iter().position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    let idx = groups
+        .iter()
+        .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match idx {
         Some(i) => {
-            let master = body.master_volume.unwrap_or(
-                groups[i]["master_volume"].as_f64().unwrap_or(0.5)
-            );
+            let master = body
+                .master_volume
+                .unwrap_or(groups[i]["master_volume"].as_f64().unwrap_or(0.5));
             groups[i]["master_volume"] = json!(master);
             if let Some(ref offsets) = body.offsets {
                 groups[i]["offsets"] = json!(offsets);
             }
-            let zone_ids: Vec<i64> = groups[i]["zone_ids"].as_array()
+            let zone_ids: Vec<i64> = groups[i]["zone_ids"]
+                .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
-            settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+            settings
+                .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+                .ok();
 
             let repo = ZoneRepo::new(state.db.clone());
             for zid in &zone_ids {
-                let offset = body.offsets.as_ref()
+                let offset = body
+                    .offsets
+                    .as_ref()
                     .and_then(|o| o.get(&zid.to_string()))
                     .copied()
                     .unwrap_or(0.0);
@@ -495,10 +541,13 @@ async fn calibrate_group(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let group = groups.iter().find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    let group = groups
+        .iter()
+        .find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match group {
         Some(group) => {
-            let zone_ids: Vec<i64> = group["zone_ids"].as_array()
+            let zone_ids: Vec<i64> = group["zone_ids"]
+                .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
 
@@ -549,10 +598,13 @@ async fn group_health(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let group = groups.iter().find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
+    let group = groups
+        .iter()
+        .find(|g| g.get("id").and_then(|v| v.as_i64()) == Some(group_id));
     match group {
         Some(group) => {
-            let zone_ids: Vec<i64> = group["zone_ids"].as_array()
+            let zone_ids: Vec<i64> = group["zone_ids"]
+                .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
             let repo = ZoneRepo::new(state.db);
@@ -560,8 +612,11 @@ async fn group_health(
             for zid in &zone_ids {
                 let ps = state.playback.get_state(*zid).await;
                 let zone = repo.get(*zid).ok().flatten();
-                let name = zone.map(|z| z.name).unwrap_or_else(|| format!("Zone {zid}"));
-                let online = ps.state != tune_core::playback::PlayState::Stopped || ps.now_playing.is_some();
+                let name = zone
+                    .map(|z| z.name)
+                    .unwrap_or_else(|| format!("Zone {zid}"));
+                let online =
+                    ps.state != tune_core::playback::PlayState::Stopped || ps.now_playing.is_some();
                 zones_health.push(json!({
                     "zone_id": zid,
                     "name": name,
@@ -587,7 +642,9 @@ async fn delete_group(
         .unwrap_or_default();
 
     groups.retain(|g| g.get("id").and_then(|v| v.as_i64()) != Some(group_id));
-    settings.set("zone_groups", &serde_json::to_string(&groups).unwrap()).ok();
+    settings
+        .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -629,7 +686,9 @@ async fn create_stereo_pair(
         "right_device_id": body.right_device_id,
     }));
 
-    settings.set("stereo_pairs", &serde_json::to_string(&pairs).unwrap()).ok();
+    settings
+        .set("stereo_pairs", &serde_json::to_string(&pairs).unwrap())
+        .ok();
     (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
 }
 
@@ -646,6 +705,8 @@ async fn delete_stereo_pair(
         .unwrap_or_default();
 
     pairs.retain(|p| p.get("id").and_then(|v| v.as_i64()) != Some(pair_id));
-    settings.set("stereo_pairs", &serde_json::to_string(&pairs).unwrap()).ok();
+    settings
+        .set("stereo_pairs", &serde_json::to_string(&pairs).unwrap())
+        .ok();
     StatusCode::NO_CONTENT
 }

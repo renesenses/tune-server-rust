@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -156,11 +156,7 @@ async fn pull_from_peer(
     Json(body): Json<PullPushBody>,
 ) -> impl IntoResponse {
     // Pull tracks from a peer Tune server
-    let track_count = body
-        .track_hashes
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let track_count = body.track_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
     let pull_all = body.all.unwrap_or(false);
 
     Json(json!({
@@ -178,11 +174,7 @@ async fn push_to_peer(
     Path(ip): Path<String>,
     Json(body): Json<PullPushBody>,
 ) -> impl IntoResponse {
-    let track_count = body
-        .track_hashes
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let track_count = body.track_hashes.as_ref().map(|v| v.len()).unwrap_or(0);
     let push_all = body.all.unwrap_or(false);
 
     Json(json!({
@@ -243,9 +235,7 @@ struct ImportManifest {
     tracks: Vec<Value>,
 }
 
-async fn import_library_manifest(
-    Json(body): Json<ImportManifest>,
-) -> impl IntoResponse {
+async fn import_library_manifest(Json(body): Json<ImportManifest>) -> impl IntoResponse {
     // Import is a planning step: return what would need to be synced
     let total = body.tracks.len();
     Json(json!({

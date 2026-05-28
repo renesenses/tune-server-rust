@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -32,7 +32,9 @@ impl PlayQueueRepo {
     pub fn get_queue(&self, zone_id: i64) -> Result<Vec<QueueItem>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"))
+            .prepare(&format!(
+                "{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"
+            ))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
@@ -45,7 +47,9 @@ impl PlayQueueRepo {
     pub fn get_current(&self, zone_id: i64) -> Result<Option<QueueItem>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_QUEUE} WHERE pq.zone_id = ? AND pq.is_current = 1"))
+            .prepare(&format!(
+                "{SELECT_QUEUE} WHERE pq.zone_id = ? AND pq.is_current = 1"
+            ))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![zone_id], |row| Ok(row_to_queue_item(row)))
             .optional()
@@ -66,7 +70,12 @@ impl PlayQueueRepo {
         Ok(())
     }
 
-    pub fn add_tracks(&self, zone_id: i64, track_ids: &[i64], position: Option<i64>) -> Result<(), String> {
+    pub fn add_tracks(
+        &self,
+        zone_id: i64,
+        track_ids: &[i64],
+        position: Option<i64>,
+    ) -> Result<(), String> {
         let conn = self.db.connection().lock().unwrap();
         let max_pos: i64 = conn
             .query_row(
@@ -91,20 +100,27 @@ impl PlayQueueRepo {
         conn.execute(
             "UPDATE play_queue SET is_current = 0 WHERE zone_id = ?",
             params![zone_id],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE play_queue SET is_current = 1 WHERE zone_id = ? AND position = ?",
             params![zone_id, position],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM play_queue WHERE zone_id = ?", &[&zone_id])?;
+        self.db
+            .execute("DELETE FROM play_queue WHERE zone_id = ?", &[&zone_id])?;
         Ok(())
     }
 
-    pub fn set_streaming_queue(&self, zone_id: i64, tracks: &[(String, String, String, Option<String>, Option<String>, i64)]) -> Result<(), String> {
+    pub fn set_streaming_queue(
+        &self,
+        zone_id: i64,
+        tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
+    ) -> Result<(), String> {
         let conn = self.db.connection().lock().unwrap();
         conn.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
             .map_err(|e| e.to_string())?;
@@ -120,11 +136,17 @@ impl PlayQueueRepo {
                 album TEXT,
                 cover_url TEXT,
                 duration_ms INTEGER DEFAULT 0
-            )"
-        ).map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM streaming_queue WHERE zone_id = ?", params![zone_id])
-            .map_err(|e| e.to_string())?;
-        for (i, (source_id, title, artist, album, cover_url, duration_ms)) in tracks.iter().enumerate() {
+            )",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM streaming_queue WHERE zone_id = ?",
+            params![zone_id],
+        )
+        .map_err(|e| e.to_string())?;
+        for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
+            tracks.iter().enumerate()
+        {
             conn.execute(
                 "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![zone_id, i as i64, source_id, title, artist, album, cover_url, duration_ms],
@@ -147,8 +169,9 @@ impl PlayQueueRepo {
                 album TEXT,
                 cover_url TEXT,
                 duration_ms INTEGER DEFAULT 0
-            )"
-        ).map_err(|e| e.to_string())?;
+            )",
+        )
+        .map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare("SELECT source_id, title, artist, album, cover_url, duration_ms, position FROM streaming_queue WHERE zone_id = ? ORDER BY position")
             .map_err(|e| e.to_string())?;
@@ -176,7 +199,8 @@ impl PlayQueueRepo {
             "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
             params![zone_id],
             |row| row.get(0),
-        ).map_err(|e| e.to_string())
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -205,7 +229,11 @@ mod tests {
     fn test_db() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        db.execute("INSERT INTO zones (name, output_type) VALUES ('Main', 'local')", &[]).unwrap();
+        db.execute(
+            "INSERT INTO zones (name, output_type) VALUES ('Main', 'local')",
+            &[],
+        )
+        .unwrap();
         db
     }
 
@@ -343,8 +371,22 @@ mod tests {
         let repo = PlayQueueRepo::new(db);
 
         let tracks = vec![
-            ("src-1".into(), "Song 1".into(), "Artist 1".into(), Some("Album 1".into()), Some("http://cover1.jpg".into()), 300_000i64),
-            ("src-2".into(), "Song 2".into(), "Artist 2".into(), None, None, 250_000i64),
+            (
+                "src-1".into(),
+                "Song 1".into(),
+                "Artist 1".into(),
+                Some("Album 1".into()),
+                Some("http://cover1.jpg".into()),
+                300_000i64,
+            ),
+            (
+                "src-2".into(),
+                "Song 2".into(),
+                "Artist 2".into(),
+                None,
+                None,
+                250_000i64,
+            ),
         ];
 
         repo.set_streaming_queue(1, &tracks).unwrap();
@@ -362,14 +404,24 @@ mod tests {
         let db = test_db();
         let repo = PlayQueueRepo::new(db);
 
-        let tracks1 = vec![
-            ("id1".into(), "Old".into(), "Old Artist".into(), None, None, 100_000i64),
-        ];
+        let tracks1 = vec![(
+            "id1".into(),
+            "Old".into(),
+            "Old Artist".into(),
+            None,
+            None,
+            100_000i64,
+        )];
         repo.set_streaming_queue(1, &tracks1).unwrap();
 
-        let tracks2 = vec![
-            ("id2".into(), "New".into(), "New Artist".into(), None, None, 200_000i64),
-        ];
+        let tracks2 = vec![(
+            "id2".into(),
+            "New".into(),
+            "New Artist".into(),
+            None,
+            None,
+            200_000i64,
+        )];
         repo.set_streaming_queue(1, &tracks2).unwrap();
 
         let queue = repo.get_streaming_queue(1).unwrap();
@@ -380,7 +432,11 @@ mod tests {
     #[test]
     fn queue_multiple_zones() {
         let db = test_db();
-        db.execute("INSERT INTO zones (name, output_type) VALUES ('Second', 'dlna')", &[]).unwrap();
+        db.execute(
+            "INSERT INTO zones (name, output_type) VALUES ('Second', 'dlna')",
+            &[],
+        )
+        .unwrap();
         let track_repo = TrackRepo::new(db.clone());
         let repo = PlayQueueRepo::new(db);
 

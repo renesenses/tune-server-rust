@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -16,7 +16,10 @@ pub fn router() -> Router<AppState> {
         .route("/config", get(offline_config).post(set_offline_config))
         .route("/download", post(download_for_offline))
         .route("/downloads", get(list_downloads))
-        .route("/downloads/{id}", get(download_status).delete(delete_download))
+        .route(
+            "/downloads/{id}",
+            get(download_status).delete(delete_download),
+        )
         .route("/albums", get(list_offline_albums))
         .route("/tracks", get(list_offline_tracks))
         .route("/sync", post(sync_offline))
@@ -138,16 +141,11 @@ async fn set_offline_config(
         settings.set("offline_cache_dir", dir).ok();
     }
     if let Some(size) = body.max_size_mb {
-        settings
-            .set("offline_max_size_mb", &size.to_string())
-            .ok();
+        settings.set("offline_max_size_mb", &size.to_string()).ok();
     }
     if let Some(sync) = body.auto_sync {
         settings
-            .set(
-                "offline_auto_sync",
-                if sync { "true" } else { "false" },
-            )
+            .set("offline_auto_sync", if sync { "true" } else { "false" })
             .ok();
     }
     Json(json!({"status": "ok"}))
@@ -205,11 +203,7 @@ async fn download_single_track(
     );
 
     if let Err(e) = result {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
 
     let id = state.db.last_insert_rowid();
@@ -462,10 +456,7 @@ async fn list_downloads(State(state): State<AppState>) -> Json<Value> {
     Json(json!(items))
 }
 
-async fn download_status(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     ensure_offline_table(&state);
     let conn = state.db.connection().lock().unwrap();
     let result = conn.query_row(
@@ -498,10 +489,7 @@ async fn download_status(
     }
 }
 
-async fn delete_download(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     ensure_offline_table(&state);
 
     // Get file path before deleting record
@@ -663,10 +651,7 @@ async fn clear_offline(State(state): State<AppState>) -> impl IntoResponse {
         std::fs::remove_file(path).ok();
     }
 
-    state
-        .db
-        .execute_batch("DELETE FROM offline_cache")
-        .ok();
+    state.db.execute_batch("DELETE FROM offline_cache").ok();
 
     // Try to remove empty cache directory
     let settings = SettingsRepo::new(state.db);

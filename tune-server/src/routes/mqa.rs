@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -44,10 +44,7 @@ async fn mqa_status(State(state): State<AppState>) -> Json<Value> {
 ///
 /// MQA embeds data in the least significant bits of a FLAC/WAV file.
 /// Detection looks for specific bit patterns in the audio stream.
-async fn detect_mqa(
-    State(state): State<AppState>,
-    Path(track_id): Path<i64>,
-) -> impl IntoResponse {
+async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) -> impl IntoResponse {
     let track = {
         let conn = state.db.connection().lock().unwrap();
         conn.prepare("SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?1")
@@ -91,8 +88,8 @@ async fn detect_mqa(
     // 2. Typically 44.1kHz or 48kHz base rate (unfolds to higher rates)
     // 3. 24-bit depth (MQA uses LSBs for signaling)
     let format_str = format.as_deref().unwrap_or("").to_lowercase();
-    let is_candidate = (format_str.contains("flac") || format_str.contains("wav"))
-        && bit_depth.unwrap_or(0) >= 24;
+    let is_candidate =
+        (format_str.contains("flac") || format_str.contains("wav")) && bit_depth.unwrap_or(0) >= 24;
 
     if !is_candidate {
         return Json(json!({

@@ -51,7 +51,9 @@ impl QobuzService {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(data) = resp.json::<serde_json::Value>().await {
                     let qobuz = &data["qobuz"];
-                    if let (Some(id), Some(secret)) = (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str()) {
+                    if let (Some(id), Some(secret)) =
+                        (qobuz["app_id"].as_str(), qobuz["app_secret"].as_str())
+                    {
                         info!(old_id = %&self.app_id, new_id = %id, "qobuz_credentials_refreshed");
                         self.app_id = id.to_string();
                         self.app_secret = secret.to_string();
@@ -62,14 +64,21 @@ impl QobuzService {
         }
     }
 
-    async fn api_get(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    async fn api_get(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, String> {
         let base = self.api_base();
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         let mut query: Vec<(&str, &str)> = params.to_vec();
         query.push(("app_id", app_id));
 
-        let mut req = self.client.get(&url).query(&query)
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&query)
             .header("X-App-Id", app_id);
 
         if let Some(ref token) = self.user_auth_token {
@@ -92,11 +101,15 @@ impl QobuzService {
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["performer"]["name"].as_str()
+            artist: item["performer"]["name"]
+                .as_str()
                 .or_else(|| item["artist"]["name"].as_str())
-                .unwrap_or("").into(),
+                .unwrap_or("")
+                .into(),
             album: album["title"].as_str().map(Into::into),
-            album_id: album["id"].as_str().map(Into::into)
+            album_id: album["id"]
+                .as_str()
+                .map(Into::into)
                 .or_else(|| album["id"].as_u64().map(|id| id.to_string())),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
             cover_path: album["image"]["large"].as_str().map(Into::into),
@@ -105,8 +118,14 @@ impl QobuzService {
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
-                sample_rate: item["maximum_sampling_rate"].as_f64().map(|r| (r * 1000.0) as u32).unwrap_or(44100),
-                bit_depth: item["maximum_bit_depth"].as_u64().map(|b| b as u16).unwrap_or(16),
+                sample_rate: item["maximum_sampling_rate"]
+                    .as_f64()
+                    .map(|r| (r * 1000.0) as u32)
+                    .unwrap_or(44100),
+                bit_depth: item["maximum_bit_depth"]
+                    .as_u64()
+                    .map(|b| b as u16)
+                    .unwrap_or(16),
                 bitrate: None,
             }),
         }
@@ -114,26 +133,38 @@ impl QobuzService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
-            id: item["id"].as_str().map(Into::into)
+            id: item["id"]
+                .as_str()
+                .map(Into::into)
                 .or_else(|| item["id"].as_u64().map(|id| id.to_string()))
                 .unwrap_or_default(),
             title: item["title"].as_str().unwrap_or("").into(),
             artist: item["artist"]["name"].as_str().unwrap_or("").into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: item["image"]["large"].as_str().map(Into::into),
-            year: item["released_at"].as_u64().map(|ts| {
-                1970 + (ts / 31_536_000) as u32
-            }).or_else(|| item["release_date_original"].as_str().and_then(|d| d.get(..4)?.parse().ok())),
+            year: item["released_at"]
+                .as_u64()
+                .map(|ts| 1970 + (ts / 31_536_000) as u32)
+                .or_else(|| {
+                    item["release_date_original"]
+                        .as_str()
+                        .and_then(|d| d.get(..4)?.parse().ok())
+                }),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             quality: None,
         }
     }
 
-    async fn login_internal(&mut self, username: &str, password: &str) -> Result<AuthStatus, String> {
+    async fn login_internal(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<AuthStatus, String> {
         self.refresh_credentials().await;
 
         let base = self.api_base();
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{base}/user/login"))
             .query(&[("app_id", self.app_id.as_str())])
             .form(&[("username", username), ("password", password)])
@@ -175,14 +206,21 @@ impl QobuzService {
         }
     }
 
-    async fn api_post(&self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    async fn api_post(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, String> {
         let base = self.api_base();
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
         let mut query: Vec<(&str, &str)> = params.to_vec();
         query.push(("app_id", app_id));
 
-        let mut req = self.client.post(&url).query(&query)
+        let mut req = self
+            .client
+            .post(&url)
+            .query(&query)
             .header("X-App-Id", app_id);
 
         if let Some(ref token) = self.user_auth_token {
@@ -195,14 +233,19 @@ impl QobuzService {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("qobuz {path}: {status} {body}"));
         }
-        resp.json().await.or_else(|_| Ok(serde_json::json!({"ok": true})))
+        resp.json()
+            .await
+            .or_else(|_| Ok(serde_json::json!({"ok": true})))
     }
 
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            has_children: item["subgenres"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            has_children: item["subgenres"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             image_url: item["image"].as_str().map(Into::into),
         }
     }
@@ -230,9 +273,16 @@ impl StreamingService for QobuzService {
         self.enabled_override = Some(enabled);
     }
 
-    async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {
-        let username = credentials["username"].as_str().ok_or("username required")?;
-        let password = credentials["password"].as_str().ok_or("password required")?;
+    async fn authenticate(
+        &mut self,
+        credentials: &serde_json::Value,
+    ) -> Result<AuthStatus, String> {
+        let username = credentials["username"]
+            .as_str()
+            .ok_or("username required")?;
+        let password = credentials["password"]
+            .as_str()
+            .ok_or("password required")?;
 
         self.stored_username = Some(username.to_string());
         self.stored_password = Some(password.to_string());
@@ -251,30 +301,46 @@ impl StreamingService for QobuzService {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
-        let data = self.api_get("/catalog/search", &[
-            ("query", query),
-            ("limit", &limit.to_string()),
-        ]).await?;
+        let data = self
+            .api_get(
+                "/catalog/search",
+                &[("query", query), ("limit", &limit.to_string())],
+            )
+            .await?;
 
-        let tracks = data["tracks"]["items"].as_array()
+        let tracks = data["tracks"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
-        let albums = data["albums"]["items"].as_array()
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
-        let artists = data["artists"]["items"].as_array()
+        let artists = data["artists"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_artist).collect())
             .unwrap_or_default();
 
-        Ok(SearchResults { tracks, albums, artists, playlists: vec![] })
+        Ok(SearchResults {
+            tracks,
+            albums,
+            artists,
+            playlists: vec![],
+        })
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String> {
-        let data = self.api_get("/track/get", &[("track_id", track_id)]).await?;
+        let data = self
+            .api_get("/track/get", &[("track_id", track_id)])
+            .await?;
         Ok(Self::map_track(&data))
     }
 
-    async fn get_track_url(&self, track_id: &str, quality: Option<&str>) -> Result<StreamUrl, String> {
+    async fn get_track_url(
+        &self,
+        track_id: &str,
+        quality: Option<&str>,
+    ) -> Result<StreamUrl, String> {
         let format_id = match quality {
             Some("hires") => "27",
             Some("cd") => "6",
@@ -286,22 +352,36 @@ impl StreamingService for QobuzService {
             .unwrap();
         let timestamp = format!("{}.{}", dur.as_secs(), dur.subsec_millis());
 
-        let sig_input = format!("trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{timestamp}{}", self.app_secret);
+        let sig_input = format!(
+            "trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{timestamp}{}",
+            self.app_secret
+        );
         let sig = md5_hex(&sig_input);
 
         info!(track_id, format_id, timestamp = %timestamp, sig = %sig, "qobuz_get_file_url");
 
-        let data = self.api_get("/track/getFileUrl", &[
-            ("track_id", track_id),
-            ("format_id", format_id),
-            ("intent", "stream"),
-            ("request_ts", &timestamp),
-            ("request_sig", &sig),
-        ]).await?;
+        let data = self
+            .api_get(
+                "/track/getFileUrl",
+                &[
+                    ("track_id", track_id),
+                    ("format_id", format_id),
+                    ("intent", "stream"),
+                    ("request_ts", &timestamp),
+                    ("request_sig", &sig),
+                ],
+            )
+            .await?;
 
         let url = data["url"].as_str().ok_or("no url")?.to_string();
-        let mime = data["mime_type"].as_str().unwrap_or("audio/flac").to_string();
-        let sample_rate = data["sampling_rate"].as_f64().map(|r| (r * 1000.0) as u32).unwrap_or(44100);
+        let mime = data["mime_type"]
+            .as_str()
+            .unwrap_or("audio/flac")
+            .to_string();
+        let sample_rate = data["sampling_rate"]
+            .as_f64()
+            .map(|r| (r * 1000.0) as u32)
+            .unwrap_or(44100);
         let bit_depth = data["bit_depth"].as_u64().map(|b| b as u16).unwrap_or(16);
 
         Ok(StreamUrl {
@@ -318,30 +398,40 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {
-        let data = self.api_get("/album/get", &[("album_id", album_id)]).await?;
+        let data = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
         Ok(Self::map_album(&data))
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get("/album/get", &[("album_id", album_id)]).await?;
-        let tracks = data["tracks"]["items"].as_array()
+        let data = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
+        let tracks = data["tracks"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
     }
 
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String> {
-        let data = self.api_get("/artist/get", &[("artist_id", artist_id)]).await?;
+        let data = self
+            .api_get("/artist/get", &[("artist_id", artist_id)])
+            .await?;
         Ok(Self::map_artist(&data))
     }
 
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
-        let data = self.api_get("/playlist/get", &[("playlist_id", playlist_id)]).await?;
+        let data = self
+            .api_get("/playlist/get", &[("playlist_id", playlist_id)])
+            .await?;
         Ok(StreamPlaylist {
             id: data["id"].as_u64().unwrap_or(0).to_string(),
             name: data["name"].as_str().unwrap_or("").into(),
             description: data["description"].as_str().map(Into::into),
-            cover_path: data["image_rectangle_mini"].as_array()
+            cover_path: data["image_rectangle_mini"]
+                .as_array()
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
                 .map(Into::into),
@@ -351,12 +441,18 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get("/playlist/get", &[
-            ("playlist_id", playlist_id),
-            ("extra", "tracks"),
-            ("limit", "500"),
-        ]).await?;
-        let tracks = data["tracks"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/playlist/get",
+                &[
+                    ("playlist_id", playlist_id),
+                    ("extra", "tracks"),
+                    ("limit", "500"),
+                ],
+            )
+            .await?;
+        let tracks = data["tracks"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
@@ -364,7 +460,8 @@ impl StreamingService for QobuzService {
 
     async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
         let data = self.api_get("/genre/list", &[]).await?;
-        let genres = data["genres"]["items"].as_array()
+        let genres = data["genres"]["items"]
+            .as_array()
             .or_else(|| data["genres"].as_array())
             .or_else(|| data.as_array())
             .map(|items| items.iter().map(Self::map_genre).collect())
@@ -372,14 +469,24 @@ impl StreamingService for QobuzService {
         Ok(genres)
     }
 
-    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_genre_albums(
+        &self,
+        genre_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, String> {
         let limit_str = limit.to_string();
-        let data = self.api_get("/genre/get", &[
-            ("genre_id", genre_id),
-            ("type", "albums"),
-            ("limit", &limit_str),
-        ]).await?;
-        let albums = data["albums"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/genre/get",
+                &[
+                    ("genre_id", genre_id),
+                    ("type", "albums"),
+                    ("limit", &limit_str),
+                ],
+            )
+            .await?;
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
@@ -387,27 +494,48 @@ impl StreamingService for QobuzService {
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
         Ok(vec![
-            FeaturedSection { id: "new-releases".into(), name: "New Releases".into() },
-            FeaturedSection { id: "best-sellers".into(), name: "Best Sellers".into() },
-            FeaturedSection { id: "press-awards".into(), name: "Press Awards".into() },
-            FeaturedSection { id: "editor-picks".into(), name: "Editor Picks".into() },
+            FeaturedSection {
+                id: "new-releases".into(),
+                name: "New Releases".into(),
+            },
+            FeaturedSection {
+                id: "best-sellers".into(),
+                name: "Best Sellers".into(),
+            },
+            FeaturedSection {
+                id: "press-awards".into(),
+                name: "Press Awards".into(),
+            },
+            FeaturedSection {
+                id: "editor-picks".into(),
+                name: "Editor Picks".into(),
+            },
         ])
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
-        let data = self.api_get("/album/getFeatured", &[
-            ("type", section_id),
-            ("limit", "50"),
-        ]).await?;
-        let albums = data["albums"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/album/getFeatured",
+                &[("type", section_id), ("limit", "50")],
+            )
+            .await?;
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get("/favorite/getUserFavorites", &[("type", "tracks"), ("limit", "500")]).await?;
-        let tracks = data["tracks"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/favorite/getUserFavorites",
+                &[("type", "tracks"), ("limit", "500")],
+            )
+            .await?;
+        let tracks = data["tracks"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
@@ -436,39 +564,59 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
-        let data = self.api_get("/playlist/getUserPlaylists", &[("limit", "500")]).await?;
-        let playlists = data["playlists"]["items"].as_array()
-            .map(|items| items.iter().map(|item| StreamPlaylist {
-                id: item["id"].as_u64().unwrap_or(0).to_string(),
-                name: item["name"].as_str().unwrap_or("").into(),
-                description: item["description"].as_str().map(Into::into),
-                cover_path: None,
-                track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
-                owner: None,
-            }).collect())
+        let data = self
+            .api_get("/playlist/getUserPlaylists", &[("limit", "500")])
+            .await?;
+        let playlists = data["playlists"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| StreamPlaylist {
+                        id: item["id"].as_u64().unwrap_or(0).to_string(),
+                        name: item["name"].as_str().unwrap_or("").into(),
+                        description: item["description"].as_str().map(Into::into),
+                        cover_path: None,
+                        track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
+                        owner: None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(playlists)
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
-        let data = self.api_get("/artist/get", &[
-            ("artist_id", artist_id),
-            ("extra", "albums"),
-            ("limit", "50"),
-        ]).await?;
-        let albums = data["albums"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/artist/get",
+                &[
+                    ("artist_id", artist_id),
+                    ("extra", "albums"),
+                    ("limit", "50"),
+                ],
+            )
+            .await?;
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get("/artist/get", &[
-            ("artist_id", artist_id),
-            ("extra", "tracks_appears_on"),
-            ("limit", "20"),
-        ]).await?;
-        let tracks = data["tracks_appears_on"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/artist/get",
+                &[
+                    ("artist_id", artist_id),
+                    ("extra", "tracks_appears_on"),
+                    ("limit", "20"),
+                ],
+            )
+            .await?;
+        let tracks = data["tracks_appears_on"]["items"]
+            .as_array()
             .or_else(|| data["tracks"]["items"].as_array())
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
@@ -476,16 +624,28 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
-        let data = self.api_get("/favorite/getUserFavorites", &[("type", "albums"), ("limit", "500")]).await?;
-        let albums = data["albums"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/favorite/getUserFavorites",
+                &[("type", "albums"), ("limit", "500")],
+            )
+            .await?;
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
     }
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
-        let data = self.api_get("/favorite/getUserFavorites", &[("type", "artists"), ("limit", "500")]).await?;
-        let artists = data["artists"]["items"].as_array()
+        let data = self
+            .api_get(
+                "/favorite/getUserFavorites",
+                &[("type", "artists"), ("limit", "500")],
+            )
+            .await?;
+        let artists = data["artists"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_artist).collect())
             .unwrap_or_default();
         Ok(artists)
@@ -573,7 +733,10 @@ mod tests {
         assert_eq!(track.track_number, Some(2));
         assert_eq!(track.disc_number, Some(1));
         assert!(!track.explicit);
-        assert_eq!(track.cover_path.as_deref(), Some("http://img.qobuz.com/large.jpg"));
+        assert_eq!(
+            track.cover_path.as_deref(),
+            Some("http://img.qobuz.com/large.jpg")
+        );
         let q = track.quality.unwrap();
         assert_eq!(q.sample_rate, 192000);
         assert_eq!(q.bit_depth, 24);
@@ -626,7 +789,10 @@ mod tests {
         assert_eq!(album.artist_id.as_deref(), Some("42"));
         assert_eq!(album.year, Some(1959));
         assert_eq!(album.track_count, 7);
-        assert_eq!(album.cover_path.as_deref(), Some("http://img.qobuz.com/album.jpg"));
+        assert_eq!(
+            album.cover_path.as_deref(),
+            Some("http://img.qobuz.com/album.jpg")
+        );
     }
 
     #[test]
@@ -665,7 +831,10 @@ mod tests {
         let artist = QobuzService::map_artist(&json);
         assert_eq!(artist.id, "42");
         assert_eq!(artist.name, "Dave Brubeck");
-        assert_eq!(artist.image_path.as_deref(), Some("http://img.qobuz.com/artist.jpg"));
+        assert_eq!(
+            artist.image_path.as_deref(),
+            Some("http://img.qobuz.com/artist.jpg")
+        );
     }
 
     #[test]
@@ -747,7 +916,7 @@ mod tests {
 }
 
 fn md5_hex(input: &str) -> String {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();

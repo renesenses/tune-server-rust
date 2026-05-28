@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -38,24 +38,26 @@ struct BatchFields {
 
 fn get_track_path(state: &AppState, track_id: i64) -> Option<(String, Value)> {
     let conn = state.db.connection().lock().unwrap();
-    conn.prepare("SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1")
-        .ok()
-        .and_then(|mut stmt| {
-            stmt.query_row([track_id], |row| {
-                let path: String = row.get(0)?;
-                let info = json!({
-                    "id": track_id,
-                    "path": path.clone(),
-                    "title": row.get::<_, Option<String>>(1).unwrap_or(None),
-                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                    "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
-                    "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
-                    "year": row.get::<_, Option<String>>(5).unwrap_or(None),
-                });
-                Ok((path, info))
-            })
-            .ok()
+    conn.prepare(
+        "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1",
+    )
+    .ok()
+    .and_then(|mut stmt| {
+        stmt.query_row([track_id], |row| {
+            let path: String = row.get(0)?;
+            let info = json!({
+                "id": track_id,
+                "path": path.clone(),
+                "title": row.get::<_, Option<String>>(1).unwrap_or(None),
+                "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
+                "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
+                "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
+                "year": row.get::<_, Option<String>>(5).unwrap_or(None),
+            });
+            Ok((path, info))
         })
+        .ok()
+    })
 }
 
 fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, String> {
@@ -101,7 +103,8 @@ fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, S
         changes.push(format!("album_artist -> {album_artist}"));
     }
 
-    tag.save_to_path(path, lofty::config::WriteOptions::default()).map_err(|e| format!("Failed to save {path}: {e}"))?;
+    tag.save_to_path(path, lofty::config::WriteOptions::default())
+        .map_err(|e| format!("Failed to save {path}: {e}"))?;
     Ok(changes)
 }
 
@@ -150,19 +153,39 @@ async fn batch_edit_tags(
 fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) {
     let conn = state.db.connection().lock().unwrap();
     if let Some(title) = &fields.title {
-        conn.execute("UPDATE tracks SET title = ?1 WHERE id = ?2", rusqlite::params![title, track_id]).ok();
+        conn.execute(
+            "UPDATE tracks SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, track_id],
+        )
+        .ok();
     }
     if let Some(artist) = &fields.artist {
-        conn.execute("UPDATE tracks SET artist_name = ?1 WHERE id = ?2", rusqlite::params![artist, track_id]).ok();
+        conn.execute(
+            "UPDATE tracks SET artist_name = ?1 WHERE id = ?2",
+            rusqlite::params![artist, track_id],
+        )
+        .ok();
     }
     if let Some(album) = &fields.album {
-        conn.execute("UPDATE tracks SET album_title = ?1 WHERE id = ?2", rusqlite::params![album, track_id]).ok();
+        conn.execute(
+            "UPDATE tracks SET album_title = ?1 WHERE id = ?2",
+            rusqlite::params![album, track_id],
+        )
+        .ok();
     }
     if let Some(genre) = &fields.genre {
-        conn.execute("UPDATE tracks SET genre = ?1 WHERE id = ?2", rusqlite::params![genre, track_id]).ok();
+        conn.execute(
+            "UPDATE tracks SET genre = ?1 WHERE id = ?2",
+            rusqlite::params![genre, track_id],
+        )
+        .ok();
     }
     if let Some(year) = &fields.year {
-        conn.execute("UPDATE tracks SET year = ?1 WHERE id = ?2", rusqlite::params![year, track_id]).ok();
+        conn.execute(
+            "UPDATE tracks SET year = ?1 WHERE id = ?2",
+            rusqlite::params![year, track_id],
+        )
+        .ok();
     }
 }
 
@@ -217,11 +240,7 @@ async fn auto_number_album(
         .prepare("SELECT id, path, title FROM tracks WHERE album_id = ?1 ORDER BY path ASC")
         .and_then(|mut stmt| {
             stmt.query_map([album_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
@@ -244,11 +263,11 @@ async fn auto_number_album(
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
 
-            let mut tagged =
-                lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
+            let mut tagged = lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
             let tag = tagged.primary_tag_mut().ok_or("No tag")?;
             tag.set_track(track_num);
-            tag.save_to_path(path, lofty::config::WriteOptions::default()).map_err(|e| format!("Write error: {e}"))?;
+            tag.save_to_path(path, lofty::config::WriteOptions::default())
+                .map_err(|e| format!("Write error: {e}"))?;
             Ok(())
         })();
 
@@ -310,11 +329,11 @@ async fn set_album_genre(
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
 
-            let mut tagged =
-                lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
+            let mut tagged = lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
             let tag = tagged.primary_tag_mut().ok_or("No tag")?;
             tag.set_genre(body.genre.clone());
-            tag.save_to_path(path, lofty::config::WriteOptions::default()).map_err(|e| format!("Write error: {e}"))?;
+            tag.save_to_path(path, lofty::config::WriteOptions::default())
+                .map_err(|e| format!("Write error: {e}"))?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -363,13 +382,13 @@ async fn set_album_year(
             use lofty::file::TaggedFileExt;
             use lofty::tag::{Accessor, TagExt};
 
-            let mut tagged =
-                lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
+            let mut tagged = lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
             let tag = tagged.primary_tag_mut().ok_or("No tag")?;
             if let Some(y) = year_num {
                 tag.set_year(y);
             }
-            tag.save_to_path(path, lofty::config::WriteOptions::default()).map_err(|e| format!("Write error: {e}"))?;
+            tag.save_to_path(path, lofty::config::WriteOptions::default())
+                .map_err(|e| format!("Write error: {e}"))?;
             Ok(())
         })();
         if let Err(e) = result {
@@ -534,10 +553,22 @@ async fn fix_encoding(
         } else {
             // Apply fixes to file and DB
             let fields = BatchFields {
-                title: fixed_fields.iter().find(|f| f["field"] == "title").and_then(|f| f["new"].as_str().map(String::from)),
-                artist: fixed_fields.iter().find(|f| f["field"] == "artist_name").and_then(|f| f["new"].as_str().map(String::from)),
-                album: fixed_fields.iter().find(|f| f["field"] == "album_title").and_then(|f| f["new"].as_str().map(String::from)),
-                genre: fixed_fields.iter().find(|f| f["field"] == "genre").and_then(|f| f["new"].as_str().map(String::from)),
+                title: fixed_fields
+                    .iter()
+                    .find(|f| f["field"] == "title")
+                    .and_then(|f| f["new"].as_str().map(String::from)),
+                artist: fixed_fields
+                    .iter()
+                    .find(|f| f["field"] == "artist_name")
+                    .and_then(|f| f["new"].as_str().map(String::from)),
+                album: fixed_fields
+                    .iter()
+                    .find(|f| f["field"] == "album_title")
+                    .and_then(|f| f["new"].as_str().map(String::from)),
+                genre: fixed_fields
+                    .iter()
+                    .find(|f| f["field"] == "genre")
+                    .and_then(|f| f["new"].as_str().map(String::from)),
                 year: None,
                 album_artist: None,
             };
@@ -574,10 +605,13 @@ fn try_fix_mojibake(s: &str) -> Option<String> {
     }
 
     // Try interpreting the UTF-8 bytes as Latin1 and re-decode
-    let bytes: Vec<u8> = s.chars().filter_map(|c| {
-        let cp = c as u32;
-        if cp <= 0xFF { Some(cp as u8) } else { None }
-    }).collect();
+    let bytes: Vec<u8> = s
+        .chars()
+        .filter_map(|c| {
+            let cp = c as u32;
+            if cp <= 0xFF { Some(cp as u8) } else { None }
+        })
+        .collect();
 
     if bytes.len() != s.chars().count() {
         return None; // Has chars outside Latin1 range, skip
@@ -604,8 +638,15 @@ async fn strip_extra_tags(
         .keep
         .unwrap_or_else(|| {
             vec![
-                "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST", "GENRE", "DATE",
-                "TRACKNUMBER", "DISCNUMBER", "COMMENT",
+                "TITLE",
+                "ARTIST",
+                "ALBUM",
+                "ALBUMARTIST",
+                "GENRE",
+                "DATE",
+                "TRACKNUMBER",
+                "DISCNUMBER",
+                "COMMENT",
             ]
             .into_iter()
             .map(String::from)
@@ -641,16 +682,14 @@ async fn strip_extra_tags(
                 .map(|item| item.key().clone())
                 .collect();
 
-            let removed: Vec<String> = to_remove
-                .iter()
-                .map(|k| format!("{:?}", k))
-                .collect();
+            let removed: Vec<String> = to_remove.iter().map(|k| format!("{:?}", k)).collect();
 
             for key in &to_remove {
                 tag.remove_key(key);
             }
 
-            tag.save_to_path(&path, lofty::config::WriteOptions::default()).map_err(|e| format!("Write error: {e}"))?;
+            tag.save_to_path(&path, lofty::config::WriteOptions::default())
+                .map_err(|e| format!("Write error: {e}"))?;
             Ok(removed)
         })();
 

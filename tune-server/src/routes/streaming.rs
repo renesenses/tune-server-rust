@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::streaming::traits::StreamingService;
@@ -49,23 +49,47 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/search", get(service_search))
         .route("/{service}/albums", get(service_albums))
         .route("/{service}/albums/{album_id}", get(service_album))
-        .route("/{service}/albums/{album_id}/tracks", get(service_album_tracks))
+        .route(
+            "/{service}/albums/{album_id}/tracks",
+            get(service_album_tracks),
+        )
         .route("/{service}/artists/{artist_id}", get(service_artist))
-        .route("/{service}/artists/{artist_id}/albums", get(service_artist_albums))
-        .route("/{service}/artists/{artist_id}/top-tracks", get(service_artist_top_tracks))
+        .route(
+            "/{service}/artists/{artist_id}/albums",
+            get(service_artist_albums),
+        )
+        .route(
+            "/{service}/artists/{artist_id}/top-tracks",
+            get(service_artist_top_tracks),
+        )
         .route("/{service}/playlists", get(service_playlists))
         .route("/{service}/playlists/{playlist_id}", get(service_playlist))
-        .route("/{service}/playlists/{playlist_id}/tracks", get(service_playlist_tracks))
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks",
+            get(service_playlist_tracks),
+        )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
         .route("/{service}/featured", get(service_featured))
-        .route("/{service}/featured/sections", get(service_featured_sections))
-        .route("/{service}/featured/{section}", get(service_featured_section))
+        .route(
+            "/{service}/featured/sections",
+            get(service_featured_sections),
+        )
+        .route(
+            "/{service}/featured/{section}",
+            get(service_featured_section),
+        )
         .route("/{service}/new-releases", get(service_new_releases))
         .route("/{service}/genres", get(service_genres))
-        .route("/{service}/genres/{genre_id}/albums", get(service_genre_albums))
+        .route(
+            "/{service}/genres/{genre_id}/albums",
+            get(service_genre_albums),
+        )
         .route("/{service}/favorites/{fav_type}", get(service_favorites))
-        .route("/{service}/favorites/{fav_type}/{item_id}", post(service_add_favorite).delete(service_remove_favorite))
+        .route(
+            "/{service}/favorites/{fav_type}/{item_id}",
+            post(service_add_favorite).delete(service_remove_favorite),
+        )
         .route("/{service}/enable", post(service_enable))
         .route("/{service}/disable", post(service_disable))
         .route("/{service}/auth/url", get(service_auth_url))
@@ -101,18 +125,20 @@ async fn service_status(
     let mut status = svc.auth_status().await;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({})).await
-        && poll_status.authenticated {
-            status = poll_status;
-            drop(svc);
-            state.save_tokens().await;
-        }
+        && poll_status.authenticated
+    {
+        status = poll_status;
+        drop(svc);
+        state.save_tokens().await;
+    }
     Json(json!({
         "service": service,
         "enabled": true,
         "authenticated": status.authenticated,
         "username": status.username,
         "subscription": status.subscription,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn service_auth(
@@ -139,10 +165,13 @@ async fn service_auth(
             drop(svc);
             state.save_tokens().await;
             if status.authenticated {
-                state.event_bus.emit("streaming.auth.success", json!({
-                    "service": &service,
-                    "username": &status.username,
-                }));
+                state.event_bus.emit(
+                    "streaming.auth.success",
+                    json!({
+                        "service": &service,
+                        "username": &status.username,
+                    }),
+                );
             }
             Json(json!({
                 "service": service,
@@ -150,13 +179,17 @@ async fn service_auth(
                 "username": status.username,
                 "verification_url": status.verification_url,
                 "user_code": status.user_code,
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => {
-            state.event_bus.emit("streaming.auth.failed", json!({
-                "service": &service,
-                "error": &e,
-            }));
+            state.event_bus.emit(
+                "streaming.auth.failed",
+                json!({
+                    "service": &service,
+                    "error": &e,
+                }),
+            );
             (StatusCode::BAD_REQUEST, e).into_response()
         }
     }
@@ -185,13 +218,15 @@ async fn auth_poll_status(
                 "service": service,
                 "authenticated": authenticated,
                 "username": username,
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => Json(json!({
             "service": service,
             "authenticated": false,
             "message": e,
-        })).into_response(),
+        }))
+        .into_response(),
     }
 }
 
@@ -508,7 +543,10 @@ async fn service_favorites(
     let result = match fav_type.as_str() {
         "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
         "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
-        "artists" => svc.get_user_artists().await.map(|a| json!({ "artists": a })),
+        "artists" => svc
+            .get_user_artists()
+            .await
+            .map(|a| json!({ "artists": a })),
         _ => Err(format!("unknown favorite type: {fav_type}")),
     };
     match result {
@@ -558,7 +596,9 @@ async fn service_enable(
     }
 
     let settings = SettingsRepo::new(state.db);
-    settings.set(&format!("streaming_{service}_enabled"), "true").ok();
+    settings
+        .set(&format!("streaming_{service}_enabled"), "true")
+        .ok();
     Json(json!({"service": service, "enabled": true})).into_response()
 }
 
@@ -573,7 +613,9 @@ async fn service_disable(
     }
 
     let settings = SettingsRepo::new(state.db);
-    settings.set(&format!("streaming_{service}_enabled"), "false").ok();
+    settings
+        .set(&format!("streaming_{service}_enabled"), "false")
+        .ok();
     Json(json!({"service": service, "enabled": false})).into_response()
 }
 
@@ -590,7 +632,8 @@ async fn service_auth_url(
         Ok(status) => Json(json!({
             "url": status.verification_url,
             "user_code": status.user_code,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
@@ -633,14 +676,18 @@ async fn spotify_callback(
         Err(e) => return e.into_response(),
     };
     let mut svc = svc.lock().await;
-    match svc.authenticate(&json!({"code": code, "state": q.state})).await {
+    match svc
+        .authenticate(&json!({"code": code, "state": q.state}))
+        .await
+    {
         Ok(status) => {
             drop(svc);
             state.save_tokens().await;
             Json(json!({
                 "authenticated": status.authenticated,
                 "username": status.username,
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }

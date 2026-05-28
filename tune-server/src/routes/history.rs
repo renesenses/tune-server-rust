@@ -2,7 +2,7 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 
@@ -42,10 +42,7 @@ async fn recent_history(
     Json(json!(items))
 }
 
-async fn top_albums(
-    State(state): State<AppState>,
-    Query(p): Query<HistoryParams>,
-) -> Json<Value> {
+async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -59,10 +56,7 @@ async fn top_albums(
     Json(json!(items))
 }
 
-async fn top_tracks(
-    State(state): State<AppState>,
-    Query(p): Query<HistoryParams>,
-) -> Json<Value> {
+async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -76,10 +70,7 @@ async fn top_tracks(
     Json(json!(items))
 }
 
-async fn top_artists(
-    State(state): State<AppState>,
-    Query(p): Query<HistoryParams>,
-) -> Json<Value> {
+async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -91,10 +82,7 @@ async fn top_artists(
     Json(json!(items))
 }
 
-async fn dashboard(
-    State(state): State<AppState>,
-    Query(p): Query<DashboardParams>,
-) -> Json<Value> {
+async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParams>) -> Json<Value> {
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
     let repo = HistoryRepo::new(state.db);

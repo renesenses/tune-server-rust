@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -47,13 +47,14 @@ fn lastfm_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client error: {e}"))
 }
 
-async fn lastfm_call(api_key: &str, method: &str, params: &[(&str, &str)]) -> Result<Value, String> {
+async fn lastfm_call(
+    api_key: &str,
+    method: &str,
+    params: &[(&str, &str)],
+) -> Result<Value, String> {
     let client = lastfm_client()?;
-    let mut query: Vec<(&str, &str)> = vec![
-        ("method", method),
-        ("api_key", api_key),
-        ("format", "json"),
-    ];
+    let mut query: Vec<(&str, &str)> =
+        vec![("method", method), ("api_key", api_key), ("format", "json")];
     query.extend_from_slice(params);
 
     let resp = client
@@ -109,7 +110,13 @@ async fn lastfm_friends(
     }
 
     let limit = q.limit.as_deref().unwrap_or("50");
-    match lastfm_call(&api_key, "user.getFriends", &[("user", &username), ("limit", limit)]).await {
+    match lastfm_call(
+        &api_key,
+        "user.getFriends",
+        &[("user", &username), ("limit", limit)],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -135,7 +142,13 @@ async fn friend_recent_tracks(
     };
 
     let limit = q.limit.as_deref().unwrap_or("20");
-    match lastfm_call(&api_key, "user.getRecentTracks", &[("user", &user), ("limit", limit)]).await {
+    match lastfm_call(
+        &api_key,
+        "user.getRecentTracks",
+        &[("user", &user), ("limit", limit)],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -156,7 +169,13 @@ async fn friend_top_artists(
     };
 
     let limit = q.limit.as_deref().unwrap_or("20");
-    match lastfm_call(&api_key, "user.getTopArtists", &[("user", &user), ("limit", limit)]).await {
+    match lastfm_call(
+        &api_key,
+        "user.getTopArtists",
+        &[("user", &user), ("limit", limit)],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -188,7 +207,13 @@ async fn lastfm_neighbors(
     }
 
     let limit = q.limit.as_deref().unwrap_or("50");
-    match lastfm_call(&api_key, "user.getNeighbours", &[("user", &username), ("limit", limit)]).await {
+    match lastfm_call(
+        &api_key,
+        "user.getNeighbours",
+        &[("user", &username), ("limit", limit)],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -222,7 +247,13 @@ async fn lastfm_recommendations(
     // Last.fm deprecated user.getRecommendedArtists for non-authenticated users.
     // Fall back to getting top artists and using similar artists for recommendations.
     let limit = q.limit.as_deref().unwrap_or("10");
-    match lastfm_call(&api_key, "user.getTopArtists", &[("user", &username), ("limit", "5"), ("period", "3month")]).await {
+    match lastfm_call(
+        &api_key,
+        "user.getTopArtists",
+        &[("user", &username), ("limit", "5"), ("period", "3month")],
+    )
+    .await
+    {
         Ok(top_data) => {
             let top_artists: Vec<String> = top_data
                 .pointer("/topartists/artist")
@@ -237,8 +268,17 @@ async fn lastfm_recommendations(
             // Get similar artists for the top artists
             let mut recommendations = Vec::new();
             for artist in top_artists.iter().take(3) {
-                if let Ok(similar) = lastfm_call(&api_key, "artist.getSimilar", &[("artist", artist), ("limit", limit)]).await {
-                    if let Some(artists) = similar.pointer("/similarartists/artist").and_then(|a| a.as_array()) {
+                if let Ok(similar) = lastfm_call(
+                    &api_key,
+                    "artist.getSimilar",
+                    &[("artist", artist), ("limit", limit)],
+                )
+                .await
+                {
+                    if let Some(artists) = similar
+                        .pointer("/similarartists/artist")
+                        .and_then(|a| a.as_array())
+                    {
                         for a in artists {
                             recommendations.push(json!({
                                 "name": a["name"],

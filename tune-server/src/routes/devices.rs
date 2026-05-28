@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::discovery::device::dedup_devices;
@@ -23,7 +23,10 @@ pub fn router() -> Router<AppState> {
         .route("/buffer-stats/all", get(all_buffer_stats))
         .route("/{device_id}/status", get(device_status))
         .route("/{device_id}/buffer-stats", get(device_buffer_stats))
-        .route("/{device_id}/buffer", axum::routing::patch(set_device_buffer))
+        .route(
+            "/{device_id}/buffer",
+            axum::routing::patch(set_device_buffer),
+        )
         .route("/clear", post(clear_devices))
         .route("/{device_id}", axum::routing::delete(delete_device))
         .route("/{device_id}/pair", post(pair_device))
@@ -66,53 +69,62 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
         let mut outputs = state.outputs.lock().await;
         for d in &deduped {
             let location = d.location.as_deref().unwrap_or("");
-            if location.is_empty() { continue; }
+            if location.is_empty() {
+                continue;
+            }
 
             if let Ok(desc) = fetch_device_description(location).await
-                && desc.is_media_renderer() {
-                    let service_urls = desc.service_urls();
-                    let av_url = service_urls.get("avtransport");
-                    let rc_url = service_urls.get("renderingcontrol");
+                && desc.is_media_renderer()
+            {
+                let service_urls = desc.service_urls();
+                let av_url = service_urls.get("avtransport");
+                let rc_url = service_urls.get("renderingcontrol");
 
-                    if let (Some(av), Some(rc)) = (av_url, rc_url) {
-                        let base = format!("http://{}:{}", d.host, d.port);
-                        let delay = state.config.play_delay_for(&d.name);
-                        let dlna = DlnaOutput::new(
-                            d.name.clone(),
-                            d.id.clone(),
-                            d.host.clone(),
-                            format!("{base}{av}"),
-                            format!("{base}{rc}"),
-                        ).with_play_delay(delay);
-                        outputs.register(Box::new(dlna));
-                        registered += 1;
-                    }
+                if let (Some(av), Some(rc)) = (av_url, rc_url) {
+                    let base = format!("http://{}:{}", d.host, d.port);
+                    let delay = state.config.play_delay_for(&d.name);
+                    let dlna = DlnaOutput::new(
+                        d.name.clone(),
+                        d.id.clone(),
+                        d.host.clone(),
+                        format!("{base}{av}"),
+                        format!("{base}{rc}"),
+                    )
+                    .with_play_delay(delay);
+                    outputs.register(Box::new(dlna));
+                    registered += 1;
                 }
+            }
         }
     }
 
     // Emit device.discovered for each found device
     for d in &deduped {
-        state.event_bus.emit("device.discovered", json!({
-            "id": &d.id,
-            "name": &d.name,
-            "host": &d.host,
-            "type": format!("{:?}", d.device_type),
-        }));
+        state.event_bus.emit(
+            "device.discovered",
+            json!({
+                "id": &d.id,
+                "name": &d.name,
+                "host": &d.host,
+                "type": format!("{:?}", d.device_type),
+            }),
+        );
     }
 
     let items: Vec<Value> = deduped
         .iter()
-        .map(|d| json!({
-            "id": d.id,
-            "name": d.name,
-            "type": format!("{:?}", d.device_type),
-            "host": d.host,
-            "port": d.port,
-            "available": d.available,
-            "manufacturer": d.manufacturer,
-            "model": d.model,
-        }))
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "name": d.name,
+                "type": format!("{:?}", d.device_type),
+                "host": d.host,
+                "port": d.port,
+                "available": d.available,
+                "manufacturer": d.manufacturer,
+                "model": d.model,
+            })
+        })
         .collect();
 
     Json(json!({
@@ -190,7 +202,11 @@ async fn device_buffer_stats(
 ) -> impl IntoResponse {
     let outputs = state.outputs.lock().await;
     let Some(output) = outputs.get(&device_id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "device not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "device not found"})),
+        )
+            .into_response();
     };
     let output = output.lock().await;
     let (buffer_s, auto) = buffer_settings_for(&state.db, &device_id);
@@ -221,7 +237,11 @@ async fn set_device_buffer(
     {
         let outputs = state.outputs.lock().await;
         if outputs.get(&device_id).is_none() {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "device not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "device not found"})),
+            )
+                .into_response();
         }
     }
 

@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -56,7 +56,7 @@ async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{base}/config")).send().await {
@@ -133,7 +133,7 @@ async fn hue_lights(State(state): State<AppState>) -> impl IntoResponse {
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{base}/lights")).send().await {
@@ -168,7 +168,7 @@ async fn hue_light_state(
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{base}/lights/{id}")).send().await {
@@ -204,7 +204,7 @@ async fn set_hue_light(
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client
@@ -241,7 +241,7 @@ async fn hue_groups(State(state): State<AppState>) -> impl IntoResponse {
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{base}/groups")).send().await {
@@ -277,7 +277,7 @@ async fn set_hue_group(
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client
@@ -314,7 +314,7 @@ async fn hue_scenes(State(state): State<AppState>) -> impl IntoResponse {
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{base}/scenes")).send().await {
@@ -349,7 +349,7 @@ async fn activate_hue_scene(
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     // Activate scene by setting it on group 0 (all lights)
@@ -399,7 +399,7 @@ async fn sync_to_music(
     let client = match hue_http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -460,9 +460,21 @@ fn hex_to_xy(hex: &str) -> (f64, f64) {
     let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255) as f64 / 255.0;
 
     // Apply gamma correction
-    let r = if r > 0.04045 { ((r + 0.055) / 1.055).powf(2.4) } else { r / 12.92 };
-    let g = if g > 0.04045 { ((g + 0.055) / 1.055).powf(2.4) } else { g / 12.92 };
-    let b = if b > 0.04045 { ((b + 0.055) / 1.055).powf(2.4) } else { b / 12.92 };
+    let r = if r > 0.04045 {
+        ((r + 0.055) / 1.055).powf(2.4)
+    } else {
+        r / 12.92
+    };
+    let g = if g > 0.04045 {
+        ((g + 0.055) / 1.055).powf(2.4)
+    } else {
+        g / 12.92
+    };
+    let b = if b > 0.04045 {
+        ((b + 0.055) / 1.055).powf(2.4)
+    } else {
+        b / 12.92
+    };
 
     // Wide RGB D65 conversion
     let x_val = r * 0.664511 + g * 0.154324 + b * 0.162028;

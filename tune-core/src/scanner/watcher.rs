@@ -7,8 +7,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif",
-    "wv", "wma", "dsf", "dff", "dst", "alac", "ape",
+    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
+    "alac", "ape",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +35,8 @@ impl FileWatcher {
         let (tx, rx) = mpsc::channel();
         let event_tx = tx;
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            match res {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
                     let change_type = match event.kind {
                         EventKind::Create(_) => Some(ChangeType::Added),
@@ -59,9 +59,8 @@ impl FileWatcher {
                 Err(e) => {
                     warn!(error = %e, "watcher_error");
                 }
-            }
-        })
-        .map_err(|e| format!("watcher init: {e}"))?;
+            })
+            .map_err(|e| format!("watcher init: {e}"))?;
 
         let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
         for dir in &dirs {

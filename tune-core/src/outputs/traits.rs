@@ -42,7 +42,13 @@ pub trait OutputTarget: Send + Sync {
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
 
-    async fn play_url(&self, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> Result<(), String>;
+    async fn play_url(
+        &self,
+        url: &str,
+        mime_type: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> Result<(), String>;
     async fn pause(&self) -> Result<(), String>;
     async fn resume(&self) -> Result<(), String>;
     async fn stop(&self) -> Result<(), String>;

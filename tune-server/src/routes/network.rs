@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -46,8 +46,14 @@ pub fn router() -> Router<AppState> {
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
-        .route("/media-servers/{id}/item/{item_id}/stream-url", get(media_server_stream_url))
-        .route("/media-servers/{id}/item/{item_id}/play/{zone_id}", post(play_media_server_item))
+        .route(
+            "/media-servers/{id}/item/{item_id}/stream-url",
+            get(media_server_stream_url),
+        )
+        .route(
+            "/media-servers/{id}/item/{item_id}/play/{zone_id}",
+            post(play_media_server_item),
+        )
         .route("/mounts/test", post(test_mount))
         .route("/shares/{id}", get(get_share_detail))
 }
@@ -98,11 +104,11 @@ async fn create_mount(
     }
 }
 
-async fn delete_mount(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
-    state.db.execute("DELETE FROM network_mounts WHERE id = ?", &[&id]).ok();
+async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    state
+        .db
+        .execute("DELETE FROM network_mounts WHERE id = ?", &[&id])
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -143,9 +149,7 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
         .await;
 
         match result {
-            Ok(Ok(out)) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).to_string()
-            }
+            Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
             _ => {
                 // Fallback to smbclient (Linux)
                 let result = tokio::time::timeout(
@@ -263,7 +267,7 @@ async fn trigger_smb_scan() -> impl IntoResponse {
                             .collect::<std::collections::HashMap<_, _>>(),
                     }));
                 }
-                Ok(_) => {} // other events (SearchStarted, ServiceFound, etc.)
+                Ok(_) => {}  // other events (SearchStarted, ServiceFound, etc.)
                 Err(_) => {} // recv timeout, continue until deadline
             }
         }
@@ -345,7 +349,9 @@ async fn mount_smb_share(
         let unc = format!("//{credentials}{}/{}", body.host, body.share_name);
         tokio::time::timeout(
             Duration::from_secs(15),
-            Command::new("mount_smbfs").args([&unc, &mount_path]).output(),
+            Command::new("mount_smbfs")
+                .args([&unc, &mount_path])
+                .output(),
         )
         .await
     } else {
@@ -424,10 +430,7 @@ async fn mount_smb_share(
 // Media Server browsing / streaming
 // ---------------------------------------------------------------------------
 
-async fn browse_media_server(
-    Path(id): Path<String>,
-    Query(q): Query<BrowseQuery>,
-) -> Json<Value> {
+async fn browse_media_server(Path(id): Path<String>, Query(q): Query<BrowseQuery>) -> Json<Value> {
     let object_id = q.object_id.as_deref().unwrap_or("0");
     Json(json!({
         "server_id": id,
@@ -443,9 +446,7 @@ struct BrowseQuery {
     object_id: Option<String>,
 }
 
-async fn media_server_stream_url(
-    Path((id, item_id)): Path<(String, String)>,
-) -> Json<Value> {
+async fn media_server_stream_url(Path((id, item_id)): Path<(String, String)>) -> Json<Value> {
     Json(json!({
         "server_id": id,
         "item_id": item_id,
@@ -481,9 +482,7 @@ async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
         false
     };
     let file_count = if readable {
-        std::fs::read_dir(path)
-            .map(|rd| rd.count())
-            .unwrap_or(0)
+        std::fs::read_dir(path).map(|rd| rd.count()).unwrap_or(0)
     } else {
         0
     };
@@ -497,10 +496,7 @@ async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
     }))
 }
 
-async fn get_share_detail(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_share_detail(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.db.connection().lock().unwrap();
     let result = conn.query_row(
         "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts WHERE id = ?",

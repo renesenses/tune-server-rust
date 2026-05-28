@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use tune_core::db::settings_repo::SettingsRepo;
@@ -191,7 +191,9 @@ async fn get_listens(
 
     let client = match lb_client() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     match client.get(&url).send().await {
@@ -202,9 +204,17 @@ async fn get_listens(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("HTTP {status}: {body}")}))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("HTTP {status}: {body}")})),
+            )
+                .into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -240,7 +250,9 @@ async fn get_stats(
 
     let client = match lb_client() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     match client.get(&url).send().await {
@@ -251,16 +263,29 @@ async fn get_stats(
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("HTTP {status}: {body}")}))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("HTTP {status}: {body}")})),
+            )
+                .into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // --- Public helpers for orchestrator integration ---
 
 /// Submit a "single" listen to ListenBrainz (fire-and-forget from orchestrator).
-pub async fn submit_listen_api(token: &str, artist: &str, track: &str, album: Option<&str>) -> Result<(), String> {
+pub async fn submit_listen_api(
+    token: &str,
+    artist: &str,
+    track: &str,
+    album: Option<&str>,
+) -> Result<(), String> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -299,7 +324,12 @@ pub async fn submit_listen_api(token: &str, artist: &str, track: &str, album: Op
 }
 
 /// Update "playing_now" on ListenBrainz.
-pub async fn update_now_playing_api(token: &str, artist: &str, track: &str, album: Option<&str>) -> Result<(), String> {
+pub async fn update_now_playing_api(
+    token: &str,
+    artist: &str,
+    track: &str,
+    album: Option<&str>,
+) -> Result<(), String> {
     let payload = json!({
         "listen_type": "playing_now",
         "payload": [{

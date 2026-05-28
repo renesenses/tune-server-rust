@@ -3,7 +3,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -192,7 +192,10 @@ async fn start_rip(
     });
 
     settings
-        .set("cd_rip_current", &serde_json::to_string(&rip_state).unwrap())
+        .set(
+            "cd_rip_current",
+            &serde_json::to_string(&rip_state).unwrap(),
+        )
         .ok();
 
     // In production, this would spawn a background tokio task running cdparanoia.

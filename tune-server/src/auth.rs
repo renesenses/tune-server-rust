@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use tune_core::db::settings_repo::SettingsRepo;
@@ -92,15 +92,17 @@ fn base64url_encode(data: &[u8]) -> String {
 
 fn base64url_decode(s: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let lut: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        .to_vec();
+    let lut: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".to_vec();
 
     let bytes: Vec<u8> = s.bytes().collect();
     let mut buf = 0u32;
     let mut bits = 0u8;
 
     for &b in &bytes {
-        let val = lut.iter().position(|&c| c == b).ok_or("invalid base64url char")? as u32;
+        let val = lut
+            .iter()
+            .position(|&c| c == b)
+            .ok_or("invalid base64url char")? as u32;
         buf = (buf << 6) | val;
         bits += 6;
         if bits >= 8 {
@@ -227,11 +229,7 @@ pub async fn auth_middleware(
         }
         Some(header) if header.starts_with("ApiKey ") => {
             let key = &header[7..];
-            let stored = settings
-                .get("api_key")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
             if !stored.is_empty() && key == stored {
                 next.run(request).await
             } else {

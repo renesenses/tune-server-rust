@@ -6,12 +6,12 @@
 //! Routes are intended to be merged into the main Axum app or served on a
 //! separate port (default 8080 for UPnP description + ContentDirectory).
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use quick_xml::events::Event;
 use tracing::{debug, warn};
 
@@ -65,7 +65,10 @@ pub fn router() -> Router<UpnpState> {
         .route("/description.xml", get(device_description))
         .route("/ContentDirectory/control", post(content_directory_control))
         .route("/ContentDirectory/event", get(content_directory_event))
-        .route("/ConnectionManager/control", post(connection_manager_control))
+        .route(
+            "/ConnectionManager/control",
+            post(connection_manager_control),
+        )
 }
 
 /// Build a standalone Axum `Router` (with state already applied) suitable for
@@ -287,7 +290,12 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
     }
 }
 
-fn browse_direct_children(state: &UpnpState, object_id: &str, start: u64, count: u64) -> DidlResult {
+fn browse_direct_children(
+    state: &UpnpState,
+    object_id: &str,
+    start: u64,
+    count: u64,
+) -> DidlResult {
     let base_url = state.base_url();
 
     match object_id {
@@ -298,11 +306,19 @@ fn browse_direct_children(state: &UpnpState, object_id: &str, start: u64, count:
         "playlists" => browse_playlists(state),
         "radios" => browse_radios(state),
         id if id.starts_with("artist/") => {
-            let artist_id: i64 = id.strip_prefix("artist/").unwrap_or("0").parse().unwrap_or(0);
+            let artist_id: i64 = id
+                .strip_prefix("artist/")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
             browse_artist_albums(state, artist_id, &base_url)
         }
         id if id.starts_with("album/") => {
-            let album_id: i64 = id.strip_prefix("album/").unwrap_or("0").parse().unwrap_or(0);
+            let album_id: i64 = id
+                .strip_prefix("album/")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
             browse_album_tracks(state, album_id, &base_url)
         }
         _ => DidlResult {
@@ -544,7 +560,13 @@ fn didl_wrap(inner: &str) -> String {
     )
 }
 
-fn didl_container(id: &str, parent_id: &str, title: &str, class: &str, child_count: Option<u64>) -> String {
+fn didl_container(
+    id: &str,
+    parent_id: &str,
+    title: &str,
+    class: &str,
+    child_count: Option<u64>,
+) -> String {
     didl_container_ext(id, parent_id, title, class, child_count, "")
 }
 

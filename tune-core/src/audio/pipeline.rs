@@ -62,7 +62,8 @@ impl AudioPipeline {
 
         let mut args = vec![
             "-hide_banner".to_string(),
-            "-loglevel".into(), "warning".into(),
+            "-loglevel".into(),
+            "warning".into(),
         ];
 
         if let Some(seek) = cfg.seek_ms {
@@ -81,12 +82,17 @@ impl AudioPipeline {
         };
 
         args.extend([
-            "-i".into(), cfg.file_path.clone(),
+            "-i".into(),
+            cfg.file_path.clone(),
             "-vn".into(),
-            "-f".into(), cfg.output_format.ffmpeg_format_arg().into(),
-            "-acodec".into(), codec.into(),
-            "-ar".into(), cfg.sample_rate.to_string(),
-            "-ac".into(), cfg.channels.to_string(),
+            "-f".into(),
+            cfg.output_format.ffmpeg_format_arg().into(),
+            "-acodec".into(),
+            codec.into(),
+            "-ar".into(),
+            cfg.sample_rate.to_string(),
+            "-ac".into(),
+            cfg.channels.to_string(),
             "pipe:1".into(),
         ]);
 
@@ -153,7 +159,11 @@ pub fn find_ffmpeg() -> Option<String> {
     let candidates = if cfg!(target_os = "windows") {
         vec!["ffmpeg.exe", ".\\ffmpeg.exe"]
     } else {
-        vec!["ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
+        vec![
+            "ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",
+        ]
     };
 
     for candidate in candidates {

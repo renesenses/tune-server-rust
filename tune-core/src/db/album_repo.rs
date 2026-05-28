@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use super::models::Album;
 use super::sqlite::SqliteDb;
@@ -27,25 +27,36 @@ impl AlbumRepo {
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? COLLATE NOCASE LIMIT 1"))
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.title = ? COLLATE NOCASE LIMIT 1"
+            ))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![title], |row| Ok(row_to_album(row)))
             .optional()
             .map_err(|e| e.to_string())
     }
 
-    pub fn get_by_title_and_artist(&self, title: &str, artist_id: i64, year: Option<i32>) -> Result<Option<Album>, String> {
+    pub fn get_by_title_and_artist(
+        &self,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+    ) -> Result<Option<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
         if let Some(y) = year {
             let mut stmt = conn
-                .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"))
+                .prepare(&format!(
+                    "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"
+                ))
                 .map_err(|e| e.to_string())?;
             stmt.query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
                 .optional()
                 .map_err(|e| e.to_string())
         } else {
             let mut stmt = conn
-                .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"))
+                .prepare(&format!(
+                    "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
+                ))
                 .map_err(|e| e.to_string())?;
             stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
                 .optional()
@@ -56,7 +67,9 @@ impl AlbumRepo {
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"))
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"
+            ))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![release_id], |row| Ok(row_to_album(row)))
             .optional()
@@ -81,7 +94,12 @@ impl AlbumRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn get_or_create(&self, title: &str, artist_id: i64, year: Option<i32>) -> Result<Album, String> {
+    pub fn get_or_create(
+        &self,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+    ) -> Result<Album, String> {
         if let Some(album) = self.get_by_title_and_artist(title, artist_id, year)? {
             return Ok(album);
         }
@@ -187,23 +205,45 @@ impl AlbumRepo {
         self.list_sorted(limit, offset, "title", "asc")
     }
 
-    pub fn list_sorted(&self, limit: i64, offset: i64, sort: &str, order: &str) -> Result<Vec<Album>, String> {
+    pub fn list_sorted(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+    ) -> Result<Vec<Album>, String> {
         self.list_filtered(limit, offset, sort, order, None, None)
     }
 
-    pub fn list_filtered(&self, limit: i64, offset: i64, sort: &str, order: &str, format: Option<&str>, quality: Option<&str>) -> Result<Vec<Album>, String> {
-        let dir = if order.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
+    pub fn list_filtered(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+    ) -> Result<Vec<Album>, String> {
+        let dir = if order.eq_ignore_ascii_case("desc") {
+            "DESC"
+        } else {
+            "ASC"
+        };
         let order_clause = match sort {
             "title" => format!("a.title COLLATE NOCASE {dir}"),
             "release_date" | "year" => format!("a.year {dir}, a.title COLLATE NOCASE ASC"),
-            "artist" => format!("ar.name COLLATE NOCASE {dir}, a.year ASC, a.title COLLATE NOCASE ASC"),
+            "artist" => {
+                format!("ar.name COLLATE NOCASE {dir}, a.year ASC, a.title COLLATE NOCASE ASC")
+            }
             _ => format!("a.id {dir}"),
         };
         let mut wheres = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(fmt) = format {
-            wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format = ?)".to_string());
+            wheres.push(
+                "a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format = ?)".to_string(),
+            );
             bind_values.push(Box::new(fmt.to_string()));
         }
         match quality {
@@ -232,7 +272,8 @@ impl AlbumRepo {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
-        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
         params_vec.push(&limit);
         params_vec.push(&offset);
 
@@ -247,7 +288,9 @@ impl AlbumRepo {
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.artist_id = ? ORDER BY a.year, a.title"))
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.artist_id = ? ORDER BY a.year, a.title"
+            ))
             .map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(params![artist_id], |row| Ok(row_to_album(row)))
@@ -277,7 +320,9 @@ impl AlbumRepo {
 
     /// Return all local albums that have no cover art set.
     /// Each entry is (album_id, title, artist_name, musicbrainz_release_id).
-    pub fn list_without_cover(&self) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
+    pub fn list_without_cover(
+        &self,
+    ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -285,7 +330,7 @@ impl AlbumRepo {
                  FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
                  WHERE (a.cover_path IS NULL OR a.cover_path = '') \
                  AND a.source = 'local' \
-                 ORDER BY a.id"
+                 ORDER BY a.id",
             )
             .map_err(|e| e.to_string())?;
         let items = stmt
@@ -311,7 +356,10 @@ impl AlbumRepo {
             .prepare(&format!("{SELECT_ALBUM} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR a.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR a.genre LIKE ? COLLATE NOCASE OR CAST(a.year AS TEXT) = ? OR a.label LIKE ? COLLATE NOCASE LIMIT ?"))
             .map_err(|e| e.to_string())?;
         let albums = stmt
-            .query_map(params![fts_query, like, like, like, query.trim(), like, limit], |row| Ok(row_to_album(row)))
+            .query_map(
+                params![fts_query, like, like, like, query.trim(), like, limit],
+                |row| Ok(row_to_album(row)),
+            )
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
@@ -366,7 +414,9 @@ mod tests {
         let artist_repo = ArtistRepo::new(db.clone());
         let repo = AlbumRepo::new(db);
 
-        let artist_id = artist_repo.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let artist_id = artist_repo
+            .create(&Artist::new("Pink Floyd".into()))
+            .unwrap();
         let mut album = Album::new("The Dark Side of the Moon".into());
         album.artist_id = Some(artist_id);
         album.year = Some(1973);
@@ -388,8 +438,12 @@ mod tests {
         let repo = AlbumRepo::new(db);
 
         let artist_id = artist_repo.create(&Artist::new("Beatles".into())).unwrap();
-        let a1 = repo.get_or_create("Abbey Road", artist_id, Some(1969)).unwrap();
-        let a2 = repo.get_or_create("Abbey Road", artist_id, Some(1969)).unwrap();
+        let a1 = repo
+            .get_or_create("Abbey Road", artist_id, Some(1969))
+            .unwrap();
+        let a2 = repo
+            .get_or_create("Abbey Road", artist_id, Some(1969))
+            .unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
     }
@@ -492,7 +546,9 @@ mod tests {
         let artist_repo = ArtistRepo::new(db.clone());
         let repo = AlbumRepo::new(db);
 
-        let aid1 = artist_repo.create(&Artist::new("Miles Davis".into())).unwrap();
+        let aid1 = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
         let aid2 = artist_repo.create(&Artist::new("Coltrane".into())).unwrap();
 
         let mut a1 = Album::new("Kind of Blue".into());
@@ -565,7 +621,9 @@ mod tests {
         let artist_repo = ArtistRepo::new(db.clone());
         let repo = AlbumRepo::new(db);
 
-        let aid = artist_repo.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let aid = artist_repo
+            .create(&Artist::new("Pink Floyd".into()))
+            .unwrap();
         let mut a = Album::new("The Dark Side of the Moon".into());
         a.artist_id = Some(aid);
         a.year = Some(1973);
@@ -589,7 +647,11 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, Some(id));
 
-        assert!(repo.get_by_musicbrainz_release_id("nonexistent").unwrap().is_none());
+        assert!(
+            repo.get_by_musicbrainz_release_id("nonexistent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -660,7 +722,11 @@ mod tests {
         let track_repo = crate::db::track_repo::TrackRepo::new(db);
 
         let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
-        let alid = album_repo.get_or_create("Test Album", aid, None).unwrap().id.unwrap();
+        let alid = album_repo
+            .get_or_create("Test Album", aid, None)
+            .unwrap()
+            .id
+            .unwrap();
 
         let mut t = crate::db::models::Track::new("Track 1".into());
         t.album_id = Some(alid);

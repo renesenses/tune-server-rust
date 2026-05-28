@@ -6,7 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -63,25 +63,36 @@ pub fn router() -> Router<AppState> {
         .route("/diff", post(diff_playlists))
         .route("/import/m3u", post(import_m3u_file))
         .route("/import/m3u-url", post(import_m3u_url))
-        .route("/{id}", get(get_playlist).put(update_playlist).delete(delete_playlist))
-        .route("/{id}/tracks", get(get_tracks).post(add_tracks).delete(remove_tracks_batch).put(reorder_tracks))
+        .route(
+            "/{id}",
+            get(get_playlist)
+                .put(update_playlist)
+                .delete(delete_playlist),
+        )
+        .route(
+            "/{id}/tracks",
+            get(get_tracks)
+                .post(add_tracks)
+                .delete(remove_tracks_batch)
+                .put(reorder_tracks),
+        )
         .route("/{id}/tracks/remove", post(remove_track))
         .route("/{id}/duplicate", post(duplicate_playlist))
         .route("/{id}/export", get(export_m3u))
         .route("/{id}/share", post(share_playlist))
         .route("/{id}/recover", post(recover_playlist))
         .route("/{id}/recover/apply", post(apply_recovery))
-        .route("/collaborative", get(list_collaborative).post(create_collaborative))
+        .route(
+            "/collaborative",
+            get(list_collaborative).post(create_collaborative),
+        )
         .route("/collaborative/{id}", get(get_collaborative))
         .route("/collaborative/{id}/add", post(add_to_collaborative))
         .route("/collaborative/{id}/tracks", get(collaborative_tracks))
         .route("/match", post(match_tracks))
 }
 
-async fn list_playlists(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Json<Value> {
+async fn list_playlists(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
     let repo = PlaylistRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -90,10 +101,7 @@ async fn list_playlists(
     Json(json!(items))
 }
 
-async fn get_playlist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(pl)) => Json(json!(pl)).into_response(),
@@ -125,10 +133,7 @@ async fn update_playlist(
     }
 }
 
-async fn delete_playlist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db);
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -136,13 +141,12 @@ async fn delete_playlist(
     }
 }
 
-async fn get_tracks(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn get_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let repo = PlaylistRepo::new(state.db.clone());
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db)
+        .get_multiple(&track_ids)
+        .unwrap_or_default();
     Json(json!(tracks))
 }
 
@@ -215,13 +219,14 @@ async fn duplicate_playlist(
         repo.add_tracks(new_id, &track_ids, None).ok();
     }
 
-    (StatusCode::CREATED, Json(json!({ "id": new_id, "name": new_name }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(json!({ "id": new_id, "name": new_name })),
+    )
+        .into_response()
 }
 
-async fn export_m3u(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn export_m3u(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db.clone());
     let playlist = match repo.get(id) {
         Ok(Some(p)) => p,
@@ -229,13 +234,18 @@ async fn export_m3u(
     };
 
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db)
+        .get_multiple(&track_ids)
+        .unwrap_or_default();
 
     let mut m3u = String::from("#EXTM3U\n");
     for t in &tracks {
         let duration_secs = t.duration_ms / 1000;
         let artist = t.artist_name.as_deref().unwrap_or("Unknown");
-        m3u.push_str(&format!("#EXTINF:{},{} - {}\n", duration_secs, artist, t.title));
+        m3u.push_str(&format!(
+            "#EXTINF:{},{} - {}\n",
+            duration_secs, artist, t.title
+        ));
         if let Some(ref path) = t.file_path {
             m3u.push_str(path);
             m3u.push('\n');
@@ -284,7 +294,11 @@ async fn import_m3u_file(
     }
 
     if file_content.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no file provided"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no file provided"})),
+        )
+            .into_response();
     }
 
     let name = playlist_name
@@ -386,7 +400,9 @@ async fn import_m3u_url(
     let m3u_content = match reqwest::get(&body.url).await {
         Ok(resp) => match resp.text().await {
             Ok(text) => text,
-            Err(e) => return (StatusCode::BAD_GATEWAY, format!("read failed: {e}")).into_response(),
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("read failed: {e}")).into_response();
+            }
         },
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("fetch failed: {e}")).into_response(),
     };
@@ -407,10 +423,11 @@ async fn import_m3u_url(
             continue;
         }
         if let Ok(Some(track)) = track_repo.get_by_path(line)
-            && let Some(id) = track.id {
-                repo.add_tracks(playlist_id, &[id], None).ok();
-                matched += 1;
-            }
+            && let Some(id) = track.id
+        {
+            repo.add_tracks(playlist_id, &[id], None).ok();
+            matched += 1;
+        }
     }
 
     (
@@ -432,10 +449,7 @@ async fn list_all_playlists(State(state): State<AppState>) -> Json<Value> {
     Json(json!(items))
 }
 
-async fn share_playlist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db.clone());
     match repo.get(id) {
         Ok(Some(_)) => {}
@@ -472,7 +486,10 @@ async fn get_shared_playlist(
     let playlist_id = all
         .iter()
         .find(|(k, v)| k.starts_with("playlist_share_") && v == &token)
-        .and_then(|(k, _)| k.strip_prefix("playlist_share_").and_then(|s| s.parse::<i64>().ok()));
+        .and_then(|(k, _)| {
+            k.strip_prefix("playlist_share_")
+                .and_then(|s| s.parse::<i64>().ok())
+        });
 
     let playlist_id = match playlist_id {
         Some(id) => id,
@@ -486,7 +503,9 @@ async fn get_shared_playlist(
     };
 
     let track_ids = repo.get_track_ids(playlist_id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db).get_multiple(&track_ids).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db)
+        .get_multiple(&track_ids)
+        .unwrap_or_default();
 
     Json(json!({
         "playlist": playlist,
@@ -495,10 +514,7 @@ async fn get_shared_playlist(
     .into_response()
 }
 
-async fn recover_playlist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(pl)) => Json(json!(pl)).into_response(),
@@ -561,10 +577,7 @@ async fn diff_playlists(
 // Recovery apply
 // ---------------------------------------------------------------------------
 
-async fn apply_recovery(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::new(state.db.clone());
     let track_repo = TrackRepo::new(state.db);
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
@@ -641,7 +654,12 @@ async fn create_collaborative(
         "created_at": nanos / 1_000_000_000,
     });
     items.push(entry.clone());
-    settings.set("collaborative_playlists", &serde_json::to_string(&items).unwrap_or_default()).ok();
+    settings
+        .set(
+            "collaborative_playlists",
+            &serde_json::to_string(&items).unwrap_or_default(),
+        )
+        .ok();
     (StatusCode::CREATED, Json(entry)).into_response()
 }
 
@@ -690,7 +708,12 @@ async fn add_to_collaborative(
             tracks.push(json!(tid));
         }
     }
-    settings.set("collaborative_playlists", &serde_json::to_string(&items).unwrap_or_default()).ok();
+    settings
+        .set(
+            "collaborative_playlists",
+            &serde_json::to_string(&items).unwrap_or_default(),
+        )
+        .ok();
     Json(json!({ "added": body.track_ids.len() })).into_response()
 }
 

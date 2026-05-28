@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -85,7 +85,8 @@ impl RadioRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM radio_stations WHERE id = ?", &[&id])?;
+        self.db
+            .execute("DELETE FROM radio_stations WHERE id = ?", &[&id])?;
         Ok(())
     }
 
@@ -224,16 +225,34 @@ mod tests {
         assert_eq!(repo.count().unwrap(), 0);
 
         let s1 = RadioStation {
-            id: None, name: "FIP".into(), url: "http://fip.fr".into(),
-            homepage: None, logo_url: None, country: Some("FR".into()),
-            language: None, genre: Some("Jazz".into()), codec: None,
-            bitrate: None, is_favorite: false, last_played: None, play_count: 0,
+            id: None,
+            name: "FIP".into(),
+            url: "http://fip.fr".into(),
+            homepage: None,
+            logo_url: None,
+            country: Some("FR".into()),
+            language: None,
+            genre: Some("Jazz".into()),
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
         };
         let s2 = RadioStation {
-            id: None, name: "BBC Radio 3".into(), url: "http://bbc.co.uk/radio3".into(),
-            homepage: None, logo_url: None, country: Some("UK".into()),
-            language: None, genre: Some("Classical".into()), codec: None,
-            bitrate: None, is_favorite: true, last_played: None, play_count: 0,
+            id: None,
+            name: "BBC Radio 3".into(),
+            url: "http://bbc.co.uk/radio3".into(),
+            homepage: None,
+            logo_url: None,
+            country: Some("UK".into()),
+            language: None,
+            genre: Some("Classical".into()),
+            codec: None,
+            bitrate: None,
+            is_favorite: true,
+            last_played: None,
+            play_count: 0,
         };
 
         repo.create(&s1).unwrap();
@@ -259,11 +278,21 @@ mod tests {
             ("Jazz FM", "Jazz", "UK"),
         ] {
             repo.create(&RadioStation {
-                id: None, name: name.into(), url: format!("http://{name}.com"),
-                homepage: None, logo_url: None, country: Some(country.into()),
-                language: None, genre: Some(genre.into()), codec: None,
-                bitrate: None, is_favorite: false, last_played: None, play_count: 0,
-            }).unwrap();
+                id: None,
+                name: name.into(),
+                url: format!("http://{name}.com"),
+                homepage: None,
+                logo_url: None,
+                country: Some(country.into()),
+                language: None,
+                genre: Some(genre.into()),
+                codec: None,
+                bitrate: None,
+                is_favorite: false,
+                last_played: None,
+                play_count: 0,
+            })
+            .unwrap();
         }
 
         let jazz = repo.search("Jazz").unwrap();
@@ -284,10 +313,19 @@ mod tests {
 
         let repo = RadioRepo::new(db);
         let station = RadioStation {
-            id: None, name: "Old Name".into(), url: "http://old.com".into(),
-            homepage: None, logo_url: None, country: None,
-            language: None, genre: None, codec: None,
-            bitrate: None, is_favorite: false, last_played: None, play_count: 0,
+            id: None,
+            name: "Old Name".into(),
+            url: "http://old.com".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
         };
         let id = repo.create(&station).unwrap();
 
@@ -311,10 +349,19 @@ mod tests {
 
         let repo = RadioRepo::new(db);
         let station = RadioStation {
-            id: None, name: "No ID".into(), url: "http://no-id.com".into(),
-            homepage: None, logo_url: None, country: None,
-            language: None, genre: None, codec: None,
-            bitrate: None, is_favorite: false, last_played: None, play_count: 0,
+            id: None,
+            name: "No ID".into(),
+            url: "http://no-id.com".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
         };
         assert!(repo.update(&station).is_err());
     }
@@ -337,10 +384,19 @@ mod tests {
 
         let repo = RadioRepo::new(db);
         let station = RadioStation {
-            id: None, name: "Test".into(), url: "http://test.com".into(),
-            homepage: None, logo_url: None, country: None,
-            language: None, genre: None, codec: None,
-            bitrate: None, is_favorite: false, last_played: None, play_count: 0,
+            id: None,
+            name: "Test".into(),
+            url: "http://test.com".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
         };
         let id = repo.create(&station).unwrap();
 

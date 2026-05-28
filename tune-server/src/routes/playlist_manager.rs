@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -47,7 +47,10 @@ fn load_json_setting(settings: &SettingsRepo, key: &str) -> Vec<Value> {
 
 fn save_json_setting(settings: &SettingsRepo, key: &str, data: &[Value]) {
     settings
-        .set(key, &serde_json::to_string(data).unwrap_or_else(|_| "[]".into()))
+        .set(
+            key,
+            &serde_json::to_string(data).unwrap_or_else(|_| "[]".into()),
+        )
         .ok();
 }
 
@@ -203,7 +206,7 @@ async fn transfer_playlist(
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"detail": format!("Failed to load source playlist: {e}")})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
 
@@ -248,10 +251,7 @@ async fn transfer_playlist(
     let mut track_details: Vec<Value> = Vec::new();
 
     for track in &source_tracks {
-        let title = track
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let title = track.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let artist = track
             .get("artist_name")
             .and_then(|v| v.as_str())
@@ -411,7 +411,7 @@ async fn batch_transfer(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"detail": format!("Source '{}' not found", body.source_service)})),
             )
-                .into_response()
+                .into_response();
         }
     };
     drop(registry);
@@ -568,10 +568,7 @@ async fn create_link(
     (StatusCode::CREATED, Json(link)).into_response()
 }
 
-async fn delete_link(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db);
     let mut links = load_json_setting(&settings, "playlist_links");
     let before = links.len();
@@ -583,10 +580,7 @@ async fn delete_link(
     Json(json!({"ok": true})).into_response()
 }
 
-async fn sync_link(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
 
@@ -627,7 +621,7 @@ async fn sync_link(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"detail": format!("Service '{service}' not available")})),
             )
-                .into_response()
+                .into_response();
         }
     };
     drop(registry);
@@ -661,7 +655,9 @@ async fn sync_link(
                 if let Some(track) = results.first() {
                     if let Some(tid) = track.id {
                         if !local_track_ids.contains(&tid) {
-                            playlist_repo.add_tracks(local_playlist_id, &[tid], None).ok();
+                            playlist_repo
+                                .add_tracks(local_playlist_id, &[tid], None)
+                                .ok();
                             added_to_local += 1;
                         }
                     }
@@ -721,7 +717,11 @@ async fn backup_playlists(
     } else {
         let mut names: Vec<String> = status_all
             .iter()
-            .filter_map(|s| s.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|s| {
+                s.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
         names.push("local".to_string());
         names
@@ -831,10 +831,7 @@ struct BackupsQuery {
     limit: Option<usize>,
 }
 
-async fn list_backups(
-    State(state): State<AppState>,
-    Query(q): Query<BackupsQuery>,
-) -> Json<Value> {
+async fn list_backups(State(state): State<AppState>, Query(q): Query<BackupsQuery>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let snapshots = load_json_setting(&settings, "playlist_snapshots");
     let limit = q.limit.unwrap_or(500);
@@ -865,10 +862,7 @@ async fn list_backups(
     Json(json!(filtered))
 }
 
-async fn get_backup(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_backup(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db);
     let snapshots = load_json_setting(&settings, "playlist_snapshots");
     let snap = snapshots
@@ -880,10 +874,7 @@ async fn get_backup(
     }
 }
 
-async fn delete_backup(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_backup(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db);
     let mut snapshots = load_json_setting(&settings, "playlist_snapshots");
     let before = snapshots.len();
@@ -964,7 +955,7 @@ async fn restore_backup(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"detail": e})),
                 )
-                    .into_response()
+                    .into_response();
             }
         }
     };
@@ -975,10 +966,7 @@ async fn restore_backup(
     let mut matched_ids: Vec<i64> = Vec::new();
 
     for track in &snapshot_tracks {
-        let title = track
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let title = track.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let artist = track
             .get("artist_name")
             .and_then(|v| v.as_str())
@@ -1063,13 +1051,15 @@ async fn merge_playlists(
     let new_id = match playlist_repo.create(&body.target_name, Some("Merged playlist")) {
         Ok(id) => id,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": e}))).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": e})),
+            )
+                .into_response();
         }
     };
 
-    playlist_repo
-        .add_tracks(new_id, &all_track_ids, None)
-        .ok();
+    playlist_repo.add_tracks(new_id, &all_track_ids, None).ok();
 
     Json(json!({
         "playlist_id": new_id,
@@ -1126,7 +1116,7 @@ async fn export_playlists(
                     StatusCode::BAD_REQUEST,
                     Json(json!({"detail": format!("Service '{}' not found", body.service)})),
                 )
-                    .into_response()
+                    .into_response();
             }
         };
         drop(registry);
@@ -1162,22 +1152,10 @@ async fn export_playlists(
         "csv" => {
             let mut csv = String::from("title,artist,album,duration_ms\n");
             for t in &tracks {
-                let title = t
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let artist = t
-                    .get("artist_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let album = t
-                    .get("album_title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let dur = t
-                    .get("duration_ms")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let artist = t.get("artist_name").and_then(|v| v.as_str()).unwrap_or("");
+                let album = t.get("album_title").and_then(|v| v.as_str()).unwrap_or("");
+                let dur = t.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
                 csv.push_str(&format!(
                     "\"{}\",\"{}\",\"{}\",{}\n",
                     title.replace('"', "\"\""),
@@ -1206,18 +1184,9 @@ async fn export_playlists(
                  <trackList>\n",
             );
             for t in &tracks {
-                let title = t
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let artist = t
-                    .get("artist_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let dur = t
-                    .get("duration_ms")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let artist = t.get("artist_name").and_then(|v| v.as_str()).unwrap_or("");
+                let dur = t.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
                 xspf.push_str(&format!(
                     "  <track><title>{title}</title><creator>{artist}</creator><duration>{dur}</duration></track>\n"
                 ));
@@ -1282,14 +1251,16 @@ async fn import_playlists(
     let playlist_repo = PlaylistRepo::new(state.db.clone());
     let track_repo = TrackRepo::new(state.db.clone());
 
-    let name = body
-        .name
-        .unwrap_or_else(|| "Imported Playlist".into());
+    let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
 
     let playlist_id = match playlist_repo.create(&name, Some("Imported playlist")) {
         Ok(id) => id,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": e}))).into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": e})),
+            )
+                .into_response();
         }
     };
 

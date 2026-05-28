@@ -7,17 +7,23 @@ use rayon::prelude::*;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
-use crate::metadata::{try_read_metadata, TrackMetadata};
 use super::hasher::compute_audio_hash;
+use crate::metadata::{TrackMetadata, try_read_metadata};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif",
-    "wv", "wma", "dsf", "dff", "dst", "alac", "ape",
+    "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
+    "alac", "ape",
 ];
 
 const SKIP_DIRS: &[&str] = &[
-    "duplicates", ".tune", ".Spotlight-V100", ".Trashes",
-    "@eaDir", "#recycle", ".DS_Store", "$RECYCLE.BIN",
+    "duplicates",
+    ".tune",
+    ".Spotlight-V100",
+    ".Trashes",
+    "@eaDir",
+    "#recycle",
+    ".DS_Store",
+    "$RECYCLE.BIN",
     "System Volume Information",
 ];
 
@@ -62,9 +68,10 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
             }
             let path = entry.path();
             if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && extensions.contains(ext.to_lowercase().as_str()) {
-                    files.push(path.to_path_buf());
-                }
+                && extensions.contains(ext.to_lowercase().as_str())
+            {
+                files.push(path.to_path_buf());
+            }
         }
     }
 
@@ -86,9 +93,10 @@ pub fn scan_files_parallel(
         .map(|path| {
             let idx = counter.fetch_add(1, Ordering::Relaxed);
             if let Some(ref cb) = progress_callback
-                && idx.is_multiple_of(100) {
-                    cb(idx, total);
-                }
+                && idx.is_multiple_of(100)
+            {
+                cb(idx, total);
+            }
 
             let path_str = path.to_string_lossy().to_string();
 

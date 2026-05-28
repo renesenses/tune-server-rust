@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -274,7 +274,9 @@ async fn step_profile(
     match profile_repo.create(&display_name, Some(&display_name)) {
         Ok(profile_id) => {
             // Store avatar color in settings and update profile avatar
-            profile_repo.update(profile_id, None, Some(avatar_color)).ok();
+            profile_repo
+                .update(profile_id, None, Some(avatar_color))
+                .ok();
             // Set as active profile
             settings
                 .set("active_profile_id", &profile_id.to_string())

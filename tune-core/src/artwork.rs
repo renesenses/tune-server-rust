@@ -1,12 +1,22 @@
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 const FOLDER_COVER_NAMES: &[&str] = &[
-    "cover.jpg", "cover.png", "folder.jpg", "folder.png",
-    "front.jpg", "front.png", "album.jpg", "album.png",
-    "Cover.jpg", "Cover.png", "Folder.jpg", "Folder.png",
-    "Front.jpg", "Front.png",
+    "cover.jpg",
+    "cover.png",
+    "folder.jpg",
+    "folder.png",
+    "front.jpg",
+    "front.png",
+    "album.jpg",
+    "album.png",
+    "Cover.jpg",
+    "Cover.png",
+    "Folder.jpg",
+    "Folder.png",
+    "Front.jpg",
+    "Front.png",
 ];
 
 const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
@@ -48,7 +58,7 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
 }
 
 pub fn artwork_hash(file_path: &str) -> String {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(file_path.as_bytes());
     let result = hasher.finalize();
@@ -110,10 +120,7 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
 /// artwork cache, and updates the album's `cover_path` in the database.
 ///
 /// Respects MusicBrainz rate limit: max 1 request/second.
-pub async fn batch_enrich_artwork(
-    db: crate::db::sqlite::SqliteDb,
-    cache_dir: PathBuf,
-) {
+pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: PathBuf) {
     let album_repo = crate::db::album_repo::AlbumRepo::new(db.clone());
     let albums = match album_repo.list_without_cover() {
         Ok(a) => a,
@@ -205,23 +212,23 @@ pub async fn batch_enrich_artwork(
 
     info!(
         total = albums.len(),
-        enriched,
-        searched,
-        failed,
-        "batch_artwork_enrichment_complete"
+        enriched, searched, failed, "batch_artwork_enrichment_complete"
     );
 
     // Store result in settings for status reporting
     let settings = crate::db::settings_repo::SettingsRepo::new(db);
-    settings.set(
-        "artwork_enrich_result",
-        &serde_json::json!({
-            "total": albums.len(),
-            "enriched": enriched,
-            "searched": searched,
-            "failed": failed,
-        }).to_string(),
-    ).ok();
+    settings
+        .set(
+            "artwork_enrich_result",
+            &serde_json::json!({
+                "total": albums.len(),
+                "enriched": enriched,
+                "searched": searched,
+                "failed": failed,
+            })
+            .to_string(),
+        )
+        .ok();
 }
 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
@@ -243,11 +250,15 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     }
 
     if let Some(folder_cover) = find_folder_cover(audio_path)
-        && let Ok(data) = std::fs::read(&folder_cover) {
-            let ext = folder_cover.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-            save_to_cache(&data, cache_dir, &hash, ext);
-            return Some(hash);
-        }
+        && let Ok(data) = std::fs::read(&folder_cover)
+    {
+        let ext = folder_cover
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg");
+        save_to_cache(&data, cache_dir, &hash, ext);
+        return Some(hash);
+    }
 
     None
 }
@@ -333,10 +344,7 @@ mod tests {
     #[test]
     fn get_or_extract_nonexistent() {
         let cache_dir = std::env::temp_dir().join("tune_test_extract_ne");
-        let result = get_or_extract(
-            Path::new("/tmp/nonexistent_audio_file.flac"),
-            &cache_dir,
-        );
+        let result = get_or_extract(Path::new("/tmp/nonexistent_audio_file.flac"), &cache_dir);
         assert!(result.is_none());
     }
 }

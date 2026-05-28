@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn make_app() -> axum::Router {
@@ -15,7 +15,9 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap_or(json!(null));
     (status, json)
 }
@@ -32,7 +34,9 @@ async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, 
         .await
         .unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
     (status, json)
 }
@@ -143,7 +147,12 @@ async fn profiles_default() {
 async fn tags_crud() {
     let app = make_app();
 
-    let (status, body) = post_json(&app, "/api/v1/tags", json!({"name": "Jazz", "color": "#FFD700"})).await;
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/tags",
+        json!({"name": "Jazz", "color": "#FFD700"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(body["id"].as_i64().unwrap() > 0);
 
@@ -186,7 +195,8 @@ async fn radio_crud() {
         &app,
         "/api/v1/radios",
         json!({"name": "FIP", "url": "http://icecast.radiofrance.fr/fip-hifi.aac"}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
 
     let (status, body) = get(&app, "/api/v1/radios").await;

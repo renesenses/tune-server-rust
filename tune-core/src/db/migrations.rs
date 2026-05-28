@@ -278,7 +278,10 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
         .unwrap_or(false);
     drop(conn);
     if !has_column {
-        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_type};")).ok();
+        db.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {col_type};"
+        ))
+        .ok();
     }
 }
 
@@ -402,7 +405,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             version INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-        )"
+        )",
     )?;
 
     let current_version = {
@@ -411,7 +414,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             "SELECT COALESCE(MAX(version), 0) FROM _migrations",
             [],
             |row| row.get::<_, i32>(0),
-        ).map_err(|e| e.to_string())?
+        )
+        .map_err(|e| e.to_string())?
     };
 
     let tables_exist = {
@@ -420,7 +424,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='artists'",
             [],
             |row| row.get::<_, i32>(0),
-        ).map_err(|e| e.to_string())? > 0
+        )
+        .map_err(|e| e.to_string())?
+            > 0
     };
 
     if tables_exist && current_version == 0 {
@@ -436,7 +442,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             continue;
         }
 
-        info!(version = migration.version, name = migration.name, "migration_applying");
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "migration_applying"
+        );
 
         if !migration.up.is_empty() {
             db.execute_batch(migration.up)?;
@@ -456,10 +466,17 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
-            &[&migration.version as &dyn rusqlite::types::ToSql, &migration.name],
+            &[
+                &migration.version as &dyn rusqlite::types::ToSql,
+                &migration.name,
+            ],
         )?;
 
-        info!(version = migration.version, name = migration.name, "migration_applied");
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "migration_applied"
+        );
     }
 
     Ok(())
@@ -472,7 +489,9 @@ pub fn current_version(db: &SqliteDb) -> Result<i32, String> {
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_migrations'",
             [],
             |row| row.get::<_, i32>(0),
-        ).map_err(|e| e.to_string())? > 0
+        )
+        .map_err(|e| e.to_string())?
+            > 0
     };
 
     if !has_table {
@@ -484,7 +503,8 @@ pub fn current_version(db: &SqliteDb) -> Result<i32, String> {
         "SELECT COALESCE(MAX(version), 0) FROM _migrations",
         [],
         |row| row.get::<_, i32>(0),
-    ).map_err(|e| e.to_string())
+    )
+    .map_err(|e| e.to_string())
 }
 
 pub fn latest_version() -> i32 {
@@ -504,9 +524,9 @@ mod tests {
         assert_eq!(current_version(&db).unwrap(), latest_version());
 
         let conn = db.connection().lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
         let tables: Vec<String> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -535,11 +555,9 @@ mod tests {
         run_migrations(&db).unwrap();
 
         let conn = db.connection().lock().unwrap();
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM _migrations",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, latest_version());
     }
 }

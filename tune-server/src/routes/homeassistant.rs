@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -62,7 +62,7 @@ async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{url}/api/")).send().await {
@@ -138,7 +138,7 @@ async fn ha_entities(State(state): State<AppState>) -> impl IntoResponse {
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{url}/api/states")).send().await {
@@ -150,13 +150,15 @@ async fn ha_entities(State(state): State<AppState>) -> impl IntoResponse {
             let status = resp.status();
             let err: Value = resp.json().await.unwrap_or(json!({}));
             let msg = format!("HA {status}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": msg, "detail": err})))
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": msg, "detail": err})),
+            )
                 .into_response()
         }
         Err(e) => {
             let msg = format!("Request failed: {e}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": msg})))
-                .into_response()
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response()
         }
     }
 }
@@ -176,7 +178,7 @@ async fn ha_entity_state(
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client
@@ -226,7 +228,7 @@ async fn ha_call_service(
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     let mut payload = body.service_data.unwrap_or(json!({}));
@@ -243,7 +245,11 @@ async fn ha_call_service(
             let status = resp.status();
             let err: Value = resp.json().await.unwrap_or(json!({}));
             let msg = format!("HA returned {status}");
-            (StatusCode::BAD_GATEWAY, Json(json!({"error": msg, "detail": err}))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": msg, "detail": err})),
+            )
+                .into_response()
         }
         Err(e) => {
             let msg = format!("Request failed: {e}");
@@ -264,7 +270,7 @@ async fn ha_media_players(State(state): State<AppState>) -> impl IntoResponse {
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{url}/api/states")).send().await {
@@ -308,7 +314,7 @@ async fn ha_automations(State(state): State<AppState>) -> impl IntoResponse {
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     match client.get(format!("{url}/api/states")).send().await {
@@ -360,7 +366,7 @@ async fn ha_trigger_automation(
     let client = match ha_client(&token) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
     let payload = json!({"entity_id": body.entity_id});

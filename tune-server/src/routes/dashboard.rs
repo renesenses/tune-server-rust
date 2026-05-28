@@ -2,7 +2,7 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 
@@ -37,10 +37,7 @@ async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
-async fn top_artists(
-    State(state): State<AppState>,
-    Query(p): Query<DashParams>,
-) -> Json<Value> {
+async fn top_artists(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -52,10 +49,7 @@ async fn top_artists(
     Json(json!(items))
 }
 
-async fn top_tracks(
-    State(state): State<AppState>,
-    Query(p): Query<DashParams>,
-) -> Json<Value> {
+async fn top_tracks(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -67,10 +61,7 @@ async fn top_tracks(
     Json(json!(items))
 }
 
-async fn top_albums(
-    State(state): State<AppState>,
-    Query(p): Query<DashParams>,
-) -> Json<Value> {
+async fn top_albums(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
     let items: Vec<Value> = repo
@@ -92,12 +83,14 @@ async fn listening_history(
         .listening_history(days)
         .unwrap_or_default()
         .into_iter()
-        .map(|(day, play_count, total_ms)| json!({
-            "day": day,
-            "play_count": play_count,
-            "total_listened_ms": total_ms,
-            "hours": (total_ms as f64 / 3_600_000.0 * 100.0).round() / 100.0,
-        }))
+        .map(|(day, play_count, total_ms)| {
+            json!({
+                "day": day,
+                "play_count": play_count,
+                "total_listened_ms": total_ms,
+                "hours": (total_ms as f64 / 3_600_000.0 * 100.0).round() / 100.0,
+            })
+        })
         .collect();
     Json(json!(items))
 }
@@ -125,7 +118,11 @@ async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
         let mut genres_for_track: Vec<String> = Vec::new();
         if let Some(json_str) = genres_col {
             if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-                genres_for_track = arr.into_iter().map(|g| g.trim().to_string()).filter(|g| !g.is_empty()).collect();
+                genres_for_track = arr
+                    .into_iter()
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty())
+                    .collect();
             }
         }
         if genres_for_track.is_empty() {

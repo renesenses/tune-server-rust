@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -43,7 +43,7 @@ async fn ia_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -80,7 +80,7 @@ async fn ia_item(Path(id): Path<String>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -112,7 +112,7 @@ async fn ia_item_files(Path(id): Path<String>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -158,7 +158,7 @@ async fn ia_collections() -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -206,7 +206,7 @@ async fn ia_collection(
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 

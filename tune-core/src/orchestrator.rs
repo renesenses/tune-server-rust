@@ -81,12 +81,26 @@ impl PlaybackOrchestrator {
         self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
 
         let output_sent = if let Some(ref device_id) = req.output_device_id {
-            self.send_to_output(device_id, &stream_url, &mime_type, Some(&title), artist.as_deref()).await
+            self.send_to_output(
+                device_id,
+                &stream_url,
+                &mime_type,
+                Some(&title),
+                artist.as_deref(),
+            )
+            .await
         } else {
             false
         };
 
-        self.record_listen(&title, artist.as_deref(), req.album_title.as_deref(), &source, duration_ms.unwrap_or(0), req.zone_id);
+        self.record_listen(
+            &title,
+            artist.as_deref(),
+            req.album_title.as_deref(),
+            &source,
+            duration_ms.unwrap_or(0),
+            req.zone_id,
+        );
 
         info!(
             zone_id = req.zone_id,
@@ -103,19 +117,53 @@ impl PlaybackOrchestrator {
         })
     }
 
-    async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
+    async fn resolve_stream(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
         if let Some(ref source) = req.source
-            && source != "local" {
-                return self.resolve_streaming_url(source, req).await;
-            }
+            && source != "local"
+        {
+            return self.resolve_streaming_url(source, req).await;
+        }
 
         self.resolve_local_track(req).await
     }
 
-    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
+    async fn resolve_local_track(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::new(self.db.clone());
-        let track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
+        let track = repo
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
 
         let file_path = track.file_path.ok_or("track has no file_path")?;
         let fmt = track.format.unwrap_or_else(|| "flac".into());
@@ -133,7 +181,11 @@ impl PlaybackOrchestrator {
             let src_fmt = source_format.unwrap(); // safe: needs_transcode is true
             let target_fmt = src_fmt.dlna_transcode_target();
             let out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
-            let out_bd: u16 = if src_fmt == AudioFormat::Dsd { 24 } else { bit_depth.max(16) };
+            let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
+                24
+            } else {
+                bit_depth.max(16)
+            };
             let out_mime = target_fmt.mime_type().to_string();
             let out_ext = target_fmt.ffmpeg_format_arg().to_string();
 
@@ -172,13 +224,19 @@ impl PlaybackOrchestrator {
 
             let args: Vec<String> = vec![
                 "-hide_banner".into(),
-                "-loglevel".into(), "warning".into(),
-                "-i".into(), file_path.clone(),
+                "-loglevel".into(),
+                "warning".into(),
+                "-i".into(),
+                file_path.clone(),
                 "-vn".into(),
-                "-f".into(), target_fmt.ffmpeg_format_arg().into(),
-                "-acodec".into(), codec.into(),
-                "-ar".into(), out_sr.to_string(),
-                "-ac".into(), channels.to_string(),
+                "-f".into(),
+                target_fmt.ffmpeg_format_arg().into(),
+                "-acodec".into(),
+                codec.into(),
+                "-ar".into(),
+                out_sr.to_string(),
+                "-ac".into(),
+                channels.to_string(),
                 "pipe:1".into(),
             ];
 
@@ -245,14 +303,19 @@ impl PlaybackOrchestrator {
                 file_size: track.file_size.map(|s| s as u64),
             };
 
-            let session_id = self.streamer.create_file_session(info, file_path.clone(), false).await;
+            let session_id = self
+                .streamer
+                .create_file_session(info, file_path.clone(), false)
+                .await;
             (session_id, mime, fmt.clone())
         };
 
         let server_ip = crate::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into());
-        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, &out_ext);
+        let stream_url = self
+            .streamer
+            .get_stream_url(&session_id, &server_ip, &out_ext);
 
         Ok((
             stream_url,
@@ -266,11 +329,32 @@ impl PlaybackOrchestrator {
         ))
     }
 
-    async fn resolve_streaming_url(&self, service_name: &str, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
-        let source_id = req.source_id.as_deref().ok_or("source_id required for streaming")?;
+    async fn resolve_streaming_url(
+        &self,
+        service_name: &str,
+        req: &PlayRequest,
+    ) -> Result<
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
+        let source_id = req
+            .source_id
+            .as_deref()
+            .ok_or("source_id required for streaming")?;
 
         let registry = self.services.lock().await;
-        let svc = registry.get(service_name).ok_or_else(|| format!("unknown service: {service_name}"))?;
+        let svc = registry
+            .get(service_name)
+            .ok_or_else(|| format!("unknown service: {service_name}"))?;
         let svc = svc.lock().await;
 
         let stream_data = svc.get_track_url(source_id, None).await?;
@@ -286,34 +370,63 @@ impl PlaybackOrchestrator {
 
         let is_https = stream_data.url.starts_with("https://");
         let (stream_url, sid) = if is_https {
-            let session_id = self.streamer.create_proxy_session(
-                info,
-                stream_data.url.clone(),
-                false,
-            ).await;
+            let session_id = self
+                .streamer
+                .create_proxy_session(info, stream_data.url.clone(), false)
+                .await;
 
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            let url = self.streamer.get_stream_url(&session_id, &server_ip, &stream_data.quality.codec.to_lowercase());
+            let url = self.streamer.get_stream_url(
+                &session_id,
+                &server_ip,
+                &stream_data.quality.codec.to_lowercase(),
+            );
             (url, Some(session_id))
         } else {
             (stream_data.url.clone(), None)
         };
 
         let (title, artist, duration_ms, cover_path) = if req.title.is_some() {
-            (req.title.clone().unwrap(), req.artist_name.clone(), req.duration_ms, None)
+            (
+                req.title.clone().unwrap(),
+                req.artist_name.clone(),
+                req.duration_ms,
+                None,
+            )
         } else {
             match svc.get_track(source_id).await {
-                Ok(track) => (track.title, Some(track.artist), Some(track.duration_ms as i64), track.cover_path),
+                Ok(track) => (
+                    track.title,
+                    Some(track.artist),
+                    Some(track.duration_ms as i64),
+                    track.cover_path,
+                ),
                 Err(_) => ("Unknown".into(), None, req.duration_ms, None),
             }
         };
 
-        Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into(), cover_path, sid))
+        Ok((
+            stream_url,
+            stream_data.mime_type,
+            title,
+            artist,
+            duration_ms,
+            service_name.into(),
+            cover_path,
+            sid,
+        ))
     }
 
-    async fn send_to_output(&self, device_id: &str, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> bool {
+    async fn send_to_output(
+        &self,
+        device_id: &str,
+        url: &str,
+        mime_type: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> bool {
         let outputs = self.outputs.lock().await;
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
@@ -333,7 +446,15 @@ impl PlaybackOrchestrator {
         }
     }
 
-    fn record_listen(&self, title: &str, artist: Option<&str>, album: Option<&str>, source: &str, duration_ms: i64, zone_id: i64) {
+    fn record_listen(
+        &self,
+        title: &str,
+        artist: Option<&str>,
+        album: Option<&str>,
+        source: &str,
+        duration_ms: i64,
+        zone_id: i64,
+    ) {
         let repo = HistoryRepo::new(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
@@ -345,7 +466,8 @@ impl PlaybackOrchestrator {
             duration_ms,
             listened_at: None,
             zone_id: Some(zone_id),
-        }).ok();
+        })
+        .ok();
 
         // Last.fm scrobble
         self.lastfm_scrobble(title, artist);
@@ -379,7 +501,16 @@ impl PlaybackOrchestrator {
             .unwrap_or_default()
             .as_secs();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::scrobble(&api_key, &api_secret, &session_key, &artist, &title, timestamp).await {
+            if let Err(e) = crate::scrobble::scrobble(
+                &api_key,
+                &api_secret,
+                &session_key,
+                &artist,
+                &title,
+                timestamp,
+            )
+            .await
+            {
                 warn!("lastfm_scrobble_error: {e}");
             }
         });
@@ -395,7 +526,15 @@ impl PlaybackOrchestrator {
         };
         let title = title.to_string();
         tokio::spawn(async move {
-            if let Err(e) = crate::scrobble::update_now_playing(&api_key, &api_secret, &session_key, &artist, &title).await {
+            if let Err(e) = crate::scrobble::update_now_playing(
+                &api_key,
+                &api_secret,
+                &session_key,
+                &artist,
+                &title,
+            )
+            .await
+            {
                 warn!("lastfm_now_playing_error: {e}");
             }
         });
@@ -403,7 +542,11 @@ impl PlaybackOrchestrator {
 
     fn listenbrainz_token(&self) -> Option<String> {
         let settings = SettingsRepo::new(self.db.clone());
-        settings.get("listenbrainz_token").ok().flatten().filter(|t| !t.is_empty())
+        settings
+            .get("listenbrainz_token")
+            .ok()
+            .flatten()
+            .filter(|t| !t.is_empty())
     }
 
     fn listenbrainz_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
@@ -541,11 +684,7 @@ impl PlaybackOrchestrator {
         }
     }
 
-    pub async fn play_from_queue(
-        &self,
-        zone_id: i64,
-        position: i64,
-    ) -> Result<PlayResult, String> {
+    pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::new(self.db.clone());
 
         let output_device_id = ZoneRepo::new(self.db.clone())
@@ -571,7 +710,9 @@ impl PlaybackOrchestrator {
                 duration_ms: item.duration_ms,
             };
             let result = self.play(req).await?;
-            self.playback.update_queue_info(zone_id, position, queue.len() as i64).await;
+            self.playback
+                .update_queue_info(zone_id, position, queue.len() as i64)
+                .await;
             return Ok(result);
         }
 
@@ -590,7 +731,8 @@ impl PlaybackOrchestrator {
 
         // Detect source from current playback state
         let current_state = self.playback.get_state(zone_id).await;
-        let source = current_state.now_playing
+        let source = current_state
+            .now_playing
             .as_ref()
             .map(|np| np.source.clone())
             .unwrap_or_else(|| "tidal".into());

@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::params;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use tune_core::playback::NowPlaying;
@@ -49,10 +49,7 @@ async fn list_radios(State(state): State<AppState>) -> Json<Value> {
     Json(json!(items))
 }
 
-async fn get_radio(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = RadioRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
@@ -87,10 +84,7 @@ async fn create_radio(
     }
 }
 
-async fn delete_radio(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = RadioRepo::new(state.db);
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -153,10 +147,7 @@ async fn play_radio(
     .into_response()
 }
 
-async fn search_radios(
-    State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
-) -> Json<Value> {
+async fn search_radios(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
     let repo = RadioRepo::new(state.db);
     let items = repo.search(&q.q).unwrap_or_default();
     Json(json!(items))
@@ -386,7 +377,10 @@ async fn delete_radio_favorite(
     State(state): State<AppState>,
     Path(fav_id): Path<i64>,
 ) -> impl IntoResponse {
-    state.db.execute("DELETE FROM radio_favorites WHERE id = ?", &[&fav_id]).ok();
+    state
+        .db
+        .execute("DELETE FROM radio_favorites WHERE id = ?", &[&fav_id])
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -401,7 +395,11 @@ async fn save_current_as_favorite(
 ) -> impl IntoResponse {
     let zone_state = state.playback.get_state(body.zone_id).await;
     let Some(np) = zone_state.now_playing else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "nothing playing" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "nothing playing" })),
+        )
+            .into_response();
     };
 
     let title = np.title.clone();
@@ -459,7 +457,11 @@ async fn create_playlist_from_favorites(
     drop(conn);
 
     if favorites.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no favorites to create playlist from"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no favorites to create playlist from"})),
+        )
+            .into_response();
     }
 
     let name = body
@@ -470,7 +472,9 @@ async fn create_playlist_from_favorites(
     let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db);
     let playlist_id = match repo.create(&name, None) {
         Ok(id) => id,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     let mut matched = 0i64;
@@ -490,12 +494,16 @@ async fn create_playlist_from_favorites(
         }
     }
 
-    (StatusCode::CREATED, Json(json!({
-        "id": playlist_id,
-        "name": name,
-        "favorites_count": favorites.len(),
-        "matched_tracks": matched,
-    }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "id": playlist_id,
+            "name": name,
+            "favorites_count": favorites.len(),
+            "matched_tracks": matched,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +513,10 @@ async fn create_playlist_from_favorites(
 pub fn alarms_router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_alarms).post(create_alarm_global))
-        .route("/{id}", axum::routing::put(update_alarm).delete(delete_alarm_global))
+        .route(
+            "/{id}",
+            axum::routing::put(update_alarm).delete(delete_alarm_global),
+        )
         .route("/{id}/snooze", post(snooze_alarm))
 }
 
@@ -566,7 +577,11 @@ async fn create_alarm_global(
 ) -> impl IntoResponse {
     let enabled_int: i32 = if body.enabled.unwrap_or(true) { 1 } else { 0 };
     let one_shot_int: i32 = if body.one_shot.unwrap_or(false) { 1 } else { 0 };
-    let skip_holidays_int: i32 = if body.skip_holidays.unwrap_or(false) { 1 } else { 0 };
+    let skip_holidays_int: i32 = if body.skip_holidays.unwrap_or(false) {
+        1
+    } else {
+        0
+    };
 
     match state.db.execute(
         "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -680,7 +695,10 @@ async fn update_alarm(
     let sql = format!("UPDATE alarms SET {} WHERE id = ?", sets.join(", "));
     values.push(Box::new(id));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref() as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
+        .iter()
+        .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql)
+        .collect();
     let conn = state.db.connection().lock().unwrap();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
@@ -709,10 +727,7 @@ async fn delete_alarm_global(
     }
 }
 
-async fn snooze_alarm(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn snooze_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     match state.db.execute(
         "UPDATE alarms SET last_fired_at = NULL WHERE id = ?",
         &[&id],

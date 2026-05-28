@@ -127,7 +127,9 @@ impl TidalService {
     /// Get current access token from the token state.
     async fn get_access_token(&self) -> Result<String, String> {
         let ts = self.tokens.lock().await;
-        ts.access_token.clone().ok_or_else(|| "not authenticated".into())
+        ts.access_token
+            .clone()
+            .ok_or_else(|| "not authenticated".into())
     }
 
     /// Attempt to refresh the access token using the refresh_token.
@@ -180,7 +182,8 @@ impl TidalService {
     async fn api_get(&self, path: &str) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&[("countryCode", &self.country_code)])
@@ -193,7 +196,8 @@ impl TidalService {
             match self.do_refresh_token().await {
                 Ok(true) => {
                     let new_token = self.get_access_token().await?;
-                    let retry_resp = self.client
+                    let retry_resp = self
+                        .client
                         .get(&url)
                         .header("Authorization", format!("Bearer {new_token}"))
                         .query(&[("countryCode", &self.country_code)])
@@ -203,7 +207,10 @@ impl TidalService {
                     if retry_resp.status() == 401 {
                         return Err("token expired after refresh".into());
                     }
-                    return retry_resp.json().await.map_err(|e| format!("tidal json: {e}"));
+                    return retry_resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("tidal json: {e}"));
                 }
                 Ok(false) => return Err("token expired, no refresh token".into()),
                 Err(e) => return Err(format!("token expired, refresh failed: {e}")),
@@ -218,9 +225,11 @@ impl TidalService {
         let is_hires = tags
             .map(|t| t.iter().any(|v| v.as_str() == Some("HIRES_LOSSLESS")))
             .unwrap_or(false);
-        let audio_quality = item["audioQuality"].as_str().unwrap_or(
-            if is_hires { "HI_RES_LOSSLESS" } else { "LOSSLESS" }
-        );
+        let audio_quality = item["audioQuality"].as_str().unwrap_or(if is_hires {
+            "HI_RES_LOSSLESS"
+        } else {
+            "LOSSLESS"
+        });
         let (sample_rate, bit_depth) = match audio_quality {
             "HI_RES_LOSSLESS" => (96000, 24),
             _ => (44100, 16),
@@ -229,14 +238,24 @@ impl TidalService {
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["artist"]["name"].as_str()
-                .or_else(|| item["artists"].as_array().and_then(|a| a.first()).and_then(|a| a["name"].as_str()))
-                .unwrap_or("").into(),
+            artist: item["artist"]["name"]
+                .as_str()
+                .or_else(|| {
+                    item["artists"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|a| a["name"].as_str())
+                })
+                .unwrap_or("")
+                .into(),
             album: item["album"]["title"].as_str().map(Into::into),
             album_id: item["album"]["id"].as_u64().map(|id| id.to_string()),
             duration_ms: item["duration"].as_u64().unwrap_or(0) * 1000,
             cover_path: item["album"]["cover"].as_str().map(|c| {
-                format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
+                format!(
+                    "https://resources.tidal.com/images/{}/640x640.jpg",
+                    c.replace('-', "/")
+                )
             }),
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: item["volumeNumber"].as_u64().map(|n| n as u32),
@@ -254,20 +273,36 @@ impl TidalService {
         StreamAlbum {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
-            artist: item["artist"]["name"].as_str()
-                .or_else(|| item["artists"].as_array().and_then(|a| a.first()).and_then(|a| a["name"].as_str()))
-                .unwrap_or("").into(),
+            artist: item["artist"]["name"]
+                .as_str()
+                .or_else(|| {
+                    item["artists"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|a| a["name"].as_str())
+                })
+                .unwrap_or("")
+                .into(),
             artist_id: item["artist"]["id"].as_u64().map(|id| id.to_string()),
             cover_path: item["cover"].as_str().map(|c| {
-                format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
+                format!(
+                    "https://resources.tidal.com/images/{}/640x640.jpg",
+                    c.replace('-', "/")
+                )
             }),
-            year: item["releaseDate"].as_str().and_then(|d| d.get(..4)?.parse().ok()),
+            year: item["releaseDate"]
+                .as_str()
+                .and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
             quality: None,
         }
     }
 
-    async fn fetch_playback_info(&self, track_id: &str, quality: &str) -> Result<serde_json::Value, String> {
+    async fn fetch_playback_info(
+        &self,
+        track_id: &str,
+        quality: &str,
+    ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
         let url = format!("{API_BASE}/tracks/{track_id}/playbackinfopostpaywall");
         let params = [
@@ -275,7 +310,8 @@ impl TidalService {
             ("playbackmode", "STREAM"),
             ("assetpresentation", "FULL"),
         ];
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&params)
@@ -292,7 +328,8 @@ impl TidalService {
             match self.do_refresh_token().await {
                 Ok(true) => {
                     let new_token = self.get_access_token().await?;
-                    let retry_resp = self.client
+                    let retry_resp = self
+                        .client
                         .get(&url)
                         .header("Authorization", format!("Bearer {new_token}"))
                         .query(&params)
@@ -303,7 +340,10 @@ impl TidalService {
                         return Err("tidal rate limited".into());
                     }
                     let status = retry_resp.status().as_u16();
-                    let body = retry_resp.text().await.map_err(|e| format!("read body: {e}"))?;
+                    let body = retry_resp
+                        .text()
+                        .await
+                        .map_err(|e| format!("read body: {e}"))?;
                     if status != 200 {
                         info!(track_id, quality, status, body = %body, "tidal_playback_info_error_after_refresh");
                         return Err(format!("tidal playback {status}: {body}"));
@@ -348,17 +388,24 @@ impl TidalService {
 
     fn extract_uid_from_jwt(token: &str) -> Option<u64> {
         let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() < 2 { return None; }
+        if parts.len() < 2 {
+            return None;
+        }
         let payload = parts[1];
         let decoded = base64_decode_url(payload).ok()?;
         let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
         claims["uid"].as_u64()
     }
 
-    async fn api_post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
+    async fn api_post_form(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Result<serde_json::Value, String> {
         let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&[("countryCode", &self.country_code)])
@@ -370,7 +417,8 @@ impl TidalService {
         if resp.status() == 401 {
             if let Ok(true) = self.do_refresh_token().await {
                 let new_token = self.get_access_token().await?;
-                let retry_resp = self.client
+                let retry_resp = self
+                    .client
                     .post(&url)
                     .header("Authorization", format!("Bearer {new_token}"))
                     .query(&[("countryCode", &self.country_code)])
@@ -399,7 +447,8 @@ impl TidalService {
     async fn api_delete(&self, path: &str) -> Result<(), String> {
         let token = self.get_access_token().await?;
         let url = format!("{API_BASE}{path}");
-        let resp = self.client
+        let resp = self
+            .client
             .delete(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&[("countryCode", &self.country_code)])
@@ -410,7 +459,8 @@ impl TidalService {
         if resp.status() == 401 {
             if let Ok(true) = self.do_refresh_token().await {
                 let new_token = self.get_access_token().await?;
-                let retry_resp = self.client
+                let retry_resp = self
+                    .client
                     .delete(&url)
                     .header("Authorization", format!("Bearer {new_token}"))
                     .query(&[("countryCode", &self.country_code)])
@@ -437,16 +487,21 @@ impl TidalService {
         StreamPlaylist {
             id: item["uuid"].as_str().unwrap_or("").into(),
             name: item["title"].as_str().unwrap_or("").into(),
-            description: item["description"].as_str()
+            description: item["description"]
+                .as_str()
                 .filter(|d| !d.is_empty())
                 .map(Into::into),
-            cover_path: item["squareImage"].as_str()
+            cover_path: item["squareImage"]
+                .as_str()
                 .or_else(|| item["image"].as_str())
                 .map(|c| {
                     if c.starts_with("http") {
                         c.to_string()
                     } else {
-                        format!("https://resources.tidal.com/images/{}/640x640.jpg", c.replace('-', "/"))
+                        format!(
+                            "https://resources.tidal.com/images/{}/640x640.jpg",
+                            c.replace('-', "/")
+                        )
                     }
                 }),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
@@ -458,7 +513,8 @@ impl TidalService {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
             name: item["name"].as_str().unwrap_or("").into(),
-            has_children: item["hasSubgenres"].as_bool()
+            has_children: item["hasSubgenres"]
+                .as_bool()
                 .or_else(|| item["subGenres"].as_array().map(|a| !a.is_empty()))
                 .unwrap_or(false),
             image_url: item["image"].as_str().map(Into::into),
@@ -470,7 +526,10 @@ impl TidalService {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
             image_path: item["picture"].as_str().map(|p| {
-                format!("https://resources.tidal.com/images/{}/480x480.jpg", p.replace('-', "/"))
+                format!(
+                    "https://resources.tidal.com/images/{}/480x480.jpg",
+                    p.replace('-', "/")
+                )
             }),
         }
     }
@@ -490,16 +549,21 @@ impl StreamingService for TidalService {
         self.enabled_override = Some(enabled);
     }
 
-    async fn authenticate(&mut self, credentials: &serde_json::Value) -> Result<AuthStatus, String> {
+    async fn authenticate(
+        &mut self,
+        credentials: &serde_json::Value,
+    ) -> Result<AuthStatus, String> {
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
-            let resp = self.client
+            let resp = self
+                .client
                 .post(format!("{AUTH_BASE}/device_authorization"))
                 .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
                 .send()
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
 
-            let device_auth: DeviceAuthResponse = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+            let device_auth: DeviceAuthResponse =
+                resp.json().await.map_err(|e| format!("parse: {e}"))?;
             info!(
                 user_code = %device_auth.user_code,
                 uri = %device_auth.verification_uri_complete,
@@ -523,7 +587,8 @@ impl StreamingService for TidalService {
         info!(has_pending = self.pending_device_auth.is_some(), device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
 
         if let Some(ref pending) = self.pending_device_auth.clone() {
-            let resp = self.client
+            let resp = self
+                .client
                 .post(format!("{AUTH_BASE}/token"))
                 .form(&[
                     ("client_id", CLIENT_ID),
@@ -546,7 +611,8 @@ impl StreamingService for TidalService {
                 });
             }
 
-            let token: TokenResponse = resp.json().await.map_err(|e| format!("token parse: {e}"))?;
+            let token: TokenResponse =
+                resp.json().await.map_err(|e| format!("token parse: {e}"))?;
             {
                 let mut ts = self.tokens.lock().await;
                 ts.access_token = Some(token.access_token);
@@ -588,18 +654,23 @@ impl StreamingService for TidalService {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
-        let data = self.api_get(&format!(
-            "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
-            urlencoding::encode(query)
-        )).await?;
+        let data = self
+            .api_get(&format!(
+                "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
+                urlencoding::encode(query)
+            ))
+            .await?;
 
-        let tracks = data["tracks"]["items"].as_array()
+        let tracks = data["tracks"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
-        let albums = data["albums"]["items"].as_array()
+        let albums = data["albums"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
-        let artists = data["artists"]["items"].as_array()
+        let artists = data["artists"]["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_artist).collect())
             .unwrap_or_default();
 
@@ -616,7 +687,11 @@ impl StreamingService for TidalService {
         Ok(Self::map_track(&data))
     }
 
-    async fn get_track_url(&self, track_id: &str, quality: Option<&str>) -> Result<StreamUrl, String> {
+    async fn get_track_url(
+        &self,
+        track_id: &str,
+        quality: Option<&str>,
+    ) -> Result<StreamUrl, String> {
         {
             let cache = self.url_cache.lock().await;
             if let Some(url) = cache.get(track_id) {
@@ -635,13 +710,20 @@ impl StreamingService for TidalService {
         }
 
         let requested_quality = quality.unwrap_or(self.quality.as_str());
-        let data = self.fetch_playback_info(track_id, requested_quality).await?;
+        let data = self
+            .fetch_playback_info(track_id, requested_quality)
+            .await?;
 
         let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
         let has_manifest = data["manifest"].as_str().is_some();
 
-        let data = if (!has_manifest || manifest_mime == "application/dash+xml") && requested_quality != "LOSSLESS" {
-            info!(track_id, manifest_mime, has_manifest, "tidal_fallback_to_lossless");
+        let data = if (!has_manifest || manifest_mime == "application/dash+xml")
+            && requested_quality != "LOSSLESS"
+        {
+            info!(
+                track_id,
+                manifest_mime, has_manifest, "tidal_fallback_to_lossless"
+            );
             let fallback = self.fetch_playback_info(track_id, "LOSSLESS").await?;
             if fallback["manifest"].as_str().is_none() && requested_quality != "HIGH" {
                 info!(track_id, "tidal_fallback_to_high");
@@ -654,12 +736,13 @@ impl StreamingService for TidalService {
         };
 
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
-        let decoded = String::from_utf8(
-            base64_decode(manifest).map_err(|e| format!("base64: {e}"))?
-        ).map_err(|e| format!("utf8: {e}"))?;
+        let decoded =
+            String::from_utf8(base64_decode(manifest).map_err(|e| format!("base64: {e}"))?)
+                .map_err(|e| format!("utf8: {e}"))?;
 
         let url = if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decoded) {
-            manifest_json["urls"].as_array()
+            manifest_json["urls"]
+                .as_array()
                 .and_then(|urls| urls.first())
                 .and_then(|u| u.as_str())
                 .ok_or("no url in manifest")?
@@ -670,7 +753,8 @@ impl StreamingService for TidalService {
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
         let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
-        let mime_type = data["manifestMimeType"].as_str()
+        let mime_type = data["manifestMimeType"]
+            .as_str()
             .and_then(|m| if m.contains("dash") { None } else { Some(m) })
             .unwrap_or("audio/flac");
 
@@ -679,18 +763,26 @@ impl StreamingService for TidalService {
             cache.set(track_id.to_string(), url.clone());
         }
 
-        info!(track_id, audio_quality, sample_rate, bit_depth, "tidal_stream_url");
+        info!(
+            track_id,
+            audio_quality, sample_rate, bit_depth, "tidal_stream_url"
+        );
 
         Ok(StreamUrl {
             url,
             mime_type: mime_type.to_string(),
             quality: StreamQuality {
-                codec: if audio_quality.contains("LOSSLESS") { "FLAC" } else { "AAC" }.into(),
+                codec: if audio_quality.contains("LOSSLESS") {
+                    "FLAC"
+                } else {
+                    "AAC"
+                }
+                .into(),
                 sample_rate,
                 bit_depth,
-                bitrate: data["bitDepth"].as_u64().map(|_| {
-                    sample_rate * (bit_depth as u32) * 2
-                }),
+                bitrate: data["bitDepth"]
+                    .as_u64()
+                    .map(|_| sample_rate * (bit_depth as u32) * 2),
             },
             expires_at: None,
         })
@@ -702,8 +794,11 @@ impl StreamingService for TidalService {
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get(&format!("/albums/{album_id}/tracks?limit=100")).await?;
-        let tracks = data["items"].as_array()
+        let data = self
+            .api_get(&format!("/albums/{album_id}/tracks?limit=100"))
+            .await?;
+        let tracks = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
@@ -715,16 +810,22 @@ impl StreamingService for TidalService {
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
-        let data = self.api_get(&format!("/artists/{artist_id}/albums?limit=50")).await?;
-        let albums = data["items"].as_array()
+        let data = self
+            .api_get(&format!("/artists/{artist_id}/albums?limit=50"))
+            .await?;
+        let albums = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get(&format!("/artists/{artist_id}/toptracks?limit=20")).await?;
-        let tracks = data["items"].as_array()
+        let data = self
+            .api_get(&format!("/artists/{artist_id}/toptracks?limit=20"))
+            .await?;
+        let tracks = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
@@ -736,8 +837,11 @@ impl StreamingService for TidalService {
     }
 
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self.api_get(&format!("/playlists/{playlist_id}/tracks?limit=100")).await?;
-        let tracks = data["items"].as_array()
+        let data = self
+            .api_get(&format!("/playlists/{playlist_id}/tracks?limit=100"))
+            .await?;
+        let tracks = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_track).collect())
             .unwrap_or_default();
         Ok(tracks)
@@ -745,18 +849,26 @@ impl StreamingService for TidalService {
 
     async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
         let data = self.api_get("/genres").await?;
-        let genres = data.as_array()
+        let genres = data
+            .as_array()
             .map(|items| items.iter().map(Self::map_genre).collect())
             .unwrap_or_default();
         Ok(genres)
     }
 
-    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
-        let data = self.api_get(&format!(
-            "/genres/{}/albums?limit={limit}",
-            urlencoding::encode(genre_id)
-        )).await?;
-        let albums = data["items"].as_array()
+    async fn get_genre_albums(
+        &self,
+        genre_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, String> {
+        let data = self
+            .api_get(&format!(
+                "/genres/{}/albums?limit={limit}",
+                urlencoding::encode(genre_id)
+            ))
+            .await?;
+        let albums = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
@@ -772,22 +884,37 @@ impl StreamingService for TidalService {
         let mut sections = Vec::new();
         if let Some(rows) = data["rows"].as_array() {
             for (i, row) in rows.iter().enumerate() {
-                let title = row["modules"].as_array()
+                let title = row["modules"]
+                    .as_array()
                     .and_then(|m| m.first())
                     .and_then(|m| m["title"].as_str())
                     .unwrap_or("");
-                if title.is_empty() { continue; }
-                let albums: Vec<StreamAlbum> = row["modules"].as_array()
+                if title.is_empty() {
+                    continue;
+                }
+                let albums: Vec<StreamAlbum> = row["modules"]
+                    .as_array()
                     .and_then(|m| m.first())
                     .and_then(|m| m["pagedList"]["items"].as_array())
-                    .map(|items| items.iter()
-                        .filter(|item| item["type"].as_str() == Some("ALBUM") || item["id"].as_u64().is_some())
-                        .map(Self::map_album)
-                        .collect())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter(|item| {
+                                item["type"].as_str() == Some("ALBUM")
+                                    || item["id"].as_u64().is_some()
+                            })
+                            .map(Self::map_album)
+                            .collect()
+                    })
                     .unwrap_or_default();
-                if albums.is_empty() { continue; }
+                if albums.is_empty() {
+                    continue;
+                }
                 sections.push((
-                    FeaturedSection { id: format!("home-{i}"), name: title.into() },
+                    FeaturedSection {
+                        id: format!("home-{i}"),
+                        name: title.into(),
+                    },
                     albums,
                 ));
             }
@@ -812,11 +939,17 @@ impl StreamingService for TidalService {
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self.api_get(&format!("/users/{user_id}/favorites/tracks?limit=100")).await?;
-        let tracks = data["items"].as_array()
-            .map(|items| items.iter().filter_map(|item| {
-                item.get("item").map(Self::map_track)
-            }).collect())
+        let data = self
+            .api_get(&format!("/users/{user_id}/favorites/tracks?limit=100"))
+            .await?;
+        let tracks = data["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("item").map(Self::map_track))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(tracks)
     }
@@ -832,7 +965,8 @@ impl StreamingService for TidalService {
         self.api_post_form(
             &format!("/users/{user_id}/favorites/{path_type}"),
             &[(form_key, item_id)],
-        ).await?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -844,7 +978,8 @@ impl StreamingService for TidalService {
             "artists" => "artists",
             _ => return Err(format!("unknown favorite type: {fav_type}")),
         };
-        self.api_delete(&format!("/users/{user_id}/favorites/{path_type}/{item_id}")).await
+        self.api_delete(&format!("/users/{user_id}/favorites/{path_type}/{item_id}"))
+            .await
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
@@ -853,8 +988,13 @@ impl StreamingService for TidalService {
         let mut offset = 0u32;
         let page_size = 50u32;
         loop {
-            let data = self.api_get(&format!("/users/{user_id}/playlists?limit={page_size}&offset={offset}")).await?;
-            let items = data["items"].as_array()
+            let data = self
+                .api_get(&format!(
+                    "/users/{user_id}/playlists?limit={page_size}&offset={offset}"
+                ))
+                .await?;
+            let items = data["items"]
+                .as_array()
                 .map(|items| items.iter().map(Self::map_playlist).collect::<Vec<_>>())
                 .unwrap_or_default();
             let count = items.len();
@@ -871,11 +1011,17 @@ impl StreamingService for TidalService {
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self.api_get(&format!("/users/{user_id}/favorites/albums?limit=100")).await?;
-        let albums = data["items"].as_array()
-            .map(|items| items.iter().filter_map(|item| {
-                item.get("item").map(Self::map_album)
-            }).collect())
+        let data = self
+            .api_get(&format!("/users/{user_id}/favorites/albums?limit=100"))
+            .await?;
+        let albums = data["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("item").map(Self::map_album))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(albums)
     }
@@ -883,18 +1029,25 @@ impl StreamingService for TidalService {
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
         // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self.api_get(&format!("/users/{user_id}/favorites/artists?limit=100")).await?;
-        let artists = data["items"].as_array()
-            .map(|items| items.iter().filter_map(|item| {
-                item.get("item").map(Self::map_artist)
-            }).collect())
+        let data = self
+            .api_get(&format!("/users/{user_id}/favorites/artists?limit=100"))
+            .await?;
+        let artists = data["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("item").map(Self::map_artist))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(artists)
     }
 
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
         let data = self.api_get("/featured/playlists?limit=50").await?;
-        let playlists = data["items"].as_array()
+        let playlists = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_playlist).collect())
             .unwrap_or_default();
         Ok(playlists)
@@ -902,7 +1055,8 @@ impl StreamingService for TidalService {
 
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
         let data = self.api_get("/featured/new/albums?limit=50").await?;
-        let albums = data["items"].as_array()
+        let albums = data["items"]
+            .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
@@ -975,7 +1129,9 @@ impl StreamingService for TidalService {
             self.username = tokens["username"].as_str().map(Into::into);
             self.country_code = tokens["country_code"].as_str().unwrap_or("FR").into();
             self.user_id = tokens["user_id"].as_u64().or_else(|| {
-                refresh_token.as_deref().and_then(Self::extract_uid_from_jwt)
+                refresh_token
+                    .as_deref()
+                    .and_then(Self::extract_uid_from_jwt)
             });
             restored = true;
         }
@@ -1163,7 +1319,10 @@ mod tests {
         assert_eq!(genre.id, "jazz");
         assert_eq!(genre.name, "Jazz");
         assert!(genre.has_children);
-        assert_eq!(genre.image_url.as_deref(), Some("http://example.com/jazz.jpg"));
+        assert_eq!(
+            genre.image_url.as_deref(),
+            Some("http://example.com/jazz.jpg")
+        );
     }
 
     #[test]
@@ -1227,7 +1386,10 @@ mod tests {
         let playlist = TidalService::map_playlist(&json);
         assert_eq!(playlist.id, "abc-123");
         assert_eq!(playlist.name, "Jazz Essentials");
-        assert_eq!(playlist.description.as_deref(), Some("The best jazz tracks"));
+        assert_eq!(
+            playlist.description.as_deref(),
+            Some("The best jazz tracks")
+        );
         assert_eq!(playlist.track_count, 42);
         assert_eq!(playlist.owner.as_deref(), Some("TIDAL"));
         assert!(playlist.cover_path.is_some());
@@ -1260,7 +1422,10 @@ mod tests {
             "numberOfTracks": 5,
         });
         let playlist = TidalService::map_playlist(&json);
-        assert_eq!(playlist.cover_path.as_deref(), Some("https://example.com/cover.jpg"));
+        assert_eq!(
+            playlist.cover_path.as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
     }
 
     #[test]
@@ -1327,8 +1492,13 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let mut bits = 0;
 
     for &byte in input.as_bytes() {
-        if byte == b'=' { break; }
-        let val = table.iter().position(|&c| c == byte).ok_or("invalid base64")? as u32;
+        if byte == b'=' {
+            break;
+        }
+        let val = table
+            .iter()
+            .position(|&c| c == byte)
+            .ok_or("invalid base64")? as u32;
         buf = (buf << 6) | val;
         bits += 6;
         if bits >= 8 {

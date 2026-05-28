@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use super::models::Track;
 use super::sqlite::SqliteDb;
@@ -81,7 +81,10 @@ impl TrackRepo {
     }
 
     pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
-        self.db.execute("DELETE FROM tracks WHERE file_path = ?", &[&file_path as &dyn rusqlite::types::ToSql])?;
+        self.db.execute(
+            "DELETE FROM tracks WHERE file_path = ?",
+            &[&file_path as &dyn rusqlite::types::ToSql],
+        )?;
         Ok(())
     }
 
@@ -107,7 +110,9 @@ impl TrackRepo {
     pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
+            .prepare(
+                "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
+            )
             .map_err(|e| e.to_string())?;
         let paths = stmt
             .query_map([], |row| row.get::<_, String>(0))
@@ -119,7 +124,9 @@ impl TrackRepo {
 
     /// Returns a map of file_path -> (track_id, file_mtime, file_size) for all local tracks.
     /// Used by the scanner to efficiently detect which files have changed without per-file queries.
-    pub fn get_all_local_file_info(&self) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
+    pub fn get_all_local_file_info(
+        &self,
+    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
@@ -141,10 +148,19 @@ impl TrackRepo {
         Ok(map)
     }
 
-    pub fn update_mtime_and_size(&self, file_path: &str, mtime: f64, file_size: i64) -> Result<(), String> {
+    pub fn update_mtime_and_size(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+    ) -> Result<(), String> {
         self.db.execute(
             "UPDATE tracks SET file_mtime = ?, file_size = ? WHERE file_path = ?",
-            &[&mtime as &dyn rusqlite::types::ToSql, &file_size, &file_path],
+            &[
+                &mtime as &dyn rusqlite::types::ToSql,
+                &file_size,
+                &file_path,
+            ],
         )?;
         Ok(())
     }
@@ -173,7 +189,9 @@ impl TrackRepo {
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.artist_id = ? ORDER BY t.title"))
+            .prepare(&format!(
+                "{SELECT_TRACK} WHERE t.artist_id = ? ORDER BY t.title"
+            ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
             .query_map(params![artist_id], |row| Ok(row_to_track(row)))
@@ -193,7 +211,10 @@ impl TrackRepo {
             ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
-            .query_map(params![fts_query, like, like, like, query.trim(), limit], |row| Ok(row_to_track(row)))
+            .query_map(
+                params![fts_query, like, like, like, query.trim(), limit],
+                |row| Ok(row_to_track(row)),
+            )
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();
@@ -208,7 +229,10 @@ impl TrackRepo {
         let sql = format!("{SELECT_TRACK} WHERE t.id IN ({})", placeholders.join(","));
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let tracks: Vec<Track> = stmt
             .query_map(params.as_slice(), |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
@@ -296,8 +320,8 @@ fn row_to_track(row: &rusqlite::Row) -> Track {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::artist_repo::ArtistRepo;
     use crate::db::album_repo::AlbumRepo;
+    use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
 
     fn test_db() -> SqliteDb {
@@ -313,8 +337,14 @@ mod tests {
         let album_repo = AlbumRepo::new(db.clone());
         let repo = TrackRepo::new(db);
 
-        let aid = artist_repo.create(&Artist::new("Pink Floyd".into())).unwrap();
-        let alid = album_repo.get_or_create("DSOTM", aid, Some(1973)).unwrap().id.unwrap();
+        let aid = artist_repo
+            .create(&Artist::new("Pink Floyd".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("DSOTM", aid, Some(1973))
+            .unwrap()
+            .id
+            .unwrap();
 
         let mut track = Track::new("Time".into());
         track.artist_id = Some(aid);
@@ -330,7 +360,9 @@ mod tests {
         assert_eq!(fetched.artist_name.as_deref(), Some("Pink Floyd"));
         assert_eq!(fetched.album_title.as_deref(), Some("DSOTM"));
 
-        let by_path = repo.get_by_path("/music/pink_floyd/dsotm/time.flac").unwrap();
+        let by_path = repo
+            .get_by_path("/music/pink_floyd/dsotm/time.flac")
+            .unwrap();
         assert!(by_path.is_some());
 
         repo.delete(id).unwrap();
@@ -441,7 +473,9 @@ mod tests {
         let album_repo = AlbumRepo::new(db.clone());
         let repo = TrackRepo::new(db);
 
-        let alid = album_repo.create(&crate::db::models::Album::new("Album".into())).unwrap();
+        let alid = album_repo
+            .create(&crate::db::models::Album::new("Album".into()))
+            .unwrap();
 
         let mut t1 = Track::new("Track 1".into());
         t1.album_id = Some(alid);
@@ -551,7 +585,8 @@ mod tests {
         t.file_path = Some("/test.flac".into());
         let id = repo.create(&t).unwrap();
 
-        repo.update_mtime_and_size("/test.flac", 999.99, 1_000_000).unwrap();
+        repo.update_mtime_and_size("/test.flac", 999.99, 1_000_000)
+            .unwrap();
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.file_mtime, Some(999.99));
         assert_eq!(fetched.file_size, Some(1_000_000));
@@ -640,8 +675,14 @@ mod tests {
         let album_repo = AlbumRepo::new(db.clone());
         let repo = TrackRepo::new(db);
 
-        let aid = artist_repo.create(&Artist::new("Miles Davis".into())).unwrap();
-        let alid = album_repo.get_or_create("Kind of Blue", aid, Some(1959)).unwrap().id.unwrap();
+        let aid = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("Kind of Blue", aid, Some(1959))
+            .unwrap()
+            .id
+            .unwrap();
 
         let mut t = Track::new("So What".into());
         t.artist_id = Some(aid);

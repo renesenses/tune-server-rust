@@ -147,13 +147,14 @@ impl ServiceRegistry {
             // Restore auth tokens
             let key = format!("auth_tokens_{name}");
             if let Some(json_str) = settings.get(&key).ok().flatten()
-                && let Ok(tokens) = serde_json::from_str(&json_str) {
-                    let mut svc = svc.lock().await;
-                    if svc.restore_tokens(&tokens) {
-                        info!(service = %name, "tokens_restored");
-                        svc.post_restore().await;
-                    }
+                && let Ok(tokens) = serde_json::from_str(&json_str)
+            {
+                let mut svc = svc.lock().await;
+                if svc.restore_tokens(&tokens) {
+                    info!(service = %name, "tokens_restored");
+                    svc.post_restore().await;
                 }
+            }
         }
     }
 }

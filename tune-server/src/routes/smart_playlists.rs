@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -38,7 +38,12 @@ struct PreviewRequest {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_smart_playlists).post(create_smart_playlist))
-        .route("/{id}", get(get_smart_playlist).put(update_smart_playlist).delete(delete_smart_playlist))
+        .route(
+            "/{id}",
+            get(get_smart_playlist)
+                .put(update_smart_playlist)
+                .delete(delete_smart_playlist),
+        )
         .route("/{id}/tracks", get(resolve_tracks))
         .route("/{id}/albums", get(smart_collection_albums))
         .route("/preview", post(preview_smart_collection))
@@ -128,28 +133,40 @@ async fn update_smart_playlist(
     Json(body): Json<UpdateSmartPlaylist>,
 ) -> impl IntoResponse {
     if let Some(ref name) = body.name {
-        state.db.execute(
-            "UPDATE smart_playlists SET name = ? WHERE id = ?",
-            &[name as &dyn rusqlite::types::ToSql, &id],
-        ).ok();
+        state
+            .db
+            .execute(
+                "UPDATE smart_playlists SET name = ? WHERE id = ?",
+                &[name as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
     }
     if let Some(ref rules) = body.rules {
-        state.db.execute(
-            "UPDATE smart_playlists SET rules = ? WHERE id = ?",
-            &[&rules.to_string() as &dyn rusqlite::types::ToSql, &id],
-        ).ok();
+        state
+            .db
+            .execute(
+                "UPDATE smart_playlists SET rules = ? WHERE id = ?",
+                &[&rules.to_string() as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
     }
     if let Some(ref sort_by) = body.sort_by {
-        state.db.execute(
-            "UPDATE smart_playlists SET sort_by = ? WHERE id = ?",
-            &[sort_by as &dyn rusqlite::types::ToSql, &id],
-        ).ok();
+        state
+            .db
+            .execute(
+                "UPDATE smart_playlists SET sort_by = ? WHERE id = ?",
+                &[sort_by as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
     }
     if let Some(ref max_tracks) = body.max_tracks {
-        state.db.execute(
-            "UPDATE smart_playlists SET max_tracks = ? WHERE id = ?",
-            &[max_tracks as &dyn rusqlite::types::ToSql, &id],
-        ).ok();
+        state
+            .db
+            .execute(
+                "UPDATE smart_playlists SET max_tracks = ? WHERE id = ?",
+                &[max_tracks as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
     }
     StatusCode::NO_CONTENT
 }
@@ -158,7 +175,10 @@ async fn delete_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    state.db.execute("DELETE FROM smart_playlists WHERE id = ?", &[&id]).ok();
+    state
+        .db
+        .execute("DELETE FROM smart_playlists WHERE id = ?", &[&id])
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -174,7 +194,10 @@ fn build_smart_query(
     let mut conditions = Vec::new();
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
-        let op = rule.get("op").and_then(|v| v.as_str()).unwrap_or("contains");
+        let op = rule
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("contains");
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
         let cond = match (field, op) {
@@ -186,9 +209,15 @@ fn build_smart_query(
             ("year", "gte") => format!("t.year >= {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "lte") => format!("t.year <= {}", value.parse::<i32>().unwrap_or(0)),
             ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
-            ("sample_rate", "gte") => format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0)),
-            ("duration_ms", "gte") => format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0)),
-            ("duration_ms", "lte") => format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0)),
+            ("sample_rate", "gte") => {
+                format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("duration_ms", "gte") => {
+                format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0))
+            }
+            ("duration_ms", "lte") => {
+                format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0))
+            }
             ("title", "contains") => format!("t.title LIKE '%{}%'", value.replace('\'', "''")),
             _ => continue,
         };
@@ -213,9 +242,7 @@ fn build_smart_query(
         if sort_order == "desc" { "DESC" } else { "ASC" }
     );
 
-    let limit_clause = max_tracks
-        .map(|n| format!("LIMIT {n}"))
-        .unwrap_or_default();
+    let limit_clause = max_tracks.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
     (where_clause, order, limit_clause)
 }
@@ -276,10 +303,7 @@ fn load_smart_criteria(state: &AppState, id: i64) -> Option<(String, String, Str
     .ok()
 }
 
-async fn resolve_tracks(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn resolve_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)
     else {
         return StatusCode::NOT_FOUND.into_response();

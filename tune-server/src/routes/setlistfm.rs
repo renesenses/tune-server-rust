@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -36,7 +36,11 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client error: {e}"))
 }
 
-async fn setlistfm_get(api_key: &str, path: &str, params: &[(&str, &str)]) -> Result<Value, (StatusCode, String)> {
+async fn setlistfm_get(
+    api_key: &str,
+    path: &str,
+    params: &[(&str, &str)],
+) -> Result<Value, (StatusCode, String)> {
     let client = http_client().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let url = format!("{SETLISTFM_API}{path}");
 
@@ -142,10 +146,7 @@ async fn artist_setlists(
     }
 }
 
-async fn get_setlist(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_setlist(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(api_key) = setlistfm_api_key(&state) else {
         return not_configured().into_response();
     };

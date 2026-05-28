@@ -14,9 +14,15 @@ pub fn quality_suffix(sample_rate: Option<u32>, bit_depth: Option<u16>) -> Strin
     }
 
     let rate_part = sample_rate.filter(|_| hi_rate).map(|sr| {
-        if sr >= 1000 { format!("{}kHz", sr / 1000) } else { format!("{}Hz", sr) }
+        if sr >= 1000 {
+            format!("{}kHz", sr / 1000)
+        } else {
+            format!("{}Hz", sr)
+        }
     });
-    let depth_part = bit_depth.filter(|_| hi_depth).map(|bd| format!("{}bit", bd));
+    let depth_part = bit_depth
+        .filter(|_| hi_depth)
+        .map(|bd| format!("{}bit", bd));
 
     match (rate_part, depth_part) {
         (Some(r), Some(d)) => format!("{r}/{d}"),

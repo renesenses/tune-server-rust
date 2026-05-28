@@ -86,7 +86,11 @@ pub struct Alternative {
 pub fn dedup_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
     let mut by_host: HashMap<String, Vec<DiscoveredDevice>> = HashMap::new();
     for dev in devices {
-        if dev.manufacturer.as_deref().is_some_and(|m| m.to_lowercase().contains("mozaik")) {
+        if dev
+            .manufacturer
+            .as_deref()
+            .is_some_and(|m| m.to_lowercase().contains("mozaik"))
+        {
             continue;
         }
         by_host.entry(dev.host.clone()).or_default().push(dev);
@@ -122,8 +126,20 @@ mod tests {
     #[test]
     fn dedup_keeps_highest_priority() {
         let devices = vec![
-            DiscoveredDevice::new("dlna-1".into(), "Speaker".into(), OutputType::Dlna, "192.168.1.50".into(), 1400),
-            DiscoveredDevice::new("oh-1".into(), "Speaker".into(), OutputType::Openhome, "192.168.1.50".into(), 1400),
+            DiscoveredDevice::new(
+                "dlna-1".into(),
+                "Speaker".into(),
+                OutputType::Dlna,
+                "192.168.1.50".into(),
+                1400,
+            ),
+            DiscoveredDevice::new(
+                "oh-1".into(),
+                "Speaker".into(),
+                OutputType::Openhome,
+                "192.168.1.50".into(),
+                1400,
+            ),
         ];
         let result = dedup_devices(devices);
         assert_eq!(result.len(), 1);
@@ -133,7 +149,13 @@ mod tests {
 
     #[test]
     fn dedup_filters_self() {
-        let mut dev = DiscoveredDevice::new("self".into(), "Tune".into(), OutputType::Dlna, "127.0.0.1".into(), 8888);
+        let mut dev = DiscoveredDevice::new(
+            "self".into(),
+            "Tune".into(),
+            OutputType::Dlna,
+            "127.0.0.1".into(),
+            8888,
+        );
         dev.manufacturer = Some("Mozaik Labs".into());
         let result = dedup_devices(vec![dev]);
         assert!(result.is_empty());

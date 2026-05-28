@@ -99,8 +99,15 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
     let file_size = std::fs::metadata(path).ok().map(|m| m.len());
 
     // Derive album from parent dir, artist from grandparent (Artist/Album/track.dsf)
-    let album = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string());
-    let artist = path.parent().and_then(|p| p.parent()).and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string());
+    let album = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string());
+    let artist = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string());
 
     let (sample_rate, channels, duration_ms) = if ext == "dsf" {
         parse_dsf_header(path).unwrap_or((None, None, None))
@@ -157,8 +164,8 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
     let sample_rate = u32::from_le_bytes([header[56], header[57], header[58], header[59]]);
     let bits_per_sample = u32::from_le_bytes([header[60], header[61], header[62], header[63]]);
     let sample_count = u64::from_le_bytes([
-        header[64], header[65], header[66], header[67],
-        header[68], header[69], header[70], header[71],
+        header[64], header[65], header[66], header[67], header[68], header[69], header[70],
+        header[71],
     ]);
 
     let duration_ms = if sample_rate > 0 {
@@ -171,11 +178,7 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
 
     let _ = bits_per_sample; // typically 1 for DSD
 
-    Ok((
-        Some(sample_rate),
-        Some(channels as u16),
-        duration_ms,
-    ))
+    Ok((Some(sample_rate), Some(channels as u16), duration_ms))
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
@@ -199,18 +202,23 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 
     let bpm = get(&ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
-    let original_year = get(&ItemKey::OriginalReleaseDate)
-        .and_then(|s| s.get(..4)?.parse::<u32>().ok());
+    let original_year =
+        get(&ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok());
 
-    let total_tracks = tag.track_total()
+    let total_tracks = tag
+        .track_total()
         .or_else(|| get(&ItemKey::TrackTotal).and_then(|s| s.parse::<u32>().ok()));
-    let total_discs = tag.disk_total()
+    let total_discs = tag
+        .disk_total()
         .or_else(|| get(&ItemKey::DiscTotal).and_then(|s| s.parse::<u32>().ok()));
 
     let credits = parse_credits(tag);
 
     let raw_genre = tag.genre().map(|s| s.to_string());
-    let genres = raw_genre.as_deref().map(split_genre_tag).unwrap_or_default();
+    let genres = raw_genre
+        .as_deref()
+        .map(split_genre_tag)
+        .unwrap_or_default();
     let genre = genres.first().cloned().or(raw_genre);
 
     Ok(TrackMetadata {
@@ -234,7 +242,9 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         sample_rate: props.sample_rate(),
         bit_depth: props.bit_depth().map(|b| b as u16),
         channels: props.channels().map(|c| c as u16),
-        format: Some(normalize_format(&format!("{:?}", tagged.file_type()).to_lowercase())),
+        format: Some(normalize_format(
+            &format!("{:?}", tagged.file_type()).to_lowercase(),
+        )),
         file_size: std::fs::metadata(path).ok().map(|m| m.len()),
         bpm,
         compilation,
@@ -271,21 +281,38 @@ pub struct MetadataUpdate {
 pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::TaggedFileExt;
-    use lofty::tag::{Accessor, ItemKey, TagItem, ItemValue, TagExt};
+    use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
 
     let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
     let tag = tagged.primary_tag_mut().ok_or("no primary tag")?;
 
-    if let Some(ref v) = update.title { tag.set_title(v.clone()); }
-    if let Some(ref v) = update.artist { tag.set_artist(v.clone()); }
-    if let Some(ref v) = update.album { tag.set_album(v.clone()); }
-    if let Some(ref v) = update.genre { tag.set_genre(v.clone()); }
-    if let Some(v) = update.track_number { tag.set_track(v); }
-    if let Some(v) = update.disc_number { tag.set_disk(v); }
-    if let Some(v) = update.year { tag.set_year(v); }
+    if let Some(ref v) = update.title {
+        tag.set_title(v.clone());
+    }
+    if let Some(ref v) = update.artist {
+        tag.set_artist(v.clone());
+    }
+    if let Some(ref v) = update.album {
+        tag.set_album(v.clone());
+    }
+    if let Some(ref v) = update.genre {
+        tag.set_genre(v.clone());
+    }
+    if let Some(v) = update.track_number {
+        tag.set_track(v);
+    }
+    if let Some(v) = update.disc_number {
+        tag.set_disk(v);
+    }
+    if let Some(v) = update.year {
+        tag.set_year(v);
+    }
 
     if let Some(ref v) = update.album_artist {
-        tag.insert(TagItem::new(ItemKey::AlbumArtist, ItemValue::Text(v.clone())));
+        tag.insert(TagItem::new(
+            ItemKey::AlbumArtist,
+            ItemValue::Text(v.clone()),
+        ));
     }
     if let Some(ref v) = update.composer {
         tag.insert(TagItem::new(ItemKey::Composer, ItemValue::Text(v.clone())));
@@ -294,7 +321,8 @@ pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String
         tag.insert(TagItem::new(ItemKey::Label, ItemValue::Text(v.clone())));
     }
 
-    tag.save_to_path(path, WriteOptions::default()).map_err(|e| format!("write: {e}"))?;
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("write: {e}"))?;
     Ok(())
 }
 
@@ -329,18 +357,22 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
 
     for item in tag.items() {
         if item.key() == &ItemKey::Performer
-            && let Some(val) = item.value().text() {
-                let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
-                    (n.trim().to_string(), Some(i.trim_end_matches(')').trim().to_string()))
-                } else {
-                    (val.to_string(), None)
-                };
-                credits.push(TrackCredit {
-                    name,
-                    role: "performer".into(),
-                    instrument,
-                });
-            }
+            && let Some(val) = item.value().text()
+        {
+            let (name, instrument) = if let Some((n, i)) = val.split_once('(') {
+                (
+                    n.trim().to_string(),
+                    Some(i.trim_end_matches(')').trim().to_string()),
+                )
+            } else {
+                (val.to_string(), None)
+            };
+            credits.push(TrackCredit {
+                name,
+                role: "performer".into(),
+                instrument,
+            });
+        }
     }
 
     credits
@@ -573,7 +605,10 @@ mod tests {
         let samples: u64 = 2_822_400 * 180;
         buf[64..72].copy_from_slice(&samples.to_le_bytes());
 
-        std::fs::File::create(&tmp).unwrap().write_all(&buf).unwrap();
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
 
         let meta = dsf_dff_fallback(&tmp);
         std::fs::remove_file(&tmp).ok();
@@ -585,7 +620,10 @@ mod tests {
         assert_eq!(meta.channels, Some(2));
         // Duration should be approximately 180_000 ms (3 minutes)
         let dur = meta.duration_ms.unwrap();
-        assert!(dur >= 179_000 && dur <= 181_000, "unexpected duration: {dur}ms");
+        assert!(
+            dur >= 179_000 && dur <= 181_000,
+            "unexpected duration: {dur}ms"
+        );
     }
 
     #[test]

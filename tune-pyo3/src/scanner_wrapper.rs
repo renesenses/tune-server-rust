@@ -27,9 +27,7 @@ fn scan_directories<'py>(
     dirs: Vec<String>,
     with_hash: bool,
 ) -> PyResult<pyo3::Bound<'py, PyDict>> {
-    let (results, stats) = py.allow_threads(|| {
-        walker::scan_directories(&dirs, with_hash, None)
-    });
+    let (results, stats) = py.allow_threads(|| walker::scan_directories(&dirs, with_hash, None));
 
     let dict = PyDict::new(py);
     let files_list = PyList::empty(py);
@@ -44,7 +42,9 @@ fn scan_directories<'py>(
             let meta_dict = PyDict::new(py);
             macro_rules! set_opt {
                 ($key:expr, $val:expr) => {
-                    if let Some(ref v) = $val { meta_dict.set_item($key, v)?; }
+                    if let Some(ref v) = $val {
+                        meta_dict.set_item($key, v)?;
+                    }
                 };
             }
             set_opt!("title", meta.title);
@@ -79,8 +79,14 @@ fn scan_directories<'py>(
             set_opt!("musicbrainz_recording_id", meta.musicbrainz_recording_id);
             set_opt!("musicbrainz_release_id", meta.musicbrainz_release_id);
             set_opt!("musicbrainz_artist_id", meta.musicbrainz_artist_id);
-            set_opt!("musicbrainz_album_artist_id", meta.musicbrainz_album_artist_id);
-            set_opt!("musicbrainz_release_group_id", meta.musicbrainz_release_group_id);
+            set_opt!(
+                "musicbrainz_album_artist_id",
+                meta.musicbrainz_album_artist_id
+            );
+            set_opt!(
+                "musicbrainz_release_group_id",
+                meta.musicbrainz_release_group_id
+            );
             set_opt!("isrc", meta.isrc);
             meta_dict.set_item("has_cover", meta.has_cover)?;
             meta_dict.set_item("compilation", meta.compilation)?;
@@ -142,8 +148,7 @@ pub struct RustFileWatcher {
 impl RustFileWatcher {
     #[new]
     fn new(dirs: Vec<String>) -> PyResult<Self> {
-        let watcher = FileWatcher::new(dirs)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        let watcher = FileWatcher::new(dirs).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(WatcherInner { watcher }))),
@@ -158,9 +163,9 @@ impl RustFileWatcher {
         debounce_ms: u64,
     ) -> PyResult<pyo3::Bound<'py, PyList>> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("watcher stopped")
-        })?;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("watcher stopped"))?;
 
         let changes = py.allow_threads(|| {
             inner.watcher.poll_debounced(
@@ -173,11 +178,14 @@ impl RustFileWatcher {
         for change in &changes {
             let dict = PyDict::new(py);
             dict.set_item("path", &change.path)?;
-            dict.set_item("type", match change.change_type {
-                ChangeType::Added => "added",
-                ChangeType::Modified => "modified",
-                ChangeType::Deleted => "deleted",
-            })?;
+            dict.set_item(
+                "type",
+                match change.change_type {
+                    ChangeType::Added => "added",
+                    ChangeType::Modified => "modified",
+                    ChangeType::Deleted => "deleted",
+                },
+            )?;
             list.append(dict)?;
         }
         Ok(list)

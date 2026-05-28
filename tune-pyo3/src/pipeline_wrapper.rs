@@ -1,9 +1,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tune_core::audio::formats::AudioFormat;
 use tune_core::audio::pipeline::{AudioPipeline, PipelineConfig};
-use tokio::sync::mpsc;
 
 struct PipelineInner {
     pipeline: AudioPipeline,
@@ -57,23 +57,32 @@ impl RustPipeline {
 
     fn start(&self) -> PyResult<()> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("pipeline already stopped")
-        })?;
-        inner.runtime.block_on(inner.pipeline.start())
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("pipeline already stopped"))?;
+        inner
+            .runtime
+            .block_on(inner.pipeline.start())
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     #[pyo3(signature = (timeout_ms=5000))]
-    fn read_chunk<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+    fn read_chunk<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
         let mut guard = self.inner.lock().unwrap();
-        let inner = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("pipeline already stopped")
-        })?;
+        let inner = guard
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("pipeline already stopped"))?;
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let chunk = py.allow_threads(|| {
             inner.runtime.block_on(async {
-                tokio::time::timeout(timeout, inner.rx.recv()).await.ok().flatten()
+                tokio::time::timeout(timeout, inner.rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
             })
         });
         match chunk {
@@ -97,9 +106,9 @@ impl RustPipeline {
 
     fn stream_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let guard = self.inner.lock().unwrap();
-        let inner = guard.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("pipeline not initialized")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("pipeline not initialized"))?;
         let info = inner.pipeline.stream_info();
         let dict = PyDict::new(py);
         dict.set_item("format", format!("{:?}", info.format).to_lowercase())?;

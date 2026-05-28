@@ -27,7 +27,8 @@ async fn main() {
         )
         .init();
 
-    let state = AppState::new(&config.db_path, config.port, config.clone()).expect("failed to init app state");
+    let state = AppState::new(&config.db_path, config.port, config.clone())
+        .expect("failed to init app state");
 
     state.restore_tokens().await;
 
@@ -51,7 +52,10 @@ async fn main() {
     if !config.music_dirs.is_empty() {
         let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
         settings
-            .set("music_dirs", &serde_json::to_string(&config.music_dirs).unwrap())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&config.music_dirs).unwrap(),
+            )
             .ok();
     }
 
@@ -76,11 +80,14 @@ async fn main() {
             let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
             info!(files = files.len(), "auto_scan_files_found");
 
-            event_bus.emit("library.scan.started", serde_json::json!({
-                "music_dirs": &music_dirs,
-                "total": files.len(),
-                "auto": true,
-            }));
+            event_bus.emit(
+                "library.scan.started",
+                serde_json::json!({
+                    "music_dirs": &music_dirs,
+                    "total": files.len(),
+                    "auto": true,
+                }),
+            );
 
             let (scanned, stats) =
                 tune_core::scanner::walker::scan_files_parallel(&files, true, None);
@@ -110,13 +117,26 @@ async fn main() {
 
                 // Determine if this is a compilation (Various Artists)
                 let is_compilation = meta.compilation
-                    || meta.album_artist.as_deref().map(|s| s.to_lowercase())
-                        .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
+                    || meta
+                        .album_artist
+                        .as_deref()
+                        .map(|s| s.to_lowercase())
+                        .map(|s| {
+                            s == "various artists"
+                                || s == "various"
+                                || s == "va"
+                                || s == "compilations"
+                        })
                         .unwrap_or(false);
 
                 // Album artist: use album_artist tag, fall back to "Various Artists" for compilations
-                let album_artist_name = meta.album_artist.as_deref()
-                    .unwrap_or_else(|| if is_compilation { "Various Artists" } else { meta.artist.as_deref().unwrap_or("Unknown Artist") });
+                let album_artist_name = meta.album_artist.as_deref().unwrap_or_else(|| {
+                    if is_compilation {
+                        "Various Artists"
+                    } else {
+                        meta.artist.as_deref().unwrap_or("Unknown Artist")
+                    }
+                });
 
                 // Track artist: always from track-level artist tag
                 let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
@@ -125,7 +145,11 @@ async fn main() {
                 let album_artist_entry = artist_repo
                     .get_or_create(
                         album_artist_name,
-                        if is_compilation { None } else { meta.musicbrainz_artist_id.as_deref() },
+                        if is_compilation {
+                            None
+                        } else {
+                            meta.musicbrainz_artist_id.as_deref()
+                        },
                         meta.album_artist_sort.as_deref(),
                     )
                     .ok();
@@ -147,7 +171,11 @@ async fn main() {
 
                 let album = meta.album.as_ref().and_then(|title| {
                     album_repo
-                        .get_or_create(title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
+                        .get_or_create(
+                            title,
+                            album_artist_id.unwrap_or(0),
+                            meta.year.map(|y| y as i32),
+                        )
                         .ok()
                 });
                 let album_id = album.as_ref().and_then(|a| a.id);
@@ -157,10 +185,11 @@ async fn main() {
                     && let Some(hash) = tune_core::artwork::get_or_extract(
                         std::path::Path::new(&sf.path),
                         &cache_dir,
-                    ) {
-                        album_repo.update_cover_path(aid, &hash).ok();
-                        albums_with_cover.insert(aid);
-                    }
+                    )
+                {
+                    album_repo.update_cover_path(aid, &hash).ok();
+                    albums_with_cover.insert(aid);
+                }
 
                 // Build the title (shared between insert and update)
                 let title = meta.title.clone().unwrap_or_else(|| {
@@ -171,9 +200,12 @@ async fn main() {
                 });
 
                 // Check if this file already exists in the DB
-                if let Some(&(existing_id, existing_mtime, existing_size)) = existing_tracks.get(&sf.path) {
+                if let Some(&(existing_id, existing_mtime, existing_size)) =
+                    existing_tracks.get(&sf.path)
+                {
                     // File exists — check if it has changed (different mtime or size)
-                    let file_changed = existing_mtime.map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                    let file_changed = existing_mtime
+                        .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
                         || existing_size.map_or(true, |s| s != sf.file_size as i64);
 
                     if !file_changed {
@@ -243,16 +275,21 @@ async fn main() {
                 // Emit progress every 500 processed files or every 2 seconds
                 let processed = inserted + updated + skipped;
                 let elapsed = last_progress_emit.elapsed();
-                if processed > 0 && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2)) {
+                if processed > 0
+                    && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2))
+                {
                     last_progress_emit = std::time::Instant::now();
-                    event_bus.emit("library.scan.progress", serde_json::json!({
-                        "scanned": processed,
-                        "total": total,
-                        "current_file": sf.path,
-                        "inserted": inserted,
-                        "updated": updated,
-                        "skipped": skipped,
-                    }));
+                    event_bus.emit(
+                        "library.scan.progress",
+                        serde_json::json!({
+                            "scanned": processed,
+                            "total": total,
+                            "current_file": sf.path,
+                            "inserted": inserted,
+                            "updated": updated,
+                            "skipped": skipped,
+                        }),
+                    );
                 }
             }
 
@@ -274,15 +311,18 @@ async fn main() {
                 "auto_scan_complete"
             );
 
-            event_bus.emit("library.scan.completed", serde_json::json!({
-                "total_files": stats.total_files,
-                "metadata_ok": stats.metadata_ok,
-                "metadata_failed": stats.metadata_failed,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "artwork_extracted": albums_with_cover.len(),
-            }));
+            event_bus.emit(
+                "library.scan.completed",
+                serde_json::json!({
+                    "total_files": stats.total_files,
+                    "metadata_ok": stats.metadata_ok,
+                    "metadata_failed": stats.metadata_failed,
+                    "inserted": inserted,
+                    "updated": updated,
+                    "skipped": skipped,
+                    "artwork_extracted": albums_with_cover.len(),
+                }),
+            );
         });
     }
 
@@ -321,9 +361,7 @@ async fn main() {
                                         let track_repo =
                                             tune_core::db::track_repo::TrackRepo::new(db.clone());
                                         let artist_repo =
-                                            tune_core::db::artist_repo::ArtistRepo::new(
-                                                db.clone(),
-                                            );
+                                            tune_core::db::artist_repo::ArtistRepo::new(db.clone());
                                         let album_repo =
                                             tune_core::db::album_repo::AlbumRepo::new(db.clone());
 
@@ -341,21 +379,38 @@ async fn main() {
 
                                             // Determine if this is a compilation
                                             let is_compilation = meta.compilation
-                                                || meta.album_artist.as_deref().map(|s| s.to_lowercase())
-                                                    .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
+                                                || meta
+                                                    .album_artist
+                                                    .as_deref()
+                                                    .map(|s| s.to_lowercase())
+                                                    .map(|s| {
+                                                        s == "various artists"
+                                                            || s == "various"
+                                                            || s == "va"
+                                                            || s == "compilations"
+                                                    })
                                                     .unwrap_or(false);
 
                                             // Album artist: use album_artist tag, fall back to track artist
-                                            let album_artist_name = meta.album_artist.as_deref()
-                                                .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"));
+                                            let album_artist_name =
+                                                meta.album_artist.as_deref().unwrap_or_else(|| {
+                                                    meta.artist
+                                                        .as_deref()
+                                                        .unwrap_or("Unknown Artist")
+                                                });
 
-                                            let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
+                                            let track_artist_name =
+                                                meta.artist.as_deref().unwrap_or("Unknown Artist");
 
                                             // For the album, use album_artist (so compilations group under "Various Artists")
                                             let album_artist_entry = artist_repo
                                                 .get_or_create(
                                                     album_artist_name,
-                                                    if is_compilation { None } else { meta.musicbrainz_artist_id.as_deref() },
+                                                    if is_compilation {
+                                                        None
+                                                    } else {
+                                                        meta.musicbrainz_artist_id.as_deref()
+                                                    },
                                                     meta.album_artist_sort.as_deref(),
                                                 )
                                                 .ok();
@@ -363,7 +418,9 @@ async fn main() {
                                                 album_artist_entry.as_ref().and_then(|a| a.id);
 
                                             // For the track, use track-level artist (important for compilations)
-                                            let track_artist = if is_compilation && track_artist_name != album_artist_name {
+                                            let track_artist = if is_compilation
+                                                && track_artist_name != album_artist_name
+                                            {
                                                 artist_repo
                                                     .get_or_create(
                                                         track_artist_name,
@@ -377,18 +434,16 @@ async fn main() {
                                             let artist_id =
                                                 track_artist.as_ref().and_then(|a| a.id);
 
-                                            let album =
-                                                meta.album.as_ref().and_then(|title| {
-                                                    album_repo
-                                                        .get_or_create(
-                                                            title,
-                                                            album_artist_id.unwrap_or(0),
-                                                            meta.year.map(|y| y as i32),
-                                                        )
-                                                        .ok()
-                                                });
-                                            let album_id =
-                                                album.as_ref().and_then(|a| a.id);
+                                            let album = meta.album.as_ref().and_then(|title| {
+                                                album_repo
+                                                    .get_or_create(
+                                                        title,
+                                                        album_artist_id.unwrap_or(0),
+                                                        meta.year.map(|y| y as i32),
+                                                    )
+                                                    .ok()
+                                            });
+                                            let album_id = album.as_ref().and_then(|a| a.id);
 
                                             if let Some(aid) = album_id {
                                                 let cache_dir = std::env::var("TUNE_ARTWORK_DIR")
@@ -402,27 +457,20 @@ async fn main() {
                                                         &cache_dir,
                                                     )
                                                 {
-                                                    album_repo
-                                                        .update_cover_path(aid, &hash)
-                                                        .ok();
+                                                    album_repo.update_cover_path(aid, &hash).ok();
                                                 }
                                                 album_repo.update_track_count(aid).ok();
-                                                album_repo
-                                                    .update_quality_from_tracks(aid)
-                                                    .ok();
+                                                album_repo.update_quality_from_tracks(aid).ok();
                                             }
 
-                                            let mut track =
-                                                tune_core::db::models::Track::new(
-                                                    meta.title.clone().unwrap_or_else(|| {
-                                                        std::path::Path::new(&sf.path)
-                                                            .file_stem()
-                                                            .map(|s| {
-                                                                s.to_string_lossy().to_string()
-                                                            })
-                                                            .unwrap_or_default()
-                                                    }),
-                                                );
+                                            let mut track = tune_core::db::models::Track::new(
+                                                meta.title.clone().unwrap_or_else(|| {
+                                                    std::path::Path::new(&sf.path)
+                                                        .file_stem()
+                                                        .map(|s| s.to_string_lossy().to_string())
+                                                        .unwrap_or_default()
+                                                }),
+                                            );
                                             track.album_id = album_id;
                                             track.artist_id = artist_id;
                                             track.artist_name = Some(track_artist_name.to_string());
@@ -436,10 +484,8 @@ async fn main() {
                                                 meta.duration_ms.unwrap_or(0) as i64;
                                             track.file_path = Some(sf.path.clone());
                                             track.format = meta.format.clone();
-                                            track.sample_rate =
-                                                meta.sample_rate.map(|s| s as i32);
-                                            track.bit_depth =
-                                                meta.bit_depth.map(|b| b as i32);
+                                            track.sample_rate = meta.sample_rate.map(|s| s as i32);
+                                            track.bit_depth = meta.bit_depth.map(|b| b as i32);
                                             track.channels = meta.channels.unwrap_or(2) as i32;
                                             track.file_size = Some(sf.file_size as i64);
                                             track.file_mtime = Some(sf.mtime as f64);
@@ -492,15 +538,26 @@ async fn main() {
             while let Some(event) = ssdp_rx.recv().await {
                 match event {
                     SsdpEvent::DeviceDiscovered(dev) => {
-                        let is_dlna = dev.device_type == tune_core::discovery::device::OutputType::Dlna
-                            || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
+                        let is_dlna = dev.device_type
+                            == tune_core::discovery::device::OutputType::Dlna
+                            || dev.device_type
+                                == tune_core::discovery::device::OutputType::Openhome;
                         if is_dlna {
-                            let svc_urls = dev.capabilities.get("service_urls")
-                                .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok())
+                            let svc_urls = dev
+                                .capabilities
+                                .get("service_urls")
+                                .and_then(|v| {
+                                    serde_json::from_value::<
+                                        std::collections::HashMap<String, String>,
+                                    >(v.clone())
+                                    .ok()
+                                })
                                 .unwrap_or_default();
-                            let av_url = svc_urls.get("avtransport")
+                            let av_url = svc_urls
+                                .get("avtransport")
                                 .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
-                            let rc_url = svc_urls.get("renderingcontrol")
+                            let rc_url = svc_urls
+                                .get("renderingcontrol")
                                 .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
                             if let (Some(av), Some(rc)) = (av_url, rc_url) {
                                 let delay = config_for_ssdp.play_delay_for(&dev.name);
@@ -510,32 +567,55 @@ async fn main() {
                                     dev.host.clone(),
                                     av,
                                     rc,
-                                ).with_play_delay(delay);
+                                )
+                                .with_play_delay(delay);
                                 let mut reg = outputs.lock().await;
                                 reg.register(Box::new(dlna));
                                 info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
                             }
 
-                            let skip_keywords = ["tv", "décodeur", "decoder", "kdl-", "bravia", "samsung", "lg ", "philips tv", "chromecast"];
+                            let skip_keywords = [
+                                "tv",
+                                "décodeur",
+                                "decoder",
+                                "kdl-",
+                                "bravia",
+                                "samsung",
+                                "lg ",
+                                "philips tv",
+                                "chromecast",
+                            ];
                             let name_lower = dev.name.to_lowercase();
                             let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
 
-                            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
+                            let zone_repo =
+                                tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
                             let existing = zone_repo.list().unwrap_or_default();
-                            let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
+                            let already = existing
+                                .iter()
+                                .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
                             if already {
                                 let _ = zone_repo.set_online_by_device(&dev.id, true);
                                 info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
-                                event_bus_for_ssdp.emit("device.reconnected", serde_json::json!({
-                                    "device_id": &dev.id,
-                                    "name": &dev.name,
-                                    "host": &dev.host,
-                                }));
+                                event_bus_for_ssdp.emit(
+                                    "device.reconnected",
+                                    serde_json::json!({
+                                        "device_id": &dev.id,
+                                        "name": &dev.name,
+                                        "host": &dev.host,
+                                    }),
+                                );
                             } else if !is_tv {
                                 let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
                                 let name_taken = existing.iter().any(|z| z.name == short_name);
-                                let zone_name = if name_taken { dev.name.clone() } else { short_name.to_string() };
-                                if let Ok(zid) = zone_repo.create(&zone_name, Some("dlna"), Some(&dev.id)) {
+                                let zone_name = if name_taken {
+                                    dev.name.clone()
+                                } else {
+                                    short_name.to_string()
+                                };
+                                if let Ok(zid) =
+                                    zone_repo.create(&zone_name, Some("dlna"), Some(&dev.id))
+                                {
                                     info!(name = %zone_name, zone_id = zid, device = %dev.id, "zone_auto_created");
                                 }
                             }
@@ -544,7 +624,8 @@ async fn main() {
                     SsdpEvent::DeviceLost(id) => {
                         let mut reg = outputs.lock().await;
                         reg.remove(&id);
-                        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
+                        let zone_repo =
+                            tune_core::db::zone_repo::ZoneRepo::new(db_for_ssdp.clone());
                         let _ = zone_repo.set_online_by_device(&id, false);
                         info!(id = %id, "output_removed_zone_offline");
                     }
@@ -569,8 +650,8 @@ async fn main() {
         let outputs = state.outputs.clone();
         let db_for_mdns = state.db.clone();
         tokio::spawn(async move {
-            use tune_core::discovery::mdns::MdnsEvent;
             use tune_core::discovery::device::OutputType;
+            use tune_core::discovery::mdns::MdnsEvent;
             while let Some(event) = mdns_rx.recv().await {
                 match event {
                     MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
@@ -585,11 +666,15 @@ async fn main() {
                             reg.register(Box::new(cast));
                             info!(name = %dev.name, host = %dev.host, port = dev.port, "chromecast_output_registered");
 
-                            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db_for_mdns.clone());
+                            let zone_repo =
+                                tune_core::db::zone_repo::ZoneRepo::new(db_for_mdns.clone());
                             let existing = zone_repo.list().unwrap_or_default();
-                            let already = existing.iter().any(|z| z.output_device_id.as_deref() == Some(&dev.id));
+                            let already = existing
+                                .iter()
+                                .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
                             if !already
-                                && let Ok(zid) = zone_repo.create(&dev.name, Some("chromecast"), Some(&dev.id))
+                                && let Ok(zid) =
+                                    zone_repo.create(&dev.name, Some("chromecast"), Some(&dev.id))
                             {
                                 info!(name = %dev.name, zone_id = zid, "chromecast_zone_auto_created");
                             }
@@ -627,14 +712,9 @@ async fn main() {
                             Ok(true) => {
                                 if let Some(tokens) = svc.save_tokens() {
                                     let settings =
-                                        tune_core::db::settings_repo::SettingsRepo::new(
-                                            db.clone(),
-                                        );
+                                        tune_core::db::settings_repo::SettingsRepo::new(db.clone());
                                     settings
-                                        .set(
-                                            &format!("auth_tokens_{name}"),
-                                            &tokens.to_string(),
-                                        )
+                                        .set(&format!("auth_tokens_{name}"), &tokens.to_string())
                                         .ok();
                                 }
                             }
@@ -662,10 +742,13 @@ async fn main() {
         info!("upnp_mediaserver_advertiser_started");
     }
 
-    state.event_bus.emit("system.started", serde_json::json!({
-        "version": tune_core::version(),
-        "port": config.port,
-    }));
+    state.event_bus.emit(
+        "system.started",
+        serde_json::json!({
+            "version": tune_core::version(),
+            "port": config.port,
+        }),
+    );
 
     info!(
         version = tune_core::version(),

@@ -20,8 +20,9 @@ impl SqliteDb {
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
-        ).map_err(|e| format!("pragma: {e}"))?;
+             PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| format!("pragma: {e}"))?;
 
         info!(path, "sqlite_opened");
 
@@ -31,12 +32,10 @@ impl SqliteDb {
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| format!("sqlite memory: {e}"))?;
+        let conn = Connection::open_in_memory().map_err(|e| format!("sqlite memory: {e}"))?;
 
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;"
-        ).map_err(|e| format!("pragma: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| format!("pragma: {e}"))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -47,7 +46,11 @@ impl SqliteDb {
         &self.conn
     }
 
-    pub fn execute(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> Result<usize, String> {
+    pub fn execute(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> Result<usize, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(sql, params)
             .map_err(|e| format!("execute: {e}"))
@@ -55,8 +58,7 @@ impl SqliteDb {
 
     pub fn execute_batch(&self, sql: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(sql)
-            .map_err(|e| format!("batch: {e}"))
+        conn.execute_batch(sql).map_err(|e| format!("batch: {e}"))
     }
 
     pub fn init_schema(&self) -> Result<(), String> {
@@ -294,9 +296,9 @@ mod tests {
         db.init_schema().unwrap();
 
         let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
         let tables: Vec<String> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()

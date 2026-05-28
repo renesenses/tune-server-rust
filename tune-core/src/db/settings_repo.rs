@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use super::sqlite::SqliteDb;
 
@@ -31,7 +31,8 @@ impl SettingsRepo {
     }
 
     pub fn delete(&self, key: &str) -> Result<(), String> {
-        self.db.execute("DELETE FROM settings WHERE key = ?", &[&key])?;
+        self.db
+            .execute("DELETE FROM settings WHERE key = ?", &[&key])?;
         Ok(())
     }
 
@@ -73,7 +74,10 @@ mod tests {
         assert_eq!(repo.get("music_dirs").unwrap().unwrap(), r#"["/music"]"#);
 
         repo.set("music_dirs", r#"["/music","/nas"]"#).unwrap();
-        assert_eq!(repo.get("music_dirs").unwrap().unwrap(), r#"["/music","/nas"]"#);
+        assert_eq!(
+            repo.get("music_dirs").unwrap().unwrap(),
+            r#"["/music","/nas"]"#
+        );
 
         let all = repo.all().unwrap();
         assert_eq!(all.len(), 1);

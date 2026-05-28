@@ -26,16 +26,16 @@ pub mod network;
 pub mod offline;
 pub mod onboarding;
 pub mod party;
+pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
-pub mod peers;
 pub mod profiles;
 pub mod radios;
-pub mod roon_bridge;
 pub mod room_calibration;
+pub mod roon_bridge;
 pub mod sacd_rip;
 pub mod search;
 pub mod setlistfm;
@@ -50,8 +50,8 @@ pub mod spotify_connect;
 pub mod squeezebox;
 pub mod streaming;
 pub mod system;
-pub mod tags;
 pub mod tagger;
+pub mod tags;
 pub mod upnp;
 pub mod visualizer;
 pub mod widget;
@@ -59,26 +59,44 @@ pub mod ws;
 pub mod zone_manager;
 pub mod zones;
 
+use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
-async fn service_tokens_list(axum::extract::State(state): axum::extract::State<crate::state::AppState>) -> axum::Json<serde_json::Value> {
+async fn service_tokens_list(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+) -> axum::Json<serde_json::Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let registry = state.services.lock().await;
     let streaming_status = registry.status_all().await;
     drop(registry);
 
-    let tidal_auth = streaming_status.iter().find(|s| s["name"] == "tidal").and_then(|s| s["authenticated"].as_bool()).unwrap_or(false);
-    let qobuz_auth = streaming_status.iter().find(|s| s["name"] == "qobuz").and_then(|s| s["authenticated"].as_bool()).unwrap_or(false);
-    let spotify_auth = streaming_status.iter().find(|s| s["name"] == "spotify").and_then(|s| s["authenticated"].as_bool()).unwrap_or(false);
-    let deezer_auth = streaming_status.iter().find(|s| s["name"] == "deezer").and_then(|s| s["authenticated"].as_bool()).unwrap_or(false);
+    let tidal_auth = streaming_status
+        .iter()
+        .find(|s| s["name"] == "tidal")
+        .and_then(|s| s["authenticated"].as_bool())
+        .unwrap_or(false);
+    let qobuz_auth = streaming_status
+        .iter()
+        .find(|s| s["name"] == "qobuz")
+        .and_then(|s| s["authenticated"].as_bool())
+        .unwrap_or(false);
+    let spotify_auth = streaming_status
+        .iter()
+        .find(|s| s["name"] == "spotify")
+        .and_then(|s| s["authenticated"].as_bool())
+        .unwrap_or(false);
+    let deezer_auth = streaming_status
+        .iter()
+        .find(|s| s["name"] == "deezer")
+        .and_then(|s| s["authenticated"].as_bool())
+        .unwrap_or(false);
 
     let services = vec![
         serde_json::json!({
@@ -197,7 +215,10 @@ async fn service_token_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let keys: Vec<String> = settings.all().unwrap_or_default().into_iter()
+    let keys: Vec<String> = settings
+        .all()
+        .unwrap_or_default()
+        .into_iter()
         .filter(|(k, _)| k.starts_with(&format!("{}_", id)))
         .map(|(k, _)| k)
         .collect();
@@ -213,23 +234,45 @@ async fn lastfm_auth(
 ) -> impl IntoResponse {
     let token = match body["token"].as_str() {
         Some(t) if !t.is_empty() => t.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "missing token"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "missing token"})),
+            )
+                .into_response();
+        }
     };
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let api_key = match settings.get("lastfm_api_key").ok().flatten() {
         Some(k) if !k.is_empty() => k,
-        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "lastfm_api_key not configured"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "lastfm_api_key not configured"})),
+            )
+                .into_response();
+        }
     };
     let api_secret = match settings.get("lastfm_api_secret").ok().flatten() {
         Some(s) if !s.is_empty() => s,
-        _ => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "lastfm_api_secret not configured"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "lastfm_api_secret not configured"})),
+            )
+                .into_response();
+        }
     };
     match tune_core::scrobble::get_session(&api_key, &api_secret, &token).await {
         Ok(session_key) => {
             settings.set("lastfm_session_key", &session_key).ok();
             axum::Json(serde_json::json!({"session_key": session_key})).into_response()
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, axum::Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
     }
 }
 
@@ -257,12 +300,18 @@ pub fn router(state: AppState) -> Router {
 
     let zones_and_playback = zones::router().merge(playback::router());
     let api = Router::new()
-        .route("/playback/shuffle-all", axum::routing::post(playback::shuffle_all))
+        .route(
+            "/playback/shuffle-all",
+            axum::routing::post(playback::shuffle_all),
+        )
         .nest("/system", system::router())
         .nest("/library", library::router())
         .nest("/library/history", history::router())
         .nest("/history", history::router())
-        .route("/zones/", get(zones::list_zones_handler).post(zones::create_zone_handler))
+        .route(
+            "/zones/",
+            get(zones::list_zones_handler).post(zones::create_zone_handler),
+        )
         .nest("/zones", zones_and_playback)
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
@@ -321,16 +370,30 @@ pub fn router(state: AppState) -> Router {
         .nest("/auth", crate::auth::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
-        .route("/services/tokens", get(service_tokens_list).post(service_tokens_list))
-        .route("/services/tokens/{id}", axum::routing::post(service_token_save).delete(service_token_delete))
-        .route("/services/tokens/{id}/test", axum::routing::post(service_token_test))
+        .route(
+            "/services/tokens",
+            get(service_tokens_list).post(service_tokens_list),
+        )
+        .route(
+            "/services/tokens/{id}",
+            axum::routing::post(service_token_save).delete(service_token_delete),
+        )
+        .route(
+            "/services/tokens/{id}/test",
+            axum::routing::post(service_token_test),
+        )
         .route("/services/lastfm/auth", axum::routing::post(lastfm_auth))
         .fallback(api_fallback)
-        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::auth_middleware));
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::auth_middleware,
+        ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
     let upnp_routes = if let Some(ref upnp_state) = state.upnp {
-        Some(tune_core::upnp_server::standalone_router(upnp_state.clone()))
+        Some(tune_core::upnp_server::standalone_router(
+            upnp_state.clone(),
+        ))
     } else {
         None
     };
@@ -348,25 +411,39 @@ pub fn router(state: AppState) -> Router {
     // xTune plugin — vinyl player UI
     let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
     let app = if std::path::Path::new(&xtune_dir).exists() {
-        app.nest_service("/xtune", ServeDir::new(&xtune_dir).fallback(ServeFile::new(format!("{xtune_dir}/index.html"))))
+        app.nest_service(
+            "/xtune",
+            ServeDir::new(&xtune_dir).fallback(ServeFile::new(format!("{xtune_dir}/index.html"))),
+        )
     } else {
         app
     };
 
     let index_path = format!("{web_dir}/index.html");
     let app = app
-        .route("/", get(move || async move {
-            match tokio::fs::read(&index_path).await {
-                Ok(html) => {
-                    let mut headers = axum::http::HeaderMap::new();
-                    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/html; charset=utf-8"));
-                    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache, must-revalidate"));
-                    (headers, html).into_response()
+        .route(
+            "/",
+            get(move || async move {
+                match tokio::fs::read(&index_path).await {
+                    Ok(html) => {
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers.insert(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+                        );
+                        headers.insert(
+                            axum::http::header::CACHE_CONTROL,
+                            axum::http::HeaderValue::from_static("no-cache, must-revalidate"),
+                        );
+                        (headers, html).into_response()
+                    }
+                    Err(_) => StatusCode::NOT_FOUND.into_response(),
                 }
-                Err(_) => StatusCode::NOT_FOUND.into_response(),
-            }
-        }))
-        .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
+            }),
+        )
+        .fallback_service(
+            ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
+        )
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive());
 

@@ -1,11 +1,11 @@
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 
-use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
@@ -21,7 +21,9 @@ async fn export_tracks_csv(State(state): State<AppState>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let tracks = repo.list(999999, 0).unwrap_or_default();
 
-    let mut csv = String::from("id,title,artist,album,disc,track,duration_ms,format,sample_rate,bit_depth,file_path\n");
+    let mut csv = String::from(
+        "id,title,artist,album,disc,track,duration_ms,format,sample_rate,bit_depth,file_path\n",
+    );
     for t in &tracks {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{},{},{},{},{}\n",
@@ -46,7 +48,8 @@ async fn export_albums_csv(State(state): State<AppState>) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db);
     let albums = repo.list(999999, 0).unwrap_or_default();
 
-    let mut csv = String::from("id,title,artist,year,genre,format,sample_rate,bit_depth,track_count\n");
+    let mut csv =
+        String::from("id,title,artist,year,genre,format,sample_rate,bit_depth,track_count\n");
     for a in &albums {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
@@ -85,7 +88,10 @@ async fn export_artists_csv(State(state): State<AppState>) -> impl IntoResponse 
 
 fn csv_response(csv: String, filename: &str) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/csv; charset=utf-8"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
     headers.insert(
         "Content-Disposition",
         HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),

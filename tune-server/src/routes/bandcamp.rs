@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -37,15 +37,11 @@ async fn bc_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
-    let resp = client
-        .get(BC_SEARCH_API)
-        .query(&[("q", &q.q)])
-        .send()
-        .await;
+    let resp = client.get(BC_SEARCH_API).query(&[("q", &q.q)]).send().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
@@ -90,7 +86,7 @@ async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -100,11 +96,7 @@ async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
         "page": q.page,
     });
 
-    let resp = client
-        .post(BC_DISCOVER_API)
-        .json(&payload)
-        .send()
-        .await;
+    let resp = client.post(BC_DISCOVER_API).json(&payload).send().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
@@ -166,14 +158,11 @@ struct TagQuery {
     page: u32,
 }
 
-async fn bc_tag_releases(
-    Path(tag): Path<String>,
-    Query(q): Query<TagQuery>,
-) -> impl IntoResponse {
+async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
     let client = match http_client() {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
         }
     };
 
@@ -183,11 +172,7 @@ async fn bc_tag_releases(
         "page": q.page,
     });
 
-    let resp = client
-        .post(BC_DISCOVER_API)
-        .json(&payload)
-        .send()
-        .await;
+    let resp = client.post(BC_DISCOVER_API).json(&payload).send().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {

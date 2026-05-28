@@ -10,7 +10,11 @@ fn md5_hex(input: &str) -> String {
 fn build_api_sig(params: &[(&str, String)], api_secret: &str) -> String {
     let mut sorted: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
     sorted.sort_by_key(|(k, _)| *k);
-    let sig_input: String = sorted.iter().map(|(k, v)| format!("{k}{v}")).collect::<String>() + api_secret;
+    let sig_input: String = sorted
+        .iter()
+        .map(|(k, v)| format!("{k}{v}"))
+        .collect::<String>()
+        + api_secret;
     md5_hex(&sig_input)
 }
 
@@ -93,11 +97,7 @@ pub async fn update_now_playing(
 }
 
 /// Exchange a Last.fm web auth token for a session key via `auth.getSession`.
-pub async fn get_session(
-    api_key: &str,
-    api_secret: &str,
-    token: &str,
-) -> Result<String, String> {
+pub async fn get_session(api_key: &str, api_secret: &str, token: &str) -> Result<String, String> {
     let mut params = vec![
         ("api_key", api_key.to_string()),
         ("method", "auth.getSession".to_string()),

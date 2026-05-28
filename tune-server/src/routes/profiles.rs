@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
@@ -70,12 +70,18 @@ pub fn router() -> Router<AppState> {
         .route("/switch", post(switch_profile))
         .route("/deactivate", post(deactivate_profile))
         .route("/search", get(search_profiles))
-        .route("/{id}", get(get_profile).put(update_profile).delete(delete_profile))
+        .route(
+            "/{id}",
+            get(get_profile).put(update_profile).delete(delete_profile),
+        )
         .route("/{id}/activate", post(activate_profile))
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
-        .route("/{id}/settings", get(profile_settings).post(update_profile_settings))
+        .route(
+            "/{id}/settings",
+            get(profile_settings).post(update_profile_settings),
+        )
         .route("/{id}/stats", get(profile_stats))
         .route("/{id}/history", get(profile_history))
         .route("/{id}/favorites/check", post(check_favorites))
@@ -111,11 +117,14 @@ async fn switch_profile(
     match repo.get(body.profile_id) {
         Ok(Some(profile)) => {
             let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-            settings.set("active_profile_id", &body.profile_id.to_string()).ok();
+            settings
+                .set("active_profile_id", &body.profile_id.to_string())
+                .ok();
             Json(json!({
                 "active_profile_id": body.profile_id,
                 "profile": profile,
-            })).into_response()
+            }))
+            .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "profile not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -128,10 +137,7 @@ async fn deactivate_profile(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "active_profile_id": serde_json::Value::Null }))
 }
 
-async fn activate_profile(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn activate_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db.clone());
     match repo.get(id) {
         Ok(Some(profile)) => {
@@ -140,17 +146,15 @@ async fn activate_profile(
             Json(json!({
                 "active_profile_id": id,
                 "profile": profile,
-            })).into_response()
+            }))
+            .into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "profile not found").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-async fn get_profile(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(p)) => Json(json!(p)).into_response(),
@@ -189,10 +193,7 @@ async fn update_profile(
     }
 }
 
-async fn delete_profile(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn delete_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -238,13 +239,14 @@ async fn remove_favorite(
 
 // --- Advanced profile routes ---
 
-async fn profile_settings(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn profile_settings(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("profile_{id}_settings");
-    let value = settings.get(&key).ok().flatten().unwrap_or_else(|| "{}".to_string());
+    let value = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "{}".to_string());
     let parsed: Value = serde_json::from_str(&value).unwrap_or(json!({}));
     Json(parsed)
 }
@@ -263,14 +265,13 @@ async fn update_profile_settings(
     }
 }
 
-async fn profile_stats(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let result: Result<Vec<(String, i64)>, String> = (|| {
         let conn = state.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type")
+            .prepare(
+                "SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(rusqlite::params![id], |row| {
@@ -339,7 +340,9 @@ async fn check_favorites(
         .item_ids
         .iter()
         .map(|&item_id| {
-            let is_fav = repo.is_favorite(id, &body.item_type, item_id).unwrap_or(false);
+            let is_fav = repo
+                .is_favorite(id, &body.item_type, item_id)
+                .unwrap_or(false);
             json!({ "item_id": item_id, "is_favorite": is_fav })
         })
         .collect();

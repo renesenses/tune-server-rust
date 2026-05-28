@@ -2,7 +2,7 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 
@@ -26,7 +26,11 @@ async fn widget_data(
     Query(params): Query<WidgetParams>,
 ) -> Json<Value> {
     let playback = state.playback.clone();
-    let zone_id_num = params.zone_id.as_deref().and_then(|z| z.parse::<i64>().ok()).unwrap_or(1);
+    let zone_id_num = params
+        .zone_id
+        .as_deref()
+        .and_then(|z| z.parse::<i64>().ok())
+        .unwrap_or(1);
     let zone_state = playback.get_state(zone_id_num).await;
     let all_zones = playback.all_states().await;
 
@@ -36,9 +40,9 @@ async fn widget_data(
         .top_tracks(5)
         .unwrap_or_default()
         .into_iter()
-        .map(|(title, artist, plays)| {
-            json!({"title": title, "artist_name": artist, "plays": plays})
-        })
+        .map(
+            |(title, artist, plays)| json!({"title": title, "artist_name": artist, "plays": plays}),
+        )
         .collect();
 
     Json(json!({
@@ -55,7 +59,11 @@ async fn widget_now_playing(
     Query(params): Query<WidgetParams>,
 ) -> Json<Value> {
     let playback = state.playback.clone();
-    let zone_id_num = params.zone_id.as_deref().and_then(|z| z.parse::<i64>().ok()).unwrap_or(1);
+    let zone_id_num = params
+        .zone_id
+        .as_deref()
+        .and_then(|z| z.parse::<i64>().ok())
+        .unwrap_or(1);
     let zone_state = playback.get_state(zone_id_num).await;
 
     let playing = zone_state.state == tune_core::playback::PlayState::Playing;

@@ -4,7 +4,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -313,7 +313,10 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
 /// Return the GraphQL schema as SDL text.
 async fn graphql_schema() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         SCHEMA_SDL,
     )
 }

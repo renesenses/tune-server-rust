@@ -20,7 +20,9 @@ fn read_metadata(py: Python<'_>, path: &str) -> PyResult<Option<PyObject>> {
             let dict = PyDict::new(py);
             macro_rules! set_opt {
                 ($key:expr, $val:expr) => {
-                    if let Some(ref v) = $val { dict.set_item($key, v)?; }
+                    if let Some(ref v) = $val {
+                        dict.set_item($key, v)?;
+                    }
                 };
             }
             set_opt!("title", m.title);
@@ -49,7 +51,10 @@ fn read_metadata(py: Python<'_>, path: &str) -> PyResult<Option<PyObject>> {
             set_opt!("musicbrainz_release_id", m.musicbrainz_release_id);
             set_opt!("musicbrainz_artist_id", m.musicbrainz_artist_id);
             set_opt!("musicbrainz_album_artist_id", m.musicbrainz_album_artist_id);
-            set_opt!("musicbrainz_release_group_id", m.musicbrainz_release_group_id);
+            set_opt!(
+                "musicbrainz_release_group_id",
+                m.musicbrainz_release_group_id
+            );
             set_opt!("isrc", m.isrc);
             dict.set_item("has_cover", m.has_cover)?;
             dict.set_item("compilation", m.compilation)?;

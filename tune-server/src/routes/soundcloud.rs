@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -39,7 +39,11 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("http client error: {e}"))
 }
 
-async fn sc_get(client_id: &str, path: &str, extra_params: &[(&str, &str)]) -> Result<Value, (StatusCode, String)> {
+async fn sc_get(
+    client_id: &str,
+    path: &str,
+    extra_params: &[(&str, &str)],
+) -> Result<Value, (StatusCode, String)> {
     let client = http_client().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut url = format!("{SC_API}{path}?client_id={client_id}");
     for (k, v) in extra_params {
@@ -89,16 +93,19 @@ async fn sc_search(
         return not_configured().into_response();
     };
 
-    match sc_get(&client_id, "/search/tracks", &[("q", &q.q), ("limit", &q.limit.to_string())]).await {
+    match sc_get(
+        &client_id,
+        "/search/tracks",
+        &[("q", &q.q), ("limit", &q.limit.to_string())],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
 }
 
-async fn sc_track(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn sc_track(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(client_id) = sc_client_id(&state) else {
         return not_configured().into_response();
     };
@@ -109,10 +116,7 @@ async fn sc_track(
     }
 }
 
-async fn sc_stream_url(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn sc_stream_url(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(client_id) = sc_client_id(&state) else {
         return not_configured().into_response();
     };
@@ -139,10 +143,7 @@ async fn sc_stream_url(
     }
 }
 
-async fn sc_user(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn sc_user(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(client_id) = sc_client_id(&state) else {
         return not_configured().into_response();
     };
@@ -173,7 +174,10 @@ async fn sc_user_tracks(
     match sc_get(
         &client_id,
         &format!("/users/{id}/tracks"),
-        &[("limit", &q.limit.to_string()), ("offset", &q.offset.to_string())],
+        &[
+            ("limit", &q.limit.to_string()),
+            ("offset", &q.offset.to_string()),
+        ],
     )
     .await
     {
@@ -182,10 +186,7 @@ async fn sc_user_tracks(
     }
 }
 
-async fn sc_playlist(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn sc_playlist(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(client_id) = sc_client_id(&state) else {
         return not_configured().into_response();
     };

@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -128,7 +128,10 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/normalization", post(set_normalization))
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
         .route("/{id}/alarm", get(get_alarms).post(create_alarm))
-        .route("/{id}/alarm/{alarm_id}", axum::routing::delete(delete_alarm))
+        .route(
+            "/{id}/alarm/{alarm_id}",
+            axum::routing::delete(delete_alarm),
+        )
         .route("/{id}/pins", get(get_zone_pins).post(set_zone_pin))
         .route("/{id}/pins/{index}", axum::routing::delete(clear_zone_pin))
         .route("/{id}/pins/{index}/invoke", post(invoke_zone_pin))
@@ -136,7 +139,10 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/audiophile", get(get_audiophile).post(set_audiophile))
         .route("/{id}/quality", get(get_quality).post(set_quality))
         .route("/{id}/share", post(share_now_playing))
-        .route("/{id}/audio-profile", get(get_audio_profile).post(set_audio_profile))
+        .route(
+            "/{id}/audio-profile",
+            get(get_audio_profile).post(set_audio_profile),
+        )
 }
 
 async fn now_listening(State(state): State<AppState>) -> Json<Value> {
@@ -149,10 +155,7 @@ async fn now_listening(State(state): State<AppState>) -> Json<Value> {
     Json(json!(playing))
 }
 
-async fn zone_status(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!(zone_state))
 }
@@ -170,7 +173,13 @@ async fn play(
         let registry = state.services.lock().await;
         let svc = match registry.get(source) {
             Some(s) => s,
-            None => return (StatusCode::BAD_REQUEST, format!("unknown service: {source}")).into_response(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown service: {source}"),
+                )
+                    .into_response();
+            }
         };
         let svc = svc.lock().await;
         let tracks = match svc.get_album_tracks(album_id).await {
@@ -190,7 +199,11 @@ async fn play(
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+            zone_repo
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
         });
 
         let orch_req = tune_core::orchestrator::PlayRequest {
@@ -207,12 +220,24 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
-                let queue_items: Vec<_> = tracks.iter().map(|t| (
-                    t.id.clone(), t.title.clone(), t.artist.clone(),
-                    t.album.clone(), t.cover_path.clone(), t.duration_ms as i64,
-                )).collect();
+                let queue_items: Vec<_> = tracks
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.id.clone(),
+                            t.title.clone(),
+                            t.artist.clone(),
+                            t.album.clone(),
+                            t.cover_path.clone(),
+                            t.duration_ms as i64,
+                        )
+                    })
+                    .collect();
                 queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
-                state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 Json(build_zone_json(&state, zone_id).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -224,7 +249,13 @@ async fn play(
         let registry = state.services.lock().await;
         let svc = match registry.get(source) {
             Some(s) => s,
-            None => return (StatusCode::BAD_REQUEST, format!("unknown service: {source}")).into_response(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown service: {source}"),
+                )
+                    .into_response();
+            }
         };
         let svc = svc.lock().await;
         let tracks = match svc.get_playlist_tracks(playlist_id).await {
@@ -244,7 +275,11 @@ async fn play(
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+            zone_repo
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
         });
 
         let orch_req = tune_core::orchestrator::PlayRequest {
@@ -261,12 +296,24 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(_) => {
-                let queue_items: Vec<_> = tracks.iter().map(|t| (
-                    t.id.clone(), t.title.clone(), t.artist.clone(),
-                    t.album.clone(), t.cover_path.clone(), t.duration_ms as i64,
-                )).collect();
+                let queue_items: Vec<_> = tracks
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.id.clone(),
+                            t.title.clone(),
+                            t.artist.clone(),
+                            t.album.clone(),
+                            t.cover_path.clone(),
+                            t.duration_ms as i64,
+                        )
+                    })
+                    .collect();
                 queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
-                state.playback.update_queue_info(zone_id, start as i64, tracks.len() as i64).await;
+                state
+                    .playback
+                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+                    .await;
                 Json(build_zone_json(&state, zone_id).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -274,10 +321,18 @@ async fn play(
     }
 
     // --- Single streaming track (source + source_id, no track_id/track_ids) ---
-    if body.source.is_some() && body.source_id.is_some() && body.track_id.is_none() && body.track_ids.is_none() {
+    if body.source.is_some()
+        && body.source_id.is_some()
+        && body.track_id.is_none()
+        && body.track_ids.is_none()
+    {
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-            zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+            zone_repo
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
         });
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
@@ -327,12 +382,19 @@ async fn play(
         queue_repo.set_current(zone_id, start).ok();
     }
 
-    let target_id = track_ids.get(start as usize).copied().unwrap_or(track_ids[0]);
+    let target_id = track_ids
+        .get(start as usize)
+        .copied()
+        .unwrap_or(track_ids[0]);
     let track = track_repo.get(target_id).ok().flatten();
 
     let output_device_id = body.output_device_id.or_else(|| {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-        zone_repo.get(zone_id).ok().flatten().and_then(|z| z.output_device_id)
+        zone_repo
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
     });
 
     let orch_req = tune_core::orchestrator::PlayRequest {
@@ -341,53 +403,60 @@ async fn play(
         track_id: Some(target_id),
         source: body.source,
         source_id: body.source_id,
-        title: body.title.or_else(|| track.as_ref().map(|t| t.title.clone())),
-        artist_name: body.artist_name.or_else(|| track.as_ref().and_then(|t| t.artist_name.clone())),
-        album_title: body.album_title.or_else(|| track.as_ref().and_then(|t| t.album_title.clone())),
-        cover_url: body.cover_path.or_else(|| track.as_ref().and_then(|t| t.cover_path.clone())),
-        duration_ms: body.duration_ms.or_else(|| track.as_ref().map(|t| t.duration_ms)),
+        title: body
+            .title
+            .or_else(|| track.as_ref().map(|t| t.title.clone())),
+        artist_name: body
+            .artist_name
+            .or_else(|| track.as_ref().and_then(|t| t.artist_name.clone())),
+        album_title: body
+            .album_title
+            .or_else(|| track.as_ref().and_then(|t| t.album_title.clone())),
+        cover_url: body
+            .cover_path
+            .or_else(|| track.as_ref().and_then(|t| t.cover_path.clone())),
+        duration_ms: body
+            .duration_ms
+            .or_else(|| track.as_ref().map(|t| t.duration_ms)),
     };
 
     match state.orchestrator.play(orch_req).await {
         Ok(_result) => {
-            state.playback.update_queue_info(zone_id, start, track_ids.len() as i64).await;
+            state
+                .playback
+                .update_queue_info(zone_id, start, track_ids.len() as i64)
+                .await;
             Json(build_zone_json(&state, zone_id).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-async fn pause(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.pause(zone_id, device_id.as_deref()).await;
+    state
+        .orchestrator
+        .pause(zone_id, device_id.as_deref())
+        .await;
     Json(build_zone_json(&state, zone_id).await)
 }
 
-async fn resume(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.resume(zone_id, device_id.as_deref()).await;
+    state
+        .orchestrator
+        .resume(zone_id, device_id.as_deref())
+        .await;
     Json(build_zone_json(&state, zone_id).await)
 }
 
-async fn stop(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     Json(build_zone_json(&state, zone_id).await)
 }
 
-async fn next(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> impl IntoResponse {
+async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let current = state.playback.get_state(zone_id).await;
     let next_pos = current.queue_position + 1;
 
@@ -406,15 +475,15 @@ async fn next(
     }
 }
 
-async fn previous(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> impl IntoResponse {
+async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let current = state.playback.get_state(zone_id).await;
 
     if current.position_ms > 3000 {
         let device_id = get_zone_device_id(&state, zone_id);
-        state.orchestrator.seek(zone_id, 0, device_id.as_deref()).await;
+        state
+            .orchestrator
+            .seek(zone_id, 0, device_id.as_deref())
+            .await;
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
@@ -435,7 +504,10 @@ async fn seek(
     Json(body): Json<SeekRequest>,
 ) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.seek(zone_id, body.position_ms as u64, device_id.as_deref()).await;
+    state
+        .orchestrator
+        .seek(zone_id, body.position_ms as u64, device_id.as_deref())
+        .await;
     Json(json!({ "position_ms": body.position_ms }))
 }
 
@@ -445,7 +517,10 @@ async fn set_volume(
     Json(body): Json<VolumeRequest>,
 ) -> Json<Value> {
     let device_id = get_zone_device_id(&state, zone_id);
-    state.orchestrator.set_volume(zone_id, body.volume, device_id.as_deref()).await;
+    state
+        .orchestrator
+        .set_volume(zone_id, body.volume, device_id.as_deref())
+        .await;
     Json(json!({ "volume": body.volume }))
 }
 
@@ -474,10 +549,7 @@ async fn set_repeat(
     Json(json!({ "repeat": mode }))
 }
 
-async fn get_queue(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let queue_repo = PlayQueueRepo::new(state.db);
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if !items.is_empty() {
@@ -487,7 +559,9 @@ async fn get_queue(
     }
     let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
     let ps = state.playback.get_state(zone_id).await;
-    Json(json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }))
+    Json(
+        json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }),
+    )
 }
 
 async fn queue_add(
@@ -532,7 +606,11 @@ async fn queue_jump(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
-    match state.orchestrator.play_from_queue(zone_id, body.position).await {
+    match state
+        .orchestrator
+        .play_from_queue(zone_id, body.position)
+        .await
+    {
         Ok(_) => {
             let zone_state = state.playback.get_state(zone_id).await;
             Json(json!(zone_state)).into_response()
@@ -541,10 +619,7 @@ async fn queue_jump(
     }
 }
 
-async fn queue_clear(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> impl IntoResponse {
+async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::new(state.db);
     queue_repo.clear(zone_id).ok();
     state.playback.stop(zone_id).await;
@@ -562,12 +637,18 @@ async fn save_queue_as_playlist(
         return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
     }
     let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
-    let name = body.name.unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
+    let name = body
+        .name
+        .unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
     let playlist_repo = PlaylistRepo::new(state.db);
     match playlist_repo.create(&name, None) {
         Ok(id) => {
             playlist_repo.add_tracks(id, &track_ids, None).ok();
-            (StatusCode::CREATED, Json(json!({"id": id, "name": name, "track_count": track_ids.len()}))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": id, "name": name, "track_count": track_ids.len()})),
+            )
+                .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -599,10 +680,7 @@ async fn set_sleep(
     }))
 }
 
-async fn get_sleep(
-    State(_state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_sleep(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     Json(json!({
         "zone_id": zone_id,
         "active": false,
@@ -617,10 +695,7 @@ struct EqSettings {
     bands: Option<Vec<Value>>,
 }
 
-async fn get_eq(
-    State(_state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_eq(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     Json(json!({
         "zone_id": zone_id,
         "enabled": false,
@@ -707,16 +782,14 @@ async fn transfer_playback(
             "from_zone": from_zone,
             "target_zone": target_zone,
             "status": "transferred",
-        })).into_response()
+        }))
+        .into_response()
     } else {
         (StatusCode::BAD_REQUEST, "nothing playing to transfer").into_response()
     }
 }
 
-async fn get_alarms(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_alarms(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let conn = state.db.connection().lock().unwrap();
     let items: Vec<Value> = conn
         .prepare("SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds FROM alarms WHERE zone_id = ? ORDER BY time")
@@ -780,7 +853,10 @@ async fn delete_alarm(
     State(state): State<AppState>,
     Path((_zone_id, alarm_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    state.db.execute("DELETE FROM alarms WHERE id = ?", &[&alarm_id]).ok();
+    state
+        .db
+        .execute("DELETE FROM alarms WHERE id = ?", &[&alarm_id])
+        .ok();
     StatusCode::NO_CONTENT
 }
 
@@ -824,14 +900,14 @@ fn load_pins(state: &AppState, zone_id: i64) -> Vec<ZonePin> {
 fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
     let settings = SettingsRepo::new(state.db.clone());
     settings
-        .set(&pins_key(zone_id), &serde_json::to_string(pins).unwrap_or_default())
+        .set(
+            &pins_key(zone_id),
+            &serde_json::to_string(pins).unwrap_or_default(),
+        )
         .ok();
 }
 
-async fn get_zone_pins(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_zone_pins(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let pins = load_pins(&state, zone_id);
     Json(json!(pins))
 }
@@ -921,10 +997,7 @@ async fn save_queue_as_pin(
 // Audiophile / Quality / Audio-Profile per-zone settings
 // ---------------------------------------------------------------------------
 
-async fn get_audiophile(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("zone_{zone_id}_audiophile");
     let val = settings
@@ -947,10 +1020,7 @@ async fn set_audiophile(
     Json(body)
 }
 
-async fn get_quality(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("zone_{zone_id}_quality");
     let val = settings
@@ -994,7 +1064,9 @@ async fn share_now_playing(
         "cover_path": np.cover_path,
         "source": np.source,
     });
-    settings.set(&format!("share_{token}"), &data.to_string()).ok();
+    settings
+        .set(&format!("share_{token}"), &data.to_string())
+        .ok();
     Json(json!({
         "token": token,
         "url": format!("/shared/{token}"),
@@ -1003,10 +1075,7 @@ async fn share_now_playing(
     .into_response()
 }
 
-async fn get_audio_profile(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn get_audio_profile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("zone_{zone_id}_audio_profile");
     let val = settings
@@ -1033,9 +1102,7 @@ async fn set_audio_profile(
 // Shuffle All (global playback)
 // ---------------------------------------------------------------------------
 
-pub async fn shuffle_all(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
     let track_repo = TrackRepo::new(state.db.clone());
     let queue_repo = PlayQueueRepo::new(state.db.clone());
 
@@ -1065,7 +1132,10 @@ pub async fn shuffle_all(
     };
     match state.orchestrator.play(orch_req).await {
         Ok(_) => {
-            state.playback.update_queue_info(zone_id, 0, all_ids.len() as i64).await;
+            state
+                .playback
+                .update_queue_info(zone_id, 0, all_ids.len() as i64)
+                .await;
             Json(json!({ "zone_id": zone_id, "tracks_queued": all_ids.len() })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use super::device::{DiscoveredDevice, OutputType};
@@ -226,17 +226,25 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
 
 async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpResponse>, String> {
     // Use socket2 with explicit multicast interface binding for VPN compat
-    let sock2 = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-        .map_err(|e| format!("socket2 new: {e}"))?;
+    let sock2 = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| format!("socket2 new: {e}"))?;
     sock2.set_reuse_address(true).ok();
     // Bind to the specific LAN IP so responses come back on the right interface
-    sock2.bind(&socket2::SockAddr::from(SocketAddrV4::new(bind_ip, 0)))
+    sock2
+        .bind(&socket2::SockAddr::from(SocketAddrV4::new(bind_ip, 0)))
         .map_err(|e| format!("bind {bind_ip}: {e}"))?;
-    sock2.set_multicast_if_v4(&bind_ip)
+    sock2
+        .set_multicast_if_v4(&bind_ip)
         .map_err(|e| format!("multicast_if: {e}"))?;
     sock2.join_multicast_v4(&SSDP_MULTICAST_ADDR, &bind_ip).ok();
     sock2.set_multicast_ttl_v4(4).ok();
-    sock2.set_nonblocking(true).map_err(|e| format!("nonblock: {e}"))?;
+    sock2
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblock: {e}"))?;
     let socket = UdpSocket::from_std(std::net::UdpSocket::from(sock2))
         .map_err(|e| format!("from_std: {e}"))?;
 
@@ -291,13 +299,25 @@ fn parse_ssdp_response(data: &[u8]) -> Option<SsdpResponse> {
 
     for line in text.lines() {
         let line = line.trim();
-        if let Some(val) = line.strip_prefix("LOCATION:").or_else(|| line.strip_prefix("Location:")) {
+        if let Some(val) = line
+            .strip_prefix("LOCATION:")
+            .or_else(|| line.strip_prefix("Location:"))
+        {
             location = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("USN:").or_else(|| line.strip_prefix("Usn:")) {
+        } else if let Some(val) = line
+            .strip_prefix("USN:")
+            .or_else(|| line.strip_prefix("Usn:"))
+        {
             usn = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("SERVER:").or_else(|| line.strip_prefix("Server:")) {
+        } else if let Some(val) = line
+            .strip_prefix("SERVER:")
+            .or_else(|| line.strip_prefix("Server:"))
+        {
             server = Some(val.trim().to_string());
-        } else if let Some(val) = line.strip_prefix("ST:").or_else(|| line.strip_prefix("St:")) {
+        } else if let Some(val) = line
+            .strip_prefix("ST:")
+            .or_else(|| line.strip_prefix("St:"))
+        {
             st = Some(val.trim().to_string());
         } else {
             let lower = line.to_lowercase();
@@ -330,18 +350,22 @@ fn device_id_from_usn(usn: &str) -> String {
 }
 
 fn host_from_location(location: &str) -> Option<String> {
-    let after_scheme = location.strip_prefix("http://")
+    let after_scheme = location
+        .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))?;
     let host_port = after_scheme.split('/').next()?;
     Some(host_port.split(':').next()?.to_string())
 }
 
 fn port_from_location(location: &str) -> u16 {
-    let after_scheme = location.strip_prefix("http://")
+    let after_scheme = location
+        .strip_prefix("http://")
         .or_else(|| location.strip_prefix("https://"))
         .unwrap_or(location);
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    host_port.split(':').nth(1)
+    host_port
+        .split(':')
+        .nth(1)
         .and_then(|p| p.parse().ok())
         .unwrap_or(80)
 }
@@ -398,8 +422,16 @@ async fn process_responses(
                     host,
                     port,
                 );
-                device.manufacturer = if desc.manufacturer.is_empty() { None } else { Some(desc.manufacturer.clone()) };
-                device.model = if desc.model_name.is_empty() { None } else { Some(desc.model_name.clone()) };
+                device.manufacturer = if desc.manufacturer.is_empty() {
+                    None
+                } else {
+                    Some(desc.manufacturer.clone())
+                };
+                device.model = if desc.model_name.is_empty() {
+                    None
+                } else {
+                    Some(desc.model_name.clone())
+                };
                 device.location = Some(resp.location.clone());
 
                 device.capabilities.insert(
@@ -407,7 +439,9 @@ async fn process_responses(
                     serde_json::to_value(desc.service_urls()).unwrap_or_default(),
                 );
                 if desc.is_openhome() {
-                    device.capabilities.insert("openhome".into(), serde_json::Value::Bool(true));
+                    device
+                        .capabilities
+                        .insert("openhome".into(), serde_json::Value::Bool(true));
                 }
 
                 let mut st = state.lock().await;
@@ -418,7 +452,9 @@ async fn process_responses(
                 drop(st);
 
                 info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
-                let _ = event_tx.send(SsdpEvent::DeviceDiscovered(Box::new(device))).await;
+                let _ = event_tx
+                    .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                    .await;
             }
             Err(e) => {
                 let mut st = state.lock().await;
@@ -497,7 +533,12 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
 pub fn get_local_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
     // Try LAN gateway first (avoids returning VPN tunnel IP)
-    for target in &["192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80", "8.8.8.8:80"] {
+    for target in &[
+        "192.168.1.1:80",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "8.8.8.8:80",
+    ] {
         if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
             if socket.connect(target).is_ok() {
                 if let Ok(SocketAddr::V4(addr)) = socket.local_addr() {
@@ -533,7 +574,10 @@ mod tests {
             \r\n";
 
         let resp = parse_ssdp_response(data).unwrap();
-        assert_eq!(resp.location, "http://192.168.1.50:1400/xml/device_description.xml");
+        assert_eq!(
+            resp.location,
+            "http://192.168.1.50:1400/xml/device_description.xml"
+        );
         assert!(resp.usn.contains("RINCON_12345"));
         assert!(resp._server.unwrap().contains("Sonos"));
     }

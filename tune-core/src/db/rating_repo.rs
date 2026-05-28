@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::sqlite::SqliteDb;
@@ -22,7 +22,13 @@ impl RatingRepo {
         Self { db }
     }
 
-    pub fn rate_album(&self, album_id: i64, profile_id: i64, rating: i32, note: Option<&str>) -> Result<(), String> {
+    pub fn rate_album(
+        &self,
+        album_id: i64,
+        profile_id: i64,
+        rating: i32,
+        note: Option<&str>,
+    ) -> Result<(), String> {
         if !(1..=5).contains(&rating) {
             return Err("rating must be 1-5".into());
         }
@@ -33,7 +39,11 @@ impl RatingRepo {
         Ok(())
     }
 
-    pub fn get_rating(&self, album_id: i64, profile_id: i64) -> Result<Option<AlbumRating>, String> {
+    pub fn get_rating(
+        &self,
+        album_id: i64,
+        profile_id: i64,
+    ) -> Result<Option<AlbumRating>, String> {
         let conn = self.db.connection().lock().unwrap();
         conn.query_row(
             "SELECT id, album_id, profile_id, rating, note, created_at FROM album_ratings WHERE album_id = ? AND profile_id = ?",
@@ -83,8 +93,8 @@ impl RatingRepo {
 mod tests {
     use super::*;
     use crate::db::album_repo::AlbumRepo;
-    use crate::db::models::Album;
     use crate::db::migrations;
+    use crate::db::models::Album;
 
     #[test]
     fn rate_and_query() {
@@ -173,7 +183,8 @@ mod tests {
         let aid = album_repo.create(&Album::new("Blue Train".into())).unwrap();
 
         let repo = RatingRepo::new(db);
-        repo.rate_album(aid, 1, 5, Some("Hard bop chef-d'oeuvre")).unwrap();
+        repo.rate_album(aid, 1, 5, Some("Hard bop chef-d'oeuvre"))
+            .unwrap();
 
         let r = repo.get_rating(aid, 1).unwrap().unwrap();
         assert_eq!(r.note.as_deref(), Some("Hard bop chef-d'oeuvre"));

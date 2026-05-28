@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -14,7 +14,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(eq_status))
         .route("/presets", get(list_presets).post(create_preset))
-        .route("/presets/{id}", get(get_preset).put(update_preset).delete(delete_preset))
+        .route(
+            "/presets/{id}",
+            get(get_preset).put(update_preset).delete(delete_preset),
+        )
         .route("/presets/{id}/activate", post(activate_preset))
         .route("/bands", get(get_bands).post(set_bands))
         // Advanced EQ routes
@@ -52,9 +55,9 @@ async fn eq_status(State(state): State<AppState>) -> Json<Value> {
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    let active_preset = active_id.as_ref().and_then(|id| {
-        presets.iter().find(|p| p["id"].as_str() == Some(id))
-    });
+    let active_preset = active_id
+        .as_ref()
+        .and_then(|id| presets.iter().find(|p| p["id"].as_str() == Some(id)));
 
     Json(json!({
         "enabled": enabled,
@@ -143,10 +146,7 @@ async fn create_preset(
 }
 
 /// Get a single preset by ID.
-async fn get_preset(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_preset(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let presets = load_presets(&state);
     match presets.iter().find(|p| p["id"].as_str() == Some(&id)) {
         Some(preset) => Json(preset.clone()).into_response(),
@@ -191,10 +191,7 @@ async fn update_preset(
 }
 
 /// Delete a preset.
-async fn delete_preset(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn delete_preset(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let mut presets = load_presets(&state);
     let before = presets.len();
     presets.retain(|p| p["id"].as_str() != Some(&id));
@@ -274,17 +271,17 @@ struct SetBandsBody {
 }
 
 /// Set EQ bands directly (updates active preset or creates a transient one).
-async fn set_bands(
-    State(state): State<AppState>,
-    Json(body): Json<SetBandsBody>,
-) -> Json<Value> {
+async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db.clone());
     let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
 
     // If there's an active preset, update it; otherwise create a transient config
     if let Some(active_id) = settings.get("eq_active_preset").ok().flatten() {
         let mut presets = load_presets(&state);
-        if let Some(p) = presets.iter_mut().find(|p| p["id"].as_str() == Some(&active_id)) {
+        if let Some(p) = presets
+            .iter_mut()
+            .find(|p| p["id"].as_str() == Some(&active_id))
+        {
             p["bands"] = json!(&bands_json);
             save_presets(&state, &presets);
         }
@@ -292,7 +289,10 @@ async fn set_bands(
 
     // Also store as current active bands
     settings
-        .set("eq_current_bands", &serde_json::to_string(&bands_json).unwrap())
+        .set(
+            "eq_current_bands",
+            &serde_json::to_string(&bands_json).unwrap(),
+        )
         .ok();
 
     Json(json!({
@@ -367,10 +367,9 @@ async fn get_graphic(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or_else(|| {
             // Default 31-band graphic EQ frequencies (ISO standard)
             let frequencies = [
-                20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0,
-                200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0,
-                1600.0, 2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0,
-                10000.0, 12500.0, 16000.0, 20000.0,
+                20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0,
+                400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0, 2000.0, 2500.0, 3150.0, 4000.0,
+                5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0, 20000.0,
             ];
             let bands: Vec<Value> = frequencies
                 .iter()
@@ -394,10 +393,7 @@ struct GraphicBody {
 }
 
 /// Set graphic EQ bands.
-async fn set_graphic(
-    State(state): State<AppState>,
-    Json(body): Json<GraphicBody>,
-) -> Json<Value> {
+async fn set_graphic(State(state): State<AppState>, Json(body): Json<GraphicBody>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut current: Value = settings
         .get("eq_graphic")
@@ -446,7 +442,10 @@ async fn apply_room_correction(
     });
 
     settings
-        .set("eq_room_correction", &serde_json::to_string(&correction).unwrap())
+        .set(
+            "eq_room_correction",
+            &serde_json::to_string(&correction).unwrap(),
+        )
         .ok();
 
     Json(correction).into_response()

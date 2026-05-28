@@ -6,9 +6,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
-use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::db::track_repo::TrackRepo;
 use tune_core::metadata::{MetadataUpdate, write_metadata};
 
 use crate::state::AppState;
@@ -78,19 +78,41 @@ async fn edit_track(
         };
 
         if let Err(e) = write_metadata(std::path::Path::new(file_path), &update) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("tag write failed: {e}")).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tag write failed: {e}"),
+            )
+                .into_response();
         }
     }
 
-    if let Some(ref v) = body.title { track.title = v.clone(); }
-    if let Some(ref v) = body.artist { track.artist_name = Some(v.clone()); }
-    if let Some(ref v) = body.album { track.album_title = Some(v.clone()); }
-    if let Some(ref v) = body.genre { track.genre = Some(v.clone()); }
-    if let Some(v) = body.track_number { track.track_number = v as i32; }
-    if let Some(v) = body.disc_number { track.disc_number = v as i32; }
-    if let Some(v) = body.year { track.year = Some(v as i32); }
-    if let Some(ref v) = body.composer { track.composer = Some(v.clone()); }
-    if let Some(ref v) = body.label { track.label = Some(v.clone()); }
+    if let Some(ref v) = body.title {
+        track.title = v.clone();
+    }
+    if let Some(ref v) = body.artist {
+        track.artist_name = Some(v.clone());
+    }
+    if let Some(ref v) = body.album {
+        track.album_title = Some(v.clone());
+    }
+    if let Some(ref v) = body.genre {
+        track.genre = Some(v.clone());
+    }
+    if let Some(v) = body.track_number {
+        track.track_number = v as i32;
+    }
+    if let Some(v) = body.disc_number {
+        track.disc_number = v as i32;
+    }
+    if let Some(v) = body.year {
+        track.year = Some(v as i32);
+    }
+    if let Some(ref v) = body.composer {
+        track.composer = Some(v.clone());
+    }
+    if let Some(ref v) = body.label {
+        track.label = Some(v.clone());
+    }
 
     repo.update(&track).ok();
 
@@ -108,10 +130,18 @@ async fn edit_album(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if let Some(ref v) = body.title { album.title = v.clone(); }
-    if let Some(ref v) = body.genre { album.genre = Some(v.clone()); }
-    if let Some(v) = body.year { album.year = Some(v); }
-    if let Some(ref v) = body.label { album.label = Some(v.clone()); }
+    if let Some(ref v) = body.title {
+        album.title = v.clone();
+    }
+    if let Some(ref v) = body.genre {
+        album.genre = Some(v.clone());
+    }
+    if let Some(v) = body.year {
+        album.year = Some(v);
+    }
+    if let Some(ref v) = body.label {
+        album.label = Some(v.clone());
+    }
 
     repo.update(&album).ok();
 
@@ -129,9 +159,15 @@ async fn edit_artist(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if let Some(ref v) = body.name { artist.name = v.clone(); }
-    if let Some(ref v) = body.sort_name { artist.sort_name = Some(v.clone()); }
-    if let Some(ref v) = body.bio { artist.bio = Some(v.clone()); }
+    if let Some(ref v) = body.name {
+        artist.name = v.clone();
+    }
+    if let Some(ref v) = body.sort_name {
+        artist.sort_name = Some(v.clone());
+    }
+    if let Some(ref v) = body.bio {
+        artist.bio = Some(v.clone());
+    }
 
     repo.update(&artist).ok();
 
@@ -145,14 +181,22 @@ async fn list_doubtful_metadata(State(state): State<AppState>) -> impl IntoRespo
     let doubtful: Vec<serde_json::Value> = all_tracks
         .iter()
         .filter(|t| {
-            let no_artist = t.artist_name.as_ref().map(|a| a.is_empty() || a == "Unknown Artist").unwrap_or(true);
+            let no_artist = t
+                .artist_name
+                .as_ref()
+                .map(|a| a.is_empty() || a == "Unknown Artist")
+                .unwrap_or(true);
             let very_short = t.duration_ms > 0 && t.duration_ms < 5000;
             let no_album = t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true);
             no_artist || very_short || no_album
         })
         .map(|t| {
             let mut reasons = Vec::new();
-            if t.artist_name.as_ref().map(|a| a.is_empty() || a == "Unknown Artist").unwrap_or(true) {
+            if t.artist_name
+                .as_ref()
+                .map(|a| a.is_empty() || a == "Unknown Artist")
+                .unwrap_or(true)
+            {
                 reasons.push("missing_artist");
             }
             if t.duration_ms > 0 && t.duration_ms < 5000 {

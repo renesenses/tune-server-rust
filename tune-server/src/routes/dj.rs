@@ -4,7 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -28,31 +28,26 @@ pub fn router() -> Router<AppState> {
         .route("/analyze/{track_id}", post(dj_analyze))
 }
 
-async fn enable_dj(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn enable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set(&format!("dj_enabled_{zone_id}"), "true").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": true}))
 }
 
-async fn disable_dj(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn disable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set(&format!("dj_enabled_{zone_id}"), "false").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": false}))
 }
 
-async fn dj_status(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-) -> Json<Value> {
+async fn dj_status(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let enabled = settings.get(&format!("dj_enabled_{zone_id}"))
-        .ok().flatten().map(|v| v == "true").unwrap_or(false);
+    let enabled = settings
+        .get(&format!("dj_enabled_{zone_id}"))
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
     Json(json!({
         "zone_id": zone_id,
         "dj_mode": enabled,
@@ -166,7 +161,11 @@ async fn dj_waveform(
     let repo = TrackRepo::new(state.db);
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "track not found"})),
+        )
+            .into_response();
     };
     let Some(ref path) = track.file_path else {
         return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
@@ -174,7 +173,9 @@ async fn dj_waveform(
 
     // Use FFmpeg to extract mono PCM at 8 kHz for waveform visualization
     let output = tokio::process::Command::new("ffmpeg")
-        .args(["-i", path, "-ac", "1", "-ar", "8000", "-f", "f32le", "-v", "quiet", "-"])
+        .args([
+            "-i", path, "-ac", "1", "-ar", "8000", "-f", "f32le", "-v", "quiet", "-",
+        ])
         .output()
         .await;
 
@@ -210,14 +211,15 @@ async fn dj_waveform(
     }
 }
 
-async fn dj_analyze(
-    State(state): State<AppState>,
-    Path(track_id): Path<i64>,
-) -> impl IntoResponse {
+async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "track not found"})),
+        )
+            .into_response();
     };
     let Some(ref path) = track.file_path else {
         return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
@@ -225,7 +227,9 @@ async fn dj_analyze(
 
     // Extract mono PCM at 22050 Hz for energy-based beat detection
     let output = tokio::process::Command::new("ffmpeg")
-        .args(["-i", path, "-ac", "1", "-ar", "22050", "-f", "f32le", "-v", "quiet", "-"])
+        .args([
+            "-i", path, "-ac", "1", "-ar", "22050", "-f", "f32le", "-v", "quiet", "-",
+        ])
         .output()
         .await;
 

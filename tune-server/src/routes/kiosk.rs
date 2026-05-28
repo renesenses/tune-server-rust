@@ -2,7 +2,7 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -111,7 +111,10 @@ async fn kiosk_now_playing(
 
     // Get current playback state from the playback manager
     let playback = state.playback.clone();
-    let zone_id_num = zone_id.as_deref().and_then(|z| z.parse::<i64>().ok()).unwrap_or(1);
+    let zone_id_num = zone_id
+        .as_deref()
+        .and_then(|z| z.parse::<i64>().ok())
+        .unwrap_or(1);
     let zone_state = playback.get_state(zone_id_num).await;
 
     let playing = zone_state.state == tune_core::playback::PlayState::Playing;
@@ -134,7 +137,10 @@ async fn kiosk_display_data(
         .or_else(|| config["zone_id"].as_str().map(String::from));
 
     let playback = state.playback.clone();
-    let zone_id_num = zone_id.as_deref().and_then(|z| z.parse::<i64>().ok()).unwrap_or(1);
+    let zone_id_num = zone_id
+        .as_deref()
+        .and_then(|z| z.parse::<i64>().ok())
+        .unwrap_or(1);
     let zone_state = playback.get_state(zone_id_num).await;
 
     Json(json!({

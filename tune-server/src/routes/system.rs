@@ -6,15 +6,15 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::album_repo::AlbumRepo;
-use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::history_repo::HistoryRepo;
-use tune_core::db::settings_repo::SettingsRepo;
-use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::db::migrations;
+use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
 
@@ -64,7 +64,10 @@ pub fn router() -> Router<AppState> {
         .route("/database/test-connection", post(test_db_connection))
         .route("/database/migrate", post(migrate_database))
         // Remote/proxy mode routes
-        .route("/remote/config", get(get_remote_config).post(set_remote_config))
+        .route(
+            "/remote/config",
+            get(get_remote_config).post(set_remote_config),
+        )
         .route("/remote/status", get(remote_status))
         // Admin routes
         .route("/admin/errors", get(admin_errors))
@@ -156,8 +159,12 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
     }
-    config.entry("server_version".to_string()).or_insert(json!(tune_core::version()));
-    config.entry("server_engine".to_string()).or_insert(json!("rust"));
+    config
+        .entry("server_version".to_string())
+        .or_insert(json!(tune_core::version()));
+    config
+        .entry("server_engine".to_string())
+        .or_insert(json!("rust"));
     Json(Value::Object(config))
 }
 
@@ -220,19 +227,24 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
         let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
 
-        event_bus.emit("library.scan.started", json!({
-            "music_dirs": &music_dirs,
-            "total": files.len(),
-        }));
+        event_bus.emit(
+            "library.scan.started",
+            json!({
+                "music_dirs": &music_dirs,
+                "total": files.len(),
+            }),
+        );
 
-        let (scanned, scan_stats) = tune_core::scanner::walker::scan_files_parallel(&files, true, None);
+        let (scanned, scan_stats) =
+            tune_core::scanner::walker::scan_files_parallel(&files, true, None);
 
         let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
         let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
         let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
 
         let cache_dir = super::library::artwork_cache_dir();
-        let mut albums_with_cover: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut albums_with_cover: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
         let mut inserted = 0i64;
         let mut updated = 0i64;
         let mut skipped = 0i64;
@@ -247,22 +259,42 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             if let Some(ref meta) = sf.metadata {
                 // Determine if this is a compilation (Various Artists)
                 let is_compilation = meta.compilation
-                    || meta.album_artist.as_deref().map(|s| s.to_lowercase())
-                        .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
+                    || meta
+                        .album_artist
+                        .as_deref()
+                        .map(|s| s.to_lowercase())
+                        .map(|s| {
+                            s == "various artists"
+                                || s == "various"
+                                || s == "va"
+                                || s == "compilations"
+                        })
                         .unwrap_or(false);
 
                 // Album artist: use album_artist tag, fall back to existing album's artist
                 // (not track artist — that splits compilation albums)
                 let existing_album_artist: Option<String> = if meta.album_artist.is_none() {
                     meta.album.as_ref().and_then(|title| {
-                        album_repo.get_by_title(title).ok().flatten().and_then(|a| a.artist_name)
+                        album_repo
+                            .get_by_title(title)
+                            .ok()
+                            .flatten()
+                            .and_then(|a| a.artist_name)
                     })
                 } else {
                     None
                 };
-                let album_artist_name = meta.album_artist.as_deref()
+                let album_artist_name = meta
+                    .album_artist
+                    .as_deref()
                     .or(existing_album_artist.as_deref())
-                    .unwrap_or_else(|| if is_compilation { "Various Artists" } else { meta.artist.as_deref().unwrap_or("Unknown Artist") });
+                    .unwrap_or_else(|| {
+                        if is_compilation {
+                            "Various Artists"
+                        } else {
+                            meta.artist.as_deref().unwrap_or("Unknown Artist")
+                        }
+                    });
 
                 // Track artist: always from track-level artist tag
                 let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
@@ -271,7 +303,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 let album_artist_entry = artist_repo
                     .get_or_create(
                         album_artist_name,
-                        if is_compilation { None } else { meta.musicbrainz_artist_id.as_deref() },
+                        if is_compilation {
+                            None
+                        } else {
+                            meta.musicbrainz_artist_id.as_deref()
+                        },
                         meta.album_artist_sort.as_deref(),
                     )
                     .ok();
@@ -293,7 +329,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
                 let album = if let Some(ref album_title) = meta.album {
                     album_repo
-                        .get_or_create(album_title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
+                        .get_or_create(
+                            album_title,
+                            album_artist_id.unwrap_or(0),
+                            meta.year.map(|y| y as i32),
+                        )
                         .ok()
                 } else {
                     None
@@ -306,11 +346,12 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     && let Some(hash) = tune_core::artwork::get_or_extract(
                         std::path::Path::new(&sf.path),
                         &cache_dir,
-                    ) {
-                        album_repo.update_cover_path(aid, &hash).ok();
-                        albums_with_cover.insert(aid);
-                        artwork_extracted += 1;
-                    }
+                    )
+                {
+                    album_repo.update_cover_path(aid, &hash).ok();
+                    albums_with_cover.insert(aid);
+                    artwork_extracted += 1;
+                }
 
                 // Issue 3: Check for artist image if not already set
                 if let Some(ref art) = track_artist {
@@ -319,10 +360,17 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                             for name in &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"] {
                                 let candidate = parent.join(name);
                                 if candidate.exists() {
-                                    let hash = tune_core::artwork::artwork_hash(&candidate.to_string_lossy());
-                                    let ext = candidate.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+                                    let hash = tune_core::artwork::artwork_hash(
+                                        &candidate.to_string_lossy(),
+                                    );
+                                    let ext = candidate
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("jpg");
                                     if let Ok(data) = std::fs::read(&candidate) {
-                                        tune_core::artwork::save_to_cache(&data, &cache_dir, &hash, ext);
+                                        tune_core::artwork::save_to_cache(
+                                            &data, &cache_dir, &hash, ext,
+                                        );
                                     }
                                     let mut updated_artist = art.clone();
                                     updated_artist.image_path = Some(hash);
@@ -344,9 +392,12 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 });
 
                 // Check if this file already exists in the DB
-                if let Some(&(existing_id, existing_mtime, existing_size)) = existing_tracks.get(&sf.path) {
+                if let Some(&(existing_id, existing_mtime, existing_size)) =
+                    existing_tracks.get(&sf.path)
+                {
                     // File exists — check if it has changed (different mtime or size)
-                    let file_changed = existing_mtime.map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                    let file_changed = existing_mtime
+                        .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
                         || existing_size.map_or(true, |s| s != sf.file_size as i64);
 
                     if !file_changed {
@@ -374,8 +425,14 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     track.file_mtime = Some(sf.mtime as f64);
                     track.audio_hash = sf.audio_hash.clone();
                     track.genre = meta.genre.clone();
-                    track.genres = if meta.genres.is_empty() { None } else { Some(serde_json::to_string(&meta.genres).unwrap_or_default()) };
-                    track.composer = meta.credits.iter()
+                    track.genres = if meta.genres.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&meta.genres).unwrap_or_default())
+                    };
+                    track.composer = meta
+                        .credits
+                        .iter()
                         .find(|c| c.role == "composer")
                         .map(|c| c.name.clone());
                     track.year = meta.year.map(|y| y as i32);
@@ -409,8 +466,14 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 track.file_mtime = Some(sf.mtime as f64);
                 track.audio_hash = sf.audio_hash.clone();
                 track.genre = meta.genre.clone();
-                track.genres = if meta.genres.is_empty() { None } else { Some(serde_json::to_string(&meta.genres).unwrap_or_default()) };
-                track.composer = meta.credits.iter()
+                track.genres = if meta.genres.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&meta.genres).unwrap_or_default())
+                };
+                track.composer = meta
+                    .credits
+                    .iter()
                     .find(|c| c.role == "composer")
                     .map(|c| c.name.clone());
                 track.year = meta.year.map(|y| y as i32);
@@ -427,16 +490,21 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             // Emit progress every 500 processed files or every 2 seconds
             let processed = inserted + updated + skipped;
             let elapsed = last_progress_emit.elapsed();
-            if processed > 0 && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2)) {
+            if processed > 0
+                && (processed % 500 == 0 || elapsed >= std::time::Duration::from_secs(2))
+            {
                 last_progress_emit = std::time::Instant::now();
-                event_bus.emit("library.scan.progress", json!({
-                    "scanned": processed,
-                    "total": total,
-                    "current_file": sf.path,
-                    "inserted": inserted,
-                    "updated": updated,
-                    "skipped": skipped,
-                }));
+                event_bus.emit(
+                    "library.scan.progress",
+                    json!({
+                        "scanned": processed,
+                        "total": total,
+                        "current_file": sf.path,
+                        "inserted": inserted,
+                        "updated": updated,
+                        "skipped": skipped,
+                    }),
+                );
             }
         }
 
@@ -474,14 +542,17 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             )
             .ok();
 
-        event_bus.emit("library.scan.completed", json!({
-            "total_files": scan_stats.total_files,
-            "metadata_ok": scan_stats.metadata_ok,
-            "inserted": inserted,
-            "updated": updated,
-            "skipped": skipped,
-            "artwork_extracted": artwork_extracted,
-        }));
+        event_bus.emit(
+            "library.scan.completed",
+            json!({
+                "total_files": scan_stats.total_files,
+                "metadata_ok": scan_stats.metadata_ok,
+                "inserted": inserted,
+                "updated": updated,
+                "skipped": skipped,
+                "artwork_extracted": artwork_extracted,
+            }),
+        );
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
@@ -497,7 +568,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let status = settings
+        .get("scan_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
     let scanning = status == "scanning";
     let result = settings
         .get("scan_result")
@@ -581,7 +656,9 @@ async fn add_music_dir(
         dirs.push(body.path);
     }
 
-    settings.set("music_dirs", &serde_json::to_string(&dirs).unwrap()).ok();
+    settings
+        .set("music_dirs", &serde_json::to_string(&dirs).unwrap())
+        .ok();
     Json(json!({ "dirs": dirs }))
 }
 
@@ -599,7 +676,9 @@ async fn remove_music_dir(
 
     dirs.retain(|d| d != &body.path);
 
-    settings.set("music_dirs", &serde_json::to_string(&dirs).unwrap()).ok();
+    settings
+        .set("music_dirs", &serde_json::to_string(&dirs).unwrap())
+        .ok();
     Json(json!({ "dirs": dirs }))
 }
 
@@ -675,10 +754,7 @@ async fn cleanup(State(state): State<AppState>) -> Json<Value> {
     let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
     let tracks = TrackRepo::new(state.db.clone()).deduplicate().unwrap_or(0);
 
-    let db_optimized = state
-        .db
-        .execute_batch("PRAGMA optimize; ANALYZE;")
-        .is_ok();
+    let db_optimized = state.db.execute_batch("PRAGMA optimize; ANALYZE;").is_ok();
 
     Json(json!({
         "duplicate_albums_merged": merged_albums,
@@ -701,21 +777,33 @@ fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> i64 {
     let mut deleted = 0i64;
     for (_title, ids_str) in &dupes {
         let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if ids.len() < 2 { continue; }
+        if ids.len() < 2 {
+            continue;
+        }
         let mut best_id = ids[0];
         let mut best_count = 0i64;
         for &aid in &ids {
-            let cnt: i64 = conn.query_row(
-                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                rusqlite::params![aid], |r| r.get(0),
-            ).unwrap_or(0);
-            if cnt > best_count { best_count = cnt; best_id = aid; }
+            let cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                    rusqlite::params![aid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if cnt > best_count {
+                best_count = cnt;
+                best_id = aid;
+            }
         }
         for &aid in &ids {
             if aid != best_id {
-                conn.execute("UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                    rusqlite::params![best_id, aid]).ok();
-                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid]).ok();
+                conn.execute(
+                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                    rusqlite::params![best_id, aid],
+                )
+                .ok();
+                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid])
+                    .ok();
                 deleted += 1;
             }
         }
@@ -760,7 +848,8 @@ async fn list_backups() -> Json<Value> {
     }
 
     items.sort_by(|a, b| {
-        b.get("created_at").and_then(|v| v.as_u64())
+        b.get("created_at")
+            .and_then(|v| v.as_u64())
             .cmp(&a.get("created_at").and_then(|v| v.as_u64()))
     });
 
@@ -783,7 +872,10 @@ async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
     }
 
-    state.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    state
+        .db
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .ok();
 
     match std::fs::copy(&db_path, &dest) {
         Ok(size) => Json(json!({
@@ -791,7 +883,11 @@ async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
             "size": size,
         }))
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("backup failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("backup failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -808,7 +904,11 @@ async fn restore_backup(
 
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
     if db_path == ":memory:" {
-        return (StatusCode::BAD_REQUEST, "cannot restore to in-memory database").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "cannot restore to in-memory database",
+        )
+            .into_response();
     }
 
     match std::fs::copy(&source, &db_path) {
@@ -818,7 +918,11 @@ async fn restore_backup(
             "message": "restart required to apply",
         }))
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("restore failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("restore failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -828,19 +932,30 @@ async fn export_database(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, "cannot export in-memory database").into_response();
     }
 
-    state.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    state
+        .db
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .ok();
 
     match tokio::fs::read(&db_path).await {
         Ok(bytes) => {
             let mut headers = axum::http::HeaderMap::new();
-            headers.insert("Content-Type", axum::http::HeaderValue::from_static("application/x-sqlite3"));
+            headers.insert(
+                "Content-Type",
+                axum::http::HeaderValue::from_static("application/x-sqlite3"),
+            );
             headers.insert(
                 "Content-Disposition",
-                axum::http::HeaderValue::from_str("attachment; filename=\"tune_server.db\"").unwrap(),
+                axum::http::HeaderValue::from_str("attachment; filename=\"tune_server.db\"")
+                    .unwrap(),
             );
             (StatusCode::OK, headers, bytes).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("export failed: {e}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("export failed: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -879,7 +994,11 @@ async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(update_path, std::fs::Permissions::from_mode(0o755)).ok();
+                            std::fs::set_permissions(
+                                update_path,
+                                std::fs::Permissions::from_mode(0o755),
+                            )
+                            .ok();
                         }
                         tracing::info!(task_id = %tid, size = bytes.len(), "update_downloaded");
                     }
@@ -891,7 +1010,10 @@ async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"task_id": task_id, "status": "downloading"})))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"task_id": task_id, "status": "downloading"})),
+    )
 }
 
 async fn update_apply() -> impl IntoResponse {
@@ -910,13 +1032,21 @@ async fn update_apply() -> impl IntoResponse {
         Json(json!({"status": "applied", "message": "restarting with new binary"})).into_response()
     } else {
         std::fs::rename(&backup, &current_exe).ok();
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed to replace binary"}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to replace binary"})),
+        )
+            .into_response()
     }
 }
 
 async fn update_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let status = settings.get("update_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let status = settings
+        .get("update_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
     let task_id = settings.get("update_task_id").ok().flatten();
     let update_exists = std::path::Path::new("/tmp/tune-server-update").exists();
     Json(json!({
@@ -937,8 +1067,17 @@ async fn changelog() -> Json<Value> {
 
 async fn scan_schedule(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let time = settings.get("scan_schedule_time").ok().flatten().unwrap_or_else(|| "03:00".into());
-    let enabled = settings.get("scan_schedule_enabled").ok().flatten().map(|v| v == "true").unwrap_or(false);
+    let time = settings
+        .get("scan_schedule_time")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "03:00".into());
+    let enabled = settings
+        .get("scan_schedule_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
     Json(json!({ "enabled": enabled, "time": time }))
 }
 
@@ -953,7 +1092,12 @@ async fn set_scan_schedule(
     Json(body): Json<ScanScheduleReq>,
 ) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    settings.set("scan_schedule_enabled", if body.enabled { "true" } else { "false" }).ok();
+    settings
+        .set(
+            "scan_schedule_enabled",
+            if body.enabled { "true" } else { "false" },
+        )
+        .ok();
     if let Some(ref t) = body.time {
         settings.set("scan_schedule_time", t).ok();
     }
@@ -985,7 +1129,11 @@ async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
     let uptime = state.started_at.elapsed().as_secs();
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let settings = SettingsRepo::new(state.db);
-    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let scan_status = settings
+        .get("scan_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
     Json(json!({
         "status": "ok",
         "uptime_seconds": uptime,
@@ -1008,7 +1156,11 @@ async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
 
 async fn get_mode(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
-    let mode = settings.get("server_mode").ok().flatten().unwrap_or_else(|| "server".into());
+    let mode = settings
+        .get("server_mode")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "server".into());
     Json(json!({ "mode": mode }))
 }
 
@@ -1017,10 +1169,7 @@ struct SetMode {
     mode: String,
 }
 
-async fn set_mode(
-    State(state): State<AppState>,
-    Json(body): Json<SetMode>,
-) -> Json<Value> {
+async fn set_mode(State(state): State<AppState>, Json(body): Json<SetMode>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set("server_mode", &body.mode).ok();
     Json(json!({ "mode": body.mode }))
@@ -1030,7 +1179,10 @@ async fn listening_stats(State(state): State<AppState>) -> Json<Value> {
     let repo = HistoryRepo::new(state.db);
     let history = repo.listening_history(30).unwrap_or_default();
     let total_listens = repo.count().unwrap_or(0);
-    let total_hours: f64 = history.iter().map(|(_, _, ms)| *ms as f64 / 3_600_000.0).sum();
+    let total_hours: f64 = history
+        .iter()
+        .map(|(_, _, ms)| *ms as f64 / 3_600_000.0)
+        .sum();
     Json(json!({
         "total_listens": total_listens,
         "total_hours_30d": (total_hours * 100.0).round() / 100.0,
@@ -1199,7 +1351,15 @@ async fn import_roon(
                             });
                             if let Ok(rows) = rows {
                                 for row in rows.flatten() {
-                                    let (title, artist, album, file_path, duration, track_num, genre) = row;
+                                    let (
+                                        title,
+                                        artist,
+                                        album,
+                                        file_path,
+                                        duration,
+                                        track_num,
+                                        genre,
+                                    ) = row;
 
                                     if let Some(ref fp) = file_path {
                                         if track_repo.get_by_path(fp).ok().flatten().is_some() {
@@ -1209,12 +1369,17 @@ async fn import_roon(
                                     }
 
                                     let artist_name = artist.as_deref().unwrap_or("Unknown Artist");
-                                    let art = artist_repo.get_or_create(artist_name, None, None).ok();
+                                    let art =
+                                        artist_repo.get_or_create(artist_name, None, None).ok();
                                     let artist_id = art.as_ref().and_then(|a| a.id);
 
                                     let alb = if let Some(ref album_title) = album {
                                         album_repo
-                                            .get_or_create(album_title, artist_id.unwrap_or(0), None)
+                                            .get_or_create(
+                                                album_title,
+                                                artist_id.unwrap_or(0),
+                                                None,
+                                            )
                                             .ok()
                                     } else {
                                         None
@@ -1250,7 +1415,11 @@ async fn import_roon(
             }
         }
 
-        let status = if errors.is_empty() { "completed" } else { "completed_with_errors" };
+        let status = if errors.is_empty() {
+            "completed"
+        } else {
+            "completed_with_errors"
+        };
         settings
             .set(
                 &format!("import_task_{tid}"),
@@ -1264,7 +1433,13 @@ async fn import_roon(
                 .to_string(),
             )
             .ok();
-        tracing::info!(task_id = tid, imported, skipped, errors = errors.len(), "roon_import_complete");
+        tracing::info!(
+            task_id = tid,
+            imported,
+            skipped,
+            errors = errors.len(),
+            "roon_import_complete"
+        );
     });
 
     (
@@ -1345,9 +1520,8 @@ async fn import_plex(
         };
 
         for sec_key in &section_keys {
-            let tracks_url = format!(
-                "{plex_url}/library/sections/{sec_key}/all?type=10&X-Plex-Token={token}"
-            );
+            let tracks_url =
+                format!("{plex_url}/library/sections/{sec_key}/all?type=10&X-Plex-Token={token}");
             let resp = match client
                 .get(&tracks_url)
                 .header("Accept", "application/json")
@@ -1368,10 +1542,7 @@ async fn import_plex(
             };
 
             for plex_track in tracks {
-                let title = plex_track["title"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let title = plex_track["title"].as_str().unwrap_or("").to_string();
                 if title.is_empty() {
                     continue;
                 }
@@ -1379,10 +1550,7 @@ async fn import_plex(
                     .as_str()
                     .unwrap_or("Unknown Artist")
                     .to_string();
-                let album_title = plex_track["parentTitle"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let album_title = plex_track["parentTitle"].as_str().unwrap_or("").to_string();
                 let duration = plex_track["duration"].as_u64().unwrap_or(0) as i64;
                 let track_num = plex_track["index"].as_u64().unwrap_or(0) as i32;
 
@@ -1403,9 +1571,7 @@ async fn import_plex(
                     }
                 }
 
-                let artist = artist_repo
-                    .get_or_create(&artist_name, None, None)
-                    .ok();
+                let artist = artist_repo.get_or_create(&artist_name, None, None).ok();
                 let artist_id = artist.as_ref().and_then(|a| a.id);
 
                 let album = if !album_title.is_empty() {
@@ -1456,7 +1622,13 @@ async fn import_plex(
                 .to_string(),
             )
             .ok();
-        tracing::info!(task_id = tid, imported, skipped, errors = errors.len(), "plex_import_complete");
+        tracing::info!(
+            task_id = tid,
+            imported,
+            skipped,
+            errors = errors.len(),
+            "plex_import_complete"
+        );
     });
 
     (
@@ -1477,10 +1649,7 @@ async fn import_playlists_file() -> Json<Value> {
     }))
 }
 
-async fn import_status(
-    State(state): State<AppState>,
-    Path(task_id): Path<String>,
-) -> Json<Value> {
+async fn import_status(State(state): State<AppState>, Path(task_id): Path<String>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("import_task_{task_id}");
     if let Some(data) = settings.get(&key).ok().flatten() {
@@ -1552,7 +1721,9 @@ async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> impl IntoResp
         }
         other => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("unknown engine: {other}. Supported: sqlite, postgresql")})),
+            Json(
+                json!({"error": format!("unknown engine: {other}. Supported: sqlite, postgresql")}),
+            ),
         )
             .into_response(),
     }
@@ -1731,9 +1902,16 @@ async fn admin_health(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
     let settings = SettingsRepo::new(state.db.clone());
-    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let scan_status = settings
+        .get("scan_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
     let zones = state.playback.all_states().await;
-    let playing = zones.iter().filter(|z| z.state == tune_core::playback::PlayState::Playing).count();
+    let playing = zones
+        .iter()
+        .filter(|z| z.state == tune_core::playback::PlayState::Playing)
+        .count();
     let outputs = state.outputs.lock().await;
     let output_count = outputs.list().len();
     drop(outputs);
@@ -1799,14 +1977,21 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db.clone());
     let music_dirs = get_music_dirs_list(&state.db);
     let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
-    let scan_status = settings.get("scan_status").ok().flatten().unwrap_or_else(|| "idle".into());
+    let scan_status = settings
+        .get("scan_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
 
     // Zones
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
-    let zones: Vec<Value> = zone_repo.list().unwrap_or_default().iter().map(|z| {
-        json!({ "id": z.id, "name": z.name, "output_type": z.output_type })
-    }).collect();
+    let zones: Vec<Value> = zone_repo
+        .list()
+        .unwrap_or_default()
+        .iter()
+        .map(|z| json!({ "id": z.id, "name": z.name, "output_type": z.output_type }))
+        .collect();
 
     // Streaming services status
     let registry = state.services.lock().await;
@@ -1832,8 +2017,15 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
     // Build markdown text
     let mut md = String::new();
     md.push_str(&format!("# Tune Bug Report\n\n"));
-    md.push_str(&format!("**Version**: {} (engine: rust)\n", tune_core::version()));
-    md.push_str(&format!("**Platform**: {} ({})\n", std::env::consts::OS, std::env::consts::ARCH));
+    md.push_str(&format!(
+        "**Version**: {} (engine: rust)\n",
+        tune_core::version()
+    ));
+    md.push_str(&format!(
+        "**Platform**: {} ({})\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
     md.push_str(&format!("**Uptime**: {uptime_str}\n"));
     md.push_str(&format!("**PID**: {}\n\n", std::process::id()));
 
@@ -1846,22 +2038,42 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
     for z in &zones {
-        md.push_str(&format!("- {} ({})\n", z["name"].as_str().unwrap_or("?"), z["output_type"].as_str().unwrap_or("?")));
+        md.push_str(&format!(
+            "- {} ({})\n",
+            z["name"].as_str().unwrap_or("?"),
+            z["output_type"].as_str().unwrap_or("?")
+        ));
     }
     md.push_str("\n");
 
     md.push_str("## Streaming Services\n");
     for s in &service_status {
-        let auth = if s["authenticated"].as_bool().unwrap_or(false) { "authenticated" } else { "not authenticated" };
-        let enabled = if s["enabled"].as_bool().unwrap_or(false) { "enabled" } else { "disabled" };
-        md.push_str(&format!("- {}: {}, {}\n", s["name"].as_str().unwrap_or("?"), enabled, auth));
+        let auth = if s["authenticated"].as_bool().unwrap_or(false) {
+            "authenticated"
+        } else {
+            "not authenticated"
+        };
+        let enabled = if s["enabled"].as_bool().unwrap_or(false) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        md.push_str(&format!(
+            "- {}: {}, {}\n",
+            s["name"].as_str().unwrap_or("?"),
+            enabled,
+            auth
+        ));
     }
     md.push_str("\n");
 
     md.push_str(&format!("## Network\n"));
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
-    md.push_str(&format!("- FFmpeg: {}\n\n", ffmpeg.as_deref().unwrap_or("not found")));
+    md.push_str(&format!(
+        "- FFmpeg: {}\n\n",
+        ffmpeg.as_deref().unwrap_or("not found")
+    ));
 
     md.push_str(&format!("## Database\n"));
     md.push_str(&format!("- Engine: sqlite\n"));
@@ -1914,7 +2126,9 @@ async fn audio_check() -> Json<Value> {
     };
 
     let formats = if ffmpeg_path.is_some() {
-        vec!["flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wma"]
+        vec![
+            "flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wma",
+        ]
     } else {
         vec![]
     };
@@ -1945,7 +2159,10 @@ async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
     tokio::spawn(async move {
         tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
-    (StatusCode::ACCEPTED, Json(json!({ "status": "enrichment_started" })))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "enrichment_started" })),
+    )
 }
 
 async fn database_import(
@@ -1962,13 +2179,21 @@ async fn database_import(
     }
 
     let Some(bytes) = file_bytes else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no file provided"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no file provided"})),
+        )
+            .into_response();
     };
 
     // Write to a temp file
     let tmp_path = "/tmp/tune_import.db";
     if let Err(e) = std::fs::write(tmp_path, &bytes) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed: {e}")}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write failed: {e}")})),
+        )
+            .into_response();
     }
 
     // Open the imported DB and count rows
@@ -1977,7 +2202,13 @@ async fn database_import(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("not a valid SQLite file: {e}")}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("not a valid SQLite file: {e}")})),
+            )
+                .into_response();
+        }
     };
 
     let track_count: i64 = import_db

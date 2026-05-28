@@ -41,7 +41,13 @@ impl DlnaOutput {
         self
     }
 
-    async fn soap_action(&self, url: &str, service: &str, action: &str, body: &str) -> Result<String, String> {
+    async fn soap_action(
+        &self,
+        url: &str,
+        service: &str,
+        action: &str,
+        body: &str,
+    ) -> Result<String, String> {
         let soap = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -55,7 +61,8 @@ impl DlnaOutput {
 
         let soap_action = format!("{service}#{action}");
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header("SOAPAction", format!("\"{soap_action}\""))
@@ -68,17 +75,32 @@ impl DlnaOutput {
     }
 
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
-        self.soap_action(&self.av_transport_url, AV_TRANSPORT_URN, action, body).await
+        self.soap_action(&self.av_transport_url, AV_TRANSPORT_URN, action, body)
+            .await
     }
 
     async fn rc_action(&self, action: &str, body: &str) -> Result<String, String> {
-        self.soap_action(&self.rendering_control_url, RENDERING_CONTROL_URN, action, body).await
+        self.soap_action(
+            &self.rendering_control_url,
+            RENDERING_CONTROL_URN,
+            action,
+            body,
+        )
+        .await
     }
 
-    fn didl_metadata(title: Option<&str>, artist: Option<&str>, mime_type: &str, url: &str) -> String {
+    fn didl_metadata(
+        title: Option<&str>,
+        artist: Option<&str>,
+        mime_type: &str,
+        url: &str,
+    ) -> String {
         let title = title.unwrap_or("Unknown");
         let artist = artist.unwrap_or("Unknown");
-        let escaped_url = url.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let escaped_url = url
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         format!(
             r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;dc:creator&gt;{artist}&lt;/dc:creator&gt;&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
         )
@@ -120,7 +142,13 @@ impl OutputTarget for DlnaOutput {
         "dlna"
     }
 
-    async fn play_url(&self, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> Result<(), String> {
+    async fn play_url(
+        &self,
+        url: &str,
+        mime_type: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> Result<(), String> {
         // Always stop the current transport first to reset renderer state.
         // Many DLNA renderers (Eversolo, Denon, Marantz, etc.) silently reject
         // SetAVTransportURI if the previous transport is still loaded (even if stopped).
@@ -150,7 +178,9 @@ impl OutputTarget for DlnaOutput {
             tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
         }
 
-        let play_resp = self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").await?;
+        let play_resp = self
+            .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            .await?;
 
         // Check for UPnP error in Play response
         if play_resp.contains("UPnPError") || play_resp.contains("<errorCode>") {
@@ -163,12 +193,14 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.av_action("Pause", "<InstanceID>0</InstanceID>").await?;
+        self.av_action("Pause", "<InstanceID>0</InstanceID>")
+            .await?;
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
-        self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").await?;
+        self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            .await?;
         Ok(())
     }
 
@@ -180,9 +212,11 @@ impl OutputTarget for DlnaOutput {
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         let target = Self::format_time(position_ms);
-        self.av_action("Seek", &format!(
-            "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"
-        )).await?;
+        self.av_action(
+            "Seek",
+            &format!("<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target>"),
+        )
+        .await?;
         Ok(())
     }
 
@@ -203,9 +237,18 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
-        let position_resp = self.av_action("GetPositionInfo", "<InstanceID>0</InstanceID>").await?;
-        let transport_resp = self.av_action("GetTransportInfo", "<InstanceID>0</InstanceID>").await?;
-        let volume_resp = self.rc_action("GetVolume", "<InstanceID>0</InstanceID><Channel>Master</Channel>").await?;
+        let position_resp = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await?;
+        let transport_resp = self
+            .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+            .await?;
+        let volume_resp = self
+            .rc_action(
+                "GetVolume",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+            )
+            .await?;
 
         let state = if transport_resp.contains("PLAYING") {
             TransportState::Playing

@@ -58,7 +58,9 @@ async fn set_upnp_config(
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
 
     if let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) {
-        settings.set("upnp_enabled", if enabled { "true" } else { "false" }).ok();
+        settings
+            .set("upnp_enabled", if enabled { "true" } else { "false" })
+            .ok();
     }
     if let Some(name) = body.get("friendly_name").and_then(|v| v.as_str()) {
         settings.set("upnp_friendly_name", name).ok();
