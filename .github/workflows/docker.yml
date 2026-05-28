@@ -54,5 +54,5 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=docker-v2
+          cache-to: type=gha,scope=docker-v2,mode=max
