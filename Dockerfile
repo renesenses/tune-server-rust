@@ -35,16 +35,15 @@ ENV TUNE_MUSIC_DIRS='["/music"]' \
     TUNE_DB_PATH=/data/tune_v2.db \
     TUNE_ARTWORK_CACHE=/data/artwork_cache \
     TUNE_WEB_DIR=/app/web \
-    TUNE_API_PORT=9888 \
-    TUNE_STREAM_PORT=9080 \
+    TUNE_PORT=8888 \
     TUNE_LOG=info \
     TUNE_AUTO_SCAN=true
 
-EXPOSE 9888 9080
+EXPOSE 8888
 
 VOLUME ["/data", "/music"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9888/api/system/stats || exit 1
+    CMD curl -f http://localhost:8888/api/system/stats || exit 1
 
 ENTRYPOINT ["/app/tune-server"]
