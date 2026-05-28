@@ -188,19 +188,56 @@ impl AlbumRepo {
     }
 
     pub fn list_sorted(&self, limit: i64, offset: i64, sort: &str, order: &str) -> Result<Vec<Album>, String> {
+        self.list_filtered(limit, offset, sort, order, None, None)
+    }
+
+    pub fn list_filtered(&self, limit: i64, offset: i64, sort: &str, order: &str, format: Option<&str>, quality: Option<&str>) -> Result<Vec<Album>, String> {
         let dir = if order.eq_ignore_ascii_case("desc") { "DESC" } else { "ASC" };
         let order_clause = match sort {
             "title" => format!("a.title COLLATE NOCASE {dir}"),
             "release_date" | "year" => format!("a.year {dir}, a.title COLLATE NOCASE ASC"),
             "artist" => format!("ar.name COLLATE NOCASE {dir}, a.year ASC, a.title COLLATE NOCASE ASC"),
-            // added_at: use rowid (insertion order)
             _ => format!("a.id {dir}"),
         };
-        let sql = format!("{SELECT_ALBUM} ORDER BY {order_clause} LIMIT ? OFFSET ?");
+        let mut wheres = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(fmt) = format {
+            wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format = ?)".to_string());
+            bind_values.push(Box::new(fmt.to_string()));
+        }
+        match quality {
+            Some("dsd") => {
+                wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format IN ('dsd','dsf','dff'))".to_string());
+            }
+            Some("hires") => {
+                wheres.push("a.id IN (SELECT DISTINCT album_id FROM tracks WHERE sample_rate > 44100 OR bit_depth > 16)".to_string());
+            }
+            Some("cd") => {
+                wheres.push("(a.sample_rate = 44100 AND a.bit_depth = 16)".to_string());
+            }
+            Some("lossy") => {
+                wheres.push("a.format IN ('mp3','aac','ogg','opus','wma')".to_string());
+            }
+            _ => {}
+        }
+
+        let where_clause = if wheres.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", wheres.join(" AND "))
+        };
+
+        let sql = format!("{SELECT_ALBUM}{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?");
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> = bind_values.iter().map(|b| b.as_ref()).collect();
+        params_vec.push(&limit);
+        params_vec.push(&offset);
+
         let albums = stmt
-            .query_map(params![limit, offset], |row| Ok(row_to_album(row)))
+            .query_map(params_vec.as_slice(), |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
             .filter_map(|r| r.ok())
             .collect();

@@ -269,7 +269,7 @@ async fn list_albums(
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
-    let items = repo.list_sorted(limit, offset, sort, order).unwrap_or_default();
+    let items = repo.list_filtered(limit, offset, sort, order, p.format.as_deref(), p.quality.as_deref()).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }
