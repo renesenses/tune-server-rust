@@ -51,6 +51,7 @@ impl TuneConfig {
     pub fn load() -> Self {
         let mut config = Self::default();
 
+        #[allow(unused_mut)]
         let mut search_paths = vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
         #[cfg(target_os = "windows")]
         if let Ok(appdata) = std::env::var("APPDATA") {
