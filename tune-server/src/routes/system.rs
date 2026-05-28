@@ -208,7 +208,7 @@ async fn update_config(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
-    StatusCode::NO_CONTENT.into_response()
+    Json(json!({"ok": true})).into_response()
 }
 
 async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
