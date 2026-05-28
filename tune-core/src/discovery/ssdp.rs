@@ -14,6 +14,7 @@ const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
 const MISS_GRACE_CYCLES: u32 = 3;
 const UNICAST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -160,7 +161,15 @@ async fn scan_loop(
             }
         }
 
-        tokio::time::sleep(SCAN_INTERVAL).await;
+        let interval = {
+            let st = state.lock().await;
+            if st.initial_scan_done && !st.devices.is_empty() {
+                IDLE_SCAN_INTERVAL
+            } else {
+                SCAN_INTERVAL
+            }
+        };
+        tokio::time::sleep(interval).await;
     }
 }
 
