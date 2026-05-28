@@ -51,10 +51,10 @@ impl PlaybackOrchestrator {
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
         // Clean up previous stream session for this zone
         let prev_state = self.playback.get_state(req.zone_id).await;
-        if let Some(ref np) = prev_state.now_playing {
-            if let Some(ref old_sid) = np.stream_id {
-                self.streamer.remove_session(old_sid).await;
-            }
+        if let Some(ref np) = prev_state.now_playing
+            && let Some(ref old_sid) = np.stream_id
+        {
+            self.streamer.remove_session(old_sid).await;
         }
 
         let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover, stream_id) =
@@ -650,10 +650,10 @@ impl PlaybackOrchestrator {
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         // Clean up stream session before stopping
         let state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = state.now_playing {
-            if let Some(ref stream_id) = np.stream_id {
-                self.streamer.remove_session(stream_id).await;
-            }
+        if let Some(ref np) = state.now_playing
+            && let Some(ref stream_id) = np.stream_id
+        {
+            self.streamer.remove_session(stream_id).await;
         }
         self.playback.stop(zone_id).await;
         if let Some(did) = device_id {

@@ -120,7 +120,6 @@ impl ZoneRepo {
             "UPDATE zones SET online = ? WHERE output_device_id = ?",
             rusqlite::params![val, device_id],
         )
-        .map(|n| n)
         .map_err(|e| e.to_string())
     }
 

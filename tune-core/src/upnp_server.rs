@@ -537,7 +537,7 @@ fn browse_album_tracks(state: &UpnpState, album_id: i64, base_url: &str) -> Didl
     let parent_id = format!("album/{album_id}");
     let mut inner = String::new();
     for track in &tracks {
-        inner.push_str(&didl_track_item(&track, &parent_id, base_url));
+        inner.push_str(&didl_track_item(track, &parent_id, base_url));
     }
 
     let total = tracks.len() as u64;

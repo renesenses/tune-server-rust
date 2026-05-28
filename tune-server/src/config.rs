@@ -52,8 +52,7 @@ impl TuneConfig {
         let mut config = Self::default();
 
         let search_paths = {
-            let mut paths =
-                vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
+            let mut paths = vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
             #[cfg(target_os = "windows")]
             if let Ok(appdata) = std::env::var("APPDATA") {
                 paths.insert(0, format!("{appdata}\\Tune\\tune.toml"));

@@ -51,10 +51,10 @@ impl DeezerService {
             .await
             .map_err(|e| format!("deezer: {e}"))?;
         let data: serde_json::Value = resp.json().await.map_err(|e| format!("deezer json: {e}"))?;
-        if let Some(err) = data.get("error") {
-            if err.is_object() {
-                return Err(format!("deezer error: {err}"));
-            }
+        if let Some(err) = data.get("error")
+            && err.is_object()
+        {
+            return Err(format!("deezer error: {err}"));
         }
         Ok(data)
     }
@@ -155,226 +155,6 @@ impl DeezerService {
             .as_array()
             .map(|items| items.iter().map(mapper).collect())
             .unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn map_track_basic() {
-        let json = json!({
-            "id": 12345,
-            "title": "Get Lucky",
-            "artist": {"name": "Daft Punk"},
-            "album": {
-                "title": "Random Access Memories",
-                "id": 678,
-                "cover_big": "https://img.deezer.com/cover_big.jpg",
-            },
-            "duration": 369,
-            "track_position": 8,
-            "disk_number": 1,
-            "explicit_lyrics": false,
-        });
-        let track = DeezerService::map_track(&json);
-        assert_eq!(track.id, "12345");
-        assert_eq!(track.title, "Get Lucky");
-        assert_eq!(track.artist, "Daft Punk");
-        assert_eq!(track.album.as_deref(), Some("Random Access Memories"));
-        assert_eq!(track.album_id.as_deref(), Some("678"));
-        assert_eq!(track.duration_ms, 369_000);
-        assert_eq!(track.track_number, Some(8));
-        assert_eq!(track.disc_number, Some(1));
-        assert!(!track.explicit);
-        assert_eq!(
-            track.cover_path.as_deref(),
-            Some("https://img.deezer.com/cover_big.jpg")
-        );
-    }
-
-    #[test]
-    fn map_track_explicit() {
-        let json = json!({
-            "id": 1,
-            "title": "Explicit Track",
-            "artist": {"name": "Test"},
-            "album": {},
-            "duration": 200,
-            "explicit_lyrics": true,
-        });
-        let track = DeezerService::map_track(&json);
-        assert!(track.explicit);
-    }
-
-    #[test]
-    fn map_track_cover_fallback() {
-        let json = json!({
-            "id": 1,
-            "title": "Test",
-            "artist": {"name": "Test"},
-            "album": {
-                "cover_medium": "http://medium.jpg",
-            },
-            "duration": 100,
-        });
-        let track = DeezerService::map_track(&json);
-        assert_eq!(track.cover_path.as_deref(), Some("http://medium.jpg"));
-    }
-
-    #[test]
-    fn map_track_missing_fields() {
-        let json = json!({
-            "id": 0,
-            "album": {},
-        });
-        let track = DeezerService::map_track(&json);
-        assert_eq!(track.id, "0");
-        assert_eq!(track.title, "");
-        assert_eq!(track.artist, "");
-        assert_eq!(track.duration_ms, 0);
-        let q = track.quality.unwrap();
-        assert_eq!(q.codec, "MP3");
-        assert_eq!(q.bitrate, Some(128));
-    }
-
-    #[test]
-    fn map_album_basic() {
-        let json = json!({
-            "id": 999,
-            "title": "Random Access Memories",
-            "artist": {"name": "Daft Punk", "id": 42},
-            "cover_big": "http://cover.jpg",
-            "release_date": "2013-05-17",
-            "nb_tracks": 13,
-        });
-        let album = DeezerService::map_album(&json);
-        assert_eq!(album.id, "999");
-        assert_eq!(album.title, "Random Access Memories");
-        assert_eq!(album.artist, "Daft Punk");
-        assert_eq!(album.artist_id.as_deref(), Some("42"));
-        assert_eq!(album.year, Some(2013));
-        assert_eq!(album.track_count, 13);
-    }
-
-    #[test]
-    fn map_artist_basic() {
-        let json = json!({
-            "id": 42,
-            "name": "Daft Punk",
-            "picture_big": "http://pic.jpg",
-        });
-        let artist = DeezerService::map_artist(&json);
-        assert_eq!(artist.id, "42");
-        assert_eq!(artist.name, "Daft Punk");
-        assert_eq!(artist.image_path.as_deref(), Some("http://pic.jpg"));
-    }
-
-    #[test]
-    fn map_artist_picture_fallback() {
-        let json = json!({
-            "id": 1,
-            "name": "Test",
-            "picture_medium": "http://medium.jpg",
-        });
-        let artist = DeezerService::map_artist(&json);
-        assert_eq!(artist.image_path.as_deref(), Some("http://medium.jpg"));
-    }
-
-    #[test]
-    fn map_playlist_basic() {
-        let json = json!({
-            "id": 555,
-            "title": "My Playlist",
-            "description": "Best songs",
-            "picture_big": "http://pic.jpg",
-            "nb_tracks": 25,
-            "creator": {"name": "User1"},
-        });
-        let pl = DeezerService::map_playlist(&json);
-        assert_eq!(pl.id, "555");
-        assert_eq!(pl.name, "My Playlist");
-        assert_eq!(pl.description.as_deref(), Some("Best songs"));
-        assert_eq!(pl.track_count, 25);
-        assert_eq!(pl.owner.as_deref(), Some("User1"));
-    }
-
-    #[test]
-    fn map_genre_basic() {
-        let json = json!({
-            "id": 10,
-            "name": "Pop",
-            "picture_big": "http://genre.jpg",
-        });
-        let genre = DeezerService::map_genre(&json);
-        assert_eq!(genre.id, "10");
-        assert_eq!(genre.name, "Pop");
-        assert!(!genre.has_children);
-        assert_eq!(genre.image_url.as_deref(), Some("http://genre.jpg"));
-    }
-
-    #[test]
-    fn collect_data_tracks() {
-        let data = json!({
-            "data": [
-                {"id": 1, "title": "A", "artist": {"name": "X"}, "album": {}, "duration": 100},
-                {"id": 2, "title": "B", "artist": {"name": "Y"}, "album": {}, "duration": 200},
-            ]
-        });
-        let tracks = DeezerService::collect_data(&data, DeezerService::map_track);
-        assert_eq!(tracks.len(), 2);
-        assert_eq!(tracks[0].title, "A");
-        assert_eq!(tracks[1].title, "B");
-    }
-
-    #[test]
-    fn collect_data_empty() {
-        let data = json!({});
-        let tracks = DeezerService::collect_data(&data, DeezerService::map_track);
-        assert!(tracks.is_empty());
-    }
-
-    #[test]
-    fn deezer_service_name() {
-        let svc = DeezerService::new();
-        assert_eq!(svc.name(), "deezer");
-        assert!(svc.enabled());
-    }
-
-    #[test]
-    fn deezer_set_enabled() {
-        let mut svc = DeezerService::new();
-        svc.set_enabled(false);
-        assert!(!svc.enabled());
-    }
-
-    #[test]
-    fn deezer_save_tokens_no_auth() {
-        let svc = DeezerService::new();
-        assert!(svc.save_tokens().is_none());
-    }
-
-    #[test]
-    fn deezer_restore_tokens() {
-        let mut svc = DeezerService::new();
-        let tokens = json!({
-            "access_token": "deezer-token-123",
-            "username": "testuser",
-            "user_id": 999,
-        });
-        assert!(svc.restore_tokens(&tokens));
-        assert_eq!(svc.access_token.as_deref(), Some("deezer-token-123"));
-        assert_eq!(svc.username.as_deref(), Some("testuser"));
-        assert_eq!(svc.user_id, Some(999));
-    }
-
-    #[test]
-    fn deezer_restore_tokens_invalid() {
-        let mut svc = DeezerService::new();
-        let tokens = json!({"nothing": "here"});
-        assert!(!svc.restore_tokens(&tokens));
     }
 }
 
@@ -785,5 +565,225 @@ impl StreamingService for DeezerService {
                 Err("deezer: token expired or revoked".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn map_track_basic() {
+        let json = json!({
+            "id": 12345,
+            "title": "Get Lucky",
+            "artist": {"name": "Daft Punk"},
+            "album": {
+                "title": "Random Access Memories",
+                "id": 678,
+                "cover_big": "https://img.deezer.com/cover_big.jpg",
+            },
+            "duration": 369,
+            "track_position": 8,
+            "disk_number": 1,
+            "explicit_lyrics": false,
+        });
+        let track = DeezerService::map_track(&json);
+        assert_eq!(track.id, "12345");
+        assert_eq!(track.title, "Get Lucky");
+        assert_eq!(track.artist, "Daft Punk");
+        assert_eq!(track.album.as_deref(), Some("Random Access Memories"));
+        assert_eq!(track.album_id.as_deref(), Some("678"));
+        assert_eq!(track.duration_ms, 369_000);
+        assert_eq!(track.track_number, Some(8));
+        assert_eq!(track.disc_number, Some(1));
+        assert!(!track.explicit);
+        assert_eq!(
+            track.cover_path.as_deref(),
+            Some("https://img.deezer.com/cover_big.jpg")
+        );
+    }
+
+    #[test]
+    fn map_track_explicit() {
+        let json = json!({
+            "id": 1,
+            "title": "Explicit Track",
+            "artist": {"name": "Test"},
+            "album": {},
+            "duration": 200,
+            "explicit_lyrics": true,
+        });
+        let track = DeezerService::map_track(&json);
+        assert!(track.explicit);
+    }
+
+    #[test]
+    fn map_track_cover_fallback() {
+        let json = json!({
+            "id": 1,
+            "title": "Test",
+            "artist": {"name": "Test"},
+            "album": {
+                "cover_medium": "http://medium.jpg",
+            },
+            "duration": 100,
+        });
+        let track = DeezerService::map_track(&json);
+        assert_eq!(track.cover_path.as_deref(), Some("http://medium.jpg"));
+    }
+
+    #[test]
+    fn map_track_missing_fields() {
+        let json = json!({
+            "id": 0,
+            "album": {},
+        });
+        let track = DeezerService::map_track(&json);
+        assert_eq!(track.id, "0");
+        assert_eq!(track.title, "");
+        assert_eq!(track.artist, "");
+        assert_eq!(track.duration_ms, 0);
+        let q = track.quality.unwrap();
+        assert_eq!(q.codec, "MP3");
+        assert_eq!(q.bitrate, Some(128));
+    }
+
+    #[test]
+    fn map_album_basic() {
+        let json = json!({
+            "id": 999,
+            "title": "Random Access Memories",
+            "artist": {"name": "Daft Punk", "id": 42},
+            "cover_big": "http://cover.jpg",
+            "release_date": "2013-05-17",
+            "nb_tracks": 13,
+        });
+        let album = DeezerService::map_album(&json);
+        assert_eq!(album.id, "999");
+        assert_eq!(album.title, "Random Access Memories");
+        assert_eq!(album.artist, "Daft Punk");
+        assert_eq!(album.artist_id.as_deref(), Some("42"));
+        assert_eq!(album.year, Some(2013));
+        assert_eq!(album.track_count, 13);
+    }
+
+    #[test]
+    fn map_artist_basic() {
+        let json = json!({
+            "id": 42,
+            "name": "Daft Punk",
+            "picture_big": "http://pic.jpg",
+        });
+        let artist = DeezerService::map_artist(&json);
+        assert_eq!(artist.id, "42");
+        assert_eq!(artist.name, "Daft Punk");
+        assert_eq!(artist.image_path.as_deref(), Some("http://pic.jpg"));
+    }
+
+    #[test]
+    fn map_artist_picture_fallback() {
+        let json = json!({
+            "id": 1,
+            "name": "Test",
+            "picture_medium": "http://medium.jpg",
+        });
+        let artist = DeezerService::map_artist(&json);
+        assert_eq!(artist.image_path.as_deref(), Some("http://medium.jpg"));
+    }
+
+    #[test]
+    fn map_playlist_basic() {
+        let json = json!({
+            "id": 555,
+            "title": "My Playlist",
+            "description": "Best songs",
+            "picture_big": "http://pic.jpg",
+            "nb_tracks": 25,
+            "creator": {"name": "User1"},
+        });
+        let pl = DeezerService::map_playlist(&json);
+        assert_eq!(pl.id, "555");
+        assert_eq!(pl.name, "My Playlist");
+        assert_eq!(pl.description.as_deref(), Some("Best songs"));
+        assert_eq!(pl.track_count, 25);
+        assert_eq!(pl.owner.as_deref(), Some("User1"));
+    }
+
+    #[test]
+    fn map_genre_basic() {
+        let json = json!({
+            "id": 10,
+            "name": "Pop",
+            "picture_big": "http://genre.jpg",
+        });
+        let genre = DeezerService::map_genre(&json);
+        assert_eq!(genre.id, "10");
+        assert_eq!(genre.name, "Pop");
+        assert!(!genre.has_children);
+        assert_eq!(genre.image_url.as_deref(), Some("http://genre.jpg"));
+    }
+
+    #[test]
+    fn collect_data_tracks() {
+        let data = json!({
+            "data": [
+                {"id": 1, "title": "A", "artist": {"name": "X"}, "album": {}, "duration": 100},
+                {"id": 2, "title": "B", "artist": {"name": "Y"}, "album": {}, "duration": 200},
+            ]
+        });
+        let tracks = DeezerService::collect_data(&data, DeezerService::map_track);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "A");
+        assert_eq!(tracks[1].title, "B");
+    }
+
+    #[test]
+    fn collect_data_empty() {
+        let data = json!({});
+        let tracks = DeezerService::collect_data(&data, DeezerService::map_track);
+        assert!(tracks.is_empty());
+    }
+
+    #[test]
+    fn deezer_service_name() {
+        let svc = DeezerService::new();
+        assert_eq!(svc.name(), "deezer");
+        assert!(svc.enabled());
+    }
+
+    #[test]
+    fn deezer_set_enabled() {
+        let mut svc = DeezerService::new();
+        svc.set_enabled(false);
+        assert!(!svc.enabled());
+    }
+
+    #[test]
+    fn deezer_save_tokens_no_auth() {
+        let svc = DeezerService::new();
+        assert!(svc.save_tokens().is_none());
+    }
+
+    #[test]
+    fn deezer_restore_tokens() {
+        let mut svc = DeezerService::new();
+        let tokens = json!({
+            "access_token": "deezer-token-123",
+            "username": "testuser",
+            "user_id": 999,
+        });
+        assert!(svc.restore_tokens(&tokens));
+        assert_eq!(svc.access_token.as_deref(), Some("deezer-token-123"));
+        assert_eq!(svc.username.as_deref(), Some("testuser"));
+        assert_eq!(svc.user_id, Some(999));
+    }
+
+    #[test]
+    fn deezer_restore_tokens_invalid() {
+        let mut svc = DeezerService::new();
+        let tokens = json!({"nothing": "here"});
+        assert!(!svc.restore_tokens(&tokens));
     }
 }

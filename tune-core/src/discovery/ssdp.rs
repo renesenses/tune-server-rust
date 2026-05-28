@@ -196,18 +196,16 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
     if std::net::UdpSocket::bind("0.0.0.0:0").is_ok() {
         // Enumerate private IPs by probing common subnets
         for subnet in &["192.168.1.1", "192.168.0.1", "10.0.0.1", "172.16.0.1"] {
-            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                if s.connect(format!("{subnet}:80")).is_ok() {
-                    if let Ok(addr) = s.local_addr() {
-                        if let SocketAddr::V4(v4) = addr {
-                            let ip = *v4.ip();
-                            if !ip.is_loopback() && !tried.contains(&ip) {
-                                tried.insert(ip);
-                                if let Ok(resps) = send_msearch_from(target, ip).await {
-                                    all_responses.extend(resps);
-                                }
-                            }
-                        }
+            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0")
+                && s.connect(format!("{subnet}:80")).is_ok()
+                && let Ok(addr) = s.local_addr()
+                && let SocketAddr::V4(v4) = addr
+            {
+                let ip = *v4.ip();
+                if !ip.is_loopback() && !tried.contains(&ip) {
+                    tried.insert(ip);
+                    if let Ok(resps) = send_msearch_from(target, ip).await {
+                        all_responses.extend(resps);
                     }
                 }
             }
@@ -215,10 +213,10 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
     }
 
     // Fallback: also try 0.0.0.0 if nothing found
-    if all_responses.is_empty() {
-        if let Ok(resps) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await {
-            all_responses.extend(resps);
-        }
+    if all_responses.is_empty()
+        && let Ok(resps) = send_msearch_from(target, Ipv4Addr::UNSPECIFIED).await
+    {
+        all_responses.extend(resps);
     }
 
     Ok(all_responses)
@@ -539,15 +537,14 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
         "10.0.0.1:80",
         "8.8.8.8:80",
     ] {
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-            if socket.connect(target).is_ok() {
-                if let Ok(SocketAddr::V4(addr)) = socket.local_addr() {
-                    let ip = *addr.ip();
-                    // Prefer private LAN IPs (192.168.x, not 10.x VPN)
-                    if ip.octets()[0] == 192 || ip.octets()[0] == 172 {
-                        return Some(ip);
-                    }
-                }
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
+            && socket.connect(target).is_ok()
+            && let Ok(SocketAddr::V4(addr)) = socket.local_addr()
+        {
+            let ip = *addr.ip();
+            // Prefer private LAN IPs (192.168.x, not 10.x VPN)
+            if ip.octets()[0] == 192 || ip.octets()[0] == 172 {
+                return Some(ip);
             }
         }
     }

@@ -656,13 +656,12 @@ impl StreamingService for QobuzService {
             return Ok(false);
         }
         let test = self.api_get("/user/get", &[]).await;
-        if let Err(ref e) = test {
-            if e.contains("401") || e.contains("403") {
-                if self.auto_relogin().await {
-                    info!("qobuz_token_refreshed_via_relogin");
-                    return Ok(true);
-                }
-            }
+        if let Err(ref e) = test
+            && (e.contains("401") || e.contains("403"))
+            && self.auto_relogin().await
+        {
+            info!("qobuz_token_refreshed_via_relogin");
+            return Ok(true);
         }
         Ok(false)
     }
@@ -698,6 +697,14 @@ impl StreamingService for QobuzService {
             false
         }
     }
+}
+
+fn md5_hex(input: &str) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    result.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -913,12 +920,4 @@ mod tests {
         let result = md5_hex("");
         assert_eq!(result, "d41d8cd98f00b204e9800998ecf8427e");
     }
-}
-
-fn md5_hex(input: &str) -> String {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
 }

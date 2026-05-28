@@ -130,6 +130,7 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
 }
 
 /// Parse a DSF file header to extract sample rate, channel count, and duration.
+#[allow(clippy::type_complexity)]
 fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64>), ()> {
     use std::io::Read;
 
@@ -621,7 +622,7 @@ mod tests {
         // Duration should be approximately 180_000 ms (3 minutes)
         let dur = meta.duration_ms.unwrap();
         assert!(
-            dur >= 179_000 && dur <= 181_000,
+            (179_000..=181_000).contains(&dur),
             "unexpected duration: {dur}ms"
         );
     }

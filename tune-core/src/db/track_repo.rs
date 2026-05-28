@@ -124,6 +124,7 @@ impl TrackRepo {
 
     /// Returns a map of file_path -> (track_id, file_mtime, file_size) for all local tracks.
     /// Used by the scanner to efficiently detect which files have changed without per-file queries.
+    #[allow(clippy::type_complexity)]
     pub fn get_all_local_file_info(
         &self,
     ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {

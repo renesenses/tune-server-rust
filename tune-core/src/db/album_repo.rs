@@ -320,6 +320,7 @@ impl AlbumRepo {
 
     /// Return all local albums that have no cover art set.
     /// Each entry is (album_id, title, artist_name, musicbrainz_release_id).
+    #[allow(clippy::type_complexity)]
     pub fn list_without_cover(
         &self,
     ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {

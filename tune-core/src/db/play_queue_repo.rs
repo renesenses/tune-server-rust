@@ -116,6 +116,7 @@ impl PlayQueueRepo {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn set_streaming_queue(
         &self,
         zone_id: i64,

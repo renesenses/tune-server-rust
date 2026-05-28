@@ -468,21 +468,21 @@ impl StreamingService for SpotifyService {
         for pid in playlists.iter().take(3) {
             if let Ok(tracks) = self.get_playlist_tracks(pid).await {
                 for t in tracks {
-                    if let (Some(album_id), Some(album_title)) = (&t.album_id, &t.album) {
-                        if !albums.iter().any(|a: &StreamAlbum| a.id == *album_id) {
-                            albums.push(StreamAlbum {
-                                id: album_id.clone(),
-                                title: album_title.clone(),
-                                artist: t.artist.clone(),
-                                artist_id: None,
-                                cover_path: t.cover_path.clone(),
-                                year: None,
-                                track_count: 0,
-                                quality: None,
-                            });
-                            if albums.len() >= limit {
-                                break;
-                            }
+                    if let (Some(album_id), Some(album_title)) = (&t.album_id, &t.album)
+                        && !albums.iter().any(|a: &StreamAlbum| a.id == *album_id)
+                    {
+                        albums.push(StreamAlbum {
+                            id: album_id.clone(),
+                            title: album_title.clone(),
+                            artist: t.artist.clone(),
+                            artist_id: None,
+                            cover_path: t.cover_path.clone(),
+                            year: None,
+                            track_count: 0,
+                            quality: None,
+                        });
+                        if albums.len() >= limit {
+                            break;
                         }
                     }
                 }
@@ -624,6 +624,26 @@ impl StreamingService for SpotifyService {
             self.username = me["display_name"].as_str().map(Into::into);
         }
     }
+}
+
+fn base64url_encode(data: &[u8]) -> String {
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::new();
+    let mut buf: u32 = 0;
+    let mut bits = 0;
+    for &byte in data {
+        buf = (buf << 8) | byte as u32;
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            output.push(table[((buf >> bits) & 0x3F) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        buf <<= 6 - bits;
+        output.push(table[(buf & 0x3F) as usize] as char);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -806,24 +826,4 @@ mod tests {
         // Standard base64 is "SGVsbG8=" but base64url has no padding and uses -_ instead of +/
         assert_eq!(result, "SGVsbG8");
     }
-}
-
-fn base64url_encode(data: &[u8]) -> String {
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut output = String::new();
-    let mut buf: u32 = 0;
-    let mut bits = 0;
-    for &byte in data {
-        buf = (buf << 8) | byte as u32;
-        bits += 8;
-        while bits >= 6 {
-            bits -= 6;
-            output.push(table[((buf >> bits) & 0x3F) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        buf <<= 6 - bits;
-        output.push(table[(buf & 0x3F) as usize] as char);
-    }
-    output
 }

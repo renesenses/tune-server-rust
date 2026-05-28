@@ -875,10 +875,10 @@ impl StreamingService for TidalService {
     }
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
-        if let Some(ref cache) = self.featured_cache {
-            if cache.fetched_at.elapsed() < Duration::from_secs(300) {
-                return Ok(cache.sections.iter().map(|(s, _)| s.clone()).collect());
-            }
+        if let Some(ref cache) = self.featured_cache
+            && cache.fetched_at.elapsed() < Duration::from_secs(300)
+        {
+            return Ok(cache.sections.iter().map(|(s, _)| s.clone()).collect());
         }
         let data = self.api_get("/pages/home").await?;
         let mut sections = Vec::new();
@@ -925,12 +925,11 @@ impl StreamingService for TidalService {
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
-        if let Some(ref cache) = self.featured_cache {
-            if cache.fetched_at.elapsed() < Duration::from_secs(300) {
-                if let Some((_, albums)) = cache.sections.iter().find(|(s, _)| s.id == section_id) {
-                    return Ok(albums.clone());
-                }
-            }
+        if let Some(ref cache) = self.featured_cache
+            && cache.fetched_at.elapsed() < Duration::from_secs(300)
+            && let Some((_, albums)) = cache.sections.iter().find(|(s, _)| s.id == section_id)
+        {
+            return Ok(albums.clone());
         }
         let sections = self.get_featured_sections().await?;
         let _ = sections;
@@ -1093,14 +1092,14 @@ impl StreamingService for TidalService {
     fn save_tokens(&self) -> Option<serde_json::Value> {
         let mut obj = serde_json::json!({});
         // Use try_lock since save_tokens is sync — if the mutex is held, skip saving
-        if let Ok(ts) = self.tokens.try_lock() {
-            if let Some(ref token) = ts.access_token {
-                obj["access_token"] = serde_json::json!(token);
-                obj["refresh_token"] = serde_json::json!(ts.refresh_token);
-                obj["username"] = serde_json::json!(self.username);
-                obj["country_code"] = serde_json::json!(self.country_code);
-                obj["user_id"] = serde_json::json!(self.user_id);
-            }
+        if let Ok(ts) = self.tokens.try_lock()
+            && let Some(ref token) = ts.access_token
+        {
+            obj["access_token"] = serde_json::json!(token);
+            obj["refresh_token"] = serde_json::json!(ts.refresh_token);
+            obj["username"] = serde_json::json!(self.username);
+            obj["country_code"] = serde_json::json!(self.country_code);
+            obj["user_id"] = serde_json::json!(self.user_id);
         }
         if let Some(ref pending) = self.pending_device_auth {
             obj["pending_device_code"] = serde_json::json!(pending.device_code);

@@ -189,6 +189,7 @@ impl PositionPoller {
                     })
                     .unwrap_or(true);
 
+                #[allow(clippy::collapsible_if)]
                 if should_poll {
                     if let Some(ref np) = zone_state.now_playing {
                         if let Some(ref source_id) = np.source_id {
