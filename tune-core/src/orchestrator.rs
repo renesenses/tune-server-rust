@@ -49,7 +49,15 @@ pub struct PlayResult {
 
 impl PlaybackOrchestrator {
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
-        let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover) =
+        // Clean up previous stream session for this zone
+        let prev_state = self.playback.get_state(req.zone_id).await;
+        if let Some(ref np) = prev_state.now_playing {
+            if let Some(ref old_sid) = np.stream_id {
+                self.streamer.remove_session(old_sid).await;
+            }
+        }
+
+        let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover, stream_id) =
             self.resolve_stream(&req).await?;
 
         let np = NowPlaying {
@@ -61,7 +69,7 @@ impl PlaybackOrchestrator {
             duration_ms: duration_ms.unwrap_or(0),
             source: source.clone(),
             source_id: req.source_id.clone(),
-            stream_id: None,
+            stream_id,
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -95,7 +103,7 @@ impl PlaybackOrchestrator {
         })
     }
 
-    async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
+    async fn resolve_stream(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
         if let Some(ref source) = req.source
             && source != "local" {
                 return self.resolve_streaming_url(source, req).await;
@@ -104,7 +112,7 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
-    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
+    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::new(self.db.clone());
         let track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
@@ -254,10 +262,11 @@ impl PlaybackOrchestrator {
             Some(track.duration_ms),
             "local".into(),
             track.cover_path,
+            Some(session_id),
         ))
     }
 
-    async fn resolve_streaming_url(&self, service_name: &str, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>), String> {
+    async fn resolve_streaming_url(&self, service_name: &str, req: &PlayRequest) -> Result<(String, String, String, Option<String>, Option<i64>, String, Option<String>, Option<String>), String> {
         let source_id = req.source_id.as_deref().ok_or("source_id required for streaming")?;
 
         let registry = self.services.lock().await;
@@ -276,7 +285,7 @@ impl PlaybackOrchestrator {
         };
 
         let is_https = stream_data.url.starts_with("https://");
-        let stream_url = if is_https {
+        let (stream_url, sid) = if is_https {
             let session_id = self.streamer.create_proxy_session(
                 info,
                 stream_data.url.clone(),
@@ -286,9 +295,10 @@ impl PlaybackOrchestrator {
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            self.streamer.get_stream_url(&session_id, &server_ip, &stream_data.quality.codec.to_lowercase())
+            let url = self.streamer.get_stream_url(&session_id, &server_ip, &stream_data.quality.codec.to_lowercase());
+            (url, Some(session_id))
         } else {
-            stream_data.url.clone()
+            (stream_data.url.clone(), None)
         };
 
         let (title, artist, duration_ms, cover_path) = if req.title.is_some() {
@@ -300,7 +310,7 @@ impl PlaybackOrchestrator {
             }
         };
 
-        Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into(), cover_path))
+        Ok((stream_url, stream_data.mime_type, title, artist, duration_ms, service_name.into(), cover_path, sid))
     }
 
     async fn send_to_output(&self, device_id: &str, url: &str, mime_type: &str, title: Option<&str>, artist: Option<&str>) -> bool {
@@ -630,7 +640,7 @@ impl PlaybackOrchestrator {
             duration_ms: item.duration_ms,
         };
 
-        let (url, mime, title, artist, _, _, _) = self.resolve_stream(&req).await?;
+        let (url, mime, title, artist, _, _, _, _) = self.resolve_stream(&req).await?;
         Ok((url, mime, title, artist))
     }
 }
