@@ -849,11 +849,23 @@ impl StreamingService for TidalService {
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
-        let data = self.api_get(&format!("/users/{user_id}/playlists?limit=50")).await?;
-        let playlists = data["items"].as_array()
-            .map(|items| items.iter().map(Self::map_playlist).collect())
-            .unwrap_or_default();
-        Ok(playlists)
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        let page_size = 50u32;
+        loop {
+            let data = self.api_get(&format!("/users/{user_id}/playlists?limit={page_size}&offset={offset}")).await?;
+            let items = data["items"].as_array()
+                .map(|items| items.iter().map(Self::map_playlist).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let count = items.len();
+            all.extend(items);
+            let total = data["totalNumberOfItems"].as_u64().unwrap_or(0) as usize;
+            offset += page_size;
+            if count == 0 || all.len() >= total {
+                break;
+            }
+        }
+        Ok(all)
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
