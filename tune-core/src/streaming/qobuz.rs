@@ -459,13 +459,19 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
-        let data = self.api_get("/genre/list", &[]).await?;
-        let genres = data["genres"]["items"]
+        let data = self.api_get("/genre/list", &[]).await.map_err(|e| {
+            info!(error = %e, "qobuz_genres_failed");
+            e
+        })?;
+        let genres: Vec<StreamGenre> = data["genres"]["items"]
             .as_array()
             .or_else(|| data["genres"].as_array())
             .or_else(|| data.as_array())
             .map(|items| items.iter().map(Self::map_genre).collect())
             .unwrap_or_default();
+        if genres.is_empty() {
+            info!(raw = %data, "qobuz_genres_empty_response");
+        }
         Ok(genres)
     }
 
@@ -696,6 +702,11 @@ impl StreamingService for QobuzService {
         } else {
             false
         }
+    }
+
+    async fn post_restore(&mut self) {
+        self.refresh_credentials().await;
+        let _ = self.refresh_if_needed().await;
     }
 }
 

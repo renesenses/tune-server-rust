@@ -222,6 +222,18 @@ impl PlaybackOrchestrator {
                 target_fmt.ffmpeg_codec_arg()
             };
 
+            // When target is WAV, output raw PCM from FFmpeg (no container header).
+            // The streamer prepends its own WAV header based on StreamInfo.format == "wav".
+            let ffmpeg_fmt = if target_fmt == AudioFormat::Wav {
+                match out_bd {
+                    24 => "s24le",
+                    32 => "s32le",
+                    _ => "s16le",
+                }
+            } else {
+                target_fmt.ffmpeg_format_arg()
+            };
+
             let args: Vec<String> = vec![
                 "-hide_banner".into(),
                 "-loglevel".into(),
@@ -230,7 +242,7 @@ impl PlaybackOrchestrator {
                 file_path.clone(),
                 "-vn".into(),
                 "-f".into(),
-                target_fmt.ffmpeg_format_arg().into(),
+                ffmpeg_fmt.into(),
                 "-acodec".into(),
                 codec.into(),
                 "-ar".into(),
