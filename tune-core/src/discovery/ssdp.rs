@@ -12,7 +12,7 @@ use super::xml_parser::fetch_device_description;
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
@@ -75,9 +75,7 @@ impl ScannerState {
 
 impl SsdpScanner {
     pub fn new(event_tx: mpsc::Sender<SsdpEvent>) -> Self {
-        let mut targets: Vec<String> = vec![MEDIA_RENDERER_URN.to_string()];
-        targets.extend(OPENHOME_SEARCH_TARGETS.iter().map(|s| s.to_string()));
-        targets.push(SSDP_ALL.to_string());
+        let targets: Vec<String> = vec![SSDP_ALL.to_string()];
 
         Self {
             state: Arc::new(Mutex::new(ScannerState::new())),
