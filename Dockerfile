@@ -44,6 +44,6 @@ EXPOSE 8888
 VOLUME ["/data", "/music"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8888/api/system/stats || exit 1
+    CMD curl -f http://localhost:8888/system/stats || exit 1
 
 ENTRYPOINT ["/app/tune-server"]
