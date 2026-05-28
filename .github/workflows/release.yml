@@ -113,10 +113,31 @@ jobs:
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           cd ..
 
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          DMG_NAME="${{ env.ARTIFACT }}.dmg"
+          APP_DIR="Tune Server"
+          mkdir -p "$APP_DIR/web"
+          cp target/${{ matrix.target }}/release/tune-server "$APP_DIR/"
+          cp -r web/* "$APP_DIR/web/"
+          cat > "$APP_DIR/start-tune-server.command" << 'SCRIPT'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export TUNE_WEB_DIR="$DIR/web"
+          export TUNE_PORT="${TUNE_PORT:-8888}"
+          open "http://localhost:$TUNE_PORT" &
+          exec "$DIR/tune-server"
+          SCRIPT
+          chmod +x "$APP_DIR/start-tune-server.command"
+          hdiutil create -volname "Tune Server" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG_NAME"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
-          path: ${{ env.ARTIFACT }}.${{ matrix.ext }}
+          path: |
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}
+            ${{ env.ARTIFACT }}.dmg
           retention-days: 1
 
   release:
@@ -132,7 +153,7 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} \; > ../SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) -exec sha256sum {} \; > ../SHA256SUMS
           cd ..
 
       - uses: softprops/action-gh-release@v2
@@ -140,5 +161,6 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
+            artifacts/**/*.dmg
             SHA256SUMS
           generate_release_notes: true
