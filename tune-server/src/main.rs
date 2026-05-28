@@ -12,6 +12,8 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    eprintln!("tune-server starting (pid {})", std::process::id());
+
     // Install rustls CryptoProvider before any TLS operation (reqwest, etc.)
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -779,8 +781,20 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await.expect("failed to install CTRL+C handler");
+
     info!("shutdown_signal_received");
 }
