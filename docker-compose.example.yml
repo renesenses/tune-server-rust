@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  tune:
+    image: renesenses/tune:v0.8.0
+    container_name: tune
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /chemin/vers/musique:/music:ro
+      - tune-data:/data
+    environment:
+      - TUNE_MUSIC_DIRS=["/music"]
+      - TUNE_PORT=8888
+      - TUNE_AUTO_SCAN=true
+      - TUNE_LOG=info
+
+volumes:
+  tune-data:
