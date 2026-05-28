@@ -160,16 +160,8 @@ async fn zone_status(
 async fn play(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    body_bytes: axum::body::Bytes,
+    Json(body): Json<PlayRequest>,
 ) -> impl IntoResponse {
-    let raw = String::from_utf8_lossy(&body_bytes);
-    let body: PlayRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(body = %raw, error = %e, "play_deserialize_error");
-            return (StatusCode::BAD_REQUEST, format!("invalid body: {e}")).into_response();
-        }
-    };
     let track_repo = TrackRepo::new(state.db.clone());
     let queue_repo = PlayQueueRepo::new(state.db.clone());
 

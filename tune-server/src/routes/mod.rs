@@ -353,7 +353,19 @@ pub fn router(state: AppState) -> Router {
         app
     };
 
+    let index_path = format!("{web_dir}/index.html");
     let app = app
+        .route("/", get(move || async move {
+            match tokio::fs::read(&index_path).await {
+                Ok(html) => {
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/html; charset=utf-8"));
+                    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache, must-revalidate"));
+                    (headers, html).into_response()
+                }
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }))
         .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive());
