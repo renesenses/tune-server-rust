@@ -36,7 +36,7 @@ ENV TUNE_MUSIC_DIRS='["/music"]' \
     TUNE_ARTWORK_CACHE=/data/artwork_cache \
     TUNE_WEB_DIR=/app/web \
     TUNE_PORT=8888 \
-    TUNE_LOG=info \
+    TUNE_LOG_LEVEL=info \
     TUNE_AUTO_SCAN=true
 
 EXPOSE 8888
