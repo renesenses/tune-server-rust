@@ -160,12 +160,13 @@ async fn zone_status(
 async fn play(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    raw_body: String,
+    body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let body: PlayRequest = match serde_json::from_str(&raw_body) {
+    let raw = String::from_utf8_lossy(&body_bytes);
+    let body: PlayRequest = match serde_json::from_slice(&body_bytes) {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(body = %raw_body, error = %e, "play_deserialize_error");
+            tracing::warn!(body = %raw, error = %e, "play_deserialize_error");
             return (StatusCode::BAD_REQUEST, format!("invalid body: {e}")).into_response();
         }
     };
