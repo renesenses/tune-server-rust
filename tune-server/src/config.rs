@@ -32,7 +32,7 @@ impl TuneConfig {
 impl Default for TuneConfig {
     fn default() -> Self {
         Self {
-            port: 8085,
+            port: 8888,
             db_path: "tune.db".into(),
             web_dir: "web".into(),
             artwork_dir: "artwork_cache".into(),
@@ -51,7 +51,20 @@ impl TuneConfig {
     pub fn load() -> Self {
         let mut config = Self::default();
 
-        for path in &["tune.toml", "/etc/tune/tune.toml"] {
+        let mut search_paths = vec![
+            "tune.toml".to_string(),
+            "/etc/tune/tune.toml".to_string(),
+        ];
+        #[cfg(target_os = "windows")]
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            search_paths.insert(0, format!("{appdata}\\Tune\\tune.toml"));
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(home) = std::env::var("HOME") {
+            search_paths.push(format!("{home}/.config/tune/tune.toml"));
+        }
+
+        for path in &search_paths {
             if let Ok(content) = std::fs::read_to_string(path)
                 && let Ok(file_config) = toml::from_str::<TuneConfig>(&content) {
                     info!(path, "config_loaded");
