@@ -193,9 +193,7 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
     let mut tried = std::collections::HashSet::new();
 
     // Try all network interfaces with private IPv4 addresses
-    if let Ok(ifaces) = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|_| Ok(()))
-    {
+    if std::net::UdpSocket::bind("0.0.0.0:0").is_ok() {
         // Enumerate private IPs by probing common subnets
         for subnet in &["192.168.1.1", "192.168.0.1", "10.0.0.1", "172.16.0.1"] {
             if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
