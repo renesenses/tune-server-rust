@@ -11,6 +11,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -59,7 +69,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@cross
 
       - name: Build (cross)
         if: matrix.cross
