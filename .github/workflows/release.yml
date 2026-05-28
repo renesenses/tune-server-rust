@@ -12,35 +12,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  web-client:
+    name: Build Web Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: renesenses/tune-web-client
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-client
+          path: dist/
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.target }}
+    needs: web-client
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: tune-server-linux-x86_64.tar.gz
+            artifact: tune-server-linux-x86_64
+            ext: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: tune-server-linux-aarch64.tar.gz
+            artifact: tune-server-linux-aarch64
+            ext: tar.gz
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: tune-server-macos-x86_64.tar.gz
+            os: macos-13
+            artifact: tune-server-macos-x86_64
+            ext: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: tune-server-macos-aarch64.tar.gz
+            artifact: tune-server-macos-aarch64
+            ext: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: tune-server-windows-x86_64.zip
+            artifact: tune-server-windows-x86_64
+            ext: zip
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install ALSA dev (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           targets: ${{ matrix.target }}
@@ -48,36 +70,50 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-client
+          path: web
+
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (cross, no local-audio)
+      - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features
 
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build (native, no local-audio on Linux/Windows)
+        if: "!matrix.cross && runner.os != 'macOS'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+
+      - name: Build (native, macOS with local-audio)
+        if: "!matrix.cross && runner.os == 'macOS'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }} tune-server
-          cd ../../..
+          mkdir -p package/web
+          cp target/${{ matrix.target }}/release/tune-server package/
+          cp -r web/* package/web/
+          cd package && tar czf ../${{ matrix.artifact }}.${{ matrix.ext }} tune-server web/
+          cd ..
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.artifact }} tune-server.exe
-          cd ../../..
+          mkdir package\web
+          copy target\${{ matrix.target }}\release\tune-server.exe package\
+          xcopy web\* package\web\ /E /I /Q
+          cd package
+          7z a ..\${{ matrix.artifact }}.${{ matrix.ext }} tune-server.exe web\
+          cd ..
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.${{ matrix.ext }}
           retention-days: 1
 
   release:

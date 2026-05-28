@@ -16,12 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-default-features
 
   build:
     name: Build ${{ matrix.target }}
@@ -50,9 +49,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install ALSA dev (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           targets: ${{ matrix.target }}
@@ -65,12 +61,16 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build (cross, no local-audio)
+      - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features
 
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build (native, no local-audio on Linux/Windows)
+        if: "!matrix.cross && runner.os != 'macOS'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+
+      - name: Build (native, macOS with local-audio)
+        if: "!matrix.cross && runner.os == 'macOS'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }}
 
       - name: Package (unix)
@@ -100,11 +100,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets -- -W clippy::all -D clippy::correctness
+      - run: cargo clippy --workspace --all-targets --no-default-features -- -W clippy::all -D clippy::correctness
