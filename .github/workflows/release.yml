@@ -113,8 +113,24 @@ jobs:
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           cd ..
 
+      - name: Import signing certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
+
       - name: Create DMG (macOS)
         if: runner.os == 'macOS'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
           APP_DIR="Tune Server"
@@ -130,7 +146,30 @@ jobs:
           exec "$DIR/tune-server"
           SCRIPT
           chmod +x "$APP_DIR/start-tune-server.command"
+          if [ -n "$APPLE_TEAM_ID" ]; then
+            IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+            codesign --force --options runtime --sign "$IDENTITY" "$APP_DIR/tune-server"
+            codesign --force --sign "$IDENTITY" "$APP_DIR/start-tune-server.command"
+          fi
           hdiutil create -volname "Tune Server" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG_NAME"
+          if [ -n "$APPLE_TEAM_ID" ]; then
+            codesign --force --sign "$IDENTITY" "$DMG_NAME"
+          fi
+
+      - name: Notarize DMG (macOS)
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG_NAME="${{ env.ARTIFACT }}.dmg"
+          xcrun notarytool submit "$DMG_NAME" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 600
+          xcrun stapler staple "$DMG_NAME"
 
       - uses: actions/upload-artifact@v4
         with:
