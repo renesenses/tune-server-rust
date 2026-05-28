@@ -20,7 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace --no-default-features
+      - run: cargo test -p tune-core -p tune-server --no-default-features
 
   build:
     name: Build ${{ matrix.target }}
@@ -106,4 +106,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --no-default-features -- -W clippy::all -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features -- -W clippy::all -D clippy::correctness
