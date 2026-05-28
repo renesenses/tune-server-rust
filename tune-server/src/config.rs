@@ -101,9 +101,7 @@ impl TuneConfig {
         {
             config.qobuz_app_secret = v;
         }
-        if let Ok(v) = std::env::var("TUNE_LOG_LEVEL")
-            .or_else(|_| std::env::var("TUNE_LOG"))
-        {
+        if let Ok(v) = std::env::var("TUNE_LOG_LEVEL").or_else(|_| std::env::var("TUNE_LOG")) {
             config.log_level = v;
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
