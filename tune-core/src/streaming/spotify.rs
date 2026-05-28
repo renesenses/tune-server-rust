@@ -128,6 +128,58 @@ impl SpotifyService {
             image_path: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
         }
     }
+
+    fn map_playlist(item: &serde_json::Value) -> StreamPlaylist {
+        StreamPlaylist {
+            id: item["id"].as_str().unwrap_or("").into(),
+            name: item["name"].as_str().unwrap_or("").into(),
+            description: item["description"].as_str().filter(|d| !d.is_empty()).map(Into::into),
+            cover_path: item["images"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
+            track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32,
+            owner: item["owner"]["display_name"].as_str().map(Into::into),
+        }
+    }
+
+    fn map_category_to_genre(item: &serde_json::Value) -> StreamGenre {
+        StreamGenre {
+            id: item["id"].as_str().unwrap_or("").into(),
+            name: item["name"].as_str().unwrap_or("").into(),
+            has_children: false,
+            image_url: item["icons"].as_array().and_then(|i| i.first()).and_then(|i| i["url"].as_str()).map(Into::into),
+        }
+    }
+
+    async fn api_put(&self, path: &str) -> Result<(), String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let resp = self.client
+            .put(format!("{API_BASE}{path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("spotify put: {e}"))?;
+        if resp.status() == 401 { return Err("token expired".into()); }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(format!("spotify PUT {path}: {status}"));
+        }
+        Ok(())
+    }
+
+    async fn api_delete(&self, path: &str) -> Result<(), String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let resp = self.client
+            .delete(format!("{API_BASE}{path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .map_err(|e| format!("spotify delete: {e}"))?;
+        if resp.status() == 401 { return Err("token expired".into()); }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(format!("spotify DELETE {path}: {status}"));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -209,7 +261,88 @@ impl StreamingService for SpotifyService {
         self.api_get(&format!("/playlists/{id}/tracks?limit=100")).await.map(|d| d["items"].as_array().map(|i| i.iter().filter_map(|item| item.get("track").map(Self::map_track)).collect()).unwrap_or_default())
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
-        self.api_get("/me/playlists?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().map(|item| StreamPlaylist { id: item["id"].as_str().unwrap_or("").into(), name: item["name"].as_str().unwrap_or("").into(), description: None, cover_path: item["images"].as_array().and_then(|imgs| imgs.first()).and_then(|img| img["url"].as_str()).map(Into::into), track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32, owner: None }).collect()).unwrap_or_default())
+        self.api_get("/me/playlists?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().map(Self::map_playlist).collect()).unwrap_or_default())
+    }
+
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get(&format!("/artists/{artist_id}/albums?include_groups=album,single&limit=50")).await?;
+        Ok(data["items"].as_array().map(|i| i.iter().map(Self::map_album).collect()).unwrap_or_default())
+    }
+
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+        let data = self.api_get(&format!("/artists/{artist_id}/top-tracks")).await?;
+        Ok(data["tracks"].as_array().map(|i| i.iter().map(Self::map_track).collect()).unwrap_or_default())
+    }
+
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get("/browse/new-releases?limit=50").await?;
+        Ok(data["albums"]["items"].as_array().map(|i| i.iter().map(Self::map_album).collect()).unwrap_or_default())
+    }
+
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+        let data = self.api_get("/browse/featured-playlists?limit=50").await?;
+        Ok(data["playlists"]["items"].as_array().map(|i| i.iter().map(Self::map_playlist).collect()).unwrap_or_default())
+    }
+
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+        let data = self.api_get("/browse/categories?limit=50").await?;
+        Ok(data["categories"]["items"].as_array().map(|i| i.iter().map(Self::map_category_to_genre).collect()).unwrap_or_default())
+    }
+
+    async fn get_genre_albums(&self, genre_id: &str, limit: usize) -> Result<Vec<StreamAlbum>, String> {
+        let data = self.api_get(&format!("/browse/categories/{genre_id}/playlists?limit={limit}")).await?;
+        let playlists: Vec<String> = data["playlists"]["items"].as_array()
+            .map(|i| i.iter().filter_map(|p| p["id"].as_str().map(Into::into)).collect())
+            .unwrap_or_default();
+        let mut albums = Vec::new();
+        for pid in playlists.iter().take(3) {
+            if let Ok(tracks) = self.get_playlist_tracks(pid).await {
+                for t in tracks {
+                    if let (Some(album_id), Some(album_title)) = (&t.album_id, &t.album) {
+                        if !albums.iter().any(|a: &StreamAlbum| a.id == *album_id) {
+                            albums.push(StreamAlbum {
+                                id: album_id.clone(),
+                                title: album_title.clone(),
+                                artist: t.artist.clone(),
+                                artist_id: None,
+                                cover_path: t.cover_path.clone(),
+                                year: None,
+                                track_count: 0,
+                                quality: None,
+                            });
+                            if albums.len() >= limit { break; }
+                        }
+                    }
+                }
+                if albums.len() >= limit { break; }
+            }
+        }
+        Ok(albums)
+    }
+
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+        let data = self.api_get("/me/tracks?limit=50").await?;
+        Ok(data["items"].as_array().map(|i| i.iter().filter_map(|item| item.get("track").map(Self::map_track)).collect()).unwrap_or_default())
+    }
+
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let path = match fav_type {
+            "tracks" => format!("/me/tracks?ids={item_id}"),
+            "albums" => format!("/me/albums?ids={item_id}"),
+            "artists" => format!("/me/following?type=artist&ids={item_id}"),
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_put(&path).await
+    }
+
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+        let path = match fav_type {
+            "tracks" => format!("/me/tracks?ids={item_id}"),
+            "albums" => format!("/me/albums?ids={item_id}"),
+            "artists" => format!("/me/following?type=artist&ids={item_id}"),
+            _ => return Err(format!("unknown favorite type: {fav_type}")),
+        };
+        self.api_delete(&path).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         self.api_get("/me/albums?limit=50").await.map(|d| d["items"].as_array().map(|i| i.iter().filter_map(|item| item.get("album").map(Self::map_album)).collect()).unwrap_or_default())
