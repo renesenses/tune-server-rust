@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
