@@ -13,6 +13,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::db::migrations;
 
 use crate::state::AppState;
@@ -104,13 +105,19 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
     let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
     let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let listens = HistoryRepo::new(state.db).count().unwrap_or(0);
+    let listens = HistoryRepo::new(state.db.clone()).count().unwrap_or(0);
+    let zones = ZoneRepo::new(state.db).count().unwrap_or(0);
+    let devices = state.scanner.lock().await.devices().await.len();
+    let outputs = state.outputs.lock().await.list().len();
 
     Json(json!({
         "artists": artists,
         "albums": albums,
         "tracks": tracks,
         "listens": listens,
+        "zones": zones,
+        "devices": devices,
+        "outputs": outputs,
         "server_version": tune_core::version(),
         "server_engine": "rust",
     }))
