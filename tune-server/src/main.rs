@@ -52,11 +52,18 @@ async fn main() {
     }
 
     if !config.music_dirs.is_empty() {
+        // Normalize paths before persisting (handles Windows backslashes, trailing separators, etc.)
+        let normalized_dirs: Vec<String> = config
+            .music_dirs
+            .iter()
+            .map(|d| tune_core::scanner::walker::normalize_path(d))
+            .filter(|d| !d.is_empty())
+            .collect();
         let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
         settings
             .set(
                 "music_dirs",
-                &serde_json::to_string(&config.music_dirs).unwrap(),
+                &serde_json::to_string(&normalized_dirs).unwrap(),
             )
             .ok();
     }
@@ -67,12 +74,19 @@ async fn main() {
         tokio::spawn(async move {
             info!("auto_scan_starting");
             let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
-            let music_dirs: Vec<String> = settings
+            let raw_dirs: Vec<String> = settings
                 .get("music_dirs")
                 .ok()
                 .flatten()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default();
+
+            // Normalize paths for cross-platform compatibility
+            let music_dirs: Vec<String> = raw_dirs
+                .iter()
+                .map(|d| tune_core::scanner::walker::normalize_path(d))
+                .filter(|d| !d.is_empty())
+                .collect();
 
             if music_dirs.is_empty() {
                 info!("auto_scan_skipped_no_dirs");

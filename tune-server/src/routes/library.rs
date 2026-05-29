@@ -707,18 +707,19 @@ async fn browse_roots(State(state): State<AppState>) -> Json<Value> {
     let roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
+            let norm = tune_core::scanner::walker::normalize_path(d);
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?",
-                    rusqlite::params![format!("{d}%")],
+                    rusqlite::params![format!("{norm}%")],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            let name = std::path::Path::new(d)
+            let name = std::path::Path::new(&norm)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or(d);
-            json!({ "path": d, "name": name, "track_count": count })
+                .unwrap_or(&norm);
+            json!({ "path": norm, "name": name, "track_count": count })
         })
         .collect();
     drop(conn);
@@ -734,7 +735,8 @@ async fn browse_directory(
     State(state): State<AppState>,
     Query(q): Query<BrowseQuery>,
 ) -> impl IntoResponse {
-    let resolved = std::path::Path::new(&q.path);
+    let normalized_query = tune_core::scanner::walker::normalize_path(&q.path);
+    let resolved = std::path::Path::new(&normalized_query);
     if !resolved.is_absolute() || !resolved.exists() {
         return (
             StatusCode::BAD_REQUEST,
@@ -743,7 +745,9 @@ async fn browse_directory(
             .into_response();
     }
 
-    // Verify path is under a configured music dir
+    // Verify path is under a configured music dir.
+    // Use std::path::Path::starts_with for OS-aware prefix matching
+    // (handles both `/` and `\` separators on Windows).
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
@@ -751,7 +755,10 @@ async fn browse_directory(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    let music_root = dirs.iter().find(|d| q.path.starts_with(d.as_str()));
+    let music_root = dirs.iter().find(|d| {
+        let norm_dir = tune_core::scanner::walker::normalize_path(d);
+        resolved.starts_with(&norm_dir)
+    });
     if music_root.is_none() {
         return (
             StatusCode::FORBIDDEN,
@@ -759,7 +766,7 @@ async fn browse_directory(
         )
             .into_response();
     }
-    let music_root = music_root.unwrap().clone();
+    let music_root = tune_core::scanner::walker::normalize_path(music_root.unwrap());
 
     // List subdirectories
     let mut subdirs: Vec<Value> = Vec::new();

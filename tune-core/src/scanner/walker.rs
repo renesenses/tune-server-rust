@@ -27,6 +27,42 @@ const SKIP_DIRS: &[&str] = &[
     "System Volume Information",
 ];
 
+/// Normalize a directory path for cross-platform compatibility.
+///
+/// On Windows, paths may use either `/` or `\` as separators. Users may also
+/// add trailing slashes. This function:
+/// - Converts forward slashes to the OS-native separator
+/// - Strips trailing separators (except for root paths like `C:\` or `/`)
+/// - Preserves UNC paths (`\\server\share`)
+pub fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // On Windows, normalize forward slashes to backslashes so that
+    // std::path operations and WalkDir work with a consistent separator.
+    #[cfg(target_os = "windows")]
+    let normalized = trimmed.replace('/', "\\");
+    #[cfg(not(target_os = "windows"))]
+    let normalized = trimmed.to_string();
+
+    // Strip trailing separator, but keep root paths intact (e.g. `C:\` or `/`)
+    let result = normalized.trim_end_matches(|c| c == '/' || c == '\\');
+    if result.is_empty() {
+        // Was just "/" or "\"
+        return normalized.chars().next().unwrap().to_string();
+    }
+
+    // Keep the trailing separator for Windows drive roots like "C:"
+    #[cfg(target_os = "windows")]
+    if result.len() == 2 && result.as_bytes()[1] == b':' {
+        return format!("{result}\\");
+    }
+
+    result.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
     pub path: String,
@@ -50,7 +86,29 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
 
     let mut files = Vec::new();
     for dir in dirs {
-        let walker = WalkDir::new(dir)
+        let normalized = normalize_path(dir);
+        let dir_path = std::path::Path::new(&normalized);
+
+        if !dir_path.exists() {
+            warn!(
+                dir = %normalized,
+                original = %dir,
+                "scan_dir_not_found — directory does not exist, skipping"
+            );
+            continue;
+        }
+        if !dir_path.is_dir() {
+            warn!(
+                dir = %normalized,
+                "scan_dir_not_a_directory — path is not a directory, skipping"
+            );
+            continue;
+        }
+
+        let mut dir_file_count = 0usize;
+        let mut dir_error_count = 0usize;
+
+        let walker = WalkDir::new(&normalized)
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
@@ -62,17 +120,47 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
                 }
             });
 
-        for entry in walker.filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && extensions.contains(ext.to_lowercase().as_str())
-            {
-                files.push(path.to_path_buf());
+        for entry in walker {
+            match entry {
+                Ok(entry) => {
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                        && extensions.contains(ext.to_lowercase().as_str())
+                    {
+                        files.push(path.to_path_buf());
+                        dir_file_count += 1;
+                    }
+                }
+                Err(err) => {
+                    dir_error_count += 1;
+                    if dir_error_count <= 5 {
+                        warn!(
+                            dir = %normalized,
+                            error = %err,
+                            "scan_walk_error — error while walking directory"
+                        );
+                    }
+                }
             }
         }
+
+        if dir_error_count > 5 {
+            warn!(
+                dir = %normalized,
+                total_errors = dir_error_count,
+                "scan_walk_errors_truncated — additional walk errors suppressed"
+            );
+        }
+
+        info!(
+            dir = %normalized,
+            files = dir_file_count,
+            errors = dir_error_count,
+            "scan_dir_complete"
+        );
     }
 
     info!(count = files.len(), dirs = dirs.len(), "audio_files_listed");
@@ -209,5 +297,69 @@ mod tests {
         let (results, stats) = scan_directories(&[], false, None);
         assert!(results.is_empty());
         assert_eq!(stats.total_files, 0);
+    }
+
+    #[test]
+    fn normalize_path_trailing_slash() {
+        assert_eq!(normalize_path("/music/"), "/music");
+        assert_eq!(normalize_path("/music"), "/music");
+    }
+
+    #[test]
+    fn normalize_path_empty() {
+        assert_eq!(normalize_path(""), "");
+        assert_eq!(normalize_path("  "), "");
+    }
+
+    #[test]
+    fn normalize_path_root() {
+        assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[test]
+    fn normalize_path_whitespace() {
+        assert_eq!(normalize_path("  /music/flac  "), "/music/flac");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalize_path_windows_backslash() {
+        assert_eq!(
+            normalize_path("C:\\Users\\Bob\\Music"),
+            "C:\\Users\\Bob\\Music"
+        );
+        assert_eq!(
+            normalize_path("C:\\Users\\Bob\\Music\\"),
+            "C:\\Users\\Bob\\Music"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalize_path_windows_forward_slash() {
+        assert_eq!(
+            normalize_path("C:/Users/Bob/Music"),
+            "C:\\Users\\Bob\\Music"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalize_path_windows_drive_root() {
+        assert_eq!(normalize_path("C:\\"), "C:\\");
+        assert_eq!(normalize_path("D:\\"), "D:\\");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn normalize_path_windows_unc() {
+        assert_eq!(
+            normalize_path("\\\\NAS\\Musique"),
+            "\\\\NAS\\Musique"
+        );
+        assert_eq!(
+            normalize_path("//NAS/Musique"),
+            "\\\\NAS\\Musique"
+        );
     }
 }

@@ -97,12 +97,13 @@ async fn step_music_dirs(
             .into_response();
     }
 
-    // Validate directories exist
+    // Validate directories exist (normalizing paths for Windows compatibility)
     let mut valid_dirs = Vec::new();
     let mut invalid_dirs = Vec::new();
     for dir in &body.dirs {
-        if std::path::Path::new(dir).is_dir() {
-            valid_dirs.push(dir.clone());
+        let normalized = tune_core::scanner::walker::normalize_path(dir);
+        if std::path::Path::new(&normalized).is_dir() {
+            valid_dirs.push(normalized);
         } else {
             invalid_dirs.push(dir.clone());
         }

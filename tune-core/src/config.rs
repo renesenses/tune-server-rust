@@ -298,7 +298,22 @@ fn parse_music_dirs(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
     if trimmed.starts_with('[') {
         serde_json::from_str(trimmed).unwrap_or_else(|_| vec![trimmed.to_string()])
+    } else if trimmed.contains(',') {
+        // Comma-separated: works on all platforms including Windows
+        trimmed
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if cfg!(target_os = "windows")
+        || trimmed.contains('\\')
+        || (trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':')
+    {
+        // Single Windows path (e.g. C:\Users\Bob\Music) — do NOT split on ':'
+        // as that would break the drive letter prefix.
+        vec![trimmed.to_string()]
     } else {
+        // Colon-separated (Unix only, e.g. /music:/data/flac)
         trimmed
             .split(':')
             .filter(|s| !s.is_empty())
@@ -374,6 +389,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_music_dirs_json_windows() {
+        let dirs = parse_music_dirs(r#"["C:\\Users\\Bob\\Music", "D:\\NAS\\Musique"]"#);
+        assert_eq!(dirs, vec![r"C:\Users\Bob\Music", r"D:\NAS\Musique"]);
+    }
+
+    #[test]
     fn parse_music_dirs_colon_separated() {
         let dirs = parse_music_dirs("/music:/data/flac");
         assert_eq!(dirs, vec!["/music", "/data/flac"]);
@@ -383,6 +404,31 @@ mod tests {
     fn parse_music_dirs_single() {
         let dirs = parse_music_dirs("/home/user/Music");
         assert_eq!(dirs, vec!["/home/user/Music"]);
+    }
+
+    #[test]
+    fn parse_music_dirs_comma_separated() {
+        let dirs = parse_music_dirs("/music, /data/flac");
+        assert_eq!(dirs, vec!["/music", "/data/flac"]);
+    }
+
+    #[test]
+    fn parse_music_dirs_windows_drive_path() {
+        // A single Windows path with drive letter must NOT be split on ':'
+        let dirs = parse_music_dirs(r"C:\Users\Bob\Music");
+        assert_eq!(dirs, vec![r"C:\Users\Bob\Music"]);
+    }
+
+    #[test]
+    fn parse_music_dirs_windows_comma_separated() {
+        let dirs = parse_music_dirs(r"C:\Users\Bob\Music, D:\NAS\Musique");
+        assert_eq!(dirs, vec![r"C:\Users\Bob\Music", r"D:\NAS\Musique"]);
+    }
+
+    #[test]
+    fn parse_music_dirs_unc_path() {
+        let dirs = parse_music_dirs(r"\\NAS\Musique");
+        assert_eq!(dirs, vec![r"\\NAS\Musique"]);
     }
 
     #[test]

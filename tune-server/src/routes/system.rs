@@ -219,11 +219,25 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.clone();
     let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
-        let music_dirs = get_music_dirs_list(&db);
-        if music_dirs.is_empty() {
+        let raw_dirs = get_music_dirs_list(&db);
+        if raw_dirs.is_empty() {
+            tracing::warn!("scan_aborted_no_dirs — no music directories configured");
             SettingsRepo::new(db).set("scan_status", "idle").ok();
             return;
         }
+
+        // Normalize paths for cross-platform compatibility (Windows backslashes, etc.)
+        let music_dirs: Vec<String> = raw_dirs
+            .iter()
+            .map(|d| tune_core::scanner::walker::normalize_path(d))
+            .filter(|d| !d.is_empty())
+            .collect();
+
+        tracing::info!(
+            dirs = ?music_dirs,
+            platform = std::env::consts::OS,
+            "scan_starting"
+        );
 
         let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
 
@@ -644,6 +658,38 @@ async fn add_music_dir(
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> impl IntoResponse {
+    let normalized = tune_core::scanner::walker::normalize_path(&body.path);
+
+    if normalized.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "path is empty" })),
+        )
+            .into_response();
+    }
+
+    let path = std::path::Path::new(&normalized);
+    if !path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "directory does not exist",
+                "path": normalized,
+            })),
+        )
+            .into_response();
+    }
+    if !path.is_dir() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "path is not a directory",
+                "path": normalized,
+            })),
+        )
+            .into_response();
+    }
+
     let settings = SettingsRepo::new(state.db);
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
@@ -652,20 +698,21 @@ async fn add_music_dir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    if !dirs.contains(&body.path) {
-        dirs.push(body.path);
+    if !dirs.contains(&normalized) {
+        dirs.push(normalized);
     }
 
     settings
         .set("music_dirs", &serde_json::to_string(&dirs).unwrap())
         .ok();
-    Json(json!({ "dirs": dirs }))
+    Json(json!({ "dirs": dirs })).into_response()
 }
 
 async fn remove_music_dir(
     State(state): State<AppState>,
     Json(body): Json<AddMusicDir>,
 ) -> Json<Value> {
+    let normalized = tune_core::scanner::walker::normalize_path(&body.path);
     let settings = SettingsRepo::new(state.db);
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
@@ -674,7 +721,10 @@ async fn remove_music_dir(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    dirs.retain(|d| d != &body.path);
+    dirs.retain(|d| {
+        let norm_d = tune_core::scanner::walker::normalize_path(d);
+        norm_d != normalized
+    });
 
     settings
         .set("music_dirs", &serde_json::to_string(&dirs).unwrap())
