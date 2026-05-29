@@ -102,6 +102,7 @@ impl OutputTarget for OaatOutput {
                 controller_name: "Tune Server".into(),
                 features: vec![],
                 clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+                tls: false,
             };
 
             let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
