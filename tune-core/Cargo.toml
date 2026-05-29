@@ -14,6 +14,7 @@ reqwest = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 socket2 = { workspace = true }
+if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 rayon = { workspace = true }

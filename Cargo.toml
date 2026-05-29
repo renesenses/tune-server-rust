@@ -25,6 +25,7 @@ md-5 = "0.10"
 quick-xml = "0.37"
 mdns-sd = "0.12"
 socket2 = "0.5"
+if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 futures-util = "0.3"
