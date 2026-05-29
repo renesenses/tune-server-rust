@@ -842,6 +842,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1606,6 +1617,35 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "oaat-controller"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hostname",
+ "mdns-sd",
+ "oaat-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "oaat-core"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytes",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2880,6 +2920,8 @@ dependencies = [
  "md-5",
  "mdns-sd",
  "notify",
+ "oaat-controller",
+ "oaat-core",
  "quick-xml",
  "rayon",
  "reqwest",
@@ -3017,6 +3059,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
