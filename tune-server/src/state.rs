@@ -7,7 +7,9 @@ use tokio::sync::{Mutex, oneshot};
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::discovery::ssdp::SsdpScanner;
 use tune_core::event_bus::EventBus;
+use tune_core::health_monitor::{AdvancedHealthMonitor, HealthMonitorConfig};
 use tune_core::http::streamer::AudioStreamer;
+use tune_core::metadata_suggestions::SuggestionStore;
 use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
@@ -31,6 +33,8 @@ pub struct AppState {
     pub port: u16,
     pub started_at: Instant,
     pub bridge_responses: Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
+    pub health_monitor: Arc<AdvancedHealthMonitor>,
+    pub suggestion_store: Arc<SuggestionStore>,
 }
 
 impl AppState {
@@ -74,6 +78,15 @@ impl AppState {
 
         let upnp = UpnpState::new(db.clone(), port);
 
+        let health_config = HealthMonitorConfig {
+            db_path: db_path.into(),
+            ..Default::default()
+        };
+        let health_monitor = Arc::new(AdvancedHealthMonitor::new(health_config));
+
+        let suggestion_store = Arc::new(SuggestionStore::new(db.clone()));
+        suggestion_store.setup_table().ok();
+
         Ok(Self {
             db,
             streamer,
@@ -88,6 +101,8 @@ impl AppState {
             port,
             started_at: Instant::now(),
             bridge_responses: Arc::new(Mutex::new(HashMap::new())),
+            health_monitor,
+            suggestion_store,
         })
     }
 

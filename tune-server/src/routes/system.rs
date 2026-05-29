@@ -828,45 +828,12 @@ async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
 }
 
 async fn list_backups() -> Json<Value> {
-    let backup_dir = backup_dir_path();
-    let mut items = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "db").unwrap_or(false) {
-                let meta = std::fs::metadata(&path).ok();
-                items.push(json!({
-                    "filename": path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
-                    "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                    "created_at": meta.and_then(|m| m.created().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs()),
-                }));
-            }
-        }
-    }
-
-    items.sort_by(|a, b| {
-        b.get("created_at")
-            .and_then(|v| v.as_u64())
-            .cmp(&a.get("created_at").and_then(|v| v.as_u64()))
-    });
-
+    let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
+    let items = tune_core::db_backup::list_backups(&db_path);
     Json(json!(items))
 }
 
 async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
-    let backup_dir = backup_dir_path();
-    std::fs::create_dir_all(&backup_dir).ok();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let filename = format!("tune_backup_{now}.db");
-    let dest = format!("{backup_dir}/{filename}");
-
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
     if db_path == ":memory:" {
         return (StatusCode::BAD_REQUEST, "cannot backup in-memory database").into_response();
@@ -877,15 +844,11 @@ async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .ok();
 
-    match std::fs::copy(&db_path, &dest) {
-        Ok(size) => Json(json!({
-            "filename": filename,
-            "size": size,
-        }))
-        .into_response(),
-        Err(e) => (
+    match tune_core::db_backup::create_backup(&db_path) {
+        Some(info) => Json(json!(info)).into_response(),
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("backup failed: {e}"),
+            "backup failed",
         )
             .into_response(),
     }
@@ -895,13 +858,6 @@ async fn restore_backup(
     State(_state): State<AppState>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let backup_dir = backup_dir_path();
-    let source = format!("{backup_dir}/{filename}");
-
-    if !std::path::Path::new(&source).exists() {
-        return (StatusCode::NOT_FOUND, "backup not found").into_response();
-    }
-
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
     if db_path == ":memory:" {
         return (
@@ -911,18 +867,15 @@ async fn restore_backup(
             .into_response();
     }
 
-    match std::fs::copy(&source, &db_path) {
-        Ok(_) => Json(json!({
+    if tune_core::db_backup::restore_backup(&db_path, &filename) {
+        Json(json!({
             "restored": true,
             "filename": filename,
             "message": "restart required to apply",
         }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("restore failed: {e}"),
-        )
-            .into_response(),
+        .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "backup not found or restore failed").into_response()
     }
 }
 
@@ -1126,7 +1079,7 @@ async fn diagnostics_network(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
-    let uptime = state.started_at.elapsed().as_secs();
+    let report = state.health_monitor.run_checks().await;
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let settings = SettingsRepo::new(state.db);
     let scan_status = settings
@@ -1135,17 +1088,19 @@ async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .unwrap_or_else(|| "idle".into());
     Json(json!({
-        "status": "ok",
-        "uptime_seconds": uptime,
+        "status": report.status,
+        "uptime_seconds": report.uptime_seconds,
         "tracks": tracks,
         "scan_status": scan_status,
         "engine": "rust",
-        "memory_mb": null,
+        "checks": report.checks,
+        "alerts": report.alerts,
     }))
 }
 
-async fn health_alerts() -> Json<Value> {
-    Json(json!({ "alerts": [] }))
+async fn health_alerts(State(state): State<AppState>) -> Json<Value> {
+    let alerts = state.health_monitor.alerts().await;
+    Json(json!({ "alerts": alerts }))
 }
 
 async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
