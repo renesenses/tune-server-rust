@@ -162,6 +162,13 @@ pub async fn handle_head(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    info!(
+        stream_id,
+        format = %session.info.format,
+        file_size = ?session.info.file_size,
+        "stream_head_request"
+    );
+
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -195,6 +202,16 @@ pub async fn handle_stream(
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
+
+    let range_hdr = req_headers.get("Range").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let user_agent = req_headers.get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    info!(
+        stream_id,
+        range = range_hdr,
+        agent = user_agent,
+        format = %session.info.format,
+        "stream_request"
+    );
 
     // File serving with Range support
     let file_path = session.file_path.lock().await.clone();

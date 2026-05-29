@@ -183,10 +183,14 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
 
-    let tagged = match lofty::read_from_path(path) {
+    let tagged = match Probe::open(path)
+        .and_then(|p| p.options(ParseOptions::new().parsing_mode(ParsingMode::Relaxed)).guess_file_type()?.read())
+    {
         Ok(t) => t,
         Err(e) => return dsf_dff_fallback(path).ok_or_else(|| format!("{e}")),
     };

@@ -24,12 +24,6 @@ pub const MEDIA_RENDERER_URN: &str = "urn:schemas-upnp-org:device:MediaRenderer:
 pub const MEDIA_SERVER_URN: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 const SSDP_ALL: &str = "ssdp:all";
 
-const OPENHOME_SEARCH_TARGETS: &[&str] = &[
-    "urn:av-openhome-org:service:Product:1",
-    "urn:av-openhome-org:service:Playlist:1",
-    "urn:linn-co-uk:device:Source:1",
-];
-
 #[derive(Debug, Clone)]
 pub enum SsdpEvent {
     DeviceDiscovered(Box<DiscoveredDevice>),
