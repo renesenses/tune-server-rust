@@ -1,3 +1,4 @@
+pub mod airplay;
 pub mod chromecast;
 pub mod dlna;
 #[cfg(feature = "local-audio")]

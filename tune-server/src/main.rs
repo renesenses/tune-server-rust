@@ -657,16 +657,33 @@ async fn main() {
             while let Some(event) = mdns_rx.recv().await {
                 match event {
                     MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
-                        if dev.device_type == OutputType::Chromecast {
-                            let cast = tune_core::outputs::chromecast::ChromecastOutput::new(
-                                dev.name.clone(),
-                                dev.id.clone(),
-                                dev.host.clone(),
-                                dev.port,
-                            );
+                        let (output, output_type_str): (Option<Box<dyn tune_core::outputs::OutputTarget>>, &str) =
+                            match dev.device_type {
+                                OutputType::Chromecast => {
+                                    let cast = tune_core::outputs::chromecast::ChromecastOutput::new(
+                                        dev.name.clone(),
+                                        dev.id.clone(),
+                                        dev.host.clone(),
+                                        dev.port,
+                                    );
+                                    (Some(Box::new(cast)), "chromecast")
+                                }
+                                OutputType::Airplay => {
+                                    let ap = tune_core::outputs::airplay::AirplayOutput::new(
+                                        dev.name.clone(),
+                                        dev.id.clone(),
+                                        dev.host.clone(),
+                                        dev.port,
+                                    );
+                                    (Some(Box::new(ap)), "airplay")
+                                }
+                                _ => (None, ""),
+                            };
+
+                        if let Some(output) = output {
                             let mut reg = outputs.lock().await;
-                            reg.register(Box::new(cast));
-                            info!(name = %dev.name, host = %dev.host, port = dev.port, "chromecast_output_registered");
+                            reg.register(output);
+                            info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
                             let zone_repo =
                                 tune_core::db::zone_repo::ZoneRepo::new(db_for_mdns.clone());
@@ -676,9 +693,9 @@ async fn main() {
                                 .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
                             if !already
                                 && let Ok(zid) =
-                                    zone_repo.create(&dev.name, Some("chromecast"), Some(&dev.id))
+                                    zone_repo.create(&dev.name, Some(output_type_str), Some(&dev.id))
                             {
-                                info!(name = %dev.name, zone_id = zid, "chromecast_zone_auto_created");
+                                info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                             }
                         }
                     }
