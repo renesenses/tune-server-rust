@@ -1,4 +1,5 @@
 pub mod crossfade;
+pub mod dj_player;
 pub mod gapless;
 pub mod queue;
 pub mod radio_handler;

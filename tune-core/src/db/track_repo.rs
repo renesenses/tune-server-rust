@@ -16,6 +16,10 @@ impl TrackRepo {
         Self { db }
     }
 
+    pub fn db(&self) -> SqliteDb {
+        self.db.clone()
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
