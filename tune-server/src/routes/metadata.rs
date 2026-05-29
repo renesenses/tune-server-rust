@@ -45,6 +45,12 @@ struct ArtistEdit {
     bio: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PaginationParams {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tracks/{id}/edit", post(edit_track))
@@ -188,22 +194,17 @@ async fn edit_artist(
     Json(json!({ "status": "ok", "artist_id": id })).into_response()
 }
 
-async fn list_doubtful_metadata(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_doubtful_metadata(
+    State(state): State<AppState>,
+    Query(p): Query<PaginationParams>,
+) -> impl IntoResponse {
+    let limit = p.limit.unwrap_or(50);
+    let offset = p.offset.unwrap_or(0);
     let track_repo = TrackRepo::new(state.db);
-    // Find tracks with suspicious metadata: missing artist, very short duration, etc.
-    let all_tracks = track_repo.search("", 99999).unwrap_or_default();
-    let doubtful: Vec<serde_json::Value> = all_tracks
+    let total = track_repo.count_doubtful().unwrap_or(0);
+    let tracks = track_repo.list_doubtful(limit, offset).unwrap_or_default();
+    let items: Vec<serde_json::Value> = tracks
         .iter()
-        .filter(|t| {
-            let no_artist = t
-                .artist_name
-                .as_ref()
-                .map(|a| a.is_empty() || a == "Unknown Artist")
-                .unwrap_or(true);
-            let very_short = t.duration_ms > 0 && t.duration_ms < 5000;
-            let no_album = t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true);
-            no_artist || very_short || no_album
-        })
         .map(|t| {
             let mut reasons = Vec::new();
             if t.artist_name
@@ -230,8 +231,10 @@ async fn list_doubtful_metadata(State(state): State<AppState>) -> impl IntoRespo
         })
         .collect();
     Json(json!({
-        "items": doubtful,
-        "total": doubtful.len(),
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     }))
     .into_response()
 }

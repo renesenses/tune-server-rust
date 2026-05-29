@@ -301,6 +301,41 @@ impl TrackRepo {
         Ok(tracks)
     }
 
+    /// Count tracks with doubtful metadata (missing artist, very short, missing album).
+    pub fn count_doubtful(&self) -> Result<i64, String> {
+        let conn = self.db.connection().lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM tracks t \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
+                OR (al.title IS NULL OR al.title = '')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// List tracks with doubtful metadata, paginated.
+    pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let sql = format!(
+            "{SELECT_TRACK} \
+             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
+                OR (al.title IS NULL OR al.title = '') \
+             ORDER BY t.id LIMIT ? OFFSET ?"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
     pub fn deduplicate(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i64 = conn
