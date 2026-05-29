@@ -42,6 +42,8 @@ sha2 = "0.10"
 blowfish = "0.9"
 chrono = "0.4"
 cbc = "0.1"
+regex = "1"
+csv = "1"
 
 [profile.release]
 opt-level = "z"

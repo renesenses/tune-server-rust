@@ -32,6 +32,8 @@ sha2 = { workspace = true }
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }
+regex = { workspace = true }
+csv = { workspace = true }
 
 # OAAT protocol support (path dep — switch to git/crates.io for CI)
 oaat-core = { path = "../../oaat/crates/oaat-core", optional = true }
