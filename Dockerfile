@@ -17,7 +17,7 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
 COPY tune-core/ tune-core/
 COPY tune-pyo3/ tune-pyo3/
 COPY tune-server/ tune-server/
-RUN rm -f target/release/tune-server target/release/deps/tune_server-* target/release/deps/tune_core-* && \
+RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
     cargo build --release --package tune-server --no-default-features && \
     strip target/release/tune-server
 
