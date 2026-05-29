@@ -1,4 +1,5 @@
 pub mod deezer;
+pub mod deezer_decrypt;
 pub mod qobuz;
 pub mod registry;
 pub mod spotify;

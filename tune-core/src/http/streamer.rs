@@ -433,16 +433,10 @@ async fn proxy_stream(
     is_radio: bool,
     req_headers: &HeaderMap,
 ) -> Response {
-    let timeout = if is_radio {
-        std::time::Duration::from_secs(86400)
+    let client = if is_radio {
+        crate::http::client::long_timeout()
     } else {
-        std::time::Duration::from_secs(600)
-    };
-
-    let client = reqwest::Client::builder().timeout(timeout).build();
-
-    let Ok(client) = client else {
-        return StatusCode::BAD_GATEWAY.into_response();
+        crate::http::client::long_timeout()
     };
 
     let upstream_resp = match client.get(upstream_url).send().await {

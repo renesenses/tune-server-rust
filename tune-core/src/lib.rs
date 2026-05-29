@@ -1,3 +1,4 @@
+pub mod alarms;
 pub mod artwork;
 pub mod audio;
 pub mod buffer;

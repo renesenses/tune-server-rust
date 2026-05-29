@@ -29,7 +29,15 @@ urlencoding = { workspace = true }
 cpal = { version = "0.15", optional = true }
 rust_cast = { workspace = true }
 sha2 = { workspace = true }
+blowfish = { workspace = true }
+chrono = { workspace = true }
+cbc = { workspace = true }
+
+# OAAT protocol support (path dep — switch to git/crates.io for CI)
+oaat-core = { path = "../../oaat/crates/oaat-core", optional = true }
+oaat-controller = { path = "../../oaat/crates/oaat-controller", optional = true }
 
 [features]
 default = ["local-audio"]
 local-audio = ["cpal"]
+oaat = ["dep:oaat-core", "dep:oaat-controller"]

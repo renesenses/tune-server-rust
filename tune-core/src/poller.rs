@@ -18,6 +18,22 @@ const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 2;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 
+fn rand_pos(queue_length: i64, current: i64) -> i64 {
+    if queue_length <= 1 {
+        return 0;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as i64;
+    let pos = seed.abs() % queue_length;
+    if pos == current {
+        (pos + 1) % queue_length
+    } else {
+        pos
+    }
+}
+
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
@@ -276,27 +292,41 @@ impl PositionPoller {
         }
     }
 
+    fn next_position(zone_state: &crate::playback::ZoneState) -> Option<i64> {
+        if zone_state.queue_length == 0 {
+            return None;
+        }
+        match zone_state.repeat {
+            RepeatMode::One => Some(zone_state.queue_position),
+            RepeatMode::All => {
+                if zone_state.shuffle {
+                    Some(rand_pos(zone_state.queue_length, zone_state.queue_position))
+                } else {
+                    Some((zone_state.queue_position + 1) % zone_state.queue_length)
+                }
+            }
+            RepeatMode::Off => {
+                if zone_state.shuffle {
+                    Some(rand_pos(zone_state.queue_length, zone_state.queue_position))
+                } else {
+                    let next = zone_state.queue_position + 1;
+                    if next >= zone_state.queue_length {
+                        None
+                    } else {
+                        Some(next)
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_track_end(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
         let device_id = self.get_zone_device_id(zone_id);
 
-        let next_pos = match zone_state.repeat {
-            RepeatMode::One => zone_state.queue_position,
-            RepeatMode::All => {
-                if zone_state.queue_length == 0 {
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                    return;
-                }
-                (zone_state.queue_position + 1) % zone_state.queue_length
-            }
-            RepeatMode::Off => {
-                let next = zone_state.queue_position + 1;
-                if next >= zone_state.queue_length {
-                    info!(zone_id, "queue_ended");
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-                    return;
-                }
-                next
-            }
+        let Some(next_pos) = Self::next_position(zone_state) else {
+            info!(zone_id, "queue_ended");
+            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+            return;
         };
 
         info!(zone_id, next_pos, "auto_next");
@@ -312,16 +342,8 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
     ) {
-        let next_pos = match zone_state.repeat {
-            RepeatMode::One => zone_state.queue_position,
-            RepeatMode::All => (zone_state.queue_position + 1) % zone_state.queue_length.max(1),
-            RepeatMode::Off => {
-                let next = zone_state.queue_position + 1;
-                if next >= zone_state.queue_length {
-                    return;
-                }
-                next
-            }
+        let Some(next_pos) = Self::next_position(zone_state) else {
+            return;
         };
 
         match self

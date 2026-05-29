@@ -7,6 +7,8 @@ use super::traits::*;
 
 const API_BASE: &str = "https://api.deezer.com";
 const OAUTH_TOKEN_URL: &str = "https://connect.deezer.com/oauth/access_token.php";
+const DEEZER_GW: &str = "https://www.deezer.com/ajax/gw-light.php";
+const DEEZER_MEDIA_URL: &str = "https://media.deezer.com/v1";
 
 pub struct DeezerService {
     client: Client,
@@ -14,6 +16,11 @@ pub struct DeezerService {
     username: Option<String>,
     user_id: Option<u64>,
     enabled_override: Option<bool>,
+    arl: Option<String>,
+    license_token: Option<String>,
+    api_token: Option<String>,
+    quality: String,
+    proxy_base_url: Option<String>,
 }
 
 impl Default for DeezerService {
@@ -33,7 +40,164 @@ impl DeezerService {
             username: None,
             user_id: None,
             enabled_override: None,
+            arl: None,
+            license_token: None,
+            api_token: None,
+            quality: "FLAC".into(),
+            proxy_base_url: None,
         }
+    }
+
+    pub fn set_proxy_base_url(&mut self, url: Option<String>) {
+        self.proxy_base_url = url;
+    }
+
+    pub fn has_full_streaming(&self) -> bool {
+        self.arl.is_some() && self.license_token.is_some()
+    }
+
+    async fn gw_api_call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let arl = self.arl.as_ref().ok_or("deezer: no ARL")?;
+        let url = format!(
+            "{DEEZER_GW}?method={method}&input=3&api_version=1.0&api_token={}",
+            self.api_token.as_deref().unwrap_or("")
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("arl={arl}"))
+            .json(&params.unwrap_or(serde_json::json!({})))
+            .send()
+            .await
+            .map_err(|e| format!("deezer gw: {e}"))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("deezer gw json: {e}"))?;
+        if let Some(err) = data.get("error").and_then(|e| e.as_object()) {
+            if !err.is_empty() {
+                return Err(format!("deezer gw error: {}", serde_json::json!(err)));
+            }
+        }
+        Ok(data.get("results").cloned().unwrap_or_default())
+    }
+
+    pub async fn authenticate_arl(&mut self, arl: &str) -> Result<bool, String> {
+        if arl.len() < 100 {
+            return Err("ARL trop court — doit faire ~192 caractères".into());
+        }
+        self.arl = Some(arl.into());
+        let result = self.gw_api_call("deezer.getUserData", None).await?;
+        let user = &result["USER"];
+        let user_id = user["USER_ID"]
+            .as_str()
+            .or_else(|| user["USER_ID"].as_u64().map(|_| ""))
+            .unwrap_or("0");
+        if user_id == "0" || user_id.is_empty() {
+            self.arl = None;
+            return Err("ARL invalide ou expiré".into());
+        }
+        self.user_id = user["USER_ID"].as_u64().or_else(|| user_id.parse().ok());
+        self.username = user["BLOG_NAME"].as_str().map(Into::into);
+        self.license_token = user
+            .get("OPTIONS")
+            .and_then(|o| o.get("license_token"))
+            .and_then(|v| v.as_str())
+            .map(Into::into);
+        if let Some(cf) = result.get("checkForm").and_then(|v| v.as_str()) {
+            self.api_token = Some(cf.into());
+        }
+        info!(
+            user_id = ?self.user_id,
+            has_license = self.license_token.is_some(),
+            "deezer_arl_authenticated"
+        );
+        Ok(true)
+    }
+
+    pub async fn get_full_stream_url(
+        &self,
+        track_id: &str,
+        max_fallbacks: u8,
+    ) -> Result<String, String> {
+        let mut current_id = track_id.to_string();
+        for attempt in 0..=max_fallbacks {
+            let result = self
+                .gw_api_call(
+                    "song.getData",
+                    Some(serde_json::json!({"SNG_ID": current_id})),
+                )
+                .await?;
+            let token = result["TRACK_TOKEN"]
+                .as_str()
+                .ok_or("no TRACK_TOKEN")?;
+            let license = self.license_token.as_ref().ok_or("no license_token")?;
+            let format_name = match self.quality.as_str() {
+                "FLAC" | "MP3_320" | "MP3_128" => self.quality.as_str(),
+                _ => "FLAC",
+            };
+            let body = serde_json::json!({
+                "license_token": license,
+                "media": [{
+                    "type": "FULL",
+                    "formats": [{"cipher": "BF_CBC_STRIPE", "format": format_name}],
+                }],
+                "track_tokens": [token],
+            });
+            let resp = self
+                .client
+                .post(&format!("{DEEZER_MEDIA_URL}/get_url"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("deezer media: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("deezer media status: {}", resp.status()));
+            }
+            let data: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("deezer media json: {e}"))?;
+            let entry = data["data"]
+                .as_array()
+                .and_then(|a| a.first())
+                .unwrap_or(&serde_json::Value::Null);
+            if let Some(url) = entry["media"]
+                .as_array()
+                .and_then(|m| m.first())
+                .and_then(|m| m["sources"].as_array())
+                .and_then(|s| s.first())
+                .and_then(|s| s["url"].as_str())
+            {
+                info!(track_id = %current_id, quality = format_name, "deezer_stream_url_resolved");
+                return Ok(url.to_string());
+            }
+            // Check geo-restriction → try fallback track
+            let rights_denied = entry["errors"]
+                .as_array()
+                .map(|errs| errs.iter().any(|e| e["code"].as_u64() == Some(2002)))
+                .unwrap_or(false);
+            if rights_denied && attempt < max_fallbacks {
+                if let Some(fid) = result
+                    .get("FALLBACK")
+                    .and_then(|f| f.get("SNG_ID"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    })
+                {
+                    if !fid.is_empty() && fid != current_id {
+                        info!(original = %current_id, fallback = %fid, "deezer_track_fallback");
+                        current_id = fid;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+        Err("no stream URL available".into())
     }
 
     /// Generic GET against the Deezer public API.
@@ -160,6 +324,9 @@ impl DeezerService {
 
 #[async_trait::async_trait]
 impl StreamingService for DeezerService {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &str {
         "deezer"
     }
@@ -178,7 +345,13 @@ impl StreamingService for DeezerService {
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, String> {
-        // Path 1: pre-existing access token (testing / manual setup)
+        // Path 1: ARL token (full streaming with decrypt proxy)
+        if let Some(arl) = credentials["arl"].as_str() {
+            self.authenticate_arl(arl).await?;
+            return Ok(self.auth_status().await);
+        }
+
+        // Path 2: pre-existing access token (testing / manual setup)
         if let Some(token) = credentials["access_token"].as_str() {
             self.access_token = Some(token.into());
             self.fetch_user_profile().await?;
@@ -186,7 +359,7 @@ impl StreamingService for DeezerService {
             return Ok(self.auth_status().await);
         }
 
-        // Path 2: OAuth code exchange (server-side flow)
+        // Path 3: OAuth code exchange (server-side flow)
         let app_id = credentials["app_id"]
             .as_str()
             .ok_or("deezer: app_id required")?;
@@ -284,6 +457,51 @@ impl StreamingService for DeezerService {
         track_id: &str,
         _quality: Option<&str>,
     ) -> Result<StreamUrl, String> {
+        // Path 1: local decrypt proxy (full quality, plain audio for DLNA)
+        if let (Some(base), true) = (&self.proxy_base_url, self.has_full_streaming()) {
+            let ext = if self.quality == "FLAC" { "flac" } else { "mp3" };
+            let mime = if ext == "flac" {
+                "audio/flac"
+            } else {
+                "audio/mpeg"
+            };
+            return Ok(StreamUrl {
+                url: format!("{base}/deezer/{track_id}.{ext}"),
+                mime_type: mime.into(),
+                quality: StreamQuality {
+                    codec: if ext == "flac" { "FLAC" } else { "MP3" }.into(),
+                    sample_rate: 44100,
+                    bit_depth: if ext == "flac" { 16 } else { 16 },
+                    bitrate: if ext == "flac" { None } else { Some(320) },
+                },
+                expires_at: None,
+            });
+        }
+
+        // Path 2: direct encrypted URL (only for clients that decrypt)
+        if self.has_full_streaming() {
+            if let Ok(url) = self.get_full_stream_url(track_id, 0).await {
+                let ext = if self.quality == "FLAC" { "flac" } else { "mp3" };
+                return Ok(StreamUrl {
+                    url,
+                    mime_type: if ext == "flac" {
+                        "audio/flac"
+                    } else {
+                        "audio/mpeg"
+                    }
+                    .into(),
+                    quality: StreamQuality {
+                        codec: if ext == "flac" { "FLAC" } else { "MP3" }.into(),
+                        sample_rate: 44100,
+                        bit_depth: 16,
+                        bitrate: if ext == "flac" { None } else { Some(320) },
+                    },
+                    expires_at: None,
+                });
+            }
+        }
+
+        // Fallback: 30s preview
         let data = self.api_get(&format!("/track/{track_id}")).await?;
         let preview = data["preview"]
             .as_str()
@@ -516,28 +734,49 @@ impl StreamingService for DeezerService {
     // ── token persistence ────────────────────────────────────────────
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
-        self.access_token.as_ref().map(|t| {
-            serde_json::json!({
-                "access_token": t,
-                "username": self.username,
-                "user_id": self.user_id,
-            })
-        })
+        if self.access_token.is_none() && self.arl.is_none() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "access_token": self.access_token,
+            "username": self.username,
+            "user_id": self.user_id,
+            "arl": self.arl,
+            "quality": self.quality,
+        }))
     }
 
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
+        let mut restored = false;
         if let Some(t) = tokens["access_token"].as_str() {
             self.access_token = Some(t.into());
-            self.username = tokens["username"].as_str().map(Into::into);
-            self.user_id = tokens["user_id"].as_u64();
-            true
-        } else {
-            false
+            restored = true;
         }
+        if let Some(arl) = tokens["arl"].as_str() {
+            self.arl = Some(arl.into());
+            restored = true;
+        }
+        if let Some(q) = tokens["quality"].as_str() {
+            self.quality = q.into();
+        }
+        self.username = tokens["username"].as_str().map(Into::into);
+        self.user_id = tokens["user_id"].as_u64();
+        restored
     }
 
     async fn post_restore(&mut self) {
-        // Validate the restored token by fetching the user profile
+        // Re-authenticate ARL to get license_token
+        if let Some(arl) = self.arl.clone() {
+            match self.authenticate_arl(&arl).await {
+                Ok(_) => info!(username = ?self.username, "deezer_arl_restored"),
+                Err(e) => {
+                    info!(error = %e, "deezer_arl_invalid_after_restore");
+                    self.arl = None;
+                    self.license_token = None;
+                }
+            }
+        }
+        // Validate OAuth token if present
         if self.access_token.is_some() {
             if let Err(e) = self.fetch_user_profile().await {
                 info!(error = %e, "deezer_token_invalid_after_restore");

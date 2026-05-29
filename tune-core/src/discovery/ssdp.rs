@@ -17,7 +17,6 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
 const MISS_GRACE_CYCLES: u32 = 3;
-const UNICAST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub const MEDIA_RENDERER_URN: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
@@ -460,13 +459,72 @@ async fn process_responses(
                     .await;
             }
             Err(e) => {
-                let mut st = state.lock().await;
-                let count = st.create_failures.entry(dev_id.clone()).or_insert(0);
-                *count += 1;
-                if *count <= 3 {
+                let failure_count = {
+                    let mut st = state.lock().await;
+                    let count = st.create_failures.entry(dev_id.clone()).or_insert(0);
+                    *count += 1;
+                    *count
+                };
+
+                // Try MinimalDMR probe on first failure
+                if failure_count == 1 {
+                    let host = host_from_location(&resp.location).unwrap_or_default();
+                    let port = port_from_location(&resp.location);
+                    let base_url = format!("http://{host}:{port}");
+                    let fallback_name = format!("Renderer ({host})");
+                    if let Some(probe) = super::minimal_dmr::probe_minimal_dmr(
+                        &base_url,
+                        Some(&resp.location),
+                        &fallback_name,
+                    )
+                    .await
+                    {
+                        let mut device = DiscoveredDevice::new(
+                            dev_id.clone(),
+                            probe.name.clone(),
+                            OutputType::Dlna,
+                            host,
+                            port,
+                        );
+                        device.location = Some(resp.location.clone());
+                        let mut svc_urls = std::collections::HashMap::new();
+                        svc_urls.insert(
+                            "AVTransport".to_string(),
+                            probe.av_transport_url.clone(),
+                        );
+                        if let Some(ref rc) = probe.rendering_control_url {
+                            svc_urls
+                                .insert("RenderingControl".to_string(), rc.clone());
+                        }
+                        device.capabilities.insert(
+                            "service_urls".into(),
+                            serde_json::to_value(&svc_urls).unwrap_or_default(),
+                        );
+                        device.capabilities.insert(
+                            "minimal_dmr".into(),
+                            serde_json::Value::Bool(true),
+                        );
+
+                        let mut st = state.lock().await;
+                        st.known_locations
+                            .insert(dev_id.clone(), resp.location);
+                        st.miss_count.remove(&dev_id);
+                        st.create_failures.remove(&dev_id);
+                        st.devices.insert(dev_id.clone(), device.clone());
+                        drop(st);
+
+                        info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
+                        let _ = event_tx
+                            .send(SsdpEvent::DeviceDiscovered(Box::new(device)))
+                            .await;
+                        continue;
+                    }
+                }
+
+                if failure_count <= 3 {
                     warn!(id = %dev_id, error = %e, "ssdp_device_create_failed");
                 }
-                // Evict devices that permanently fail to avoid unbounded growth
+                let mut st = state.lock().await;
                 if st.create_failures.len() > 200 {
                     st.create_failures.retain(|_, c| *c < 50);
                 }
@@ -521,13 +579,7 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
         return false;
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(UNICAST_PROBE_TIMEOUT)
-        .build();
-
-    let Ok(client) = client else {
-        return false;
-    };
+    let client = crate::http::client::shared();
 
     match client.get(&location).send().await {
         Ok(resp) => resp.status().is_success(),
