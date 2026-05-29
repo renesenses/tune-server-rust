@@ -688,7 +688,7 @@ async fn main() {
     {
         let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
         _mdns_handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
-            let mut mdns = mdns.with_chromecast().with_airplay().with_bluos();
+            let mut mdns = mdns.with_chromecast().with_airplay().with_bluos().with_oaat();
             if let Err(e) = mdns.start() {
                 tracing::warn!(error = %e, "mdns_start_failed");
             }
@@ -735,6 +735,15 @@ async fn main() {
                                     dev.port,
                                 );
                                 (Some(Box::new(bluos)), "bluos")
+                            }
+                            OutputType::Oaat => {
+                                let oaat = tune_core::outputs::oaat::OaatOutput::new(
+                                    dev.name.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                    dev.id.clone(),
+                                );
+                                (Some(Box::new(oaat)), "oaat")
                             }
                             _ => (None, ""),
                         };
@@ -846,6 +855,48 @@ async fn main() {
         );
         tune_core::upnp_server::spawn_ssdp_advertiser(upnp.uuid.clone(), location).await;
         info!("upnp_mediaserver_advertiser_started");
+    }
+
+    // Configure Deezer proxy base URL so get_track_url returns decryptable URLs
+    {
+        let registry = state.services.lock().await;
+        if let Some(svc) = registry.get("deezer") {
+            let mut svc = svc.lock().await;
+            if let Some(deezer) =
+                svc.as_any_mut()
+                    .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
+            {
+                let server_ip = tune_core::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into());
+                deezer.set_proxy_base_url(Some(format!(
+                    "http://{}:{}/deezer-proxy",
+                    server_ip, config.port
+                )));
+                info!("deezer_proxy_configured");
+            }
+        }
+    }
+
+    // Alarm scheduler
+    {
+        let alarm_sched = std::sync::Arc::new(tune_core::alarms::AlarmScheduler::new(
+            state.db.clone(),
+            state.orchestrator.clone(),
+        ));
+        alarm_sched.spawn();
+    }
+
+    // Desktop notifications
+    if tune_core::notifications::is_enabled() {
+        let server_ip = tune_core::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+        let server_base = std::sync::Arc::new(format!("http://{}:{}", server_ip, config.port));
+        tune_core::notifications::spawn_notification_listener(
+            state.event_bus.subscribe(),
+            server_base,
+        );
     }
 
     state.event_bus.emit(

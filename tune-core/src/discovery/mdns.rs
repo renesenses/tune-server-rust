@@ -13,6 +13,7 @@ pub const BLUOS_SERVICE: &str = "_musc._tcp.local.";
 pub const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
 pub const SQUEEZEBOX_SERVICE: &str = "_slimcli._tcp.local.";
 pub const TUNE_SERVICE: &str = "_tune-server._tcp.local.";
+pub const OAAT_SERVICE: &str = "_oaat._tcp.local.";
 
 #[derive(Debug, Clone)]
 pub enum MdnsEvent {
@@ -100,6 +101,15 @@ impl MdnsScanner {
             service_type: SQUEEZEBOX_SERVICE.to_string(),
             output_type: OutputType::Squeezebox,
             default_port: 9090,
+        });
+        self
+    }
+
+    pub fn with_oaat(mut self) -> Self {
+        self.configs.push(MdnsServiceConfig {
+            service_type: OAAT_SERVICE.to_string(),
+            output_type: OutputType::Oaat,
+            default_port: 9740,
         });
         self
     }
@@ -385,6 +395,33 @@ fn service_to_device(
                 serde_json::Value::String(tracks.to_string()),
             );
         }
+    }
+
+    // OAAT endpoint capabilities
+    if output_type == OutputType::Oaat {
+        if let Some(name_txt) = info.get_property_val_str("name") {
+            device.name = name_txt.to_string();
+        }
+        if let Some(id) = info.get_property_val_str("id") {
+            device.id = format!("oaat:{id}");
+            device.mac_address = Some(id.to_string());
+        }
+        if let Some(cap_str) = info.get_property_val_str("caps") {
+            caps.insert("caps".into(), serde_json::Value::String(cap_str.to_string()));
+        }
+        if let Some(ch) = info.get_property_val_str("ch") {
+            caps.insert("channels".into(), serde_json::Value::String(ch.to_string()));
+        }
+        if let Some(vendor) = info.get_property_val_str("vendor") {
+            device.manufacturer = Some(vendor.to_string());
+        }
+        if let Some(model) = info.get_property_val_str("model") {
+            device.model = Some(model.to_string());
+        }
+        if let Some(fw) = info.get_property_val_str("fw") {
+            caps.insert("firmware".into(), serde_json::Value::String(fw.to_string()));
+        }
+        caps.insert("oaat".into(), serde_json::Value::Bool(true));
     }
 
     device.capabilities = caps;

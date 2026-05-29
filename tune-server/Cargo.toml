@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["local-audio"]
+default = ["local-audio", "oaat"]
 local-audio = ["tune-core/local-audio"]
+oaat = ["tune-core/oaat"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false }

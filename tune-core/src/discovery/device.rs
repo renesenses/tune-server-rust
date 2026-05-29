@@ -11,11 +11,13 @@ pub enum OutputType {
     Bluos,
     Openhome,
     Squeezebox,
+    Oaat,
 }
 
 impl OutputType {
     pub fn priority(self) -> u8 {
         match self {
+            Self::Oaat => 8,
             Self::Openhome => 7,
             Self::Bluos => 6,
             Self::Squeezebox => 5,
@@ -37,6 +39,7 @@ impl std::fmt::Display for OutputType {
             Self::Bluos => write!(f, "bluos"),
             Self::Openhome => write!(f, "openhome"),
             Self::Squeezebox => write!(f, "squeezebox"),
+            Self::Oaat => write!(f, "oaat"),
         }
     }
 }
