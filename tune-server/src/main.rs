@@ -523,6 +523,19 @@ async fn main() {
         }
     }
 
+    let oh_event_listener = {
+        let server_ip = tune_core::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+        match tune_core::outputs::oh_events::OpenHomeEventListener::new(server_ip).await {
+            Ok(l) => Some(std::sync::Arc::new(l)),
+            Err(e) => {
+                tracing::warn!(error = %e, "oh_event_listener_init_failed");
+                None
+            }
+        }
+    };
+
     {
         let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
         {
@@ -535,6 +548,7 @@ async fn main() {
         let db_for_ssdp = state.db.clone();
         let config_for_ssdp = config.clone();
         let event_bus_for_ssdp = state.event_bus.clone();
+        let oh_listener_for_ssdp = oh_event_listener.clone();
         tokio::spawn(async move {
             use tune_core::discovery::ssdp::SsdpEvent;
             while let Some(event) = ssdp_rx.recv().await {
@@ -556,7 +570,30 @@ async fn main() {
                                 })
                                 .unwrap_or_default();
 
-                            {
+                            if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
+                                let evt_urls = dev
+                                    .capabilities
+                                    .get("event_sub_urls")
+                                    .and_then(|v| {
+                                        serde_json::from_value::<
+                                            std::collections::HashMap<String, String>,
+                                        >(v.clone())
+                                        .ok()
+                                    })
+                                    .unwrap_or_default();
+                                let oh = tune_core::outputs::openhome::OpenHomeOutput::new(
+                                    dev.name.clone(),
+                                    dev.id.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                    svc_urls.clone(),
+                                    oh_listener_for_ssdp.clone(),
+                                    evt_urls,
+                                );
+                                let mut reg = outputs.lock().await;
+                                reg.register(Box::new(oh));
+                                info!(name = %dev.name, id = %dev.id, "openhome_output_registered");
+                            } else {
                                 let av_url = svc_urls
                                     .get("avtransport")
                                     .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
@@ -682,8 +719,13 @@ async fn main() {
                                     (Some(Box::new(ap)), "airplay")
                                 }
                                 OutputType::Bluos => {
-                                    info!(name = %dev.name, host = %dev.host, "bluos_device_discovered");
-                                    (None, "bluos")
+                                    let bluos = tune_core::outputs::bluos::BluosOutput::new(
+                                        dev.name.clone(),
+                                        dev.id.clone(),
+                                        dev.host.clone(),
+                                        dev.port,
+                                    );
+                                    (Some(Box::new(bluos)), "bluos")
                                 }
                                 _ => (None, ""),
                             };
@@ -696,14 +738,25 @@ async fn main() {
                             let zone_repo =
                                 tune_core::db::zone_repo::ZoneRepo::new(db_for_mdns.clone());
                             let existing = zone_repo.list().unwrap_or_default();
-                            let already = existing
+                            let already_by_device = existing
                                 .iter()
                                 .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
-                            if !already
-                                && let Ok(zid) =
-                                    zone_repo.create(&dev.name, Some(output_type_str), Some(&dev.id))
-                            {
-                                info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                            if already_by_device {
+                                let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
+                            } else {
+                                // Skip zone creation if a zone with the same name already exists
+                                // (e.g., DLNA already created "DMP-A8", skip AirPlay duplicate)
+                                let name_taken = existing.iter().any(|z| z.name == dev.name);
+                                if !name_taken {
+                                    if let Ok(zid) =
+                                        zone_repo.create(&dev.name, Some(output_type_str), Some(&dev.id))
+                                    {
+                                        info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                    }
+                                } else {
+                                    info!(name = %dev.name, r#type = output_type_str, "mdns_zone_skipped_name_exists");
+                                }
                             }
                         }
                     }
@@ -837,4 +890,11 @@ async fn shutdown_signal() {
     ctrl_c.await.expect("failed to install CTRL+C handler");
 
     info!("shutdown_signal_received");
+
+    // Force exit after 3s if graceful shutdown stalls (background tasks, long-lived streams)
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        info!("shutdown_timeout_forcing_exit");
+        std::process::exit(0);
+    });
 }

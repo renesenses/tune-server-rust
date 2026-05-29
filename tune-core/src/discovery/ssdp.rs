@@ -437,6 +437,10 @@ async fn process_responses(
                     "service_urls".into(),
                     serde_json::to_value(desc.service_urls()).unwrap_or_default(),
                 );
+                device.capabilities.insert(
+                    "event_sub_urls".into(),
+                    serde_json::to_value(desc.event_sub_urls()).unwrap_or_default(),
+                );
                 if desc.is_openhome() {
                     device
                         .capabilities

@@ -243,7 +243,7 @@ pub async fn handle_stream(
     // Proxy mode
     let proxy_url = session.proxy_url.lock().await.clone();
     if let Some(ref url) = proxy_url {
-        return proxy_stream(url, &session.info, session.is_radio).await;
+        return proxy_stream(url, &session.info, session.is_radio, &req_headers).await;
     }
 
     // Chunked streaming mode
@@ -397,19 +397,20 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
 
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
 
-async fn proxy_stream(upstream_url: &str, info: &StreamInfo, is_radio: bool) -> Response {
+async fn proxy_stream(
+    upstream_url: &str,
+    info: &StreamInfo,
+    is_radio: bool,
+    req_headers: &HeaderMap,
+) -> Response {
     let timeout = if is_radio {
-        std::time::Duration::from_secs(0) // no total timeout for radio
+        std::time::Duration::from_secs(86400)
     } else {
         std::time::Duration::from_secs(600)
     };
 
     let client = reqwest::Client::builder()
-        .timeout(if is_radio {
-            std::time::Duration::from_secs(86400)
-        } else {
-            timeout
-        })
+        .timeout(timeout)
         .build();
 
     let Ok(client) = client else {
@@ -447,6 +448,39 @@ async fn proxy_stream(upstream_url: &str, info: &StreamInfo, is_radio: bool) -> 
         "transferMode.dlna.org",
         HeaderValue::from_static("Streaming"),
     );
+
+    // DLNA renderers (e.g. Eversolo DMP-A8 with Lavf) send Range: bytes=0-
+    // and expect 206 Partial Content with Content-Range header.
+    // Returning 200 OK causes them to abort after ~31 seconds.
+    let range_requested = req_headers
+        .get("Range")
+        .and_then(|v| v.to_str().ok())
+        .filter(|r| r.starts_with("bytes=0-"));
+
+    if let (Some(_), Some(cl)) = (range_requested, content_length) {
+        headers.insert("Content-Length", HeaderValue::from(cl));
+        headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes 0-{}/{}", cl - 1, cl)).unwrap(),
+        );
+
+        let body = Body::from_stream(async_stream::stream! {
+            let mut stream = upstream_resp.bytes_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
+                    Err(e) => {
+                        warn!(error = %e, "proxy_chunk_error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
+
     if let Some(cl) = content_length {
         headers.insert("Content-Length", HeaderValue::from(cl));
     }

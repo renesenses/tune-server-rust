@@ -223,6 +223,21 @@ async fn handle_event(
             let dev_id = device.id.clone();
 
             let mut st = state.lock().await;
+
+            // For AirPlay: skip RAOP if AirPlay2 already registered for this host (or vice versa)
+            if output_type == OutputType::Airplay {
+                let host_already = st.devices.values().any(|d| {
+                    d.device_type == OutputType::Airplay
+                        && d.host == device.host
+                        && d.id != dev_id
+                });
+                if host_already {
+                    debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_airplay_dup_skipped");
+                    drop(st);
+                    return;
+                }
+            }
+
             let is_new = !st.devices.contains_key(&dev_id);
             st.service_to_device
                 .insert(info.get_fullname().to_string(), dev_id.clone());
@@ -262,7 +277,7 @@ fn service_to_device(
     output_type: OutputType,
     default_port: u16,
 ) -> DiscoveredDevice {
-    let name = info
+    let raw_name = info
         .get_fullname()
         .split('.')
         .next()
@@ -271,9 +286,22 @@ fn service_to_device(
         .trim()
         .to_string();
 
+    // RAOP names look like "800A805D4DEE@DMP-A8" — strip the hex MAC prefix
+    let name = if output_type == OutputType::Airplay {
+        if let Some(pos) = raw_name.find('@') {
+            let after = &raw_name[pos + 1..];
+            if !after.is_empty() { after.to_string() } else { raw_name }
+        } else {
+            raw_name
+        }
+    } else {
+        raw_name
+    };
+
     let friendly_name = info
         .get_property_val_str("fn")
         .or_else(|| info.get_property_val_str("n"))
+        .or_else(|| info.get_property_val_str("am"))
         .map(|s| s.to_string())
         .unwrap_or_else(|| name.clone());
 
@@ -372,5 +400,29 @@ mod tests {
         assert!(CHROMECAST_SERVICE.ends_with(".local."));
         assert!(SQUEEZEBOX_SERVICE.ends_with(".local."));
         assert!(TUNE_SERVICE.ends_with(".local."));
+    }
+
+    #[test]
+    fn raop_name_strips_mac_prefix() {
+        let raw = "800A805D4DEE@DMP-A8";
+        let name = if let Some(pos) = raw.find('@') {
+            let after = &raw[pos + 1..];
+            if !after.is_empty() { after.to_string() } else { raw.to_string() }
+        } else {
+            raw.to_string()
+        };
+        assert_eq!(name, "DMP-A8");
+    }
+
+    #[test]
+    fn non_raop_name_unchanged() {
+        let raw = "Mac Studio";
+        let name = if let Some(pos) = raw.find('@') {
+            let after = &raw[pos + 1..];
+            if !after.is_empty() { after.to_string() } else { raw.to_string() }
+        } else {
+            raw.to_string()
+        };
+        assert_eq!(name, "Mac Studio");
     }
 }
