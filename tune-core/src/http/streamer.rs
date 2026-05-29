@@ -272,13 +272,43 @@ pub async fn handle_stream(
     let bd = session.info.bit_depth;
     let ch = session.info.channels;
 
+    let has_icy = wants_icy && (session.track_title.is_some() || session.track_artist.is_some());
+    let icy_block = if has_icy {
+        build_icy_metadata(
+            session.track_artist.as_deref(),
+            session.track_title.as_deref(),
+            session.cover_url.as_deref(),
+        )
+    } else {
+        vec![0u8]
+    };
+
     let body = Body::from_stream(async_stream::stream! {
         if is_wav {
             let hdr = build_wav_header(ch, sr, bd);
             yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
         }
-        while let Some(chunk) = session.recv_chunk().await {
-            yield Ok(bytes::Bytes::from(chunk));
+
+        if has_icy {
+            let mut bytes_since_meta: usize = 0;
+            while let Some(chunk) = session.recv_chunk().await {
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let remaining = ICY_METAINT - bytes_since_meta;
+                    let end = (offset + remaining).min(chunk.len());
+                    yield Ok(bytes::Bytes::copy_from_slice(&chunk[offset..end]));
+                    bytes_since_meta += end - offset;
+                    offset = end;
+                    if bytes_since_meta >= ICY_METAINT {
+                        yield Ok(bytes::Bytes::copy_from_slice(&icy_block));
+                        bytes_since_meta = 0;
+                    }
+                }
+            }
+        } else {
+            while let Some(chunk) = session.recv_chunk().await {
+                yield Ok(bytes::Bytes::from(chunk));
+            }
         }
     });
 
@@ -409,9 +439,7 @@ async fn proxy_stream(
         std::time::Duration::from_secs(600)
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build();
+    let client = reqwest::Client::builder().timeout(timeout).build();
 
     let Ok(client) = client else {
         return StatusCode::BAD_GATEWAY.into_response();
@@ -511,6 +539,36 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
         .with_state(sessions)
 }
 
+fn build_icy_metadata(
+    artist: Option<&str>,
+    title: Option<&str>,
+    cover_url: Option<&str>,
+) -> Vec<u8> {
+    let mut parts = Vec::new();
+    let stream_title = match (artist, title) {
+        (Some(a), Some(t)) => Some(format!("{a} - {t}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(t)) => Some(t.to_string()),
+        (None, None) => None,
+    };
+    if let Some(st) = stream_title {
+        parts.push(format!("StreamTitle='{st}';"));
+    }
+    if let Some(url) = cover_url {
+        parts.push(format!("StreamUrl='{url}';"));
+    }
+    if parts.is_empty() {
+        return vec![0u8];
+    }
+    let mut payload = parts.join("").into_bytes();
+    let pad = (16 - payload.len() % 16) % 16;
+    payload.resize(payload.len() + pad, 0);
+    let len_byte = (payload.len() / 16).min(255) as u8;
+    let mut block = vec![len_byte];
+    block.extend_from_slice(&payload[..len_byte as usize * 16]);
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +606,29 @@ mod tests {
         let url = streamer.get_stream_url(&id, "192.168.1.18", "flac");
         assert!(url.contains(".flac"));
         streamer.remove_session(&id).await;
+    }
+
+    #[test]
+    fn icy_metadata_block() {
+        let block = build_icy_metadata(Some("Artist"), Some("Title"), None);
+        assert!(block.len() > 1);
+        let len_byte = block[0] as usize;
+        assert_eq!(block.len(), 1 + len_byte * 16);
+        let payload = std::str::from_utf8(&block[1..]).unwrap();
+        assert!(payload.contains("StreamTitle='Artist - Title'"));
+    }
+
+    #[test]
+    fn icy_metadata_empty() {
+        let block = build_icy_metadata(None, None, None);
+        assert_eq!(block, vec![0u8]);
+    }
+
+    #[test]
+    fn icy_metadata_with_cover() {
+        let block = build_icy_metadata(Some("A"), Some("T"), Some("http://example.com/cover.jpg"));
+        let payload = String::from_utf8_lossy(&block[1..]);
+        assert!(payload.contains("StreamUrl='http://example.com/cover.jpg'"));
     }
 
     #[tokio::test]

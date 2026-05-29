@@ -60,8 +60,13 @@ pub trait OutputTarget: Send + Sync {
         artist: Option<&str>,
     ) -> Result<(), String> {
         self.play_media(&PlayMedia {
-            url, mime_type, title, artist, ..Default::default()
-        }).await
+            url,
+            mime_type,
+            title,
+            artist,
+            ..Default::default()
+        })
+        .await
     }
 
     async fn play_media(&self, _media: &PlayMedia<'_>) -> Result<(), String> {
@@ -88,6 +93,7 @@ pub trait OutputTarget: Send + Sync {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        self.set_next_url(media.url, media.mime_type, media.title, media.artist).await
+        self.set_next_url(media.url, media.mime_type, media.title, media.artist)
+            .await
     }
 }

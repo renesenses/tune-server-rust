@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use quick_xml::Reader;
@@ -164,10 +164,7 @@ impl OpenHomeEventListener {
             return None;
         }
 
-        self.handlers
-            .write()
-            .await
-            .insert(path_id.clone(), state);
+        self.handlers.write().await.insert(path_id.clone(), state);
         self.subscriptions
             .write()
             .await
@@ -227,9 +224,7 @@ async fn handle_notify(
 
     let mut body = vec![0u8; content_length];
     if content_length > 0 && buf_reader.read_exact(&mut body).await.is_err() {
-        let _ = writer
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await;
+        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
         return;
     }
 

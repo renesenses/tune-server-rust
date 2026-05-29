@@ -227,9 +227,7 @@ async fn handle_event(
             // For AirPlay: skip RAOP if AirPlay2 already registered for this host (or vice versa)
             if output_type == OutputType::Airplay {
                 let host_already = st.devices.values().any(|d| {
-                    d.device_type == OutputType::Airplay
-                        && d.host == device.host
-                        && d.id != dev_id
+                    d.device_type == OutputType::Airplay && d.host == device.host && d.id != dev_id
                 });
                 if host_already {
                     debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_airplay_dup_skipped");
@@ -290,7 +288,11 @@ fn service_to_device(
     let name = if output_type == OutputType::Airplay {
         if let Some(pos) = raw_name.find('@') {
             let after = &raw_name[pos + 1..];
-            if !after.is_empty() { after.to_string() } else { raw_name }
+            if !after.is_empty() {
+                after.to_string()
+            } else {
+                raw_name
+            }
         } else {
             raw_name
         }
@@ -407,7 +409,11 @@ mod tests {
         let raw = "800A805D4DEE@DMP-A8";
         let name = if let Some(pos) = raw.find('@') {
             let after = &raw[pos + 1..];
-            if !after.is_empty() { after.to_string() } else { raw.to_string() }
+            if !after.is_empty() {
+                after.to_string()
+            } else {
+                raw.to_string()
+            }
         } else {
             raw.to_string()
         };
@@ -419,7 +425,11 @@ mod tests {
         let raw = "Mac Studio";
         let name = if let Some(pos) = raw.find('@') {
             let after = &raw[pos + 1..];
-            if !after.is_empty() { after.to_string() } else { raw.to_string() }
+            if !after.is_empty() {
+                after.to_string()
+            } else {
+                raw.to_string()
+            }
         } else {
             raw.to_string()
         };

@@ -218,10 +218,7 @@ impl RtspSession {
     }
 
     async fn record(&mut self) -> Result<(), String> {
-        let mut headers = vec![
-            ("Range", "npt=0-"),
-            ("RTP-Info", "seq=0;rtptime=0"),
-        ];
+        let mut headers = vec![("Range", "npt=0-"), ("RTP-Info", "seq=0;rtptime=0")];
         let session_id = self.session_id.clone().unwrap_or_default();
         if !session_id.is_empty() {
             headers.push(("Session", &session_id));
@@ -473,11 +470,16 @@ async fn stream_to_airplay(
 ) -> Result<(), String> {
     let mut child = tokio::process::Command::new(ffmpeg)
         .args([
-            "-i", url,
-            "-f", "s16be",
-            "-ar", &SAMPLE_RATE.to_string(),
-            "-ac", &CHANNELS.to_string(),
-            "-acodec", "pcm_s16be",
+            "-i",
+            url,
+            "-f",
+            "s16be",
+            "-ar",
+            &SAMPLE_RATE.to_string(),
+            "-ac",
+            &CHANNELS.to_string(),
+            "-acodec",
+            "pcm_s16be",
             "-",
         ])
         .stdout(Stdio::piped())
@@ -494,8 +496,7 @@ async fn stream_to_airplay(
     let mut audio_buf = vec![0u8; BYTES_PER_PACKET];
     let mut total_frames: u64 = 0;
 
-    let udp = tokio::net::UdpSocket::from_std(udp)
-        .map_err(|e| format!("tokio udp: {e}"))?;
+    let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
     let start_time = tokio::time::Instant::now();
 
     loop {

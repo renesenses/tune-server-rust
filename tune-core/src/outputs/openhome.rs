@@ -201,13 +201,8 @@ impl OpenHomeOutput {
 
     async fn playlist_seek_id(&self, id: u32) -> Result<(), String> {
         if let Some(url) = self.svc_url("playlist") {
-            self.soap_call(
-                url,
-                SVC_PLAYLIST,
-                "SeekId",
-                &[("Value", &id.to_string())],
-            )
-            .await?;
+            self.soap_call(url, SVC_PLAYLIST, "SeekId", &[("Value", &id.to_string())])
+                .await?;
         }
         Ok(())
     }
@@ -312,12 +307,7 @@ impl OpenHomeOutput {
         let escaped_url = quick_xml::escape::escape(url);
 
         let album_tag = album
-            .map(|a| {
-                format!(
-                    "<upnp:album>{}</upnp:album>",
-                    quick_xml::escape::escape(a)
-                )
-            })
+            .map(|a| format!("<upnp:album>{}</upnp:album>", quick_xml::escape::escape(a)))
             .unwrap_or_default();
         let art_tag = cover_url
             .map(|c| {
@@ -420,8 +410,13 @@ impl OutputTarget for OpenHomeOutput {
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
         let level = (volume * 100.0).round().clamp(0.0, 100.0) as u32;
         if let Some(url) = self.svc_url("volume") {
-            self.soap_call(url, SVC_VOLUME, "SetVolume", &[("Value", &level.to_string())])
-                .await?;
+            self.soap_call(
+                url,
+                SVC_VOLUME,
+                "SetVolume",
+                &[("Value", &level.to_string())],
+            )
+            .await?;
         }
         Ok(())
     }
@@ -497,11 +492,7 @@ impl OutputTarget for OpenHomeOutput {
             false
         };
 
-        let current_uri = if eventing {
-            cached_uri
-        } else {
-            None
-        };
+        let current_uri = if eventing { cached_uri } else { None };
 
         let (current_uri, track_title, track_artist) = if current_uri.is_some() {
             (current_uri, None, None)
@@ -556,9 +547,7 @@ impl OutputTarget for OpenHomeOutput {
             media.cover_url,
         );
         let after_id = self.current_oh_id.lock().await.unwrap_or(0);
-        let new_id = self
-            .playlist_insert(after_id, media.url, &metadata)
-            .await?;
+        let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;
         if let Some(id) = new_id {
             info!(device = %self.name, url = media.url, oh_id = id, "oh_set_next");
         }
@@ -572,11 +561,7 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
     let text = xml[start..end].trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 #[cfg(test)]

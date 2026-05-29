@@ -570,7 +570,8 @@ async fn main() {
                                 })
                                 .unwrap_or_default();
 
-                            if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
+                            if dev.device_type == tune_core::discovery::device::OutputType::Openhome
+                            {
                                 let evt_urls = dev
                                     .capabilities
                                     .get("event_sub_urls")
@@ -655,7 +656,13 @@ async fn main() {
                                 } else {
                                     short_name.to_string()
                                 };
-                                let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome { "openhome" } else { "dlna" };
+                                let type_str = if dev.device_type
+                                    == tune_core::discovery::device::OutputType::Openhome
+                                {
+                                    "openhome"
+                                } else {
+                                    "dlna"
+                                };
                                 if let Ok(zid) =
                                     zone_repo.create(&zone_name, Some(type_str), Some(&dev.id))
                                 {
@@ -698,37 +705,39 @@ async fn main() {
             while let Some(event) = mdns_rx.recv().await {
                 match event {
                     MdnsEvent::DeviceDiscovered(dev) | MdnsEvent::DeviceUpdated(dev) => {
-                        let (output, output_type_str): (Option<Box<dyn tune_core::outputs::OutputTarget>>, &str) =
-                            match dev.device_type {
-                                OutputType::Chromecast => {
-                                    let cast = tune_core::outputs::chromecast::ChromecastOutput::new(
-                                        dev.name.clone(),
-                                        dev.id.clone(),
-                                        dev.host.clone(),
-                                        dev.port,
-                                    );
-                                    (Some(Box::new(cast)), "chromecast")
-                                }
-                                OutputType::Airplay => {
-                                    let ap = tune_core::outputs::airplay::AirplayOutput::new(
-                                        dev.name.clone(),
-                                        dev.id.clone(),
-                                        dev.host.clone(),
-                                        dev.port,
-                                    );
-                                    (Some(Box::new(ap)), "airplay")
-                                }
-                                OutputType::Bluos => {
-                                    let bluos = tune_core::outputs::bluos::BluosOutput::new(
-                                        dev.name.clone(),
-                                        dev.id.clone(),
-                                        dev.host.clone(),
-                                        dev.port,
-                                    );
-                                    (Some(Box::new(bluos)), "bluos")
-                                }
-                                _ => (None, ""),
-                            };
+                        let (output, output_type_str): (
+                            Option<Box<dyn tune_core::outputs::OutputTarget>>,
+                            &str,
+                        ) = match dev.device_type {
+                            OutputType::Chromecast => {
+                                let cast = tune_core::outputs::chromecast::ChromecastOutput::new(
+                                    dev.name.clone(),
+                                    dev.id.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                );
+                                (Some(Box::new(cast)), "chromecast")
+                            }
+                            OutputType::Airplay => {
+                                let ap = tune_core::outputs::airplay::AirplayOutput::new(
+                                    dev.name.clone(),
+                                    dev.id.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                );
+                                (Some(Box::new(ap)), "airplay")
+                            }
+                            OutputType::Bluos => {
+                                let bluos = tune_core::outputs::bluos::BluosOutput::new(
+                                    dev.name.clone(),
+                                    dev.id.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                );
+                                (Some(Box::new(bluos)), "bluos")
+                            }
+                            _ => (None, ""),
+                        };
 
                         if let Some(output) = output {
                             let mut reg = outputs.lock().await;
@@ -749,9 +758,11 @@ async fn main() {
                                 // (e.g., DLNA already created "DMP-A8", skip AirPlay duplicate)
                                 let name_taken = existing.iter().any(|z| z.name == dev.name);
                                 if !name_taken {
-                                    if let Ok(zid) =
-                                        zone_repo.create(&dev.name, Some(output_type_str), Some(&dev.id))
-                                    {
+                                    if let Ok(zid) = zone_repo.create(
+                                        &dev.name,
+                                        Some(output_type_str),
+                                        Some(&dev.id),
+                                    ) {
                                         info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                     }
                                 } else {
