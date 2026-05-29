@@ -30,6 +30,7 @@ pub mod library_watcher;
 pub mod m3u_parser;
 pub mod metadata;
 pub mod metadata_enrichment;
+pub mod metadata_matcher;
 pub mod metadata_suggestions;
 pub mod musicbrainz_release;
 pub mod mount_manager;
@@ -43,6 +44,7 @@ pub mod playback_history;
 pub mod playlist_manager;
 pub mod playlist_sync;
 pub mod playlist_transfer;
+pub mod plugin_sdk;
 pub mod plugins;
 pub mod poller;
 pub mod radio_favorites;
@@ -64,6 +66,7 @@ pub mod genre_tree;
 pub mod updater;
 pub mod upnp_server;
 pub mod user_profiles;
+pub mod zone_manager;
 pub mod zones;
 
 pub fn version() -> &'static str {
