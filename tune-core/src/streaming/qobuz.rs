@@ -245,11 +245,7 @@ impl QobuzService {
         let has_children = item["subgenresCount"]
             .as_u64()
             .map(|n| n > 0)
-            .or_else(|| {
-                item["subgenres"]
-                    .as_array()
-                    .map(|a| !a.is_empty())
-            })
+            .or_else(|| item["subgenres"].as_array().map(|a| !a.is_empty()))
             .unwrap_or_else(|| {
                 // Top-level genres (slug without '/') typically have children
                 item["slug"]
@@ -898,7 +894,10 @@ mod tests {
         assert_eq!(genre.id, "10");
         assert_eq!(genre.name, "Jazz");
         assert!(genre.has_children);
-        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/jazz.jpg"));
+        assert_eq!(
+            genre.image_url.as_deref(),
+            Some("http://img.qobuz.com/jazz.jpg")
+        );
     }
 
     #[test]
@@ -915,7 +914,10 @@ mod tests {
         assert_eq!(genre.id, "10");
         assert_eq!(genre.name, "Jazz");
         assert!(genre.has_children);
-        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/jazz-large.jpg"));
+        assert_eq!(
+            genre.image_url.as_deref(),
+            Some("http://img.qobuz.com/jazz-large.jpg")
+        );
     }
 
     #[test]
@@ -928,7 +930,10 @@ mod tests {
             "image": {"large": "http://img.qobuz.com/classical.jpg", "small": "http://img.qobuz.com/classical-sm.jpg"},
         });
         let genre = QobuzService::map_genre(&json);
-        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/classical.jpg"));
+        assert_eq!(
+            genre.image_url.as_deref(),
+            Some("http://img.qobuz.com/classical.jpg")
+        );
     }
 
     #[test]

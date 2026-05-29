@@ -171,11 +171,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
         .get("onboarding_complete")
         .and_then(|v| v.as_str())
         .map(|v| v == "true")
-        .or_else(|| {
-            config
-                .get("onboarding_complete")
-                .and_then(|v| v.as_bool())
-        })
+        .or_else(|| config.get("onboarding_complete").and_then(|v| v.as_bool()))
         .unwrap_or(false);
     config
         .entry("onboarding_completed".to_string())
@@ -558,12 +554,14 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 "UPDATE tracks SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
                 [],
-            ).ok();
+            )
+            .ok();
             conn.execute(
                 "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
                 [],
-            ).ok();
+            )
+            .ok();
         }
 
         for album in album_repo.list(99999, 0).unwrap_or_default() {
