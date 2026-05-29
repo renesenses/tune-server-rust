@@ -2904,6 +2904,7 @@ dependencies = [
  "cpal",
  "csv",
  "futures-util",
+ "if-addrs",
  "lofty",
  "md-5",
  "mdns-sd",

@@ -140,7 +140,7 @@ impl PositionPoller {
                     album_title: None,
                     cover_path: None,
                     duration_ms: status.duration_ms as i64,
-                    source: "recovered".into(),
+                    source: "local".into(),
                     source_id: None,
                     stream_id: None,
                 };
@@ -194,7 +194,7 @@ impl PositionPoller {
             let is_radio = zone_state
                 .now_playing
                 .as_ref()
-                .map(|np| np.source == "radio" || np.source == "recovered")
+                .map(|np| np.source == "radio")
                 .unwrap_or(false);
             if is_radio {
                 let should_poll = poll_states

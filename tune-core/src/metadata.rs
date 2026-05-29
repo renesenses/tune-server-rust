@@ -77,6 +77,7 @@ pub fn normalize_format(raw: &str) -> String {
     match raw {
         "mpeg" => "mp3".to_string(),
         "dsf" | "dff" => "dsd".to_string(),
+        "mp4" | "m4a" => "aac".to_string(),
         other => other.to_string(),
     }
 }
