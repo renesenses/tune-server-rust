@@ -523,6 +523,59 @@ async fn main() {
         }
     }
 
+    // Register local audio output devices (USB DAC, headphones, speakers)
+    #[cfg(feature = "local-audio")]
+    {
+        let devices = tune_core::outputs::local::list_audio_devices();
+        if !devices.is_empty() {
+            let mut outputs = state.outputs.lock().await;
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            let existing_zones = zone_repo.list().unwrap_or_default();
+
+            for dev in &devices {
+                let device_id = format!("local:{}", dev.name);
+                let local_out = tune_core::outputs::local::LocalOutput::new(dev.name.clone());
+                outputs.register(Box::new(local_out));
+                info!(
+                    name = %dev.name,
+                    device_id = %device_id,
+                    default = dev.is_default,
+                    channels = dev.max_channels,
+                    rates = ?dev.sample_rates,
+                    "local_audio_output_registered"
+                );
+
+                // Auto-create zone if not already mapped to this device
+                let already = existing_zones
+                    .iter()
+                    .any(|z| z.output_device_id.as_deref() == Some(&device_id));
+                if !already {
+                    let zone_name = if dev.is_default {
+                        "This Computer".to_string()
+                    } else {
+                        dev.name.clone()
+                    };
+                    // Skip if a zone with that name already exists
+                    let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
+                    if !name_taken {
+                        if let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(&device_id)) {
+                            info!(
+                                name = %zone_name,
+                                zone_id = zid,
+                                device_id = %device_id,
+                                "local_audio_zone_auto_created"
+                            );
+                        }
+                    }
+                }
+            }
+
+            info!(count = devices.len(), "local_audio_devices_registered");
+        } else {
+            info!("no_local_audio_devices_found");
+        }
+    }
+
     let oh_event_listener = {
         let server_ip = tune_core::discovery::ssdp::get_local_ip()
             .map(|ip| ip.to_string())
