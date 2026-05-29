@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::discovery::ssdp::SsdpScanner;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub config: Arc<TuneConfig>,
     pub port: u16,
     pub started_at: Instant,
+    pub bridge_responses: Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
 }
 
 impl AppState {
@@ -85,6 +87,7 @@ impl AppState {
             config: Arc::new(tune_config),
             port,
             started_at: Instant::now(),
+            bridge_responses: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 

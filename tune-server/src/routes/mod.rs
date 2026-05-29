@@ -55,6 +55,7 @@ pub mod tags;
 pub mod upnp;
 pub mod visualizer;
 pub mod widget;
+pub mod bridge;
 pub mod ws;
 pub mod zone_manager;
 pub mod zones;
@@ -408,6 +409,7 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
+        .nest("/ws/bridge", bridge::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
         .merge(deezer_proxy);
