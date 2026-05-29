@@ -775,7 +775,7 @@ impl PlaybackOrchestrator {
 
         let result = self.play(req).await?;
         self.playback
-            .update_queue_info(zone_id, position, queue.len() as i64)
+            .update_queue_info(zone_id, position, streaming.len() as i64)
             .await;
         Ok(result)
     }

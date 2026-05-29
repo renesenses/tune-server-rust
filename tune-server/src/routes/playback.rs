@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -352,11 +353,9 @@ async fn play(
         };
     }
 
-    let track_ids: Vec<i64> = if let Some(ids) = body.track_ids {
-        ids
-    } else if let Some(id) = body.track_id {
-        vec![id]
-    } else if let Some(album_id) = body.album_id {
+    // Resolve track list: containers (album/playlist) take priority so the full
+    // collection is always queued, even when a track_id is also provided.
+    let track_ids: Vec<i64> = if let Some(album_id) = body.album_id {
         track_repo
             .list_by_album(album_id)
             .unwrap_or_default()
@@ -367,6 +366,10 @@ async fn play(
         tune_core::db::playlist_repo::PlaylistRepo::new(state.db.clone())
             .get_track_ids(playlist_id)
             .unwrap_or_default()
+    } else if let Some(ids) = body.track_ids {
+        ids
+    } else if let Some(id) = body.track_id {
+        vec![id]
     } else {
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
@@ -375,9 +378,18 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    queue_repo.set_queue(zone_id, &track_ids).ok();
+    if let Err(e) = queue_repo.set_queue(zone_id, &track_ids) {
+        warn!(zone_id, error = %e, "set_queue_failed");
+    }
 
-    let start = body.start_index.unwrap_or(0);
+    // When a container (album/playlist) is requested alongside a track_id,
+    // infer start_index from the position of that track in the resolved list.
+    let start = body.start_index.unwrap_or_else(|| {
+        body.track_id
+            .and_then(|tid| track_ids.iter().position(|&id| id == tid))
+            .map(|pos| pos as i64)
+            .unwrap_or(0)
+    });
     if start > 0 {
         queue_repo.set_current(zone_id, start).ok();
     }
