@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats))
         .route("/config", get(get_config).patch(update_config))
         .route("/settings", get(get_settings))
+        .route("/library/clear", post(library_clear))
         .route("/scan", post(trigger_scan))
         .route("/scan/status", get(scan_status))
         .route("/scan/cancel", post(scan_cancel))
@@ -209,6 +210,20 @@ async fn update_config(
         }
     }
     Json(json!({"ok": true})).into_response()
+}
+
+async fn library_clear(State(state): State<AppState>) -> Json<Value> {
+    let repo = tune_core::db::track_repo::TrackRepo::new(state.db.clone());
+    match repo.delete_all() {
+        Ok(count) => {
+            tracing::info!(tracks_deleted = count, "library_cleared");
+            Json(json!({"ok": true, "deleted": count}))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "library_clear_failed");
+            Json(json!({"ok": false, "error": e}))
+        }
+    }
 }
 
 async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {

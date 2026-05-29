@@ -84,6 +84,14 @@ impl TrackRepo {
         Ok(())
     }
 
+    pub fn delete_all(&self) -> Result<u64, String> {
+        let count = self.db.execute("DELETE FROM tracks", &[])?;
+        self.db.execute("DELETE FROM albums", &[]).ok();
+        self.db.execute("DELETE FROM artists", &[]).ok();
+        self.db.execute("DELETE FROM track_credits", &[]).ok();
+        Ok(count as u64)
+    }
+
     pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
         self.db.execute(
             "DELETE FROM tracks WHERE file_path = ?",
