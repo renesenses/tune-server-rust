@@ -1132,6 +1132,39 @@ async fn changelog() -> Json<Value> {
         "version": tune_core::version(),
         "entries": [
             {
+                "version": "0.8.6",
+                "date": "2026-05-29",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Play queue — file de lecture correcte en lançant album ou playlist",
+                        "DLNA gapless — toggle par zone + URLs pochettes dans DIDL",
+                        "Qobuz genres — format API réel pris en charge",
+                        "Onboarding — onboarding_completed + genres JSON array",
+                    ]},
+                    { "title": "Nouveautés", "items": [
+                        "OAAT — feature flag activé pour streaming bit-perfect",
+                        "Library clear — endpoint POST /system/library/clear",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.5",
+                "date": "2026-05-29",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Windows — scan bibliothèque retournait 0 résultats (chemins)",
+                        "Spotify — lecture TUNE_SPOTIFY_CLIENT_ID pour OAuth",
+                        "Squeezebox/LMS — erreur JSON-parse sur réponse vide",
+                        "SSDP — énumération des vraies interfaces réseau",
+                        "MP4/AAC — normalisation du format",
+                    ]},
+                    { "title": "Nouveautés", "items": [
+                        "Audio USB local — sortie audio via cpal",
+                        "Changelog intégré dans l'interface web",
+                    ]},
+                ]
+            },
+            {
                 "version": "0.8.4",
                 "date": "2026-05-29",
                 "sections": [
