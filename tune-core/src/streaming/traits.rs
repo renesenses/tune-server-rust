@@ -100,6 +100,7 @@ pub struct AuthStatus {
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     fn name(&self) -> &str;
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);

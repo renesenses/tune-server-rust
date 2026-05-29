@@ -263,6 +263,32 @@ impl TrackRepo {
         Ok(ids)
     }
 
+    pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![path], |row| Ok(row_to_track(row)))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, String> {
+        let like = format!("%{title}%");
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_TRACK} WHERE t.title LIKE ? COLLATE NOCASE LIMIT ?"
+            ))
+            .map_err(|e| e.to_string())?;
+        let tracks = stmt
+            .query_map(params![like, limit], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tracks)
+    }
+
     pub fn deduplicate(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i64 = conn

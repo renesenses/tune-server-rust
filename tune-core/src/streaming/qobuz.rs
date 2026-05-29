@@ -262,6 +262,7 @@ impl QobuzService {
 #[async_trait::async_trait]
 impl StreamingService for QobuzService {
     fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
     fn name(&self) -> &str {
         "qobuz"
     }

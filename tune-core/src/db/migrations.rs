@@ -265,6 +265,46 @@ CREATE INDEX IF NOT EXISTS idx_offline_cache_source ON offline_cache(source, sou
 CREATE INDEX IF NOT EXISTS idx_offline_cache_status ON offline_cache(status);
 ",
     },
+    Migration {
+        version: 14,
+        name: "add_sync_links",
+        up: "
+CREATE TABLE IF NOT EXISTS sync_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_playlist_id INTEGER NOT NULL,
+    service TEXT NOT NULL,
+    remote_playlist_id TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT '\"bidirectional\"',
+    last_synced TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS sync_link_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playlist_link_id INTEGER NOT NULL REFERENCES sync_links(id) ON DELETE CASCADE,
+    side TEXT NOT NULL,
+    tracks_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sync_snapshots_link ON sync_link_snapshots(playlist_link_id, side);
+",
+    },
+    Migration {
+        version: 15,
+        name: "add_smart_collections",
+        up: "
+CREATE TABLE IF NOT EXISTS smart_collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    rules TEXT NOT NULL DEFAULT '[]',
+    match_mode TEXT NOT NULL DEFAULT '\"all\"',
+    sort_by TEXT,
+    sort_order TEXT NOT NULL DEFAULT '\"asc\"',
+    max_limit INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

@@ -1,3 +1,8 @@
+pub mod crossfade;
+pub mod gapless;
+pub mod queue;
+pub mod radio_handler;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

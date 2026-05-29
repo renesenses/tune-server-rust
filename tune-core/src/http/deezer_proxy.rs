@@ -9,13 +9,11 @@ use tracing::{info, warn};
 
 use crate::streaming::deezer::DeezerService;
 use crate::streaming::deezer_decrypt::DeezerDecryptStream;
-use crate::streaming::traits::StreamingService;
-
-type SharedDeezer = Arc<Mutex<Box<dyn StreamingService>>>;
+use crate::streaming::ServiceRegistry;
 
 pub async fn handle_deezer_proxy(
     Path(filename): Path<String>,
-    State(deezer_svc): State<SharedDeezer>,
+    State(services): State<Arc<Mutex<ServiceRegistry>>>,
 ) -> Response {
     let sng_id = filename.split('.').next().unwrap_or(&filename);
     if sng_id.is_empty() || !sng_id.chars().all(|c| c.is_ascii_digit()) {
@@ -34,7 +32,12 @@ pub async fn handle_deezer_proxy(
     };
 
     let upstream_url = {
-        let svc = deezer_svc.lock().await;
+        let registry = services.lock().await;
+        let svc = match registry.get("deezer") {
+            Some(s) => s,
+            None => return (StatusCode::NOT_FOUND, "deezer not registered").into_response(),
+        };
+        let svc = svc.lock().await;
         let deezer = match svc.as_any().downcast_ref::<DeezerService>() {
             Some(d) => d,
             None => return (StatusCode::INTERNAL_SERVER_ERROR, "not deezer").into_response(),

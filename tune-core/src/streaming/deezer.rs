@@ -34,6 +34,7 @@ impl DeezerService {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
                 .unwrap(),
             access_token: None,
@@ -70,11 +71,19 @@ impl DeezerService {
             .client
             .post(&url)
             .header("Cookie", format!("arl={arl}"))
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
             .json(&params.unwrap_or(serde_json::json!({})))
             .send()
             .await
             .map_err(|e| format!("deezer gw: {e}"))?;
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("deezer gw json: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| format!("deezer gw body: {e}"))?;
+        if !status.is_success() || body.starts_with('<') {
+            tracing::warn!(method, %status, body_preview = &body[..body.len().min(200)], "deezer_gw_blocked");
+            return Err(format!("deezer gw http {status}"));
+        }
+        let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("deezer gw json: {e}"))?;
         if let Some(err) = data.get("error").and_then(|e| e.as_object()) {
             if !err.is_empty() {
                 return Err(format!("deezer gw error: {}", serde_json::json!(err)));
@@ -90,15 +99,15 @@ impl DeezerService {
         self.arl = Some(arl.into());
         let result = self.gw_api_call("deezer.getUserData", None).await?;
         let user = &result["USER"];
-        let user_id = user["USER_ID"]
-            .as_str()
-            .or_else(|| user["USER_ID"].as_u64().map(|_| ""))
-            .unwrap_or("0");
-        if user_id == "0" || user_id.is_empty() {
+        let user_id_num = user["USER_ID"]
+            .as_u64()
+            .or_else(|| user["USER_ID"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        if user_id_num == 0 {
             self.arl = None;
             return Err("ARL invalide ou expiré".into());
         }
-        self.user_id = user["USER_ID"].as_u64().or_else(|| user_id.parse().ok());
+        self.user_id = Some(user_id_num);
         self.username = user["BLOG_NAME"].as_str().map(Into::into);
         self.license_token = user
             .get("OPTIONS")
@@ -327,6 +336,9 @@ impl StreamingService for DeezerService {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &str {
         "deezer"
     }
@@ -399,7 +411,7 @@ impl StreamingService for DeezerService {
 
     async fn auth_status(&self) -> AuthStatus {
         AuthStatus {
-            authenticated: self.access_token.is_some(),
+            authenticated: self.access_token.is_some() || self.arl.is_some(),
             username: self.username.clone(),
             subscription: None,
             ..Default::default()

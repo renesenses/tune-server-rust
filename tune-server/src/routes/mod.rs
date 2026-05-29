@@ -398,11 +398,19 @@ pub fn router(state: AppState) -> Router {
         None
     };
 
+    let deezer_proxy = axum::Router::new()
+        .route(
+            "/deezer-proxy/{filename}",
+            get(tune_core::http::deezer_proxy::handle_deezer_proxy),
+        )
+        .with_state(state.services.clone());
+
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .with_state(state)
-        .merge(tune_core::http::streamer::router(streamer_sessions));
+        .merge(tune_core::http::streamer::router(streamer_sessions))
+        .merge(deezer_proxy);
 
     if let Some(upnp) = upnp_routes {
         app = app.nest("/upnp", upnp);
