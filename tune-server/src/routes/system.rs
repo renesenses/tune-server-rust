@@ -1011,7 +1011,61 @@ async fn system_peers() -> Json<Value> {
 }
 
 async fn changelog() -> Json<Value> {
-    Json(json!({ "entries": [], "version": tune_core::version() }))
+    Json(json!({
+        "version": tune_core::version(),
+        "entries": [
+            {
+                "version": "0.8.4",
+                "date": "2026-05-29",
+                "sections": [
+                    { "title": "Nouveaux protocoles", "items": [
+                        "AirPlay (RAOP) — lecture native sans dépendance externe",
+                        "BluOS — support Bluesound (Pulse, Node, Powernode)",
+                        "OpenHome — Linn et compatibles avec UPnP eventing",
+                        "OAAT — découverte mDNS, transport FLAC natif, bit-perfect",
+                    ]},
+                    { "title": "DLNA amélioré", "items": [
+                        "Retry automatique sur erreur SOAP",
+                        "Détection du mute",
+                        "Pochette d'album dans les métadonnées DIDL",
+                        "Meilleur support DSD (format DSF explicite pour FFmpeg)",
+                    ]},
+                    { "title": "Nouvelles fonctionnalités", "items": [
+                        "Deezer — proxy de déchiffrement intégré",
+                        "DJ Player — mode DJ avec crossfade",
+                        "Profils utilisateurs multi-profils",
+                        "Playlist transfer entre services de streaming",
+                        "Recherche full-text corrigée (FTS5)",
+                        "Alarmes — scheduler avec réveil programmé",
+                        "ICY metadata — titre/artiste des webradios",
+                        "Enrichissement crédits MusicBrainz automatique",
+                    ]},
+                    { "title": "Performances et stabilité", "items": [
+                        "SQLite optimisé — requêtes accélérées",
+                        "Prévention des fuites mémoire (session GC, cache eviction)",
+                        "SSDP optimisé (scan unique, fréquence réduite)",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.3",
+                "date": "2026-05-29",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Docker fix critique — binaire vide corrigé",
+                        "FTS5 recherche full-text fonctionnelle",
+                        "SSDP optimisé — scan unique ssdp:all",
+                        "MP3 parsing relaxé",
+                    ]},
+                    { "title": "Nouveautés", "items": [
+                        "DMG macOS signé et notarisé (ARM + Intel)",
+                        "Installer Windows setup.exe (NSIS)",
+                        "Noms d'assets versionnés",
+                    ]},
+                ]
+            },
+        ]
+    }))
 }
 
 async fn scan_schedule(State(state): State<AppState>) -> Json<Value> {
