@@ -42,6 +42,7 @@ struct PatchZone {
     muted: Option<bool>,
     output_device_id: Option<String>,
     output_type: Option<String>,
+    gapless_enabled: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -176,6 +177,11 @@ async fn patch_zone(
     }
     if let Some(ref ot) = body.output_type {
         if let Err(e) = repo.update_output_type(id, ot) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(gapless) = body.gapless_enabled {
+        if let Err(e) = repo.update_gapless_enabled(id, gapless) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }

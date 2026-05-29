@@ -281,7 +281,18 @@ impl PositionPoller {
                         && status.duration_ms > GAPLESS_WINDOW_MS
                         && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
                     {
-                        self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                        // Only send SetNextAVTransportURI if gapless is enabled for this zone
+                        let gapless_enabled = ZoneRepo::new(self.db.clone())
+                            .get(zone_id)
+                            .ok()
+                            .flatten()
+                            .map(|z| z.gapless_enabled)
+                            .unwrap_or(true);
+                        if gapless_enabled {
+                            self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                        } else {
+                            debug!(zone_id, "gapless_disabled_for_zone");
+                        }
                         ps.gapless_sent = true;
                     }
                 }

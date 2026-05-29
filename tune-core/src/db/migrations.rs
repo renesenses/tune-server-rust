@@ -322,6 +322,11 @@ CREATE INDEX IF NOT EXISTS idx_listen_history_track ON listen_history(title, art
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id);
 ",
     },
+    Migration {
+        version: 17,
+        name: "add_zone_gapless_enabled",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -535,6 +540,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
+        }
+        if migration.version == 17 {
+            add_column_if_missing(db, "zones", "gapless_enabled", "INTEGER DEFAULT 1");
         }
 
         db.execute(

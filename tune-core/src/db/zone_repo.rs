@@ -12,6 +12,7 @@ pub struct Zone {
     pub volume: i32,
     pub muted: bool,
     pub online: bool,
+    pub gapless_enabled: bool,
 }
 
 pub struct ZoneRepo {
@@ -26,7 +27,7 @@ impl ZoneRepo {
     pub fn get(&self, id: i64) -> Result<Option<Zone>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online FROM zones WHERE id = ?")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled FROM zones WHERE id = ?")
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_zone(row)))
             .optional()
@@ -36,7 +37,7 @@ impl ZoneRepo {
     pub fn list(&self) -> Result<Vec<Zone>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online FROM zones ORDER BY name")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled FROM zones ORDER BY name")
             .map_err(|e| e.to_string())?;
         let zones = stmt
             .query_map([], |row| Ok(row_to_zone(row)))
@@ -113,6 +114,15 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
+        let val = if enabled { 1i64 } else { 0i64 };
+        self.db.execute(
+            "UPDATE zones SET gapless_enabled = ? WHERE id = ?",
+            &[&val as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val = if online { 1i64 } else { 0i64 };
         let conn = self.db.connection().lock().unwrap();
@@ -144,6 +154,7 @@ fn row_to_zone(row: &rusqlite::Row) -> Zone {
         volume: row.get(4).unwrap_or(50),
         muted: row.get::<_, i64>(5).unwrap_or(0) != 0,
         online: row.get::<_, i64>(6).unwrap_or(1) != 0,
+        gapless_enabled: row.get::<_, i64>(7).unwrap_or(1) != 0,
     }
 }
 

@@ -197,7 +197,8 @@ CREATE TABLE IF NOT EXISTS zones (
     output_device_id TEXT,
     volume INTEGER DEFAULT 50,
     muted INTEGER DEFAULT 0,
-    online INTEGER DEFAULT 1
+    online INTEGER DEFAULT 1,
+    gapless_enabled INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (

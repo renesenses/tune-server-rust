@@ -91,13 +91,14 @@ impl PlaybackOrchestrator {
         self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
 
         let output_sent = if let Some(ref device_id) = req.output_device_id {
+            let resolved_cover_url = Self::resolve_cover_url(cover_path.as_deref());
             let media = crate::outputs::traits::PlayMedia {
                 url: &stream_url,
                 mime_type: &mime_type,
                 title: Some(&title),
                 artist: artist.as_deref(),
                 album: req.album_title.as_deref(),
-                cover_url: cover_path.as_deref(),
+                cover_url: resolved_cover_url.as_deref(),
             };
             self.send_to_output(device_id, &media).await
         } else {
@@ -443,6 +444,27 @@ impl PlaybackOrchestrator {
             cover_path,
             sid,
         ))
+    }
+
+    /// Convert a cover_path (which may be a short hash or a full URL) into an
+    /// absolute HTTP URL accessible by network renderers (DLNA/OpenHome).
+    /// Hash-only values like `"abc123def"` become `http://IP:PORT/api/v1/artwork/abc123def`.
+    /// Full URLs (starting with `http://` or `https://`) are passed through unchanged.
+    fn resolve_cover_url(cover: Option<&str>) -> Option<String> {
+        let c = cover?;
+        if c.starts_with("http://") || c.starts_with("https://") {
+            return Some(c.to_string());
+        }
+        // It's a local artwork hash — build an absolute URL
+        let server_ip = crate::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+        // Use the streamer port (same as API server port)
+        let port = std::env::var("TUNE_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(8888);
+        Some(format!("http://{server_ip}:{port}/api/v1/artwork/{c}"))
     }
 
     async fn send_to_output(
@@ -810,13 +832,14 @@ impl PlaybackOrchestrator {
 
         let (url, mime_type, title, artist, _, _, resolved_cover, _) =
             self.resolve_stream(&req).await?;
+        let raw_cover = cover.or(resolved_cover);
         Ok(ResolvedQueueItem {
             url,
             mime_type,
             title,
             artist,
             album,
-            cover_url: cover.or(resolved_cover),
+            cover_url: Self::resolve_cover_url(raw_cover.as_deref()),
         })
     }
 }
