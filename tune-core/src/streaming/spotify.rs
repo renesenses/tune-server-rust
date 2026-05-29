@@ -35,18 +35,37 @@ impl SpotifyService {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            client_id: std::env::var("SPOTIFY_CLIENT_ID")
+            client_id: std::env::var("TUNE_SPOTIFY_CLIENT_ID")
+                .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
                 .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into()),
             access_token: None,
             refresh_token: None,
             username: None,
             code_verifier: None,
-            redirect_uri: std::env::var("SPOTIFY_REDIRECT_URI").unwrap_or_else(|_| {
-                "http://localhost:8085/api/v1/streaming/spotify/callback".into()
-            }),
+            redirect_uri: std::env::var("TUNE_SPOTIFY_REDIRECT_URI")
+                .or_else(|_| std::env::var("SPOTIFY_REDIRECT_URI"))
+                .unwrap_or_else(|_| {
+                    "http://localhost:8085/api/v1/streaming/spotify/callback".into()
+                }),
             token_expires: None,
             enabled_override: None,
         }
+    }
+
+    /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
+    pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
+        let mut svc = Self::new();
+        if let Some(id) = client_id {
+            if !id.is_empty() {
+                svc.client_id = id.to_string();
+            }
+        }
+        if let Some(uri) = redirect_uri {
+            if !uri.is_empty() {
+                svc.redirect_uri = uri.to_string();
+            }
+        }
+        svc
     }
 
     fn generate_pkce() -> (String, String) {
