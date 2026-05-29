@@ -461,8 +461,10 @@ async fn process_responses(
                 *count += 1;
                 if *count <= 3 {
                     warn!(id = %dev_id, error = %e, "ssdp_device_create_failed");
-                } else {
-                    debug!(id = %dev_id, error = %e, "ssdp_device_create_failed");
+                }
+                // Evict devices that permanently fail to avoid unbounded growth
+                if st.create_failures.len() > 200 {
+                    st.create_failures.retain(|_, c| *c < 50);
                 }
             }
         }

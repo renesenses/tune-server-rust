@@ -540,11 +540,11 @@ async fn main() {
             while let Some(event) = ssdp_rx.recv().await {
                 match event {
                     SsdpEvent::DeviceDiscovered(dev) => {
-                        let is_dlna = dev.device_type
+                        let is_renderer = dev.device_type
                             == tune_core::discovery::device::OutputType::Dlna
                             || dev.device_type
                                 == tune_core::discovery::device::OutputType::Openhome;
-                        if is_dlna {
+                        if is_renderer {
                             let svc_urls = dev
                                 .capabilities
                                 .get("service_urls")
@@ -555,25 +555,28 @@ async fn main() {
                                     .ok()
                                 })
                                 .unwrap_or_default();
-                            let av_url = svc_urls
-                                .get("avtransport")
-                                .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
-                            let rc_url = svc_urls
-                                .get("renderingcontrol")
-                                .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
-                            if let (Some(av), Some(rc)) = (av_url, rc_url) {
-                                let delay = config_for_ssdp.play_delay_for(&dev.name);
-                                let dlna = tune_core::outputs::dlna::DlnaOutput::new(
-                                    dev.name.clone(),
-                                    dev.id.clone(),
-                                    dev.host.clone(),
-                                    av,
-                                    rc,
-                                )
-                                .with_play_delay(delay);
-                                let mut reg = outputs.lock().await;
-                                reg.register(Box::new(dlna));
-                                info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
+
+                            {
+                                let av_url = svc_urls
+                                    .get("avtransport")
+                                    .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+                                let rc_url = svc_urls
+                                    .get("renderingcontrol")
+                                    .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+                                if let (Some(av), Some(rc)) = (av_url, rc_url) {
+                                    let delay = config_for_ssdp.play_delay_for(&dev.name);
+                                    let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+                                        dev.name.clone(),
+                                        dev.id.clone(),
+                                        dev.host.clone(),
+                                        av,
+                                        rc,
+                                    )
+                                    .with_play_delay(delay);
+                                    let mut reg = outputs.lock().await;
+                                    reg.register(Box::new(dlna));
+                                    info!(name = %dev.name, id = %dev.id, "dlna_output_registered");
+                                }
                             }
 
                             let skip_keywords = [
@@ -615,10 +618,11 @@ async fn main() {
                                 } else {
                                     short_name.to_string()
                                 };
+                                let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome { "openhome" } else { "dlna" };
                                 if let Ok(zid) =
-                                    zone_repo.create(&zone_name, Some("dlna"), Some(&dev.id))
+                                    zone_repo.create(&zone_name, Some(type_str), Some(&dev.id))
                                 {
-                                    info!(name = %zone_name, zone_id = zid, device = %dev.id, "zone_auto_created");
+                                    info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "zone_auto_created");
                                 }
                             }
                         }
@@ -640,7 +644,7 @@ async fn main() {
     {
         let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
         _mdns_handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
-            let mut mdns = mdns.with_chromecast().with_airplay();
+            let mut mdns = mdns.with_chromecast().with_airplay().with_bluos();
             if let Err(e) = mdns.start() {
                 tracing::warn!(error = %e, "mdns_start_failed");
             }
@@ -677,6 +681,10 @@ async fn main() {
                                     );
                                     (Some(Box::new(ap)), "airplay")
                                 }
+                                OutputType::Bluos => {
+                                    info!(name = %dev.name, host = %dev.host, "bluos_device_discovered");
+                                    (None, "bluos")
+                                }
                                 _ => (None, ""),
                             };
 
@@ -703,6 +711,21 @@ async fn main() {
                         let mut reg = outputs.lock().await;
                         reg.remove(&id);
                     }
+                }
+            }
+        });
+    }
+
+    // Periodic cleanup of stale streaming sessions (prevents memory leaks)
+    {
+        let streamer = state.streamer.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                let removed = streamer.cleanup_stale_sessions().await;
+                if removed > 0 {
+                    info!(removed, "session_gc_sweep");
                 }
             }
         });

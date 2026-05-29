@@ -141,6 +141,21 @@ impl AudioStreamer {
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
     }
+
+    pub async fn cleanup_stale_sessions(&self) -> usize {
+        let mut sessions = self.sessions.lock().await;
+        let before = sessions.len();
+        sessions.retain(|id, s| {
+            let age = s.created_at.elapsed();
+            if age > std::time::Duration::from_secs(1800) {
+                info!(stream_id = %id, age_secs = age.as_secs(), "stale_session_removed");
+                false
+            } else {
+                true
+            }
+        });
+        before - sessions.len()
+    }
 }
 
 // ─── Axum handlers ──────────────────────────────────────────────

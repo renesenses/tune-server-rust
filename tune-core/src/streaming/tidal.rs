@@ -71,6 +71,10 @@ impl UrlCache {
     }
 
     fn set(&mut self, key: String, url: String) {
+        if self.entries.len() > 1000 {
+            self.entries
+                .retain(|_, (_, created)| created.elapsed() < self.ttl);
+        }
         self.entries.insert(key, (url, Instant::now()));
     }
 }
