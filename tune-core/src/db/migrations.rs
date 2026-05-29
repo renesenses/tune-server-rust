@@ -305,6 +305,23 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 );
 ",
     },
+    Migration {
+        version: 16,
+        name: "add_performance_indexes",
+        up: "
+CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_albums_title ON albums(title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_albums_title_artist ON albums(title, artist_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_album_disc_track ON tracks(album_id, disc_number, track_number);
+CREATE INDEX IF NOT EXISTS idx_tracks_artist_title ON tracks(artist_id, title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_tracks_source_path ON tracks(source, file_path);
+CREATE INDEX IF NOT EXISTS idx_listen_history_zone ON listen_history(zone_id);
+CREATE INDEX IF NOT EXISTS idx_listen_history_artist ON listen_history(artist_name);
+CREATE INDEX IF NOT EXISTS idx_listen_history_album ON listen_history(album_title, artist_name);
+CREATE INDEX IF NOT EXISTS idx_listen_history_track ON listen_history(title, artist_name);
+CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -534,6 +551,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             "migration_applied"
         );
     }
+
+    db.execute_batch("ANALYZE;").ok();
+    info!("sqlite_analyze_complete");
 
     Ok(())
 }

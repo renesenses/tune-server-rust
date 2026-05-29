@@ -112,7 +112,8 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
     let registered_devices: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let registered_for_cleanup = registered_devices.clone();
 
-    let (mut ws_tx, mut ws_rx) = socket.into_inner().into_split();
+    use futures_util::StreamExt as _;
+    let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Writer task: forwards commands to WebSocket
     let writer_connected = connected.clone();

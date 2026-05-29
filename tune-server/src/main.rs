@@ -915,6 +915,7 @@ async fn main() {
         "tune_server_starting"
     );
 
+    let outputs_for_diag = state.outputs.clone();
     let app = routes::router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -927,6 +928,27 @@ async fn main() {
             }
         }
     };
+    // Periodic RSS memory diagnostics (Linux only)
+    {
+        let outputs = outputs_for_diag;
+        tokio::spawn(async move {
+            loop {
+                #[cfg(target_os = "linux")]
+                if let Ok(statm) = tokio::fs::read_to_string("/proc/self/statm").await {
+                    let rss_pages: u64 = statm
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    let rss_mb = rss_pages * 4 / 1024;
+                    let count = outputs.lock().await.list().len();
+                    info!(rss_mb, outputs_count = count, "memory_diagnostics");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        });
+    }
+
     info!(%addr, "listening");
 
     axum::serve(listener, app)
@@ -953,10 +975,11 @@ async fn shutdown_signal() {
 
     info!("shutdown_signal_received");
 
-    // Force exit after 3s if graceful shutdown stalls (background tasks, long-lived streams)
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        info!("shutdown_timeout_forcing_exit");
+    // Force exit after 3s if graceful shutdown stalls — must use std::thread
+    // because tokio runtime may itself be stalling
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        eprintln!("shutdown_timeout_forcing_exit");
         std::process::exit(0);
     });
 }

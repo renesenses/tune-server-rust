@@ -113,7 +113,7 @@ impl HistoryRepo {
     pub fn listening_history(&self, days: i64) -> Result<Vec<(String, i64, i64)>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT DATE(listened_at) as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms FROM listen_history WHERE DATE(listened_at) >= DATE('now', '-' || ? || ' days') GROUP BY day ORDER BY day")
+            .prepare("SELECT DATE(listened_at) as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms FROM listen_history WHERE listened_at >= strftime('%Y-%m-%dT00:00:00Z', 'now', '-' || ? || ' days') GROUP BY day ORDER BY day")
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![days], |row| {

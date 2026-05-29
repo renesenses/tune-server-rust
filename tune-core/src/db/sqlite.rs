@@ -20,7 +20,11 @@ impl SqliteDb {
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA busy_timeout=5000;
+             PRAGMA cache_size=-64000;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA mmap_size=268435456;
+             PRAGMA analysis_limit=400;",
         )
         .map_err(|e| format!("pragma: {e}"))?;
 
@@ -68,6 +72,17 @@ impl SqliteDb {
     pub fn last_insert_rowid(&self) -> i64 {
         let conn = self.conn.lock().unwrap();
         conn.last_insert_rowid()
+    }
+
+    pub fn query_timed<T>(&self, label: &str, f: impl FnOnce(&Connection) -> T) -> T {
+        let conn = self.conn.lock().unwrap();
+        let start = std::time::Instant::now();
+        let result = f(&conn);
+        let elapsed = start.elapsed();
+        if elapsed > std::time::Duration::from_millis(100) {
+            tracing::warn!(query = label, ms = elapsed.as_millis() as u64, "slow_query");
+        }
+        result
     }
 }
 

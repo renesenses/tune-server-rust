@@ -98,26 +98,29 @@ impl PlaylistRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<Vec<i64>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let max_pos: i64 = conn
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let max_pos: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = ?",
                 params![playlist_id],
                 |row| row.get(0),
             )
             .unwrap_or(-1);
-
         let start_pos = position.unwrap_or(max_pos + 1);
         let mut inserted = Vec::new();
-        for (i, tid) in track_ids.iter().enumerate() {
-            let pos = start_pos + i as i64;
-            conn.execute(
-                "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
-                params![playlist_id, tid, pos],
-            )
-            .map_err(|e| e.to_string())?;
-            inserted.push(*tid);
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)")
+                .map_err(|e| e.to_string())?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                let pos = start_pos + i as i64;
+                stmt.execute(params![playlist_id, tid, pos])
+                    .map_err(|e| e.to_string())?;
+                inserted.push(*tid);
+            }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(inserted)
     }
 
@@ -162,19 +165,23 @@ impl PlaylistRepo {
     }
 
     pub fn reorder_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute(
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
             "DELETE FROM playlist_tracks WHERE playlist_id = ?",
             params![playlist_id],
         )
         .map_err(|e| e.to_string())?;
-        for (i, tid) in track_ids.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
-                params![playlist_id, tid, i as i64],
-            )
-            .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)")
+                .map_err(|e| e.to_string())?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                stmt.execute(params![playlist_id, tid, i as i64])
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 

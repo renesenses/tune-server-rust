@@ -57,16 +57,21 @@ impl PlayQueueRepo {
     }
 
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
             .map_err(|e| e.to_string())?;
-        for (i, tid) in track_ids.iter().enumerate() {
-            let is_current = if i == 0 { 1i64 } else { 0i64 };
-            conn.execute(
-                "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, ?)",
-                params![zone_id, tid, i as i64, is_current],
-            ).map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, ?)")
+                .map_err(|e| e.to_string())?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                let is_current = if i == 0 { 1i64 } else { 0i64 };
+                stmt.execute(params![zone_id, tid, i as i64, is_current])
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -76,22 +81,26 @@ impl PlayQueueRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-        let max_pos: i64 = conn
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let max_pos: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(position), -1) FROM play_queue WHERE zone_id = ?",
                 params![zone_id],
                 |row| row.get(0),
             )
             .unwrap_or(-1);
-
         let start = position.unwrap_or(max_pos + 1);
-        for (i, tid) in track_ids.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, 0)",
-                params![zone_id, tid, start + i as i64],
-            ).map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, 0)")
+                .map_err(|e| e.to_string())?;
+            for (i, tid) in track_ids.iter().enumerate() {
+                stmt.execute(params![zone_id, tid, start + i as i64])
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -122,10 +131,11 @@ impl PlayQueueRepo {
         zone_id: i64,
         tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
     ) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
             .map_err(|e| e.to_string())?;
-        conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS streaming_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 zone_id INTEGER NOT NULL,
@@ -140,19 +150,23 @@ impl PlayQueueRepo {
             )",
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM streaming_queue WHERE zone_id = ?",
             params![zone_id],
         )
         .map_err(|e| e.to_string())?;
-        for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
-            tracks.iter().enumerate()
         {
-            conn.execute(
-                "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![zone_id, i as i64, source_id, title, artist, album, cover_url, duration_ms],
-            ).map_err(|e| e.to_string())?;
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                .map_err(|e| e.to_string())?;
+            for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
+                tracks.iter().enumerate()
+            {
+                stmt.execute(params![zone_id, i as i64, source_id, title, artist, album, cover_url, duration_ms])
+                    .map_err(|e| e.to_string())?;
+            }
         }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
