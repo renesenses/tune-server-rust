@@ -166,6 +166,20 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
     config
         .entry("server_engine".to_string())
         .or_insert(json!("rust"));
+    // Ensure onboarding_completed is always present as a boolean
+    let onboarding_complete = config
+        .get("onboarding_complete")
+        .and_then(|v| v.as_str())
+        .map(|v| v == "true")
+        .or_else(|| {
+            config
+                .get("onboarding_complete")
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(false);
+    config
+        .entry("onboarding_completed".to_string())
+        .or_insert(json!(onboarding_complete));
     Json(Value::Object(config))
 }
 
@@ -178,6 +192,12 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| state.config.db_path.clone());
+    let onboarding_completed = settings
+        .get("onboarding_complete")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     Json(json!({
         "music_dirs": music_dirs,
@@ -186,6 +206,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         "artwork_dir": state.config.artwork_dir,
         "port": state.port,
         "auto_scan": state.config.auto_scan,
+        "onboarding_completed": onboarding_completed,
         "server_version": tune_core::version(),
         "server_engine": "rust",
     }))
@@ -454,11 +475,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     track.file_mtime = Some(sf.mtime as f64);
                     track.audio_hash = sf.audio_hash.clone();
                     track.genre = meta.genre.clone();
-                    track.genres = if meta.genres.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::to_string(&meta.genres).unwrap_or_default())
-                    };
+                    track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
                     track.composer = meta
                         .credits
                         .iter()
@@ -495,11 +512,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 track.file_mtime = Some(sf.mtime as f64);
                 track.audio_hash = sf.audio_hash.clone();
                 track.genre = meta.genre.clone();
-                track.genres = if meta.genres.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&meta.genres).unwrap_or_default())
-                };
+                track.genres = build_genres_json(&meta.genres, meta.genre.as_deref());
                 track.composer = meta
                     .credits
                     .iter()
@@ -535,6 +548,22 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     }),
                 );
             }
+        }
+
+        // Backfill: populate genres JSON array from genre text for any
+        // tracks/albums that have genre but not genres (legacy data).
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE tracks SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
+                 WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
+                [],
+            ).ok();
+            conn.execute(
+                "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
+                 WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
+                [],
+            ).ok();
         }
 
         for album in album_repo.list(99999, 0).unwrap_or_default() {
@@ -772,6 +801,31 @@ fn chrono_now() -> String {
         .unwrap()
         .as_secs();
     format!("{now}")
+}
+
+/// Build a JSON array string for the `genres` column from parsed metadata.
+///
+/// If the structured `genres` vec is non-empty, serialize it as JSON.
+/// Otherwise, fall back to the primary `genre` string and wrap it as a
+/// single-element array so the column is never NULL when genre data exists.
+fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
+    if !genres.is_empty() {
+        Some(serde_json::to_string(genres).unwrap_or_default())
+    } else if let Some(g) = genre {
+        if g.is_empty() {
+            None
+        } else {
+            // Split in case genre contains separators (legacy data)
+            let split = tune_core::metadata::split_genre_tag(g);
+            if split.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&split).unwrap_or_default())
+            }
+        }
+    } else {
+        None
+    }
 }
 
 async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
