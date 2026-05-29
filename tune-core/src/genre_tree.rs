@@ -148,17 +148,9 @@ const GENRE_HIERARCHY: &[(&str, &[&str])] = &[
     ),
     (
         "Country",
-        &[
-            "Alt-Country",
-            "Bluegrass",
-            "Outlaw Country",
-            "Country Rock",
-        ],
+        &["Alt-Country", "Bluegrass", "Outlaw Country", "Country Rock"],
     ),
-    (
-        "Reggae",
-        &["Dub", "Dancehall", "Ska", "Roots Reggae"],
-    ),
+    ("Reggae", &["Dub", "Dancehall", "Ska", "Roots Reggae"]),
     (
         "World",
         &[
@@ -175,12 +167,7 @@ const GENRE_HIERARCHY: &[(&str, &[&str])] = &[
     ),
     (
         "Soundtrack",
-        &[
-            "Film Score",
-            "Video Game",
-            "TV Series",
-            "Musical",
-        ],
+        &["Film Score", "Video Game", "TV Series", "Musical"],
     ),
 ];
 
@@ -220,8 +207,7 @@ pub fn build_genre_tree(db: &SqliteDb) -> Vec<GenreNode> {
     let categorized: std::collections::HashSet<String> = GENRE_HIERARCHY
         .iter()
         .flat_map(|(parent, children)| {
-            std::iter::once(parent.to_lowercase())
-                .chain(children.iter().map(|c| c.to_lowercase()))
+            std::iter::once(parent.to_lowercase()).chain(children.iter().map(|c| c.to_lowercase()))
         })
         .collect();
 

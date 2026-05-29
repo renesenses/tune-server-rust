@@ -82,7 +82,17 @@ pub async fn scrobble(
     track: &str,
     timestamp: u64,
 ) -> Result<(), String> {
-    scrobble_full(api_key, api_secret, session_key, artist, track, None, None, timestamp).await
+    scrobble_full(
+        api_key,
+        api_secret,
+        session_key,
+        artist,
+        track,
+        None,
+        None,
+        timestamp,
+    )
+    .await
 }
 
 pub async fn scrobble_full(

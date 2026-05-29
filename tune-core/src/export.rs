@@ -27,18 +27,29 @@ impl ExportService {
             .from_writer(Vec::new());
 
         wtr.write_record([
-            "id", "title", "artist_name", "year", "original_year",
-            "release_date", "original_date", "genre", "track_count",
-            "disc_count", "format", "sample_rate", "bit_depth", "label",
-            "catalog_number", "musicbrainz_release_id", "source",
+            "id",
+            "title",
+            "artist_name",
+            "year",
+            "original_year",
+            "release_date",
+            "original_date",
+            "genre",
+            "track_count",
+            "disc_count",
+            "format",
+            "sample_rate",
+            "bit_depth",
+            "label",
+            "catalog_number",
+            "musicbrainz_release_id",
+            "source",
         ])
         .map_err(|e| e.to_string())?;
 
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let record: Vec<String> = (0..17)
-                .map(|i| val(row, i))
-                .collect();
+            let record: Vec<String> = (0..17).map(|i| val(row, i)).collect();
             wtr.write_record(&record).map_err(|e| e.to_string())?;
         }
 
@@ -66,10 +77,22 @@ impl ExportService {
             .from_writer(Vec::new());
 
         wtr.write_record([
-            "id", "title", "artist_name", "album_title", "track_number",
-            "disc_number", "disc_subtitle", "duration", "duration_ms",
-            "format", "sample_rate", "bit_depth", "channels", "file_path",
-            "source", "musicbrainz_recording_id",
+            "id",
+            "title",
+            "artist_name",
+            "album_title",
+            "track_number",
+            "disc_number",
+            "disc_subtitle",
+            "duration",
+            "duration_ms",
+            "format",
+            "sample_rate",
+            "bit_depth",
+            "channels",
+            "file_path",
+            "source",
+            "musicbrainz_recording_id",
         ])
         .map_err(|e| e.to_string())?;
 
@@ -111,8 +134,15 @@ impl ExportService {
             .delimiter(b';')
             .from_writer(Vec::new());
 
-        wtr.write_record(["id", "name", "sort_name", "musicbrainz_id", "bio", "image_path"])
-            .map_err(|e| e.to_string())?;
+        wtr.write_record([
+            "id",
+            "name",
+            "sort_name",
+            "musicbrainz_id",
+            "bio",
+            "image_path",
+        ])
+        .map_err(|e| e.to_string())?;
 
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {

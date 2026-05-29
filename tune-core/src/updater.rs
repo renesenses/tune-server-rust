@@ -33,7 +33,9 @@ impl ReleaseInfo {
         self.assets.iter().find(|a| {
             let name = a.name.to_lowercase();
             let os_match = match os {
-                "macos" => name.contains("macos") || name.contains("darwin") || name.contains(".dmg"),
+                "macos" => {
+                    name.contains("macos") || name.contains("darwin") || name.contains(".dmg")
+                }
                 "linux" => name.contains("linux") || name.contains(".tar.gz"),
                 "windows" => name.contains("windows") || name.contains(".exe"),
                 _ => false,
@@ -95,10 +97,7 @@ impl UpdateChecker {
             .iter()
             .map(|a| ReleaseAsset {
                 name: a["name"].as_str().unwrap_or("").to_string(),
-                browser_download_url: a["browser_download_url"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
+                browser_download_url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
                 size: a["size"].as_u64().unwrap_or(0),
                 content_type: a["content_type"].as_str().unwrap_or("").to_string(),
             })
@@ -145,11 +144,7 @@ impl Default for UpdateChecker {
 }
 
 fn is_newer(remote: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .filter_map(|p| p.parse().ok())
-            .collect()
-    };
+    let parse = |s: &str| -> Vec<u64> { s.split('.').filter_map(|p| p.parse().ok()).collect() };
     let r = parse(remote);
     let c = parse(current);
     for i in 0..r.len().max(c.len()) {

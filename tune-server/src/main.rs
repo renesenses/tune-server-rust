@@ -688,7 +688,11 @@ async fn main() {
     {
         let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
         _mdns_handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
-            let mut mdns = mdns.with_chromecast().with_airplay().with_bluos().with_oaat();
+            let mut mdns = mdns
+                .with_chromecast()
+                .with_airplay()
+                .with_bluos()
+                .with_oaat();
             if let Err(e) = mdns.start() {
                 tracing::warn!(error = %e, "mdns_start_failed");
             }
@@ -862,9 +866,9 @@ async fn main() {
         let registry = state.services.lock().await;
         if let Some(svc) = registry.get("deezer") {
             let mut svc = svc.lock().await;
-            if let Some(deezer) =
-                svc.as_any_mut()
-                    .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
+            if let Some(deezer) = svc
+                .as_any_mut()
+                .downcast_mut::<tune_core::streaming::deezer::DeezerService>()
             {
                 let server_ip = tune_core::discovery::ssdp::get_local_ip()
                     .map(|ip| ip.to_string())

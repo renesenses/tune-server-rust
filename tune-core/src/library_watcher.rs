@@ -9,8 +9,8 @@ use tracing::{debug, info, warn};
 const DEBOUNCE_MS: u64 = 2000;
 
 static SUPPORTED_EXTENSIONS: &[&str] = &[
-    ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif",
-    ".wma", ".dsf", ".dff", ".ape", ".wv", ".alac",
+    ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".wma", ".dsf", ".dff",
+    ".ape", ".wv", ".alac",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +175,9 @@ mod tests {
     fn supported_extensions() {
         assert!(FileSystemWatcher::is_supported_extension("song.flac"));
         assert!(FileSystemWatcher::is_supported_extension("track.MP3"));
-        assert!(FileSystemWatcher::is_supported_extension("/music/album/01.m4a"));
+        assert!(FileSystemWatcher::is_supported_extension(
+            "/music/album/01.m4a"
+        ));
         assert!(!FileSystemWatcher::is_supported_extension("readme.txt"));
         assert!(!FileSystemWatcher::is_supported_extension("cover.jpg"));
     }

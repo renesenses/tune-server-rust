@@ -29,7 +29,13 @@ pub async fn get_lastfm_tags(title: &str, artist: &str, api_key: &str) -> Lastfm
         .send()
         .await
         .ok()
-        .and_then(|r| if r.status().is_success() { Some(r) } else { None });
+        .and_then(|r| {
+            if r.status().is_success() {
+                Some(r)
+            } else {
+                None
+            }
+        });
 
     let track_json: serde_json::Value = match track_data {
         Some(r) => r.json().await.unwrap_or_default(),

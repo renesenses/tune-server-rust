@@ -20,9 +20,7 @@ impl Period {
             Period::Year => 365,
             Period::All => return None,
         };
-        Some(format!(
-            "datetime('now', '-{days} days')"
-        ))
+        Some(format!("datetime('now', '-{days} days')"))
     }
 }
 

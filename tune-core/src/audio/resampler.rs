@@ -63,7 +63,10 @@ impl Resampler {
 
         let in_fmt = pcm_format(self.source_depth);
         let out_fmt = pcm_format(self.target_depth);
-        let af = format!("aresample=resampler=soxr:out_sample_rate={}", self.target_rate);
+        let af = format!(
+            "aresample=resampler=soxr:out_sample_rate={}",
+            self.target_rate
+        );
 
         debug!(
             source_rate = self.source_rate,

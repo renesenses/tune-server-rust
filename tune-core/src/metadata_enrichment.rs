@@ -68,7 +68,11 @@ impl MetadataEnricher {
         let resp = self
             .client
             .get(format!("{MUSICBRAINZ_API}/recording"))
-            .query(&[("query", &query), ("fmt", &"json".to_string()), ("limit", &"1".to_string())])
+            .query(&[
+                ("query", &query),
+                ("fmt", &"json".to_string()),
+                ("limit", &"1".to_string()),
+            ])
             .send()
             .await
             .map_err(|e| format!("musicbrainz: {e}"))?;
@@ -125,11 +129,14 @@ impl MetadataEnricher {
         let front = data["images"]
             .as_array()
             .and_then(|imgs| {
-                imgs.iter().find(|img| {
-                    img["front"].as_bool().unwrap_or(false)
-                })
+                imgs.iter()
+                    .find(|img| img["front"].as_bool().unwrap_or(false))
             })
-            .and_then(|img| img["thumbnails"]["500"].as_str().or_else(|| img["image"].as_str()))
+            .and_then(|img| {
+                img["thumbnails"]["500"]
+                    .as_str()
+                    .or_else(|| img["image"].as_str())
+            })
             .map(String::from);
 
         Ok(front)
@@ -139,11 +146,7 @@ impl MetadataEnricher {
         let resp = self
             .client
             .get(format!("{MUSICBRAINZ_API}/artist"))
-            .query(&[
-                ("query", artist_name),
-                ("fmt", "json"),
-                ("limit", "1"),
-            ])
+            .query(&[("query", artist_name), ("fmt", "json"), ("limit", "1")])
             .send()
             .await
             .map_err(|e| format!("mb artist: {e}"))?;
@@ -178,7 +181,10 @@ impl MetadataEnricher {
 
     pub async fn enrich_track(&self, track_id: i64) -> Result<Option<EnrichmentResult>, String> {
         let repo = TrackRepo::new(self.db.clone());
-        let track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
+        let track = repo
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
 
         let recording = self
             .lookup_musicbrainz(

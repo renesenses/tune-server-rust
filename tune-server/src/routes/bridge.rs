@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use tune_core::outputs::bridge::{BridgeCommand, BridgeOutput, BridgeResponse};
@@ -170,8 +170,7 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
                     }
                     "bridge.device_lost" => {
                         if let Ok(lost) = serde_json::from_value::<BridgeDeviceLost>(msg) {
-                            let full_id =
-                                format!("bridge:{}:{}", bridge_id, lost.device_id);
+                            let full_id = format!("bridge:{}:{}", bridge_id, lost.device_id);
                             let mut reg = state.outputs.lock().await;
                             reg.remove(&full_id);
                             registered_devices.lock().await.retain(|d| d != &full_id);
@@ -282,8 +281,7 @@ async fn handle_devices(
         } else {
             let name_taken = existing_zones.iter().any(|z| z.name == dev.name);
             if !name_taken {
-                if let Ok(zid) =
-                    zone_repo.create(&dev.name, Some(&dev.device_type), Some(&full_id))
+                if let Ok(zid) = zone_repo.create(&dev.name, Some(&dev.device_type), Some(&full_id))
                 {
                     info!(name = %dev.name, zone_id = zid, "bridge zone created");
                 }

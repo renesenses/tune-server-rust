@@ -169,8 +169,10 @@ impl SmartCollectionRepo {
 
     pub fn save(&self, collection: &SmartCollection) -> Result<i64, String> {
         let rules_json = serde_json::to_string(&collection.rules).map_err(|e| e.to_string())?;
-        let match_mode = serde_json::to_string(&collection.match_mode).map_err(|e| e.to_string())?;
-        let sort_order = serde_json::to_string(&collection.sort_order).map_err(|e| e.to_string())?;
+        let match_mode =
+            serde_json::to_string(&collection.match_mode).map_err(|e| e.to_string())?;
+        let sort_order =
+            serde_json::to_string(&collection.sort_order).map_err(|e| e.to_string())?;
 
         let conn = self.db.connection().lock().unwrap();
 

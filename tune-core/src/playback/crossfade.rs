@@ -36,10 +36,7 @@ impl CrossfadeHandler {
         remaining_ms <= threshold_ms && remaining_ms > (threshold_ms - 500)
     }
 
-    pub async fn start_fade_out(
-        &self,
-        output: &dyn OutputTarget,
-    ) -> Result<(), String> {
+    pub async fn start_fade_out(&self, output: &dyn OutputTarget) -> Result<(), String> {
         {
             let fading = self.fading.lock().await;
             if *fading {
@@ -63,10 +60,7 @@ impl CrossfadeHandler {
         Ok(())
     }
 
-    pub async fn finish_fade_in(
-        &self,
-        output: &dyn OutputTarget,
-    ) -> Result<(), String> {
+    pub async fn finish_fade_in(&self, output: &dyn OutputTarget) -> Result<(), String> {
         let target_vol = {
             let mut orig = self.original_volume.lock().await;
             match orig.take() {

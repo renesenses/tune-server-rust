@@ -49,7 +49,11 @@ pub async fn lookup_track(title: &str, artist: &str, album: &str) -> Vec<TrackMa
     let client = reqwest::Client::new();
     let resp = client
         .get(&format!("{MB_API}/recording"))
-        .query(&[("query", &query), ("limit", &"5".to_string()), ("fmt", &"json".to_string())])
+        .query(&[
+            ("query", &query),
+            ("limit", &"5".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
         .header("User-Agent", MB_UA)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -91,7 +95,11 @@ pub async fn lookup_track(title: &str, artist: &str, album: &str) -> Vec<TrackMa
             let (album_title, year, label) = releases
                 .and_then(|rels| rels.first())
                 .map(|rel| {
-                    let at = rel.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let at = rel
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let date = rel.get("date").and_then(|v| v.as_str()).unwrap_or("");
                     let y = if date.len() >= 4 {
                         date[..4].parse::<i32>().ok()
@@ -112,7 +120,11 @@ pub async fn lookup_track(title: &str, artist: &str, album: &str) -> Vec<TrackMa
                 .unwrap_or_default();
 
             TrackMatch {
-                title: rec.get("title").and_then(|v| v.as_str()).unwrap_or("").into(),
+                title: rec
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
                 artist_name,
                 album_title,
                 musicbrainz_recording_id: rec
@@ -146,7 +158,11 @@ pub async fn lookup_album(title: &str, artist: &str) -> Vec<AlbumMatch> {
     let client = reqwest::Client::new();
     let resp = client
         .get(&format!("{MB_API}/release"))
-        .query(&[("query", &query), ("limit", &"5".to_string()), ("fmt", &"json".to_string())])
+        .query(&[
+            ("query", &query),
+            ("limit", &"5".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
         .header("User-Agent", MB_UA)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -194,13 +210,25 @@ pub async fn lookup_album(title: &str, artist: &str) -> Vec<AlbumMatch> {
                 .to_string();
 
             AlbumMatch {
-                title: rel.get("title").and_then(|v| v.as_str()).unwrap_or("").into(),
+                title: rel
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
                 artist_name,
                 musicbrainz_release_id: rel.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
                 year,
                 label,
-                barcode: rel.get("barcode").and_then(|v| v.as_str()).unwrap_or("").into(),
-                country: rel.get("country").and_then(|v| v.as_str()).unwrap_or("").into(),
+                barcode: rel
+                    .get("barcode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
+                country: rel
+                    .get("country")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
                 score: rel.get("score").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
                 track_count: rel.get("track-count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             }

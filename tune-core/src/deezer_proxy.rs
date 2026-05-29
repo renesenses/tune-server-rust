@@ -15,7 +15,10 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
 }
 
 pub fn parse_sng_id(filename: &str) -> Option<&str> {
-    let sng_id = filename.rsplit_once('.').map(|(id, _)| id).unwrap_or(filename);
+    let sng_id = filename
+        .rsplit_once('.')
+        .map(|(id, _)| id)
+        .unwrap_or(filename);
     if sng_id.chars().all(|c| c.is_ascii_digit()) && !sng_id.is_empty() {
         Some(sng_id)
     } else {

@@ -176,7 +176,9 @@ impl DlnaBufferStatsRegistry {
                     d.device_name = device_name.to_string();
                 }
             })
-            .or_insert_with(|| DeviceBufferStats::new(device_id.to_string(), device_name.to_string()))
+            .or_insert_with(|| {
+                DeviceBufferStats::new(device_id.to_string(), device_name.to_string())
+            })
     }
 
     pub fn record_event(

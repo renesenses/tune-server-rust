@@ -102,8 +102,7 @@ impl SnoozeState {
 
     fn snooze(&mut self, alarm_id: i64, minutes: u64) {
         self.snoozed.insert(alarm_id, Instant::now());
-        self.durations
-            .insert(alarm_id, minutes.max(1).min(60) * 60);
+        self.durations.insert(alarm_id, minutes.max(1).min(60) * 60);
     }
 
     fn pop_ready(&mut self) -> Vec<i64> {
@@ -232,10 +231,7 @@ impl AlarmScheduler {
         let dow = now.weekday().num_days_from_monday(); // 0=Mon..6=Sun
 
         for alarm in &alarms {
-            let alarm_id = alarm
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+            let alarm_id = alarm.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
             if alarm_id == 0 || fired_today.contains(&alarm_id) {
                 continue;
             }
@@ -254,21 +250,14 @@ impl AlarmScheduler {
                 .unwrap_or(0)
                 != 0
             {
-                if is_french_holiday(
-                    now.year(),
-                    now.month(),
-                    now.day(),
-                ) {
+                if is_french_holiday(now.year(), now.month(), now.day()) {
                     info!(alarm_id, date = %today, "alarm_skipped_holiday");
                     fired_today.insert(alarm_id);
                     continue;
                 }
             }
 
-            let alarm_time = alarm
-                .get("time")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let alarm_time = alarm.get("time").and_then(|v| v.as_str()).unwrap_or("");
             let parts: Vec<&str> = alarm_time.split(':').collect();
             if parts.len() < 2 {
                 continue;
@@ -303,9 +292,7 @@ impl AlarmScheduler {
         } else {
             source_id.to_string()
         };
-        let volume = alarm["volume"]
-            .as_f64()
-            .unwrap_or(0.5);
+        let volume = alarm["volume"].as_f64().unwrap_or(0.5);
         let volume = if volume > 1.0 { volume / 100.0 } else { volume };
         let fade_s = alarm["fade_duration_s"]
             .as_u64()
@@ -369,10 +356,7 @@ impl AlarmScheduler {
         // One-shot: disable after firing
         if alarm["one_shot"].as_i64().unwrap_or(0) != 0 {
             self.db
-                .execute(
-                    "UPDATE alarms SET enabled = 0 WHERE id = ?",
-                    &[&alarm_id],
-                )
+                .execute("UPDATE alarms SET enabled = 0 WHERE id = ?", &[&alarm_id])
                 .ok();
             info!(alarm_id, "alarm_one_shot_disabled");
         }

@@ -28,36 +28,29 @@ pub fn normalize(text: &str) -> String {
     let lower = text.to_lowercase();
     let stripped = strip_suffixes(&lower);
     let no_accents = remove_accents(&stripped);
-    no_accents
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    no_accents.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn remove_accents(text: &str) -> String {
     let nfkd = unicode_normalization_simple(text);
-    nfkd.chars()
-        .filter(|c| !is_combining(*c))
-        .collect()
+    nfkd.chars().filter(|c| !is_combining(*c)).collect()
 }
 
 fn unicode_normalization_simple(text: &str) -> String {
     text.chars()
-        .flat_map(|c| {
-            match c {
-                'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => vec!['a'],
-                'è' | 'é' | 'ê' | 'ë' => vec!['e'],
-                'ì' | 'í' | 'î' | 'ï' => vec!['i'],
-                'ò' | 'ó' | 'ô' | 'õ' | 'ö' => vec!['o'],
-                'ù' | 'ú' | 'û' | 'ü' => vec!['u'],
-                'ñ' => vec!['n'],
-                'ç' => vec!['c'],
-                'ÿ' | 'ý' => vec!['y'],
-                'æ' => vec!['a', 'e'],
-                'œ' => vec!['o', 'e'],
-                'ß' => vec!['s', 's'],
-                _ => vec![c],
-            }
+        .flat_map(|c| match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => vec!['a'],
+            'è' | 'é' | 'ê' | 'ë' => vec!['e'],
+            'ì' | 'í' | 'î' | 'ï' => vec!['i'],
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => vec!['o'],
+            'ù' | 'ú' | 'û' | 'ü' => vec!['u'],
+            'ñ' => vec!['n'],
+            'ç' => vec!['c'],
+            'ÿ' | 'ý' => vec!['y'],
+            'æ' => vec!['a', 'e'],
+            'œ' => vec!['o', 'e'],
+            'ß' => vec!['s', 's'],
+            _ => vec![c],
         })
         .collect()
 }
@@ -69,9 +62,17 @@ fn is_combining(c: char) -> bool {
 fn strip_suffixes(text: &str) -> String {
     let mut result = text.to_string();
     let patterns = [
-        "(remastered", "(remaster", "[remastered", "[remaster",
-        "(deluxe", "[deluxe", "(live)", "[live]",
-        "(bonus track)", "(mono)", "(stereo)",
+        "(remastered",
+        "(remaster",
+        "[remastered",
+        "[remaster",
+        "(deluxe",
+        "[deluxe",
+        "(live)",
+        "[live]",
+        "(bonus track)",
+        "(mono)",
+        "(stereo)",
         "- remastered",
     ];
     for pat in patterns {
@@ -119,10 +120,7 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     ratio
 }
 
-pub fn match_by_isrc(
-    source_isrc: &str,
-    candidates: &[MatchCandidate],
-) -> Option<MatchCandidate> {
+pub fn match_by_isrc(source_isrc: &str, candidates: &[MatchCandidate]) -> Option<MatchCandidate> {
     if source_isrc.is_empty() {
         return None;
     }
@@ -193,7 +191,14 @@ pub fn match_fuzzy(
                 let mut result = c.clone();
                 result.score = score;
                 result.match_method = "fuzzy".into();
-                result.confidence = if score >= 0.85 { "high" } else if score >= 0.7 { "medium" } else { "low" }.into();
+                result.confidence = if score >= 0.85 {
+                    "high"
+                } else if score >= 0.7 {
+                    "medium"
+                } else {
+                    "low"
+                }
+                .into();
                 best = Some((score, result));
             }
         }

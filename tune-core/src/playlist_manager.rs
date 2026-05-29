@@ -17,9 +17,7 @@ impl PlaylistManager {
 
     pub fn export_m3u(&self, playlist_id: i64) -> Result<String, String> {
         let repo = PlaylistRepo::new(self.db.clone());
-        let playlist = repo
-            .get(playlist_id)?
-            .ok_or("playlist not found")?;
+        let playlist = repo.get(playlist_id)?.ok_or("playlist not found")?;
 
         let track_ids = repo.get_track_ids(playlist_id)?;
         let track_repo = TrackRepo::new(self.db.clone());
@@ -32,7 +30,10 @@ impl PlaylistManager {
             if let Ok(Some(track)) = track_repo.get(*tid) {
                 let duration_s = track.duration_ms / 1000;
                 let artist = track.artist_name.as_deref().unwrap_or("Unknown");
-                lines.push(format!("#EXTINF:{},{} - {}", duration_s, artist, track.title));
+                lines.push(format!(
+                    "#EXTINF:{},{} - {}",
+                    duration_s, artist, track.title
+                ));
                 if let Some(ref path) = track.file_path {
                     lines.push(path.clone());
                 }

@@ -78,12 +78,16 @@ impl DeezerService {
             .await
             .map_err(|e| format!("deezer gw: {e}"))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| format!("deezer gw body: {e}"))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("deezer gw body: {e}"))?;
         if !status.is_success() || body.starts_with('<') {
             tracing::warn!(method, %status, body_preview = &body[..body.len().min(200)], "deezer_gw_blocked");
             return Err(format!("deezer gw http {status}"));
         }
-        let data: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("deezer gw json: {e}"))?;
+        let data: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("deezer gw json: {e}"))?;
         if let Some(err) = data.get("error").and_then(|e| e.as_object()) {
             if !err.is_empty() {
                 return Err(format!("deezer gw error: {}", serde_json::json!(err)));
@@ -138,9 +142,7 @@ impl DeezerService {
                     Some(serde_json::json!({"SNG_ID": current_id})),
                 )
                 .await?;
-            let token = result["TRACK_TOKEN"]
-                .as_str()
-                .ok_or("no TRACK_TOKEN")?;
+            let token = result["TRACK_TOKEN"].as_str().ok_or("no TRACK_TOKEN")?;
             let license = self.license_token.as_ref().ok_or("no license_token")?;
             let format_name = match self.quality.as_str() {
                 "FLAC" | "MP3_320" | "MP3_128" => self.quality.as_str(),
@@ -471,7 +473,11 @@ impl StreamingService for DeezerService {
     ) -> Result<StreamUrl, String> {
         // Path 1: local decrypt proxy (full quality, plain audio for DLNA)
         if let (Some(base), true) = (&self.proxy_base_url, self.has_full_streaming()) {
-            let ext = if self.quality == "FLAC" { "flac" } else { "mp3" };
+            let ext = if self.quality == "FLAC" {
+                "flac"
+            } else {
+                "mp3"
+            };
             let mime = if ext == "flac" {
                 "audio/flac"
             } else {
@@ -493,7 +499,11 @@ impl StreamingService for DeezerService {
         // Path 2: direct encrypted URL (only for clients that decrypt)
         if self.has_full_streaming() {
             if let Ok(url) = self.get_full_stream_url(track_id, 0).await {
-                let ext = if self.quality == "FLAC" { "flac" } else { "mp3" };
+                let ext = if self.quality == "FLAC" {
+                    "flac"
+                } else {
+                    "mp3"
+                };
                 return Ok(StreamUrl {
                     url,
                     mime_type: if ext == "flac" {

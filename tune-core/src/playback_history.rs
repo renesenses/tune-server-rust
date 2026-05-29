@@ -162,11 +162,17 @@ impl PlaybackHistory {
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM playback_history", [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        conn.query_row("SELECT COUNT(*) FROM playback_history", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())
     }
 
-    pub fn top_tracks(&self, limit: usize, since: Option<i64>) -> Result<Vec<(String, Option<String>, i64)>, String> {
+    pub fn top_tracks(
+        &self,
+        limit: usize,
+        since: Option<i64>,
+    ) -> Result<Vec<(String, Option<String>, i64)>, String> {
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
         let sql = if let Some(ts) = since {
@@ -223,8 +229,15 @@ mod tests {
         let history = PlaybackHistory::new(db);
         let id = history
             .record(
-                Some(1), "Song A", Some("Artist A"), Some("Album A"),
-                "local", None, 0, 180_000, 180_000,
+                Some(1),
+                "Song A",
+                Some("Artist A"),
+                Some("Album A"),
+                "local",
+                None,
+                0,
+                180_000,
+                180_000,
             )
             .unwrap();
         assert!(id > 0);
@@ -252,11 +265,31 @@ mod tests {
         let history = PlaybackHistory::new(db);
         for _ in 0..3 {
             history
-                .record(Some(1), "Hit", Some("Star"), None, "local", None, 0, 200_000, 200_000)
+                .record(
+                    Some(1),
+                    "Hit",
+                    Some("Star"),
+                    None,
+                    "local",
+                    None,
+                    0,
+                    200_000,
+                    200_000,
+                )
                 .unwrap();
         }
         history
-            .record(Some(2), "Other", Some("Star"), None, "local", None, 0, 100_000, 100_000)
+            .record(
+                Some(2),
+                "Other",
+                Some("Star"),
+                None,
+                "local",
+                None,
+                0,
+                100_000,
+                100_000,
+            )
             .unwrap();
 
         let top = history.top_tracks(10, None).unwrap();

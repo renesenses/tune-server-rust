@@ -237,20 +237,29 @@ impl TuneConfig {
         env_f64("TUNE_CROSSFADE_DURATION", &mut config.crossfade_duration);
         env_str("TUNE_FFMPEG_PATH", &mut config.ffmpeg_path);
         env_str("TUNE_FFPROBE_PATH", &mut config.ffprobe_path);
-        env_str("TUNE_DEFAULT_OUTPUT_FORMAT", &mut config.default_output_format);
+        env_str(
+            "TUNE_DEFAULT_OUTPUT_FORMAT",
+            &mut config.default_output_format,
+        );
         env_u32("TUNE_MAX_SAMPLE_RATE", &mut config.max_sample_rate);
         env_u32("TUNE_MAX_BIT_DEPTH", &mut config.max_bit_depth);
         env_bool("TUNE_METADATA_READONLY", &mut config.metadata_readonly);
         env_str("TUNE_DISCOGS_TOKEN", &mut config.discogs_token);
         env_str("TUNE_LASTFM_API_KEY", &mut config.lastfm_api_key);
         env_str("TUNE_LASTFM_API_SECRET", &mut config.lastfm_api_secret);
-        env_bool("TUNE_LASTFM_SCROBBLE_ENABLED", &mut config.lastfm_scrobble_enabled);
+        env_bool(
+            "TUNE_LASTFM_SCROBBLE_ENABLED",
+            &mut config.lastfm_scrobble_enabled,
+        );
         env_bool("TUNE_ENRICH_ON_SCAN", &mut config.enrich_on_scan);
         env_bool("TUNE_TIDAL_ENABLED", &mut config.tidal_enabled);
         env_str("TUNE_TIDAL_QUALITY", &mut config.tidal_quality);
         env_bool("TUNE_QOBUZ_ENABLED", &mut config.qobuz_enabled);
         env_bool("TUNE_SPOTIFY_ENABLED", &mut config.spotify_enabled);
-        env_bool("TUNE_SPOTIFY_CONNECT_ENABLED", &mut config.spotify_connect_enabled);
+        env_bool(
+            "TUNE_SPOTIFY_CONNECT_ENABLED",
+            &mut config.spotify_connect_enabled,
+        );
         env_bool("TUNE_DEEZER_ENABLED", &mut config.deezer_enabled);
         env_opt("TUNE_DEEZER_ARL", &mut config.deezer_arl);
         env_str("TUNE_DEEZER_QUALITY", &mut config.deezer_quality);

@@ -4,7 +4,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::track_matcher::{find_best_match, MatchCandidate, MatchResult};
+use crate::track_matcher::{MatchCandidate, MatchResult, find_best_match};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferProgress {
@@ -139,12 +139,7 @@ impl PlaylistTransfer {
             p.status = "complete".into();
         }
 
-        info!(
-            matched,
-            approximate,
-            not_found,
-            "transfer_complete"
-        );
+        info!(matched, approximate, not_found, "transfer_complete");
 
         TransferResult {
             source_service: source_service.into(),
@@ -168,14 +163,7 @@ mod tests {
     async fn transfer_empty() {
         let transfer = PlaylistTransfer::new();
         let result = transfer
-            .execute(
-                &[],
-                "spotify",
-                "tidal",
-                "Test",
-                |_| async { vec![] },
-                0.6,
-            )
+            .execute(&[], "spotify", "tidal", "Test", |_| async { vec![] }, 0.6)
             .await;
 
         assert_eq!(result.total, 0);

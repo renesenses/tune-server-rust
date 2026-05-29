@@ -59,14 +59,8 @@ pub fn router() -> Router<AppState> {
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .route("/suggestions/auto-apply", post(auto_apply_suggestions))
-        .route(
-            "/suggestions/tracks/{track_id}",
-            get(suggestions_for_track),
-        )
-        .route(
-            "/suggestions/albums/{album_id}",
-            get(suggestions_for_album),
-        )
+        .route("/suggestions/tracks/{track_id}", get(suggestions_for_track))
+        .route("/suggestions/albums/{album_id}", get(suggestions_for_album))
         // Artist enrichment
         .route("/artists/{id}/enrich", get(enrich_artist))
         .route("/artists/{id}/similar", get(similar_artists))
@@ -351,10 +345,7 @@ async fn auto_apply_suggestions(
 // Artist Enrichment
 // ---------------------------------------------------------------------------
 
-async fn enrich_artist(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,
@@ -373,10 +364,7 @@ async fn enrich_artist(
     Json(json!(data)).into_response()
 }
 
-async fn similar_artists(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,

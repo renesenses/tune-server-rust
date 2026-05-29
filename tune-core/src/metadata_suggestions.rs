@@ -192,8 +192,7 @@ impl SuggestionStore {
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        self.db
-            .execute_batch("DELETE FROM metadata_suggestions")
+        self.db.execute_batch("DELETE FROM metadata_suggestions")
     }
 
     fn query_suggestions(&self, sql: &str, param: i64) -> Result<Vec<MetadataSuggestion>, String> {
@@ -304,12 +303,8 @@ mod tests {
     #[test]
     fn count_and_clear() {
         let store = setup();
-        store
-            .add_track_suggestion(1, "a", "v", "s", 0.5)
-            .unwrap();
-        store
-            .add_track_suggestion(2, "b", "w", "s", 0.5)
-            .unwrap();
+        store.add_track_suggestion(1, "a", "v", "s", 0.5).unwrap();
+        store.add_track_suggestion(2, "b", "w", "s", 0.5).unwrap();
         assert_eq!(store.count_pending().unwrap(), 2);
 
         store.clear().unwrap();

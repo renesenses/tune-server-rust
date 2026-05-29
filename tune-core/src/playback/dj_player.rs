@@ -180,8 +180,7 @@ impl DualDeckPlayer {
         let gain_a = self.deck_a.lock().await.gain * cf_a;
         let gain_b = self.deck_b.lock().await.gain * cf_b;
 
-        self.mixer
-            .mix_buffers(&[buf_a, buf_b], &[gain_a, gain_b])
+        self.mixer.mix_buffers(&[buf_a, buf_b], &[gain_a, gain_b])
     }
 
     pub async fn status(&self) -> serde_json::Value {
@@ -255,8 +254,10 @@ mod tests {
     #[tokio::test]
     async fn bpm_sync() {
         let dj = DualDeckPlayer::new(1);
-        dj.load_track(Deck::A, "Fast", None, 180000, Some(140.0)).await;
-        dj.load_track(Deck::B, "Slow", None, 200000, Some(100.0)).await;
+        dj.load_track(Deck::A, "Fast", None, 180000, Some(140.0))
+            .await;
+        dj.load_track(Deck::B, "Slow", None, 200000, Some(100.0))
+            .await;
         dj.sync_bpm().await;
 
         let b = dj.deck_b.lock().await;

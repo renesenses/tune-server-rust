@@ -14,10 +14,7 @@ fn md5_hex(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub async fn fetch_cover_from_caa(
-    musicbrainz_release_id: &str,
-    cache_dir: &str,
-) -> Option<String> {
+pub async fn fetch_cover_from_caa(musicbrainz_release_id: &str, cache_dir: &str) -> Option<String> {
     if musicbrainz_release_id.is_empty() {
         return None;
     }
@@ -74,7 +71,11 @@ pub async fn fetch_cover_from_discogs(
         .get(format!("{DISCOGS_API}/database/search"))
         .header("Authorization", format!("Discogs token={discogs_token}"))
         .header("User-Agent", DISCOGS_UA)
-        .query(&[("q", &query), ("type", &"release".to_string()), ("per_page", &"1".to_string())])
+        .query(&[
+            ("q", &query),
+            ("type", &"release".to_string()),
+            ("per_page", &"1".to_string()),
+        ])
         .send()
         .await
         .ok()?;

@@ -107,7 +107,10 @@ mod tests {
     fn set_and_get() {
         let mut cache = StreamUrlCache::new(60, 100);
         cache.set("t1", "http://example.com/stream", None);
-        assert_eq!(cache.get("t1").as_deref(), Some("http://example.com/stream"));
+        assert_eq!(
+            cache.get("t1").as_deref(),
+            Some("http://example.com/stream")
+        );
     }
 
     #[test]

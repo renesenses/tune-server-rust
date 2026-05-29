@@ -95,20 +95,12 @@ impl RemoteProxy {
         self.post_json(&url, &body).await
     }
 
-    pub async fn get_stream_url(
-        &self,
-        peer: &PeerServer,
-        track_id: i64,
-    ) -> Result<String, String> {
+    pub async fn get_stream_url(&self, peer: &PeerServer, track_id: i64) -> Result<String, String> {
         let base = Self::base_url(peer);
         Ok(format!("{base}/api/stream/{track_id}"))
     }
 
-    pub async fn get_artwork_url(
-        &self,
-        peer: &PeerServer,
-        track_id: i64,
-    ) -> String {
+    pub async fn get_artwork_url(&self, peer: &PeerServer, track_id: i64) -> String {
         let base = Self::base_url(peer);
         format!("{base}/api/artwork/track/{track_id}")
     }

@@ -846,11 +846,7 @@ async fn create_backup(State(state): State<AppState>) -> impl IntoResponse {
 
     match tune_core::db_backup::create_backup(&db_path) {
         Some(info) => Json(json!(info)).into_response(),
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "backup failed",
-        )
-            .into_response(),
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "backup failed").into_response(),
     }
 }
 

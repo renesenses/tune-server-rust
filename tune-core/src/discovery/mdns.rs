@@ -407,7 +407,10 @@ fn service_to_device(
             device.mac_address = Some(id.to_string());
         }
         if let Some(cap_str) = info.get_property_val_str("caps") {
-            caps.insert("caps".into(), serde_json::Value::String(cap_str.to_string()));
+            caps.insert(
+                "caps".into(),
+                serde_json::Value::String(cap_str.to_string()),
+            );
         }
         if let Some(ch) = info.get_property_val_str("ch") {
             caps.insert("channels".into(), serde_json::Value::String(ch.to_string()));

@@ -8,25 +8,23 @@ const LOCAL_LATENCY_MS: i64 = 10;
 const DEFAULT_SAMPLES: usize = 5;
 const SAMPLE_DELAY_MS: u64 = 100;
 
-pub async fn measure_output_latency(
-    output: &dyn OutputTarget,
-    samples: usize,
-) -> Option<i64> {
+pub async fn measure_output_latency(output: &dyn OutputTarget, samples: usize) -> Option<i64> {
     let output_type = output.output_type();
     if output_type == "local" {
         return Some(LOCAL_LATENCY_MS);
     }
 
-    let n = if samples == 0 { DEFAULT_SAMPLES } else { samples };
+    let n = if samples == 0 {
+        DEFAULT_SAMPLES
+    } else {
+        samples
+    };
     let mut latencies = Vec::with_capacity(n);
 
     for _ in 0..n {
         let start = Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            output.get_status(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), output.get_status()).await;
         match result {
             Ok(Ok(_)) => {
                 let rtt_ms = start.elapsed().as_millis() as i64;
@@ -107,17 +105,9 @@ pub struct ZoneHealth {
     pub position_ok: bool,
 }
 
-pub async fn check_zone_health(
-    zone_id: i64,
-    name: &str,
-    output: &dyn OutputTarget,
-) -> ZoneHealth {
+pub async fn check_zone_health(zone_id: i64, name: &str, output: &dyn OutputTarget) -> ZoneHealth {
     let start = Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        output.get_status(),
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), output.get_status()).await;
 
     match result {
         Ok(Ok(status)) => {
@@ -132,7 +122,8 @@ pub async fn check_zone_health(
                     "online".into()
                 },
                 latency_ms: Some(latency_ms),
-                position_ok: status.position_ms > 0 || status.state == crate::outputs::TransportState::Stopped,
+                position_ok: status.position_ms > 0
+                    || status.state == crate::outputs::TransportState::Stopped,
             }
         }
         Ok(Err(_)) | Err(_) => ZoneHealth {

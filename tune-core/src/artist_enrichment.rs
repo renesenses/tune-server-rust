@@ -27,7 +27,10 @@ pub struct ArtistEnrichmentClient {
 impl ArtistEnrichmentClient {
     pub fn new(base_url: Option<&str>, timeout_secs: u64) -> Self {
         Self {
-            base_url: base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/').to_string(),
+            base_url: base_url
+                .unwrap_or(DEFAULT_BASE_URL)
+                .trim_end_matches('/')
+                .to_string(),
             cache: HashMap::new(),
             timeout_secs,
         }
@@ -43,7 +46,11 @@ impl ArtistEnrichmentClient {
         if let Some(inner) = artist.fields.get_mut("data") {
             if let Some(img) = inner.get("image_url").and_then(|v| v.as_str()) {
                 if img.starts_with("/storage/") {
-                    let base = self.base_url.split("/api/").next().unwrap_or(&self.base_url);
+                    let base = self
+                        .base_url
+                        .split("/api/")
+                        .next()
+                        .unwrap_or(&self.base_url);
                     let full = format!("{base}{img}");
                     inner["image_url"] = serde_json::json!(full);
                 }

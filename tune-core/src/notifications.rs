@@ -8,7 +8,12 @@ use crate::event_bus::TuneEvent;
 
 pub fn is_enabled() -> bool {
     std::env::var("TUNE_NOTIFICATIONS_ENABLED")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -47,7 +52,11 @@ async fn download_icon(cover_url: &str, server_base: &str) -> Option<String> {
     };
     let icon_path = icon_cache_dir().join(format!("{hash}.jpg"));
 
-    if icon_path.exists() && std::fs::metadata(&icon_path).map(|m| m.len() > 0).unwrap_or(false) {
+    if icon_path.exists()
+        && std::fs::metadata(&icon_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+    {
         return Some(icon_path.to_string_lossy().to_string());
     }
 
@@ -158,18 +167,9 @@ pub fn spawn_notification_listener(
                 continue;
             }
 
-            let artist = event.data["artist_name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let album = event.data["album_title"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let cover = event.data["cover_path"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let artist = event.data["artist_name"].as_str().unwrap_or("").to_string();
+            let album = event.data["album_title"].as_str().unwrap_or("").to_string();
+            let cover = event.data["cover_path"].as_str().unwrap_or("").to_string();
 
             let body = [&artist, &album]
                 .iter()

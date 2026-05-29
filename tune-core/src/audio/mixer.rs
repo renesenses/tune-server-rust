@@ -89,7 +89,8 @@ impl PcmMixer {
             16 => {
                 for chunk in data.chunks_exact_mut(2) {
                     let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                    let adjusted = (sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    let adjusted =
+                        (sample as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     let bytes = adjusted.to_le_bytes();
                     chunk[0] = bytes[0];
                     chunk[1] = bytes[1];
@@ -97,8 +98,13 @@ impl PcmMixer {
             }
             24 => {
                 for chunk in data.chunks_exact_mut(3) {
-                    let raw = ((chunk[2] as i32) << 16) | ((chunk[1] as i32) << 8) | (chunk[0] as i32);
-                    let sample = if raw & 0x800000 != 0 { raw | !0xFFFFFF } else { raw };
+                    let raw =
+                        ((chunk[2] as i32) << 16) | ((chunk[1] as i32) << 8) | (chunk[0] as i32);
+                    let sample = if raw & 0x800000 != 0 {
+                        raw | !0xFFFFFF
+                    } else {
+                        raw
+                    };
                     let adjusted = (sample as f32 * gain).clamp(-8388608.0, 8388607.0) as i32;
                     chunk[0] = (adjusted & 0xFF) as u8;
                     chunk[1] = ((adjusted >> 8) & 0xFF) as u8;
@@ -110,8 +116,7 @@ impl PcmMixer {
     }
 
     pub fn silence(&self, duration_ms: u64) -> Vec<u8> {
-        let sample_count =
-            (self.sample_rate as u64 * self.channels as u64 * duration_ms) / 1000;
+        let sample_count = (self.sample_rate as u64 * self.channels as u64 * duration_ms) / 1000;
         let bytes_per_sample = (self.bit_depth / 8) as u64;
         vec![0u8; (sample_count * bytes_per_sample) as usize]
     }

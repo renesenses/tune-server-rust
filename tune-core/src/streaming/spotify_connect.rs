@@ -108,21 +108,32 @@ fn parse_librespot_event(line: &str) -> Option<(String, Option<String>)> {
 
     let event = events.iter().find(|e| lower.contains(*e))?;
 
-    let track_id = line
-        .find("track_id")
-        .and_then(|pos| {
-            let after = &line[pos..];
-            let start = after.find(|c: char| c.is_alphanumeric() && c != 't' && c != 'r' && c != 'a' && c != 'c' && c != 'k' && c != '_' && c != 'i' && c != 'd')
-                .or_else(|| after.find('=').map(|p| p + 1))
-                .or_else(|| after.find(':').map(|p| p + 1))?;
-            let trimmed = after[start..].trim_start_matches(|c: char| !c.is_alphanumeric());
-            let end = trimmed.find(|c: char| !c.is_alphanumeric()).unwrap_or(trimmed.len());
-            if end > 0 {
-                Some(trimmed[..end].to_string())
-            } else {
-                None
-            }
-        });
+    let track_id = line.find("track_id").and_then(|pos| {
+        let after = &line[pos..];
+        let start = after
+            .find(|c: char| {
+                c.is_alphanumeric()
+                    && c != 't'
+                    && c != 'r'
+                    && c != 'a'
+                    && c != 'c'
+                    && c != 'k'
+                    && c != '_'
+                    && c != 'i'
+                    && c != 'd'
+            })
+            .or_else(|| after.find('=').map(|p| p + 1))
+            .or_else(|| after.find(':').map(|p| p + 1))?;
+        let trimmed = after[start..].trim_start_matches(|c: char| !c.is_alphanumeric());
+        let end = trimmed
+            .find(|c: char| !c.is_alphanumeric())
+            .unwrap_or(trimmed.len());
+        if end > 0 {
+            Some(trimmed[..end].to_string())
+        } else {
+            None
+        }
+    });
 
     Some((event.to_string(), track_id))
 }

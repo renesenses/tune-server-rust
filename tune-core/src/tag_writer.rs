@@ -140,10 +140,7 @@ pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResu
     })
 }
 
-fn build_ffmpeg_metadata(
-    update: &TagUpdate,
-    format: TagFormat,
-) -> Vec<(String, String)> {
+fn build_ffmpeg_metadata(update: &TagUpdate, format: TagFormat) -> Vec<(String, String)> {
     let mut metadata = Vec::new();
     let map: &[(&str, &str)] = match format {
         TagFormat::Vorbis => VORBIS_MAP,
@@ -205,8 +202,10 @@ fn tag_update_to_map(update: &TagUpdate) -> HashMap<String, String> {
 pub async fn read_tags(file_path: &str) -> Result<HashMap<String, String>, String> {
     let output = tokio::process::Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_format",
             file_path,
         ])

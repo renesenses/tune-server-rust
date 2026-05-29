@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod bandcamp;
+pub mod bridge;
 pub mod cd_rip;
 pub mod connect;
 pub mod dashboard;
@@ -55,7 +56,6 @@ pub mod tags;
 pub mod upnp;
 pub mod visualizer;
 pub mod widget;
-pub mod bridge;
 pub mod ws;
 pub mod zone_manager;
 pub mod zones;

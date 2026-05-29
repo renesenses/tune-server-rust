@@ -488,26 +488,20 @@ async fn process_responses(
                         );
                         device.location = Some(resp.location.clone());
                         let mut svc_urls = std::collections::HashMap::new();
-                        svc_urls.insert(
-                            "AVTransport".to_string(),
-                            probe.av_transport_url.clone(),
-                        );
+                        svc_urls.insert("AVTransport".to_string(), probe.av_transport_url.clone());
                         if let Some(ref rc) = probe.rendering_control_url {
-                            svc_urls
-                                .insert("RenderingControl".to_string(), rc.clone());
+                            svc_urls.insert("RenderingControl".to_string(), rc.clone());
                         }
                         device.capabilities.insert(
                             "service_urls".into(),
                             serde_json::to_value(&svc_urls).unwrap_or_default(),
                         );
-                        device.capabilities.insert(
-                            "minimal_dmr".into(),
-                            serde_json::Value::Bool(true),
-                        );
+                        device
+                            .capabilities
+                            .insert("minimal_dmr".into(), serde_json::Value::Bool(true));
 
                         let mut st = state.lock().await;
-                        st.known_locations
-                            .insert(dev_id.clone(), resp.location);
+                        st.known_locations.insert(dev_id.clone(), resp.location);
                         st.miss_count.remove(&dev_id);
                         st.create_failures.remove(&dev_id);
                         st.devices.insert(dev_id.clone(), device.clone());

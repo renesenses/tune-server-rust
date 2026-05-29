@@ -68,12 +68,12 @@ pub async fn lookup_acoustid(
         .await
         .map_err(|e| format!("acoustid: {e}"))?;
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| format!("acoustid parse: {e}"))?;
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("acoustid parse: {e}"))?;
 
-    let results = data["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let results = data["results"].as_array().cloned().unwrap_or_default();
 
     let mut matches = Vec::new();
     for result in &results {
@@ -103,7 +103,11 @@ pub async fn lookup_acoustid(
         }
     }
 
-    matches.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    matches.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(matches)
 }
 

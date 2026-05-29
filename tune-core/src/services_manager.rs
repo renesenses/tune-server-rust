@@ -209,11 +209,8 @@ impl ServicesManager {
         let blob = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM streaming_auth WHERE service = ?1",
-            [service],
-        )
-        .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM streaming_auth WHERE service = ?1", [service])
+            .map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO streaming_auth (service, token_data) VALUES (?1, ?2)",
             rusqlite::params![service, blob],
@@ -225,11 +222,8 @@ impl ServicesManager {
     pub fn delete_token(&self, service: &str) -> Result<(), String> {
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM streaming_auth WHERE service = ?1",
-            [service],
-        )
-        .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM streaming_auth WHERE service = ?1", [service])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -261,9 +255,7 @@ impl ServicesManager {
                     source: if configured { Some("db".into()) } else { None },
                     valid: payload.as_ref().and_then(|p| p.valid),
                     validated_at: payload.as_ref().and_then(|p| p.validated_at),
-                    validation_message: payload
-                        .as_ref()
-                        .and_then(|p| p.validation_message.clone()),
+                    validation_message: payload.as_ref().and_then(|p| p.validation_message.clone()),
                 }
             })
             .collect()

@@ -8,10 +8,29 @@ const MB_UA: &str = "TuneServer/1.0 (https://github.com/renesenses/tune-server-r
 const RATE_LIMIT: Duration = Duration::from_millis(1100);
 
 const INSTRUMENTS: &[&str] = &[
-    "guitar", "bass", "drums", "piano", "keyboard", "trumpet", "saxophone",
-    "violin", "cello", "flute", "harmonica", "organ", "percussion", "trombone",
-    "clarinet", "harp", "banjo", "mandolin", "accordion", "synthesizer",
-    "vibraphone", "oboe", "bassoon",
+    "guitar",
+    "bass",
+    "drums",
+    "piano",
+    "keyboard",
+    "trumpet",
+    "saxophone",
+    "violin",
+    "cello",
+    "flute",
+    "harmonica",
+    "organ",
+    "percussion",
+    "trombone",
+    "clarinet",
+    "harp",
+    "banjo",
+    "mandolin",
+    "accordion",
+    "synthesizer",
+    "vibraphone",
+    "oboe",
+    "bassoon",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +64,11 @@ pub async fn lookup_recording(
     let query = format!("recording:\"{title}\" AND artist:\"{artist}\"");
     let resp = client
         .get(format!("{MB_API}/recording"))
-        .query(&[("query", &query), ("limit", &"3".to_string()), ("fmt", &"json".to_string())])
+        .query(&[
+            ("query", &query),
+            ("limit", &"3".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
         .send()
         .await
         .ok()?;
@@ -64,7 +87,9 @@ pub async fn lookup_recording(
         }
     }
 
-    recordings.first().and_then(|r| r["id"].as_str().map(String::from))
+    recordings
+        .first()
+        .and_then(|r| r["id"].as_str().map(String::from))
 }
 
 pub async fn get_recording_credits(
@@ -155,7 +180,11 @@ pub async fn lookup_artist_instrument(
     let query = format!("artist:\"{artist_name}\"");
     let resp = client
         .get(format!("{MB_API}/artist"))
-        .query(&[("query", &query), ("limit", &"3".to_string()), ("fmt", &"json".to_string())])
+        .query(&[
+            ("query", &query),
+            ("limit", &"3".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
         .send()
         .await
         .ok()?;
@@ -313,9 +342,8 @@ mod tests {
     #[test]
     fn disamb_vocalist_detection() {
         let disamb = "rock vocalist and songwriter".to_lowercase();
-        let is_vocal = disamb.contains("singer")
-            || disamb.contains("vocalist")
-            || disamb.contains("vocal");
+        let is_vocal =
+            disamb.contains("singer") || disamb.contains("vocalist") || disamb.contains("vocal");
         assert!(is_vocal);
     }
 }

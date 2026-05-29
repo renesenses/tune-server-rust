@@ -51,9 +51,17 @@ pub fn normalize(text: &str) -> String {
 fn strip_suffixes(text: &str) -> String {
     let mut result = text.to_string();
     let patterns = [
-        "(remastered", "(remaster", "[remastered", "[remaster",
-        "(deluxe", "[deluxe", "(live)", "[live]",
-        "(bonus track)", "(mono)", "(stereo)",
+        "(remastered",
+        "(remaster",
+        "[remastered",
+        "[remaster",
+        "(deluxe",
+        "[deluxe",
+        "(live)",
+        "[live]",
+        "(bonus track)",
+        "(mono)",
+        "(stereo)",
     ];
     for pat in patterns {
         if let Some(pos) = result.to_lowercase().find(pat) {
@@ -63,10 +71,7 @@ fn strip_suffixes(text: &str) -> String {
     result.trim().to_string()
 }
 
-pub fn compute_delta(
-    current: &[TrackSnapshot],
-    previous: &[TrackSnapshot],
-) -> SyncDelta {
+pub fn compute_delta(current: &[TrackSnapshot], previous: &[TrackSnapshot]) -> SyncDelta {
     let prev_keys: HashSet<String> = previous
         .iter()
         .map(|t| track_key(&t.title, &t.artist_name))

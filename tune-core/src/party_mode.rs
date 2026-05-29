@@ -96,10 +96,7 @@ impl PartyVoteStore {
     }
 }
 
-pub fn bubble_up_voted(
-    queue: &mut [PartyQueueItem],
-    current_position: usize,
-) {
+pub fn bubble_up_voted(queue: &mut [PartyQueueItem], current_position: usize) {
     let len = queue.len();
     if len < 2 {
         return;

@@ -53,13 +53,27 @@ impl FFmpegEncoder {
                 args.extend(["-f".into(), "flac".into()]);
             }
             "mp3" => {
-                args.extend(["-codec:a".into(), "libmp3lame".into(), "-q:a".into(), "2".into(), "-f".into(), "mp3".into()]);
+                args.extend([
+                    "-codec:a".into(),
+                    "libmp3lame".into(),
+                    "-q:a".into(),
+                    "2".into(),
+                    "-f".into(),
+                    "mp3".into(),
+                ]);
             }
             "wav" => {
                 args.extend(["-f".into(), "wav".into()]);
             }
             "ogg" => {
-                args.extend(["-codec:a".into(), "libvorbis".into(), "-q:a".into(), "6".into(), "-f".into(), "ogg".into()]);
+                args.extend([
+                    "-codec:a".into(),
+                    "libvorbis".into(),
+                    "-q:a".into(),
+                    "6".into(),
+                    "-f".into(),
+                    "ogg".into(),
+                ]);
             }
             other => {
                 args.extend(["-f".into(), other.to_string()]);

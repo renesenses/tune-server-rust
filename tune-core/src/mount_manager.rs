@@ -185,9 +185,23 @@ impl MountManager {
         std::fs::create_dir_all(mount_path).map_err(|e| e.to_string())?;
 
         let result = if cfg!(target_os = "macos") {
-            mount_smb_macos(&mount.host, &mount.share_name, mount_path, mount.username.as_deref(), password).await
+            mount_smb_macos(
+                &mount.host,
+                &mount.share_name,
+                mount_path,
+                mount.username.as_deref(),
+                password,
+            )
+            .await
         } else {
-            mount_smb_linux(&mount.host, &mount.share_name, mount_path, mount.username.as_deref(), password).await
+            mount_smb_linux(
+                &mount.host,
+                &mount.share_name,
+                mount_path,
+                mount.username.as_deref(),
+                password,
+            )
+            .await
         };
 
         match result {
@@ -307,8 +321,14 @@ mod tests {
 
     #[test]
     fn sanitize_name() {
-        assert_eq!(sanitize_mount_name("192.168.1.1", "Music"), "192.168.1.1_Music");
-        assert_eq!(sanitize_mount_name("server/bad", "sh@re"), "server_bad_sh_re");
+        assert_eq!(
+            sanitize_mount_name("192.168.1.1", "Music"),
+            "192.168.1.1_Music"
+        );
+        assert_eq!(
+            sanitize_mount_name("server/bad", "sh@re"),
+            "server_bad_sh_re"
+        );
     }
 
     #[test]

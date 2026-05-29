@@ -104,10 +104,14 @@ fn parse_extinf(line: &str) -> (i32, Option<String>, Option<String>, HashMap<Str
 
 fn parse_duration_token(token: &str) -> i32 {
     let cleaned = token.trim_end_matches(',').trim();
-    cleaned.parse::<f64>().ok().map(|v| {
-        let i = v as i32;
-        if i >= 0 { i } else { -1 }
-    }).unwrap_or(-1)
+    cleaned
+        .parse::<f64>()
+        .ok()
+        .map(|v| {
+            let i = v as i32;
+            if i >= 0 { i } else { -1 }
+        })
+        .unwrap_or(-1)
 }
 
 fn split_artist_title(display: &str) -> (Option<String>, Option<String>) {
@@ -118,8 +122,16 @@ fn split_artist_title(display: &str) -> (Option<String>, Option<String>) {
         if let Some(idx) = display.find(sep) {
             let artist = display[..idx].trim();
             let title = display[idx + sep.len()..].trim();
-            let a = if artist.is_empty() { None } else { Some(artist.to_string()) };
-            let t = if title.is_empty() { None } else { Some(title.to_string()) };
+            let a = if artist.is_empty() {
+                None
+            } else {
+                Some(artist.to_string())
+            };
+            let t = if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            };
             return (a, t);
         }
     }
@@ -217,7 +229,10 @@ mod tests {
                         http://stream.example.com\n";
         let entries = parse_m3u_content(content, false);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].extra_attrs.get("tvg-logo").unwrap(), "http://logo.png");
+        assert_eq!(
+            entries[0].extra_attrs.get("tvg-logo").unwrap(),
+            "http://logo.png"
+        );
         assert_eq!(entries[0].extra_attrs.get("group-title").unwrap(), "Music");
     }
 

@@ -154,11 +154,7 @@ async fn try_xml_description(
     })
 }
 
-async fn probe_common_paths(
-    client: &Client,
-    base: &str,
-    name: &str,
-) -> Option<ProbeResult> {
+async fn probe_common_paths(client: &Client, base: &str, name: &str) -> Option<ProbeResult> {
     let soap = soap_body(AVT_NS, "GetTransportInfo", &[("InstanceID", "0")]);
     let soap_action = format!("{AVT_NS}#GetTransportInfo");
 
@@ -230,7 +226,11 @@ mod tests {
 
     #[test]
     fn soap_body_escapes_xml() {
-        let body = soap_body(AVT_NS, "SetAVTransportURI", &[("CurrentURI", "http://x.com/a&b")]);
+        let body = soap_body(
+            AVT_NS,
+            "SetAVTransportURI",
+            &[("CurrentURI", "http://x.com/a&b")],
+        );
         assert!(body.contains("&amp;b"));
     }
 }

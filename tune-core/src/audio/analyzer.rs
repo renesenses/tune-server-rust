@@ -45,7 +45,10 @@ pub async fn ffmpeg_pcm(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!(file = file_path, error = %stderr, "ffmpeg_pcm_error");
-        return Err(format!("ffmpeg failed: {}", &stderr[..stderr.len().min(200)]));
+        return Err(format!(
+            "ffmpeg failed: {}",
+            &stderr[..stderr.len().min(200)]
+        ));
     }
 
     Ok(output.stdout)
@@ -54,9 +57,12 @@ pub async fn ffmpeg_pcm(
 pub async fn get_duration(file_path: &str) -> Result<f64, String> {
     let output = tokio::process::Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
             file_path,
         ])
         .stdout(Stdio::piped())
@@ -74,9 +80,13 @@ pub async fn get_duration(file_path: &str) -> Result<f64, String> {
 pub async fn measure_loudness(file_path: &str) -> Option<f64> {
     let output = tokio::process::Command::new("ffmpeg")
         .args([
-            "-i", file_path,
-            "-af", "ebur128=peak=true",
-            "-f", "null", "-",
+            "-i",
+            file_path,
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -241,7 +251,10 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
         }
     }
 
-    rms_values.iter().map(|v| (*v as f32 * 10000.0).round() / 10000.0).collect()
+    rms_values
+        .iter()
+        .map(|v| (*v as f32 * 10000.0).round() / 10000.0)
+        .collect()
 }
 
 pub fn ffmpeg_available() -> bool {
@@ -271,10 +284,7 @@ mod tests {
     fn waveform_normalize() {
         let rms = vec![0.5_f64, 1.0, 0.25];
         let max = rms.iter().cloned().fold(0.0_f64, f64::max);
-        let normalized: Vec<f32> = rms
-            .iter()
-            .map(|v| (v / max) as f32)
-            .collect();
+        let normalized: Vec<f32> = rms.iter().map(|v| (v / max) as f32).collect();
         assert!((normalized[0] - 0.5).abs() < 0.01);
         assert!((normalized[1] - 1.0).abs() < 0.01);
         assert!((normalized[2] - 0.25).abs() < 0.01);

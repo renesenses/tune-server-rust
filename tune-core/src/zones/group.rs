@@ -102,8 +102,7 @@ impl GroupManager {
         let group = ZoneGroup::new(group_id.clone(), leader_zone_id, follower_zone_ids.clone());
         let info = group.info();
 
-        self.zone_to_group
-            .insert(leader_zone_id, group_id.clone());
+        self.zone_to_group.insert(leader_zone_id, group_id.clone());
         for &fid in &follower_zone_ids {
             self.zone_to_group.insert(fid, group_id.clone());
         }

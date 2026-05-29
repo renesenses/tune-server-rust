@@ -70,10 +70,7 @@ pub fn collect_system_info(
 
     let sanitized_dirs: Vec<String> = music_dirs.iter().map(|d| sanitize_path(d)).collect();
 
-    let recent_errors: Vec<String> = recent_errors
-        .iter()
-        .map(|e| sanitize_path(e))
-        .collect();
+    let recent_errors: Vec<String> = recent_errors.iter().map(|e| sanitize_path(e)).collect();
 
     BugReportData {
         version: version.to_string(),

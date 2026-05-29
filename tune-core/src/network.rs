@@ -74,12 +74,7 @@ impl MountManager {
 
         let mut args: Vec<String> = if cfg!(target_os = "macos") {
             let unc = format!("//{}/{}", host, share_name);
-            vec![
-                "-t".into(),
-                "smbfs".into(),
-                unc,
-                mount_point.into(),
-            ]
+            vec!["-t".into(), "smbfs".into(), unc, mount_point.into()]
         } else {
             let unc = format!("//{}/{}", host, share_name);
             let mut a = vec![

@@ -54,8 +54,8 @@ impl PluginManager {
             return Ok(found);
         }
 
-        let entries = std::fs::read_dir(&self.plugins_dir)
-            .map_err(|e| format!("read plugins dir: {e}"))?;
+        let entries =
+            std::fs::read_dir(&self.plugins_dir).map_err(|e| format!("read plugins dir: {e}"))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -131,8 +131,7 @@ impl PluginManager {
 
         let path = Path::new(&plugin.path);
         if path.exists() {
-            std::fs::remove_dir_all(path)
-                .map_err(|e| format!("remove plugin: {e}"))?;
+            std::fs::remove_dir_all(path).map_err(|e| format!("remove plugin: {e}"))?;
         }
 
         info!(id = plugin_id, "plugin_uninstalled");
@@ -159,15 +158,18 @@ impl PluginManager {
 
     pub async fn install_from_archive(&self, archive_data: &[u8]) -> Result<PluginInfo, String> {
         let temp_dir = std::env::temp_dir().join(format!("tune_plugin_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&temp_dir)
-            .map_err(|e| format!("create temp dir: {e}"))?;
+        std::fs::create_dir_all(&temp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 
         let archive_path = temp_dir.join("plugin.tar.gz");
-        std::fs::write(&archive_path, archive_data)
-            .map_err(|e| format!("write archive: {e}"))?;
+        std::fs::write(&archive_path, archive_data).map_err(|e| format!("write archive: {e}"))?;
 
         let output = std::process::Command::new("tar")
-            .args(["xzf", &archive_path.to_string_lossy(), "-C", &temp_dir.to_string_lossy()])
+            .args([
+                "xzf",
+                &archive_path.to_string_lossy(),
+                "-C",
+                &temp_dir.to_string_lossy(),
+            ])
             .output()
             .map_err(|e| format!("extract: {e}"))?;
 
@@ -181,12 +183,10 @@ impl PluginManager {
 
         let target_dir = self.plugins_dir.join(&manifest.id);
         if target_dir.exists() {
-            std::fs::remove_dir_all(&target_dir)
-                .map_err(|e| format!("remove old: {e}"))?;
+            std::fs::remove_dir_all(&target_dir).map_err(|e| format!("remove old: {e}"))?;
         }
 
-        std::fs::rename(&temp_dir, &target_dir)
-            .map_err(|e| format!("install: {e}"))?;
+        std::fs::rename(&temp_dir, &target_dir).map_err(|e| format!("install: {e}"))?;
 
         let info = PluginInfo {
             manifest: manifest.clone(),
@@ -195,10 +195,7 @@ impl PluginManager {
             error: None,
         };
 
-        self.plugins
-            .lock()
-            .await
-            .insert(manifest.id, info.clone());
+        self.plugins.lock().await.insert(manifest.id, info.clone());
 
         info!(id = %info.manifest.id, name = %info.manifest.name, "plugin_installed");
         Ok(info)
@@ -206,10 +203,8 @@ impl PluginManager {
 }
 
 fn load_manifest(path: &Path) -> Result<PluginManifest, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("read manifest: {e}"))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("parse manifest: {e}"))
+    let content = std::fs::read_to_string(path).map_err(|e| format!("read manifest: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
 }
 
 #[cfg(test)]

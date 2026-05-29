@@ -78,15 +78,9 @@ impl AmazonMusicService {
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref token) = self.access_token {
-            headers.insert(
-                "Authorization",
-                format!("Bearer {token}").parse().unwrap(),
-            );
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         }
-        headers.insert(
-            "X-Amzn-Device-Id",
-            self.device_id.parse().unwrap(),
-        );
+        headers.insert("X-Amzn-Device-Id", self.device_id.parse().unwrap());
         headers.insert(
             "X-Amzn-Music-Domain",
             format!("music.amazon.{}", self.region_tld())
@@ -108,9 +102,7 @@ impl AmazonMusicService {
         if resp.status().as_u16() == 401 {
             return Err("unauthorized".into());
         }
-        resp.json()
-            .await
-            .map_err(|e| format!("amazon parse: {e}"))
+        resp.json().await.map_err(|e| format!("amazon parse: {e}"))
     }
 
     async fn api_post(&self, endpoint: &str, body: &Value) -> Result<Value, String> {
@@ -126,9 +118,7 @@ impl AmazonMusicService {
         if resp.status().as_u16() == 401 {
             return Err("unauthorized".into());
         }
-        resp.json()
-            .await
-            .map_err(|e| format!("amazon parse: {e}"))
+        resp.json().await.map_err(|e| format!("amazon parse: {e}"))
     }
 
     async fn refresh_access_token(&mut self) -> bool {
@@ -288,10 +278,7 @@ impl StreamingService for AmazonMusicService {
         self.enabled_override = Some(enabled);
     }
 
-    async fn authenticate(
-        &mut self,
-        _credentials: &Value,
-    ) -> Result<AuthStatus, String> {
+    async fn authenticate(&mut self, _credentials: &Value) -> Result<AuthStatus, String> {
         // Device code flow — step 1: request code pair
         let resp = self
             .client
@@ -305,7 +292,10 @@ impl StreamingService for AmazonMusicService {
             .await
             .map_err(|e| format!("amazon auth: {e}"))?;
 
-        let data: Value = resp.json().await.map_err(|e| format!("amazon auth parse: {e}"))?;
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("amazon auth parse: {e}"))?;
         let device_code = data["device_code"]
             .as_str()
             .ok_or("no device_code")?
@@ -366,7 +356,10 @@ impl StreamingService for AmazonMusicService {
             });
         }
         let data = self
-            .api_get(&format!("search?query={}&limit={limit}", urlencoding::encode(query)))
+            .api_get(&format!(
+                "search?query={}&limit={limit}",
+                urlencoding::encode(query)
+            ))
             .await?;
         let results = data["results"].as_array().cloned().unwrap_or_default();
 
@@ -464,9 +457,7 @@ impl StreamingService for AmazonMusicService {
     }
 
     async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self
-            .api_get(&format!("albums/{album_id}/tracks"))
-            .await?;
+        let data = self.api_get(&format!("albums/{album_id}/tracks")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|t| self.map_track(t)).collect())
     }
@@ -477,17 +468,13 @@ impl StreamingService for AmazonMusicService {
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
-        let data = self
-            .api_get(&format!("artists/{artist_id}/albums"))
-            .await?;
+        let data = self.api_get(&format!("artists/{artist_id}/albums")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|a| self.map_album(a)).collect())
     }
 
     async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
-        let data = self
-            .api_get(&format!("artists/{artist_id}/tracks"))
-            .await?;
+        let data = self.api_get(&format!("artists/{artist_id}/tracks")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|t| self.map_track(t)).collect())
     }

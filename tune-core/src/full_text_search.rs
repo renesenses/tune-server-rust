@@ -45,7 +45,9 @@ pub fn setup_fts(conn: &Connection) {
 
         // Rebuild FTS if content table has rows but FTS is empty
         let fts_count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {fts_name}"), [], |r| r.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {fts_name}"), [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         let source_count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -81,21 +83,13 @@ pub fn search_where(table_name: &str) -> String {
 
 pub fn search_with_rank(table_name: &str) -> String {
     let fts_name = format!("{table_name}_fts");
-    format!(
-        "SELECT rowid, rank FROM {fts_name} WHERE {fts_name} MATCH ? ORDER BY rank"
-    )
+    format!("SELECT rowid, rank FROM {fts_name} WHERE {fts_name} MATCH ? ORDER BY rank")
 }
 
-pub fn fts_search(
-    conn: &Connection,
-    table_name: &str,
-    query: &str,
-    limit: i64,
-) -> Vec<i64> {
+pub fn fts_search(conn: &Connection, table_name: &str, query: &str, limit: i64) -> Vec<i64> {
     let fts_name = format!("{table_name}_fts");
-    let sql = format!(
-        "SELECT rowid FROM {fts_name} WHERE {fts_name} MATCH ? ORDER BY rank LIMIT ?"
-    );
+    let sql =
+        format!("SELECT rowid FROM {fts_name} WHERE {fts_name} MATCH ? ORDER BY rank LIMIT ?");
 
     let escaped = escape_fts_query(query);
 
@@ -117,7 +111,10 @@ fn escape_fts_query(query: &str) -> String {
     let tokens: Vec<String> = query
         .split_whitespace()
         .map(|t| {
-            let clean: String = t.chars().filter(|c| c.is_alphanumeric() || *c == '*').collect();
+            let clean: String = t
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '*')
+                .collect();
             if clean.is_empty() {
                 String::new()
             } else if clean.ends_with('*') {
@@ -200,11 +197,8 @@ mod tests {
         let conn = db.connection().lock().unwrap();
         setup_fts(&conn);
 
-        conn.execute(
-            "INSERT INTO artists (id, name) VALUES (1, 'Stromae')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Stromae')", [])
+            .unwrap();
 
         let results = fts_search(&conn, "artists", "stromae", 10);
         assert_eq!(results, vec![1]);

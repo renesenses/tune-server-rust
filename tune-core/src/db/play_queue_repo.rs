@@ -162,8 +162,17 @@ impl PlayQueueRepo {
             for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
                 tracks.iter().enumerate()
             {
-                stmt.execute(params![zone_id, i as i64, source_id, title, artist, album, cover_url, duration_ms])
-                    .map_err(|e| e.to_string())?;
+                stmt.execute(params![
+                    zone_id,
+                    i as i64,
+                    source_id,
+                    title,
+                    artist,
+                    album,
+                    cover_url,
+                    duration_ms
+                ])
+                .map_err(|e| e.to_string())?;
             }
         }
         tx.commit().map_err(|e| e.to_string())?;

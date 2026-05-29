@@ -51,8 +51,13 @@ impl SqueezeboxOutput {
     }
 
     async fn player_status(&self) -> Result<Value, String> {
-        self.lms_request(vec![json!("status"), json!(0), json!(100), json!("tags:adlNJ")])
-            .await
+        self.lms_request(vec![
+            json!("status"),
+            json!(0),
+            json!(100),
+            json!("tags:adlNJ"),
+        ])
+        .await
     }
 }
 

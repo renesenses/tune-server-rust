@@ -97,7 +97,12 @@ pub struct ScanProgressData {
 }
 
 impl TypedEvent {
-    pub fn playback_started(zone_id: i64, title: &str, artist: Option<&str>, track_id: Option<i64>) -> Self {
+    pub fn playback_started(
+        zone_id: i64,
+        title: &str,
+        artist: Option<&str>,
+        track_id: Option<i64>,
+    ) -> Self {
         Self {
             event_type: EventType::PlaybackStarted,
             source: "playback".into(),

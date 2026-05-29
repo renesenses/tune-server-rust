@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, warn};
 
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
@@ -54,7 +54,9 @@ impl BridgeOutput {
         }
     }
 
-    pub fn pending_responses(&self) -> Arc<Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>> {
+    pub fn pending_responses(
+        &self,
+    ) -> Arc<Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>> {
         self.pending.clone()
     }
 

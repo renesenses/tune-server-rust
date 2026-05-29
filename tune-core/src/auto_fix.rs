@@ -171,7 +171,11 @@ impl AutoFixEngine {
 
         let mut p = self.progress.lock().await;
         p.status = "complete".into();
-        info!(fixed = p.fixed, suggestions = p.suggestions, "auto_fix_scan_complete");
+        info!(
+            fixed = p.fixed,
+            suggestions = p.suggestions,
+            "auto_fix_scan_complete"
+        );
     }
 
     async fn add_suggestion(
@@ -196,9 +200,17 @@ impl AutoFixEngine {
         self.progress.lock().await.suggestions += 1;
     }
 
-    pub async fn apply_suggestion(&self, track_id: i64, field: &str, value: &str) -> Result<(), String> {
+    pub async fn apply_suggestion(
+        &self,
+        track_id: i64,
+        field: &str,
+        value: &str,
+    ) -> Result<(), String> {
         let repo = TrackRepo::new(self.db.clone());
-        let mut track = repo.get(track_id).map_err(|e| e.to_string())?.ok_or("track not found")?;
+        let mut track = repo
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
 
         match field {
             "genre" => track.genre = Some(value.into()),

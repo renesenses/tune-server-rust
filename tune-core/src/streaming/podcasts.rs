@@ -60,10 +60,7 @@ impl PodcastService {
             .await
             .map_err(|e| format!("podcast parse: {e}"))?;
 
-        let results = data["results"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let results = data["results"].as_array().cloned().unwrap_or_default();
 
         Ok(results
             .iter()
@@ -199,8 +196,8 @@ fn parse_rss(xml: &str, limit: usize) -> Result<Vec<PodcastEpisode>, String> {
 
         let published = extract_tag(item, "pubDate").unwrap_or_default();
 
-        let cover_url = extract_attr(item, "itunes:image", "href")
-            .unwrap_or_else(|| channel_cover.clone());
+        let cover_url =
+            extract_attr(item, "itunes:image", "href").unwrap_or_else(|| channel_cover.clone());
 
         episodes.push(PodcastEpisode {
             title,

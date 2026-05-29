@@ -231,7 +231,8 @@ impl AdvancedHealthMonitor {
         };
 
         if status != AlertLevel::Ok {
-            let msg = format!("{recent_count} erreurs en 5 minutes (seuil: {ERROR_SPIKE_THRESHOLD})");
+            let msg =
+                format!("{recent_count} erreurs en 5 minutes (seuil: {ERROR_SPIKE_THRESHOLD})");
             self.add_alert(status, "errors", &msg).await;
         }
 
@@ -345,9 +346,18 @@ mod tests {
 
     #[test]
     fn worst_status() {
-        assert_eq!(worst(AlertLevel::Ok, AlertLevel::Warning), AlertLevel::Warning);
-        assert_eq!(worst(AlertLevel::Warning, AlertLevel::Ok), AlertLevel::Warning);
-        assert_eq!(worst(AlertLevel::Warning, AlertLevel::Critical), AlertLevel::Critical);
+        assert_eq!(
+            worst(AlertLevel::Ok, AlertLevel::Warning),
+            AlertLevel::Warning
+        );
+        assert_eq!(
+            worst(AlertLevel::Warning, AlertLevel::Ok),
+            AlertLevel::Warning
+        );
+        assert_eq!(
+            worst(AlertLevel::Warning, AlertLevel::Critical),
+            AlertLevel::Critical
+        );
         assert_eq!(worst(AlertLevel::Ok, AlertLevel::Ok), AlertLevel::Ok);
     }
 

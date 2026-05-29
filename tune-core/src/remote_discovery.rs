@@ -119,9 +119,7 @@ impl PeerRegistry {
             .map_err(|e| format!("udp bind: {e}"))?;
 
         let search = Self::ssdp_search_message();
-        let target: SocketAddr = SSDP_MULTICAST
-            .parse()
-            .map_err(|e| format!("parse: {e}"))?;
+        let target: SocketAddr = SSDP_MULTICAST.parse().map_err(|e| format!("parse: {e}"))?;
 
         socket
             .send_to(search.as_bytes(), target)
@@ -232,10 +230,7 @@ fn parse_headers(response: &str) -> HashMap<String, String> {
             break;
         }
         if let Some((key, value)) = line.split_once(':') {
-            headers.insert(
-                key.trim().to_lowercase(),
-                value.trim().to_string(),
-            );
+            headers.insert(key.trim().to_lowercase(), value.trim().to_string());
         }
     }
     headers

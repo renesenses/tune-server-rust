@@ -124,7 +124,9 @@ impl PlayQueue {
         if pos_i < self.position {
             self.position -= 1;
         } else if pos_i == self.position {
-            self.position = self.position.min(self.tracks.len().saturating_sub(1) as i64);
+            self.position = self
+                .position
+                .min(self.tracks.len().saturating_sub(1) as i64);
         }
         if self.shuffle {
             self.regenerate_shuffle();

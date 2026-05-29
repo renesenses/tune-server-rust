@@ -32,7 +32,8 @@ pub struct AppState {
     pub config: Arc<TuneConfig>,
     pub port: u16,
     pub started_at: Instant,
-    pub bridge_responses: Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
+    pub bridge_responses:
+        Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
     pub health_monitor: Arc<AdvancedHealthMonitor>,
     pub suggestion_store: Arc<SuggestionStore>,
 }

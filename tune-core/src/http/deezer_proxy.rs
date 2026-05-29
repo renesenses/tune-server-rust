@@ -7,9 +7,9 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::streaming::ServiceRegistry;
 use crate::streaming::deezer::DeezerService;
 use crate::streaming::deezer_decrypt::DeezerDecryptStream;
-use crate::streaming::ServiceRegistry;
 
 pub async fn handle_deezer_proxy(
     Path(filename): Path<String>,

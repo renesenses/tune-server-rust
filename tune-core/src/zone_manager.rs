@@ -255,7 +255,10 @@ impl ZoneManager {
     }
 
     pub fn should_resume(&self, zone_id: i64) -> bool {
-        self.resume_on_recovery.get(&zone_id).copied().unwrap_or(false)
+        self.resume_on_recovery
+            .get(&zone_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn clear_resume(&mut self, zone_id: i64) {

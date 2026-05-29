@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 use tracing::info;
@@ -66,9 +66,9 @@ impl OutputTarget for OaatOutput {
     #[cfg(feature = "oaat")]
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         use oaat_controller::{ConnectedEndpoint, ControllerConfig};
+        use oaat_core::ChannelLayout;
         use oaat_core::format::AudioFormat;
         use oaat_core::wire::PacketFlags;
-        use oaat_core::ChannelLayout;
 
         self.stop().await.ok();
 
@@ -121,7 +121,11 @@ impl OutputTarget for OaatOutput {
             let stream_id = "tune-stream";
 
             // If endpoint supports FLAC, request FLAC from streamer for bandwidth savings
-            let use_flac = endpoint.info.capabilities.formats.contains(&AudioFormat::Flac);
+            let use_flac = endpoint
+                .info
+                .capabilities
+                .formats
+                .contains(&AudioFormat::Flac);
             let fetch_url = if use_flac {
                 url.replace(".wav", ".flac").replace(".WAV", ".flac")
             } else {
@@ -170,8 +174,10 @@ impl OutputTarget for OaatOutput {
                 while data_offset + 8 <= buf.len() {
                     let chunk_id = &buf[data_offset..data_offset + 4];
                     let chunk_size = u32::from_le_bytes([
-                        buf[data_offset + 4], buf[data_offset + 5],
-                        buf[data_offset + 6], buf[data_offset + 7],
+                        buf[data_offset + 4],
+                        buf[data_offset + 5],
+                        buf[data_offset + 6],
+                        buf[data_offset + 7],
                     ]) as usize;
                     if chunk_id == b"data" {
                         buf.drain(..data_offset + 8);
@@ -203,7 +209,11 @@ impl OutputTarget for OaatOutput {
                 (fmt, bpf, 480)
             };
             let ch = channels.min(8) as u8;
-            let layout = if ch <= 2 { ChannelLayout::Stereo } else { ChannelLayout::Stereo };
+            let layout = if ch <= 2 {
+                ChannelLayout::Stereo
+            } else {
+                ChannelLayout::Stereo
+            };
             let packet_size = if format == AudioFormat::Flac {
                 4096 // FLAC frames sent in ~4KB chunks
             } else {
@@ -218,7 +228,14 @@ impl OutputTarget for OaatOutput {
             );
 
             if let Err(e) = endpoint
-                .propose_format(stream_id, format, sample_rate, ch, layout, bits_per_sample as u8)
+                .propose_format(
+                    stream_id,
+                    format,
+                    sample_rate,
+                    ch,
+                    layout,
+                    bits_per_sample as u8,
+                )
                 .await
             {
                 error!(error = %e, "oaat: format propose failed");
@@ -336,19 +353,25 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
-        self.volume.store((volume.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::SeqCst);
+        self.volume
+            .store((volume.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::SeqCst);
         Ok(())
     }
 
     async fn set_mute(&self, muted: bool) -> Result<(), String> {
-        if muted { self.volume.store(0, Ordering::SeqCst); }
+        if muted {
+            self.volume.store(0, Ordering::SeqCst);
+        }
         Ok(())
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
         let state = if self.playing.load(Ordering::Relaxed) {
-            if self.paused.load(Ordering::Relaxed) { TransportState::Paused }
-            else { TransportState::Playing }
+            if self.paused.load(Ordering::Relaxed) {
+                TransportState::Paused
+            } else {
+                TransportState::Playing
+            }
         } else {
             TransportState::Stopped
         };
@@ -366,6 +389,8 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn is_available(&self) -> bool {
-        tokio::net::TcpStream::connect(self.endpoint_addr()).await.is_ok()
+        tokio::net::TcpStream::connect(self.endpoint_addr())
+            .await
+            .is_ok()
     }
 }

@@ -63,7 +63,8 @@ pub fn batch_edit_tracks(db: &SqliteDb, request: &BatchEditRequest) -> BatchResu
         values.push(Box::new(track_id));
         let sql = format!("UPDATE tracks SET {} WHERE id = ?", sets.join(", "));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            values.iter().map(|v| v.as_ref()).collect();
 
         match conn.execute(&sql, param_refs.as_slice()) {
             Ok(n) => updated += n,
@@ -74,7 +75,12 @@ pub fn batch_edit_tracks(db: &SqliteDb, request: &BatchEditRequest) -> BatchResu
         }
     }
 
-    info!(updated, errors, tracks = request.track_ids.len(), "batch_edit_complete");
+    info!(
+        updated,
+        errors,
+        tracks = request.track_ids.len(),
+        "batch_edit_complete"
+    );
     BatchResult { updated, errors }
 }
 

@@ -45,7 +45,11 @@ pub async fn lookup_release(
     let client = reqwest::Client::new();
     let resp = client
         .get(&format!("{MB_API}/release"))
-        .query(&[("query", &query), ("limit", &"5".to_string()), ("fmt", &"json".to_string())])
+        .query(&[
+            ("query", &query),
+            ("limit", &"5".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
         .header("User-Agent", MB_UA)
         .timeout(std::time::Duration::from_secs(15))
         .send()

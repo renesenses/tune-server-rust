@@ -50,7 +50,12 @@ impl SleepTimer {
             original_volume: None,
         });
         *self.cancel_flag.lock().await = false;
-        info!(zone_id, minutes, fade_s = fade_duration_s, "sleep_timer_set");
+        info!(
+            zone_id,
+            minutes,
+            fade_s = fade_duration_s,
+            "sleep_timer_set"
+        );
     }
 
     pub async fn cancel(&self) {

@@ -40,7 +40,14 @@ pub struct ImportReport {
 
 // -- Roon CSV parser --
 
-const ROON_PATH_HEADERS: &[&str] = &["file path", "filepath", "path", "file_path", "location", "file"];
+const ROON_PATH_HEADERS: &[&str] = &[
+    "file path",
+    "filepath",
+    "path",
+    "file_path",
+    "location",
+    "file",
+];
 const ROON_TITLE_HEADERS: &[&str] = &["title", "track title", "track_title", "track", "name"];
 const ROON_ARTIST_HEADERS: &[&str] = &["artist", "artist name", "artist_name", "performers"];
 const ROON_ALBUM_HEADERS: &[&str] = &["album", "album title", "album_title"];
@@ -63,7 +70,10 @@ pub fn parse_roon_csv(raw: &str) -> Vec<ImportedTrack> {
         .from_reader(raw.as_bytes());
 
     let headers: Vec<String> = match reader.headers() {
-        Ok(h) => h.iter().map(|s| s.trim().trim_start_matches('\u{feff}').to_lowercase()).collect(),
+        Ok(h) => h
+            .iter()
+            .map(|s| s.trim().trim_start_matches('\u{feff}').to_lowercase())
+            .collect(),
         Err(_) => return Vec::new(),
     };
 
@@ -91,25 +101,41 @@ pub fn parse_roon_csv(raw: &str) -> Vec<ImportedTrack> {
         if let Some(i) = col_path {
             t.file_path = record.get(i).and_then(|s| {
                 let s = s.trim();
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             });
         }
         if let Some(i) = col_title {
             t.title = record.get(i).and_then(|s| {
                 let s = s.trim();
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             });
         }
         if let Some(i) = col_artist {
             t.artist = record.get(i).and_then(|s| {
                 let s = s.trim();
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             });
         }
         if let Some(i) = col_album {
             t.album = record.get(i).and_then(|s| {
                 let s = s.trim();
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             });
         }
         if let Some(i) = col_play {
@@ -147,7 +173,8 @@ pub fn parse_plex_xml(raw: &str) -> Vec<ImportedTrack> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Empty(ref e)) | Ok(quick_xml::events::Event::Start(ref e)) => {
+            Ok(quick_xml::events::Event::Empty(ref e))
+            | Ok(quick_xml::events::Event::Start(ref e)) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
                 if tag != "track" && tag != "video" {
                     continue;
@@ -373,7 +400,8 @@ mod tests {
 
     #[test]
     fn parse_roon_csv_basic() {
-        let csv = "Title,Artist,Album,Play Count\nSong One,Artist A,Album X,5\nSong Two,Artist B,,3\n";
+        let csv =
+            "Title,Artist,Album,Play Count\nSong One,Artist A,Album X,5\nSong Two,Artist B,,3\n";
         let tracks = parse_roon_csv(csv);
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].title.as_deref(), Some("Song One"));

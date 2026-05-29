@@ -23,7 +23,10 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
     fs::create_dir_all(&backup_dir).ok()?;
 
     let stem = db_file.file_stem()?.to_str()?;
-    let ext = db_file.extension().map(|e| e.to_str().unwrap_or("db")).unwrap_or("db");
+    let ext = db_file
+        .extension()
+        .map(|e| e.to_str().unwrap_or("db"))
+        .unwrap_or("db");
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let backup_name = format!("{stem}_{timestamp}.{ext}");
     let backup_path = backup_dir.join(&backup_name);
@@ -76,10 +79,7 @@ pub fn list_backups(db_path: &str) -> Vec<BackupInfo> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("tune_server");
-    let ext = db_file
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("db");
+    let ext = db_file.extension().and_then(|s| s.to_str()).unwrap_or("db");
 
     let pattern = format!("{stem}_");
     let suffix = format!(".{ext}");
@@ -143,7 +143,11 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
     for suffix in ["-wal", "-shm"] {
         let wal = db_file.with_file_name(format!(
             "{}{}",
-            db_file.file_name().unwrap_or_default().to_str().unwrap_or(""),
+            db_file
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or(""),
             suffix
         ));
         if wal.exists() {
@@ -187,7 +191,10 @@ fn prune_backups(backup_dir: &Path, stem: &str, ext: &str) {
         if let Some(old) = files.first() {
             let _ = fs::remove_file(old);
             for s in ["-wal", "-shm"] {
-                let wal = old.with_file_name(format!("{}{s}", old.file_name().unwrap_or_default().to_str().unwrap_or("")));
+                let wal = old.with_file_name(format!(
+                    "{}{s}",
+                    old.file_name().unwrap_or_default().to_str().unwrap_or("")
+                ));
                 let _ = fs::remove_file(&wal);
             }
             info!(path = %old.display(), "database_backup_pruned");

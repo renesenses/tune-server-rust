@@ -84,12 +84,7 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
 
     let rows: Vec<(i64, String, String, Option<String>)> = stmt
         .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })
         .unwrap_or_else(|_| panic!("query_map failed"))
         .filter_map(|r| r.ok())
