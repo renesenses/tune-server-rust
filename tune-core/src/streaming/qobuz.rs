@@ -239,14 +239,36 @@ impl QobuzService {
     }
 
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
+        // Qobuz returns subgenresCount (integer) rather than a subgenres array
+        // at the /genre/list level. Fall back to checking the subgenres array
+        // (returned by /genre/get) or slug depth as a heuristic.
+        let has_children = item["subgenresCount"]
+            .as_u64()
+            .map(|n| n > 0)
+            .or_else(|| {
+                item["subgenres"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+            })
+            .unwrap_or_else(|| {
+                // Top-level genres (slug without '/') typically have children
+                item["slug"]
+                    .as_str()
+                    .map(|s| !s.contains('/'))
+                    .unwrap_or(false)
+            });
+
+        // Qobuz image can be a string or an object {"large": "...", "small": "..."}
+        let image_url = item["image"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| item["image"]["large"].as_str().map(String::from));
+
         StreamGenre {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
-            has_children: item["subgenres"]
-                .as_array()
-                .map(|a| !a.is_empty())
-                .unwrap_or(false),
-            image_url: item["image"].as_str().map(Into::into),
+            has_children,
+            image_url,
         }
     }
 
@@ -465,10 +487,13 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
-        let data = self.api_get("/genre/list", &[]).await.map_err(|e| {
-            info!(error = %e, "qobuz_genres_failed");
-            e
-        })?;
+        let data = self
+            .api_get("/genre/list", &[("offset", "0"), ("limit", "500")])
+            .await
+            .map_err(|e| {
+                info!(error = %e, "qobuz_genres_failed");
+                e
+            })?;
         let genres: Vec<StreamGenre> = data["genres"]["items"]
             .as_array()
             .or_else(|| data["genres"].as_array())
@@ -873,6 +898,37 @@ mod tests {
         assert_eq!(genre.id, "10");
         assert_eq!(genre.name, "Jazz");
         assert!(genre.has_children);
+        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/jazz.jpg"));
+    }
+
+    #[test]
+    fn map_genre_subgenres_count() {
+        // Qobuz /genre/list returns subgenresCount (integer) instead of subgenres array
+        let json = json!({
+            "id": 10,
+            "name": "Jazz",
+            "slug": "jazz",
+            "subgenresCount": 15,
+            "image": {"large": "http://img.qobuz.com/jazz-large.jpg"},
+        });
+        let genre = QobuzService::map_genre(&json);
+        assert_eq!(genre.id, "10");
+        assert_eq!(genre.name, "Jazz");
+        assert!(genre.has_children);
+        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/jazz-large.jpg"));
+    }
+
+    #[test]
+    fn map_genre_image_object() {
+        // Image as object with large/small keys
+        let json = json!({
+            "id": 30,
+            "name": "Classical",
+            "subgenresCount": 5,
+            "image": {"large": "http://img.qobuz.com/classical.jpg", "small": "http://img.qobuz.com/classical-sm.jpg"},
+        });
+        let genre = QobuzService::map_genre(&json);
+        assert_eq!(genre.image_url.as_deref(), Some("http://img.qobuz.com/classical.jpg"));
     }
 
     #[test]
@@ -884,6 +940,27 @@ mod tests {
         });
         let genre = QobuzService::map_genre(&json);
         assert!(!genre.has_children);
+    }
+
+    #[test]
+    fn map_genre_slug_heuristic() {
+        // Top-level slug (no '/') implies children
+        let json = json!({
+            "id": 40,
+            "name": "Rock",
+            "slug": "rock",
+        });
+        let genre = QobuzService::map_genre(&json);
+        assert!(genre.has_children);
+
+        // Sub-genre slug with '/' implies no children
+        let json2 = json!({
+            "id": 41,
+            "name": "Hard Rock",
+            "slug": "rock/hard-rock",
+        });
+        let genre2 = QobuzService::map_genre(&json2);
+        assert!(!genre2.has_children);
     }
 
     #[test]
