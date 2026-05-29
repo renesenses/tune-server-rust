@@ -245,10 +245,16 @@ impl PlaybackOrchestrator {
                 target_fmt.ffmpeg_format_arg()
             };
 
-            let args: Vec<String> = vec![
+            let mut args: Vec<String> = vec![
                 "-hide_banner".into(),
                 "-loglevel".into(),
                 "warning".into(),
+            ];
+            // DSD/DSF requires explicit input format for FFmpeg to decode correctly
+            if src_fmt == AudioFormat::Dsd {
+                args.extend(["-f".into(), "dsf".into()]);
+            }
+            args.extend([
                 "-i".into(),
                 file_path.clone(),
                 "-vn".into(),
@@ -261,7 +267,7 @@ impl PlaybackOrchestrator {
                 "-ac".into(),
                 channels.to_string(),
                 "pipe:1".into(),
-            ];
+            ]);
 
             let fp = file_path.clone();
             tokio::spawn(async move {

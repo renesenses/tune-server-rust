@@ -71,6 +71,17 @@ impl AudioPipeline {
             args.extend(["-ss".into(), format!("{secs:.3}")]);
         }
 
+        // DSD/DSF requires explicit input format for FFmpeg to decode correctly
+        if AudioFormat::from_extension(
+            std::path::Path::new(&cfg.file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or(""),
+        ) == Some(AudioFormat::Dsd)
+        {
+            args.extend(["-f".into(), "dsf".into()]);
+        }
+
         let codec = if cfg.output_format == AudioFormat::Wav {
             match cfg.bit_depth {
                 24 => "pcm_s24le",
