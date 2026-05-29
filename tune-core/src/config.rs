@@ -93,6 +93,7 @@ pub struct TuneConfig {
     pub qobuz_app_id: Option<String>,
     pub spotify_enabled: bool,
     pub spotify_client_id: Option<String>,
+    pub spotify_redirect_uri: Option<String>,
     pub spotify_connect_enabled: bool,
     pub spotify_connect_device_name: Option<String>,
     pub spotify_connect_bitrate: u32,
@@ -193,6 +194,7 @@ impl Default for TuneConfig {
             qobuz_app_id: Some("798273057".into()),
             spotify_enabled: false,
             spotify_client_id: None,
+            spotify_redirect_uri: None,
             spotify_connect_enabled: false,
             spotify_connect_device_name: None,
             spotify_connect_bitrate: 320,
@@ -256,6 +258,11 @@ impl TuneConfig {
         env_str("TUNE_TIDAL_QUALITY", &mut config.tidal_quality);
         env_bool("TUNE_QOBUZ_ENABLED", &mut config.qobuz_enabled);
         env_bool("TUNE_SPOTIFY_ENABLED", &mut config.spotify_enabled);
+        env_opt("TUNE_SPOTIFY_CLIENT_ID", &mut config.spotify_client_id);
+        env_opt(
+            "TUNE_SPOTIFY_REDIRECT_URI",
+            &mut config.spotify_redirect_uri,
+        );
         env_bool(
             "TUNE_SPOTIFY_CONNECT_ENABLED",
             &mut config.spotify_connect_enabled,

@@ -54,7 +54,10 @@ impl AppState {
             std::env::var("QOBUZ_APP_SECRET").unwrap_or_default(),
         )));
         services.register(Box::new(
-            tune_core::streaming::spotify::SpotifyService::new(),
+            tune_core::streaming::spotify::SpotifyService::with_config(
+                tune_config.spotify_client_id.as_deref(),
+                tune_config.spotify_redirect_uri.as_deref(),
+            ),
         ));
         services.register(Box::new(tune_core::streaming::deezer::DeezerService::new()));
         services.register(Box::new(

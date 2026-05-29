@@ -17,6 +17,10 @@ pub struct TuneConfig {
     pub dlna_play_delay_ms: u64,
     #[serde(default)]
     pub device_delays: HashMap<String, u64>,
+    #[serde(default)]
+    pub spotify_client_id: Option<String>,
+    #[serde(default)]
+    pub spotify_redirect_uri: Option<String>,
 }
 
 impl TuneConfig {
@@ -43,6 +47,8 @@ impl Default for TuneConfig {
             log_level: "info".into(),
             dlna_play_delay_ms: 0,
             device_delays: HashMap::new(),
+            spotify_client_id: None,
+            spotify_redirect_uri: None,
         }
     }
 }
@@ -103,6 +109,16 @@ impl TuneConfig {
         }
         if let Ok(v) = std::env::var("TUNE_LOG_LEVEL").or_else(|_| std::env::var("TUNE_LOG")) {
             config.log_level = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_SPOTIFY_CLIENT_ID")
+            && !v.is_empty()
+        {
+            config.spotify_client_id = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_SPOTIFY_REDIRECT_URI")
+            && !v.is_empty()
+        {
+            config.spotify_redirect_uri = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
