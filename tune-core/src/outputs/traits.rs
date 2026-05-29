@@ -36,6 +36,16 @@ impl Default for OutputStatus {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PlayMedia<'a> {
+    pub url: &'a str,
+    pub mime_type: &'a str,
+    pub title: Option<&'a str>,
+    pub artist: Option<&'a str>,
+    pub album: Option<&'a str>,
+    pub cover_url: Option<&'a str>,
+}
+
 #[async_trait::async_trait]
 pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;
@@ -48,7 +58,16 @@ pub trait OutputTarget: Send + Sync {
         mime_type: &str,
         title: Option<&str>,
         artist: Option<&str>,
-    ) -> Result<(), String>;
+    ) -> Result<(), String> {
+        self.play_media(&PlayMedia {
+            url, mime_type, title, artist, ..Default::default()
+        }).await
+    }
+
+    async fn play_media(&self, _media: &PlayMedia<'_>) -> Result<(), String> {
+        Err("not implemented".into())
+    }
+
     async fn pause(&self) -> Result<(), String>;
     async fn resume(&self) -> Result<(), String>;
     async fn stop(&self) -> Result<(), String>;
@@ -66,5 +85,9 @@ pub trait OutputTarget: Send + Sync {
         _artist: Option<&str>,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        self.set_next_url(media.url, media.mime_type, media.title, media.artist).await
     }
 }

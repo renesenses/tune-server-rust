@@ -124,10 +124,14 @@ async fn play_radio(
         let outputs = state.outputs.lock().await;
         if let Some(output) = outputs.get(did) {
             let output = output.lock().await;
-            output
-                .play_url(&radio.url, "audio/aac", Some(&radio.name), None)
-                .await
-                .is_ok()
+            let media = tune_core::outputs::PlayMedia {
+                url: &radio.url,
+                mime_type: "audio/aac",
+                title: Some(&radio.name),
+                cover_url: radio.logo_url.as_deref(),
+                ..Default::default()
+            };
+            output.play_media(&media).await.is_ok()
         } else {
             false
         }

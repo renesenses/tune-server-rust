@@ -329,17 +329,22 @@ impl PositionPoller {
             .resolve_queue_item_url(zone_id, next_pos)
             .await
         {
-            Ok((url, mime_type, title, artist)) => {
+            Ok(resolved) => {
                 let outputs = self.outputs.lock().await;
                 if let Some(output) = outputs.get(device_id) {
                     let output = output.lock().await;
-                    if let Err(e) = output
-                        .set_next_url(&url, &mime_type, Some(&title), artist.as_deref())
-                        .await
-                    {
+                    let media = crate::outputs::PlayMedia {
+                        url: &resolved.url,
+                        mime_type: &resolved.mime_type,
+                        title: Some(&resolved.title),
+                        artist: resolved.artist.as_deref(),
+                        album: resolved.album.as_deref(),
+                        cover_url: resolved.cover_url.as_deref(),
+                    };
+                    if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");
                     } else {
-                        info!(zone_id, title = %title, "gapless_next_set");
+                        info!(zone_id, title = %resolved.title, "gapless_next_set");
                     }
                 }
             }

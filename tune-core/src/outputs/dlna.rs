@@ -1,10 +1,11 @@
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use super::traits::{OutputStatus, OutputTarget, TransportState};
+use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
+const SOAP_MAX_RETRIES: usize = 2;
 
 pub struct DlnaOutput {
     name: String,
@@ -60,18 +61,37 @@ impl DlnaOutput {
         );
 
         let soap_action = format!("{service}#{action}");
+        let mut last_err = String::new();
 
-        let resp = self
-            .client
-            .post(url)
-            .header("Content-Type", "text/xml; charset=utf-8")
-            .header("SOAPAction", format!("\"{soap_action}\""))
-            .body(soap)
-            .send()
-            .await
-            .map_err(|e| format!("soap send: {e}"))?;
+        for attempt in 0..=SOAP_MAX_RETRIES {
+            if attempt > 0 {
+                let delay = 200 * (1 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                debug!(device = %self.name, action, attempt, "soap_retry");
+            }
 
-        resp.text().await.map_err(|e| format!("soap read: {e}"))
+            match self
+                .client
+                .post(url)
+                .header("Content-Type", "text/xml; charset=utf-8")
+                .header("SOAPAction", format!("\"{soap_action}\""))
+                .body(soap.clone())
+                .send()
+                .await
+            {
+                Ok(resp) => match resp.text().await {
+                    Ok(text) => return Ok(text),
+                    Err(e) => last_err = format!("soap read: {e}"),
+                },
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    last_err = format!("soap send: {e}");
+                }
+                Err(e) => return Err(format!("soap send: {e}")),
+            }
+        }
+
+        warn!(device = %self.name, action, error = %last_err, "soap_all_retries_failed");
+        Err(last_err)
     }
 
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
@@ -92,17 +112,31 @@ impl DlnaOutput {
     fn didl_metadata(
         title: Option<&str>,
         artist: Option<&str>,
+        album: Option<&str>,
         mime_type: &str,
         url: &str,
+        cover_url: Option<&str>,
     ) -> String {
-        let title = title.unwrap_or("Unknown");
-        let artist = artist.unwrap_or("Unknown");
-        let escaped_url = url
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+        let title = quick_xml::escape::escape(title.unwrap_or("Unknown"));
+        let artist = quick_xml::escape::escape(artist.unwrap_or("Unknown"));
+        let escaped_url = quick_xml::escape::escape(url);
+
+        let album_tag = album
+            .map(|a| {
+                let a = quick_xml::escape::escape(a);
+                format!("&lt;upnp:album&gt;{a}&lt;/upnp:album&gt;")
+            })
+            .unwrap_or_default();
+
+        let art_tag = cover_url
+            .map(|c| {
+                let c = quick_xml::escape::escape(c);
+                format!("&lt;upnp:albumArtURI&gt;{c}&lt;/upnp:albumArtURI&gt;")
+            })
+            .unwrap_or_default();
+
         format!(
-            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;dc:creator&gt;{artist}&lt;/dc:creator&gt;&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
+            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;dc:creator&gt;{artist}&lt;/dc:creator&gt;&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
         )
     }
 
@@ -142,33 +176,28 @@ impl OutputTarget for DlnaOutput {
         "dlna"
     }
 
-    async fn play_url(
-        &self,
-        url: &str,
-        mime_type: &str,
-        title: Option<&str>,
-        artist: Option<&str>,
-    ) -> Result<(), String> {
-        // Always stop the current transport first to reset renderer state.
-        // Many DLNA renderers (Eversolo, Denon, Marantz, etc.) silently reject
-        // SetAVTransportURI if the previous transport is still loaded (even if stopped).
+    async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         let stop_resp = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
         match &stop_resp {
             Ok(_) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
             Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
         }
 
-        // Minimum 200ms settling time after Stop for renderers that need it
-        // (observed on Eversolo DMP-A6, some Pioneer/Onkyo models).
-        // User-configured play_delay_ms is added on top.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let metadata = Self::didl_metadata(title, artist, mime_type, url);
+        let metadata = Self::didl_metadata(
+            media.title,
+            media.artist,
+            media.album,
+            media.mime_type,
+            media.url,
+            media.cover_url,
+        );
         let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
-            "<InstanceID>0</InstanceID><CurrentURI>{url}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>"
+            "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
+            media.url
         )).await?;
 
-        // Check for UPnP error in the SetAVTransportURI response
         if set_uri_resp.contains("UPnPError") || set_uri_resp.contains("<errorCode>") {
             warn!(device = %self.name, response = %set_uri_resp, "dlna_set_uri_error");
             return Err(format!("SetAVTransportURI rejected: {set_uri_resp}"));
@@ -182,13 +211,12 @@ impl OutputTarget for DlnaOutput {
             .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             .await?;
 
-        // Check for UPnP error in Play response
         if play_resp.contains("UPnPError") || play_resp.contains("<errorCode>") {
             warn!(device = %self.name, response = %play_resp, "dlna_play_error");
             return Err(format!("Play rejected: {play_resp}"));
         }
 
-        info!(device = %self.name, url, delay_ms = self.play_delay_ms, "dlna_play");
+        info!(device = %self.name, url = media.url, delay_ms = self.play_delay_ms, "dlna_play");
         Ok(())
     }
 
@@ -249,6 +277,12 @@ impl OutputTarget for DlnaOutput {
                 "<InstanceID>0</InstanceID><Channel>Master</Channel>",
             )
             .await?;
+        let mute_resp = self
+            .rc_action(
+                "GetMute",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+            )
+            .await;
 
         let state = if transport_resp.contains("PLAYING") {
             TransportState::Playing
@@ -270,6 +304,11 @@ impl OutputTarget for DlnaOutput {
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v / 100.0)
             .unwrap_or(0.5);
+        let muted = mute_resp
+            .ok()
+            .and_then(|r| extract_tag(&r, "CurrentMute"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let current_uri = extract_tag(&position_resp, "TrackURI");
 
         Ok(OutputStatus {
@@ -277,7 +316,7 @@ impl OutputTarget for DlnaOutput {
             position_ms,
             duration_ms,
             volume,
-            muted: false,
+            muted,
             current_uri,
             track_title: extract_tag(&position_resp, "dc:title"),
             track_artist: extract_tag(&position_resp, "dc:creator"),
@@ -293,18 +332,20 @@ impl OutputTarget for DlnaOutput {
             .is_ok()
     }
 
-    async fn set_next_url(
-        &self,
-        url: &str,
-        mime_type: &str,
-        title: Option<&str>,
-        artist: Option<&str>,
-    ) -> Result<(), String> {
-        let metadata = Self::didl_metadata(title, artist, mime_type, url);
+    async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let metadata = Self::didl_metadata(
+            media.title,
+            media.artist,
+            media.album,
+            media.mime_type,
+            media.url,
+            media.cover_url,
+        );
         self.av_action("SetNextAVTransportURI", &format!(
-            "<InstanceID>0</InstanceID><NextURI>{url}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>"
+            "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
+            media.url
         )).await?;
-        info!(device = %self.name, url, "dlna_set_next");
+        info!(device = %self.name, url = media.url, "dlna_set_next");
         Ok(())
     }
 }
@@ -340,5 +381,52 @@ mod tests {
         assert_eq!(extract_tag(xml, "RelTime"), Some("0:03:45".into()));
         assert_eq!(extract_tag(xml, "TrackDuration"), Some("0:05:30".into()));
         assert_eq!(extract_tag(xml, "Missing"), None);
+    }
+
+    #[test]
+    fn didl_metadata_with_cover_and_album() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("Test Track"),
+            Some("Test Artist"),
+            Some("Test Album"),
+            "audio/flac",
+            "http://example.com/stream",
+            Some("http://example.com/cover.jpg"),
+        );
+        assert!(didl.contains("Test Track"));
+        assert!(didl.contains("Test Artist"));
+        assert!(didl.contains("Test Album"));
+        assert!(didl.contains("albumArtURI"));
+        assert!(didl.contains("cover.jpg"));
+    }
+
+    #[test]
+    fn didl_metadata_without_cover() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("Title"),
+            None,
+            None,
+            "audio/flac",
+            "http://example.com/stream",
+            None,
+        );
+        assert!(didl.contains("Title"));
+        assert!(!didl.contains("albumArtURI"));
+        assert!(!didl.contains("upnp:album"));
+    }
+
+    #[test]
+    fn didl_escapes_special_chars() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("Rock & Roll"),
+            Some("AC/DC"),
+            None,
+            "audio/flac",
+            "http://example.com/stream?a=1&b=2",
+            None,
+        );
+        assert!(didl.contains("Rock &amp; Roll"));
+        assert!(didl.contains("AC/DC"));
+        assert!(didl.contains("a=1&amp;b=2"));
     }
 }

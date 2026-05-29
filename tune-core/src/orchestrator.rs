@@ -47,6 +47,15 @@ pub struct PlayResult {
     pub source: String,
 }
 
+pub struct ResolvedQueueItem {
+    pub url: String,
+    pub mime_type: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub cover_url: Option<String>,
+}
+
 impl PlaybackOrchestrator {
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
         // Clean up previous stream session for this zone
@@ -60,12 +69,13 @@ impl PlaybackOrchestrator {
         let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover, stream_id) =
             self.resolve_stream(&req).await?;
 
+        let cover_path = req.cover_url.clone().or(resolved_cover);
         let np = NowPlaying {
             track_id: req.track_id,
             title: title.clone(),
             artist_name: artist.clone(),
             album_title: req.album_title.clone(),
-            cover_path: req.cover_url.clone().or(resolved_cover),
+            cover_path: cover_path.clone(),
             duration_ms: duration_ms.unwrap_or(0),
             source: source.clone(),
             source_id: req.source_id.clone(),
@@ -81,14 +91,15 @@ impl PlaybackOrchestrator {
         self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
 
         let output_sent = if let Some(ref device_id) = req.output_device_id {
-            self.send_to_output(
-                device_id,
-                &stream_url,
-                &mime_type,
-                Some(&title),
-                artist.as_deref(),
-            )
-            .await
+            let media = crate::outputs::traits::PlayMedia {
+                url: &stream_url,
+                mime_type: &mime_type,
+                title: Some(&title),
+                artist: artist.as_deref(),
+                album: req.album_title.as_deref(),
+                cover_url: cover_path.as_deref(),
+            };
+            self.send_to_output(device_id, &media).await
         } else {
             false
         };
@@ -434,15 +445,12 @@ impl PlaybackOrchestrator {
     async fn send_to_output(
         &self,
         device_id: &str,
-        url: &str,
-        mime_type: &str,
-        title: Option<&str>,
-        artist: Option<&str>,
+        media: &crate::outputs::traits::PlayMedia<'_>,
     ) -> bool {
         let outputs = self.outputs.lock().await;
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
-            match output.play_url(url, mime_type, title, artist).await {
+            match output.play_media(media).await {
                 Ok(()) => {
                     info!(device_id, "output_play_sent");
                     true
@@ -773,13 +781,16 @@ impl PlaybackOrchestrator {
         &self,
         zone_id: i64,
         position: i64,
-    ) -> Result<(String, String, String, Option<String>), String> {
+    ) -> Result<ResolvedQueueItem, String> {
         let queue_repo = PlayQueueRepo::new(self.db.clone());
         let queue = queue_repo.get_queue(zone_id)?;
         let item = queue
             .iter()
             .find(|i| i.position == position)
             .ok_or("no queue item at position")?;
+
+        let album = item.album_title.clone();
+        let cover = item.cover_path.clone();
 
         let req = PlayRequest {
             zone_id,
@@ -789,12 +800,20 @@ impl PlaybackOrchestrator {
             source_id: None,
             title: item.title.clone(),
             artist_name: item.artist_name.clone(),
-            album_title: item.album_title.clone(),
-            cover_url: item.cover_path.clone(),
+            album_title: album.clone(),
+            cover_url: cover.clone(),
             duration_ms: item.duration_ms,
         };
 
-        let (url, mime, title, artist, _, _, _, _) = self.resolve_stream(&req).await?;
-        Ok((url, mime, title, artist))
+        let (url, mime_type, title, artist, _, _, resolved_cover, _) =
+            self.resolve_stream(&req).await?;
+        Ok(ResolvedQueueItem {
+            url,
+            mime_type,
+            title,
+            artist,
+            album,
+            cover_url: cover.or(resolved_cover),
+        })
     }
 }

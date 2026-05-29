@@ -6,4 +6,4 @@ pub mod registry;
 pub mod traits;
 
 pub use registry::OutputRegistry;
-pub use traits::*;
+pub use traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
