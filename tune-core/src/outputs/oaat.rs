@@ -118,8 +118,17 @@ impl OutputTarget for OaatOutput {
             }
 
             let stream_id = "tune-stream";
+
+            // If endpoint supports FLAC, request FLAC from streamer for bandwidth savings
+            let use_flac = endpoint.info.capabilities.formats.contains(&AudioFormat::Flac);
+            let fetch_url = if use_flac {
+                url.replace(".wav", ".flac").replace(".WAV", ".flac")
+            } else {
+                url.clone()
+            };
+
             let client = reqwest::Client::new();
-            let resp = match client.get(&url).send().await {
+            let resp = match client.get(&fetch_url).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     error!(error = %e, "oaat: HTTP fetch failed");
@@ -178,17 +187,27 @@ impl OutputTarget for OaatOutput {
                 header_parsed = true;
             }
 
-            let format = match bits_per_sample {
-                16 => AudioFormat::PcmS16le,
-                24 => AudioFormat::PcmS24le,
-                32 => AudioFormat::PcmS32le,
-                _ => AudioFormat::PcmS16le,
+            let (format, bytes_per_frame, samples_per_packet) = if use_flac && !header_parsed {
+                // FLAC stream: no WAV header, propose FLAC format
+                // We'll send raw FLAC frames in ~4KB chunks
+                (AudioFormat::Flac, 0usize, 0usize)
+            } else {
+                let fmt = match bits_per_sample {
+                    16 => AudioFormat::PcmS16le,
+                    24 => AudioFormat::PcmS24le,
+                    32 => AudioFormat::PcmS32le,
+                    _ => AudioFormat::PcmS16le,
+                };
+                let bpf = (bits_per_sample as usize / 8) * channels as usize;
+                (fmt, bpf, 480)
             };
             let ch = channels.min(8) as u8;
             let layout = if ch <= 2 { ChannelLayout::Stereo } else { ChannelLayout::Stereo };
-            let bytes_per_frame = (bits_per_sample as usize / 8) * channels as usize;
-            let samples_per_packet = 480usize;
-            let packet_size = samples_per_packet * bytes_per_frame;
+            let packet_size = if format == AudioFormat::Flac {
+                4096 // FLAC frames sent in ~4KB chunks
+            } else {
+                samples_per_packet * bytes_per_frame
+            };
 
             info!(
                 device = %device_name,
