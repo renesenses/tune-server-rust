@@ -305,27 +305,22 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
         DROP TABLE IF EXISTS albums_fts;
         DROP TABLE IF EXISTS artists_fts;
 
-        -- Recreate with multiple columns
+        -- Recreate with multiple columns (contentless — triggers handle sync)
         CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
             title, artist_name, album_title, genre, composer,
             tokenize='unicode61 remove_diacritics 2',
-            content='tracks', content_rowid='id'
+            content='', content_rowid='id'
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
             title, artist_name, genre,
             tokenize='unicode61 remove_diacritics 2',
-            content='albums', content_rowid='id'
+            content='', content_rowid='id'
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
             name, sort_name,
             tokenize='unicode61 remove_diacritics 2',
-            content='artists', content_rowid='id'
+            content='', content_rowid='id'
         );
-
-        -- Rebuild (populate from content tables)
-        INSERT INTO tracks_fts(tracks_fts) VALUES('rebuild');
-        INSERT INTO albums_fts(albums_fts) VALUES('rebuild');
-        INSERT INTO artists_fts(artists_fts) VALUES('rebuild');
 
         -- Auto-sync triggers: tracks
         CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
@@ -394,8 +389,29 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
 
     if let Err(e) = db.execute_batch(sql) {
         tracing::warn!(error = %e, "fts5_upgrade_failed");
+        return;
+    }
+    info!("fts5_tables_upgraded_to_multi_column");
+
+    let populate = "
+        INSERT OR IGNORE INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
+        SELECT t.id, t.title,
+               (SELECT name FROM artists WHERE id = t.artist_id),
+               (SELECT title FROM albums WHERE id = t.album_id),
+               t.genre, t.composer
+        FROM tracks t;
+        INSERT OR IGNORE INTO albums_fts(rowid, title, artist_name, genre)
+        SELECT a.id, a.title,
+               (SELECT name FROM artists WHERE id = a.artist_id),
+               a.genre
+        FROM albums a;
+        INSERT OR IGNORE INTO artists_fts(rowid, name, sort_name)
+        SELECT id, name, sort_name FROM artists;
+    ";
+    if let Err(e) = db.execute_batch(populate) {
+        tracing::warn!(error = %e, "fts5_populate_failed");
     } else {
-        info!("fts5_tables_upgraded_to_multi_column");
+        info!("fts5_tables_populated");
     }
 }
 

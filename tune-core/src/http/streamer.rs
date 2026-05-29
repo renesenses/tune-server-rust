@@ -203,8 +203,14 @@ pub async fn handle_stream(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let range_hdr = req_headers.get("Range").and_then(|v| v.to_str().ok()).unwrap_or("-");
-    let user_agent = req_headers.get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let range_hdr = req_headers
+        .get("Range")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let user_agent = req_headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
     info!(
         stream_id,
         range = range_hdr,
