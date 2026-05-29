@@ -40,8 +40,7 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
                         max_ch = max_ch.max(config.channels());
                         let min = config.min_sample_rate().0;
                         let max = config.max_sample_rate().0;
-                        for &rate in &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
-                        {
+                        for &rate in &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
                             if rate >= min && rate <= max && !rates.contains(&rate) {
                                 rates.push(rate);
                             }
@@ -190,13 +189,12 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
 
     while offset + 8 <= header.len() {
         let chunk_id = &header[offset..offset + 4];
-        let chunk_size =
-            u32::from_le_bytes([
-                header[offset + 4],
-                header[offset + 5],
-                header[offset + 6],
-                header[offset + 7],
-            ]) as usize;
+        let chunk_size = u32::from_le_bytes([
+            header[offset + 4],
+            header[offset + 5],
+            header[offset + 6],
+            header[offset + 7],
+        ]) as usize;
 
         if chunk_id == b"fmt " && offset + 8 + chunk_size <= header.len() {
             let fmt = &header[offset + 8..];
@@ -231,9 +229,8 @@ fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
         24 => bytes
             .chunks_exact(3)
             .map(|c| {
-                let sample = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16))
-                    << 8
-                    >> 8; // sign-extend
+                let sample =
+                    ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8; // sign-extend
                 sample as f32 / 8388608.0
             })
             .collect(),
@@ -478,8 +475,7 @@ impl OutputTarget for LocalOutput {
                         samples = simple_resample(&samples, sample_rate, output_sr, output_ch);
                     }
                     feed_ring(&ring, &samples, &stop_rx, &paused);
-                    total_frames_fed +=
-                        (aligned_len / frame_bytes) as u64;
+                    total_frames_fed += (aligned_len / frame_bytes) as u64;
                 }
             }
 

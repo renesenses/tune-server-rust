@@ -353,13 +353,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn normalize_path_windows_unc() {
-        assert_eq!(
-            normalize_path("\\\\NAS\\Musique"),
-            "\\\\NAS\\Musique"
-        );
-        assert_eq!(
-            normalize_path("//NAS/Musique"),
-            "\\\\NAS\\Musique"
-        );
+        assert_eq!(normalize_path("\\\\NAS\\Musique"), "\\\\NAS\\Musique");
+        assert_eq!(normalize_path("//NAS/Musique"), "\\\\NAS\\Musique");
     }
 }

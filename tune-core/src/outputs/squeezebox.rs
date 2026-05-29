@@ -46,7 +46,10 @@ impl SqueezeboxOutput {
             .await
             .map_err(|e| {
                 if e.is_connect() {
-                    format!("LMS connection failed ({}:{}): {e}", self.lms_host, self.lms_port)
+                    format!(
+                        "LMS connection failed ({}:{}): {e}",
+                        self.lms_host, self.lms_port
+                    )
                 } else if e.is_timeout() {
                     format!("LMS timeout ({}:{})", self.lms_host, self.lms_port)
                 } else {
@@ -60,8 +63,8 @@ impl SqueezeboxOutput {
                 self.lms_host, self.lms_port
             ));
         }
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| format!("JSON-parse: {e} (body: {})", &text[..text.len().min(200)]))?;
+        let json: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("JSON-parse: {e} (body: {})", &text[..text.len().min(200)]))?;
         Ok(json.get("result").cloned().unwrap_or(Value::Null))
     }
 

@@ -572,7 +572,9 @@ async fn main() {
                     // Skip if a zone with that name already exists
                     let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
                     if !name_taken {
-                        if let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(&device_id)) {
+                        if let Ok(zid) =
+                            zone_repo.create(&zone_name, Some("local"), Some(&device_id))
+                        {
                             info!(
                                 name = %zone_name,
                                 zone_id = zid,
@@ -820,8 +822,14 @@ async fn main() {
                             OutputType::Squeezebox => {
                                 // mDNS _slimcli._tcp discovers the LMS server (CLI port 9090).
                                 // Store the host for LMS polling; JSON-RPC uses port 9000.
-                                let settings = tune_core::db::settings_repo::SettingsRepo::new(db_for_mdns.clone());
-                                let current = settings.get("squeezebox_host").ok().flatten().unwrap_or_default();
+                                let settings = tune_core::db::settings_repo::SettingsRepo::new(
+                                    db_for_mdns.clone(),
+                                );
+                                let current = settings
+                                    .get("squeezebox_host")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
                                 if current.is_empty() {
                                     let lms_addr = format!("{}:9000", dev.host);
                                     settings.set("squeezebox_host", &lms_addr).ok();
@@ -882,7 +890,8 @@ async fn main() {
             // Initial delay to let the server fully start
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             loop {
-                let settings = tune_core::db::settings_repo::SettingsRepo::new(state_for_sb.db.clone());
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::new(state_for_sb.db.clone());
                 let enabled = settings
                     .get("squeezebox_enabled")
                     .ok()

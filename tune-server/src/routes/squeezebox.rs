@@ -217,7 +217,8 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
         } else {
             let name_taken = existing_zones.iter().any(|z| z.name == player_name);
             if !name_taken {
-                if let Ok(zid) = zone_repo.create(&player_name, Some("squeezebox"), Some(&device_id))
+                if let Ok(zid) =
+                    zone_repo.create(&player_name, Some("squeezebox"), Some(&device_id))
                 {
                     tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
                 }
