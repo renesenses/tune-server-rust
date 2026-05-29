@@ -63,12 +63,17 @@ async fn lms_request(host: &str, player: &str, cmd: Vec<Value>) -> Result<Value,
                 format!("LMS request failed: {e}")
             }
         })?;
-    let text = resp.text().await.map_err(|e| format!("LMS read error: {e}"))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("LMS read error: {e}"))?;
     if text.is_empty() {
-        return Err(format!("Le serveur sur {host} a renvoyé une réponse vide. Vérifiez qu'il s'agit bien d'un serveur Squeezebox/LMS."));
+        return Err(format!(
+            "Le serveur sur {host} a renvoyé une réponse vide. Vérifiez qu'il s'agit bien d'un serveur Squeezebox/LMS."
+        ));
     }
-    let json: Value = serde_json::from_str(&text)
-        .map_err(|e| format!("Réponse invalide du serveur LMS: {e}"))?;
+    let json: Value =
+        serde_json::from_str(&text).map_err(|e| format!("Réponse invalide du serveur LMS: {e}"))?;
     Ok(json.get("result").cloned().unwrap_or(Value::Null))
 }
 

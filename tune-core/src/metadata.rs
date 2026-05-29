@@ -188,9 +188,11 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
 
-    let tagged = match Probe::open(path)
-        .and_then(|p| p.options(ParseOptions::new().parsing_mode(ParsingMode::Relaxed)).guess_file_type()?.read())
-    {
+    let tagged = match Probe::open(path).and_then(|p| {
+        p.options(ParseOptions::new().parsing_mode(ParsingMode::Relaxed))
+            .guess_file_type()?
+            .read()
+    }) {
         Ok(t) => t,
         Err(e) => return dsf_dff_fallback(path).ok_or_else(|| format!("{e}")),
     };
