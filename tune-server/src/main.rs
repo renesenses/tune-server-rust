@@ -692,7 +692,8 @@ async fn main() {
                 .with_chromecast()
                 .with_airplay()
                 .with_bluos()
-                .with_oaat();
+                .with_oaat()
+                .with_squeezebox();
             if let Err(e) = mdns.start() {
                 tracing::warn!(error = %e, "mdns_start_failed");
             }
@@ -749,6 +750,20 @@ async fn main() {
                                 );
                                 (Some(Box::new(oaat)), "oaat")
                             }
+                            OutputType::Squeezebox => {
+                                // mDNS _slimcli._tcp discovers the LMS server (CLI port 9090).
+                                // Store the host for LMS polling; JSON-RPC uses port 9000.
+                                let settings = tune_core::db::settings_repo::SettingsRepo::new(db_for_mdns.clone());
+                                let current = settings.get("squeezebox_host").ok().flatten().unwrap_or_default();
+                                if current.is_empty() {
+                                    let lms_addr = format!("{}:9000", dev.host);
+                                    settings.set("squeezebox_host", &lms_addr).ok();
+                                    settings.set("squeezebox_enabled", "true").ok();
+                                    info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");
+                                }
+                                // Individual players are discovered via LMS polling, not mDNS
+                                (None, "squeezebox")
+                            }
                             _ => (None, ""),
                         };
 
@@ -789,6 +804,45 @@ async fn main() {
                         reg.remove(&id);
                     }
                 }
+            }
+        });
+    }
+
+    // Squeezebox/LMS player discovery: poll LMS for players when squeezebox_enabled=true
+    {
+        let state_for_sb = state.clone();
+        tokio::spawn(async move {
+            // Initial delay to let the server fully start
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            loop {
+                let settings = tune_core::db::settings_repo::SettingsRepo::new(state_for_sb.db.clone());
+                let enabled = settings
+                    .get("squeezebox_enabled")
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false);
+                let host = settings
+                    .get("squeezebox_host")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+
+                if enabled && !host.is_empty() {
+                    match crate::routes::squeezebox::discover_and_register(&state_for_sb).await {
+                        Ok(players) => {
+                            if !players.is_empty() {
+                                info!(count = players.len(), lms = %host, "squeezebox_poll_discovered");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, lms = %host, "squeezebox_poll_failed");
+                        }
+                    }
+                }
+
+                // Poll every 60 seconds
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
     }
