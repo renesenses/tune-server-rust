@@ -117,33 +117,7 @@ impl OutputTarget for OaatOutput {
                 debug!(error = %e, "oaat: clock sync failed, continuing");
             }
 
-            let sample_rate = 44100u32;
-            let format = AudioFormat::PcmS16le;
             let stream_id = "tune-stream";
-
-            if let Err(e) = endpoint
-                .propose_format(stream_id, format, sample_rate, 2, ChannelLayout::Stereo, 16)
-                .await
-            {
-                error!(error = %e, "oaat: format propose failed");
-                playing.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            endpoint
-                .send_metadata(oaat_core::message::TrackMetadata {
-                    title,
-                    artist,
-                    album,
-                    duration_ms: 0,
-                    artwork_url: None,
-                    format: Some("PCM 16/44".into()),
-                })
-                .await
-                .ok();
-
-            endpoint.send_play(stream_id).await.ok();
-
             let client = reqwest::Client::new();
             let resp = match client.get(&url).send().await {
                 Ok(r) => r,
@@ -157,12 +131,97 @@ impl OutputTarget for OaatOutput {
             let mut stream = resp.bytes_stream();
             use futures_util::StreamExt;
 
+            // Read initial data to parse WAV header
             let mut buf = Vec::new();
-            let mut wav_header_skipped = false;
-            let mut sample_offset: u64 = 0;
-            let bytes_per_frame = 4usize; // 16-bit stereo
+            let mut header_parsed = false;
+            let mut sample_rate = 44100u32;
+            let mut channels = 2u16;
+            let mut bits_per_sample = 16u16;
+
+            while buf.len() < 128 {
+                match stream.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    _ => {
+                        error!("oaat: stream ended before WAV header");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+
+            // Parse WAV header for actual format
+            if buf.len() >= 44 && &buf[..4] == b"RIFF" && &buf[8..12] == b"WAVE" {
+                channels = u16::from_le_bytes([buf[22], buf[23]]);
+                sample_rate = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+                bits_per_sample = u16::from_le_bytes([buf[34], buf[35]]);
+
+                // Find "data" chunk (may not be at offset 36 if extra fmt chunks exist)
+                let mut data_offset = 12;
+                while data_offset + 8 <= buf.len() {
+                    let chunk_id = &buf[data_offset..data_offset + 4];
+                    let chunk_size = u32::from_le_bytes([
+                        buf[data_offset + 4], buf[data_offset + 5],
+                        buf[data_offset + 6], buf[data_offset + 7],
+                    ]) as usize;
+                    if chunk_id == b"data" {
+                        buf.drain(..data_offset + 8);
+                        header_parsed = true;
+                        break;
+                    }
+                    data_offset += 8 + chunk_size;
+                }
+                if !header_parsed {
+                    buf.drain(..44);
+                    header_parsed = true;
+                }
+            } else {
+                header_parsed = true;
+            }
+
+            let format = match bits_per_sample {
+                16 => AudioFormat::PcmS16le,
+                24 => AudioFormat::PcmS24le,
+                32 => AudioFormat::PcmS32le,
+                _ => AudioFormat::PcmS16le,
+            };
+            let ch = channels.min(8) as u8;
+            let layout = if ch <= 2 { ChannelLayout::Stereo } else { ChannelLayout::Stereo };
+            let bytes_per_frame = (bits_per_sample as usize / 8) * channels as usize;
             let samples_per_packet = 480usize;
             let packet_size = samples_per_packet * bytes_per_frame;
+
+            info!(
+                device = %device_name,
+                sample_rate, bits_per_sample, channels,
+                format = %format,
+                "oaat: detected audio format from stream"
+            );
+
+            if let Err(e) = endpoint
+                .propose_format(stream_id, format, sample_rate, ch, layout, bits_per_sample as u8)
+                .await
+            {
+                error!(error = %e, "oaat: format propose failed");
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            let fmt_str = format!("PCM {bits_per_sample}/{}", sample_rate / 1000);
+            endpoint
+                .send_metadata(oaat_core::message::TrackMetadata {
+                    title,
+                    artist,
+                    album,
+                    duration_ms: 0,
+                    artwork_url: None,
+                    format: Some(fmt_str),
+                })
+                .await
+                .ok();
+
+            endpoint.send_play(stream_id).await.ok();
+
+            let mut sample_offset: u64 = 0;
             let start = std::time::Instant::now();
 
             loop {
@@ -182,15 +241,6 @@ impl OutputTarget for OaatOutput {
                         };
 
                         buf.extend_from_slice(&chunk);
-
-                        if !wav_header_skipped && buf.len() >= 44 {
-                            if &buf[..4] == b"RIFF" {
-                                buf.drain(..44);
-                            }
-                            wav_header_skipped = true;
-                        }
-
-                        if !wav_header_skipped { continue; }
 
                         while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
                             while paused.load(Ordering::Relaxed) {
