@@ -37,6 +37,9 @@ cbc = { workspace = true }
 oaat-core = { path = "../../oaat/crates/oaat-core", optional = true }
 oaat-controller = { path = "../../oaat/crates/oaat-controller", optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["local-audio"]
 local-audio = ["cpal"]
