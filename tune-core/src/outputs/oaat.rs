@@ -136,6 +136,11 @@ impl OutputTarget for OaatOutput {
                 url.clone()
             };
 
+            // Always request WAV for now — FLAC passthrough needs the endpoint
+            // to decode, and format detection from WAV header is reliable.
+            let use_flac = false;
+            let fetch_url = url.clone();
+
             let client = reqwest::Client::new();
             let resp = match client.get(&fetch_url).send().await {
                 Ok(r) => r,
@@ -149,9 +154,7 @@ impl OutputTarget for OaatOutput {
             let mut stream = resp.bytes_stream();
             use futures_util::StreamExt;
 
-            // Read initial data to parse WAV header
             let mut buf = Vec::new();
-            let mut header_parsed = false;
             let mut sample_rate = 44100u32;
             let mut channels = 2u16;
             let mut bits_per_sample = 16u16;
@@ -160,21 +163,21 @@ impl OutputTarget for OaatOutput {
                 match stream.next().await {
                     Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                     _ => {
-                        error!("oaat: stream ended before WAV header");
+                        error!("oaat: stream ended before header");
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
                 }
             }
 
-            // Parse WAV header for actual format
+            // Parse WAV header
             if buf.len() >= 44 && &buf[..4] == b"RIFF" && &buf[8..12] == b"WAVE" {
                 channels = u16::from_le_bytes([buf[22], buf[23]]);
                 sample_rate = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
                 bits_per_sample = u16::from_le_bytes([buf[34], buf[35]]);
 
-                // Find "data" chunk (may not be at offset 36 if extra fmt chunks exist)
                 let mut data_offset = 12;
+                let mut found_data = false;
                 while data_offset + 8 <= buf.len() {
                     let chunk_id = &buf[data_offset..data_offset + 4];
                     let chunk_size = u32::from_le_bytes([
@@ -185,33 +188,25 @@ impl OutputTarget for OaatOutput {
                     ]) as usize;
                     if chunk_id == b"data" {
                         buf.drain(..data_offset + 8);
-                        header_parsed = true;
+                        found_data = true;
                         break;
                     }
                     data_offset += 8 + chunk_size;
                 }
-                if !header_parsed {
+                if !found_data {
                     buf.drain(..44);
-                    header_parsed = true;
                 }
-            } else {
-                header_parsed = true;
             }
 
-            let (format, bytes_per_frame, samples_per_packet) = if use_flac && !header_parsed {
-                // FLAC stream: no WAV header, propose FLAC format
-                // We'll send raw FLAC frames in ~4KB chunks
-                (AudioFormat::Flac, 0usize, 0usize)
-            } else {
-                let fmt = match bits_per_sample {
-                    16 => AudioFormat::PcmS16le,
-                    24 => AudioFormat::PcmS24le,
-                    32 => AudioFormat::PcmS32le,
-                    _ => AudioFormat::PcmS16le,
-                };
-                let bpf = (bits_per_sample as usize / 8) * channels as usize;
-                (fmt, bpf, 480)
+            let fmt = match bits_per_sample {
+                16 => AudioFormat::PcmS16le,
+                24 => AudioFormat::PcmS24le,
+                32 => AudioFormat::PcmS32le,
+                _ => AudioFormat::PcmS16le,
             };
+            let bytes_per_frame = (bits_per_sample as usize / 8) * channels as usize;
+            let samples_per_packet: usize = 480;
+            let format = fmt;
             let ch = channels.min(8) as u8;
             let layout = if ch <= 2 {
                 ChannelLayout::Stereo
