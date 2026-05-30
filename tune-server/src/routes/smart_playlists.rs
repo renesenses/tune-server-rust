@@ -235,7 +235,10 @@ fn build_smart_query(
                 if n == 0 {
                     "t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL)".into()
                 } else {
-                    format!("t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) = {})", n)
+                    format!(
+                        "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) = {})",
+                        n
+                    )
                 }
             }
             ("play_count", "gte") => format!(
