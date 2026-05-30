@@ -59,6 +59,71 @@ impl TrackRepo {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// Insert multiple tracks using a single prepared statement.
+    ///
+    /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
+    /// if desired. Returns the number of successfully inserted tracks.
+    pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut count = 0;
+        for track in tracks {
+            let res = stmt.execute(params![
+                track.title,
+                track.album_id, track.artist_id, track.album_artist,
+                track.disc_number, track.disc_subtitle,
+                track.track_number, track.duration_ms,
+                track.file_path, track.format,
+                track.sample_rate, track.bit_depth, track.channels,
+                track.file_mtime, track.file_size, track.audio_hash,
+                track.source, track.source_id, track.isrc,
+                track.genre, track.genres, track.composer, track.year,
+                track.bpm, track.label, track.musicbrainz_recording_id,
+            ]);
+            if res.is_ok() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Update multiple tracks using a single prepared statement.
+    ///
+    /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
+    /// if desired. Returns the number of successfully updated tracks.
+    pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached(
+                "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, genres = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut count = 0;
+        for track in tracks {
+            let Some(id) = track.id else { continue };
+            let res = stmt.execute(params![
+                track.title,
+                track.album_id, track.artist_id, track.album_artist,
+                track.disc_number, track.disc_subtitle,
+                track.track_number, track.duration_ms,
+                track.file_path, track.format,
+                track.sample_rate, track.bit_depth, track.channels,
+                track.file_mtime, track.file_size, track.audio_hash,
+                track.genre, track.genres, track.composer, track.year,
+                track.bpm, track.label, track.musicbrainz_recording_id,
+                id,
+            ]);
+            if res.is_ok() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
         self.db.execute(

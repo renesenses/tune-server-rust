@@ -256,6 +256,120 @@ pub fn scan_files_parallel(
     (results, stats)
 }
 
+/// Default batch size for chunked scanning.
+/// Balances memory usage vs. rayon thread-pool efficiency.
+pub const SCAN_BATCH_SIZE: usize = 500;
+
+/// Scan files in batches, calling `on_batch` after each chunk is parsed.
+///
+/// This enables **progressive availability**: each batch can be committed to
+/// the database independently, so tracks are queryable as soon as each batch
+/// finishes — not only after the entire scan completes.
+///
+/// The callback receives `(batch: Vec<ScannedFile>, batch_index: usize, total_files: usize)`.
+/// It runs on a rayon worker thread, so the caller must ensure any shared
+/// state (DB handle, caches) is `Send + Sync`.
+///
+/// Returns aggregate `ScanStats` over all batches.
+pub fn scan_files_batched(
+    files: &[PathBuf],
+    with_hash: bool,
+    batch_size: usize,
+    mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize),
+) -> ScanStats {
+    let total = files.len();
+    let batch_sz = if batch_size == 0 { SCAN_BATCH_SIZE } else { batch_size };
+    let mut aggregate = ScanStats::default();
+    aggregate.total_files = total;
+
+    for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
+        // Parse metadata in parallel within this chunk
+        let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let batch: Vec<ScannedFile> = chunk
+            .par_iter()
+            .map(|path| {
+                let path_str = path.to_string_lossy().to_string();
+
+                let file_meta = path.metadata().ok();
+                let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = file_meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let metadata = match try_read_metadata(path) {
+                    Ok(meta) => Some(meta),
+                    Err(err) => {
+                        warn!(
+                            path = %path_str,
+                            error = %err,
+                            "scan_file_failed"
+                        );
+                        failed_files.lock().unwrap().push((path_str.clone(), err));
+                        None
+                    }
+                };
+
+                let audio_hash = if with_hash {
+                    compute_audio_hash(path)
+                } else {
+                    None
+                };
+
+                ScannedFile {
+                    path: path_str,
+                    metadata,
+                    audio_hash,
+                    file_size,
+                    mtime,
+                }
+            })
+            .collect();
+
+        // Update aggregate stats
+        aggregate.metadata_ok += batch.iter().filter(|f| f.metadata.is_some()).count();
+        aggregate.metadata_failed += batch.iter().filter(|f| f.metadata.is_none()).count();
+        aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
+
+        let failed = failed_files.lock().unwrap();
+        if !failed.is_empty() {
+            let listing: Vec<String> = failed
+                .iter()
+                .take(10)
+                .map(|(p, e)| format!("  {} ({})", p, e))
+                .collect();
+            warn!(
+                count = failed.len(),
+                batch = batch_idx,
+                "scan_batch_failures\n{}",
+                listing.join("\n")
+            );
+        }
+        drop(failed);
+
+        info!(
+            batch = batch_idx,
+            batch_size = batch.len(),
+            scanned = (batch_idx + 1) * batch_sz,
+            total,
+            "scan_batch_complete"
+        );
+
+        on_batch(batch, batch_idx, total);
+    }
+
+    info!(
+        total = aggregate.total_files,
+        metadata_ok = aggregate.metadata_ok,
+        metadata_failed = aggregate.metadata_failed,
+        "batched_scan_complete"
+    );
+
+    aggregate
+}
+
 pub fn scan_directories(
     dirs: &[String],
     with_hash: bool,
