@@ -261,6 +261,7 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
 
     let mut responses = Vec::new();
     let mut buf = [0u8; 4096];
+    let mut recv_count: u32 = 0;
 
     let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
     loop {
@@ -269,9 +270,12 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             break;
         }
         match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _addr))) => {
+            Ok(Ok((len, addr))) => {
+                recv_count += 1;
                 if let Some(resp) = parse_ssdp_response(&buf[..len]) {
                     responses.push(resp);
+                } else {
+                    debug!(from = %addr, bytes = len, "ssdp_unparseable_response");
                 }
             }
             Ok(Err(e)) => {
@@ -281,6 +285,7 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             Err(_) => break,
         }
     }
+    debug!(bind = %bind_ip, target, recv_count, parsed = responses.len(), "ssdp_search_done");
 
     Ok(responses)
 }
