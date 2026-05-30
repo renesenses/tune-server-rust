@@ -21,7 +21,18 @@ async fn main() {
 
     let config = TuneConfig::load();
 
+    // Use local time for log timestamps (fixes UTC display on Windows/CEST systems).
+    // Must capture offset before spawning threads (security restriction on some OS).
+    let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
+        time_offset,
+        time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
+        ),
+    );
+
     tracing_subscriber::fmt()
+        .with_timer(timer)
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
@@ -66,6 +77,21 @@ async fn main() {
                 &serde_json::to_string(&normalized_dirs).unwrap(),
             )
             .ok();
+    }
+
+    // Persist TUNE_DISCOGS_TOKEN from env/.env to settings DB if not already configured
+    if let Some(ref token) = config.discogs_token {
+        let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+        let already_set = settings
+            .get("discogs_token")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if !already_set {
+            settings.set("discogs_token", token).ok();
+            info!("discogs_token_persisted_from_env");
+        }
     }
 
     if config.auto_scan {

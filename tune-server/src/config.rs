@@ -21,6 +21,8 @@ pub struct TuneConfig {
     pub spotify_client_id: Option<String>,
     #[serde(default)]
     pub spotify_redirect_uri: Option<String>,
+    #[serde(default)]
+    pub discogs_token: Option<String>,
 }
 
 impl TuneConfig {
@@ -49,6 +51,7 @@ impl Default for TuneConfig {
             device_delays: HashMap::new(),
             spotify_client_id: None,
             spotify_redirect_uri: None,
+            discogs_token: None,
         }
     }
 }
@@ -119,6 +122,11 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.spotify_redirect_uri = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_DISCOGS_TOKEN")
+            && !v.is_empty()
+        {
+            config.discogs_token = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
