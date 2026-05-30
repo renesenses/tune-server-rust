@@ -93,6 +93,10 @@ impl OutputTarget for SqueezeboxOutput {
         "squeezebox"
     }
 
+    fn host(&self) -> Option<&str> {
+        Some(&self.lms_host)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         info!(player = %self.device_id, url = media.url, "squeezebox_play");
         self.lms_request(vec![json!("playlist"), json!("play"), json!(media.url)])

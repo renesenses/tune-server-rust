@@ -82,6 +82,10 @@ pub trait OutputTarget: Send + Sync {
     async fn get_status(&self) -> Result<OutputStatus, String>;
     async fn is_available(&self) -> bool;
 
+    fn host(&self) -> Option<&str> {
+        None
+    }
+
     async fn set_next_url(
         &self,
         _url: &str,

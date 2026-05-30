@@ -34,6 +34,10 @@ impl OutputTarget for ChromecastOutput {
         "chromecast"
     }
 
+    fn host(&self) -> Option<&str> {
+        Some(&self.host)
+    }
+
     async fn play_url(
         &self,
         url: &str,

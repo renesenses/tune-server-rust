@@ -19,6 +19,7 @@ const SVC_TIME: &str = "urn:av-openhome-org:service:Time:1";
 pub struct OpenHomeOutput {
     name: String,
     device_id: String,
+    host_addr: String,
     service_urls: HashMap<String, String>,
     event_sub_urls: HashMap<String, String>,
     event_listener: Option<Arc<OpenHomeEventListener>>,
@@ -51,6 +52,7 @@ impl OpenHomeOutput {
         Self {
             name,
             device_id,
+            host_addr: host,
             service_urls,
             event_sub_urls,
             event_listener,
@@ -336,6 +338,10 @@ impl OutputTarget for OpenHomeOutput {
 
     fn output_type(&self) -> &str {
         "openhome"
+    }
+
+    fn host(&self) -> Option<&str> {
+        Some(&self.host_addr)
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

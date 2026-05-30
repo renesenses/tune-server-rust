@@ -44,12 +44,16 @@ impl OutputRegistry {
         for (id, output) in &self.outputs {
             let output = output.lock().await;
             let available = output.is_available().await;
-            results.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "device_id": id,
                 "name": output.name(),
                 "type": output.output_type(),
                 "available": available,
-            }));
+            });
+            if let Some(host) = output.host() {
+                entry.as_object_mut().unwrap().insert("host".into(), serde_json::json!(host));
+            }
+            results.push(entry);
         }
         results
     }
