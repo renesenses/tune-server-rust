@@ -64,10 +64,22 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
             if seen_ids.contains(device_id) {
                 continue;
             }
-            let name = output_info.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let output_type = output_info.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let available = output_info.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
-            let host = output_info.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let name = output_info
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let output_type = output_info
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let available = output_info
+                .get("available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let host = output_info
+                .get("host")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             items.push(json!({
                 "id": device_id,
                 "name": name,

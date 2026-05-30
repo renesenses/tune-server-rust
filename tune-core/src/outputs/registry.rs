@@ -51,7 +51,10 @@ impl OutputRegistry {
                 "available": available,
             });
             if let Some(host) = output.host() {
-                entry.as_object_mut().unwrap().insert("host".into(), serde_json::json!(host));
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("host".into(), serde_json::json!(host));
             }
             results.push(entry);
         }

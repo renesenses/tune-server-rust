@@ -1083,16 +1083,15 @@ async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     let max_lines = q.lines.unwrap_or(100);
 
     // Try log file first
-    let log_path = std::env::var("TUNE_LOG_FILE")
-        .unwrap_or_else(|_| {
-            if cfg!(target_os = "windows") {
-                let appdata = std::env::var("LOCALAPPDATA")
-                    .unwrap_or_else(|_| "C:\\ProgramData".into());
-                format!("{appdata}\\TuneServer\\tune-server.log")
-            } else {
-                "/var/log/tune-server.log".into()
-            }
-        });
+    let log_path = std::env::var("TUNE_LOG_FILE").unwrap_or_else(|_| {
+        if cfg!(target_os = "windows") {
+            let appdata =
+                std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+            format!("{appdata}\\TuneServer\\tune-server.log")
+        } else {
+            "/var/log/tune-server.log".into()
+        }
+    });
 
     // Try reading log file
     if let Ok(content) = std::fs::read_to_string(&log_path) {
@@ -1110,7 +1109,15 @@ async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(output) = std::process::Command::new("journalctl")
-            .args(["-u", "tune-server", "-n", &max_lines.to_string(), "--no-pager", "-o", "short-iso"])
+            .args([
+                "-u",
+                "tune-server",
+                "-n",
+                &max_lines.to_string(),
+                "--no-pager",
+                "-o",
+                "short-iso",
+            ])
             .output()
         {
             if output.status.success() {
