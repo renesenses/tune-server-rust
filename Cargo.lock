@@ -864,6 +864,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
+]
+
+[[package]]
 name = "http"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1628,6 +1639,39 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "oaat-controller"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5325e2e78ed32d37b03408cc6b82372105b9640bcec70666918d438b64548a4e"
+dependencies = [
+ "bytes",
+ "hostname",
+ "mdns-sd",
+ "oaat-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "oaat-core"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e84227e660180846eb3557d1a37667f74dd7bad054a2e845d206168ed0e43ca"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytes",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2894,7 +2938,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-core"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2911,6 +2955,8 @@ dependencies = [
  "md-5",
  "mdns-sd",
  "notify",
+ "oaat-controller",
+ "oaat-core",
  "quick-xml",
  "rayon",
  "regex",
@@ -2931,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "tune-pyo3"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -2941,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "async-stream",
  "axum",
@@ -3051,6 +3097,7 @@ checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
