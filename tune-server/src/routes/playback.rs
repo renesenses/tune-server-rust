@@ -453,13 +453,42 @@ async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<
     Json(build_zone_json(&state, zone_id).await)
 }
 
-async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    let current = state.playback.get_state(zone_id).await;
+
+    // When stopped with a valid NowPlaying, re-play the current track from the start
+    if current.state == tune_core::playback::PlayState::Stopped {
+        if let Some(ref np) = current.now_playing {
+            let output_device_id = get_zone_device_id(&state, zone_id);
+            let orch_req = tune_core::orchestrator::PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: np.track_id,
+                source: if np.source == "local" {
+                    None
+                } else {
+                    Some(np.source.clone())
+                },
+                source_id: np.source_id.clone(),
+                title: Some(np.title.clone()),
+                artist_name: np.artist_name.clone(),
+                album_title: np.album_title.clone(),
+                cover_url: np.cover_path.clone(),
+                duration_ms: Some(np.duration_ms),
+            };
+            return match state.orchestrator.play(orch_req).await {
+                Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            };
+        }
+    }
+
     let device_id = get_zone_device_id(&state, zone_id);
     state
         .orchestrator
         .resume(zone_id, device_id.as_deref())
         .await;
-    Json(build_zone_json(&state, zone_id).await)
+    Json(build_zone_json(&state, zone_id).await).into_response()
 }
 
 async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {

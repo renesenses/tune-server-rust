@@ -129,6 +129,26 @@ impl ArtistRepo {
         Ok(artists)
     }
 
+    /// Delete artists that have zero tracks referencing them.
+    pub fn cleanup_orphans(&self) -> Result<i64, String> {
+        let conn = self.db.connection().lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if count > 0 {
+            conn.execute(
+                "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(count)
+    }
+
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");

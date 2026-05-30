@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats))
         .route("/config", get(get_config).patch(update_config))
         .route("/settings", get(get_settings))
+        .route("/settings/theme", axum::routing::put(set_theme).get(get_theme))
         .route("/library/clear", post(library_clear))
         .route("/scan", post(trigger_scan))
         .route("/scan/status", get(scan_status))
@@ -194,6 +195,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
+    let theme = settings.get("theme").ok().flatten();
 
     Json(json!({
         "music_dirs": music_dirs,
@@ -205,6 +207,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         "onboarding_completed": onboarding_completed,
         "server_version": tune_core::version(),
         "server_engine": "rust",
+        "theme": theme,
     }))
 }
 
@@ -227,6 +230,26 @@ async fn update_config(
         }
     }
     Json(json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct ThemeRequest {
+    theme: String,
+}
+
+async fn set_theme(
+    State(state): State<AppState>,
+    Json(body): Json<ThemeRequest>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    settings.set("theme", &body.theme).ok();
+    Json(json!({ "theme": body.theme }))
+}
+
+async fn get_theme(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let theme = settings.get("theme").ok().flatten();
+    Json(json!({ "theme": theme }))
 }
 
 async fn library_clear(State(state): State<AppState>) -> Json<Value> {
@@ -677,6 +700,12 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         }
         db.execute_batch("COMMIT").ok();
 
+        // Clean up orphan artists left behind after tag corrections
+        let orphan_artists = ArtistRepo::new(db.clone()).cleanup_orphans().unwrap_or(0);
+        if orphan_artists > 0 {
+            tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
+        }
+
         let settings = SettingsRepo::new(db.clone());
         settings.set("scan_status", "idle").ok();
         tracing::info!(
@@ -686,6 +715,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             updated,
             skipped,
             artwork = artwork_extracted,
+            orphan_artists,
             "scan_and_import_complete"
         );
 
@@ -975,9 +1005,11 @@ async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
 
 async fn cleanup(State(state): State<AppState>) -> Json<Value> {
     let album_repo = AlbumRepo::new(state.db.clone());
+    let artist_repo = ArtistRepo::new(state.db.clone());
 
     let merged_albums = merge_duplicate_albums(&state.db);
     let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
+    let orphan_artists = artist_repo.cleanup_orphans().unwrap_or(0);
     let tracks = TrackRepo::new(state.db.clone()).deduplicate().unwrap_or(0);
 
     let db_optimized = state.db.execute_batch("PRAGMA optimize; ANALYZE;").is_ok();
@@ -985,6 +1017,7 @@ async fn cleanup(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "duplicate_albums_merged": merged_albums,
         "orphan_albums_deleted": orphan_albums,
+        "orphan_artists_deleted": orphan_artists,
         "duplicate_tracks_removed": tracks,
         "db_optimized": db_optimized,
     }))
