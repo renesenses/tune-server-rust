@@ -40,10 +40,15 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
 
     let outputs = state.outputs.lock().await;
     let registered_ids: std::collections::HashSet<String> = outputs.list().into_iter().collect();
+    let all_output_status = outputs.status_all().await;
+    drop(outputs);
 
-    let items: Vec<Value> = discovered
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut items: Vec<Value> = discovered
         .iter()
         .map(|d| {
+            seen_ids.insert(d.id.clone());
             let mut v = serde_json::to_value(d).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("available".into(), json!(true));
@@ -53,6 +58,27 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
             v
         })
         .collect();
+
+    for output_info in &all_output_status {
+        if let Some(device_id) = output_info.get("device_id").and_then(|v| v.as_str()) {
+            if seen_ids.contains(device_id) {
+                continue;
+            }
+            let name = output_info.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let output_type = output_info.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let available = output_info.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+            let host = output_info.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            items.push(json!({
+                "id": device_id,
+                "name": name,
+                "type": output_type,
+                "host": host,
+                "port": 0,
+                "available": available,
+                "registered": true,
+            }));
+        }
+    }
 
     Json(json!(items))
 }

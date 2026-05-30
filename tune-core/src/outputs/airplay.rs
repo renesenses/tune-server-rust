@@ -315,6 +315,10 @@ impl OutputTarget for AirplayOutput {
         "airplay"
     }
 
+    fn host(&self) -> Option<&str> {
+        Some(&self.host)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.stop().await.ok();
 
