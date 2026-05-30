@@ -272,7 +272,14 @@ impl PositionPoller {
                         .map(|np| np.duration_ms as u64)
                         .unwrap_or(0);
 
-                    if ps.gapless_sent && track_duration > 0 && status.duration_ms != track_duration
+                    // Detect end-of-track when position reaches or exceeds duration.
+                    // Some DLNA renderers stay in "Playing" state after the track ends,
+                    // so we must also check position vs duration (not only TransportState::Stopped).
+                    if track_duration > 0 && status.position_ms >= track_duration {
+                        info!(zone_id, position_ms = status.position_ms, duration_ms = track_duration, "end_of_track_detected_by_position");
+                        poll_states.remove(&zone_id);
+                        self.handle_track_end(zone_id, zone_state).await;
+                    } else if ps.gapless_sent && track_duration > 0 && status.duration_ms != track_duration
                     {
                         info!(zone_id, "gapless_transition_detected");
                         ps.gapless_sent = false;

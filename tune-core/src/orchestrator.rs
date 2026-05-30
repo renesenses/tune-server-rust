@@ -248,9 +248,11 @@ impl PlaybackOrchestrator {
 
             let mut args: Vec<String> =
                 vec!["-hide_banner".into(), "-loglevel".into(), "warning".into()];
-            // DSD/DSF requires explicit input format for FFmpeg to decode correctly
+            // DSD/DSF and AIFF require explicit input format for FFmpeg to decode correctly
             if src_fmt == AudioFormat::Dsd {
                 args.extend(["-f".into(), "dsf".into()]);
+            } else if src_fmt == AudioFormat::Aiff {
+                args.extend(["-f".into(), "aiff".into()]);
             }
             args.extend([
                 "-i".into(),

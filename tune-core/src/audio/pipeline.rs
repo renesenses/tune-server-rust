@@ -80,6 +80,7 @@ impl AudioPipeline {
         match ext.as_str() {
             "dsf" => args.extend(["-f".into(), "dsf".into()]),
             "dff" => args.extend(["-f".into(), "dff".into()]),
+            "aiff" | "aif" => args.extend(["-f".into(), "aiff".into()]),
             _ => {}
         }
 
