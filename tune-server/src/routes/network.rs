@@ -124,13 +124,57 @@ async fn list_media_servers() -> Json<Value> {
 // SMB discovery and mount management
 // ---------------------------------------------------------------------------
 
-/// Return discovered network shares (stub — real mDNS scanning is a future feature).
+/// Discover network shares via mDNS service browsing (_smb._tcp).
 async fn list_shares() -> Json<Value> {
-    Json(json!({
-        "items": [],
-        "total": 0,
-        "message": "Network share discovery pending (mDNS not yet implemented)",
-    }))
+    let result = tokio::task::spawn_blocking(|| {
+        let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+        let receiver = daemon.browse("_smb._tcp.local.").ok()?;
+        let mut shares = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                    let host = info.get_hostname().trim_end_matches('.').to_string();
+                    let addrs: Vec<String> = info.get_addresses()
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect();
+                    let ip = addrs.first().cloned().unwrap_or_default();
+                    let name = info.get_fullname()
+                        .split("._smb._tcp")
+                        .next()
+                        .unwrap_or(&host)
+                        .to_string();
+                    let key = format!("{}:{}", ip, info.get_port());
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+                    shares.push(json!({
+                        "id": format!("smb://{}", ip),
+                        "name": name,
+                        "host": if ip.is_empty() { host.clone() } else { ip },
+                        "hostname": host,
+                        "port": info.get_port(),
+                        "protocol": "smb",
+                        "available": true,
+                    }));
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        daemon.shutdown().ok();
+        Some(shares)
+    })
+    .await;
+
+    match result {
+        Ok(Some(shares)) => Json(json!(shares)),
+        _ => Json(json!([])),
+    }
 }
 
 /// Scan a specific host for SMB or NFS shares.
