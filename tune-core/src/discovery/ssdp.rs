@@ -276,7 +276,7 @@ async fn send_msearch_from(target: &str, bind_ip: Ipv4Addr) -> Result<Vec<SsdpRe
             }
             Ok(Err(e)) => {
                 debug!(error = %e, "ssdp_recv_error");
-                break;
+                continue;
             }
             Err(_) => break,
         }
