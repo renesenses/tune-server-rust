@@ -25,7 +25,10 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats))
         .route("/config", get(get_config).patch(update_config))
         .route("/settings", get(get_settings))
-        .route("/settings/theme", axum::routing::put(set_theme).get(get_theme))
+        .route(
+            "/settings/theme",
+            axum::routing::put(set_theme).get(get_theme),
+        )
         .route("/library/clear", post(library_clear))
         .route("/scan", post(trigger_scan))
         .route("/scan/status", get(scan_status))
@@ -237,10 +240,7 @@ struct ThemeRequest {
     theme: String,
 }
 
-async fn set_theme(
-    State(state): State<AppState>,
-    Json(body): Json<ThemeRequest>,
-) -> Json<Value> {
+async fn set_theme(State(state): State<AppState>, Json(body): Json<ThemeRequest>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set("theme", &body.theme).ok();
     Json(json!({ "theme": body.theme }))

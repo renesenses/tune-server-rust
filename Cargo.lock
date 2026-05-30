@@ -3002,7 +3002,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-core"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "tune-pyo3"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "async-stream",
  "axum",
