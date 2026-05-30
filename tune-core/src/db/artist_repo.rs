@@ -112,14 +112,14 @@ impl ArtistRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))
+        conn.query_row("SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists ORDER BY COALESCE(sort_name, name) COLLATE NOCASE LIMIT ? OFFSET ?")
+            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) ORDER BY COALESCE(sort_name, name) COLLATE NOCASE LIMIT ? OFFSET ?")
             .map_err(|e| e.to_string())?;
         let artists = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_artist(row)))

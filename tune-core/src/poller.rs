@@ -272,9 +272,16 @@ impl PositionPoller {
                         .map(|np| np.duration_ms as u64)
                         .unwrap_or(0);
 
-                    if ps.gapless_sent && track_duration > 0 && status.duration_ms != track_duration
-                    {
-                        info!(zone_id, "gapless_transition_detected");
+                    // Detect gapless transition: renderer reports a different duration
+                    // than the current track, meaning it moved to the next track.
+                    // Use 2s tolerance to avoid false positives from rounding (WAV).
+                    // Ignore if renderer reports duration 0 (no metadata).
+                    let duration_changed = ps.gapless_sent
+                        && track_duration > 0
+                        && status.duration_ms > 0
+                        && (status.duration_ms as i64 - track_duration as i64).unsigned_abs() > 2000;
+                    if duration_changed {
+                        info!(zone_id, renderer_dur = status.duration_ms, track_dur = track_duration, "gapless_transition_detected");
                         ps.gapless_sent = false;
                         self.handle_track_end(zone_id, zone_state).await;
                     } else if !ps.gapless_sent
