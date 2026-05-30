@@ -653,6 +653,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                         "library.scan.progress",
                         json!({
                             "scanned": processed,
+                            "added": inserted,
                             "total": total,
                             "batch": batch_idx,
                             "inserted": inserted,
