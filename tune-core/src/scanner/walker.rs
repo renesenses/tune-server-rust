@@ -278,7 +278,11 @@ pub fn scan_files_batched(
     mut on_batch: impl FnMut(Vec<ScannedFile>, usize, usize),
 ) -> ScanStats {
     let total = files.len();
-    let batch_sz = if batch_size == 0 { SCAN_BATCH_SIZE } else { batch_size };
+    let batch_sz = if batch_size == 0 {
+        SCAN_BATCH_SIZE
+    } else {
+        batch_size
+    };
     let mut aggregate = ScanStats::default();
     aggregate.total_files = total;
 

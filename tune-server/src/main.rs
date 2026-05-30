@@ -145,10 +145,9 @@ async fn main() {
                                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            let unchanged =
-                                existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                                    && existing_size
-                                        .map_or(false, |s| s == file_meta.len() as i64);
+                            let unchanged = existing_mtime
+                                .map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                                && existing_size.map_or(false, |s| s == file_meta.len() as i64);
                             return !unchanged;
                         }
                     }
@@ -190,8 +189,10 @@ async fn main() {
                 true,
                 tune_core::scanner::walker::SCAN_BATCH_SIZE,
                 |batch, _batch_idx, _total_files| {
-                    let mut to_insert: Vec<tune_core::db::models::Track> = Vec::with_capacity(batch.len());
-                    let mut to_update: Vec<tune_core::db::models::Track> = Vec::with_capacity(batch.len() / 4);
+                    let mut to_insert: Vec<tune_core::db::models::Track> =
+                        Vec::with_capacity(batch.len());
+                    let mut to_update: Vec<tune_core::db::models::Track> =
+                        Vec::with_capacity(batch.len() / 4);
 
                     db.execute_batch("BEGIN IMMEDIATE").ok();
 
@@ -236,17 +237,18 @@ async fn main() {
                             .ok();
                         let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
-                        let track_artist = if is_compilation && track_artist_name != album_artist_name {
-                            artist_repo
-                                .get_or_create(
-                                    track_artist_name,
-                                    meta.musicbrainz_artist_id.as_deref(),
-                                    None,
-                                )
-                                .ok()
-                        } else {
-                            album_artist_entry.clone()
-                        };
+                        let track_artist =
+                            if is_compilation && track_artist_name != album_artist_name {
+                                artist_repo
+                                    .get_or_create(
+                                        track_artist_name,
+                                        meta.musicbrainz_artist_id.as_deref(),
+                                        None,
+                                    )
+                                    .ok()
+                            } else {
+                                album_artist_entry.clone()
+                            };
                         let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
                         let album = meta.album.as_ref().and_then(|title| {

@@ -296,10 +296,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let unchanged =
-                            existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
-                                && existing_size
-                                    .map_or(false, |s| s == file_meta.len() as i64);
+                        let unchanged = existing_mtime
+                            .map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                            && existing_size.map_or(false, |s| s == file_meta.len() as i64);
                         return !unchanged;
                     }
                 }
@@ -359,8 +358,10 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             batch_size,
             |batch, batch_idx, _total_files| {
                 // Collect tracks to batch-insert and batch-update
-                let mut to_insert: Vec<tune_core::db::models::Track> = Vec::with_capacity(batch.len());
-                let mut to_update: Vec<tune_core::db::models::Track> = Vec::with_capacity(batch.len() / 4);
+                let mut to_insert: Vec<tune_core::db::models::Track> =
+                    Vec::with_capacity(batch.len());
+                let mut to_update: Vec<tune_core::db::models::Track> =
+                    Vec::with_capacity(batch.len() / 4);
 
                 // BEGIN transaction for this batch
                 db.execute_batch("BEGIN IMMEDIATE").ok();
@@ -465,9 +466,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                         if let Some(cached) = album_cache.get(key) {
                             Some(cached.clone())
                         } else {
-                            let result = album_repo
-                                .get_or_create(&key.0, key.1, key.2)
-                                .ok();
+                            let result = album_repo.get_or_create(&key.0, key.1, key.2).ok();
                             if let Some(ref a) = result {
                                 album_cache.insert(key.clone(), a.clone());
                             }
@@ -495,7 +494,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     if let Some(ref art) = track_artist {
                         if art.image_path.is_none() {
                             if let Some(parent) = std::path::Path::new(&sf.path).parent() {
-                                for name in &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"] {
+                                for name in
+                                    &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"]
+                                {
                                     let candidate = parent.join(name);
                                     if candidate.exists() {
                                         let hash = tune_core::artwork::artwork_hash(
