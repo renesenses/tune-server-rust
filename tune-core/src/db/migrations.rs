@@ -327,6 +327,24 @@ CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id
         name: "add_zone_gapless_enabled",
         up: "", // Applied programmatically via add_column_if_missing
     },
+    Migration {
+        version: 18,
+        name: "seed_default_smart_playlists",
+        up: "
+INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks)
+    SELECT '50 Random Tracks', '[]', 'random', 'asc', 50
+    WHERE NOT EXISTS (SELECT 1 FROM smart_playlists WHERE name = '50 Random Tracks');
+INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks)
+    SELECT 'Recently Added', '[]', 'added_at', 'desc', 100
+    WHERE NOT EXISTS (SELECT 1 FROM smart_playlists WHERE name = 'Recently Added');
+INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks)
+    SELECT 'Most Played', '[]', 'play_count', 'desc', 50
+    WHERE NOT EXISTS (SELECT 1 FROM smart_playlists WHERE name = 'Most Played');
+INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks)
+    SELECT 'Never Played', '[{\"field\":\"play_count\",\"op\":\"eq\",\"value\":\"0\"}]', 'title', 'asc', 100
+    WHERE NOT EXISTS (SELECT 1 FROM smart_playlists WHERE name = 'Never Played');
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

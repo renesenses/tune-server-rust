@@ -165,15 +165,29 @@ impl PlaybackManager {
 
     pub async fn stop(&self, zone_id: i64) {
         let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
+        let np_data = if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
-            state.now_playing = None;
             state.position_ms = 0;
-        }
+            // Keep now_playing so Play can resume the same track
+            state.now_playing.as_ref().map(|np| {
+                serde_json::json!({
+                    "track_id": np.track_id,
+                    "title": np.title,
+                    "artist_name": np.artist_name,
+                    "album_title": np.album_title,
+                    "cover_path": np.cover_path,
+                    "duration_ms": np.duration_ms,
+                    "source": np.source,
+                    "source_id": np.source_id,
+                })
+            })
+        } else {
+            None
+        };
         self.emit(PlaybackEvent {
             event: "stop".into(),
             zone_id,
-            data: serde_json::json!({}),
+            data: np_data.unwrap_or(serde_json::json!({})),
         });
     }
 

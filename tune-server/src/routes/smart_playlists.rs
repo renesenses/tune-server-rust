@@ -79,19 +79,30 @@ async fn create_smart_playlist(
     Json(body): Json<CreateSmartPlaylist>,
 ) -> impl IntoResponse {
     let rules_json = body.rules.to_string();
-    match state.db.execute(
-        "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)",
-        &[
-            &body.name as &dyn rusqlite::types::ToSql,
-            &rules_json,
-            &body.sort_by.unwrap_or_else(|| "title".into()),
-            &body.sort_order.unwrap_or_else(|| "asc".into()),
-            &body.max_tracks,
-        ],
-    ) {
-        Ok(_) => {
-            let id = state.db.last_insert_rowid();
-            (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+    let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
+    let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
+
+    let result = {
+        let conn = state.db.connection().lock().unwrap();
+        conn.execute(
+            "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)",
+            rusqlite::params![body.name, rules_json, sort_by, sort_order, body.max_tracks],
+        )
+        .map(|_| conn.last_insert_rowid())
+        .map_err(|e| e.to_string())
+    };
+
+    match result {
+        Ok(id) => {
+            let created = json!({
+                "id": id,
+                "name": body.name,
+                "rules": body.rules,
+                "sort_by": sort_by,
+                "sort_order": sort_order,
+                "max_tracks": body.max_tracks,
+            });
+            (StatusCode::CREATED, Json(created)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -219,6 +230,18 @@ fn build_smart_query(
                 format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0))
             }
             ("title", "contains") => format!("t.title LIKE '%{}%'", value.replace('\'', "''")),
+            ("play_count", "eq") => {
+                let n = value.parse::<i64>().unwrap_or(0);
+                if n == 0 {
+                    "t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL)".into()
+                } else {
+                    format!("t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) = {})", n)
+                }
+            }
+            ("play_count", "gte") => format!(
+                "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) >= {})",
+                value.parse::<i64>().unwrap_or(0)
+            ),
             _ => continue,
         };
         conditions.push(cond);
@@ -230,17 +253,23 @@ fn build_smart_query(
         format!("WHERE {}", conditions.join(" AND "))
     };
 
-    let order = format!(
-        "ORDER BY {} {}",
-        match sort_by {
-            "artist" => "ar.name",
-            "album" => "al.title",
-            "year" => "t.year",
-            "duration" => "t.duration_ms",
-            _ => "t.title",
-        },
-        if sort_order == "desc" { "DESC" } else { "ASC" }
-    );
+    let order = if sort_by == "random" {
+        "ORDER BY RANDOM()".to_string()
+    } else {
+        format!(
+            "ORDER BY {} {}",
+            match sort_by {
+                "artist" => "ar.name",
+                "album" => "al.title",
+                "year" => "t.year",
+                "duration" => "t.duration_ms",
+                "added_at" => "t.id",
+                "play_count" => "t.play_count",
+                _ => "t.title",
+            },
+            if sort_order == "desc" { "DESC" } else { "ASC" }
+        )
+    };
 
     let limit_clause = max_tracks.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
@@ -254,13 +283,25 @@ fn execute_smart_track_query(
     order: &str,
     limit_clause: &str,
 ) -> Vec<Value> {
+    let needs_play_count = order.contains("play_count");
+    let play_count_join = if needs_play_count {
+        "LEFT JOIN (SELECT track_id, COUNT(*) AS play_count FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id) lh ON t.id = lh.track_id"
+    } else {
+        ""
+    };
+    // Replace play_count reference with the computed column (COALESCE for never-played)
+    let order = if needs_play_count {
+        order.replace("t.play_count", "COALESCE(lh.play_count, 0)")
+    } else {
+        order.to_string()
+    };
     let sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
-         {} {} {}",
-        where_clause, order, limit_clause
+         {} {} {} {}",
+        play_count_join, where_clause, order, limit_clause
     );
 
     let conn = state.db.connection().lock().unwrap();
