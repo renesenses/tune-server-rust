@@ -1079,10 +1079,56 @@ struct LogsQuery {
 }
 
 async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    let _lines = q.lines.unwrap_or(100);
+    let max_lines = q.lines.unwrap_or(100);
+
+    // Try log file first
+    let log_path = std::env::var("TUNE_LOG_FILE")
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "windows") {
+                let appdata = std::env::var("LOCALAPPDATA")
+                    .unwrap_or_else(|_| "C:\\ProgramData".into());
+                format!("{appdata}\\TuneServer\\tune-server.log")
+            } else {
+                "/var/log/tune-server.log".into()
+            }
+        });
+
+    // Try reading log file
+    if let Ok(content) = std::fs::read_to_string(&log_path) {
+        let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
+        let lines: Vec<&str> = lines.into_iter().rev().collect();
+        return Json(json!({
+            "logs": lines.join("\n"),
+            "lines": lines.len(),
+            "source": "file",
+            "path": log_path,
+        }));
+    }
+
+    // Try journalctl on Linux
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("journalctl")
+            .args(["-u", "tune-server", "-n", &max_lines.to_string(), "--no-pager", "-o", "short-iso"])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let count = text.lines().count();
+                return Json(json!({
+                    "logs": text,
+                    "lines": count,
+                    "source": "journalctl",
+                }));
+            }
+        }
+    }
+
+    // Fallback: return in-memory ring buffer if available, or empty
     Json(json!({
-        "logs": "log retrieval not yet implemented (journalctl/file)",
+        "logs": "No log file found. Launch Tune from a terminal to see logs in real-time.\nChecked: ".to_owned() + &log_path,
         "lines": 0,
+        "source": "none",
     }))
 }
 
