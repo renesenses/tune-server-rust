@@ -54,6 +54,26 @@ impl HistoryRepo {
         Ok(items)
     }
 
+    pub fn recent_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ListenRecord>, i64), String> {
+        let conn = self.db.connection().lock().unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id FROM listen_history ORDER BY listened_at DESC LIMIT ? OFFSET ?")
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map(params![limit, offset], |row| Ok(row_to_listen(row)))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok((items, total))
+    }
+
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
