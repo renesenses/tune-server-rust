@@ -12,7 +12,7 @@ use super::xml_parser::fetch_device_description;
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(300);
@@ -20,6 +20,7 @@ const MISS_GRACE_CYCLES: u32 = 3;
 const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 pub const MEDIA_RENDERER_URN: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
+pub const MEDIA_RENDERER_URN_V2: &str = "urn:schemas-upnp-org:device:MediaRenderer:2";
 pub const MEDIA_SERVER_URN: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 const SSDP_ALL: &str = "ssdp:all";
 
