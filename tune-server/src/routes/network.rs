@@ -182,45 +182,76 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
     let protocol = q.protocol.as_deref().unwrap_or("smb");
 
     let raw_output = if protocol == "smb" {
-        // Try smbutil (macOS) first, then smbclient (Linux)
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            Command::new("smbutil")
-                .args(["view", &format!("//guest@{host}")])
-                .output(),
-        )
-        .await;
+        // Platform-specific SMB share enumeration
+        let mut output = String::new();
+        let mut success = false;
 
-        match result {
-            Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
-            _ => {
-                // Fallback to smbclient (Linux)
-                let result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    Command::new("smbclient")
-                        .args(["-N", "-L", &format!("//{host}")])
-                        .output(),
-                )
-                .await;
-                match result {
-                    Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
-                    Ok(Err(e)) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({ "error": format!("scan failed: {e}") })),
-                        )
-                            .into_response();
-                    }
-                    Err(_) => {
-                        return (
-                            StatusCode::GATEWAY_TIMEOUT,
-                            Json(json!({ "error": "scan timed out" })),
-                        )
-                            .into_response();
-                    }
+        // Windows: net view \\host
+        if !success {
+            if let Ok(Ok(out)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                Command::new("net")
+                    .args(["view", &format!("\\\\{host}")])
+                    .output(),
+            )
+            .await
+            {
+                if out.status.success() {
+                    output = String::from_utf8_lossy(&out.stdout).to_string();
+                    success = true;
                 }
             }
         }
+
+        // macOS: smbutil view
+        if !success {
+            if let Ok(Ok(out)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                Command::new("smbutil")
+                    .args(["view", &format!("//guest@{host}")])
+                    .output(),
+            )
+            .await
+            {
+                if out.status.success() {
+                    output = String::from_utf8_lossy(&out.stdout).to_string();
+                    success = true;
+                }
+            }
+        }
+
+        // Linux: smbclient -N -L
+        if !success {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                Command::new("smbclient")
+                    .args(["-N", "-L", &format!("//{host}")])
+                    .output(),
+            )
+            .await
+            {
+                Ok(Ok(out)) => {
+                    output = String::from_utf8_lossy(&out.stdout).to_string();
+                    success = true;
+                }
+                Ok(Err(e)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("No SMB client available (net/smbutil/smbclient): {e}") })),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        Json(json!({ "error": "scan timed out" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        output
     } else {
         // NFS: showmount -e host
         let result = tokio::time::timeout(
