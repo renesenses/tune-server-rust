@@ -272,34 +272,82 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         );
 
         let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let total_discovered = files.len();
+
+        let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
+        let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
+        let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
+
+        // Load existing tracks BEFORE scanning to skip unchanged files
+        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+
+        // Quick stat pass: skip files whose mtime+size haven't changed
+        let files_to_scan: Vec<std::path::PathBuf> = files
+            .into_iter()
+            .filter(|path| {
+                let path_str = path.to_string_lossy();
+                if let Some(&(_, existing_mtime, existing_size)) =
+                    existing_tracks.get(path_str.as_ref())
+                {
+                    if let Ok(file_meta) = path.metadata() {
+                        let mtime = file_meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let unchanged =
+                            existing_mtime.map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                                && existing_size
+                                    .map_or(false, |s| s == file_meta.len() as i64);
+                        return !unchanged;
+                    }
+                }
+                true
+            })
+            .collect();
+        let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
+
+        tracing::info!(
+            total = total_discovered,
+            changed = files_to_scan.len(),
+            unchanged = pre_skipped,
+            "pre_scan_filter_complete"
+        );
 
         event_bus.emit(
             "library.scan.started",
             json!({
                 "music_dirs": &music_dirs,
-                "total": files.len(),
+                "total": total_discovered,
+                "to_scan": files_to_scan.len(),
+                "unchanged": pre_skipped,
             }),
         );
 
+        // Only parse metadata + hash for changed/new files
         let (scanned, scan_stats) =
-            tune_core::scanner::walker::scan_files_parallel(&files, true, None);
-
-        let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
-        let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
-        let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
+            tune_core::scanner::walker::scan_files_parallel(&files_to_scan, true, None);
 
         let cache_dir = super::library::artwork_cache_dir();
         let mut albums_with_cover: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
         let mut inserted = 0i64;
         let mut updated = 0i64;
-        let mut skipped = 0i64;
+        let mut skipped = pre_skipped;
         let mut artwork_extracted = 0i64;
-        let total = scanned.len() as i64;
+        let total = (scanned.len() as i64) + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
 
-        // Load all existing local tracks in one query for efficient change detection
-        let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        // In-memory caches to avoid repeated DB lookups
+        let mut artist_cache: std::collections::HashMap<String, tune_core::db::models::Artist> =
+            std::collections::HashMap::new();
+        let mut album_cache: std::collections::HashMap<
+            (String, i64, Option<i32>),
+            tune_core::db::models::Album,
+        > = std::collections::HashMap::new();
+
+        db.execute_batch("BEGIN IMMEDIATE").ok();
 
         for sf in &scanned {
             if let Some(ref meta) = sf.metadata {
@@ -346,41 +394,70 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
 
                 // For the album, use album_artist (so compilations group under "Various Artists")
-                let album_artist_entry = artist_repo
-                    .get_or_create(
-                        album_artist_name,
-                        if is_compilation {
-                            None
-                        } else {
-                            meta.musicbrainz_artist_id.as_deref()
-                        },
-                        meta.album_artist_sort.as_deref(),
-                    )
-                    .ok();
+                let album_artist_entry =
+                    if let Some(cached) = artist_cache.get(album_artist_name) {
+                        Some(cached.clone())
+                    } else {
+                        let result = artist_repo
+                            .get_or_create(
+                                album_artist_name,
+                                if is_compilation {
+                                    None
+                                } else {
+                                    meta.musicbrainz_artist_id.as_deref()
+                                },
+                                meta.album_artist_sort.as_deref(),
+                            )
+                            .ok();
+                        if let Some(ref a) = result {
+                            artist_cache.insert(album_artist_name.to_string(), a.clone());
+                        }
+                        result
+                    };
                 let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
                 // For the track, use track-level artist (important for compilations)
                 let track_artist = if is_compilation && track_artist_name != album_artist_name {
-                    artist_repo
-                        .get_or_create(
-                            track_artist_name,
-                            meta.musicbrainz_artist_id.as_deref(),
-                            None,
-                        )
-                        .ok()
+                    if let Some(cached) = artist_cache.get(track_artist_name) {
+                        Some(cached.clone())
+                    } else {
+                        let result = artist_repo
+                            .get_or_create(
+                                track_artist_name,
+                                meta.musicbrainz_artist_id.as_deref(),
+                                None,
+                            )
+                            .ok();
+                        if let Some(ref a) = result {
+                            artist_cache.insert(track_artist_name.to_string(), a.clone());
+                        }
+                        result
+                    }
                 } else {
                     album_artist_entry.clone()
                 };
                 let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
-                let album = if let Some(ref album_title) = meta.album {
-                    album_repo
-                        .get_or_create(
-                            album_title,
-                            album_artist_id.unwrap_or(0),
-                            meta.year.map(|y| y as i32),
-                        )
-                        .ok()
+                let album_key = meta.album.as_ref().map(|t| {
+                    (
+                        t.clone(),
+                        album_artist_id.unwrap_or(0),
+                        meta.year.map(|y| y as i32),
+                    )
+                });
+
+                let album = if let Some(ref key) = album_key {
+                    if let Some(cached) = album_cache.get(key) {
+                        Some(cached.clone())
+                    } else {
+                        let result = album_repo
+                            .get_or_create(&key.0, key.1, key.2)
+                            .ok();
+                        if let Some(ref a) = result {
+                            album_cache.insert(key.clone(), a.clone());
+                        }
+                        result
+                    }
                 } else {
                     None
                 };
@@ -546,8 +623,10 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             }
         }
 
-        // Backfill: populate genres JSON array from genre text for any
-        // tracks/albums that have genre but not genres (legacy data).
+        db.execute_batch("COMMIT").ok();
+
+        // Backfill + album stats in a single transaction
+        db.execute_batch("BEGIN IMMEDIATE").ok();
         {
             let conn = db.connection().lock().unwrap();
             conn.execute(
@@ -562,19 +641,31 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 [],
             )
             .ok();
+            conn.execute(
+                "UPDATE albums SET track_count = \
+                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
+                [],
+            )
+            .ok();
+            conn.execute(
+                "UPDATE albums SET \
+                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
+                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
+                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                 genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1)), \
+                 genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL LIMIT 1)), \
+                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id))",
+                [],
+            )
+            .ok();
         }
-
-        for album in album_repo.list(99999, 0).unwrap_or_default() {
-            if let Some(id) = album.id {
-                album_repo.update_track_count(id).ok();
-                album_repo.update_quality_from_tracks(id).ok();
-            }
-        }
+        db.execute_batch("COMMIT").ok();
 
         let settings = SettingsRepo::new(db.clone());
         settings.set("scan_status", "idle").ok();
         tracing::info!(
-            scanned = scan_stats.total_files,
+            discovered = total_discovered,
+            parsed = scan_stats.total_files,
             inserted,
             updated,
             skipped,
@@ -586,7 +677,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             .set(
                 "scan_result",
                 &json!({
-                    "total_files": scan_stats.total_files,
+                    "total_files": total_discovered,
+                    "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
                     "inserted": inserted,
@@ -601,7 +693,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         event_bus.emit(
             "library.scan.completed",
             json!({
-                "total_files": scan_stats.total_files,
+                "total_files": total_discovered,
+                "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "inserted": inserted,
                 "updated": updated,

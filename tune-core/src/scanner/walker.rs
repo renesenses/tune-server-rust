@@ -188,10 +188,9 @@ pub fn scan_files_parallel(
 
             let path_str = path.to_string_lossy().to_string();
 
-            let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-            let mtime = path
-                .metadata()
-                .ok()
+            let file_meta = path.metadata().ok();
+            let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = file_meta
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
