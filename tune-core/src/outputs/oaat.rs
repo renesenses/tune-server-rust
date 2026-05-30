@@ -26,7 +26,11 @@ pub struct OaatOutput {
 
 impl OaatOutput {
     pub fn new(name: String, host: String, port: u16, endpoint_id: String) -> Self {
-        let device_id = format!("oaat:{endpoint_id}");
+        let device_id = if endpoint_id.starts_with("oaat:") {
+            endpoint_id
+        } else {
+            format!("oaat:{endpoint_id}")
+        };
         Self {
             name,
             device_id,
