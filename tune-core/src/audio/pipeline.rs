@@ -71,15 +71,16 @@ impl AudioPipeline {
             args.extend(["-ss".into(), format!("{secs:.3}")]);
         }
 
-        // DSD/DSF requires explicit input format for FFmpeg to decode correctly
-        if AudioFormat::from_extension(
-            std::path::Path::new(&cfg.file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or(""),
-        ) == Some(AudioFormat::Dsd)
-        {
-            args.extend(["-f".into(), "dsf".into()]);
+        // DSD requires explicit input format for FFmpeg
+        let ext = std::path::Path::new(&cfg.file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "dsf" => args.extend(["-f".into(), "dsf".into()]),
+            "dff" => args.extend(["-f".into(), "dff".into()]),
+            _ => {}
         }
 
         let codec = if cfg.output_format == AudioFormat::Wav {

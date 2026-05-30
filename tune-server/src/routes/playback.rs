@@ -664,6 +664,14 @@ async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
     let queue_repo = PlayQueueRepo::new(state.db);
     queue_repo.clear(zone_id).ok();
     state.playback.stop(zone_id).await;
+    state
+        .playback
+        .update_queue_info(zone_id, 0, 0)
+        .await;
+    state.event_bus.emit(
+        "playback.queue.cleared",
+        serde_json::json!({ "zone_id": zone_id }),
+    );
     StatusCode::NO_CONTENT
 }
 
