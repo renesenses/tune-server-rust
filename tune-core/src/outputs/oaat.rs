@@ -109,8 +109,13 @@ impl OutputTarget for OaatOutput {
                 tls: false,
             };
 
+            info!(device = %device_name, addr = %endpoint_addr, "oaat: connecting to endpoint");
+
             let mut endpoint = match ConnectedEndpoint::connect(&config, endpoint_addr).await {
-                Ok(ep) => ep,
+                Ok(ep) => {
+                    info!(device = %device_name, endpoint_name = %ep.info.endpoint_name, "oaat: connected, handshake ok");
+                    ep
+                }
                 Err(e) => {
                     error!(device = %device_name, error = %e, "oaat: connect failed");
                     playing.store(false, Ordering::SeqCst);
@@ -124,28 +129,25 @@ impl OutputTarget for OaatOutput {
 
             let stream_id = "tune-stream";
 
-            // If endpoint supports FLAC, request FLAC from streamer for bandwidth savings
-            let use_flac = endpoint
-                .info
-                .capabilities
-                .formats
-                .contains(&AudioFormat::Flac);
-            let fetch_url = if use_flac {
-                url.replace(".wav", ".flac").replace(".WAV", ".flac")
-            } else {
-                url.clone()
-            };
+            // Always request WAV — FLAC passthrough needs endpoint decode
+            info!(device = %device_name, url = %url, "oaat: fetching audio stream");
 
-            // Always request WAV for now — FLAC passthrough needs the endpoint
-            // to decode, and format detection from WAV header is reliable.
-            let use_flac = false;
-            let fetch_url = url.clone();
-
-            let client = reqwest::Client::new();
-            let resp = match client.get(&fetch_url).send().await {
-                Ok(r) => r,
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            let resp = match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    info!(device = %device_name, status = %r.status(), "oaat: stream fetch ok");
+                    r
+                }
+                Ok(r) => {
+                    error!(device = %device_name, status = %r.status(), url = %url, "oaat: stream fetch HTTP error");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
                 Err(e) => {
-                    error!(error = %e, "oaat: HTTP fetch failed");
+                    error!(device = %device_name, error = %e, url = %url, "oaat: HTTP fetch failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
