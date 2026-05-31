@@ -94,6 +94,24 @@ impl SqliteDb {
         conn.last_insert_rowid()
     }
 
+    /// Execute a read-only closure on the read connection.
+    pub fn read<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, String> {
+        let conn = self.read_conn.lock().unwrap();
+        f(&conn).map_err(|e| format!("db read: {e}"))
+    }
+
+    /// Execute a write closure on the write connection.
+    pub fn write<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, String> {
+        let conn = self.conn.lock().unwrap();
+        f(&conn).map_err(|e| format!("db write: {e}"))
+    }
+
     pub fn query_timed<T>(&self, label: &str, f: impl FnOnce(&Connection) -> T) -> T {
         let conn = self.read_conn.lock().unwrap();
         let start = std::time::Instant::now();
@@ -341,8 +359,8 @@ mod tests {
         let tables: Vec<String> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert!(tables.contains(&"artists".to_string()));
         assert!(tables.contains(&"albums".to_string()));

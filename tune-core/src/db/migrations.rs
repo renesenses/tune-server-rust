@@ -357,8 +357,10 @@ fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &st
     let has_column = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == column))
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|name| name == column))
         })
         .unwrap_or(false);
     drop(conn);
@@ -641,8 +643,8 @@ mod tests {
         let tables: Vec<String> = stmt
             .query_map([], |row| row.get(0))
             .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert!(tables.contains(&"radio_stations".to_string()));
         assert!(tables.contains(&"listen_history".to_string()));

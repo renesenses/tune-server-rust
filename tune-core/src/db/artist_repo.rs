@@ -124,8 +124,8 @@ impl ArtistRepo {
         let artists = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_artist(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(artists)
     }
 
@@ -161,8 +161,8 @@ impl ArtistRepo {
                 Ok(row_to_artist(row))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(artists)
     }
 }

@@ -196,8 +196,8 @@ impl AlbumRepo {
         let items = stmt
             .query_map(params![limit], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -280,8 +280,8 @@ impl AlbumRepo {
         let albums = stmt
             .query_map(params_vec.as_slice(), |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(albums)
     }
 
@@ -295,8 +295,8 @@ impl AlbumRepo {
         let albums = stmt
             .query_map(params![artist_id], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(albums)
     }
 
@@ -313,8 +313,8 @@ impl AlbumRepo {
         let albums = stmt
             .query_map(params![genre, json_pattern], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(albums)
     }
 
@@ -344,8 +344,8 @@ impl AlbumRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -362,8 +362,8 @@ impl AlbumRepo {
                 |row| Ok(row_to_album(row)),
             )
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(albums)
     }
 }

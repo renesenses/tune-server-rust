@@ -44,8 +44,8 @@ impl ZoneRepo {
         let zones = stmt
             .query_map([], |row| Ok(row_to_zone(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(zones)
     }
 

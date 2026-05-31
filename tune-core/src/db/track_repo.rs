@@ -209,8 +209,8 @@ impl TrackRepo {
         let tracks = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 
@@ -224,7 +224,9 @@ impl TrackRepo {
         let paths = stmt
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
             .collect();
         Ok(paths)
     }
@@ -251,7 +253,9 @@ impl TrackRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
             .collect();
         Ok(map)
     }
@@ -289,8 +293,8 @@ impl TrackRepo {
         let tracks = stmt
             .query_map(params![album_id], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 
@@ -304,8 +308,8 @@ impl TrackRepo {
         let tracks = stmt
             .query_map(params![artist_id], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 
@@ -324,8 +328,8 @@ impl TrackRepo {
                 |row| Ok(row_to_track(row)),
             )
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 
@@ -344,8 +348,8 @@ impl TrackRepo {
         let tracks: Vec<Track> = stmt
             .query_map(params.as_slice(), |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
 
         // Preserve caller's ordering
         let mut ordered = Vec::with_capacity(ids.len());
@@ -365,8 +369,8 @@ impl TrackRepo {
         let ids = stmt
             .query_map(rusqlite::params![limit], |row| row.get(0))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(ids)
     }
 
@@ -391,8 +395,8 @@ impl TrackRepo {
         let tracks = stmt
             .query_map(params![like, limit], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 
@@ -426,8 +430,8 @@ impl TrackRepo {
         let tracks = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(tracks)
     }
 

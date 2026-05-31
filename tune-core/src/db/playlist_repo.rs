@@ -60,8 +60,8 @@ impl PlaylistRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -159,8 +159,8 @@ impl PlaylistRepo {
         let ids = stmt
             .query_map(params![playlist_id], |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(ids)
     }
 

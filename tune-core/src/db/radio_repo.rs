@@ -47,8 +47,8 @@ impl RadioRepo {
         let items = stmt
             .query_map([], |row| Ok(row_to_radio(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -60,8 +60,8 @@ impl RadioRepo {
         let items = stmt
             .query_map([], |row| Ok(row_to_radio(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -115,8 +115,8 @@ impl RadioRepo {
         let items = stmt
             .query_map(params![like, like, like], |row| Ok(row_to_radio(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 

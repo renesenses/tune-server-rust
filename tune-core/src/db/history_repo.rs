@@ -49,8 +49,8 @@ impl HistoryRepo {
         let items = stmt
             .query_map(params![limit], |row| Ok(row_to_listen(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -69,8 +69,8 @@ impl HistoryRepo {
         let items = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_listen(row)))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok((items, total))
     }
 
@@ -88,8 +88,8 @@ impl HistoryRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -106,8 +106,8 @@ impl HistoryRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -125,8 +125,8 @@ impl HistoryRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -144,8 +144,8 @@ impl HistoryRepo {
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -306,8 +306,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── Top albums (join albums table for cover_path) ──
@@ -336,8 +336,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── Top tracks ──
@@ -360,8 +360,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── Trend (daily) ──
@@ -389,8 +389,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── Hourly distribution ──
@@ -410,8 +410,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── By zone (LEFT JOIN zones for name) ──
@@ -434,8 +434,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── By source ──
@@ -456,8 +456,8 @@ impl HistoryRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         // ── Completion stats ──
