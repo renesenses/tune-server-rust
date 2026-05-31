@@ -319,7 +319,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 let path_str = path.to_string_lossy();
                 if let Some(&(_, existing_mtime, existing_size)) =
                     existing_tracks.get(path_str.as_ref())
-                    && let Ok(file_meta) = path.metadata() {
+                {
+                    if let Ok(file_meta) = path.metadata() {
                         let mtime = file_meta
                             .modified()
                             .ok()
@@ -327,10 +328,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
                         let unchanged = existing_mtime
-                            .is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                            && (existing_size == Some(file_meta.len() as i64));
+                            .map_or(false, |m| (m - mtime as f64).abs() <= 0.5)
+                            && existing_size.map_or(false, |s| s == file_meta.len() as i64);
                         return !unchanged;
                     }
+                }
                 true
             })
             .collect();
@@ -533,9 +535,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     }
 
                     // Check for artist image if not already set
-                    if let Some(ref art) = track_artist
-                        && art.image_path.is_none()
-                            && let Some(parent) = std::path::Path::new(&sf.path).parent() {
+                    if let Some(ref art) = track_artist {
+                        if art.image_path.is_none() {
+                            if let Some(parent) = std::path::Path::new(&sf.path).parent() {
                                 for name in
                                     &["artist.jpg", "artist.png", "Artist.jpg", "Artist.png"]
                                 {
@@ -564,6 +566,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                                     }
                                 }
                             }
+                        }
+                    }
 
                     let title = meta.title.clone().unwrap_or_else(|| {
                         std::path::Path::new(&sf.path)
@@ -577,8 +581,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                         existing_tracks.get(&sf.path)
                     {
                         let file_changed = existing_mtime
-                            .is_none_or(|m| (m - sf.mtime as f64).abs() > 0.5)
-                            || (existing_size != Some(sf.file_size as i64));
+                            .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                            || existing_size.map_or(true, |s| s != sf.file_size as i64);
 
                         if !file_changed {
                             skipped += 1;
@@ -1140,12 +1144,13 @@ fn cleanup_orphan_artwork(db: &tune_core::db::sqlite::SqliteDb) -> i64 {
     if let Ok(mut stmt) = conn.prepare(
         "SELECT cover_path FROM albums WHERE cover_path IS NOT NULL \
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
-    )
-        && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
             for hash in rows.flatten() {
                 referenced.insert(hash);
             }
         }
+    }
     drop(conn);
 
     // Walk artwork cache and delete files whose stem (hash) isn't referenced
@@ -1158,10 +1163,11 @@ fn cleanup_orphan_artwork(db: &tune_core::db::sqlite::SqliteDb) -> i64 {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
-                if !stem.is_empty() && !referenced.contains(stem)
-                    && std::fs::remove_file(&path).is_ok() {
+                if !stem.is_empty() && !referenced.contains(stem) {
+                    if std::fs::remove_file(&path).is_ok() {
                         deleted += 1;
                     }
+                }
             }
         }
     }
@@ -1741,11 +1747,12 @@ async fn import_roon(
         if let Some(entries) = body.data {
             for entry in &entries {
                 // Skip if file_path exists and already in DB
-                if let Some(ref fp) = entry.file_path
-                    && track_repo.get_by_path(fp).ok().flatten().is_some() {
+                if let Some(ref fp) = entry.file_path {
+                    if track_repo.get_by_path(fp).ok().flatten().is_some() {
                         skipped += 1;
                         continue;
                     }
+                }
 
                 let artist_name = entry.artist.as_deref().unwrap_or("Unknown Artist");
                 let artist = artist_repo.get_or_create(artist_name, None, None).ok();
@@ -1812,11 +1819,12 @@ async fn import_roon(
                                         genre,
                                     ) = row;
 
-                                    if let Some(ref fp) = file_path
-                                        && track_repo.get_by_path(fp).ok().flatten().is_some() {
+                                    if let Some(ref fp) = file_path {
+                                        if track_repo.get_by_path(fp).ok().flatten().is_some() {
                                             skipped += 1;
                                             continue;
                                         }
+                                    }
 
                                     let artist_name = artist.as_deref().unwrap_or("Unknown Artist");
                                     let art =
@@ -2014,11 +2022,12 @@ async fn import_plex(
                     .map(|s| s.to_string());
 
                 // Skip if we already have this track by file_path
-                if let Some(ref fp) = file_path
-                    && track_repo.get_by_path(fp).ok().flatten().is_some() {
+                if let Some(ref fp) = file_path {
+                    if track_repo.get_by_path(fp).ok().flatten().is_some() {
                         skipped += 1;
                         continue;
                     }
+                }
 
                 let artist = artist_repo.get_or_create(&artist_name, None, None).ok();
                 let artist_id = artist.as_ref().and_then(|a| a.id);
@@ -2101,8 +2110,8 @@ async fn import_playlists_file() -> Json<Value> {
 async fn import_status(State(state): State<AppState>, Path(task_id): Path<String>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("import_task_{task_id}");
-    if let Some(data) = settings.get(&key).ok().flatten()
-        && let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+    if let Some(data) = settings.get(&key).ok().flatten() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
             return Json(json!({
                 "task_id": task_id,
                 "status": parsed["status"],
@@ -2112,6 +2121,7 @@ async fn import_status(State(state): State<AppState>, Path(task_id): Path<String
                 "error_details": parsed["error_details"],
             }));
         }
+    }
     Json(json!({
         "task_id": task_id,
         "status": "unknown",
@@ -2287,8 +2297,8 @@ async fn admin_errors(Query(q): Query<AdminErrorsQuery>) -> Json<Value> {
     let max_lines = q.lines.unwrap_or(100);
 
     // Try reading from TUNE_LOG_FILE if set
-    if let Ok(log_path) = std::env::var("TUNE_LOG_FILE")
-        && let Ok(content) = std::fs::read_to_string(&log_path) {
+    if let Ok(log_path) = std::env::var("TUNE_LOG_FILE") {
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
             let all_lines: Vec<&str> = content.lines().collect();
             let error_lines: Vec<&str> = all_lines
                 .iter()
@@ -2305,6 +2315,7 @@ async fn admin_errors(Query(q): Query<AdminErrorsQuery>) -> Json<Value> {
                 "source": log_path,
             }));
         }
+    }
 
     Json(json!({
         "errors": [],
@@ -2461,7 +2472,7 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
 
     // Build markdown text
     let mut md = String::new();
-    md.push_str(&"# Tune Bug Report\n\n".to_string());
+    md.push_str(&format!("# Tune Bug Report\n\n"));
     md.push_str(&format!(
         "**Version**: {} (engine: rust)\n",
         tune_core::version()
@@ -2489,7 +2500,7 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
-    md.push('\n');
+    md.push_str("\n");
 
     md.push_str("## Streaming Services\n");
     for s in &service_status {
@@ -2510,9 +2521,9 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
             auth
         ));
     }
-    md.push('\n');
+    md.push_str("\n");
 
-    md.push_str(&"## Network\n".to_string());
+    md.push_str(&format!("## Network\n"));
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     md.push_str(&format!(
@@ -2520,8 +2531,8 @@ async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
         ffmpeg.as_deref().unwrap_or("not found")
     ));
 
-    md.push_str(&"## Database\n".to_string());
-    md.push_str(&"- Engine: sqlite\n".to_string());
+    md.push_str(&format!("## Database\n"));
+    md.push_str(&format!("- Engine: sqlite\n"));
     md.push_str(&format!("- Migration version: {db_version}\n"));
 
     Json(json!({
