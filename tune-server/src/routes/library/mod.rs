@@ -1,0 +1,188 @@
+mod albums;
+mod artists;
+mod artwork;
+mod browse;
+mod collections;
+mod credits;
+mod duplicates;
+mod enrich;
+mod genres;
+mod ratings;
+mod search;
+mod stats;
+mod tracks;
+
+use axum::routing::{get, post};
+use axum::Router;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+pub(super) struct Pagination {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+pub(super) const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours
+
+pub(super) fn api_cache_get(db: &tune_core::db::sqlite::SqliteDb, key: &str) -> Option<Value> {
+    let conn = db.connection().lock().ok()?;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ? AND \
+         CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
+        rusqlite::params![key, API_CACHE_TTL_SECS],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+pub(super) fn api_cache_set(db: &tune_core::db::sqlite::SqliteDb, key: &str, data: &Value) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+    settings.set(key, &data.to_string()).ok();
+}
+
+pub(super) fn now_iso_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Approximate date from days since epoch
+    let mut y = 1970i64;
+    let mut d = days as i64;
+    loop {
+        let ylen = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if d < ylen {
+            break;
+        }
+        d -= ylen;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut mo = 0usize;
+    for (i, &ml) in mdays.iter().enumerate() {
+        if d < ml as i64 {
+            mo = i;
+            break;
+        }
+        d -= ml as i64;
+    }
+    format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
+}
+
+pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
+    let dir = std::env::var("TUNE_ARTWORK_DIR").unwrap_or_else(|_| "artwork_cache".into());
+    std::path::PathBuf::from(dir)
+}
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/artists", get(artists::list_artists))
+        .route("/artists/{id}", get(artists::get_artist))
+        .route("/artists/{id}/albums", get(artists::artist_albums))
+        .route("/artists/{id}/tracks", get(artists::artist_tracks))
+        .route("/artists/{id}/bio", get(artists::artist_bio))
+        .route("/artists/{id}/similar", get(artists::artist_similar))
+        .route("/artists/{id}/metadata", get(artists::artist_metadata))
+        .route("/albums", get(albums::list_albums))
+        .route("/albums/count", get(albums::album_count))
+        .route("/albums/filters", get(albums::album_filters))
+        .route("/albums/recent", get(albums::recent_albums))
+        .route("/albums/{id}", get(albums::get_album))
+        .route("/albums/{id}/tracks", get(albums::album_tracks))
+        .route("/tracks", get(tracks::list_tracks))
+        .route("/tracks/count", get(tracks::track_count))
+        .route("/tracks/{id}", get(tracks::get_track))
+        .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
+        .route("/tracks/{id}/rescan", post(tracks::rescan_track))
+        .route("/tracks/{id}/quick-fav", post(tracks::quick_fav_track))
+        .route("/albums/{id}/quick-fav", post(albums::quick_fav_album))
+        .route("/genre-tree", get(genres::genre_tree).put(genres::update_genre_tree))
+        .route("/albums/top-rated", get(albums::top_rated_albums))
+        .route("/albums/{id}/rate", post(albums::rate_album))
+        .route("/albums/{id}/rating", get(albums::get_album_rating))
+        .route("/tracks/{id}/credits", get(credits::track_credits))
+        .route("/artists/{id}/credits", get(credits::artist_credits))
+        .route("/tracks/{id}/credits/enrich", post(credits::enrich_track_credits))
+        .route("/albums/{id}/credits/enrich", post(credits::enrich_album_credits))
+        .route("/enrich-credits", post(credits::enrich_all_credits))
+        .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
+        .route("/browse", get(browse::browse_roots))
+        .route("/browse/dir", get(browse::browse_directory))
+        .route("/folders", get(browse::browse_folders))
+        .route("/genres", get(genres::list_genres))
+        .route("/genres/{name}/albums", get(genres::genre_albums))
+        .route("/recommendations", get(albums::recommendations))
+        .route("/stats/completeness", get(stats::completeness_stats))
+        .route("/search", get(search::search))
+        .route("/stats", get(stats::library_stats))
+        .route("/artwork/{hash}", get(artwork::serve_artwork))
+        .route("/artwork/proxy", get(artwork::proxy_artwork))
+        .route("/albums/{id}/artwork", get(artwork::album_artwork))
+        .route("/albums/{id}/artwork/enrich", post(artwork::enrich_album_artwork))
+        .route("/artwork/enrich", post(artwork::batch_enrich_artwork))
+        .route("/artwork/enrich/status", get(artwork::batch_enrich_artwork_status))
+        .route("/duplicates", get(duplicates::list_duplicates))
+        .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
+        .route("/activity", get(stats::library_activity))
+        .route("/albums/{id}/bio", get(albums::album_bio))
+        .route("/albums/{id}/similar", get(albums::album_similar))
+        .route("/albums/{id}/artwork/rescan", post(artwork::rescan_album_artwork))
+        .route(
+            "/albums/merge-duplicates",
+            post(albums::merge_duplicate_albums_route),
+        )
+        .route("/artists/{id}/timeline", get(artists::artist_timeline))
+        .route("/artists/{id}/image/upload", post(artists::artist_image_upload))
+        .route("/artists/{id}/image/report", post(artists::artist_image_report))
+        .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
+        .route("/ratings/export", get(ratings::export_ratings))
+        .route("/ratings/import", post(ratings::import_ratings))
+        .route("/enrich-all", post(enrich::enrich_all_library))
+        .route("/enrich-all/status", get(enrich::enrich_all_status))
+        .route("/artwork/rescan", post(artwork::rescan_all_artwork))
+        .route("/duplicates/smart", get(duplicates::smart_duplicates))
+        .route(
+            "/collections",
+            get(collections::list_collections).post(collections::create_collection),
+        )
+        .route(
+            "/collections/{id}",
+            get(collections::get_collection).delete(collections::delete_collection),
+        )
+        .route("/collections/{id}/albums", get(collections::collection_albums))
+        .route(
+            "/collections/{id}/albums/{album_id}",
+            post(collections::add_album_to_collection).delete(collections::remove_album_from_collection),
+        )
+}

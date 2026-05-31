@@ -1,0 +1,297 @@
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::track_repo::TrackRepo;
+use crate::state::AppState;
+
+use super::artwork_cache_dir;
+
+#[derive(Deserialize)]
+pub(super) struct ProxyQuery {
+    url: String,
+}
+
+pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    for ext in &["jpg", "png"] {
+        let path = cache_dir.join(format!("{hash}.{ext}"));
+        if path.exists()
+            && let Ok(data) = tokio::fs::read(&path).await
+        {
+            let mime = if *ext == "png" {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
+            headers.insert(
+                "Cache-Control",
+                axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            headers.insert(
+                "ETag",
+                axum::http::HeaderValue::from_str(&format!("\"{hash}\""))
+                    .unwrap_or(axum::http::HeaderValue::from_static("\"artwork\"")),
+            );
+            return (StatusCode::OK, headers, data).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+pub(super) async fn album_artwork(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    if let Some(ref cover_path) = album.cover_path {
+        if cover_path.starts_with("http") {
+            return axum::response::Redirect::temporary(cover_path).into_response();
+        }
+        let hash = tune_core::artwork::artwork_hash(cover_path);
+        return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
+            .into_response();
+    }
+
+    let track_repo = TrackRepo::new(state.db);
+    let tracks = track_repo.list_by_album(id).unwrap_or_default();
+    if let Some(track) = tracks.first()
+        && let Some(ref file_path) = track.file_path
+    {
+        let cache_dir = artwork_cache_dir();
+        if let Some(hash) =
+            tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
+        {
+            return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
+                .into_response();
+        }
+    }
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
+pub(super) async fn proxy_artwork(
+    State(state): State<AppState>,
+    Query(q): Query<ProxyQuery>,
+) -> impl IntoResponse {
+    match state.http_client.get(&q.url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .to_string();
+            match resp.bytes().await {
+                Ok(data) => {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "Content-Type",
+                        HeaderValue::from_str(&content_type)
+                            .unwrap_or(HeaderValue::from_static("image/jpeg")),
+                    );
+                    headers.insert(
+                        "Cache-Control",
+                        HeaderValue::from_static("public, max-age=86400"),
+                    );
+                    (StatusCode::OK, headers, data.to_vec()).into_response()
+                }
+                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+        _ => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+pub(super) async fn enrich_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "album not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Skip if album already has a cover
+    if album.cover_path.is_some() {
+        return Json(json!({"enriched": false, "reason": "album already has cover art"}))
+            .into_response();
+    }
+
+    let Some(ref mbid) = album.musicbrainz_release_id else {
+        return Json(json!({"enriched": false, "reason": "no MusicBrainz release ID"}))
+            .into_response();
+    };
+
+    match tune_core::artwork::fetch_cover_art(mbid).await {
+        Some(data) => {
+            let cache_dir = artwork_cache_dir();
+            let hash = tune_core::artwork::artwork_hash(mbid);
+            if tune_core::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                repo.update_cover_path(id, &hash).ok();
+                Json(json!({"enriched": true, "hash": hash, "size": data.len()})).into_response()
+            } else {
+                Json(json!({"enriched": false, "reason": "failed to save to cache"}))
+                    .into_response()
+            }
+        }
+        None => {
+            Json(json!({"enriched": false, "reason": "no cover art found on Cover Art Archive"}))
+                .into_response()
+        }
+    }
+}
+
+pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.db.clone();
+
+    // Check how many albums are missing covers
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let missing = album_repo.list_without_cover().unwrap_or_default();
+
+    if missing.is_empty() {
+        return Json(json!({
+            "status": "skipped",
+            "message": "all albums already have cover art",
+            "missing": 0,
+        }))
+        .into_response();
+    }
+
+    // Store initial status
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("artwork_enrich_status", "running").ok();
+    settings
+        .set(
+            "artwork_enrich_result",
+            &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string(),
+        )
+        .ok();
+
+    tokio::spawn(async move {
+        tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "message": "batch artwork enrichment started",
+            "albums_to_process": missing.len(),
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let result = settings
+        .get("artwork_enrich_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let album_repo = AlbumRepo::new(state.db);
+    let still_missing = album_repo.list_without_cover().unwrap_or_default().len();
+
+    Json(json!({
+        "result": result,
+        "albums_without_cover": still_missing,
+    }))
+}
+
+pub(super) async fn rescan_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let track_repo = TrackRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::new(state.db);
+    let tracks = track_repo.list_by_album(id).unwrap_or_default();
+    if tracks.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no tracks in album"})),
+        )
+            .into_response();
+    }
+    let cache_dir = artwork_cache_dir();
+    let mut found_hash: Option<String> = None;
+    for track in &tracks {
+        if let Some(ref file_path) = track.file_path {
+            if let Some(hash) =
+                tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
+            {
+                found_hash = Some(hash);
+                break;
+            }
+        }
+    }
+    if let Some(ref hash) = found_hash {
+        album_repo.update_cover_path(id, hash).ok();
+    }
+    Json(json!({
+        "album_id": id,
+        "rescanned_tracks": tracks.len(),
+        "artwork_found": found_hash.is_some(),
+        "hash": found_hash,
+    }))
+    .into_response()
+}
+
+pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.db.clone();
+
+    tokio::spawn(async move {
+        let albums: Vec<(i64,)> = {
+            let conn = db.connection().lock().unwrap();
+            conn.prepare("SELECT id FROM albums")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| Ok((row.get(0)?,)))
+                        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                })
+                .unwrap_or_default()
+        };
+
+        let track_repo = TrackRepo::new(db.clone());
+        let album_repo = AlbumRepo::new(db);
+        let mut updated = 0i32;
+        for (album_id,) in &albums {
+            let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+            for track in &tracks {
+                if let Some(ref file_path) = track.file_path {
+                    if let Some(hash) = tune_core::artwork::get_or_extract(
+                        std::path::Path::new(file_path),
+                        &cache_dir,
+                    ) {
+                        album_repo.update_cover_path(*album_id, &hash).ok();
+                        updated += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!(updated, total = albums.len(), "rescan_all_artwork done");
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "accepted", "message": "artwork rescan started"})),
+    )
+}
