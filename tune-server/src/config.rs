@@ -91,6 +91,18 @@ impl TuneConfig {
         if let Ok(v) = std::env::var("TUNE_DB_PATH") {
             config.db_path = v;
         }
+
+        // On Windows, resolve relative db_path to a writable location
+        // (Program Files is read-only for standard users)
+        #[cfg(target_os = "windows")]
+        if !std::path::Path::new(&config.db_path).is_absolute() {
+            let data_dir = std::env::var("LOCALAPPDATA")
+                .map(|d| format!("{d}\\TuneServer"))
+                .unwrap_or_else(|_| "TuneServer".into());
+            std::fs::create_dir_all(&data_dir).ok();
+            config.db_path = format!("{data_dir}\\{}", config.db_path);
+            config.artwork_dir = format!("{data_dir}\\{}", config.artwork_dir);
+        }
         if let Ok(v) = std::env::var("TUNE_WEB_DIR") {
             config.web_dir = v;
         }
