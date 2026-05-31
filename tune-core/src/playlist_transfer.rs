@@ -1,8 +1,7 @@
-use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::track_matcher::{MatchCandidate, MatchResult, find_best_match};
 

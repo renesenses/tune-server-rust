@@ -1,9 +1,8 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::audio::mixer::PcmMixer;
 

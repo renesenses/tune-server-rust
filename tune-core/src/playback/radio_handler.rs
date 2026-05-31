@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::playback::{NowPlaying, PlaybackManager};
 

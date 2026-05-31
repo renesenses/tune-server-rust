@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::db::playlist_repo::PlaylistRepo;
 use crate::db::sqlite::SqliteDb;

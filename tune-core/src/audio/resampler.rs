@@ -2,7 +2,7 @@ use std::process::Stdio;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
-use tracing::{debug, warn};
+use tracing::debug;
 
 fn pcm_format(depth: u32) -> &'static str {
     match depth {

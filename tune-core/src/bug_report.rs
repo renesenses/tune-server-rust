@@ -2,7 +2,6 @@ use std::process::Stdio;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use crate::db::sqlite::SqliteDb;
 

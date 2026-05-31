@@ -1,8 +1,6 @@
-use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::traits::{OutputStatus, TransportState};

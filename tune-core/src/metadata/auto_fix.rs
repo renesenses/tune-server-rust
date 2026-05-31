@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;

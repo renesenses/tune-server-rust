@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 const CACHE_TTL_SECS: u64 = 3600;
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr/api/v1/artists";

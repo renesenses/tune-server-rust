@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;

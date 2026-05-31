@@ -123,7 +123,7 @@ impl TypedEvent {
         }
     }
 
-    pub fn track_changed(zone_id: i64, data: TrackChangedData) -> Self {
+    pub fn track_changed(_zone_id: i64, data: TrackChangedData) -> Self {
         Self {
             event_type: EventType::TrackChanged,
             source: "playback".into(),

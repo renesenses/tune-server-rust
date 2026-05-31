@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
 const MB_UA: &str = "TuneServer/1.0 (https://github.com/renesenses/tune-server-rust)";

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
 const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";

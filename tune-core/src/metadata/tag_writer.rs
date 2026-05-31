@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TagUpdate {

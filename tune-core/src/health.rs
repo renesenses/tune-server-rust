@@ -1,9 +1,8 @@
 use std::collections::VecDeque;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::info;
 
 const MAX_ERRORS: usize = 100;
 

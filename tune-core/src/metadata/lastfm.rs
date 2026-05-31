@@ -1,4 +1,3 @@
-use tracing::debug;
 
 const LASTFM_API: &str = "https://ws.audioscrobbler.com/2.0/";
 

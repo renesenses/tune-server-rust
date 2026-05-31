@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkShare {
@@ -72,7 +71,7 @@ impl MountManager {
     ) -> Result<(), String> {
         let cred = self.credentials.lock().await.get(host).cloned();
 
-        let mut args: Vec<String> = if cfg!(target_os = "macos") {
+        let args: Vec<String> = if cfg!(target_os = "macos") {
             let unc = format!("//{}/{}", host, share_name);
             vec!["-t".into(), "smbfs".into(), unc, mount_point.into()]
         } else {

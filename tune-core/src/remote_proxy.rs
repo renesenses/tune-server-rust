@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::Value;
-use tracing::{debug, warn};
 
 use crate::remote_discovery::PeerServer;
 

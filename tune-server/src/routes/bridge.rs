@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use tune_core::outputs::bridge::{BridgeCommand, BridgeOutput, BridgeResponse};
 
@@ -211,7 +210,7 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
                     }
                 }
             }
-            Some(Ok(axum::extract::ws::Message::Ping(data))) => {
+            Some(Ok(axum::extract::ws::Message::Ping(_data))) => {
                 // Ping handled by tungstenite automatically
             }
             Some(Ok(axum::extract::ws::Message::Close(_))) | None | Some(Err(_)) => {

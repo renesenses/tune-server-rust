@@ -1,7 +1,6 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::warn;
 
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
 

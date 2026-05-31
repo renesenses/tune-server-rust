@@ -1,7 +1,6 @@
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
 
 const ACOUSTID_API: &str = "https://api.acoustid.org/v2/lookup";
 

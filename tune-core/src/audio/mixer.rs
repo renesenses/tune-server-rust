@@ -1,4 +1,3 @@
-use tracing::debug;
 
 pub struct PcmMixer {
     channels: u16,

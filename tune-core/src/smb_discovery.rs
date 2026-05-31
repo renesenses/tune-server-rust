@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const DEFAULT_SCAN_INTERVAL: u64 = 60;
 

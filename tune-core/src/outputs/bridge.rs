@@ -4,9 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tracing::{debug, warn};
 
-use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{OutputStatus, OutputTarget, PlayMedia};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BridgeCommand {

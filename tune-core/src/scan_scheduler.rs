@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
