@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::info;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -19,40 +20,52 @@ pub fn router() -> Router<AppState> {
         .route("/transfer", post(transfer_playback))
 }
 
-/// Get the current Spotify access token from the service registry via save_tokens().
 async fn spotify_token(state: &AppState) -> Option<String> {
     let registry = state.services.lock().await;
     let svc = registry.get("spotify")?;
-    drop(registry); // release registry lock before awaiting
+    drop(registry);
     let svc = svc.lock().await;
     let tokens = svc.save_tokens()?;
     tokens.get("access_token")?.as_str().map(Into::into)
 }
 
 async fn connect_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
-    let enabled = settings
-        .get("spotify_connect_enabled")
-        .ok()
-        .flatten()
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let has_token = spotify_token(&state).await.is_some();
-    Json(json!({
-        "enabled": enabled,
-        "authenticated": has_token,
-    }))
+    Json(state.spotify_connect.status().await)
 }
 
-async fn enable_connect(State(state): State<AppState>) -> Json<Value> {
+#[derive(Deserialize)]
+struct EnableBody {
+    zone_id: Option<i64>,
+    device_name: Option<String>,
+}
+
+async fn enable_connect(
+    State(state): State<AppState>,
+    Json(body): Json<EnableBody>,
+) -> Json<Value> {
+    let zone_id = body.zone_id.unwrap_or(1);
+
+    if let Some(ref name) = body.device_name {
+        info!(name, "spotify_connect_custom_name");
+    }
+
+    if let Err(e) = state.spotify_connect.enable(zone_id).await {
+        return Json(json!({"enabled": false, "error": e}));
+    }
+
     let settings = SettingsRepo::new(state.db);
     settings.set("spotify_connect_enabled", "true").ok();
-    Json(json!({"enabled": true}))
+    settings.set("spotify_connect_zone_id", &zone_id.to_string()).ok();
+
+    Json(json!({"enabled": true, "zone_id": zone_id}))
 }
 
 async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
+    state.spotify_connect.disable().await;
+
     let settings = SettingsRepo::new(state.db);
     settings.set("spotify_connect_enabled", "false").ok();
+
     Json(json!({"enabled": false}))
 }
 
@@ -64,7 +77,8 @@ async fn list_connect_devices(State(state): State<AppState>) -> impl IntoRespons
         )
             .into_response();
     };
-    let resp = state.http_client
+    let resp = state
+        .http_client
         .get("https://api.spotify.com/v1/me/player/devices")
         .bearer_auth(&token)
         .send()
@@ -103,7 +117,8 @@ async fn transfer_playback(
         "device_ids": [body.device_id],
         "play": body.play.unwrap_or(true),
     });
-    let resp = state.http_client
+    let resp = state
+        .http_client
         .put("https://api.spotify.com/v1/me/player")
         .bearer_auth(&token)
         .json(&payload)
@@ -124,5 +139,34 @@ async fn transfer_playback(
             Json(json!({"error": format!("Spotify API error: {e}")})),
         )
             .into_response(),
+    }
+}
+
+pub async fn auto_start(state: &AppState) {
+    let settings = SettingsRepo::new(state.db.clone());
+    let enabled = settings
+        .get("spotify_connect_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let zone_id: i64 = settings
+        .get("spotify_connect_zone_id")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+
+    if !tune_core::streaming::spotify_connect::binary_available() {
+        info!("spotify_connect_auto_start_skipped: librespot not found");
+        return;
+    }
+
+    match state.spotify_connect.enable(zone_id).await {
+        Ok(()) => info!(zone_id, "spotify_connect_auto_started"),
+        Err(e) => info!(error = %e, "spotify_connect_auto_start_failed"),
     }
 }

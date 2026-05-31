@@ -1,40 +1,22 @@
 pub mod alarms;
-pub mod artist_enrichment;
-pub mod artwork;
 pub mod audio;
-pub mod auto_fix;
-pub mod batch_metadata;
 pub mod buffer;
 pub mod bug_report;
 pub mod config;
-pub mod cover_fetcher;
 pub mod credentials_vault;
-pub mod credit_enricher;
 pub mod dashboard;
 pub mod db;
 pub mod db_backup;
 pub mod deezer_proxy;
 pub mod discovery;
-pub mod duplicate_detector;
 pub mod event_bus;
 pub mod event_types;
-pub mod export;
-pub mod fingerprint;
-pub mod full_text_search;
-pub mod genre_tree;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
-pub mod lastfm_enrichment;
-pub mod library_importer;
-pub mod library_watcher;
-pub mod m3u_parser;
+pub mod library;
 pub mod metadata;
-pub mod metadata_enrichment;
-pub mod metadata_matcher;
-pub mod metadata_suggestions;
 pub mod mount_manager;
-pub mod musicbrainz_release;
 pub mod network;
 pub mod notifications;
 pub mod orchestrator;
@@ -57,17 +39,40 @@ pub mod scanner;
 pub mod scrobble;
 pub mod services_manager;
 pub mod sleep_timer;
-pub mod smart_collections;
 pub mod smb_discovery;
 pub mod stream_cache;
 pub mod streaming;
-pub mod tag_writer;
-pub mod track_matcher;
 pub mod updater;
 pub mod upnp_server;
 pub mod user_profiles;
 pub mod zone_manager;
 pub mod zones;
+
+// Re-exports for backward compatibility (modules moved into library/)
+pub use library::artwork;
+pub use library::cover_fetcher;
+pub use library::duplicate_detector;
+pub use library::export;
+pub use library::full_text_search;
+pub use library::genre_tree;
+pub use library::importer as library_importer;
+pub use library::m3u_parser;
+pub use library::smart_collections;
+pub use library::track_matcher;
+pub use library::watcher as library_watcher;
+
+// Re-exports for backward compatibility (modules moved into metadata/)
+pub use metadata::artist_enrichment;
+pub use metadata::auto_fix;
+pub use metadata::batch as batch_metadata;
+pub use metadata::credit_enricher;
+pub use metadata::enrichment as metadata_enrichment;
+pub use metadata::fingerprint;
+pub use metadata::lastfm as lastfm_enrichment;
+pub use metadata::matcher as metadata_matcher;
+pub use metadata::musicbrainz_release;
+pub use metadata::suggestions as metadata_suggestions;
+pub use metadata::tag_writer;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
-use crate::metadata_enrichment::MetadataEnricher;
+use crate::metadata::enrichment::MetadataEnricher;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoFixProgress {

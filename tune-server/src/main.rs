@@ -1094,6 +1094,8 @@ async fn main() {
         "tune_server_starting"
     );
 
+    routes::spotify_connect::auto_start(&state).await;
+
     let outputs_for_diag = state.outputs.clone();
     let app = routes::router(state);
 
