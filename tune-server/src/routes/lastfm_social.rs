@@ -40,19 +40,12 @@ fn lastfm_username(state: &AppState) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-fn lastfm_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
-
 async fn lastfm_call(
+    client: &reqwest::Client,
     api_key: &str,
     method: &str,
     params: &[(&str, &str)],
 ) -> Result<Value, String> {
-    let client = lastfm_client()?;
     let mut query: Vec<(&str, &str)> =
         vec![("method", method), ("api_key", api_key), ("format", "json")];
     query.extend_from_slice(params);
@@ -111,6 +104,7 @@ async fn lastfm_friends(
 
     let limit = q.limit.as_deref().unwrap_or("50");
     match lastfm_call(
+        &state.http_client,
         &api_key,
         "user.getFriends",
         &[("user", &username), ("limit", limit)],
@@ -143,6 +137,7 @@ async fn friend_recent_tracks(
 
     let limit = q.limit.as_deref().unwrap_or("20");
     match lastfm_call(
+        &state.http_client,
         &api_key,
         "user.getRecentTracks",
         &[("user", &user), ("limit", limit)],
@@ -170,6 +165,7 @@ async fn friend_top_artists(
 
     let limit = q.limit.as_deref().unwrap_or("20");
     match lastfm_call(
+        &state.http_client,
         &api_key,
         "user.getTopArtists",
         &[("user", &user), ("limit", limit)],
@@ -208,6 +204,7 @@ async fn lastfm_neighbors(
 
     let limit = q.limit.as_deref().unwrap_or("50");
     match lastfm_call(
+        &state.http_client,
         &api_key,
         "user.getNeighbours",
         &[("user", &username), ("limit", limit)],
@@ -248,6 +245,7 @@ async fn lastfm_recommendations(
     // Fall back to getting top artists and using similar artists for recommendations.
     let limit = q.limit.as_deref().unwrap_or("10");
     match lastfm_call(
+        &state.http_client,
         &api_key,
         "user.getTopArtists",
         &[("user", &username), ("limit", "5"), ("period", "3month")],
@@ -269,6 +267,7 @@ async fn lastfm_recommendations(
             let mut recommendations = Vec::new();
             for artist in top_artists.iter().take(3) {
                 if let Ok(similar) = lastfm_call(
+                    &state.http_client,
                     &api_key,
                     "artist.getSimilar",
                     &[("artist", artist), ("limit", limit)],

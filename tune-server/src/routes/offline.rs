@@ -211,6 +211,7 @@ async fn download_single_track(
     // Spawn background download task
     let db = state.db.clone();
     let services = state.services.clone();
+    let http_client = state.http_client.clone();
     let source_owned = source.to_string();
     let source_id_owned = source_id.to_string();
     let quality_owned = quality.to_string();
@@ -238,13 +239,8 @@ async fn download_single_track(
 
         match stream_result {
             Ok(url) => {
-                // Download the file
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(300))
-                    .build()
-                    .unwrap_or_default();
-
-                match client.get(&url).send().await {
+                // Download the file (use longer timeout for large audio files)
+                match http_client.get(&url).timeout(std::time::Duration::from_secs(300)).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let content_type = resp
                             .headers()

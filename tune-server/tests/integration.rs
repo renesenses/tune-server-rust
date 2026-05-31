@@ -114,8 +114,8 @@ async fn library_empty() {
 
     let (status, body) = get(&app, "/api/v1/library/tracks?limit=10").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_array().unwrap().len(), 0);
-    assert!(body.as_array().unwrap().is_empty());
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total"], 0);
 
     let (status, body) = get(&app, "/api/v1/library/albums/count").await;
     assert_eq!(status, StatusCode::OK);

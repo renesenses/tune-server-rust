@@ -34,12 +34,6 @@ fn hue_base_url(bridge_ip: &str, username: &str) -> String {
     format!("http://{bridge_ip}/api/{username}")
 }
 
-fn hue_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
 
 async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
     let (bridge_ip, username) = hue_settings(&state);
@@ -53,12 +47,7 @@ async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
         .into_response();
     }
     let base = hue_base_url(&bridge_ip.unwrap(), &username.unwrap());
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client.get(format!("{base}/config")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -130,12 +119,7 @@ async fn hue_lights(State(state): State<AppState>) -> impl IntoResponse {
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client.get(format!("{base}/lights")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -165,12 +149,7 @@ async fn hue_light_state(
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client.get(format!("{base}/lights/{id}")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -201,12 +180,7 @@ async fn set_hue_light(
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client
         .put(format!("{base}/lights/{id}/state"))
         .json(&body)
@@ -238,12 +212,7 @@ async fn hue_groups(State(state): State<AppState>) -> impl IntoResponse {
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client.get(format!("{base}/groups")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -274,12 +243,7 @@ async fn set_hue_group(
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client
         .put(format!("{base}/groups/{id}/action"))
         .json(&body)
@@ -311,12 +275,7 @@ async fn hue_scenes(State(state): State<AppState>) -> impl IntoResponse {
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     match client.get(format!("{base}/scenes")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -346,12 +305,7 @@ async fn activate_hue_scene(
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
     // Activate scene by setting it on group 0 (all lights)
     let payload = json!({"scene": id});
     match client
@@ -396,12 +350,7 @@ async fn sync_to_music(
             .into_response();
     };
     let base = hue_base_url(&bridge_ip, &username);
-    let client = match hue_http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
 
     // Convert hex color to Hue xy color space (simplified approximation)
     let (x, y) = if let Some(hex) = &body.color {

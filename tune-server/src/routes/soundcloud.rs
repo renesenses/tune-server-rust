@@ -32,19 +32,12 @@ fn sc_client_id(state: &AppState) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
-
 async fn sc_get(
+    client: &reqwest::Client,
     client_id: &str,
     path: &str,
     extra_params: &[(&str, &str)],
 ) -> Result<Value, (StatusCode, String)> {
-    let client = http_client().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let mut url = format!("{SC_API}{path}?client_id={client_id}");
     for (k, v) in extra_params {
         url.push_str(&format!("&{k}={}", urlencoding::encode(v)));
@@ -94,6 +87,7 @@ async fn sc_search(
     };
 
     match sc_get(
+        &state.http_client,
         &client_id,
         "/search/tracks",
         &[("q", &q.q), ("limit", &q.limit.to_string())],
@@ -110,7 +104,7 @@ async fn sc_track(State(state): State<AppState>, Path(id): Path<String>) -> impl
         return not_configured().into_response();
     };
 
-    match sc_get(&client_id, &format!("/tracks/{id}"), &[]).await {
+    match sc_get(&state.http_client, &client_id, &format!("/tracks/{id}"), &[]).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -123,7 +117,7 @@ async fn sc_stream_url(State(state): State<AppState>, Path(id): Path<String>) ->
 
     // SoundCloud stream URLs require fetching the track first, then resolving the
     // transcodings/media URL. For now, return the expected structure with the API URL.
-    match sc_get(&client_id, &format!("/tracks/{id}"), &[]).await {
+    match sc_get(&state.http_client, &client_id, &format!("/tracks/{id}"), &[]).await {
         Ok(track) => {
             let stream = track
                 .pointer("/media/transcodings")
@@ -148,7 +142,7 @@ async fn sc_user(State(state): State<AppState>, Path(id): Path<String>) -> impl 
         return not_configured().into_response();
     };
 
-    match sc_get(&client_id, &format!("/users/{id}"), &[]).await {
+    match sc_get(&state.http_client, &client_id, &format!("/users/{id}"), &[]).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -172,6 +166,7 @@ async fn sc_user_tracks(
     };
 
     match sc_get(
+        &state.http_client,
         &client_id,
         &format!("/users/{id}/tracks"),
         &[
@@ -191,7 +186,7 @@ async fn sc_playlist(State(state): State<AppState>, Path(id): Path<String>) -> i
         return not_configured().into_response();
     };
 
-    match sc_get(&client_id, &format!("/playlists/{id}"), &[]).await {
+    match sc_get(&state.http_client, &client_id, &format!("/playlists/{id}"), &[]).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -223,6 +218,7 @@ async fn sc_charts(
     };
 
     match sc_get(
+        &state.http_client,
         &client_id,
         "/charts",
         &[

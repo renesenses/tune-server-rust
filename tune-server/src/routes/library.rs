@@ -14,11 +14,7 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::db::zone_repo::ZoneRepo;
-
 use crate::state::AppState;
-
-const MB_USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
 
 #[derive(Deserialize)]
 struct Pagination {
@@ -129,9 +125,9 @@ async fn list_artists(State(state): State<AppState>, Query(p): Query<Pagination>
     let repo = ArtistRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let _total = repo.count().unwrap_or(0);
+    let total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    Json(json!(items))
+    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
 async fn get_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
@@ -163,11 +159,8 @@ async fn artist_bio(
             .into_response();
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
         .send()
         .await
@@ -189,11 +182,8 @@ async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> i
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
         .send()
         .await
@@ -215,11 +205,8 @@ async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> 
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!(artist)).into_response();
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}"))
         .send()
         .await
@@ -288,6 +275,7 @@ async fn list_albums(State(state): State<AppState>, Query(p): Query<AlbumFilters
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
+    let total = repo.count().unwrap_or(0);
     let items = repo
         .list_filtered(
             limit,
@@ -299,7 +287,7 @@ async fn list_albums(State(state): State<AppState>, Query(p): Query<AlbumFilters
         )
         .unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
-    Json(json!(items))
+    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
 async fn album_count(State(state): State<AppState>) -> Json<Value> {
@@ -354,9 +342,9 @@ async fn list_tracks(State(state): State<AppState>, Query(p): Query<Pagination>)
     let repo = TrackRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let _total = repo.count().unwrap_or(0);
+    let total = repo.count().unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
-    Json(json!(items))
+    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
 async fn track_count(State(state): State<AppState>) -> Json<Value> {
@@ -471,23 +459,30 @@ async fn search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> 
 }
 
 async fn library_stats(State(state): State<AppState>) -> Json<Value> {
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let listens = HistoryRepo::new(state.db.clone()).count().unwrap_or(0);
-    let zones = ZoneRepo::new(state.db.clone()).count().unwrap_or(0);
-
     let conn = state.db.connection().lock().unwrap();
-    let total_duration_ms: i64 = conn
+    let (artists, albums, tracks, zones, total_duration_ms, total_size_bytes): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn
         .query_row(
-            "SELECT COALESCE(SUM(duration_ms), 0) FROM tracks",
+            "SELECT \
+             (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+             (SELECT COUNT(*) FROM albums), \
+             (SELECT COUNT(*) FROM tracks), \
+             (SELECT COUNT(*) FROM zones), \
+             COALESCE((SELECT SUM(duration_ms) FROM tracks), 0), \
+             COALESCE((SELECT SUM(file_size) FROM tracks WHERE file_size IS NOT NULL), 0)",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
-        .unwrap_or(0);
-    let total_size_bytes: i64 = conn
+        .unwrap_or((0, 0, 0, 0, 0, 0));
+    let listens: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(file_size), 0) FROM tracks WHERE file_size IS NOT NULL",
+            "SELECT COUNT(*) FROM listen_history",
             [],
             |row| row.get(0),
         )
@@ -1043,13 +1038,11 @@ struct ProxyQuery {
     url: String,
 }
 
-async fn proxy_artwork(Query(q): Query<ProxyQuery>) -> impl IntoResponse {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-
-    match client.get(&q.url).send().await {
+async fn proxy_artwork(
+    State(state): State<AppState>,
+    Query(q): Query<ProxyQuery>,
+) -> impl IntoResponse {
+    match state.http_client.get(&q.url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let content_type = resp
                 .headers()
@@ -1146,18 +1139,12 @@ async fn enrich_track_credits(
             .into_response();
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent(MB_USER_AGENT)
-        .build()
-        .unwrap();
-
     let url = format!(
         "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
     );
 
     let resp =
-        match client.get(&url).send().await {
+        match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
                 Err(_) => {
@@ -1263,17 +1250,11 @@ async fn enrich_album_credits(
             continue;
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent(MB_USER_AGENT)
-            .build()
-            .unwrap();
-
         let url = format!(
             "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
         );
 
-        let resp = match client.get(&url).send().await {
+        let resp = match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
                 Err(_) => {
@@ -1365,19 +1346,13 @@ async fn enrich_all_credits(State(state): State<AppState>) -> impl IntoResponse 
                 .unwrap_or_default()
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent(MB_USER_AGENT)
-            .build()
-            .unwrap();
-
         let mut enriched = 0i32;
         for (track_id, mbid) in &track_ids {
             let url = format!(
                 "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
             );
 
-            if let Ok(r) = client.get(&url).send().await {
+            if let Ok(r) = state.http_client.get(&url).send().await {
                 if r.status().is_success() {
                     if let Ok(data) = r.json::<Value>().await {
                         db.execute(
@@ -1849,11 +1824,8 @@ async fn album_bio(
         .into_response();
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
         .send()
         .await
@@ -1885,11 +1857,8 @@ async fn album_similar(State(state): State<AppState>, Path(id): Path<i64>) -> im
     let Some(mbid) = mbid else {
         return Json(json!({"album": album.title, "artists": []})).into_response();
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
         .send()
         .await
@@ -2103,15 +2072,12 @@ async fn track_lyrics(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     let title = &track.title;
     let artist = track.artist_name.as_deref().unwrap_or("");
     let q = format!("{title} {artist}");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
     let search_url = format!(
         "https://api.genius.com/search?q={}",
         urlencoding::encode(&q)
     );
-    let resp = client
+    let resp = state
+        .http_client
         .get(&search_url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
@@ -2218,6 +2184,7 @@ async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse 
     let task_id = uuid::Uuid::new_v4().to_string();
     let db = state.db.clone();
 
+    let http_client = state.http_client.clone();
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     settings
         .set(
@@ -2240,11 +2207,6 @@ async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse 
         };
 
         let total = track_ids.len();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent(MB_USER_AGENT)
-            .build()
-            .unwrap();
 
         let mut enriched = 0i32;
         for (track_id, file_path) in &track_ids {
@@ -2268,7 +2230,7 @@ async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse 
                                 urlencoding::encode(title),
                                 urlencoding::encode(artist),
                             );
-                            if let Ok(r) = client.get(&url).send().await {
+                            if let Ok(r) = http_client.get(&url).send().await {
                                 if r.status().is_success() {
                                     if let Ok(data) = r.json::<Value>().await {
                                         if let Some(mbid) = data

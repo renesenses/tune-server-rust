@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -19,13 +19,6 @@ pub fn router() -> Router<AppState> {
         .route("/collection/{id}", get(ia_collection))
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
-
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
@@ -39,13 +32,8 @@ fn default_rows() -> u32 {
     50
 }
 
-async fn ia_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn ia_search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let page = q.page.unwrap_or(1);
     let url = format!(
@@ -76,13 +64,8 @@ async fn ia_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
     }
 }
 
-async fn ia_item(Path(id): Path<String>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn ia_item(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let url = format!("{IA_BASE}/metadata/{id}");
 
@@ -108,13 +91,8 @@ async fn ia_item(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
-async fn ia_item_files(Path(id): Path<String>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn ia_item_files(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let url = format!("{IA_BASE}/metadata/{id}/files");
 
@@ -154,13 +132,8 @@ async fn ia_item_files(Path(id): Path<String>) -> impl IntoResponse {
     }
 }
 
-async fn ia_collections() -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn ia_collections(State(state): State<AppState>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     // Search for well-known audio collections
     let url = format!(
@@ -200,15 +173,11 @@ struct CollectionQuery {
 }
 
 async fn ia_collection(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<CollectionQuery>,
 ) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+    let client = &state.http_client;
 
     let page = q.page.unwrap_or(1);
     let sort = q.sort.unwrap_or_else(|| "downloads+desc".into());

@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -21,25 +21,13 @@ pub fn router() -> Router<AppState> {
         .route("/tag/{tag}", get(bc_tag_releases))
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
-
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
 }
 
-async fn bc_search(Query(q): Query<SearchQuery>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn bc_search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let resp = client.get(BC_SEARCH_API).query(&[("q", &q.q)]).send().await;
 
@@ -82,13 +70,8 @@ fn default_sort() -> String {
     "top".into()
 }
 
-async fn bc_discover(Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn bc_discover(State(state): State<AppState>, Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let payload = json!({
         "tag_norm_names": [q.tag],
@@ -158,13 +141,8 @@ struct TagQuery {
     page: u32,
 }
 
-async fn bc_tag_releases(Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
-    let client = match http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
+async fn bc_tag_releases(State(state): State<AppState>, Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
+    let client = &state.http_client;
 
     let payload = json!({
         "tag_norm_names": [tag],

@@ -73,12 +73,8 @@ async fn compare_with_peer(
 ) -> impl IntoResponse {
     // Fetch peer's manifest
     let peer_url = format!("http://{ip}/api/v1/mediasync/export");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
 
-    let peer_manifest: Value = match client.get(&peer_url).send().await {
+    let peer_manifest: Value = match state.http_client.get(&peer_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             resp.json().await.unwrap_or(json!({"tracks": []}))
         }

@@ -39,17 +39,13 @@ fn lms_url(host: &str) -> String {
 
 /// Send a JSON-RPC request to LMS. LMS uses a "slim" protocol:
 /// `{ "id": 1, "method": "slim.request", "params": [player_id, [command, ...]] }`
-async fn lms_request(host: &str, player: &str, cmd: Vec<Value>) -> Result<Value, String> {
+async fn lms_request(client: &reqwest::Client, host: &str, player: &str, cmd: Vec<Value>) -> Result<Value, String> {
     let url = lms_url(host);
     let body = json!({
         "id": 1,
         "method": "slim.request",
         "params": [player, cmd],
     });
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))?;
     let resp = client
         .post(&url)
         .json(&body)
@@ -80,7 +76,7 @@ async fn lms_request(host: &str, player: &str, cmd: Vec<Value>) -> Result<Value,
 
 async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&host, "", vec![json!("serverstatus"), json!(0), json!(100)]).await {
+    match lms_request(&state.http_client, &host, "", vec![json!("serverstatus"), json!(0), json!(100)]).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -88,7 +84,7 @@ async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn list_players(State(state): State<AppState>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&host, "", vec![json!("players"), json!(0), json!(100)]).await {
+    match lms_request(&state.http_client, &host, "", vec![json!("players"), json!(0), json!(100)]).await {
         Ok(result) => {
             let players = result.get("players_loop").cloned().unwrap_or(json!([]));
             Json(players).into_response()
@@ -99,7 +95,7 @@ async fn list_players(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn play_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&host, &id, vec![json!("play")]).await {
+    match lms_request(&state.http_client, &host, &id, vec![json!("play")]).await {
         Ok(result) => Json(json!({"status": "playing", "result": result})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -107,7 +103,7 @@ async fn play_player(State(state): State<AppState>, Path(id): Path<String>) -> i
 
 async fn pause_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&host, &id, vec![json!("pause")]).await {
+    match lms_request(&state.http_client, &host, &id, vec![json!("pause")]).await {
         Ok(result) => Json(json!({"status": "paused", "result": result})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -125,6 +121,7 @@ async fn set_player_volume(
 ) -> impl IntoResponse {
     let host = lms_host(&state);
     match lms_request(
+        &state.http_client,
         &host,
         &id,
         vec![json!("mixer"), json!("volume"), json!(body.volume)],
@@ -166,7 +163,7 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
         (host.clone(), 9000u16)
     };
 
-    let result = lms_request(&host, "", vec![json!("players"), json!(0), json!(100)]).await?;
+    let result = lms_request(&state.http_client, &host, "", vec![json!("players"), json!(0), json!(100)]).await?;
     let players = result
         .get("players_loop")
         .and_then(|v| v.as_array())

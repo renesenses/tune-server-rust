@@ -40,12 +40,6 @@ fn lb_username(state: &AppState) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-fn lb_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
 
 async fn lb_status(State(state): State<AppState>) -> Json<Value> {
     let token_set = lb_token(&state).is_some();
@@ -104,7 +98,7 @@ async fn submit_listen(
         }]
     });
 
-    match lb_submit(&token, &payload).await {
+    match lb_submit(&state.http_client, &token, &payload).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -133,14 +127,13 @@ async fn update_now_playing(
         }]
     });
 
-    match lb_submit(&token, &payload).await {
+    match lb_submit(&state.http_client, &token, &payload).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
 
-async fn lb_submit(token: &str, payload: &Value) -> Result<Value, String> {
-    let client = lb_client()?;
+async fn lb_submit(client: &reqwest::Client, token: &str, payload: &Value) -> Result<Value, String> {
     let resp = client
         .post(format!("{LB_API}/1/submit-listens"))
         .header("Authorization", format!("Token {token}"))
@@ -189,14 +182,7 @@ async fn get_listens(
     let count = q.count.unwrap_or(25);
     let url = format!("{LB_API}/1/user/{username}/listens?count={count}");
 
-    let client = match lb_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
-
-    match client.get(&url).send().await {
+    match state.http_client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
             Json(body).into_response()
@@ -248,14 +234,7 @@ async fn get_stats(
     let count = q.count.unwrap_or(25);
     let url = format!("{LB_API}/1/stats/user/{username}/artists?range={range}&count={count}");
 
-    let client = match lb_client() {
-        Ok(c) => c,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
-        }
-    };
-
-    match client.get(&url).send().await {
+    match state.http_client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
             Json(body).into_response()
@@ -281,6 +260,7 @@ async fn get_stats(
 
 /// Submit a "single" listen to ListenBrainz (fire-and-forget from orchestrator).
 pub async fn submit_listen_api(
+    client: &reqwest::Client,
     token: &str,
     artist: &str,
     track: &str,
@@ -303,7 +283,6 @@ pub async fn submit_listen_api(
         }]
     });
 
-    let client = lb_client()?;
     let resp = client
         .post(format!("{LB_API}/1/submit-listens"))
         .header("Authorization", format!("Token {token}"))
@@ -325,6 +304,7 @@ pub async fn submit_listen_api(
 
 /// Update "playing_now" on ListenBrainz.
 pub async fn update_now_playing_api(
+    client: &reqwest::Client,
     token: &str,
     artist: &str,
     track: &str,
@@ -341,7 +321,6 @@ pub async fn update_now_playing_api(
         }]
     });
 
-    let client = lb_client()?;
     let resp = client
         .post(format!("{LB_API}/1/submit-listens"))
         .header("Authorization", format!("Token {token}"))

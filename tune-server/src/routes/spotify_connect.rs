@@ -64,11 +64,7 @@ async fn list_connect_devices(State(state): State<AppState>) -> impl IntoRespons
         )
             .into_response();
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-    let resp = client
+    let resp = state.http_client
         .get("https://api.spotify.com/v1/me/player/devices")
         .bearer_auth(&token)
         .send()
@@ -103,15 +99,11 @@ async fn transfer_playback(
         )
             .into_response();
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
     let payload = json!({
         "device_ids": [body.device_id],
         "play": body.play.unwrap_or(true),
     });
-    let resp = client
+    let resp = state.http_client
         .put("https://api.spotify.com/v1/me/player")
         .bearer_auth(&token)
         .json(&payload)

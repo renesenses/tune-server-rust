@@ -11,7 +11,7 @@ impl SqliteDb {
     pub fn open(path: &str) -> Result<Self, String> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| format!("sqlite open {path}: {e}"))?;

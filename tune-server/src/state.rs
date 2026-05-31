@@ -30,6 +30,7 @@ pub struct AppState {
     pub event_bus: Arc<EventBus>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
+    pub http_client: reqwest::Client,
     pub port: u16,
     pub started_at: Instant,
     pub bridge_responses:
@@ -91,6 +92,12 @@ impl AppState {
         let suggestion_store = Arc::new(SuggestionStore::new(db.clone()));
         suggestion_store.setup_table().ok();
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+            .build()
+            .expect("http client init");
+
         Ok(Self {
             db,
             streamer,
@@ -102,6 +109,7 @@ impl AppState {
             event_bus,
             upnp: Some(upnp),
             config: Arc::new(tune_config),
+            http_client,
             port,
             started_at: Instant::now(),
             bridge_responses: Arc::new(Mutex::new(HashMap::new())),

@@ -134,12 +134,7 @@ async fn podcast_episodes(
     };
 
     // Fetch RSS feed
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap();
-
-    let xml = match client.get(&feed_url).send().await {
+    let xml = match state.http_client.get(&feed_url).send().await {
         Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
         _ => {
             return Json(json!({"error": "failed to fetch RSS feed"})).into_response();

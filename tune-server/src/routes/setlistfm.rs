@@ -29,19 +29,12 @@ fn setlistfm_api_key(state: &AppState) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client error: {e}"))
-}
-
 async fn setlistfm_get(
+    client: &reqwest::Client,
     api_key: &str,
     path: &str,
     params: &[(&str, &str)],
 ) -> Result<Value, (StatusCode, String)> {
-    let client = http_client().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let url = format!("{SETLISTFM_API}{path}");
 
     let mut req = client
@@ -117,7 +110,7 @@ async fn search_setlists(
     }
 
     let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match setlistfm_get(&api_key, "/search/setlists", &param_refs).await {
+    match setlistfm_get(&state.http_client, &api_key, "/search/setlists", &param_refs).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -140,7 +133,7 @@ async fn artist_setlists(
 
     let params = [("p", q.p.to_string())];
     let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match setlistfm_get(&api_key, &format!("/artist/{mbid}/setlists"), &param_refs).await {
+    match setlistfm_get(&state.http_client, &api_key, &format!("/artist/{mbid}/setlists"), &param_refs).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -151,7 +144,7 @@ async fn get_setlist(State(state): State<AppState>, Path(id): Path<String>) -> i
         return not_configured().into_response();
     };
 
-    match setlistfm_get(&api_key, &format!("/setlist/{id}"), &[]).await {
+    match setlistfm_get(&state.http_client, &api_key, &format!("/setlist/{id}"), &[]).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -168,7 +161,7 @@ async fn venue_setlists(
 
     let params = [("p", q.p.to_string())];
     let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match setlistfm_get(&api_key, &format!("/venue/{id}/setlists"), &param_refs).await {
+    match setlistfm_get(&state.http_client, &api_key, &format!("/venue/{id}/setlists"), &param_refs).await {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }

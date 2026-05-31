@@ -268,8 +268,12 @@ async fn library_clear(State(state): State<AppState>) -> Json<Value> {
 
 async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db.clone());
-    settings.set("scan_status", "scanning").ok();
-    settings.set("scan_started_at", &chrono_now()).ok();
+    if let Err(e) = settings.set("scan_status", "scanning") {
+        tracing::warn!(error = %e, "scan_status_set_failed");
+    }
+    if let Err(e) = settings.set("scan_started_at", &chrono_now()) {
+        tracing::warn!(error = %e, "scan_started_at_set_failed");
+    }
 
     let db = state.db.clone();
     let event_bus = state.event_bus.clone();
@@ -277,7 +281,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         let raw_dirs = get_music_dirs_list(&db);
         if raw_dirs.is_empty() {
             tracing::warn!("scan_aborted_no_dirs — no music directories configured");
-            SettingsRepo::new(db).set("scan_status", "idle").ok();
+            if let Err(e) = SettingsRepo::new(db).set("scan_status", "idle") {
+                tracing::warn!(error = %e, "scan_status_reset_failed");
+            }
             return;
         }
 
@@ -365,11 +371,13 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         let mut last_progress_emit = std::time::Instant::now();
 
         // In-memory caches to avoid repeated DB lookups (persist across batches)
-        let mut artist_cache: std::collections::HashMap<String, tune_core::db::models::Artist> =
-            std::collections::HashMap::new();
+        let mut artist_cache: std::collections::HashMap<
+            String,
+            std::sync::Arc<tune_core::db::models::Artist>,
+        > = std::collections::HashMap::new();
         let mut album_cache: std::collections::HashMap<
             (String, i64, Option<i32>),
-            tune_core::db::models::Album,
+            std::sync::Arc<tune_core::db::models::Album>,
         > = std::collections::HashMap::new();
 
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
@@ -387,7 +395,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                     Vec::with_capacity(batch.len() / 4);
 
                 // BEGIN transaction for this batch
-                db.execute_batch("BEGIN IMMEDIATE").ok();
+                if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+                    tracing::warn!(error = %e, batch = batch_idx, "scan_batch_begin_failed");
+                }
 
                 for sf in &batch {
                     let Some(ref meta) = sf.metadata else {
@@ -436,7 +446,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
                     let album_artist_entry =
                         if let Some(cached) = artist_cache.get(album_artist_name) {
-                            Some(cached.clone())
+                            Some(std::sync::Arc::clone(cached))
                         } else {
                             let result = artist_repo
                                 .get_or_create(
@@ -448,9 +458,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                                     },
                                     meta.album_artist_sort.as_deref(),
                                 )
-                                .ok();
+                                .ok()
+                                .map(std::sync::Arc::new);
                             if let Some(ref a) = result {
-                                artist_cache.insert(album_artist_name.to_string(), a.clone());
+                                artist_cache
+                                    .insert(album_artist_name.to_string(), std::sync::Arc::clone(a));
                             }
                             result
                         };
@@ -458,7 +470,7 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
                     let track_artist = if is_compilation && track_artist_name != album_artist_name {
                         if let Some(cached) = artist_cache.get(track_artist_name) {
-                            Some(cached.clone())
+                            Some(std::sync::Arc::clone(cached))
                         } else {
                             let result = artist_repo
                                 .get_or_create(
@@ -466,9 +478,11 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                                     meta.musicbrainz_artist_id.as_deref(),
                                     None,
                                 )
-                                .ok();
+                                .ok()
+                                .map(std::sync::Arc::new);
                             if let Some(ref a) = result {
-                                artist_cache.insert(track_artist_name.to_string(), a.clone());
+                                artist_cache
+                                    .insert(track_artist_name.to_string(), std::sync::Arc::clone(a));
                             }
                             result
                         }
@@ -487,11 +501,14 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
 
                     let album = if let Some(ref key) = album_key {
                         if let Some(cached) = album_cache.get(key) {
-                            Some(cached.clone())
+                            Some(std::sync::Arc::clone(cached))
                         } else {
-                            let result = album_repo.get_or_create(&key.0, key.1, key.2).ok();
+                            let result = album_repo
+                                .get_or_create(&key.0, key.1, key.2)
+                                .ok()
+                                .map(std::sync::Arc::new);
                             if let Some(ref a) = result {
-                                album_cache.insert(key.clone(), a.clone());
+                                album_cache.insert(key.clone(), std::sync::Arc::clone(a));
                             }
                             result
                         }
@@ -534,7 +551,8 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                                                 &data, &cache_dir, &hash, ext,
                                             );
                                         }
-                                        let mut updated_artist = art.clone();
+                                        let mut updated_artist =
+                                            tune_core::db::models::Artist::clone(art);
                                         updated_artist.image_path = Some(hash);
                                         updated_artist.image_source = Some("local".to_string());
                                         artist_repo.update(&updated_artist).ok();
@@ -640,7 +658,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
                 updated += batch_updated;
 
                 // COMMIT this batch -- tracks are now queryable
-                db.execute_batch("COMMIT").ok();
+                if let Err(e) = db.execute_batch("COMMIT") {
+                    tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
+                }
 
                 // Emit progress after each batch
                 let processed = inserted + updated + skipped;
@@ -666,7 +686,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         );
 
         // Backfill + album stats in a single transaction
-        db.execute_batch("BEGIN IMMEDIATE").ok();
+        if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+            tracing::warn!(error = %e, "post_scan_begin_failed");
+        }
         {
             let conn = db.connection().lock().unwrap();
             conn.execute(
@@ -699,7 +721,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
             )
             .ok();
         }
-        db.execute_batch("COMMIT").ok();
+        if let Err(e) = db.execute_batch("COMMIT") {
+            tracing::warn!(error = %e, "post_scan_commit_failed");
+        }
 
         // Clean up orphan artists left behind after tag corrections
         let orphan_artists = ArtistRepo::new(db.clone()).cleanup_orphans().unwrap_or(0);
@@ -708,7 +732,9 @@ async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
         }
 
         let settings = SettingsRepo::new(db.clone());
-        settings.set("scan_status", "idle").ok();
+        if let Err(e) = settings.set("scan_status", "idle") {
+            tracing::warn!(error = %e, "scan_status_idle_failed");
+        }
         tracing::info!(
             discovered = total_discovered,
             parsed = scan_stats.total_files,
@@ -1237,18 +1263,21 @@ async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
     settings.set("update_task_id", &task_id).ok();
     settings.set("update_status", "downloading").ok();
 
+    let http_client = state.http_client.clone();
     let tid = task_id.clone();
     tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap();
+        let client = http_client;
         let arch = std::env::consts::ARCH;
         let os = std::env::consts::OS;
         let url = format!(
             "https://github.com/renesenses/tune-server-rust/releases/latest/download/tune-server-{os}-{arch}"
         );
-        match client.get(&url).send().await {
+        match client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(bytes) = resp.bytes().await {
                     let update_path = "/tmp/tune-server-update";
@@ -2147,12 +2176,10 @@ async fn remote_status(State(state): State<AppState>) -> impl IntoResponse {
             .into_response();
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap();
-    match client
+    match state
+        .http_client
         .get(format!("{url}/api/v1/system/health"))
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
     {
@@ -2537,9 +2564,9 @@ async fn database_import(
             .into_response();
     };
 
-    // Write to a temp file
-    let tmp_path = "/tmp/tune_import.db";
-    if let Err(e) = std::fs::write(tmp_path, &bytes) {
+    // Write to a unique temp file (safe for concurrent imports)
+    let tmp_path = std::env::temp_dir().join(format!("tune_import_{}.db", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write failed: {e}")})),
@@ -2549,7 +2576,7 @@ async fn database_import(
 
     // Open the imported DB and count rows
     let import_db = match rusqlite::Connection::open_with_flags(
-        tmp_path,
+        &tmp_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) {
         Ok(c) => c,
@@ -2573,13 +2600,15 @@ async fn database_import(
         .unwrap_or(0);
     drop(import_db);
 
+    let tmp_str = tmp_path.to_string_lossy();
+
     // Store the import path for potential restore
     let settings = SettingsRepo::new(state.db);
-    settings.set("last_imported_db", tmp_path).ok();
+    settings.set("last_imported_db", &tmp_str).ok();
 
     Json(json!({
         "status": "imported",
-        "temp_path": tmp_path,
+        "temp_path": tmp_str,
         "tracks": track_count,
         "albums": album_count,
         "artists": artist_count,
