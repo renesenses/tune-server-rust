@@ -55,6 +55,12 @@ pub struct StreamQuality {
     pub sample_rate: u32,
     pub bit_depth: u16,
     pub bitrate: Option<u32>,
+    #[serde(default = "default_channels")]
+    pub channels: u16,
+}
+
+fn default_channels() -> u16 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +214,7 @@ mod tests {
                 sample_rate: 96000,
                 bit_depth: 24,
                 bitrate: None,
+                channels: 2,
             }),
         };
         let json = serde_json::to_value(&track).unwrap();
@@ -289,6 +296,7 @@ mod tests {
             sample_rate: 192000,
             bit_depth: 24,
             bitrate: Some(9216),
+            channels: 2,
         };
         let json = serde_json::to_value(&quality).unwrap();
         assert_eq!(json["codec"], "FLAC");
@@ -307,6 +315,7 @@ mod tests {
                 sample_rate: 44100,
                 bit_depth: 16,
                 bitrate: None,
+                channels: 2,
             },
             expires_at: Some(1700000000),
         };

@@ -127,6 +127,7 @@ impl QobuzService {
                     .map(|b| b as u16)
                     .unwrap_or(16),
                 bitrate: None,
+                channels: 2,
             }),
         }
     }
@@ -416,6 +417,7 @@ impl StreamingService for QobuzService {
                 sample_rate,
                 bit_depth,
                 bitrate: None,
+                channels: 2,
             },
             expires_at: None,
         })

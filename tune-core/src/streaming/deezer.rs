@@ -265,6 +265,7 @@ impl DeezerService {
                 sample_rate: 44100,
                 bit_depth: 16,
                 bitrate: Some(128), // 30s preview is 128 kbps MP3
+                channels: 2,
             }),
         }
     }
@@ -491,6 +492,7 @@ impl StreamingService for DeezerService {
                     sample_rate: 44100,
                     bit_depth: if ext == "flac" { 16 } else { 16 },
                     bitrate: if ext == "flac" { None } else { Some(320) },
+                    channels: 2,
                 },
                 expires_at: None,
             });
@@ -517,6 +519,7 @@ impl StreamingService for DeezerService {
                         sample_rate: 44100,
                         bit_depth: 16,
                         bitrate: if ext == "flac" { None } else { Some(320) },
+                        channels: 2,
                     },
                     expires_at: None,
                 });
@@ -536,6 +539,7 @@ impl StreamingService for DeezerService {
                 sample_rate: 44100,
                 bit_depth: 16,
                 bitrate: Some(128),
+                channels: 2,
             },
             expires_at: None,
         })

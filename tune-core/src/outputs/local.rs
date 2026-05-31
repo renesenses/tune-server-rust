@@ -709,7 +709,12 @@ fn find_matching_config(
     None
 }
 
-/// Adapt channel count (mono->stereo, stereo->mono, etc.)
+/// Adapt channel count between source and output.
+///
+/// Handles upmix (mono to stereo, etc.) and downmix.  When downmixing
+/// from 5.1 (6 ch) or 7.1 (8 ch) to stereo, applies ITU-R BS.775
+/// compliant coefficients (K = 0.707) over the standard SMPTE/ITU
+/// channel layout: FL, FR, C, LFE, SL, SR [, BL, BR].
 fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
     if from_ch == to_ch {
         return samples.to_vec();
@@ -728,8 +733,23 @@ fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
             for _ in from..to {
                 out.push(last);
             }
+        } else if to == 2 && from >= 6 {
+            const K: f32 = 0.707;
+            let fl = frame[0];
+            let fr = frame[1];
+            let c = frame[2];
+            let sl = frame[4];
+            let sr = frame[5];
+            let (bl, br) = if from >= 8 {
+                (frame[6], frame[7])
+            } else {
+                (0.0, 0.0)
+            };
+            let l = fl + K * c + K * sl + K * bl;
+            let r = fr + K * c + K * sr + K * br;
+            out.push(l.clamp(-1.0, 1.0));
+            out.push(r.clamp(-1.0, 1.0));
         } else {
-            // Downmix: average first `to` channels
             for ch in 0..to {
                 out.push(frame[ch]);
             }

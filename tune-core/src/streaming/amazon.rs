@@ -194,6 +194,7 @@ impl AmazonMusicService {
                 sample_rate: sr,
                 bit_depth: bd,
                 bitrate: None,
+                channels: 2,
             }),
         }
     }
@@ -410,6 +411,7 @@ impl StreamingService for AmazonMusicService {
                     sample_rate: sr,
                     bit_depth: bd,
                     bitrate: None,
+                    channels: 2,
                 },
                 expires_at: None,
             });
@@ -446,6 +448,7 @@ impl StreamingService for AmazonMusicService {
                 sample_rate: sr,
                 bit_depth: bd,
                 bitrate: None,
+                channels: 2,
             },
             expires_at: None,
         })

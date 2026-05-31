@@ -141,6 +141,7 @@ impl SpotifyService {
                 sample_rate: 44100,
                 bit_depth: 16,
                 bitrate: Some(320),
+                channels: 2,
             }),
         }
     }

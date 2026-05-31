@@ -269,6 +269,7 @@ impl TidalService {
                 sample_rate,
                 bit_depth,
                 bitrate: None,
+                channels: 2,
             }),
         }
     }
@@ -713,6 +714,7 @@ impl StreamingService for TidalService {
                         sample_rate: 44100,
                         bit_depth: 16,
                         bitrate: None,
+                        channels: 2,
                     },
                     expires_at: None,
                 });
@@ -793,6 +795,7 @@ impl StreamingService for TidalService {
                 bitrate: data["bitDepth"]
                     .as_u64()
                     .map(|_| sample_rate * (bit_depth as u32) * 2),
+                channels: 2,
             },
             expires_at: None,
         })
