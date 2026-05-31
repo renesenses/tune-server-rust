@@ -192,6 +192,15 @@ mod tests {
         db
     }
 
+    fn link_artist_album(db: &SqliteDb, artist_id: i64) {
+        let conn = db.connection().lock().unwrap();
+        conn.execute(
+            "INSERT INTO albums (title, artist_id) VALUES ('test album', ?)",
+            rusqlite::params![artist_id],
+        )
+        .ok();
+    }
+
     #[test]
     fn crud_artist() {
         let db = test_db();
@@ -218,9 +227,10 @@ mod tests {
     #[test]
     fn get_or_create() {
         let db = test_db();
-        let repo = ArtistRepo::new(db);
+        let repo = ArtistRepo::new(db.clone());
 
         let a1 = repo.get_or_create("Beatles", None, None).unwrap();
+        link_artist_album(&db, a1.id.unwrap());
         let a2 = repo.get_or_create("Beatles", None, None).unwrap();
         assert_eq!(a1.id, a2.id);
         assert_eq!(repo.count().unwrap(), 1);
@@ -241,22 +251,27 @@ mod tests {
     #[test]
     fn artist_count() {
         let db = test_db();
-        let repo = ArtistRepo::new(db);
+        let repo = ArtistRepo::new(db.clone());
 
         assert_eq!(repo.count().unwrap(), 0);
-        repo.create(&Artist::new("A".into())).unwrap();
-        repo.create(&Artist::new("B".into())).unwrap();
+        let a1 = repo.create(&Artist::new("A".into())).unwrap();
+        let a2 = repo.create(&Artist::new("B".into())).unwrap();
+        link_artist_album(&db, a1);
+        link_artist_album(&db, a2);
         assert_eq!(repo.count().unwrap(), 2);
     }
 
     #[test]
     fn artist_list() {
         let db = test_db();
-        let repo = ArtistRepo::new(db);
+        let repo = ArtistRepo::new(db.clone());
 
-        repo.create(&Artist::new("Zappa".into())).unwrap();
-        repo.create(&Artist::new("Armstrong".into())).unwrap();
-        repo.create(&Artist::new("Miles Davis".into())).unwrap();
+        let a1 = repo.create(&Artist::new("Zappa".into())).unwrap();
+        let a2 = repo.create(&Artist::new("Armstrong".into())).unwrap();
+        let a3 = repo.create(&Artist::new("Miles Davis".into())).unwrap();
+        link_artist_album(&db, a1);
+        link_artist_album(&db, a2);
+        link_artist_album(&db, a3);
 
         let all = repo.list(100, 0).unwrap();
         assert_eq!(all.len(), 3);
@@ -266,10 +281,11 @@ mod tests {
     #[test]
     fn artist_list_pagination() {
         let db = test_db();
-        let repo = ArtistRepo::new(db);
+        let repo = ArtistRepo::new(db.clone());
 
         for i in 0..10 {
-            repo.create(&Artist::new(format!("Artist {i:02}"))).unwrap();
+            let a = repo.create(&Artist::new(format!("Artist {i:02}"))).unwrap();
+            link_artist_album(&db, a);
         }
 
         let page1 = repo.list(3, 0).unwrap();
@@ -309,11 +325,12 @@ mod tests {
     #[test]
     fn artist_get_or_create_with_musicbrainz_id() {
         let db = test_db();
-        let repo = ArtistRepo::new(db);
+        let repo = ArtistRepo::new(db.clone());
 
         let a1 = repo
             .get_or_create("Miles Davis", Some("mbid-123"), None)
             .unwrap();
+        link_artist_album(&db, a1.id.unwrap());
         let a2 = repo
             .get_or_create("Miles Davis", Some("mbid-123"), None)
             .unwrap();

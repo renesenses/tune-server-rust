@@ -464,7 +464,9 @@ impl PlaybackOrchestrator {
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(8888);
-        Some(format!("http://{server_ip}:{port}/api/v1/library/artwork/{c}"))
+        Some(format!(
+            "http://{server_ip}:{port}/api/v1/library/artwork/{c}"
+        ))
     }
 
     async fn send_to_output(
