@@ -125,7 +125,7 @@ impl PlaybackManager {
         state.now_playing = Some(np.clone());
 
         self.emit(PlaybackEvent {
-            event: "play".into(),
+            event: "started".into(),
             zone_id,
             data: serde_json::json!({
                 "title": np.title,
@@ -145,7 +145,7 @@ impl PlaybackManager {
             state.state = PlayState::Paused;
         }
         self.emit(PlaybackEvent {
-            event: "pause".into(),
+            event: "paused".into(),
             zone_id,
             data: serde_json::json!({}),
         });
@@ -157,7 +157,7 @@ impl PlaybackManager {
             state.state = PlayState::Playing;
         }
         self.emit(PlaybackEvent {
-            event: "resume".into(),
+            event: "resumed".into(),
             zone_id,
             data: serde_json::json!({}),
         });
@@ -185,7 +185,7 @@ impl PlaybackManager {
             None
         };
         self.emit(PlaybackEvent {
-            event: "stop".into(),
+            event: "stopped".into(),
             zone_id,
             data: np_data.unwrap_or(serde_json::json!({})),
         });
@@ -260,7 +260,7 @@ impl PlaybackManager {
             state.now_playing = Some(np.clone());
         }
         self.emit(PlaybackEvent {
-            event: "now_playing".into(),
+            event: "track_changed".into(),
             zone_id,
             data: serde_json::json!({
                 "title": np.title,

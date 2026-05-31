@@ -43,6 +43,7 @@ struct PatchZone {
     output_device_id: Option<String>,
     output_type: Option<String>,
     gapless_enabled: Option<bool>,
+    sync_delay_ms: Option<i32>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -155,36 +156,34 @@ async fn patch_zone(
     Json(body): Json<PatchZone>,
 ) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db.clone());
-    if let Some(ref name) = body.name {
-        if let Err(e) = repo.update_name(id, name) {
+    if let Some(ref name) = body.name
+        && let Err(e) = repo.update_name(id, name) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
-    if let Some(vol) = body.volume {
-        if let Err(e) = repo.update_volume(id, vol) {
+    if let Some(vol) = body.volume
+        && let Err(e) = repo.update_volume(id, vol) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
-    if let Some(muted) = body.muted {
-        if let Err(e) = repo.update_muted(id, muted) {
+    if let Some(muted) = body.muted
+        && let Err(e) = repo.update_muted(id, muted) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
-    if let Some(ref device_id) = body.output_device_id {
-        if let Err(e) = repo.update_output_device(id, device_id) {
+    if let Some(ref device_id) = body.output_device_id
+        && let Err(e) = repo.update_output_device(id, device_id) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
-    if let Some(ref ot) = body.output_type {
-        if let Err(e) = repo.update_output_type(id, ot) {
+    if let Some(ref ot) = body.output_type
+        && let Err(e) = repo.update_output_type(id, ot) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
-    if let Some(gapless) = body.gapless_enabled {
-        if let Err(e) = repo.update_gapless_enabled(id, gapless) {
+    if let Some(gapless) = body.gapless_enabled
+        && let Err(e) = repo.update_gapless_enabled(id, gapless) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-    }
+    if let Some(ms) = body.sync_delay_ms
+        && let Err(e) = repo.update_sync_delay(id, ms) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
     get_zone(State(state), Path(id)).await.into_response()
 }
 
@@ -225,8 +224,8 @@ async fn create_zone(
     // Check for duplicate device assignment
     if let Some(device_id) = output_device_id {
         let repo = ZoneRepo::new(state.db.clone());
-        if let Ok(zones) = repo.list() {
-            if zones
+        if let Ok(zones) = repo.list()
+            && zones
                 .iter()
                 .any(|z| z.output_device_id.as_deref() == Some(device_id))
             {
@@ -236,7 +235,6 @@ async fn create_zone(
                 )
                     .into_response();
             }
-        }
     }
 
     let repo = ZoneRepo::new(state.db.clone());

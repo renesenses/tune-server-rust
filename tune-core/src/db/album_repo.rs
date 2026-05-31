@@ -15,7 +15,7 @@ impl AlbumRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_ALBUM} WHERE a.id = ?"))
             .map_err(|e| e.to_string())?;
@@ -25,7 +25,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_ALBUM} WHERE a.title = ? COLLATE NOCASE LIMIT 1"
@@ -42,7 +42,7 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         if let Some(y) = year {
             let mut stmt = conn
                 .prepare(&format!(
@@ -65,7 +65,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"
@@ -183,13 +183,13 @@ impl AlbumRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_ALBUM} ORDER BY a.id DESC LIMIT ?"))
             .map_err(|e| e.to_string())?;
@@ -269,7 +269,7 @@ impl AlbumRepo {
         };
 
         let sql = format!("{SELECT_ALBUM}{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
         let mut params_vec: Vec<&dyn rusqlite::types::ToSql> =
@@ -286,7 +286,7 @@ impl AlbumRepo {
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_ALBUM} WHERE a.artist_id = ? ORDER BY a.year, a.title"
@@ -301,7 +301,7 @@ impl AlbumRepo {
     }
 
     pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         // Match against primary genre OR any genre in the JSON genres array.
         // The JSON pattern matches `"Jazz"` as an element inside `["Jazz","Fusion"]`.
         let json_pattern = format!("%\"{}%", genre.replace('"', ""));
@@ -324,7 +324,7 @@ impl AlbumRepo {
     pub fn list_without_cover(
         &self,
     ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id \
@@ -352,7 +352,7 @@ impl AlbumRepo {
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_ALBUM} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR a.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR a.genre LIKE ? COLLATE NOCASE OR CAST(a.year AS TEXT) = ? OR a.label LIKE ? COLLATE NOCASE LIMIT ?"))
             .map_err(|e| e.to_string())?;

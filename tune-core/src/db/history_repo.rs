@@ -42,7 +42,7 @@ impl HistoryRepo {
     }
 
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id FROM listen_history ORDER BY listened_at DESC LIMIT ?")
             .map_err(|e| e.to_string())?;
@@ -59,7 +59,7 @@ impl HistoryRepo {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ListenRecord>, i64), String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
@@ -75,7 +75,7 @@ impl HistoryRepo {
     }
 
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT title, artist_name, COUNT(*) as plays FROM listen_history GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?")
             .map_err(|e| e.to_string())?;
@@ -94,7 +94,7 @@ impl HistoryRepo {
     }
 
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL GROUP BY artist_name ORDER BY plays DESC LIMIT ?")
             .map_err(|e| e.to_string())?;
@@ -112,7 +112,7 @@ impl HistoryRepo {
     }
 
     pub fn top_albums(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?")
             .map_err(|e| e.to_string())?;
@@ -131,7 +131,7 @@ impl HistoryRepo {
     }
 
     pub fn listening_history(&self, days: i64) -> Result<Vec<(String, i64, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT DATE(listened_at) as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms FROM listen_history WHERE listened_at >= strftime('%Y-%m-%dT00:00:00Z', 'now', '-' || ? || ' days') GROUP BY day ORDER BY day")
             .map_err(|e| e.to_string())?;
@@ -150,13 +150,13 @@ impl HistoryRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn dashboard(&self) -> Result<DashboardStats, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
 
         let total_listens: i64 = conn
             .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
@@ -203,7 +203,7 @@ impl HistoryRepo {
         _profile_id: Option<i64>,
         top_n: i64,
     ) -> Result<DashboardData, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
 
         // Build WHERE clause from period + zone_id
         let mut conditions: Vec<String> = Vec::new();

@@ -144,12 +144,31 @@ struct LangQuery {
     lang: Option<String>,
 }
 
+const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours
+
+fn api_cache_get(db: &tune_core::db::sqlite::SqliteDb, key: &str) -> Option<Value> {
+    let conn = db.connection().lock().unwrap();
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ? AND \
+         CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
+        rusqlite::params![key, API_CACHE_TTL_SECS],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn api_cache_set(db: &tune_core::db::sqlite::SqliteDb, key: &str, data: &Value) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+    settings.set(key, &data.to_string()).ok();
+}
+
 async fn artist_bio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::new(state.db.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -159,6 +178,10 @@ async fn artist_bio(
             .into_response();
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
+    let cache_key = format!("cache:bio:{mbid}:{lang}");
+    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+        return Json(cached).into_response();
+    }
     match state
         .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/bio?lang={lang}"))
@@ -167,6 +190,7 @@ async fn artist_bio(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
+            api_cache_set(&state.db, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
@@ -174,7 +198,7 @@ async fn artist_bio(
 }
 
 async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::new(state.db.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -182,6 +206,10 @@ async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> i
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
+    let cache_key = format!("cache:similar:{mbid}");
+    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+        return Json(cached).into_response();
+    }
     match state
         .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}/similar"))
@@ -190,6 +218,7 @@ async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> i
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
+            api_cache_set(&state.db, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
@@ -197,7 +226,7 @@ async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> i
 }
 
 async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::new(state.db.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -205,6 +234,10 @@ async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> 
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!(artist)).into_response();
     };
+    let cache_key = format!("cache:meta:{mbid}");
+    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+        return Json(cached).into_response();
+    }
     match state
         .http_client
         .get(format!("https://mozaiklabs.fr/api/{mbid}"))
@@ -213,6 +246,7 @@ async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> 
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
+            api_cache_set(&state.db, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!(artist)).into_response(),
@@ -584,8 +618,8 @@ async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
     let mut genre_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (genre_col, genres_col) in &raw_genres {
         // Prefer the structured genres JSON array if present
-        if let Some(json_str) = genres_col {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
+        if let Some(json_str) = genres_col
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
                 for g in arr {
                     let trimmed = g.trim().to_string();
                     if !trimmed.is_empty() {
@@ -594,7 +628,6 @@ async fn genre_tree(State(state): State<AppState>) -> Json<Value> {
                 }
                 continue;
             }
-        }
         // Fall back to splitting the legacy genre column
         if let Some(raw) = genre_col {
             for g in tune_core::metadata::split_genre_tag(raw) {
@@ -907,21 +940,19 @@ async fn list_genres(
     for (genre_col, genres_col) in &raw {
         let mut genres_for_album: Vec<String> = Vec::new();
         // Prefer the structured genres JSON array if present
-        if let Some(json_str) = genres_col {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
+        if let Some(json_str) = genres_col
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
                 genres_for_album = arr
                     .into_iter()
                     .map(|g| g.trim().to_string())
                     .filter(|g| !g.is_empty())
                     .collect();
             }
-        }
         // Fall back to splitting the legacy genre column
-        if genres_for_album.is_empty() {
-            if let Some(raw_genre) = genre_col {
+        if genres_for_album.is_empty()
+            && let Some(raw_genre) = genre_col {
                 genres_for_album = tune_core::metadata::split_genre_tag(raw_genre);
             }
-        }
         for g in genres_for_album {
             *counts.entry(g).or_insert(0) += 1;
         }
@@ -1352,9 +1383,9 @@ async fn enrich_all_credits(State(state): State<AppState>) -> impl IntoResponse 
                 "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
             );
 
-            if let Ok(r) = state.http_client.get(&url).send().await {
-                if r.status().is_success() {
-                    if let Ok(data) = r.json::<Value>().await {
+            if let Ok(r) = state.http_client.get(&url).send().await
+                && r.status().is_success()
+                    && let Ok(data) = r.json::<Value>().await {
                         db.execute(
                             "DELETE FROM track_credits WHERE track_id = ?",
                             &[track_id as &dyn rusqlite::types::ToSql],
@@ -1401,8 +1432,6 @@ async fn enrich_all_credits(State(state): State<AppState>) -> impl IntoResponse 
 
                         enriched += 1;
                     }
-                }
-            }
 
             // MusicBrainz rate limit: 1 request/sec
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -1428,8 +1457,8 @@ async fn track_all_tags(State(state): State<AppState>, Path(id): Path<i64>) -> i
     let mut result = serde_json::to_value(&track).unwrap_or_default();
 
     // Try reading raw file tags with lofty
-    if let Some(ref path) = track.file_path {
-        if let Ok(tagged) = lofty::read_from_path(path) {
+    if let Some(ref path) = track.file_path
+        && let Ok(tagged) = lofty::read_from_path(path) {
             let tags: Vec<Value> = tagged
                 .tags()
                 .iter()
@@ -1442,7 +1471,6 @@ async fn track_all_tags(State(state): State<AppState>, Path(id): Path<i64>) -> i
                 .collect();
             result["file_tags"] = json!(tags);
         }
-    }
 
     Json(result).into_response()
 }
@@ -1888,14 +1916,13 @@ async fn rescan_album_artwork(
     let cache_dir = artwork_cache_dir();
     let mut found_hash: Option<String> = None;
     for track in &tracks {
-        if let Some(ref file_path) = track.file_path {
-            if let Some(hash) =
+        if let Some(ref file_path) = track.file_path
+            && let Some(hash) =
                 tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
             {
                 found_hash = Some(hash);
                 break;
             }
-        }
     }
     if let Some(ref hash) = found_hash {
         album_repo.update_cover_path(id, hash).ok();
@@ -1968,7 +1995,7 @@ async fn artist_timeline(State(state): State<AppState>, Path(id): Path<i64>) -> 
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let mut albums = repo.list_by_artist(id).unwrap_or_default();
-    albums.sort_by(|a, b| a.year.unwrap_or(0).cmp(&b.year.unwrap_or(0)));
+    albums.sort_by_key(|a| a.year.unwrap_or(0));
     let items: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     Json(json!({
         "artist": artist.name,
@@ -1999,11 +2026,10 @@ async fn artist_image_upload(
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         if name == "image" || name == "file" {
-            if let Some(ct) = field.content_type() {
-                if ct.contains("png") {
+            if let Some(ct) = field.content_type()
+                && ct.contains("png") {
                     ext = "png".to_string();
                 }
-            }
             image_data = field.bytes().await.ok().map(|b| b.to_vec());
         }
     }
@@ -2230,10 +2256,10 @@ async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse 
                                 urlencoding::encode(title),
                                 urlencoding::encode(artist),
                             );
-                            if let Ok(r) = http_client.get(&url).send().await {
-                                if r.status().is_success() {
-                                    if let Ok(data) = r.json::<Value>().await {
-                                        if let Some(mbid) = data
+                            if let Ok(r) = http_client.get(&url).send().await
+                                && r.status().is_success()
+                                    && let Ok(data) = r.json::<Value>().await
+                                        && let Some(mbid) = data
                                             .pointer("/recordings/0/id")
                                             .and_then(|v| v.as_str())
                                         {
@@ -2243,9 +2269,6 @@ async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse 
                                             ).ok();
                                             enriched += 1;
                                         }
-                                    }
-                                }
-                            }
                             // MusicBrainz rate limit
                             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
                         }
@@ -2325,8 +2348,8 @@ async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse 
         for (album_id,) in &albums {
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
             for track in &tracks {
-                if let Some(ref file_path) = track.file_path {
-                    if let Some(hash) = tune_core::artwork::get_or_extract(
+                if let Some(ref file_path) = track.file_path
+                    && let Some(hash) = tune_core::artwork::get_or_extract(
                         std::path::Path::new(file_path),
                         &cache_dir,
                     ) {
@@ -2334,7 +2357,6 @@ async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse 
                         updated += 1;
                         break;
                     }
-                }
             }
         }
         tracing::info!(updated, total = albums.len(), "rescan_all_artwork done");

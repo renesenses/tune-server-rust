@@ -329,6 +329,11 @@ CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id
     },
     Migration {
         version: 18,
+        name: "add_zone_group_and_sync_delay",
+        up: "",
+    },
+    Migration {
+        version: 19,
         name: "seed_default_smart_playlists",
         up: "
 INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks)
@@ -561,6 +566,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 17 {
             add_column_if_missing(db, "zones", "gapless_enabled", "INTEGER DEFAULT 1");
+        }
+        if migration.version == 18 {
+            add_column_if_missing(db, "zones", "group_id", "TEXT");
+            add_column_if_missing(db, "zones", "sync_delay_ms", "INTEGER NOT NULL DEFAULT 0");
         }
 
         db.execute(

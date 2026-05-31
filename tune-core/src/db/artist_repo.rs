@@ -13,7 +13,7 @@ impl ArtistRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id = ?")
             .map_err(|e| e.to_string())?;
@@ -25,7 +25,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE")
             .map_err(|e| e.to_string())?;
@@ -37,7 +37,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?")
             .map_err(|e| e.to_string())?;
@@ -111,13 +111,13 @@ impl ArtistRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) ORDER BY COALESCE(sort_name, name) COLLATE NOCASE LIMIT ? OFFSET ?")
             .map_err(|e| e.to_string())?;
@@ -152,7 +152,7 @@ impl ArtistRepo {
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?) OR name LIKE ? COLLATE NOCASE LIMIT ?")
             .map_err(|e| e.to_string())?;

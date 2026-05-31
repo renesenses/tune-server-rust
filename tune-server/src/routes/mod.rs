@@ -391,13 +391,9 @@ pub fn router(state: AppState) -> Router {
         ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
-    let upnp_routes = if let Some(ref upnp_state) = state.upnp {
-        Some(tune_core::upnp_server::standalone_router(
+    let upnp_routes = state.upnp.as_ref().map(|upnp_state| tune_core::upnp_server::standalone_router(
             upnp_state.clone(),
-        ))
-    } else {
-        None
-    };
+        ));
 
     let deezer_proxy = axum::Router::new()
         .route(
@@ -409,6 +405,7 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
+        .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state)
         .merge(tune_core::http::streamer::router(streamer_sessions))
@@ -430,7 +427,9 @@ pub fn router(state: AppState) -> Router {
     };
 
     let index_path = format!("{web_dir}/index.html");
-    let app = app
+    
+
+    app
         .route(
             "/",
             get(move || async move {
@@ -455,7 +454,5 @@ pub fn router(state: AppState) -> Router {
             ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
         )
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive());
-
-    app
+        .layer(CorsLayer::permissive())
 }

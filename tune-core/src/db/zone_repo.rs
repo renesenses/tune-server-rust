@@ -13,6 +13,8 @@ pub struct Zone {
     pub muted: bool,
     pub online: bool,
     pub gapless_enabled: bool,
+    pub group_id: Option<String>,
+    pub sync_delay_ms: i32,
 }
 
 pub struct ZoneRepo {
@@ -25,9 +27,9 @@ impl ZoneRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Zone>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled FROM zones WHERE id = ?")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms FROM zones WHERE id = ?")
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_zone(row)))
             .optional()
@@ -35,9 +37,9 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled FROM zones ORDER BY name")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms FROM zones ORDER BY name")
             .map_err(|e| e.to_string())?;
         let zones = stmt
             .query_map([], |row| Ok(row_to_zone(row)))
@@ -138,8 +140,24 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_group(&self, id: i64, group_id: Option<&str>) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET group_id = ? WHERE id = ?",
+            &[&group_id as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_sync_delay(&self, id: i64, ms: i32) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET sync_delay_ms = ? WHERE id = ?",
+            &[&ms as &dyn rusqlite::types::ToSql, &id],
+        )?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM zones", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
@@ -155,6 +173,8 @@ fn row_to_zone(row: &rusqlite::Row) -> Zone {
         muted: row.get::<_, i64>(5).unwrap_or(0) != 0,
         online: row.get::<_, i64>(6).unwrap_or(1) != 0,
         gapless_enabled: row.get::<_, i64>(7).unwrap_or(1) != 0,
+        group_id: row.get(8).ok(),
+        sync_delay_ms: row.get(9).unwrap_or(0),
     }
 }
 

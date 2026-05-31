@@ -21,7 +21,7 @@ impl TrackRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_TRACK} WHERE t.id = ?"))
             .map_err(|e| e.to_string())?;
@@ -31,7 +31,7 @@ impl TrackRepo {
     }
 
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
             .map_err(|e| e.to_string())?;
@@ -196,13 +196,13 @@ impl TrackRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_TRACK} ORDER BY ar.name COLLATE NOCASE, al.title COLLATE NOCASE, t.disc_number, t.track_number LIMIT ? OFFSET ?"))
             .map_err(|e| e.to_string())?;
@@ -215,7 +215,7 @@ impl TrackRepo {
     }
 
     pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
@@ -235,7 +235,7 @@ impl TrackRepo {
     pub fn get_all_local_file_info(
         &self,
     ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
             .map_err(|e| e.to_string())?;
@@ -282,7 +282,7 @@ impl TrackRepo {
     }
 
     pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_TRACK} WHERE t.album_id = ? ORDER BY t.disc_number, t.track_number, t.file_path"))
             .map_err(|e| e.to_string())?;
@@ -295,7 +295,7 @@ impl TrackRepo {
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_TRACK} WHERE t.artist_id = ? ORDER BY t.title"
@@ -312,7 +312,7 @@ impl TrackRepo {
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_TRACK} WHERE t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?) OR ar.name LIKE ? COLLATE NOCASE OR t.genre LIKE ? COLLATE NOCASE OR t.composer LIKE ? COLLATE NOCASE OR CAST(al.year AS TEXT) = ? LIMIT ?"
@@ -335,7 +335,7 @@ impl TrackRepo {
         }
         let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
         let sql = format!("{SELECT_TRACK} WHERE t.id IN ({})", placeholders.join(","));
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let params: Vec<&dyn rusqlite::types::ToSql> = ids
             .iter()
@@ -358,7 +358,7 @@ impl TrackRepo {
     }
 
     pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id FROM tracks ORDER BY RANDOM() LIMIT ?")
             .map_err(|e| e.to_string())?;
@@ -371,7 +371,7 @@ impl TrackRepo {
     }
 
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
             .map_err(|e| e.to_string())?;
@@ -382,7 +382,7 @@ impl TrackRepo {
 
     pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, String> {
         let like = format!("%{title}%");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_TRACK} WHERE t.title LIKE ? COLLATE NOCASE LIMIT ?"
@@ -398,7 +398,7 @@ impl TrackRepo {
 
     /// Count tracks with doubtful metadata (missing artist, very short, missing album).
     pub fn count_doubtful(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
@@ -414,7 +414,7 @@ impl TrackRepo {
 
     /// List tracks with doubtful metadata, paginated.
     pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let sql = format!(
             "{SELECT_TRACK} \
              WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \

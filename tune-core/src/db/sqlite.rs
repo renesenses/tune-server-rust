@@ -5,33 +5,45 @@ use tracing::info;
 
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
+    read_conn: Arc<Mutex<Connection>>,
 }
 
-impl SqliteDb {
-    pub fn open(path: &str) -> Result<Self, String> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-
-        let conn = Connection::open_with_flags(path, flags)
-            .map_err(|e| format!("sqlite open {path}: {e}"))?;
-
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+const PRAGMAS: &str = "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;
              PRAGMA cache_size=-64000;
              PRAGMA temp_store=MEMORY;
              PRAGMA mmap_size=268435456;
-             PRAGMA analysis_limit=400;",
-        )
-        .map_err(|e| format!("pragma: {e}"))?;
+             PRAGMA analysis_limit=400;";
+
+impl SqliteDb {
+    pub fn open(path: &str) -> Result<Self, String> {
+        if path == ":memory:" {
+            return Self::open_in_memory();
+        }
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+        let conn = Connection::open_with_flags(path, flags)
+            .map_err(|e| format!("sqlite open {path}: {e}"))?;
+        conn.execute_batch(PRAGMAS)
+            .map_err(|e| format!("pragma: {e}"))?;
+
+        let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let read_conn = Connection::open_with_flags(path, read_flags)
+            .map_err(|e| format!("sqlite open read {path}: {e}"))?;
+        read_conn
+            .execute_batch(PRAGMAS)
+            .map_err(|e| format!("pragma read: {e}"))?;
 
         info!(path, "sqlite_opened");
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            read_conn: Arc::new(Mutex::new(read_conn)),
         })
     }
 
@@ -41,13 +53,21 @@ impl SqliteDb {
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| format!("pragma: {e}"))?;
 
+        // In-memory DBs: share the same connection for reads and writes
+        // (separate in-memory connections don't share data)
+        let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            read_conn: conn.clone(),
+            conn,
         })
     }
 
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
+    }
+
+    pub fn read_connection(&self) -> &Arc<Mutex<Connection>> {
+        &self.read_conn
     }
 
     pub fn execute(
@@ -75,7 +95,7 @@ impl SqliteDb {
     }
 
     pub fn query_timed<T>(&self, label: &str, f: impl FnOnce(&Connection) -> T) -> T {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let start = std::time::Instant::now();
         let result = f(&conn);
         let elapsed = start.elapsed();
@@ -90,6 +110,7 @@ impl Clone for SqliteDb {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
+            read_conn: self.read_conn.clone(),
         }
     }
 }
@@ -198,7 +219,9 @@ CREATE TABLE IF NOT EXISTS zones (
     volume INTEGER DEFAULT 50,
     muted INTEGER DEFAULT 0,
     online INTEGER DEFAULT 1,
-    gapless_enabled INTEGER DEFAULT 1
+    gapless_enabled INTEGER DEFAULT 1,
+    group_id TEXT,
+    sync_delay_ms INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
