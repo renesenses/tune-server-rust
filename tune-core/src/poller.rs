@@ -289,7 +289,18 @@ impl PositionPoller {
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
-                        self.handle_track_end(zone_id, zone_state).await;
+                        if let Some(next_pos) = Self::next_position(zone_state) {
+                            info!(zone_id, next_pos, "gapless_advance_metadata");
+                            if let Err(e) = self
+                                .orchestrator
+                                .advance_queue_metadata(zone_id, next_pos)
+                                .await
+                            {
+                                warn!(zone_id, error = %e, "gapless_advance_failed");
+                            }
+                        } else {
+                            self.handle_track_end(zone_id, zone_state).await;
+                        }
                     } else if !ps.gapless_sent
                         && status.duration_ms > GAPLESS_WINDOW_MS
                         && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS

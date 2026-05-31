@@ -804,6 +804,66 @@ impl PlaybackOrchestrator {
         Ok(result)
     }
 
+    pub async fn advance_queue_metadata(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<(), String> {
+        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        queue_repo.set_current(zone_id, position).ok();
+
+        let queue = queue_repo.get_queue(zone_id)?;
+        if let Some(item) = queue.iter().find(|i| i.is_current) {
+            let track_repo = crate::db::track_repo::TrackRepo::new(self.db.clone());
+            let track = track_repo.get(item.track_id).ok().flatten();
+            let cover_path = track.as_ref().and_then(|t| t.cover_path.clone());
+            let np = crate::playback::NowPlaying {
+                track_id: Some(item.track_id),
+                title: item.title.clone().unwrap_or_default(),
+                artist_name: item.artist_name.clone(),
+                album_title: item.album_title.clone(),
+                cover_path: Self::resolve_cover_url(cover_path.as_deref()),
+                duration_ms: item.duration_ms.unwrap_or(0),
+                source: "local".into(),
+                source_id: None,
+                stream_id: None,
+            };
+            self.playback.play(zone_id, np).await;
+            self.playback
+                .update_queue_info(zone_id, position, queue.len() as i64)
+                .await;
+            return Ok(());
+        }
+
+        let streaming = queue_repo.get_streaming_queue(zone_id)?;
+        if let Some(item) = streaming.get(position as usize) {
+            let title = item["title"].as_str().unwrap_or("").to_string();
+            let artist = item["artist_name"].as_str().map(String::from);
+            let album = item["album_title"].as_str().map(String::from);
+            let cover = item["cover_path"].as_str().map(String::from);
+            let duration = item["duration_ms"].as_i64().unwrap_or(0);
+            let source = item["source"].as_str().unwrap_or("streaming").to_string();
+            let np = crate::playback::NowPlaying {
+                track_id: None,
+                title,
+                artist_name: artist,
+                album_title: album,
+                cover_path: Self::resolve_cover_url(cover.as_deref()),
+                duration_ms: duration,
+                source,
+                source_id: item["source_id"].as_str().map(String::from),
+                stream_id: None,
+            };
+            self.playback.play(zone_id, np).await;
+            self.playback
+                .update_queue_info(zone_id, position, streaming.len() as i64)
+                .await;
+            return Ok(());
+        }
+
+        Err("no queue item at position".into())
+    }
+
     pub async fn resolve_queue_item_url(
         &self,
         zone_id: i64,
