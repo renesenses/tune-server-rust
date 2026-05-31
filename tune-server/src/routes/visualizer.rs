@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -55,10 +56,10 @@ struct VizConfigBody {
 async fn set_viz_config(
     State(state): State<AppState>,
     Json(body): Json<VizConfigBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut config = load_viz_config(&state);
-    let obj = config.as_object_mut().unwrap();
+    let obj = config.as_object_mut().ok_or_else(|| AppError::internal("visualizer config is not a JSON object"))?;
 
     if let Some(v) = body.enabled {
         obj.insert("enabled".into(), json!(v));
@@ -85,10 +86,10 @@ async fn set_viz_config(
     settings
         .set(
             "visualizer_config",
-            &serde_json::to_string(&config).unwrap(),
+            &serde_json::to_string(&config)?,
         )
         .ok();
-    Json(json!({"saved": true, "config": config}))
+    Ok(Json(json!({"saved": true, "config": config})))
 }
 
 /// Return mock spectrum data (32 frequency bins).

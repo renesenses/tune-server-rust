@@ -4,6 +4,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -66,8 +67,8 @@ struct PlayRadioBody {
 async fn siri_play_radio(
     State(state): State<AppState>,
     Json(body): Json<PlayRadioBody>,
-) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     let pattern = format!("%{}%", body.name);
     let station: Option<Value> = conn
@@ -85,17 +86,17 @@ async fn siri_play_radio(
     drop(conn);
 
     match station {
-        Some(s) => Json(json!({
+        Some(s) => Ok(Json(json!({
             "action": "play_radio",
             "station": s,
             "zone_id": body.zone_id,
             "status": "queued",
-        })),
-        None => Json(json!({
+        }))),
+        None => Ok(Json(json!({
             "action": "play_radio",
             "error": format!("No radio station matching '{}'", body.name),
             "status": "not_found",
-        })),
+        }))),
     }
 }
 
@@ -109,8 +110,8 @@ struct PlayPlaylistBody {
 async fn siri_play_playlist(
     State(state): State<AppState>,
     Json(body): Json<PlayPlaylistBody>,
-) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     let pattern = format!("%{}%", body.name);
     let playlist: Option<Value> = conn
@@ -127,17 +128,17 @@ async fn siri_play_playlist(
     drop(conn);
 
     match playlist {
-        Some(p) => Json(json!({
+        Some(p) => Ok(Json(json!({
             "action": "play_playlist",
             "playlist": p,
             "zone_id": body.zone_id,
             "status": "queued",
-        })),
-        None => Json(json!({
+        }))),
+        None => Ok(Json(json!({
             "action": "play_playlist",
             "error": format!("No playlist matching '{}'", body.name),
             "status": "not_found",
-        })),
+        }))),
     }
 }
 
@@ -152,8 +153,8 @@ struct PlayAlbumBody {
 async fn siri_play_album(
     State(state): State<AppState>,
     Json(body): Json<PlayAlbumBody>,
-) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     let title_pattern = format!("%{}%", body.title);
     let album: Option<Value> = if let Some(ref artist) = body.artist {
@@ -187,17 +188,17 @@ async fn siri_play_album(
     drop(conn);
 
     match album {
-        Some(a) => Json(json!({
+        Some(a) => Ok(Json(json!({
             "action": "play_album",
             "album": a,
             "zone_id": body.zone_id,
             "status": "queued",
-        })),
-        None => Json(json!({
+        }))),
+        None => Ok(Json(json!({
             "action": "play_album",
             "error": format!("No album matching '{}'", body.title),
             "status": "not_found",
-        })),
+        }))),
     }
 }
 
@@ -211,60 +212,58 @@ struct VoiceCommandBody {
 async fn voice_command(
     State(state): State<AppState>,
     Json(body): Json<VoiceCommandBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let text = body.text.to_lowercase();
 
-    // Simple keyword-based NLU
     if text.contains("pause") || text.contains("stop") {
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "pause",
             "zone_id": body.zone_id,
             "parsed": "pause playback",
             "status": "executed",
-        }));
+        })));
     }
 
     if text.contains("resume") || text.starts_with("play") && text.len() < 6 {
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "resume",
             "zone_id": body.zone_id,
             "parsed": "resume playback",
             "status": "executed",
-        }));
+        })));
     }
 
     if text.contains("next") || text.contains("skip") {
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "next",
             "zone_id": body.zone_id,
             "parsed": "skip to next track",
             "status": "executed",
-        }));
+        })));
     }
 
     if text.contains("previous") || text.contains("back") {
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "previous",
             "zone_id": body.zone_id,
             "parsed": "go to previous track",
             "status": "executed",
-        }));
+        })));
     }
 
     if text.contains("shuffle") {
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "shuffle",
             "zone_id": body.zone_id,
             "parsed": "shuffle playback",
             "status": "executed",
-        }));
+        })));
     }
 
     // "play X" -> search and play
     if let Some(query) = text.strip_prefix("play ") {
         let query = query.trim();
-        // Search the library
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         let pattern = format!("%{query}%");
 
         let track: Option<Value> = conn
@@ -281,21 +280,21 @@ async fn voice_command(
             .ok();
         drop(conn);
 
-        return Json(json!({
+        return Ok(Json(json!({
             "action": "play_search",
             "query": query,
             "result": track,
             "zone_id": body.zone_id,
             "parsed": format!("search and play: {query}"),
             "status": if track.is_some() { "found" } else { "not_found" },
-        }));
+        })));
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "action": "unknown",
         "text": body.text,
         "parsed": null,
         "status": "unrecognized",
         "message": "Could not parse voice command. Try: 'play [artist/album/track]', 'pause', 'next', 'shuffle'.",
-    }))
+    })))
 }

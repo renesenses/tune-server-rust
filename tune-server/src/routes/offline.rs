@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -59,9 +60,9 @@ fn offline_cache_dir(settings: &SettingsRepo) -> String {
         .unwrap_or_else(|| "offline_cache".into())
 }
 
-async fn offline_status(State(state): State<AppState>) -> Json<Value> {
+async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM offline_cache", [], |r| r.get(0))
@@ -92,14 +93,14 @@ async fn offline_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let cache_dir = offline_cache_dir(&settings);
 
-    Json(json!({
+    Ok(Json(json!({
         "total_tracks": total,
         "completed": completed,
         "pending": pending,
         "total_size_bytes": total_size,
         "total_size_mb": (total_size as f64 / 1_048_576.0 * 100.0).round() / 100.0,
         "cache_dir": cache_dir,
-    }))
+    })))
 }
 
 async fn offline_config(State(state): State<AppState>) -> Json<Value> {
@@ -420,9 +421,9 @@ async fn download_playlist_tracks(
     }
 }
 
-async fn list_downloads(State(state): State<AppState>) -> Json<Value> {
+async fn list_downloads(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, source, source_id, track_title, artist_name, album_title, file_size, quality, status, error, downloaded_at \
@@ -444,17 +445,17 @@ async fn list_downloads(State(state): State<AppState>) -> Json<Value> {
                     "downloaded_at": row.get::<_, Option<String>>(10).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
-async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, quality, status, error, downloaded_at, expires_at \
          FROM offline_cache WHERE id = ?",
@@ -480,16 +481,15 @@ async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> 
     drop(conn);
 
     match result {
-        Ok(v) => Json(v).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
-async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    // Get file path before deleting record
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let file_path: Option<String> = conn
         .query_row(
             "SELECT file_path FROM offline_cache WHERE id = ?",
@@ -514,12 +514,12 @@ async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> 
         )
         .ok();
 
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_offline_albums(State(state): State<AppState>) -> Json<Value> {
+async fn list_offline_albums(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT album_title, artist_name, COUNT(*) as track_count, COALESCE(SUM(file_size), 0), source \
@@ -538,17 +538,17 @@ async fn list_offline_albums(State(state): State<AppState>) -> Json<Value> {
                     "source": row.get::<_, Option<String>>(4).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
-    Json(json!({"albums": items, "total": items.len()}))
+    Ok(Json(json!({"albums": items, "total": items.len()})))
 }
 
-async fn list_offline_tracks(State(state): State<AppState>) -> Json<Value> {
+async fn list_offline_tracks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, duration_ms, quality, downloaded_at \
@@ -572,19 +572,18 @@ async fn list_offline_tracks(State(state): State<AppState>) -> Json<Value> {
                     "downloaded_at": row.get::<_, Option<String>>(10).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
-    Json(json!({"tracks": items, "total": items.len()}))
+    Ok(Json(json!({"tracks": items, "total": items.len()})))
 }
 
-async fn sync_offline(State(state): State<AppState>) -> impl IntoResponse {
+async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    // Clean up entries where local file is missing
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let completed: Vec<(i64, String)> = conn
         .prepare("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL")
         .and_then(|mut stmt| {
@@ -594,7 +593,7 @@ async fn sync_offline(State(state): State<AppState>) -> impl IntoResponse {
                     row.get::<_, String>(1).unwrap_or_default(),
                 ))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
@@ -622,23 +621,22 @@ async fn sync_offline(State(state): State<AppState>) -> impl IntoResponse {
         )
         .unwrap_or(0) as i64;
 
-    Json(json!({
+    Ok(Json(json!({
         "synced": true,
         "missing_cleaned": cleaned,
         "errors_retried": retried,
-    }))
+    })))
 }
 
-async fn clear_offline(State(state): State<AppState>) -> impl IntoResponse {
+async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    // Get all file paths and delete files
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<String> = conn
         .prepare("SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
@@ -654,10 +652,10 @@ async fn clear_offline(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = offline_cache_dir(&settings);
     std::fs::remove_dir_all(&cache_dir).ok();
 
-    Json(json!({
+    Ok(Json(json!({
         "cleared": true,
         "files_removed": paths.len(),
-    }))
+    })))
 }
 
 // Placeholder type alias for response

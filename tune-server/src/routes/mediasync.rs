@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -19,8 +20,8 @@ pub fn router() -> Router<AppState> {
         .route("/import", post(import_library_manifest))
 }
 
-async fn sync_status(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn sync_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let track_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
         .unwrap_or(0);
@@ -29,12 +30,12 @@ async fn sync_status(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     drop(conn);
 
-    Json(json!({
+    Ok(Json(json!({
         "local_tracks": track_count,
         "local_albums": album_count,
         "sync_running": false,
         "last_sync": null,
-    }))
+    })))
 }
 
 async fn sync_peers(State(state): State<AppState>) -> Json<Value> {
@@ -70,7 +71,7 @@ async fn sync_peers(State(state): State<AppState>) -> Json<Value> {
 async fn compare_with_peer(
     State(state): State<AppState>,
     Path(ip): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     // Fetch peer's manifest
     let peer_url = format!("http://{ip}/api/v1/mediasync/export");
 
@@ -80,16 +81,15 @@ async fn compare_with_peer(
         }
         Ok(resp) => {
             let msg = format!("Peer returned {}", resp.status());
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response();
+            return Ok((StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response());
         }
         Err(e) => {
             let msg = format!("Cannot reach peer: {e}");
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response();
+            return Ok((StatusCode::BAD_GATEWAY, Json(json!({"error": msg}))).into_response());
         }
     };
 
-    // Build local hash set
-    let local_manifest = build_manifest(&state);
+    let local_manifest = build_manifest(&state)?;
     let empty_local = vec![];
     let local_arr = local_manifest.as_array().unwrap_or(&empty_local);
     let local_hashes: std::collections::HashSet<String> = local_arr
@@ -128,7 +128,7 @@ async fn compare_with_peer(
         })
         .collect();
 
-    Json(json!({
+    Ok(Json(json!({
         "peer": ip,
         "local_total": local_tracks_arr.len(),
         "peer_total": peer_tracks.len(),
@@ -137,7 +137,7 @@ async fn compare_with_peer(
         "only_local_tracks": only_local,
         "only_peer_tracks": only_peer,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -183,8 +183,8 @@ async fn push_to_peer(
     .into_response()
 }
 
-fn build_manifest(state: &AppState) -> Value {
-    let conn = state.db.connection().lock().unwrap();
+fn build_manifest(state: &AppState) -> Result<Value, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let tracks: Vec<Value> = conn
         .prepare(
             "SELECT id, path, title, artist_name, album_title, genre, year, duration, \
@@ -205,17 +205,17 @@ fn build_manifest(state: &AppState) -> Value {
                     "file_size": row.get::<_, Option<i64>>(9)?,
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    json!(tracks)
+    Ok(json!(tracks))
 }
 
-async fn export_library_manifest(State(state): State<AppState>) -> Json<Value> {
-    let tracks = build_manifest(&state);
+async fn export_library_manifest(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let tracks = build_manifest(&state)?;
     let count = tracks.as_array().map(|a| a.len()).unwrap_or(0);
-    Json(json!({
+    Ok(Json(json!({
         "tracks": tracks,
         "total": count,
         "server_version": env!("CARGO_PKG_VERSION"),
@@ -223,7 +223,7 @@ async fn export_library_manifest(State(state): State<AppState>) -> Json<Value> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-    }))
+    })))
 }
 
 #[derive(Deserialize)]

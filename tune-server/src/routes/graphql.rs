@@ -1,11 +1,11 @@
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -87,21 +87,17 @@ struct GraphqlRequest {
 async fn graphql_query(
     State(state): State<AppState>,
     Json(body): Json<GraphqlRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<Value>, AppError> {
     let query = body.query.trim();
     let variables = body.variables.unwrap_or(json!({}));
 
     // Simple top-level query parser
     if let Some(result) = try_execute(query, &variables, &state) {
-        Json(json!({"data": result})).into_response()
+        Ok(Json(json!({"data": result})))
     } else {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "errors": [{"message": "Unsupported query. Supported: tracks, albums, artists, search, track(id), album(id), artist(id)"}],
-            })),
-        )
-            .into_response()
+        Err(AppError::bad_request(
+            "Unsupported query. Supported: tracks, albums, artists, search, track(id), album(id), artist(id)",
+        ))
     }
 }
 
@@ -148,14 +144,14 @@ fn try_execute(query: &str, variables: &Value, state: &AppState) -> Option<Value
 }
 
 fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
-    let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, title, artist_name, album_title, duration, path, format, sample_rate, bit_depth \
-             FROM tracks ORDER BY title LIMIT ?1 OFFSET ?2",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([limit, offset], |row| {
+    let items: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, artist_name, album_title, duration, path, format, sample_rate, bit_depth \
+                 FROM tracks ORDER BY title LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map([limit, offset], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "title": row.get::<_, Option<String>>(1)?,
@@ -167,15 +163,15 @@ fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
                     "sample_rate": row.get::<_, Option<i64>>(7)?,
                     "bit_depth": row.get::<_, Option<i64>>(8)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
 
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
+    let total: i64 = state
+        .db
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)))
         .unwrap_or(0);
-    drop(conn);
 
     json!({
         "items": items,
@@ -184,14 +180,14 @@ fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
-    let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, title, artist_name, year, track_count, cover_path \
-             FROM albums ORDER BY title LIMIT ?1 OFFSET ?2",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([limit, offset], |row| {
+    let items: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, artist_name, year, track_count, cover_path \
+                 FROM albums ORDER BY title LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map([limit, offset], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "title": row.get::<_, Option<String>>(1)?,
@@ -200,15 +196,15 @@ fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
                     "track_count": row.get::<_, Option<i64>>(4)?,
                     "cover_path": row.get::<_, Option<String>>(5)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
 
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
+    let total: i64 = state
+        .db
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0)))
         .unwrap_or(0);
-    drop(conn);
 
     json!({
         "items": items,
@@ -217,29 +213,29 @@ fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
-    let conn = state.db.connection().lock().unwrap();
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, name, album_count, track_count \
-             FROM artists ORDER BY name LIMIT ?1 OFFSET ?2",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([limit, offset], |row| {
+    let items: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, album_count, track_count \
+                 FROM artists ORDER BY name LIMIT ?1 OFFSET ?2",
+            )?;
+            let rows = stmt.query_map([limit, offset], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "name": row.get::<_, Option<String>>(1)?,
                     "album_count": row.get::<_, Option<i64>>(2)?,
                     "track_count": row.get::<_, Option<i64>>(3)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
 
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))
+    let total: i64 = state
+        .db
+        .read(|conn| conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0)))
         .unwrap_or(0);
-    drop(conn);
 
     json!({
         "items": items,
@@ -248,16 +244,16 @@ fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
-    let conn = state.db.connection().lock().unwrap();
     let pattern = format!("%{q}%");
 
-    let tracks: Vec<Value> = conn
-        .prepare(
-            "SELECT id, title, artist_name, album_title, duration \
-             FROM tracks WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![&pattern, limit], |row| {
+    let tracks: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, artist_name, album_title, duration \
+                 FROM tracks WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "title": row.get::<_, Option<String>>(1)?,
@@ -265,43 +261,44 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
                     "album_title": row.get::<_, Option<String>>(3)?,
                     "duration": row.get::<_, Option<f64>>(4)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
 
-    let albums: Vec<Value> = conn
-        .prepare(
-            "SELECT id, title, artist_name, year \
-             FROM albums WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![&pattern, limit], |row| {
+    let albums: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, artist_name, year \
+                 FROM albums WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "title": row.get::<_, Option<String>>(1)?,
                     "artist_name": row.get::<_, Option<String>>(2)?,
                     "year": row.get::<_, Option<i64>>(3)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
 
-    let artists: Vec<Value> = conn
-        .prepare("SELECT id, name FROM artists WHERE name LIKE ?1 LIMIT ?2")
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![&pattern, limit], |row| {
+    let artists: Vec<Value> = state
+        .db
+        .read(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT id, name FROM artists WHERE name LIKE ?1 LIMIT ?2")?;
+            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0)?,
                     "name": row.get::<_, Option<String>>(1)?,
                 }))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
-
-    drop(conn);
 
     json!({
         "tracks": tracks,
@@ -311,7 +308,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
 }
 
 /// Return the GraphQL schema as SDL text.
-async fn graphql_schema() -> impl IntoResponse {
+async fn graphql_schema() -> impl axum::response::IntoResponse {
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -323,14 +320,14 @@ async fn graphql_schema() -> impl IntoResponse {
 
 /// Return an HTML page for GraphiQL playground.
 async fn graphql_playground() -> Html<String> {
-    Html(format!(
+    Html(
         r#"<!DOCTYPE html>
 <html>
 <head>
   <title>Tune GraphQL Playground</title>
   <style>
-    body {{ margin: 0; height: 100vh; }}
-    #graphiql {{ height: 100vh; }}
+    body { margin: 0; height: 100vh; }
+    #graphiql { height: 100vh; }
   </style>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -340,14 +337,15 @@ async fn graphql_playground() -> Html<String> {
 <body>
   <div id="graphiql"></div>
   <script>
-    const fetcher = GraphiQL.createFetcher({{ url: '/api/v1/graphql/' }});
+    const fetcher = GraphiQL.createFetcher({ url: '/api/v1/graphql/' });
     ReactDOM.createRoot(document.getElementById('graphiql')).render(
-      React.createElement(GraphiQL, {{ fetcher }})
+      React.createElement(GraphiQL, { fetcher })
     );
   </script>
 </body>
 </html>"#
-    ))
+            .to_string(),
+    )
 }
 
 /// Extract a string argument from a GraphQL-like query string.
@@ -357,12 +355,11 @@ fn extract_string_arg(query: &str, arg_name: &str) -> Option<String> {
     let idx = query.find(&pattern)?;
     let rest = &query[idx + pattern.len()..];
     let rest = rest.trim_start();
-    if rest.starts_with('"') {
-        let inner = &rest[1..];
+    if let Some(inner) = rest.strip_prefix('"') {
         let end = inner.find('"')?;
         Some(inner[..end].to_string())
     } else {
-        // Variable reference like $q — not supported in this simple parser
+        // Variable reference like $q -- not supported in this simple parser
         None
     }
 }

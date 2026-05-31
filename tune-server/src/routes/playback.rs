@@ -11,6 +11,7 @@ use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
@@ -835,8 +836,8 @@ async fn transfer_playback(
     }
 }
 
-async fn get_alarms(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn get_alarms(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds FROM alarms WHERE zone_id = ? ORDER BY time")
         .and_then(|mut stmt| {
@@ -853,11 +854,11 @@ async fn get_alarms(State(state): State<AppState>, Path(zone_id): Path<i64>) -> 
                     "fade_in_seconds": row.get::<_, Option<i32>>(8).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 #[derive(Deserialize)]

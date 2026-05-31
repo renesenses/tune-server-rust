@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -44,9 +45,9 @@ async fn mqa_status(State(state): State<AppState>) -> Json<Value> {
 ///
 /// MQA embeds data in the least significant bits of a FLAC/WAV file.
 /// Detection looks for specific bit patterns in the audio stream.
-async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) -> impl IntoResponse {
+async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) -> Result<impl IntoResponse, AppError> {
     let track = {
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         conn.prepare("SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?1")
             .and_then(|mut stmt| {
                 stmt.query_row([track_id], |row| {
@@ -63,23 +64,23 @@ async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) ->
     let (path, format, sample_rate, bit_depth) = match track {
         Ok(t) => t,
         Err(_) => {
-            return (
+            return Ok((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "track not found"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
     let path = match path {
         Some(p) => p,
         None => {
-            return Json(json!({
+            return Ok(Json(json!({
                 "track_id": track_id,
                 "mqa_detected": false,
                 "error": "no file path for this track",
             }))
-            .into_response();
+            .into_response());
         }
     };
 
@@ -92,7 +93,7 @@ async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) ->
         (format_str.contains("flac") || format_str.contains("wav")) && bit_depth.unwrap_or(0) >= 24;
 
     if !is_candidate {
-        return Json(json!({
+        return Ok(Json(json!({
             "track_id": track_id,
             "path": path,
             "format": format,
@@ -101,7 +102,7 @@ async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) ->
             "mqa_detected": false,
             "reason": "Not a candidate — MQA requires 24-bit FLAC/WAV",
         }))
-        .into_response();
+        .into_response());
     }
 
     // Attempt to read the file and check for MQA magic bytes.
@@ -110,7 +111,7 @@ async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) ->
     // MQA sync word pattern. For now, we do a best-effort check.
     let mqa_result = check_mqa_signaling(&path).await;
 
-    Json(json!({
+    Ok(Json(json!({
         "track_id": track_id,
         "path": path,
         "format": format,
@@ -121,7 +122,7 @@ async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) ->
         "mqa_studio": mqa_result.is_studio,
         "analysis": mqa_result.analysis,
     }))
-    .into_response()
+    .into_response())
 }
 
 struct MqaResult {

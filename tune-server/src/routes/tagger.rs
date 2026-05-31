@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -36,9 +37,9 @@ struct BatchFields {
     album_artist: Option<String>,
 }
 
-fn get_track_path(state: &AppState, track_id: i64) -> Option<(String, Value)> {
-    let conn = state.db.connection().lock().unwrap();
-    conn.prepare(
+fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Value)>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn.prepare(
         "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1",
     )
     .ok()
@@ -57,7 +58,7 @@ fn get_track_path(state: &AppState, track_id: i64) -> Option<(String, Value)> {
             Ok((path, info))
         })
         .ok()
-    })
+    }))
 }
 
 fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, String> {
@@ -111,21 +112,20 @@ fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, S
 async fn batch_edit_tags(
     State(state): State<AppState>,
     Json(body): Json<BatchEditRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut results: Vec<Value> = Vec::new();
     let mut success_count = 0;
     let mut error_count = 0;
 
     for track_id in &body.track_ids {
-        let Some((path, info)) = get_track_path(&state, *track_id) else {
+        let Some((path, info)) = get_track_path(&state, *track_id)? else {
             results.push(json!({"track_id": track_id, "error": "Track not found"}));
             error_count += 1;
             continue;
         };
         match apply_tags_to_file(&path, &body.fields) {
             Ok(changes) => {
-                // Update DB
-                update_track_db(&state, *track_id, &body.fields);
+                update_track_db(&state, *track_id, &body.fields)?;
                 results.push(json!({
                     "track_id": track_id,
                     "path": info["path"],
@@ -141,17 +141,17 @@ async fn batch_edit_tags(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "total": body.track_ids.len(),
         "success": success_count,
         "errors": error_count,
         "results": results,
     }))
-    .into_response()
+    .into_response())
 }
 
-fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) {
-    let conn = state.db.connection().lock().unwrap();
+fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Result<(), AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     if let Some(title) = &fields.title {
         conn.execute(
             "UPDATE tracks SET title = ?1 WHERE id = ?2",
@@ -187,16 +187,17 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) {
         )
         .ok();
     }
+    Ok(())
 }
 
 async fn preview_batch_edit(
     State(state): State<AppState>,
     Json(body): Json<BatchEditRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut previews: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let Some((_path, info)) = get_track_path(&state, *track_id) else {
+        let Some((_path, info)) = get_track_path(&state, *track_id)? else {
             previews.push(json!({"track_id": track_id, "error": "Track not found"}));
             continue;
         };
@@ -223,36 +224,36 @@ async fn preview_batch_edit(
         }));
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "dry_run": true,
         "total": body.track_ids.len(),
         "previews": previews,
     }))
-    .into_response()
+    .into_response())
 }
 
 async fn auto_number_album(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let tracks: Vec<(i64, String, Option<String>)> = conn
         .prepare("SELECT id, path, title FROM tracks WHERE album_id = ?1 ORDER BY path ASC")
         .and_then(|mut stmt| {
             stmt.query_map([album_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
     if tracks.is_empty() {
-        return (
+        return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Album not found or has no tracks"})),
         )
-            .into_response();
+            .into_response());
     }
 
     let mut results: Vec<Value> = Vec::new();
@@ -271,8 +272,7 @@ async fn auto_number_album(
             Ok(())
         })();
 
-        // Update DB
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         conn.execute(
             "UPDATE tracks SET track_number = ?1 WHERE id = ?2",
             rusqlite::params![track_num, track_id],
@@ -289,12 +289,12 @@ async fn auto_number_album(
         }));
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "album_id": album_id,
         "tracks_numbered": results.len(),
         "results": results,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -306,13 +306,13 @@ async fn set_album_genre(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
     Json(body): Json<SetGenreBody>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<(i64, String)> = conn
         .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
         .and_then(|mut stmt| {
             stmt.query_map([album_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     // Update DB for all tracks
@@ -341,13 +341,13 @@ async fn set_album_genre(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "album_id": album_id,
         "genre": body.genre,
         "tracks_updated": paths.len(),
         "file_errors": file_errors,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -359,13 +359,13 @@ async fn set_album_year(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
     Json(body): Json<SetYearBody>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<(i64, String)> = conn
         .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
         .and_then(|mut stmt| {
             stmt.query_map([album_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     conn.execute(
@@ -396,13 +396,13 @@ async fn set_album_year(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "album_id": album_id,
         "year": body.year,
         "tracks_updated": paths.len(),
         "file_errors": file_errors,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -416,12 +416,12 @@ struct RenamePatternBody {
 async fn rename_by_pattern(
     State(state): State<AppState>,
     Json(body): Json<RenamePatternBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let dry_run = body.dry_run.unwrap_or(false);
     let mut results: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         let track_info: Option<(String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = conn
             .prepare("SELECT path, title, artist_name, album_title, track_number, year FROM tracks WHERE id = ?1")
             .ok()
@@ -472,7 +472,7 @@ async fn rename_by_pattern(
         } else if path != new_path {
             match std::fs::rename(&path, &new_path) {
                 Ok(()) => {
-                    let conn = state.db.connection().lock().unwrap();
+                    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
                     conn.execute(
                         "UPDATE tracks SET path = ?1 WHERE id = ?2",
                         rusqlite::params![new_path, track_id],
@@ -504,12 +504,12 @@ async fn rename_by_pattern(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "dry_run": dry_run,
         "total": body.track_ids.len(),
         "results": results,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(Deserialize)]
@@ -520,11 +520,11 @@ struct FixEncodingBody {
 async fn fix_encoding(
     State(state): State<AppState>,
     Json(body): Json<FixEncodingBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut results: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let Some((path, info)) = get_track_path(&state, *track_id) else {
+        let Some((path, info)) = get_track_path(&state, *track_id)? else {
             results.push(json!({"track_id": track_id, "error": "Track not found"}));
             continue;
         };
@@ -573,7 +573,7 @@ async fn fix_encoding(
                 album_artist: None,
             };
             let file_result = apply_tags_to_file(&path, &fields);
-            update_track_db(&state, *track_id, &fields);
+            update_track_db(&state, *track_id, &fields)?;
             results.push(json!({
                 "track_id": track_id,
                 "fixed": true,
@@ -584,11 +584,11 @@ async fn fix_encoding(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "total": body.track_ids.len(),
         "results": results,
     }))
-    .into_response()
+    .into_response())
 }
 
 /// Attempt to fix mojibake: if string contains typical Latin1-as-UTF8 artifacts,
@@ -633,7 +633,7 @@ struct StripTagsBody {
 async fn strip_extra_tags(
     State(state): State<AppState>,
     Json(body): Json<StripTagsBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let keep_set: std::collections::HashSet<String> = body
         .keep
         .unwrap_or_else(|| {
@@ -659,7 +659,7 @@ async fn strip_extra_tags(
     let mut results: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let Some((path, _info)) = get_track_path(&state, *track_id) else {
+        let Some((path, _info)) = get_track_path(&state, *track_id)? else {
             results.push(json!({"track_id": track_id, "error": "Track not found"}));
             continue;
         };
@@ -707,9 +707,9 @@ async fn strip_extra_tags(
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "total": body.track_ids.len(),
         "results": results,
     }))
-    .into_response()
+    .into_response())
 }

@@ -11,6 +11,7 @@ use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -1084,7 +1085,7 @@ struct ExportRequest {
 async fn export_playlists(
     State(state): State<AppState>,
     Json(body): Json<ExportRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let format = body.format.as_deref().unwrap_or("json");
     let playlist_repo = PlaylistRepo::new(state.db.clone());
     let track_repo = TrackRepo::new(state.db.clone());
@@ -1112,11 +1113,11 @@ async fn export_playlists(
         let svc_arc = match registry.get(&body.service) {
             Some(arc) => arc,
             None => {
-                return (
+                return Ok((
                     StatusCode::BAD_REQUEST,
                     Json(json!({"detail": format!("Service '{}' not found", body.service)})),
                 )
-                    .into_response();
+                    .into_response());
             }
         };
         drop(registry);
@@ -1173,9 +1174,9 @@ async fn export_playlists(
             headers.insert(
                 "Content-Disposition",
                 axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                    .unwrap(),
+                    .map_err(|e| AppError::internal(format!("{e}")))?,
             );
-            (StatusCode::OK, headers, csv).into_response()
+            Ok((StatusCode::OK, headers, csv).into_response())
         }
         "xspf" => {
             let mut xspf = String::from(
@@ -1201,12 +1202,11 @@ async fn export_playlists(
             headers.insert(
                 "Content-Disposition",
                 axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                    .unwrap(),
+                    .map_err(|e| AppError::internal(format!("{e}")))?,
             );
-            (StatusCode::OK, headers, xspf).into_response()
+            Ok((StatusCode::OK, headers, xspf).into_response())
         }
         _ => {
-            // Default: JSON
             let content = serde_json::to_string_pretty(&json!({
                 "name": name,
                 "tracks": tracks,
@@ -1223,9 +1223,9 @@ async fn export_playlists(
             headers.insert(
                 "Content-Disposition",
                 axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                    .unwrap(),
+                    .map_err(|e| AppError::internal(format!("{e}")))?,
             );
-            (StatusCode::OK, headers, content).into_response()
+            Ok((StatusCode::OK, headers, content).into_response())
         }
     }
 }

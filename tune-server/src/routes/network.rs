@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -58,8 +59,8 @@ pub fn router() -> Router<AppState> {
         .route("/shares/{id}", get(get_share_detail))
 }
 
-async fn list_mounts(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn list_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts ORDER BY id")
         .and_then(|mut stmt| {
@@ -74,11 +75,11 @@ async fn list_mounts(State(state): State<AppState>) -> Json<Value> {
                     "active": row.get::<_, i32>(6).unwrap_or(1) != 0,
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 async fn create_mount(
@@ -369,8 +370,8 @@ async fn trigger_smb_scan() -> impl IntoResponse {
 }
 
 /// List all stored SMB mounts from the network_mounts table.
-async fn list_smb_mounts(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, server, share, mount_path, username, active \
@@ -387,11 +388,11 @@ async fn list_smb_mounts(State(state): State<AppState>) -> Json<Value> {
                     "active": row.get::<_, i32>(5).unwrap_or(1) != 0,
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 /// Mount an SMB share: execute the OS mount command, then persist in the database.
@@ -570,8 +571,8 @@ async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
     }))
 }
 
-async fn get_share_detail(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+async fn get_share_detail(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts WHERE id = ?",
         rusqlite::params![id],
@@ -589,7 +590,7 @@ async fn get_share_detail(State(state): State<AppState>, Path(id): Path<i64>) ->
     );
     drop(conn);
     match result {
-        Ok(val) => Json(val).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(val) => Ok(Json(val).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }

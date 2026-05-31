@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -33,14 +34,15 @@ fn load_profiles(state: &AppState) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn save_profiles(state: &AppState, profiles: &[Value]) {
+fn save_profiles(state: &AppState, profiles: &[Value]) -> Result<(), AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     settings
         .set(
             "room_cal_profiles",
-            &serde_json::to_string(profiles).unwrap(),
+            &serde_json::to_string(profiles)?,
         )
         .ok();
+    Ok(())
 }
 
 /// Status of room calibration subsystem.
@@ -93,7 +95,7 @@ struct CreateProfileBody {
 async fn create_cal_profile(
     State(state): State<AppState>,
     Json(body): Json<CreateProfileBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut profiles = load_profiles(&state);
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -109,9 +111,9 @@ async fn create_cal_profile(
     });
 
     profiles.push(profile.clone());
-    save_profiles(&state, &profiles);
+    save_profiles(&state, &profiles)?;
 
-    (StatusCode::CREATED, Json(profile)).into_response()
+    Ok((StatusCode::CREATED, Json(profile)).into_response())
 }
 
 /// Get a single calibration profile by ID.
@@ -134,17 +136,13 @@ async fn get_cal_profile(
 async fn delete_cal_profile(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut profiles = load_profiles(&state);
     let before = profiles.len();
     profiles.retain(|p| p["id"].as_str() != Some(&id));
 
     if profiles.len() == before {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "profile not found"})),
-        )
-            .into_response();
+        return Err(AppError::not_found("profile not found"));
     }
 
     save_profiles(&state, &profiles);
@@ -161,7 +159,7 @@ async fn delete_cal_profile(
         settings.delete("room_cal_active_profile").ok();
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Activate a calibration profile for use during playback.
@@ -205,18 +203,14 @@ struct MeasurementRequest {
 async fn start_measurement(
     State(state): State<AppState>,
     Json(body): Json<MeasurementRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let profiles = load_profiles(&state);
     let profile = profiles
         .iter()
         .find(|p| p["id"].as_str() == Some(&body.profile_id));
 
     if profile.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "profile not found"})),
-        )
-            .into_response();
+        return Err(AppError::not_found("profile not found"));
     }
 
     let settings = SettingsRepo::new(state.db.clone());
@@ -231,11 +225,11 @@ async fn start_measurement(
     settings
         .set(
             "room_cal_measurement",
-            &serde_json::to_string(&measurement).unwrap(),
+            &serde_json::to_string(&measurement)?,
         )
         .ok();
 
-    Json(measurement).into_response()
+    Ok(Json(measurement))
 }
 
 /// Get current measurement status.

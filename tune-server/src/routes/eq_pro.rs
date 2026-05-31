@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -36,11 +37,12 @@ fn load_presets(state: &AppState) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn save_presets(state: &AppState, presets: &[Value]) {
+fn save_presets(state: &AppState, presets: &[Value]) -> Result<(), AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     settings
-        .set("eq_presets", &serde_json::to_string(presets).unwrap())
+        .set("eq_presets", &serde_json::to_string(presets)?)
         .ok();
+    Ok(())
 }
 
 /// EQ subsystem status.
@@ -124,7 +126,7 @@ impl EqBand {
 async fn create_preset(
     State(state): State<AppState>,
     Json(body): Json<CreatePresetBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut presets = load_presets(&state);
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -140,9 +142,9 @@ async fn create_preset(
     });
 
     presets.push(preset.clone());
-    save_presets(&state, &presets);
+    save_presets(&state, &presets)?;
 
-    (StatusCode::CREATED, Json(preset)).into_response()
+    Ok((StatusCode::CREATED, Json(preset)).into_response())
 }
 
 /// Get a single preset by ID.
@@ -163,7 +165,7 @@ async fn update_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<CreatePresetBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let mut presets = load_presets(&state);
     let idx = presets.iter().position(|p| p["id"].as_str() == Some(&id));
 
@@ -179,39 +181,39 @@ async fn update_preset(
                 presets[i]["zone_id"] = json!(z);
             }
             let updated = presets[i].clone();
-            save_presets(&state, &presets);
-            Json(updated).into_response()
+            save_presets(&state, &presets)?;
+            Ok(Json(updated).into_response())
         }
-        None => (
+        None => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "preset not found"})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 /// Delete a preset.
-async fn delete_preset(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn delete_preset(State(state): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, AppError> {
     let mut presets = load_presets(&state);
     let before = presets.len();
     presets.retain(|p| p["id"].as_str() != Some(&id));
 
     if presets.len() == before {
-        return (
+        return Ok((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "preset not found"})),
         )
-            .into_response();
+            .into_response());
     }
 
-    save_presets(&state, &presets);
+    save_presets(&state, &presets)?;
 
     let settings = SettingsRepo::new(state.db.clone());
     if settings.get("eq_active_preset").ok().flatten().as_deref() == Some(&id) {
         settings.delete("eq_active_preset").ok();
     }
 
-    StatusCode::NO_CONTENT.into_response()
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Activate a preset for the current or specified zone.
@@ -271,7 +273,7 @@ struct SetBandsBody {
 }
 
 /// Set EQ bands directly (updates active preset or creates a transient one).
-async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>) -> Json<Value> {
+async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
 
@@ -283,23 +285,22 @@ async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>
             .find(|p| p["id"].as_str() == Some(&active_id))
         {
             p["bands"] = json!(&bands_json);
-            save_presets(&state, &presets);
+            save_presets(&state, &presets)?;
         }
     }
 
-    // Also store as current active bands
     settings
         .set(
             "eq_current_bands",
-            &serde_json::to_string(&bands_json).unwrap(),
+            &serde_json::to_string(&bands_json)?,
         )
         .ok();
 
-    Json(json!({
+    Ok(Json(json!({
         "bands": bands_json,
         "count": bands_json.len(),
         "applied": true,
-    }))
+    })))
 }
 
 // --- Advanced EQ routes ---
@@ -331,7 +332,7 @@ struct ParametricBody {
 async fn set_parametric(
     State(state): State<AppState>,
     Json(body): Json<ParametricBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut current: Value = settings
         .get("eq_parametric")
@@ -351,9 +352,9 @@ async fn set_parametric(
     }
 
     settings
-        .set("eq_parametric", &serde_json::to_string(&current).unwrap())
+        .set("eq_parametric", &serde_json::to_string(&current)?)
         .ok();
-    Json(json!({"saved": true, "parametric": current}))
+    Ok(Json(json!({"saved": true, "parametric": current})))
 }
 
 /// Get graphic EQ state (fixed frequency bands).
@@ -393,7 +394,7 @@ struct GraphicBody {
 }
 
 /// Set graphic EQ bands.
-async fn set_graphic(State(state): State<AppState>, Json(body): Json<GraphicBody>) -> Json<Value> {
+async fn set_graphic(State(state): State<AppState>, Json(body): Json<GraphicBody>) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut current: Value = settings
         .get("eq_graphic")
@@ -413,9 +414,9 @@ async fn set_graphic(State(state): State<AppState>, Json(body): Json<GraphicBody
     }
 
     settings
-        .set("eq_graphic", &serde_json::to_string(&current).unwrap())
+        .set("eq_graphic", &serde_json::to_string(&current)?)
         .ok();
-    Json(json!({"saved": true, "graphic": current}))
+    Ok(Json(json!({"saved": true, "graphic": current})))
 }
 
 #[derive(Deserialize)]
@@ -430,7 +431,7 @@ struct RoomCorrectionBody {
 async fn apply_room_correction(
     State(state): State<AppState>,
     Json(body): Json<RoomCorrectionBody>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
 
     let correction = json!({
@@ -444,11 +445,11 @@ async fn apply_room_correction(
     settings
         .set(
             "eq_room_correction",
-            &serde_json::to_string(&correction).unwrap(),
+            &serde_json::to_string(&correction)?,
         )
         .ok();
 
-    Json(correction).into_response()
+    Ok(Json(correction).into_response())
 }
 
 fn epoch_secs() -> u64 {

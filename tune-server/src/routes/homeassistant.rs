@@ -32,17 +32,14 @@ fn ha_settings(state: &AppState) -> (Option<String>, Option<String>) {
 
 async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
     let (url, token) = ha_settings(&state);
-    let configured = url.is_some() && token.is_some();
-    if !configured {
+    let (Some(url), Some(token)) = (url, token) else {
         return Json(json!({
             "configured": false,
             "connected": false,
             "message": "Home Assistant not configured. Set ha_url and ha_token.",
         }))
         .into_response();
-    }
-    let url = url.unwrap();
-    let token = token.unwrap();
+    };
     match state.http_client.get(format!("{url}/api/")).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));

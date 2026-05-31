@@ -9,6 +9,7 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -29,12 +30,12 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Aggregated home page: returns all sections in a single response.
-async fn home_page(State(state): State<AppState>) -> Json<Value> {
-    let continue_items = fetch_continue_listening(&state, 10);
-    let recent_items = fetch_recently_added(&state, 20);
+async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let continue_items = fetch_continue_listening(&state, 10)?;
+    let recent_items = fetch_recently_added(&state, 20)?;
     let top_tracks = fetch_top_tracks(&state, 20);
-    let radios = fetch_radio_picks(&state);
-    let discover = fetch_recommendations(&state, 20);
+    let radios = fetch_radio_picks(&state)?;
+    let discover = fetch_recommendations(&state, 20)?;
 
     let mut sections = Vec::new();
 
@@ -83,7 +84,7 @@ async fn home_page(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
-    Json(json!({ "sections": sections }))
+    Ok(Json(json!({ "sections": sections })))
 }
 
 /// Albums from listen history where the user hasn't finished the album
@@ -91,14 +92,14 @@ async fn home_page(State(state): State<AppState>) -> Json<Value> {
 async fn continue_listening(
     State(state): State<AppState>,
     Query(p): Query<HomeParams>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(10);
-    let items = fetch_continue_listening(&state, limit);
-    Json(json!(items))
+    let items = fetch_continue_listening(&state, limit)?;
+    Ok(Json(json!(items)))
 }
 
-fn fetch_continue_listening(state: &AppState, limit: i64) -> Vec<Value> {
-    let conn = state.db.connection().lock().unwrap();
+fn fetch_continue_listening(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let sql = "\
         SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
@@ -112,9 +113,9 @@ fn fetch_continue_listening(state: &AppState, limit: i64) -> Vec<Value> {
         LIMIT ?";
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
-    stmt.query_map(params![limit], |row| {
+    Ok(stmt.query_map(params![limit], |row| {
         Ok(json!({
             "id": row.get::<_, i64>(0).unwrap_or(0),
             "title": row.get::<_, String>(1).unwrap_or_default(),
@@ -126,20 +127,19 @@ fn fetch_continue_listening(state: &AppState, limit: i64) -> Vec<Value> {
             "track_count": row.get::<_, Option<i32>>(7).unwrap_or(None),
         }))
     })
-    .ok()
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    .unwrap_or_default())
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
-async fn recently_added(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Json<Value> {
+async fn recently_added(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
-    let items = fetch_recently_added(&state, limit);
-    Json(json!(items))
+    let items = fetch_recently_added(&state, limit)?;
+    Ok(Json(json!(items)))
 }
 
-fn fetch_recently_added(state: &AppState, limit: i64) -> Vec<Value> {
-    let conn = state.db.connection().lock().unwrap();
+fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let seven_days_ago = chrono_epoch_seven_days_ago();
     let sql = "\
         SELECT DISTINCT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
@@ -154,9 +154,9 @@ fn fetch_recently_added(state: &AppState, limit: i64) -> Vec<Value> {
         LIMIT ?";
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
-    stmt.query_map(params![seven_days_ago, limit], |row| {
+    Ok(stmt.query_map(params![seven_days_ago, limit], |row| {
         Ok(json!({
             "id": row.get::<_, i64>(0).unwrap_or(0),
             "title": row.get::<_, String>(1).unwrap_or_default(),
@@ -171,9 +171,8 @@ fn fetch_recently_added(state: &AppState, limit: i64) -> Vec<Value> {
             "added_mtime": row.get::<_, Option<f64>>(10).unwrap_or(None),
         }))
     })
-    .ok()
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    .unwrap_or_default())
 }
 
 /// Returns epoch seconds for 7 days ago.
@@ -190,14 +189,14 @@ fn chrono_epoch_seven_days_ago() -> f64 {
 async fn home_recommendations(
     State(state): State<AppState>,
     Query(p): Query<HomeParams>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(20);
-    let items = fetch_recommendations(&state, limit);
-    Json(json!(items))
+    let items = fetch_recommendations(&state, limit)?;
+    Ok(Json(json!(items)))
 }
 
-fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
-    let conn = state.db.connection().lock().unwrap();
+fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Find top genres from listen history
     let top_genres: Vec<String> = conn
@@ -213,8 +212,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 .unwrap_or_default()
         })
         .unwrap_or_default();
@@ -226,9 +224,9 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
                    ORDER BY RANDOM() LIMIT ?";
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return Ok(Vec::new()),
         };
-        return stmt
+        return Ok(stmt
             .query_map(params![limit], |row| {
                 Ok(json!({
                     "id": row.get::<_, i64>(0).unwrap_or(0),
@@ -240,9 +238,8 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
                     "reason": "random",
                 }))
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .unwrap_or_default());
     }
 
     // Find albums matching top genres that the user hasn't listened to
@@ -258,7 +255,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
     };
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = top_genres
         .into_iter()
@@ -268,7 +265,7 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
 
-    stmt.query_map(param_refs.as_slice(), |row| {
+    Ok(stmt.query_map(param_refs.as_slice(), |row| {
         Ok(json!({
             "id": row.get::<_, i64>(0).unwrap_or(0),
             "title": row.get::<_, String>(1).unwrap_or_default(),
@@ -279,15 +276,14 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Vec<Value> {
             "reason": "genre_match",
         }))
     })
-    .ok()
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    .unwrap_or_default())
 }
 
 /// Auto-generated "mixes" by genre from top genres in history.
 /// Each mix = playlist of 20 tracks from that genre.
-async fn top_mixes(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Get top 5 genres from history
     let top_genres: Vec<(String, i64)> = conn
@@ -308,8 +304,7 @@ async fn top_mixes(State(state): State<AppState>) -> Json<Value> {
                     row.get::<_, i64>(1).unwrap_or(0),
                 ))
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .unwrap_or_default()
         })
         .unwrap_or_default();
@@ -338,8 +333,8 @@ async fn top_mixes(State(state): State<AppState>) -> Json<Value> {
                             "cover_path": row.get::<_, Option<String>>(5).unwrap_or(None),
                         }))
                     })
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                     .ok()
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 })
                 .unwrap_or_default();
 
@@ -357,13 +352,13 @@ async fn top_mixes(State(state): State<AppState>) -> Json<Value> {
         })
         .collect();
 
-    Json(json!(mixes))
+    Ok(Json(json!(mixes)))
 }
 
 /// Tracks added in the last scan (newest by file_mtime, recent imports).
-async fn new_in_library(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Json<Value> {
+async fn new_in_library(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(30);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let sql = "\
         SELECT t.id, t.title, ar.name, al.title, t.duration_ms, al.cover_path, \
                t.format, t.sample_rate, t.bit_depth, t.file_mtime \
@@ -391,24 +386,22 @@ async fn new_in_library(State(state): State<AppState>, Query(p): Query<HomeParam
                     "file_mtime": row.get::<_, Option<f64>>(9).unwrap_or(None),
                 }))
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 /// Favorite radios + recently played radios.
-async fn radio_picks(State(state): State<AppState>) -> Json<Value> {
-    let items = fetch_radio_picks(&state);
-    Json(json!(items))
+async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let items = fetch_radio_picks(&state)?;
+    Ok(Json(json!(items)))
 }
 
-fn fetch_radio_picks(state: &AppState) -> Vec<Value> {
+fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
     let repo = RadioRepo::new(state.db.clone());
 
-    // Favorites first
     let mut items: Vec<Value> = repo
         .favorites()
         .unwrap_or_default()
@@ -416,8 +409,7 @@ fn fetch_radio_picks(state: &AppState) -> Vec<Value> {
         .map(|r| json!(r))
         .collect();
 
-    // Then recently played (not already in favorites)
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let recent: Vec<Value> = conn
         .prepare(
             "SELECT id, name, url, logo_url, genre, last_played, play_count \
@@ -439,14 +431,13 @@ fn fetch_radio_picks(state: &AppState) -> Vec<Value> {
                     "is_favorite": false,
                 }))
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .unwrap_or_default()
         })
         .unwrap_or_default();
 
     items.extend(recent);
-    items
+    Ok(items)
 }
 
 fn fetch_top_tracks(state: &AppState, limit: i64) -> Vec<Value> {

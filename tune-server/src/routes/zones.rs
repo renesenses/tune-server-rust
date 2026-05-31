@@ -11,6 +11,7 @@ use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::outputs::dlna::DlnaOutput;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -413,7 +414,7 @@ async fn list_groups(State(state): State<AppState>) -> Json<Value> {
 async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroup>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -430,9 +431,9 @@ async fn create_group(
     }));
 
     settings
-        .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+        .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
-    (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
 }
 
 #[derive(Deserialize)]
@@ -451,7 +452,7 @@ async fn patch_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
     Json(body): Json<PatchGroup>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -473,11 +474,11 @@ async fn patch_group(
             }
             let result = groups[i].clone();
             settings
-                .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+                .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
-            Json(result).into_response()
+            Ok(Json(result).into_response())
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -485,7 +486,7 @@ async fn group_volume(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -511,7 +512,7 @@ async fn group_volume(
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
             settings
-                .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+                .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
 
             let repo = ZoneRepo::new(state.db.clone());
@@ -527,9 +528,9 @@ async fn group_volume(
                 repo.update_volume(*zid, vol_int).ok();
                 state.orchestrator.set_volume(*zid, effective, None).await;
             }
-            Json(json!({"group_id": group_id, "master_volume": master})).into_response()
+            Ok(Json(json!({"group_id": group_id, "master_volume": master})).into_response())
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -636,7 +637,7 @@ async fn group_health(
 async fn delete_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
@@ -647,9 +648,9 @@ async fn delete_group(
 
     groups.retain(|g| g.get("id").and_then(|v| v.as_i64()) != Some(group_id));
     settings
-        .set("zone_groups", &serde_json::to_string(&groups).unwrap())
+        .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_stereo_pairs(State(state): State<AppState>) -> Json<Value> {
@@ -673,7 +674,7 @@ struct CreateStereoPair {
 async fn create_stereo_pair(
     State(state): State<AppState>,
     Json(body): Json<CreateStereoPair>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let mut pairs: Vec<Value> = settings
         .get("stereo_pairs")
@@ -691,15 +692,15 @@ async fn create_stereo_pair(
     }));
 
     settings
-        .set("stereo_pairs", &serde_json::to_string(&pairs).unwrap())
+        .set("stereo_pairs", &serde_json::to_string(&pairs)?)
         .ok();
-    (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
 }
 
 async fn delete_stereo_pair(
     State(state): State<AppState>,
     Path(pair_id): Path<i64>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let mut pairs: Vec<Value> = settings
         .get("stereo_pairs")
@@ -710,7 +711,7 @@ async fn delete_stereo_pair(
 
     pairs.retain(|p| p.get("id").and_then(|v| v.as_i64()) != Some(pair_id));
     settings
-        .set("stereo_pairs", &serde_json::to_string(&pairs).unwrap())
+        .set("stereo_pairs", &serde_json::to_string(&pairs)?)
         .ok();
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }

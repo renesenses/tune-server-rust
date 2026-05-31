@@ -10,6 +10,7 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -267,7 +268,7 @@ async fn update_profile_settings(
 
 async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let result: Result<Vec<(String, i64)>, String> = (|| {
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| format!("{e}"))?;
         let mut stmt = conn
             .prepare(
                 "SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type",
@@ -281,8 +282,8 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 ))
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(rows)
     })();
 

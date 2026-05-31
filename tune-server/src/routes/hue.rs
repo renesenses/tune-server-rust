@@ -37,16 +37,15 @@ fn hue_base_url(bridge_ip: &str, username: &str) -> String {
 
 async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
     let (bridge_ip, username) = hue_settings(&state);
-    let configured = bridge_ip.is_some() && username.is_some();
-    if !configured {
+    let (Some(bridge_ip), Some(username)) = (bridge_ip, username) else {
         return Json(json!({
             "configured": false,
             "connected": false,
             "message": "Hue Bridge not configured. Set hue_bridge_ip and hue_username.",
         }))
         .into_response();
-    }
-    let base = hue_base_url(&bridge_ip.unwrap(), &username.unwrap());
+    };
+    let base = hue_base_url(&bridge_ip, &username);
     let client = &state.http_client;
     match client.get(format!("{base}/config")).send().await {
         Ok(resp) if resp.status().is_success() => {

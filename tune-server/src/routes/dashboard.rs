@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -95,8 +96,8 @@ async fn listening_history(
     Json(json!(items))
 }
 
-async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect raw genre + genres columns from tracks
     let raw: Vec<(Option<String>, Option<String>)> = conn
         .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
@@ -107,7 +108,7 @@ async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
                     row.get::<_, Option<String>>(1).unwrap_or(None),
                 ))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
@@ -145,5 +146,5 @@ async fn genre_breakdown(State(state): State<AppState>) -> Json<Value> {
         .map(|(genre, count)| serde_json::json!({ "genre": genre, "count": count }))
         .collect();
 
-    Json(serde_json::json!(items))
+    Ok(Json(serde_json::json!(items)))
 }

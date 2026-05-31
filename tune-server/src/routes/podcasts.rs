@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -38,8 +39,8 @@ async fn search_podcasts(Query(q): Query<SearchQuery>) -> Json<Value> {
     }))
 }
 
-async fn list_subscriptions(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, feed_url, title, author, image_url, description FROM podcast_subscriptions ORDER BY title")
         .and_then(|mut stmt| {
@@ -53,11 +54,11 @@ async fn list_subscriptions(State(state): State<AppState>) -> Json<Value> {
                     "description": row.get::<_, Option<String>>(5).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 async fn subscribe(
@@ -103,10 +104,10 @@ async fn radiofrance_podcasts() -> Json<Value> {
 async fn podcast_episodes(
     State(state): State<AppState>,
     Path(podcast_id): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     // Try to find feed URL from subscriptions (by ID first, then by title slug)
     let feed_url = {
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         if let Ok(id) = podcast_id.parse::<i64>() {
             conn.query_row(
                 "SELECT feed_url FROM podcast_subscriptions WHERE id = ?",
@@ -125,33 +126,31 @@ async fn podcast_episodes(
     };
 
     let Some(feed_url) = feed_url else {
-        return Json(json!({
+        return Ok(Json(json!({
             "podcast_id": podcast_id,
             "episodes": [],
             "error": "podcast not found in subscriptions"
         }))
-        .into_response();
+        .into_response());
     };
 
-    // Fetch RSS feed
     let xml = match state.http_client.get(&feed_url).send().await {
         Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
         _ => {
-            return Json(json!({"error": "failed to fetch RSS feed"})).into_response();
+            return Ok(Json(json!({"error": "failed to fetch RSS feed"})).into_response());
         }
     };
 
-    // Parse RSS XML using quick-xml
     let episodes = parse_rss_episodes(&xml);
     let count = episodes.len();
 
-    Json(json!({
+    Ok(Json(json!({
         "podcast_id": podcast_id,
         "feed_url": feed_url,
         "episodes": episodes,
         "count": count,
     }))
-    .into_response()
+    .into_response())
 }
 
 fn parse_rss_episodes(xml: &str) -> Vec<Value> {

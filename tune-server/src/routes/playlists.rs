@@ -13,6 +13,8 @@ use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::error::AppError;
+
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -226,11 +228,11 @@ async fn duplicate_playlist(
         .into_response()
 }
 
-async fn export_m3u(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn export_m3u(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
     let repo = PlaylistRepo::new(state.db.clone());
     let playlist = match repo.get(id) {
         Ok(Some(p)) => p,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return Err(AppError::not_found("playlist not found")),
     };
 
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
@@ -260,10 +262,11 @@ async fn export_m3u(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
     );
     headers.insert(
         "Content-Disposition",
-        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|e| AppError::internal(e.to_string()))?,
     );
 
-    (axum::http::StatusCode::OK, headers, m3u).into_response()
+    Ok((axum::http::StatusCode::OK, headers, m3u))
 }
 
 async fn import_m3u_file(

@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -49,8 +50,8 @@ pub fn router() -> Router<AppState> {
         .route("/preview", post(preview_smart_collection))
 }
 
-async fn list_smart_playlists(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists ORDER BY name")
         .and_then(|mut stmt| {
@@ -67,23 +68,23 @@ async fn list_smart_playlists(State(state): State<AppState>) -> Json<Value> {
                     "created_at": row.get::<_, Option<String>>(6).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 async fn create_smart_playlist(
     State(state): State<AppState>,
     Json(body): Json<CreateSmartPlaylist>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let rules_json = body.rules.to_string();
     let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
     let result = {
-        let conn = state.db.connection().lock().unwrap();
+        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
         conn.execute(
             "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)",
             rusqlite::params![body.name, rules_json, sort_by, sort_order, body.max_tracks],
@@ -102,17 +103,17 @@ async fn create_smart_playlist(
                 "sort_order": sort_order,
                 "max_tracks": body.max_tracks,
             });
-            (StatusCode::CREATED, Json(created)).into_response()
+            Ok((StatusCode::CREATED, Json(created)).into_response())
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => Err(AppError::internal(e)),
     }
 }
 
 async fn get_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?",
         rusqlite::params![id],
@@ -133,8 +134,8 @@ async fn get_smart_playlist(
     drop(conn);
 
     match result {
-        Ok(v) => Json(v).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -285,7 +286,7 @@ fn execute_smart_track_query(
     where_clause: &str,
     order: &str,
     limit_clause: &str,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, AppError> {
     let needs_play_count = order.contains("play_count");
     let play_count_join = if needs_play_count {
         "LEFT JOIN (SELECT track_id, COUNT(*) AS play_count FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id) lh ON t.id = lh.track_id"
@@ -307,8 +308,8 @@ fn execute_smart_track_query(
         play_count_join, where_clause, order, limit_clause
     );
 
-    let conn = state.db.connection().lock().unwrap();
-    conn.prepare(&sql)
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn.prepare(&sql)
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
                 Ok(json!({
@@ -324,15 +325,15 @@ fn execute_smart_track_query(
                     "album_cover": row.get::<_, Option<String>>(9).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
-fn load_smart_criteria(state: &AppState, id: i64) -> Option<(String, String, String, Option<i64>)> {
-    let conn = state.db.connection().lock().unwrap();
-    conn.query_row(
+fn load_smart_criteria(state: &AppState, id: i64) -> Result<Option<(String, String, String, Option<i64>)>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn.query_row(
         "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
         rusqlite::params![id],
         |row| {
@@ -344,34 +345,34 @@ fn load_smart_criteria(state: &AppState, id: i64) -> Option<(String, String, Str
             ))
         },
     )
-    .ok()
+    .ok())
 }
 
-async fn resolve_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)
+async fn resolve_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)?
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let (where_clause, order, limit_clause) =
         build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
-    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
+    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
-    Json(json!(items)).into_response()
+    Ok(Json(json!(items)).into_response())
 }
 
 async fn smart_collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
-    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)
+) -> Result<impl IntoResponse, AppError> {
+    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)?
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let (where_clause, order, limit_clause) =
         build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
-    let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
+    let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     // Group tracks by album_id, dedup albums
     let mut seen = std::collections::HashSet::new();
@@ -390,20 +391,20 @@ async fn smart_collection_albums(
         }
     }
 
-    Json(json!({"albums": albums, "total": albums.len()})).into_response()
+    Ok(Json(json!({"albums": albums, "total": albums.len()})).into_response())
 }
 
 async fn preview_smart_collection(
     State(state): State<AppState>,
     Json(body): Json<PreviewRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<Value>, AppError> {
     let rules_json = body.rules.to_string();
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
     let (where_clause, order, limit_clause) =
         build_smart_query(&rules_json, sort_by, sort_order, body.max_tracks);
-    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause);
+    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
-    Json(json!({"tracks": items, "total": items.len()}))
+    Ok(Json(json!({"tracks": items, "total": items.len()})))
 }

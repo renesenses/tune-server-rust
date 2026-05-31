@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -169,7 +170,7 @@ struct RipRequest {
 async fn start_rip(
     State(state): State<AppState>,
     Json(body): Json<RipRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
 
     let output_dir = body
@@ -194,19 +195,17 @@ async fn start_rip(
     settings
         .set(
             "cd_rip_current",
-            &serde_json::to_string(&rip_state).unwrap(),
+            &serde_json::to_string(&rip_state)?,
         )
         .ok();
 
-    // In production, this would spawn a background tokio task running cdparanoia.
-    // For now, we store the intent and let the client poll rip_status.
-    Json(json!({
+    Ok(Json(json!({
         "id": rip_id,
         "status": "started",
         "output_dir": output_dir,
         "format": format,
         "message": "CD rip task queued. Poll /rip/status for progress.",
-    }))
+    })))
 }
 
 /// Get current rip progress.
@@ -228,24 +227,24 @@ async fn rip_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// Cancel a running rip task.
-async fn cancel_rip(State(state): State<AppState>) -> Json<Value> {
+async fn cancel_rip(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     if let Some(current) = settings.get("cd_rip_current").ok().flatten() {
         if let Ok(mut rip) = serde_json::from_str::<Value>(&current) {
             rip["status"] = json!("cancelled");
             settings
-                .set("cd_rip_current", &serde_json::to_string(&rip).unwrap())
+                .set("cd_rip_current", &serde_json::to_string(&rip)?)
                 .ok();
-            return Json(json!({
+            return Ok(Json(json!({
                 "status": "cancelled",
                 "message": "Rip task cancelled",
-            }));
+            })));
         }
     }
-    Json(json!({
+    Ok(Json(json!({
         "status": "idle",
         "message": "No rip in progress to cancel",
-    }))
+    })))
 }
 
 fn chrono_now() -> String {

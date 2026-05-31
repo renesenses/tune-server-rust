@@ -141,7 +141,7 @@ fn save_to_history(state: &AppState, result: &Value) {
         history = history.split_off(history.len() - 100);
     }
 
-    settings
-        .set("shazam_history", &serde_json::to_string(&history).unwrap())
-        .ok();
+    if let Ok(serialized) = serde_json::to_string(&history) {
+        settings.set("shazam_history", &serialized).ok();
+    }
 }

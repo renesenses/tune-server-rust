@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -62,10 +63,10 @@ struct KioskConfigBody {
 async fn set_kiosk_config(
     State(state): State<AppState>,
     Json(body): Json<KioskConfigBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut config = load_kiosk_settings(&state);
-    let obj = config.as_object_mut().unwrap();
+    let obj = config.as_object_mut().ok_or_else(|| AppError::internal("kiosk config is not a JSON object"))?;
 
     if let Some(v) = body.enabled {
         obj.insert("enabled".into(), json!(v));
@@ -90,9 +91,9 @@ async fn set_kiosk_config(
     }
 
     settings
-        .set("kiosk_config", &serde_json::to_string(&config).unwrap())
+        .set("kiosk_config", &serde_json::to_string(&config)?)
         .ok();
-    Json(json!({"saved": true, "config": config}))
+    Ok(Json(json!({"saved": true, "config": config})))
 }
 
 #[derive(Deserialize)]
@@ -165,9 +166,9 @@ struct ScreensaverParams {
 async fn kiosk_screensaver(
     State(state): State<AppState>,
     Query(params): Query<ScreensaverParams>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let limit = params.limit.unwrap_or(20);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Get random albums with artwork
     let albums: Vec<Value> = conn
@@ -185,13 +186,13 @@ async fn kiosk_screensaver(
                     "cover_path": row.get::<_, Option<String>>(3)?,
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
-    Json(json!({
+    Ok(Json(json!({
         "albums": albums,
         "total": albums.len(),
-    }))
+    })))
 }

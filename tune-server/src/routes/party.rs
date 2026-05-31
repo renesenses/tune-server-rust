@@ -29,9 +29,9 @@ fn load_queue(settings: &SettingsRepo) -> Vec<Value> {
 }
 
 fn save_queue(settings: &SettingsRepo, queue: &[Value]) {
-    settings
-        .set("party_queue", &serde_json::to_string(queue).unwrap())
-        .ok();
+    if let Ok(serialized) = serde_json::to_string(queue) {
+        settings.set("party_queue", &serialized).ok();
+    }
 }
 
 async fn party_status(State(state): State<AppState>) -> Json<Value> {

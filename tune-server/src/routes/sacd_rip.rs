@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -72,7 +73,7 @@ struct SacdRipRequest {
 async fn start_sacd_rip(
     State(state): State<AppState>,
     Json(body): Json<SacdRipRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
 
     let output_dir = body
@@ -97,11 +98,11 @@ async fn start_sacd_rip(
     settings
         .set(
             "sacd_rip_current",
-            &serde_json::to_string(&rip_state).unwrap(),
+            &serde_json::to_string(&rip_state)?,
         )
         .ok();
 
-    Json(rip_state)
+    Ok(Json(rip_state))
 }
 
 /// Get current SACD rip status.

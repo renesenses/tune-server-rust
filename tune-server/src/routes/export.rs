@@ -8,6 +8,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -86,7 +87,7 @@ async fn export_artists_csv(State(state): State<AppState>) -> impl IntoResponse 
     csv_response(csv, "artists.csv")
 }
 
-fn csv_response(csv: String, filename: &str) -> impl IntoResponse {
+fn csv_response(csv: String, filename: &str) -> Result<impl IntoResponse, AppError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
@@ -94,9 +95,10 @@ fn csv_response(csv: String, filename: &str) -> impl IntoResponse {
     );
     headers.insert(
         "Content-Disposition",
-        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|e| AppError::internal(e.to_string()))?,
     );
-    (StatusCode::OK, headers, csv)
+    Ok((StatusCode::OK, headers, csv))
 }
 
 fn csv_escape(s: &str) -> String {

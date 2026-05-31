@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use tune_core::playback::NowPlaying;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -288,10 +289,10 @@ struct RadioFavPagination {
 async fn list_radio_favorites(
     State(state): State<AppState>,
     Query(q): Query<RadioFavPagination>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?")
         .and_then(|mut stmt| {
@@ -306,20 +307,20 @@ async fn list_radio_favorites(
                     "saved_at": row.get::<_, Option<String>>(6).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
-async fn radio_favorites_count(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn radio_favorites_count(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM radio_favorites", [], |row| row.get(0))
         .unwrap_or(0);
     drop(conn);
-    Json(json!({ "count": count }))
+    Ok(Json(json!({ "count": count })))
 }
 
 #[derive(Deserialize)]
@@ -331,9 +332,9 @@ struct IsFavoriteQuery {
 async fn is_radio_favorite(
     State(state): State<AppState>,
     Query(q): Query<IsFavoriteQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let artist = q.artist.unwrap_or_default();
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?)",
@@ -342,7 +343,7 @@ async fn is_radio_favorite(
         )
         .unwrap_or(false);
     drop(conn);
-    Json(json!({ "is_favorite": exists }))
+    Ok(Json(json!({ "is_favorite": exists })))
 }
 
 #[derive(Deserialize)]
@@ -444,8 +445,8 @@ struct CreatePlaylistFromFavBody {
 async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
-) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let favorites: Vec<(String, String)> = conn
         .prepare("SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC")
         .and_then(|mut stmt| {
@@ -455,17 +456,17 @@ async fn create_playlist_from_favorites(
                     row.get::<_, String>(1).unwrap_or_default(),
                 ))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
 
     if favorites.is_empty() {
-        return (
+        return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no favorites to create playlist from"})),
         )
-            .into_response();
+            .into_response());
     }
 
     let name = body
@@ -477,7 +478,7 @@ async fn create_playlist_from_favorites(
     let playlist_id = match repo.create(&name, None) {
         Ok(id) => id,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response());
         }
     };
 
@@ -498,7 +499,7 @@ async fn create_playlist_from_favorites(
         }
     }
 
-    (
+    Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": playlist_id,
@@ -507,7 +508,7 @@ async fn create_playlist_from_favorites(
             "matched_tracks": matched,
         })),
     )
-        .into_response()
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -524,8 +525,8 @@ pub fn alarms_router() -> Router<AppState> {
         .route("/{id}/snooze", post(snooze_alarm))
 }
 
-async fn list_alarms(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.db.connection().lock().unwrap();
+async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time"
@@ -551,11 +552,11 @@ async fn list_alarms(State(state): State<AppState>) -> Json<Value> {
                     "fade_in_seconds": row.get::<_, Option<i32>>(15).ok().flatten(),
                 }))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
         .unwrap_or_default();
     drop(conn);
-    Json(json!(items))
+    Ok(Json(json!(items)))
 }
 
 #[derive(Deserialize)]
@@ -634,7 +635,7 @@ async fn update_alarm(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateAlarm>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     // Build SET clause dynamically from provided fields
     let mut sets: Vec<String> = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::types::ToSql + Send>> = Vec::new();
@@ -693,7 +694,7 @@ async fn update_alarm(
     }
 
     if sets.is_empty() {
-        return (StatusCode::BAD_REQUEST, "no fields to update").into_response();
+        return Ok((StatusCode::BAD_REQUEST, "no fields to update").into_response());
     }
 
     let sql = format!("UPDATE alarms SET {} WHERE id = ?", sets.join(", "));
@@ -703,19 +704,19 @@ async fn update_alarm(
         .iter()
         .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql)
         .collect();
-    let conn = state.db.connection().lock().unwrap();
+    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
             drop(conn);
-            StatusCode::NOT_FOUND.into_response()
+            Ok(StatusCode::NOT_FOUND.into_response())
         }
         Ok(_) => {
             drop(conn);
-            Json(json!({ "id": id, "updated": true })).into_response()
+            Ok(Json(json!({ "id": id, "updated": true })).into_response())
         }
         Err(e) => {
             drop(conn);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
         }
     }
 }
