@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tracing::info;
 
 use crate::db::sqlite::SqliteDb;
 

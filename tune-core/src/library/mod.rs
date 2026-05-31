@@ -1,0 +1,11 @@
+pub mod artwork;
+pub mod cover_fetcher;
+pub mod duplicate_detector;
+pub mod export;
+pub mod full_text_search;
+pub mod genre_tree;
+pub mod importer;
+pub mod m3u_parser;
+pub mod smart_collections;
+pub mod track_matcher;
+pub mod watcher;

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use md5::{Digest, Md5};
-use tracing::{debug, info};
+use tracing::info;
 
 const CAA_URL: &str = "https://coverartarchive.org/release";
 const DISCOGS_API: &str = "https://api.discogs.com";
