@@ -54,6 +54,7 @@ pub struct ResolvedQueueItem {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub cover_url: Option<String>,
+    pub duration_ms: Option<u64>,
 }
 
 impl PlaybackOrchestrator {
@@ -99,6 +100,7 @@ impl PlaybackOrchestrator {
                 artist: artist.as_deref(),
                 album: req.album_title.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
+                duration_ms: duration_ms.map(|d| d as u64),
             };
             self.send_to_output(device_id, &media).await
         } else {
@@ -901,6 +903,7 @@ impl PlaybackOrchestrator {
             artist,
             album,
             cover_url: Self::resolve_cover_url(raw_cover.as_deref()),
+            duration_ms: None,
         })
     }
 }

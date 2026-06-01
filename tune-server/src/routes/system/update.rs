@@ -114,6 +114,89 @@ pub(super) async fn changelog() -> Json<Value> {
         "version": tune_core::version(),
         "entries": [
             {
+                "version": "0.8.15",
+                "date": "2026-06-01",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Zones = 0 dans le dashboard — compteur corrigé (DB au lieu de mémoire)",
+                        "Gapless DLNA — triple fix : faux positifs DMP-A6, cooldown anti-restart, parse_time sub-seconde",
+                        "WAV Content-Length — les renderers DLNA n'ont plus besoin de prober la taille du stream",
+                        "19 erreurs DB silencieuses remplacées par propagation correcte",
+                        "Schéma ZoneManager divergent corrigé (online vs enabled, volume type)",
+                    ]},
+                    { "title": "Nouveautés", "items": [
+                        "Crédits Now Playing — compositeur, chef d'orchestre, interprètes dans /zones/status",
+                        "Windows crash log — tune-crash.log écrit en cas de panic",
+                        "MockOutput — infrastructure de test pour simuler des renderers",
+                    ]},
+                    { "title": "Qualité", "items": [
+                        "119 warnings clippy corrigés",
+                        "Code mort supprimé (ZoneManager, -362 LOC)",
+                        "43 nouveaux tests (total : 862)",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.12",
+                "date": "2026-06-01",
+                "sections": [
+                    { "title": "Nouveautés", "items": [
+                        "Multichannel — détection et affichage du nombre de canaux",
+                        "Spotify Connect — écoute et contrôle depuis Tune",
+                        "Refactoring majeur — system.rs et library.rs splitté en modules",
+                        "main.rs réduit de 1166 à 140 lignes",
+                        "AppError standardisé sur toutes les routes",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.11",
+                "date": "2026-05-31",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "DLNA cover art — pochettes transmises aux renderers",
+                        "WAV skip fix — détection fin de piste corrigée",
+                        "Artistes orphelins — nettoyage automatique",
+                        "SMB Windows — découverte réseau améliorée",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.10",
+                "date": "2026-05-30",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "SSDP Lindemann — support renderers exotiques",
+                        "OAAT fix — transport et découverte mDNS stabilisés",
+                        "SMB discovery — scan réseau fiable",
+                        "AIFF — détection fin de fichier correcte",
+                        "Logs — endpoint /system/logs fonctionnel",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.8",
+                "date": "2026-05-30",
+                "sections": [
+                    { "title": "Nouveautés", "items": [
+                        "Scanner progressif — progression temps réel via WebSocket",
+                        "Logs locaux — stockage et consultation depuis l'interface",
+                        "Discogs token — enrichissement métadonnées via .env",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.7",
+                "date": "2026-05-30",
+                "sections": [
+                    { "title": "Nouveautés", "items": [
+                        "OAAT intégré — crates.io, streaming bit-perfect multi-room",
+                        "Smart playlists — création et exécution",
+                        "Changelog intégré — visible dans l'interface web",
+                    ]},
+                ]
+            },
+            {
                 "version": "0.8.6",
                 "date": "2026-05-29",
                 "sections": [

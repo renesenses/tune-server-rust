@@ -391,6 +391,41 @@ async fn diagnostics_returns_ok() {
     assert!(body["cpu_count"].as_u64().unwrap() > 0);
 }
 
+#[tokio::test]
+async fn telemetry_snapshot_default_disabled() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/telemetry").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    assert!(body["payload"]["version"].is_string());
+    assert!(body["payload"]["os"].is_string());
+    assert!(body["payload"]["tracks"].is_number());
+    assert!(body["payload"]["zones"].is_number());
+}
+
+#[tokio::test]
+async fn telemetry_toggle() {
+    let app = make_app();
+
+    let (status, body) = post_json(&app, "/api/v1/system/telemetry", json!({"enabled": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], true);
+
+    let (_, body) = get(&app, "/api/v1/system/telemetry").await;
+    assert_eq!(body["enabled"], true);
+}
+
+#[tokio::test]
+async fn changelog_has_entries() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/changelog").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["version"].is_string());
+    let entries = body["entries"].as_array().unwrap();
+    assert!(entries.len() >= 5, "changelog should have at least 5 versions");
+    assert_eq!(entries[0]["version"], "0.8.15");
+}
+
 // ── Playback e2e tests with MockOutput ──────────────────────────────
 
 #[tokio::test]

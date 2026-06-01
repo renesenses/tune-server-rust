@@ -343,3 +343,47 @@ fn which_cmd(name: &str) -> Option<String> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
+
+/// Anonymous telemetry snapshot — returns what would be sent if telemetry
+/// is enabled. No data leaves the server unless the user explicitly opts in.
+pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db.clone());
+    let enabled = settings
+        .get("telemetry_enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true");
+    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
+    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
+    let zone_count = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+        .count()
+        .unwrap_or(0);
+    let uptime = state.started_at.elapsed().as_secs();
+
+    Json(json!({
+        "enabled": enabled,
+        "payload": {
+            "version": tune_core::version(),
+            "engine": "rust",
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "uptime_seconds": uptime,
+            "tracks": tracks,
+            "albums": albums,
+            "artists": artists,
+            "zones": zone_count,
+        }
+    }))
+}
+
+pub(super) async fn telemetry_toggle(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let enabled = body["enabled"].as_bool().unwrap_or(false);
+    let settings = SettingsRepo::new(state.db);
+    let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
+    Json(json!({ "enabled": enabled }))
+}

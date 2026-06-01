@@ -44,6 +44,7 @@ pub struct PlayMedia<'a> {
     pub artist: Option<&'a str>,
     pub album: Option<&'a str>,
     pub cover_url: Option<&'a str>,
+    pub duration_ms: Option<u64>,
 }
 
 #[async_trait::async_trait]

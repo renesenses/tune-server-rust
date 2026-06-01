@@ -102,6 +102,10 @@ pub fn router() -> Router<AppState> {
         .route("/update/status", get(update::update_status))
         .route("/bug-report", get(diagnostics::generate_bug_report))
         .route("/audio-check", get(diagnostics::audio_check))
+        .route(
+            "/telemetry",
+            get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),
+        )
         .route("/enrich", post(enrich::system_enrich))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))

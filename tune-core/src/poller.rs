@@ -418,6 +418,7 @@ impl PositionPoller {
                         artist: resolved.artist.as_deref(),
                         album: resolved.album.as_deref(),
                         cover_url: resolved.cover_url.as_deref(),
+                        duration_ms: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");
