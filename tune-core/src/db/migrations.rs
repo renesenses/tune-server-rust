@@ -355,6 +355,11 @@ INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tra
         name: "add_waveform_column",
         up: "",
     },
+    Migration {
+        version: 21,
+        name: "add_acoustid_columns",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -580,6 +585,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 20 {
             add_column_if_missing(db, "tracks", "waveform_json", "TEXT");
+        }
+        if migration.version == 21 {
+            add_column_if_missing(db, "tracks", "acoustid_fingerprint", "TEXT");
+            add_column_if_missing(db, "tracks", "acoustid_confidence", "REAL");
         }
 
         db.execute(

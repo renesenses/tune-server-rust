@@ -195,6 +195,40 @@ impl TrackRepo {
         Ok(())
     }
 
+    pub fn set_acoustid(
+        &self,
+        track_id: i64,
+        fingerprint: &str,
+        confidence: f64,
+    ) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE tracks SET acoustid_fingerprint = ?, acoustid_confidence = ? WHERE id = ?",
+            &[
+                &fingerprint as &dyn rusqlite::types::ToSql,
+                &confidence,
+                &track_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_unidentified(&self, limit: i64) -> Result<Vec<super::models::Track>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_TRACK} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
+                 OR ar.name = 'Unknown Artist' OR ar.name IS NULL) \
+                 AND t.acoustid_fingerprint IS NULL \
+                 AND t.file_path IS NOT NULL \
+                 ORDER BY t.id LIMIT ?"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![limit], |row| Ok(row_to_track(row)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(

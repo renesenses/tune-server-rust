@@ -230,6 +230,67 @@ pub(super) async fn track_lyrics(
     }
 }
 
+pub(super) async fn identify_track(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<Value>,
+) -> impl IntoResponse {
+    let api_key = match state.config.acoustid_api_key.as_deref() {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"}))).into_response(),
+    };
+    if !tune_core::metadata::fingerprint::fpcalc_available() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "fpcalc not installed"}))).into_response();
+    }
+
+    let track_id = match body["track_id"].as_i64() {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "track_id required"}))).into_response(),
+    };
+
+    let repo = TrackRepo::new(state.db.clone());
+    let track = match repo.get(track_id) {
+        Ok(Some(t)) => t,
+        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response(),
+    };
+
+    let file_path = match track.file_path.as_deref() {
+        Some(p) => p.to_string(),
+        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "track has no file"}))).into_response(),
+    };
+
+    let fp = match tune_core::metadata::fingerprint::generate_fingerprint(&file_path).await {
+        Ok(fp) => fp,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    };
+
+    let matches = tune_core::metadata::fingerprint::lookup_acoustid(&api_key, &fp.fingerprint, fp.duration)
+        .await
+        .unwrap_or_default();
+
+    let best = matches.first();
+    let confidence = best.map(|m| m.score).unwrap_or(0.0);
+
+    repo.set_acoustid(track_id, &fp.fingerprint, confidence).ok();
+
+    if let Some(m) = best {
+        if m.score >= 0.8 && !m.title.is_empty() {
+            let conn = state.db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE tracks SET title = ?, musicbrainz_recording_id = ? WHERE id = ? AND (title LIKE 'Track %' OR title LIKE 'Unknown%')",
+                rusqlite::params![m.title, m.recording_id, track_id],
+            ).ok();
+            drop(conn);
+        }
+    }
+
+    Json(json!({
+        "track_id": track_id,
+        "matched": best.is_some(),
+        "confidence": confidence,
+        "result": best,
+    })).into_response()
+}
+
 pub(super) async fn track_waveform(
     State(state): State<AppState>,
     Path(id): Path<i64>,

@@ -23,6 +23,8 @@ pub struct TuneConfig {
     pub spotify_redirect_uri: Option<String>,
     #[serde(default)]
     pub discogs_token: Option<String>,
+    #[serde(default)]
+    pub acoustid_api_key: Option<String>,
 }
 
 impl TuneConfig {
@@ -52,6 +54,7 @@ impl Default for TuneConfig {
             spotify_client_id: None,
             spotify_redirect_uri: None,
             discogs_token: None,
+            acoustid_api_key: None,
         }
     }
 }
@@ -139,6 +142,11 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.discogs_token = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_ACOUSTID_API_KEY")
+            && !v.is_empty()
+        {
+            config.acoustid_api_key = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
