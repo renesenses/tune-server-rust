@@ -54,6 +54,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/name", put(rename_zone))
+        .route("/sync-status", get(sync_status))
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
@@ -82,6 +83,53 @@ pub fn router() -> Router<AppState> {
 
 pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
     list_zones(State(state)).await
+}
+
+async fn sync_status(State(state): State<AppState>) -> Json<Value> {
+    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zones = zone_repo.list().unwrap_or_default();
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let groups: Vec<Value> = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let metrics = state.poller_metrics.lock().await;
+
+    let mut zone_data = Vec::new();
+    for z in &zones {
+        let zone_id = z.id.unwrap_or(0);
+        let ps = state.playback.get_state(zone_id).await;
+        let poller = metrics.get(&zone_id).cloned().unwrap_or_default();
+        let group_id = z.group_id.as_deref();
+        zone_data.push(json!({
+            "zone_id": zone_id,
+            "name": z.name,
+            "output_type": z.output_type,
+            "state": match ps.state {
+                tune_core::playback::PlayState::Playing => "playing",
+                tune_core::playback::PlayState::Paused => "paused",
+                tune_core::playback::PlayState::Stopped => "stopped",
+            },
+            "position_ms": ps.position_ms,
+            "duration_ms": ps.now_playing.as_ref().map(|np| np.duration_ms).unwrap_or(0),
+            "now_playing": ps.now_playing.as_ref().map(|np| json!({
+                "title": np.title,
+                "artist": np.artist_name,
+                "album": np.album_title,
+            })),
+            "group_id": group_id,
+            "poller": poller,
+        }));
+    }
+
+    Json(json!({
+        "zones": zone_data,
+        "groups": groups,
+        "total_zones": zones.len(),
+        "playing_count": zone_data.iter().filter(|z| z["state"] == "playing").count(),
+    }))
 }
 
 pub async fn create_zone_handler(

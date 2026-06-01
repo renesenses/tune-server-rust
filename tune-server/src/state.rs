@@ -40,6 +40,7 @@ pub struct AppState {
     pub suggestion_store: Arc<SuggestionStore>,
     pub spotify_connect: Arc<SpotifyConnectManager>,
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
+    pub poller_metrics: tune_core::poller::PollerMetricsMap,
 }
 
 impl AppState {
@@ -122,6 +123,7 @@ impl AppState {
             suggestion_store,
             spotify_connect,
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
+            poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 

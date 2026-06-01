@@ -13,6 +13,17 @@ use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::TransportState;
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
+pub type PollerMetricsMap = Arc<Mutex<HashMap<i64, ZonePollerMetrics>>>;
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ZonePollerMetrics {
+    pub total_polls: u64,
+    pub total_errors: u64,
+    pub consecutive_errors: u8,
+    pub last_latency_ms: u32,
+    pub max_latency_ms: u32,
+}
+
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 2;
@@ -67,6 +78,7 @@ pub struct PositionPoller {
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
     db: SqliteDb,
+    shared_metrics: PollerMetricsMap,
 }
 
 impl PositionPoller {
@@ -75,12 +87,14 @@ impl PositionPoller {
         playback: Arc<PlaybackManager>,
         outputs: Arc<Mutex<OutputRegistry>>,
         db: SqliteDb,
+        shared_metrics: PollerMetricsMap,
     ) -> Self {
         Self {
             orchestrator,
             playback,
             outputs,
             db,
+            shared_metrics,
         }
     }
 
@@ -445,6 +459,15 @@ impl PositionPoller {
                     ps.stopped_ticks = 0;
                 }
             }
+
+            // Sync metrics to shared map for external visibility
+            self.shared_metrics.lock().await.insert(zone_id, ZonePollerMetrics {
+                total_polls: ps.total_polls,
+                total_errors: ps.total_errors,
+                consecutive_errors: ps.consecutive_errors,
+                last_latency_ms: ps.last_latency_ms,
+                max_latency_ms: ps.max_latency_ms,
+            });
 
             if track_ended {
                 poll_states.remove(&zone_id);

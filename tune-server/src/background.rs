@@ -78,6 +78,7 @@ fn spawn_position_poller(state: &AppState) {
         state.playback.clone(),
         state.outputs.clone(),
         state.db.clone(),
+        state.poller_metrics.clone(),
     );
     poller.spawn();
 }
