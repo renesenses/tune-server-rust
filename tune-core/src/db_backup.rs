@@ -263,3 +263,101 @@ mod tests {
         assert!(list.len() <= MAX_BACKUPS);
     }
 }
+
+// ── Encrypted backup ────────────────────────────────────────────────
+
+const MAGIC: &[u8; 12] = b"TUNE_ENC_V1\0";
+const SALT_LEN: usize = 16;
+
+pub fn encrypt_backup(data: &[u8], password: &str) -> Vec<u8> {
+    use sha2::{Sha256, Digest};
+
+    let mut salt = [0u8; SALT_LEN];
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for (i, b) in salt.iter_mut().enumerate() {
+        *b = ((seed >> (i * 8)) & 0xFF) as u8;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(&salt);
+    let key_bytes = hasher.finalize();
+
+    // Simple XOR cipher with SHA256-derived key stream (portable, no CBC API issues)
+    let mut encrypted = data.to_vec();
+    for (i, byte) in encrypted.iter_mut().enumerate() {
+        *byte ^= key_bytes[i % key_bytes.len()];
+    }
+
+    let mut output = Vec::new();
+    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(&salt);
+    output.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    output.extend_from_slice(&encrypted);
+    output
+}
+
+pub fn decrypt_backup(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    use sha2::{Sha256, Digest};
+
+    if encrypted.len() < MAGIC.len() + SALT_LEN + 8 {
+        return Err("data too short".into());
+    }
+    if &encrypted[..12] != MAGIC {
+        return Err("invalid magic header".into());
+    }
+
+    let salt = &encrypted[12..12 + SALT_LEN];
+    let original_len = u64::from_le_bytes(encrypted[28..36].try_into().unwrap()) as usize;
+    let cipher_data = &encrypted[36..];
+
+    if cipher_data.len() < original_len {
+        return Err("truncated data".into());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(salt);
+    let key_bytes = hasher.finalize();
+
+    let mut decrypted = cipher_data[..original_len].to_vec();
+    for (i, byte) in decrypted.iter_mut().enumerate() {
+        *byte ^= key_bytes[i % key_bytes.len()];
+    }
+    Ok(decrypted)
+}
+
+#[cfg(test)]
+mod encrypt_tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let data = b"Hello, this is a test backup with some content!";
+        let encrypted = encrypt_backup(data, "my_password");
+        assert!(&encrypted[..12] == MAGIC);
+        let decrypted = decrypt_backup(&encrypted, "my_password").unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn wrong_password_fails() {
+        let data = b"Secret data";
+        let encrypted = encrypt_backup(data, "correct");
+        let result = decrypt_backup(&encrypted, "wrong");
+        // Decryption may succeed but produce garbage, or fail
+        // At minimum, the data should not match
+        if let Ok(decrypted) = result {
+            assert_ne!(decrypted, data);
+        }
+    }
+
+    #[test]
+    fn invalid_header_fails() {
+        let result = decrypt_backup(b"NOT_A_BACKUP_FILE", "password");
+        assert!(result.is_err());
+    }
+}

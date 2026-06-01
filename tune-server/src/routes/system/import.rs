@@ -459,3 +459,126 @@ fn uuid_v4() -> String {
     let e = (seed.wrapping_mul(6364136223846793005) & 0xFFFF_FFFF_FFFF) as u64;
     format!("{a:08x}-{b:04x}-{c:04x}-{d:04x}-{e:012x}")
 }
+
+#[derive(Deserialize)]
+pub(super) struct ImportJriverRequest {
+    xml_path: String,
+}
+
+pub(super) async fn import_jriver(
+    State(state): State<AppState>,
+    Json(body): Json<ImportJriverRequest>,
+) -> impl IntoResponse {
+    let task_id = uuid_v4();
+    let db = state.db.clone();
+    let xml_path = body.xml_path.clone();
+    let event_bus = state.event_bus.clone();
+
+    let settings = SettingsRepo::new(db.clone());
+    let key = format!("import_task_{task_id}");
+    settings.set(&key, "running").ok();
+
+    tokio::spawn(async move {
+        let result = parse_jriver_xml(&xml_path, &db);
+        let settings = SettingsRepo::new(db);
+        match result {
+            Ok((imported, skipped)) => {
+                settings.set(&key, &format!("completed:{imported}:{skipped}")).ok();
+                event_bus.emit("import.completed", json!({
+                    "source": "jriver", "imported": imported, "skipped": skipped,
+                }));
+            }
+            Err(e) => {
+                settings.set(&key, &format!("error:{e}")).ok();
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!({
+        "status": "accepted",
+        "task_id": task_id,
+        "source": "jriver",
+    }))).into_response()
+}
+
+fn parse_jriver_xml(
+    xml_path: &str,
+    db: &tune_core::db::sqlite::SqliteDb,
+) -> Result<(usize, usize), String> {
+    let content = std::fs::read_to_string(xml_path)
+        .map_err(|e| format!("read {xml_path}: {e}"))?;
+
+    let artist_repo = ArtistRepo::new(db.clone());
+    let album_repo = AlbumRepo::new(db.clone());
+    let track_repo = TrackRepo::new(db.clone());
+
+    let mut imported = 0;
+    let mut skipped = 0;
+
+    // Parse JRiver XML: <MPL><Item><Field Name="X">value</Field>...</Item></MPL>
+    let mut in_item = false;
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut reader = quick_xml::Reader::from_str(&content);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name == "Item" {
+                    in_item = true;
+                    fields.clear();
+                } else if name == "Field" && in_item {
+                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"Name") {
+                        let field_name = String::from_utf8_lossy(&attr.value).to_string();
+                        if let Ok(quick_xml::events::Event::Text(t)) = reader.read_event_into(&mut buf) {
+                            fields.insert(field_name, t.unescape().unwrap_or_default().to_string());
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(ref e)) => {
+                if String::from_utf8_lossy(e.name().as_ref()) == "Item" && in_item {
+                    in_item = false;
+                    let title = fields.get("Name").cloned().unwrap_or_default();
+                    if title.is_empty() {
+                        skipped += 1;
+                        continue;
+                    }
+                    let artist_name = fields.get("Artist").cloned().unwrap_or_else(|| "Unknown Artist".into());
+                    let album_title = fields.get("Album").cloned();
+                    let file_path = fields.get("Filename").cloned();
+
+                    // Skip if already in DB by file_path
+                    if let Some(ref fp) = file_path {
+                        if track_repo.get_by_path(fp).ok().flatten().is_some() {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+
+                    let artist_id = artist_repo.get_or_create(&artist_name, None, None).ok().and_then(|a| a.id);
+                    let album_id = album_title.as_deref().and_then(|t| {
+                        album_repo.get_or_create(t, artist_id.unwrap_or(0), None).ok().and_then(|a| a.id)
+                    });
+
+                    let mut track = tune_core::db::models::Track::new(title);
+                    track.artist_id = artist_id;
+                    track.album_id = album_id;
+                    track.file_path = file_path;
+                    track.genre = fields.get("Genre").cloned();
+                    track.year = fields.get("Year").and_then(|y| y.parse().ok());
+                    track.source = "jriver".into();
+                    track_repo.create(&track).ok();
+                    imported += 1;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(format!("xml parse: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok((imported, skipped))
+}

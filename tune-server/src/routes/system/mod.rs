@@ -53,6 +53,7 @@ pub fn router() -> Router<AppState> {
             get(backup::list_backups).post(backup::create_backup),
         )
         .route("/backups/{filename}/restore", post(backup::restore_backup))
+        .route("/backups/encrypt", post(backup::create_encrypted_backup))
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
         .route("/changelog", get(update::changelog))
@@ -83,6 +84,7 @@ pub fn router() -> Router<AppState> {
         .route("/import/roon", post(import::import_roon))
         .route("/import/plex", post(import::import_plex))
         .route("/import/playlists", post(import::import_playlists_file))
+        .route("/import/jriver", post(import::import_jriver))
         .route("/import/status/{task_id}", get(import::import_status))
         // Database engine routes
         .route(
