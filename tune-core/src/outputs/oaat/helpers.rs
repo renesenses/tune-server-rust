@@ -79,8 +79,7 @@ fn parse_flac(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     if block_type != 0 {
         return None;
     }
-    let block_len =
-        ((buf[5] as usize) << 16) | ((buf[6] as usize) << 8) | (buf[7] as usize);
+    let block_len = ((buf[5] as usize) << 16) | ((buf[6] as usize) << 8) | (buf[7] as usize);
     if block_len < 34 || buf.len() < 8 + block_len {
         return None;
     }
@@ -93,7 +92,7 @@ fn parse_flac(buf: &mut Vec<u8>) -> Option<StreamInfo> {
     let channels = ((si[12] >> 1) & 0x07) as u16 + 1;
     let bps_hi = ((si[12] & 0x01) as u16) << 4;
     let bps_lo = ((si[13] >> 4) & 0x0F) as u16;
-    let bits_per_sample = bps_hi | bps_lo + 1;
+    let bits_per_sample = (bps_hi | bps_lo) + 1;
 
     // Total samples (36 bits): lower 4 bits of si[13] + si[14..18]
     let total_lo = ((si[13] & 0x0F) as u64) << 32;

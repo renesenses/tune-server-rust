@@ -222,6 +222,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             );
                             (Some(Box::new(bluos)), "bluos")
                         }
+                        #[cfg(feature = "oaat")]
                         OutputType::Oaat => {
                             let oaat = tune_core::outputs::oaat::OaatOutput::new(
                                 dev.name.clone(),
@@ -230,6 +231,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 dev.id.clone(),
                             );
                             (Some(Box::new(oaat)), "oaat")
+                        }
+                        #[cfg(not(feature = "oaat"))]
+                        OutputType::Oaat => {
+                            tracing::warn!("OAAT support not compiled in");
+                            (None, "oaat")
                         }
                         OutputType::Squeezebox => {
                             let settings =

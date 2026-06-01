@@ -110,7 +110,8 @@ async fn connect_and_setup(
 ) -> Option<oaat_controller::ConnectedEndpoint> {
     use oaat_core::ChannelLayout;
 
-    let mut endpoint = match oaat_controller::ConnectedEndpoint::connect(config, endpoint_addr).await
+    let mut endpoint = match oaat_controller::ConnectedEndpoint::connect(config, endpoint_addr)
+        .await
     {
         Ok(ep) => {
             info!(device = %device_name, endpoint_name = %ep.info.endpoint_name, "oaat: reconnected");
@@ -150,7 +151,11 @@ async fn connect_and_setup(
         return None;
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(3), endpoint.response_rx.recv()).await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        endpoint.response_rx.recv(),
+    )
+    .await
     {
         Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => {}
         Ok(Some(oaat_controller::EndpointResponse::FormatCounter(_))) => {}
@@ -271,7 +276,9 @@ impl OutputTarget for OaatOutput {
             .await
             {
                 Ok(Ok(())) => info!(device = %device_name, "oaat: clock sync ok"),
-                Ok(Err(e)) => info!(device = %device_name, error = %e, "oaat: clock sync failed, continuing"),
+                Ok(Err(e)) => {
+                    info!(device = %device_name, error = %e, "oaat: clock sync failed, continuing")
+                }
                 Err(_) => info!(device = %device_name, "oaat: clock sync timed out, continuing"),
             }
 
@@ -298,8 +305,10 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
-            let mut stream: futures_util::stream::BoxStream<'_, Result<bytes::Bytes, reqwest::Error>> =
-                Box::pin(resp.bytes_stream());
+            let mut stream: futures_util::stream::BoxStream<
+                '_,
+                Result<bytes::Bytes, reqwest::Error>,
+            > = Box::pin(resp.bytes_stream());
             let mut buf = Vec::new();
 
             while buf.len() < 128 {
@@ -332,11 +341,19 @@ impl OutputTarget for OaatOutput {
             let ch = cur_channels.min(8) as u8;
             let layout = ChannelLayout::Stereo;
 
-            let track_duration_ms = if track_duration_ms > 0 { track_duration_ms } else { si.duration_ms };
+            let track_duration_ms = if track_duration_ms > 0 {
+                track_duration_ms
+            } else {
+                si.duration_ms
+            };
             duration_ms_arc.store(track_duration_ms, Ordering::SeqCst);
 
             let mut bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-            let mut packet_size = if is_flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
+            let mut packet_size = if is_flac {
+                FLAC_CHUNK_SIZE
+            } else {
+                PCM_SAMPLES_PER_PACKET * bytes_per_frame
+            };
 
             info!(
                 device = %device_name,
@@ -346,13 +363,28 @@ impl OutputTarget for OaatOutput {
             );
 
             // Format negotiation
-            if let Err(e) = endpoint.propose_format(&stream_id, cur_format, cur_sample_rate, ch, layout, cur_bits as u8).await {
+            if let Err(e) = endpoint
+                .propose_format(
+                    &stream_id,
+                    cur_format,
+                    cur_sample_rate,
+                    ch,
+                    layout,
+                    cur_bits as u8,
+                )
+                .await
+            {
                 error!(device = %device_name, error = %e, "oaat: format propose failed");
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
 
-            match tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.response_rx.recv()).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.response_rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(oaat_controller::EndpointResponse::FormatAccept(fa))) => {
                     info!(device = %device_name, stream_id = %fa.stream_id, "oaat: format accepted");
                 }
@@ -362,7 +394,11 @@ impl OutputTarget for OaatOutput {
                     cur_bits = fc.bits_per_sample as u16;
                     cur_sample_rate = fc.sample_rate;
                     bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-                    packet_size = if cur_format == AudioFormat::Flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
+                    packet_size = if cur_format == AudioFormat::Flac {
+                        FLAC_CHUNK_SIZE
+                    } else {
+                        PCM_SAMPLES_PER_PACKET * bytes_per_frame
+                    };
                 }
                 Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
                     error!(device = %device_name, reason = %fr.reason, "oaat: format rejected");
@@ -385,13 +421,19 @@ impl OutputTarget for OaatOutput {
             }
 
             // Metadata + Play
-            let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format == AudioFormat::Flac);
-            endpoint.send_metadata(oaat_core::message::TrackMetadata {
-                title, artist, album,
-                duration_ms: track_duration_ms,
-                artwork_url: cover_url,
-                format: Some(fmt_str),
-            }).await.ok();
+            let fmt_str =
+                format_rate_display(cur_sample_rate, cur_bits, cur_format == AudioFormat::Flac);
+            endpoint
+                .send_metadata(oaat_core::message::TrackMetadata {
+                    title,
+                    artist,
+                    album,
+                    duration_ms: track_duration_ms,
+                    artwork_url: cover_url,
+                    format: Some(fmt_str),
+                })
+                .await
+                .ok();
 
             if let Err(e) = endpoint.send_play(&stream_id).await {
                 error!(device = %device_name, error = %e, "oaat: send_play failed");
@@ -417,7 +459,8 @@ impl OutputTarget for OaatOutput {
             let mut reconnect_attempts: u32 = 0;
 
             let mut next_track: Option<NextTrackPrefetch> = None;
-            let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> = None;
+            let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> =
+                None;
 
             loop {
                 tokio::select! {
@@ -643,7 +686,11 @@ impl OutputTarget for OaatOutput {
             endpoint.send_stop(&stream_id).await.ok();
             playing.store(false, Ordering::SeqCst);
             let duration_s = start.elapsed().as_secs_f64();
-            let packets = if is_flac { byte_offset / FLAC_CHUNK_SIZE as u64 } else { sample_offset / PCM_SAMPLES_PER_PACKET as u64 };
+            let packets = if is_flac {
+                byte_offset / FLAC_CHUNK_SIZE as u64
+            } else {
+                sample_offset / PCM_SAMPLES_PER_PACKET as u64
+            };
             info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat: playback complete");
         });
 
@@ -810,7 +857,11 @@ async fn prefetch_next_track(
         }
     };
 
-    let duration_ms = if duration_ms > 0 { duration_ms } else { si.duration_ms };
+    let duration_ms = if duration_ms > 0 {
+        duration_ms
+    } else {
+        si.duration_ms
+    };
     let same_format = si.format == cur_format
         && si.sample_rate == cur_sample_rate
         && si.bits_per_sample == cur_bits;
