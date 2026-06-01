@@ -55,6 +55,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
+        .route("/{id}/network-health", get(network_health))
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
@@ -129,6 +130,44 @@ async fn sync_status(State(state): State<AppState>) -> Json<Value> {
         "groups": groups,
         "total_zones": zones.len(),
         "playing_count": zone_data.iter().filter(|z| z["state"] == "playing").count(),
+    }))
+}
+
+async fn network_health(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let metrics = state.poller_metrics.lock().await;
+    let poller = metrics.get(&id).cloned().unwrap_or_default();
+    let ps = state.playback.get_state(id).await;
+
+    let stream_bytes: u64 = if let Some(ref np) = ps.now_playing
+        && let Some(ref sid) = np.stream_id
+    {
+        let sessions = state.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions.get(sid.as_str())
+            .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let uptime_s = state.started_at.elapsed().as_secs();
+    let bitrate_kbps = if uptime_s > 0 && stream_bytes > 0 {
+        (stream_bytes * 8 / 1000) as f64 / uptime_s as f64
+    } else {
+        0.0
+    };
+
+    Json(json!({
+        "zone_id": id,
+        "bytes_sent": stream_bytes,
+        "bitrate_kbps": (bitrate_kbps * 10.0).round() / 10.0,
+        "poll_latency_ms": poller.last_latency_ms,
+        "max_latency_ms": poller.max_latency_ms,
+        "poll_errors": poller.total_errors,
+        "total_polls": poller.total_polls,
     }))
 }
 

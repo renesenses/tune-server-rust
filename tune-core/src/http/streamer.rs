@@ -53,6 +53,7 @@ pub struct StreamSession {
     pub bit_perfect: bool,
     pub is_radio: bool,
     pub created_at: Instant,
+    pub bytes_sent: std::sync::atomic::AtomicU64,
 }
 
 impl StreamSession {
@@ -72,6 +73,7 @@ impl StreamSession {
             bit_perfect,
             is_radio: false,
             created_at: Instant::now(),
+            bytes_sent: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
