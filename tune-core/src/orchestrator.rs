@@ -187,9 +187,16 @@ impl PlaybackOrchestrator {
         let channels = track.channels as u16;
 
         // Check if this format needs transcoding for DLNA (AIFF, DSD, WavPack, APE)
+        // OAAT outputs handle DSD natively — skip FFmpeg transcode
+        let is_oaat_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+        let is_dsd = source_format.as_ref().is_some_and(|f| *f == AudioFormat::Dsd);
         let needs_transcode = source_format
             .as_ref()
-            .is_some_and(|f| f.needs_transcode_for_dlna());
+            .is_some_and(|f| f.needs_transcode_for_dlna())
+            && !(is_oaat_output && is_dsd);
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
             let src_fmt = source_format.unwrap(); // safe: needs_transcode is true

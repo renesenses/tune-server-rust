@@ -70,6 +70,40 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn demo_library(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let demo_enabled = settings.get("demo_enabled").ok().flatten().as_deref() == Some("true");
+    let demo_token = settings.get("demo_token").ok().flatten().unwrap_or_default();
+
+    if !demo_enabled {
+        return (StatusCode::FORBIDDEN, serde_json::json!({"error": "demo mode disabled"}).to_string()).into_response();
+    }
+
+    if !demo_token.is_empty() {
+        let provided = q.get("token").map(|s| s.as_str()).unwrap_or("");
+        if provided != demo_token {
+            return (StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid demo token"}).to_string()).into_response();
+        }
+    }
+
+    let albums = tune_core::db::album_repo::AlbumRepo::new(state.db.clone())
+        .list(50, 0)
+        .unwrap_or_default();
+    let stats = tune_core::db::track_repo::TrackRepo::new(state.db.clone())
+        .count()
+        .unwrap_or(0);
+
+    axum::Json(serde_json::json!({
+        "demo": true,
+        "read_only": true,
+        "stats": { "tracks": stats },
+        "albums": albums,
+    })).into_response()
+}
+
 async fn service_tokens_list(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
 ) -> axum::Json<serde_json::Value> {
@@ -306,6 +340,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(playback::shuffle_all),
         )
         .nest("/system", system::router())
+        .route("/demo/library", get(demo_library))
         .nest("/library", library::router())
         .nest("/library/history", history::router())
         .nest("/history", history::router())

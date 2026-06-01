@@ -379,6 +379,21 @@ impl OutputTarget for DlnaOutput {
     }
 }
 
+impl DlnaOutput {
+    pub async fn get_protocol_info(&self) -> Result<Vec<String>, String> {
+        let body = self
+            .soap_action(
+                &self.av_transport_url,
+                "urn:schemas-upnp-org:service:ConnectionManager:1",
+                "GetProtocolInfo",
+                "",
+            )
+            .await?;
+        let sink = extract_tag(&body, "Sink").unwrap_or_default();
+        Ok(sink.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+    }
+}
+
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");

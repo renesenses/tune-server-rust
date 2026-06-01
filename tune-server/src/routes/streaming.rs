@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
         .route("/{service}/auth/status", get(auth_poll_status))
         .route("/{service}/logout", post(service_logout))
         .route("/{service}/disconnect", post(service_logout))
+        .route("/compare", get(compare_services))
         .route("/{service}/search", get(service_search))
         .route("/{service}/albums", get(service_albums))
         .route("/{service}/albums/{album_id}", get(service_album))
@@ -691,4 +692,59 @@ async fn spotify_callback(
         }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    services: String,
+    artist: Option<String>,
+    album: Option<String>,
+}
+
+async fn compare_services(
+    State(state): State<AppState>,
+    Query(q): Query<CompareQuery>,
+) -> impl IntoResponse {
+    let service_names: Vec<&str> = q.services.split(',').map(|s| s.trim()).collect();
+    if service_names.len() < 2 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "need at least 2 services"}))).into_response();
+    }
+
+    let query = q.artist.as_deref().or(q.album.as_deref()).unwrap_or("");
+    if query.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "provide artist or album parameter"}))).into_response();
+    }
+
+    let registry = state.services.lock().await;
+    let mut results: serde_json::Map<String, Value> = serde_json::Map::new();
+
+    for name in &service_names {
+        let svc = match registry.get(name) {
+            Some(s) => s,
+            None => {
+                results.insert(name.to_string(), json!({"error": "service not found"}));
+                continue;
+            }
+        };
+        let svc = svc.lock().await;
+        match svc.search(query, 10).await {
+            Ok(sr) => {
+                results.insert(name.to_string(), json!({
+                    "tracks": sr.tracks.len(),
+                    "albums": sr.albums.len(),
+                    "artists": sr.artists.len(),
+                    "results": sr,
+                }));
+            }
+            Err(e) => {
+                results.insert(name.to_string(), json!({"error": e}));
+            }
+        }
+    }
+    drop(registry);
+
+    Json(json!({
+        "query": query,
+        "services": results,
+    })).into_response()
 }

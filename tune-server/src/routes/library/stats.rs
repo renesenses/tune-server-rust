@@ -106,6 +106,23 @@ pub(super) async fn completeness_stats(
             .unwrap_or(0)
     };
 
+    let genre_pct = if total_tracks > 0 { with_genre as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
+    let year_pct = if total_tracks > 0 { with_year as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
+    let artist_pct = if total_tracks > 0 { with_artist as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
+    let cover_pct = if total_albums > 0 { with_cover as f64 / total_albums as f64 * 100.0 } else { 0.0 };
+    let mbid_pct = if total_tracks > 0 { with_mbid as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
+
+    // Weighted health score: cover(30%) + genre(25%) + year(20%) + mbid(15%) + artist(10%)
+    let health_score = (cover_pct * 0.30 + genre_pct * 0.25 + year_pct * 0.20 + mbid_pct * 0.15 + artist_pct * 0.10).round();
+
+    let grade = match health_score as u32 {
+        90..=100 => "A",
+        75..=89 => "B",
+        50..=74 => "C",
+        25..=49 => "D",
+        _ => "F",
+    };
+
     Ok(Json(json!({
         "total_tracks": total_tracks,
         "total_albums": total_albums,
@@ -121,13 +138,14 @@ pub(super) async fn completeness_stats(
         "albums_without_year": total_albums - (with_year * total_albums / total_tracks.max(1)),
         "tracks_without_artist": total_tracks - with_artist,
         "artists_without_image": total_artists,
-        "doubtful_count": 0,
-        "genre_pct": if total_tracks > 0 { (with_genre as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
-        "year_pct": if total_tracks > 0 { (with_year as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
-        "artist_pct": if total_tracks > 0 { (with_artist as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "genre_pct": genre_pct.round(),
+        "year_pct": year_pct.round(),
+        "artist_pct": artist_pct.round(),
         "album_pct": if total_tracks > 0 { (with_album as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
-        "cover_pct": if total_albums > 0 { (with_cover as f64 / total_albums as f64 * 100.0).round() } else { 0.0 },
-        "mbid_pct": if total_tracks > 0 { (with_mbid as f64 / total_tracks as f64 * 100.0).round() } else { 0.0 },
+        "cover_pct": cover_pct.round(),
+        "mbid_pct": mbid_pct.round(),
+        "health_score": health_score,
+        "health_grade": grade,
     })))
 }
 

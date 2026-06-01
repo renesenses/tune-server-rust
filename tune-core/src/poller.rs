@@ -45,6 +45,10 @@ struct ZonePollState {
     /// After N failures, skip 2^min(N,4) ticks before retrying.
     consecutive_errors: u8,
     backoff_remaining: u8,
+    total_polls: u64,
+    total_errors: u64,
+    last_latency_ms: u32,
+    max_latency_ms: u32,
     last_radio_poll: Instant,
 }
 
@@ -174,6 +178,10 @@ impl PositionPoller {
                 gapless_cooldown: 0,
                 consecutive_errors: 0,
                 backoff_remaining: 0,
+                total_polls: 0,
+                total_errors: 0,
+                last_latency_ms: 0,
+                max_latency_ms: 0,
                 last_radio_poll: Instant::now(),
             });
 
@@ -182,6 +190,8 @@ impl PositionPoller {
                 continue;
             }
 
+            ps.total_polls += 1;
+            let poll_start = Instant::now();
             let status = {
                 let outputs = self.outputs.lock().await;
                 let output = match outputs.get(&device_id) {
@@ -192,10 +202,16 @@ impl PositionPoller {
                 match output.get_status().await {
                     Ok(s) => {
                         ps.consecutive_errors = 0;
+                        let latency = poll_start.elapsed().as_millis() as u32;
+                        ps.last_latency_ms = latency;
+                        if latency > ps.max_latency_ms {
+                            ps.max_latency_ms = latency;
+                        }
                         s
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
+                        ps.total_errors += 1;
                         ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
                         debug!(
                             zone_id,
@@ -469,6 +485,10 @@ mod tests {
             gapless_cooldown: 4,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
             last_radio_poll: Instant::now(),
         };
 
@@ -496,6 +516,10 @@ mod tests {
             gapless_cooldown: 3,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
             last_radio_poll: Instant::now(),
         };
 
@@ -578,6 +602,10 @@ mod tests {
             gapless_cooldown: 0,
             consecutive_errors: 0,
             backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
             last_radio_poll: Instant::now(),
         };
 
