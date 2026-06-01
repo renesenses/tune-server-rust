@@ -1,7 +1,24 @@
+/// Build a 44-byte WAV header. When `duration_ms` is provided, the header
+/// contains the correct data size so DLNA renderers don't need to probe
+/// the stream end. Falls back to max u32 for unknown-length streams.
 pub fn build_wav_header(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
+    build_wav_header_with_duration(channels, sample_rate, bit_depth, None)
+}
+
+pub fn build_wav_header_with_duration(
+    channels: u16,
+    sample_rate: u32,
+    bit_depth: u16,
+    duration_ms: Option<u64>,
+) -> [u8; 44] {
     let byte_rate = sample_rate * channels as u32 * (bit_depth as u32 / 8);
     let block_align = channels * (bit_depth / 8);
-    let data_size: u32 = 0x7FFF_FFFF;
+    let data_size: u32 = if let Some(dur) = duration_ms {
+        let bytes = dur * sample_rate as u64 * channels as u64 * (bit_depth as u64 / 8) / 1000;
+        bytes.min(0x7FFF_FFFF) as u32
+    } else {
+        0x7FFF_FFFF
+    };
     let file_size: u32 = data_size.wrapping_add(36);
 
     let mut header = [0u8; 44];
@@ -86,5 +103,31 @@ mod tests {
         let h = build_wav_header(2, 44100, 16);
         let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
         assert_eq!(data_size, 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn wav_header_with_known_duration() {
+        // 3 minutes of 44100/16/2 = 180s * 176400 bytes/s = 31752000 bytes
+        let h = build_wav_header_with_duration(2, 44100, 16, Some(180_000));
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        assert_eq!(data_size, 180 * 44100 * 2 * 2);
+        let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        assert_eq!(riff_size, data_size + 36);
+    }
+
+    #[test]
+    fn wav_header_without_duration_uses_max() {
+        let h = build_wav_header_with_duration(2, 44100, 16, None);
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        assert_eq!(data_size, 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn wav_header_duration_hires() {
+        // 4:16.487 of 96000/24/2
+        let h = build_wav_header_with_duration(2, 96000, 24, Some(256_487));
+        let data_size = u32::from_le_bytes([h[40], h[41], h[42], h[43]]);
+        let expected = 256_487u64 * 96000 * 2 * 3 / 1000;
+        assert_eq!(data_size, expected as u32);
     }
 }

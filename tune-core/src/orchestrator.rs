@@ -216,7 +216,8 @@ impl PlaybackOrchestrator {
                 sample_rate: out_sr,
                 bit_depth: out_bd,
                 channels,
-                file_size: None, // transcoded stream has unknown size
+                file_size: None,
+                duration_ms: Some(track.duration_ms as u64),
             };
 
             let (session_id, tx) = self.streamer.create_session(info, false, 256).await;
@@ -328,6 +329,7 @@ impl PlaybackOrchestrator {
                 bit_depth,
                 channels,
                 file_size: track.file_size.map(|s| s as u64),
+                duration_ms: Some(track.duration_ms as u64),
             };
 
             let session_id = self
@@ -393,6 +395,7 @@ impl PlaybackOrchestrator {
             bit_depth: stream_data.quality.bit_depth,
             channels: 2,
             file_size: None,
+            duration_ms: None,
         };
 
         let is_https = stream_data.url.starts_with("https://");

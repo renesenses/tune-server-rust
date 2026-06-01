@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
-use crate::audio::wav::build_wav_header;
+use crate::audio::wav::build_wav_header_with_duration;
 
 const ICY_METAINT: usize = 16384;
 
@@ -21,6 +21,22 @@ pub struct StreamInfo {
     pub bit_depth: u16,
     pub channels: u16,
     pub file_size: Option<u64>,
+    pub duration_ms: Option<u64>,
+}
+
+impl StreamInfo {
+    /// Calculate the expected WAV file size from audio parameters and duration.
+    /// Returns `44 + data_bytes` (WAV header + raw PCM data).
+    pub fn wav_content_length(&self) -> Option<u64> {
+        let dur = self.duration_ms?;
+        if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
+            return None;
+        }
+        let bytes_per_sample = self.bit_depth as u64 / 8;
+        let data_bytes =
+            dur * self.sample_rate as u64 * self.channels as u64 * bytes_per_sample / 1000;
+        Some(44 + data_bytes)
+    }
 }
 
 pub struct StreamSession {
@@ -258,6 +274,19 @@ pub async fn handle_stream(
     );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
 
+    // When we know the WAV content length, send it so DLNA renderers
+    // (DMP-A6/A8) don't need to probe the stream end with seek requests.
+    let is_wav = session.info.format == "wav";
+    let wav_length = if is_wav {
+        session.info.wav_content_length()
+    } else {
+        None
+    };
+    if let Some(len) = wav_length {
+        headers.insert("Content-Length", HeaderValue::from(len));
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    }
+
     let wants_icy = req_headers
         .get("Icy-MetaData")
         .and_then(|v| v.to_str().ok())
@@ -267,10 +296,10 @@ pub async fn handle_stream(
         headers.insert("icy-metaint", HeaderValue::from(ICY_METAINT as u64));
     }
 
-    let is_wav = session.info.format == "wav";
     let sr = session.info.sample_rate;
     let bd = session.info.bit_depth;
     let ch = session.info.channels;
+    let dur_ms = session.info.duration_ms;
 
     let has_icy = wants_icy && (session.track_title.is_some() || session.track_artist.is_some());
     let icy_block = if has_icy {
@@ -285,7 +314,7 @@ pub async fn handle_stream(
 
     let body = Body::from_stream(async_stream::stream! {
         if is_wav {
-            let hdr = build_wav_header(ch, sr, bd);
+            let hdr = build_wav_header_with_duration(ch, sr, bd, dur_ms);
             yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
         }
 
@@ -577,6 +606,7 @@ mod tests {
             bit_depth: 16,
             channels: 2,
             file_size: None,
+            duration_ms: None,
         };
         let (id, _tx) = streamer.create_session(info, false, 128).await;
         assert!(!id.is_empty());
@@ -593,6 +623,7 @@ mod tests {
             bit_depth: 24,
             channels: 2,
             file_size: Some(50_000_000),
+            duration_ms: None,
         };
         let id = streamer
             .create_file_session(info, "/music/test.flac".into(), true)
@@ -635,6 +666,7 @@ mod tests {
             bit_depth: 16,
             channels: 2,
             file_size: None,
+            duration_ms: None,
         };
         let id = streamer
             .create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false)
@@ -647,5 +679,50 @@ mod tests {
     fn stream_id_extraction() {
         assert_eq!(extract_stream_id("abc123.flac"), "abc123");
         assert_eq!(extract_stream_id("abc123"), "abc123");
+    }
+
+    #[test]
+    fn wav_content_length_known_duration() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(180_000),
+        };
+        // 180s * 44100 * 2ch * 2bytes + 44 header
+        let expected = 180 * 44100 * 2 * 2 + 44;
+        assert_eq!(info.wav_content_length(), Some(expected));
+    }
+
+    #[test]
+    fn wav_content_length_no_duration() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+        };
+        assert_eq!(info.wav_content_length(), None);
+    }
+
+    #[test]
+    fn wav_content_length_hires() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 96000,
+            bit_depth: 24,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(256_487),
+        };
+        let expected = 256_487u64 * 96000 * 2 * 3 / 1000 + 44;
+        assert_eq!(info.wav_content_length(), Some(expected));
     }
 }
