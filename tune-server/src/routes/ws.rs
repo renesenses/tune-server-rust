@@ -35,8 +35,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut event_rx = state.event_bus.subscribe();
     let mut patterns: Vec<String> = vec!["*".to_string()];
     let mut ping_interval = interval(PING_INTERVAL);
-    // Consume the first tick (fires immediately).
     ping_interval.tick().await;
+    let mut last_scan_progress = std::time::Instant::now() - Duration::from_secs(10);
 
     loop {
         tokio::select! {
@@ -75,6 +75,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !patterns.iter().any(|p| matches_pattern(&ev.event_type, p)) {
                             continue;
                         }
+                        // Throttle scan progress events to max 1 per 2s per client
+                        if ev.event_type == "library.scan.progress" {
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_scan_progress) < Duration::from_secs(2) {
+                                continue;
+                            }
+                            last_scan_progress = now;
+                        }
                         let ws_event = serde_json::json!({
                             "type": ev.event_type,
                             "data": ev.data,
@@ -100,7 +108,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(subs) = cmd.get("subscribe").and_then(|v| v.as_array()) {
+                            // Support both formats:
+                            // v1: {"subscribe": ["pattern1", "pattern2"]}
+                            // v2: {"action": "subscribe", "patterns": ["pattern1", "pattern2"]}
+                            let subs = cmd.get("subscribe").and_then(|v| v.as_array())
+                                .or_else(|| {
+                                    if cmd.get("action").and_then(|v| v.as_str()) == Some("subscribe") {
+                                        cmd.get("patterns").and_then(|v| v.as_array())
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(subs) = subs {
                                 patterns = subs.iter()
                                     .filter_map(|v| v.as_str().map(String::from))
                                     .collect();
