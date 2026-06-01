@@ -12,6 +12,22 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
+    // On Windows, catch panics early and log to file so users can report crashes
+    // instead of seeing "tune-server.exe has stopped working" with no info.
+    #[cfg(windows)]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("PANIC: {info}");
+            eprintln!("{msg}");
+            let log_path = std::env::current_dir()
+                .unwrap_or_default()
+                .join("tune-crash.log");
+            let _ = std::fs::write(&log_path, &msg);
+            default_hook(info);
+        }));
+    }
+
     eprintln!("tune-server starting (pid {})", std::process::id());
 
     // Install rustls CryptoProvider before any TLS operation (reqwest, etc.)

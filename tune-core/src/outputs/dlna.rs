@@ -164,7 +164,19 @@ impl DlnaOutput {
             let m: u64 = parts[1].parse().unwrap_or(0);
             let s_parts: Vec<&str> = parts[2].split('.').collect();
             let s: u64 = s_parts[0].parse().unwrap_or(0);
-            (h * 3600 + m * 60 + s) * 1000
+            let frac_ms: u64 = if s_parts.len() > 1 {
+                let frac = s_parts[1];
+                let val: u64 = frac.parse().unwrap_or(0);
+                match frac.len() {
+                    1 => val * 100,
+                    2 => val * 10,
+                    3 => val,
+                    _ => val / 10u64.pow(frac.len() as u32 - 3),
+                }
+            } else {
+                0
+            };
+            (h * 3600 + m * 60 + s) * 1000 + frac_ms
         } else {
             0
         }
@@ -384,6 +396,17 @@ mod tests {
         assert_eq!(DlnaOutput::parse_time("0:03:45"), 225_000);
         assert_eq!(DlnaOutput::parse_time("1:00:00"), 3_600_000);
         assert_eq!(DlnaOutput::parse_time("0:00:00.000"), 0);
+    }
+
+    #[test]
+    fn parse_time_fractional_seconds() {
+        assert_eq!(DlnaOutput::parse_time("0:04:16.487"), 256_487);
+        assert_eq!(DlnaOutput::parse_time("0:03:46.5"), 226_500);
+        assert_eq!(DlnaOutput::parse_time("0:03:46.50"), 226_500);
+        assert_eq!(DlnaOutput::parse_time("0:03:46.500"), 226_500);
+        assert_eq!(DlnaOutput::parse_time("0:00:01.1"), 1_100);
+        assert_eq!(DlnaOutput::parse_time("0:00:01.12"), 1_120);
+        assert_eq!(DlnaOutput::parse_time("0:00:01.123"), 1_123);
     }
 
     #[test]
