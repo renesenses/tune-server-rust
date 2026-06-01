@@ -44,11 +44,32 @@ pub trait TunePlugin: Send + Sync {
     }
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String>;
     async fn teardown(&mut self) -> Result<(), String>;
+
+    /// Called when the event bus emits an event.
+    /// Override to react to playback, library, or system events.
+    async fn on_event(&mut self, _event: &crate::event_bus::TuneEvent) {}
+
+    /// Read plugin-specific configuration from the context data_dir.
+    fn read_config(&self, ctx: &PluginContext) -> serde_json::Value {
+        let path = ctx.data_dir.join("config.json");
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write plugin-specific configuration to the context data_dir.
+    fn write_config(&self, ctx: &PluginContext, config: &serde_json::Value) -> Result<(), String> {
+        let path = ctx.data_dir.join("config.json");
+        let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
 }
 
 pub struct PluginLoader {
     plugins: Vec<Box<dyn TunePlugin>>,
     data_root: PathBuf,
+    event_bus: Option<crate::event_bus::EventBus>,
 }
 
 impl PluginLoader {
@@ -56,7 +77,13 @@ impl PluginLoader {
         Self {
             plugins: Vec::new(),
             data_root,
+            event_bus: None,
         }
+    }
+
+    pub fn with_event_bus(mut self, bus: crate::event_bus::EventBus) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     pub fn register(&mut self, plugin: Box<dyn TunePlugin>) {
