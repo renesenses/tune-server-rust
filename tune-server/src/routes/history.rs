@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/top-artists", get(top_artists))
         .route("/top-albums", get(top_albums))
         .route("/dashboard", get(dashboard))
+        .route("/export", get(export_csv))
 }
 
 async fn recent_history(
@@ -109,4 +110,37 @@ async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParam
             "completion": { "completed": 0, "skipped": 0, "avg_listened_ms": 0, "avg_track_duration_ms": 0 }
         })),
     }
+}
+
+async fn export_csv(
+    State(state): State<AppState>,
+    Query(p): Query<HistoryParams>,
+) -> impl axum::response::IntoResponse {
+    let limit = p.limit.unwrap_or(10000);
+    let repo = HistoryRepo::new(state.db);
+    let (items, _) = repo.recent_paginated(limit, 0).unwrap_or_default();
+
+    let mut csv = String::from("title,artist,album,source,duration_ms,listened_at,zone_id\n");
+    for item in &items {
+        let title = item.title.replace(',', ";");
+        let artist = item.artist_name.as_deref().unwrap_or("").replace(',', ";");
+        let album = item.album_title.as_deref().unwrap_or("").replace(',', ";");
+        let source = &item.source;
+        let dur = item.duration_ms;
+        let listened = item.listened_at.as_deref().unwrap_or("");
+        let zone = item.zone_id.unwrap_or(0);
+        csv.push_str(&format!("{title},{artist},{album},{source},{dur},{listened},{zone}\n"));
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"tune-history.csv\"",
+            ),
+        ],
+        csv,
+    )
 }
