@@ -8,6 +8,12 @@ fn make_app() -> axum::Router {
     tune_server::routes::router(state)
 }
 
+fn make_app_with_state() -> (axum::Router, tune_server::state::AppState) {
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let router = tune_server::routes::router(state.clone());
+    (router, state)
+}
+
 async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
     let resp = app
         .clone()
@@ -383,4 +389,121 @@ async fn diagnostics_returns_ok() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["engine"], "rust");
     assert!(body["cpu_count"].as_u64().unwrap() > 0);
+}
+
+// ── Playback e2e tests with MockOutput ──────────────────────────────
+
+#[tokio::test]
+async fn playback_zone_with_mock_output() {
+    let (app, state) = make_app_with_state();
+
+    // Create zone
+    let (status, body) = post_json(&app, "/api/v1/zones", json!({"name": "MockZone", "output_type": "mock", "output_device_id": "mock-dev-1"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let zone_id = body["id"].as_i64().unwrap();
+
+    // Register mock output
+    let mock = tune_core::outputs::mock::MockOutput::new("mock-dev-1", "Mock Device");
+    {
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(mock));
+    }
+
+    // Zone should exist and be stopped
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zone_id}/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "stopped");
+}
+
+#[tokio::test]
+async fn mock_output_registered_in_outputs() {
+    let (_app, state) = make_app_with_state();
+
+    let mock = tune_core::outputs::mock::MockOutput::new("test-output", "Test Output");
+    {
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(mock));
+    }
+
+    let outputs = state.outputs.lock().await;
+    assert!(outputs.get("test-output").is_some());
+    let output = outputs.get("test-output").unwrap();
+    let locked = output.lock().await;
+    assert_eq!(locked.name(), "Test Output");
+    assert_eq!(locked.output_type(), "mock");
+    assert!(locked.is_available().await);
+}
+
+#[tokio::test]
+async fn mock_output_status_reflects_in_admin_zones() {
+    let (app, state) = make_app_with_state();
+
+    // Create zone linked to mock output
+    post_json(&app, "/api/v1/zones", json!({"name": "Living Room", "output_type": "mock", "output_device_id": "mock-living"})).await;
+
+    let mock = tune_core::outputs::mock::MockOutput::new("mock-living", "Living Room Speaker");
+    {
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(mock));
+    }
+
+    // Admin zones should include our zone
+    let (status, body) = get(&app, "/api/v1/system/admin/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zones = body.as_array().unwrap();
+    assert!(zones.iter().any(|z| z["name"] == "Living Room"));
+}
+
+#[tokio::test]
+async fn playback_manager_state_transitions() {
+    let (_app, state) = make_app_with_state();
+
+    // Create a zone in DB
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_id = zone_repo.create("Test", Some("mock"), Some("mock-1")).unwrap();
+
+    // Initially stopped
+    let zs = state.playback.get_state(zone_id).await;
+    assert_eq!(zs.state, tune_core::playback::PlayState::Stopped);
+
+    // Simulate play
+    let np = tune_core::playback::NowPlaying {
+        track_id: Some(1),
+        title: "Track A".into(),
+        artist_name: Some("Artist".into()),
+        album_title: Some("Album".into()),
+        cover_path: None,
+        duration_ms: 256_487,
+        source: "local".into(),
+        source_id: None,
+        stream_id: Some("stream-001".into()),
+    };
+    state.playback.play(zone_id, np).await;
+    let zs = state.playback.get_state(zone_id).await;
+    assert_eq!(zs.state, tune_core::playback::PlayState::Playing);
+    assert_eq!(zs.now_playing.as_ref().unwrap().title, "Track A");
+    assert_eq!(zs.now_playing.as_ref().unwrap().duration_ms, 256_487);
+
+    // Simulate advance (gapless metadata update)
+    let np2 = tune_core::playback::NowPlaying {
+        track_id: Some(2),
+        title: "Track B".into(),
+        artist_name: Some("Artist".into()),
+        album_title: Some("Album".into()),
+        cover_path: None,
+        duration_ms: 226_000,
+        source: "local".into(),
+        source_id: None,
+        stream_id: None,
+    };
+    state.playback.play(zone_id, np2).await;
+    let zs = state.playback.get_state(zone_id).await;
+    assert_eq!(zs.state, tune_core::playback::PlayState::Playing);
+    assert_eq!(zs.now_playing.as_ref().unwrap().title, "Track B");
+    assert!(zs.now_playing.as_ref().unwrap().stream_id.is_none(), "gapless advance should have stream_id=None");
+
+    // Stop
+    state.playback.stop(zone_id).await;
+    let zs = state.playback.get_state(zone_id).await;
+    assert_eq!(zs.state, tune_core::playback::PlayState::Stopped);
 }

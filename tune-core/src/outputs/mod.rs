@@ -1,4 +1,5 @@
 pub mod airplay;
+pub mod mock;
 pub mod bluos;
 pub mod bridge;
 pub mod chromecast;
