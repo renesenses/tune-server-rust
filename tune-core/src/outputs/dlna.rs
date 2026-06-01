@@ -109,6 +109,12 @@ impl DlnaOutput {
         .await
     }
 
+    /// Return true when the value is a usable metadata string (not empty,
+    /// not the literal `"null"` that JavaScript clients sometimes send).
+    fn is_valid_meta(v: Option<&str>) -> bool {
+        matches!(v, Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+    }
+
     fn didl_metadata(
         title: Option<&str>,
         artist: Option<&str>,
@@ -117,11 +123,20 @@ impl DlnaOutput {
         url: &str,
         cover_url: Option<&str>,
     ) -> String {
-        let title = quick_xml::escape::escape(title.unwrap_or("Unknown"));
-        let artist = quick_xml::escape::escape(artist.unwrap_or("Unknown"));
+        let title = quick_xml::escape::escape(
+            if Self::is_valid_meta(title) { title.unwrap() } else { "Unknown" },
+        );
         let escaped_url = quick_xml::escape::escape(url);
 
+        let artist_tag = if Self::is_valid_meta(artist) {
+            let a = quick_xml::escape::escape(artist.unwrap());
+            format!("&lt;dc:creator&gt;{a}&lt;/dc:creator&gt;")
+        } else {
+            String::new()
+        };
+
         let album_tag = album
+            .filter(|a| Self::is_valid_meta(Some(a)))
             .map(|a| {
                 let a = quick_xml::escape::escape(a);
                 format!("&lt;upnp:album&gt;{a}&lt;/upnp:album&gt;")
@@ -136,7 +151,7 @@ impl DlnaOutput {
             .unwrap_or_default();
 
         format!(
-            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;&lt;dc:creator&gt;{artist}&lt;/dc:creator&gt;&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
+            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
         )
     }
 
@@ -413,6 +428,35 @@ mod tests {
         assert!(didl.contains("Title"));
         assert!(!didl.contains("albumArtURI"));
         assert!(!didl.contains("upnp:album"));
+        // artist tag must be omitted when None
+        assert!(!didl.contains("dc:creator"));
+    }
+
+    #[test]
+    fn didl_metadata_null_artist_string() {
+        // JavaScript clients may send the literal string "null"
+        let didl = DlnaOutput::didl_metadata(
+            Some("Title"),
+            Some("null"),
+            None,
+            "audio/flac",
+            "http://example.com/stream",
+            None,
+        );
+        assert!(!didl.contains("dc:creator"), "literal 'null' artist must be omitted");
+    }
+
+    #[test]
+    fn didl_metadata_empty_artist() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("Title"),
+            Some(""),
+            None,
+            "audio/flac",
+            "http://example.com/stream",
+            None,
+        );
+        assert!(!didl.contains("dc:creator"), "empty artist must be omitted");
     }
 
     #[test]
