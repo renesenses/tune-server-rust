@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test -p tune-core -p tune-server --no-default-features
+      - run: cargo test -p tune-core -p tune-server --no-default-features --features oaat
 
   build:
     name: Build ${{ matrix.target }}
@@ -76,11 +76,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
       - name: Build (native, no local-audio on Linux/Windows)
         if: "!matrix.cross && runner.os != 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
@@ -120,4 +120,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat -- -D clippy::correctness

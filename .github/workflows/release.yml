@@ -84,11 +84,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
       - name: Build (native, no local-audio on Linux/Windows)
         if: "!matrix.cross && runner.os != 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"

@@ -10,7 +10,7 @@ COPY tune-pyo3/Cargo.toml tune-pyo3/
 COPY tune-server/Cargo.toml tune-server/
 RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     touch tune-core/src/lib.rs tune-pyo3/src/lib.rs tune-server/src/lib.rs && \
-    cargo build --release --package tune-server --no-default-features 2>/dev/null || true && \
+    cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
     rm -rf tune-core/src tune-pyo3/src tune-server/src
 
 # Build real source — clean dummy artifacts to force recompilation
@@ -18,7 +18,7 @@ COPY tune-core/ tune-core/
 COPY tune-pyo3/ tune-pyo3/
 COPY tune-server/ tune-server/
 RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-server && \
-    cargo build --release --package tune-server --no-default-features && \
+    cargo build --release --package tune-server --no-default-features --features oaat && \
     strip target/release/tune-server
 
 FROM debian:bookworm-slim
