@@ -433,3 +433,61 @@ pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json
         "total_groups": groups.len(),
     })))
 }
+
+pub(super) async fn album_completeness(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = repo
+        .get(id)
+        .ok()
+        .flatten()
+        .ok_or(AppError::not_found("album not found"))?;
+
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let actual_tracks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let expected_tracks = album.track_count.unwrap_or(0) as i64;
+
+    // Check total_tracks from metadata tags
+    let max_tag_total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(CAST(track_number AS INTEGER)), 0) FROM tracks WHERE album_id = ?",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    drop(conn);
+
+    let expected = if expected_tracks > 0 {
+        expected_tracks
+    } else {
+        max_tag_total
+    };
+    let complete = expected > 0 && actual_tracks >= expected;
+    let missing = if expected > actual_tracks {
+        expected - actual_tracks
+    } else {
+        0
+    };
+
+    Ok(Json(json!({
+        "album_id": id,
+        "album_title": album.title,
+        "actual_tracks": actual_tracks,
+        "expected_tracks": expected,
+        "missing": missing,
+        "complete": complete,
+        "completeness_pct": if expected > 0 { (actual_tracks as f64 / expected as f64 * 100.0).round() } else { 100.0 },
+    })))
+}

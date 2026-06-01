@@ -54,6 +54,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/sleep", axum::routing::post(sleep_timer))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
@@ -85,6 +86,47 @@ pub fn router() -> Router<AppState> {
 
 pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
     list_zones(State(state)).await
+}
+
+async fn sleep_timer(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let minutes = body["minutes"].as_u64().unwrap_or(30);
+    let steps = 10u64;
+    let step_duration = std::time::Duration::from_secs(minutes * 60 / steps);
+
+    let playback = state.playback.clone();
+    let orchestrator = state.orchestrator.clone();
+    let db = state.db.clone();
+
+    tokio::spawn(async move {
+        let initial_volume = playback.get_state(id).await.volume;
+        for i in 1..=steps {
+            tokio::time::sleep(step_duration).await;
+            let vol = initial_volume * (1.0 - i as f64 / steps as f64);
+            playback.set_volume(id, vol.max(0.0)).await;
+            let vol_int = (vol * 100.0) as i32;
+            tune_core::db::zone_repo::ZoneRepo::new(db.clone())
+                .update_volume(id, vol_int)
+                .ok();
+        }
+        let device_id = tune_core::db::zone_repo::ZoneRepo::new(db)
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id);
+        orchestrator.stop(id, device_id.as_deref()).await;
+        tracing::info!(zone_id = id, minutes, "sleep_timer_completed");
+    });
+
+    Json(json!({
+        "zone_id": id,
+        "sleep_minutes": minutes,
+        "status": "scheduled",
+        "fade_steps": steps,
+    }))
 }
 
 async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {

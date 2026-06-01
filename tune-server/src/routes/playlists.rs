@@ -228,10 +228,20 @@ async fn duplicate_playlist(
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
 async fn export_m3u(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(q): Query<ExportQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let fmt = q.format.as_deref().unwrap_or("m3u");
+    if fmt != "m3u" {
+        return export_multi_format(State(state.clone()), id, fmt).await;
+    }
     let repo = PlaylistRepo::new(state.db.clone());
     let playlist = match repo.get(id) {
         Ok(Some(p)) => p,
@@ -270,6 +280,114 @@ async fn export_m3u(
     );
 
     Ok((axum::http::StatusCode::OK, headers, m3u))
+}
+
+async fn export_multi_format(
+    State(state): State<AppState>,
+    id: i64,
+    format: &str,
+) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, String), AppError> {
+    let repo = PlaylistRepo::new(state.db.clone());
+    let playlist = repo
+        .get(id)
+        .ok()
+        .flatten()
+        .ok_or(AppError::not_found("playlist not found"))?;
+    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let tracks = TrackRepo::new(state.db.clone())
+        .get_multiple(&track_ids)
+        .unwrap_or_default();
+
+    let (content, content_type, ext) = match format {
+        "json" => {
+            let items: Vec<serde_json::Value> = tracks
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "title": t.title, "artist": t.artist_name, "album": t.album_title,
+                        "duration_ms": t.duration_ms, "file_path": t.file_path,
+                    })
+                })
+                .collect();
+            (
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"name": playlist.name, "tracks": items}),
+                )
+                .unwrap_or_default(),
+                "application/json",
+                "json",
+            )
+        }
+        "csv" => {
+            let mut csv = String::from("title,artist,album,duration_ms,file_path\n");
+            for t in &tracks {
+                csv.push_str(&format!(
+                    "\"{}\",\"{}\",\"{}\",{},\"{}\"\n",
+                    t.title.replace('"', "\"\""),
+                    t.artist_name.as_deref().unwrap_or("").replace('"', "\"\""),
+                    t.album_title.as_deref().unwrap_or("").replace('"', "\"\""),
+                    t.duration_ms,
+                    t.file_path.as_deref().unwrap_or("").replace('"', "\"\""),
+                ));
+            }
+            (csv, "text/csv", "csv")
+        }
+        "xspf" => {
+            let mut xspf = String::from(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n",
+            );
+            xspf.push_str(&format!(
+                "  <title>{}</title>\n  <trackList>\n",
+                quick_xml::escape::escape(&playlist.name)
+            ));
+            for t in &tracks {
+                xspf.push_str("    <track>\n");
+                xspf.push_str(&format!(
+                    "      <title>{}</title>\n",
+                    quick_xml::escape::escape(&t.title)
+                ));
+                if let Some(ref a) = t.artist_name {
+                    xspf.push_str(&format!(
+                        "      <creator>{}</creator>\n",
+                        quick_xml::escape::escape(a)
+                    ));
+                }
+                if let Some(ref a) = t.album_title {
+                    xspf.push_str(&format!(
+                        "      <album>{}</album>\n",
+                        quick_xml::escape::escape(a)
+                    ));
+                }
+                xspf.push_str(&format!("      <duration>{}</duration>\n", t.duration_ms));
+                if let Some(ref p) = t.file_path {
+                    xspf.push_str(&format!(
+                        "      <location>{}</location>\n",
+                        quick_xml::escape::escape(p)
+                    ));
+                }
+                xspf.push_str("    </track>\n");
+            }
+            xspf.push_str("  </trackList>\n</playlist>\n");
+            (xspf, "application/xspf+xml", "xspf")
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "format must be m3u, json, csv, or xspf",
+            ));
+        }
+    };
+
+    let filename = format!("{}.{ext}", playlist.name.replace(' ', "_"));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "Content-Type",
+        axum::http::HeaderValue::from_str(content_type).unwrap(),
+    );
+    headers.insert(
+        "Content-Disposition",
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
+    );
+    Ok((axum::http::StatusCode::OK, headers, content))
 }
 
 async fn import_m3u_file(

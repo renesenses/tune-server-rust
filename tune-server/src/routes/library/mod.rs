@@ -119,6 +119,7 @@ pub fn router() -> Router<AppState> {
         .route("/albums/filters", get(albums::album_filters))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
+        .route("/albums/{id}/completeness", get(albums::album_completeness))
         .route("/albums/{id}", get(albums::get_album))
         .route("/albums/{id}/tracks", get(albums::album_tracks))
         .route("/tracks", get(tracks::list_tracks))
