@@ -1,10 +1,15 @@
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use tokio::time::interval;
 
 use crate::state::AppState;
+
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(ws_handler))
@@ -29,6 +34,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut rx = state.playback.subscribe();
     let mut event_rx = state.event_bus.subscribe();
     let mut patterns: Vec<String> = vec!["*".to_string()];
+    let mut ping_interval = interval(PING_INTERVAL);
+    // Consume the first tick (fires immediately).
+    ping_interval.tick().await;
 
     loop {
         tokio::select! {
@@ -54,7 +62,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("WebSocket playback broadcast lagged, skipped {n} messages");
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
@@ -73,8 +84,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("WebSocket event_bus broadcast lagged, skipped {n} messages");
+                        continue;
+                    }
                     Err(_) => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
                 }
             }
             msg = socket.recv() => {
