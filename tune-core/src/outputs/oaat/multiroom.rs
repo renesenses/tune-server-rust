@@ -310,14 +310,15 @@ impl OutputTarget for OaatMultiroomOutput {
                                 Ordering::Relaxed,
                             );
 
-                            if !is_flac {
-                                let expected = std::time::Duration::from_nanos(
-                                    (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                                );
-                                let elapsed = start.elapsed();
-                                if expected > elapsed {
-                                    tokio::time::sleep(expected - elapsed).await;
-                                }
+                            let expected = if is_flac {
+                                let audio_bps = cur_sample_rate as f64 * bytes_per_frame as f64;
+                                std::time::Duration::from_nanos((byte_offset as f64 / audio_bps * 1e9) as u64)
+                            } else {
+                                std::time::Duration::from_nanos((sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64)
+                            };
+                            let elapsed = start.elapsed();
+                            if expected > elapsed {
+                                tokio::time::sleep(expected - elapsed).await;
                             }
                         }
                     }

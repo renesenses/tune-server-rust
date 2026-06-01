@@ -250,7 +250,12 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             Some(std::sync::Arc::clone(cached))
                         } else {
                             let result = album_repo
-                                .get_or_create(&key.0, key.1, key.2)
+                                .get_or_create_with_mbid(
+                                    &key.0,
+                                    key.1,
+                                    key.2,
+                                    meta.musicbrainz_release_id.as_deref(),
+                                )
                                 .ok()
                                 .map(std::sync::Arc::new);
                             if let Some(ref a) = result {

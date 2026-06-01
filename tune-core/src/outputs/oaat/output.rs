@@ -756,15 +756,20 @@ impl OutputTarget for OaatOutput {
                                 Ordering::Relaxed,
                             );
 
-                            // Real-time pacing (PCM only — FLAC packets have variable size)
-                            if !is_flac {
-                                let expected = std::time::Duration::from_nanos(
+                            // Real-time pacing
+                            let expected = if is_flac {
+                                let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
+                                std::time::Duration::from_nanos(
+                                    (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
+                                )
+                            } else {
+                                std::time::Duration::from_nanos(
                                     (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                                );
-                                let elapsed = start.elapsed();
-                                if expected > elapsed {
-                                    tokio::time::sleep(expected - elapsed).await;
-                                }
+                                )
+                            };
+                            let elapsed = start.elapsed();
+                            if expected > elapsed {
+                                tokio::time::sleep(expected - elapsed).await;
                             }
                         }
                     }

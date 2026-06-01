@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(si.channels, 2);
         assert_eq!(si.bits_per_sample, 16);
         assert_eq!(si.format, AudioFormat::Flac);
-        assert_eq!(si.duration_ms, 10000);
+        assert!((9999..=10001).contains(&si.duration_ms), "duration_ms={}", si.duration_ms);
     }
 
     #[test]

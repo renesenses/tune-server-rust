@@ -1,4 +1,5 @@
 pub(crate) mod helpers;
+mod integration_test;
 mod multiroom;
 mod output;
 
