@@ -454,8 +454,4 @@ pub fn router(state: AppState) -> Router {
     )
     .layer(CompressionLayer::new())
     .layer(CorsLayer::permissive())
-    .layer(tower::limit::RateLimitLayer::new(
-        120,
-        std::time::Duration::from_secs(1),
-    ))
 }
