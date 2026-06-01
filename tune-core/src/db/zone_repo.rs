@@ -156,6 +156,29 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_dsp(&self, id: i64, preset_id: Option<i64>, enabled: bool) -> Result<(), String> {
+        let en = if enabled { 1i64 } else { 0i64 };
+        self.db.execute(
+            "UPDATE zones SET dsp_preset_id = ?, dsp_enabled = ? WHERE id = ?",
+            &[
+                &preset_id as &dyn rusqlite::types::ToSql,
+                &en,
+                &id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_dsp_config(&self, id: i64) -> Result<(Option<i64>, bool), String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        conn.query_row(
+            "SELECT dsp_preset_id, COALESCE(dsp_enabled, 0) FROM zones WHERE id = ?",
+            params![id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM zones", [], |row| row.get(0))

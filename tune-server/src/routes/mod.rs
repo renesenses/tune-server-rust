@@ -56,6 +56,7 @@ pub mod tags;
 pub mod upnp;
 pub mod visualizer;
 pub mod widget;
+pub mod voice;
 pub mod ws;
 pub mod zone_manager;
 pub mod zones;
@@ -468,6 +469,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())
         .route("/radio/auto", get(auto_dj_handler))
+        .route("/voice-search", axum::routing::post(voice::voice_search))
         .route(
             "/party/rooms",
             get(party_list_rooms).post(party_create_room),
