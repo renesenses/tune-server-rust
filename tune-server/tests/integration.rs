@@ -256,14 +256,22 @@ async fn admin_health_zone_count_matches_db() {
 
     let (status, body) = get(&app, "/api/v1/system/admin/health").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["playback"]["zones_total"], 3, "admin/health must report DB zone count, not in-memory playback");
+    assert_eq!(
+        body["playback"]["zones_total"], 3,
+        "admin/health must report DB zone count, not in-memory playback"
+    );
 }
 
 #[tokio::test]
 async fn admin_zones_returns_created_zones() {
     let app = make_app();
 
-    post_json(&app, "/api/v1/zones", json!({"name": "Salon", "output_type": "dlna"})).await;
+    post_json(
+        &app,
+        "/api/v1/zones",
+        json!({"name": "Salon", "output_type": "dlna"}),
+    )
+    .await;
     post_json(&app, "/api/v1/zones", json!({"name": "Bureau"})).await;
 
     let (status, body) = get(&app, "/api/v1/system/admin/zones").await;
@@ -306,7 +314,16 @@ async fn stats_response_has_all_fields() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/system/stats").await;
     assert_eq!(status, StatusCode::OK);
-    for field in ["artists", "albums", "tracks", "zones", "devices", "outputs", "server_version", "server_engine"] {
+    for field in [
+        "artists",
+        "albums",
+        "tracks",
+        "zones",
+        "devices",
+        "outputs",
+        "server_version",
+        "server_engine",
+    ] {
         assert!(body.get(field).is_some(), "stats missing field: {field}");
     }
     assert!(body["artists"].is_number());
@@ -351,7 +368,10 @@ async fn zone_status_response_fields() {
     let (status, body) = get(&app, "/api/v1/zones/1/status").await;
     assert_eq!(status, StatusCode::OK);
     for field in ["state", "volume"] {
-        assert!(body.get(field).is_some(), "zone status missing field: {field}");
+        assert!(
+            body.get(field).is_some(),
+            "zone status missing field: {field}"
+        );
     }
     assert!(["playing", "paused", "stopped"].contains(&body["state"].as_str().unwrap()));
 }

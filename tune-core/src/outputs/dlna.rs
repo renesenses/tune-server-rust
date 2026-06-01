@@ -123,9 +123,11 @@ impl DlnaOutput {
         url: &str,
         cover_url: Option<&str>,
     ) -> String {
-        let title = quick_xml::escape::escape(
-            if Self::is_valid_meta(title) { title.unwrap() } else { "Unknown" },
-        );
+        let title = quick_xml::escape::escape(if Self::is_valid_meta(title) {
+            title.unwrap()
+        } else {
+            "Unknown"
+        });
         let escaped_url = quick_xml::escape::escape(url);
 
         let artist_tag = if Self::is_valid_meta(artist) {
@@ -443,7 +445,10 @@ mod tests {
             "http://example.com/stream",
             None,
         );
-        assert!(!didl.contains("dc:creator"), "literal 'null' artist must be omitted");
+        assert!(
+            !didl.contains("dc:creator"),
+            "literal 'null' artist must be omitted"
+        );
     }
 
     #[test]

@@ -689,7 +689,10 @@ mod tests {
 
     #[test]
     fn split_genre_very_long() {
-        let long = (0..50).map(|i| format!("Genre{i}")).collect::<Vec<_>>().join(";");
+        let long = (0..50)
+            .map(|i| format!("Genre{i}"))
+            .collect::<Vec<_>>()
+            .join(";");
         let genres = split_genre_tag(&long);
         assert_eq!(genres.len(), 50);
     }
