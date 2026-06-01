@@ -123,16 +123,7 @@ impl OutputTarget for OaatMultiroomOutput {
         paused.store(false, Ordering::SeqCst);
         position_ms.store(0, Ordering::SeqCst);
 
-        // Zone uses ConnectedEndpoint which requires Sync for tokio::spawn.
-        // After oaat-controller 0.1.2 (writer wrapped in Mutex), this can use tokio::spawn directly.
-        std::thread::Builder::new()
-            .name(format!("oaat-multiroom-{}", device_name))
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async move {
+        tokio::spawn(async move {
             use futures_util::StreamExt;
 
             let config = ControllerConfig {
@@ -330,9 +321,7 @@ impl OutputTarget for OaatMultiroomOutput {
             let duration_s = start.elapsed().as_secs_f64();
             let packets = if is_flac { byte_offset / FLAC_CHUNK_SIZE as u64 } else { sample_offset / PCM_SAMPLES_PER_PACKET as u64 };
             info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat-multiroom: complete");
-                }); // rt.block_on
-            }) // thread::spawn
-            .ok();
+        });
 
         Ok(())
     }
