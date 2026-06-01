@@ -43,25 +43,41 @@ impl AlbumRepo {
         year: Option<i32>,
     ) -> Result<Option<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
+        // Try exact match with year first
         if let Some(y) = year {
             let mut stmt = conn
                 .prepare(&format!(
                     "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"
                 ))
                 .map_err(|e| e.to_string())?;
-            stmt.query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
+            if let Some(album) = stmt
+                .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
                 .optional()
-                .map_err(|e| e.to_string())
-        } else {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
-                .optional()
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(Some(album));
+            }
         }
+        // Fallback: match by title + artist without year (avoids duplicate albums
+        // when tracks from the same album have different or missing year tags)
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? LIMIT 1"))
+            .map_err(|e| e.to_string())?;
+        stmt.query_row(params![title], |row| Ok(row_to_album(row)))
+            .optional()
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {

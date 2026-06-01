@@ -64,13 +64,20 @@ pub fn build_track_from_metadata(
     };
     let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
+    let has_explicit_album_artist = meta.album_artist.is_some();
     let album = meta.album.as_ref().and_then(|title| {
+        let aid = album_artist_id.unwrap_or(0);
+        // When album_artist tag is explicit, use strict matching (title + artist + year).
+        // When album_artist is missing (fallback to track artist), try to find any
+        // existing album with this title first to avoid creating duplicates when
+        // tracks in the same album have different track artists.
+        if !has_explicit_album_artist {
+            if let Ok(Some(existing)) = album_repo.get_by_title_only(title) {
+                return Some(existing);
+            }
+        }
         album_repo
-            .get_or_create(
-                title,
-                album_artist_id.unwrap_or(0),
-                meta.year.map(|y| y as i32),
-            )
+            .get_or_create(title, aid, meta.year.map(|y| y as i32))
             .ok()
     });
     let album_id = album.as_ref().and_then(|a| a.id);
