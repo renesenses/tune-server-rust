@@ -9,7 +9,7 @@ use tokio::time::interval;
 
 use crate::state::AppState;
 
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/", get(ws_handler))
