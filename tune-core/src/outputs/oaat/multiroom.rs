@@ -123,8 +123,8 @@ impl OutputTarget for OaatMultiroomOutput {
         paused.store(false, Ordering::SeqCst);
         position_ms.store(0, Ordering::SeqCst);
 
-        // Zone's async methods are !Send (ConnectedEndpoint writer is !Sync).
-        // Use a dedicated single-thread runtime so Send is not required.
+        // Zone uses ConnectedEndpoint which requires Sync for tokio::spawn.
+        // After oaat-controller 0.1.2 (writer wrapped in Mutex), this can use tokio::spawn directly.
         std::thread::Builder::new()
             .name(format!("oaat-multiroom-{}", device_name))
             .spawn(move || {

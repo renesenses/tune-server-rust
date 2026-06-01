@@ -168,4 +168,29 @@ mod tests {
         assert!(rx1.try_recv().is_err()); // excluded
         assert_eq!(rx2.recv().await.unwrap(), "from-a");
     }
+
+    #[test]
+    fn list_and_delete_rooms() {
+        let mut mgr = RoomManager::new();
+        mgr.create_room("r1");
+        mgr.create_room("r2");
+        assert_eq!(mgr.list_rooms().len(), 2);
+
+        assert!(mgr.delete_room("r1"));
+        assert!(!mgr.delete_room("r1")); // already deleted
+        assert_eq!(mgr.list_rooms().len(), 1);
+    }
+
+    #[test]
+    fn join_nonexistent_room() {
+        let mut mgr = RoomManager::new();
+        let (tx, _rx) = mpsc::channel(10);
+        assert!(!mgr.join("nope", "user", tx));
+    }
+
+    #[test]
+    fn room_info_nonexistent() {
+        let mgr = RoomManager::new();
+        assert!(mgr.room_info("nope").is_none());
+    }
 }

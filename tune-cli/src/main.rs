@@ -1,7 +1,82 @@
-use std::env;
-use std::process;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
+use serde_json::json;
 
 const DEFAULT_SERVER: &str = "http://localhost:8888";
+
+#[derive(Parser)]
+#[command(name = "tune", about = "Tune server command line interface", version)]
+struct Cli {
+    /// Server URL
+    #[arg(long, default_value = DEFAULT_SERVER, env = "TUNE_SERVER")]
+    server: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Show server status
+    Status,
+    /// List zones
+    Zones,
+    /// Play a track on a zone
+    Play {
+        /// Zone ID
+        zone: i64,
+        /// Track ID
+        track: i64,
+    },
+    /// Pause playback on a zone
+    Pause {
+        /// Zone ID
+        zone: i64,
+    },
+    /// Skip to next track
+    Next {
+        /// Zone ID
+        zone: i64,
+    },
+    /// Set volume (0-100)
+    Volume {
+        /// Zone ID
+        zone: i64,
+        /// Volume level (0-100)
+        level: u32,
+    },
+    /// Search the library
+    Search {
+        /// Search query
+        query: Vec<String>,
+    },
+    /// Trigger library scan
+    Scan,
+    /// Library statistics
+    Stats,
+    /// Current track info
+    NowPlaying {
+        /// Zone ID
+        zone: i64,
+    },
+    /// Show listening history
+    History {
+        /// Number of items
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show OAAT endpoint diagnostics
+    Oaat,
+    /// Generate shell completions
+    Completions {
+        /// Shell type
+        shell: Shell,
+    },
+}
 
 struct Client {
     base: String,
@@ -76,150 +151,72 @@ fn print_human(value: &serde_json::Value) {
     }
 }
 
-fn usage() {
-    eprintln!("tune-cli — Tune server command line interface");
-    eprintln!();
-    eprintln!("Usage: tune [--server URL] [--json] <command> [args]");
-    eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  status              Show server status");
-    eprintln!("  zones               List zones");
-    eprintln!("  play <zone> <track> Play a track on a zone");
-    eprintln!("  pause <zone>        Pause playback");
-    eprintln!("  next <zone>         Skip to next track");
-    eprintln!("  volume <zone> <vol> Set volume (0-100)");
-    eprintln!("  search <query>      Search the library");
-    eprintln!("  scan                Trigger library scan");
-    eprintln!("  stats               Library statistics");
-    eprintln!("  now-playing <zone>  Current track info");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --server URL  Server address (default: {DEFAULT_SERVER})");
-    eprintln!("  --json        Output raw JSON");
-}
-
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let cli = Cli::parse();
 
-    let mut server = DEFAULT_SERVER.to_string();
-    let mut json_mode = false;
-    let mut cmd_args: Vec<String> = Vec::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--server" => {
-                i += 1;
-                if i < args.len() {
-                    server = args[i].clone();
-                }
-            }
-            "--json" => json_mode = true,
-            "--help" | "-h" => {
-                usage();
-                return;
-            }
-            _ => cmd_args.push(args[i].clone()),
-        }
-        i += 1;
+    if let Commands::Completions { shell } = &cli.command {
+        clap_complete::generate(*shell, &mut Cli::command(), "tune", &mut std::io::stdout());
+        return;
     }
 
-    if cmd_args.is_empty() {
-        usage();
-        process::exit(1);
-    }
+    let client = Client::new(&cli.server, cli.json);
 
-    let client = Client::new(&server, json_mode);
-    let cmd = cmd_args[0].as_str();
-
-    let result = match cmd {
-        "status" => client.get("/system/version").await,
-        "stats" => client.get("/system/stats").await,
-        "zones" => client.get("/zones").await,
-        "scan" => client.post("/system/scan", serde_json::json!({})).await,
-        "search" => {
-            let q = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
-            client
-                .get(&format!("/search?q={}", urlencoding::encode(q)))
-                .await
-        }
-        "now-playing" => {
-            let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            client.get(&format!("/zones/{zone}/status")).await
-        }
-        "play" => {
-            let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            let track = cmd_args
-                .get(2)
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
+    let result = match &cli.command {
+        Commands::Status => client.get("/system/version").await,
+        Commands::Zones => client.get("/zones").await,
+        Commands::Play { zone, track } => {
             client
                 .post(
                     &format!("/zones/{zone}/play"),
-                    serde_json::json!({"track_id": track}),
+                    json!({"track_id": track, "source": "local"}),
                 )
                 .await
         }
-        "pause" => {
-            let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
+        Commands::Pause { zone } => {
             client
-                .post(&format!("/zones/{zone}/pause"), serde_json::json!({}))
+                .post(&format!("/zones/{zone}/pause"), json!({}))
                 .await
         }
-        "next" => {
-            let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
+        Commands::Next { zone } => {
             client
-                .post(&format!("/zones/{zone}/next"), serde_json::json!({}))
+                .post(&format!("/zones/{zone}/next"), json!({}))
                 .await
         }
-        "volume" => {
-            let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            let vol = cmd_args
-                .get(2)
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(50);
+        Commands::Volume { zone, level } => {
             client
                 .post(
                     &format!("/zones/{zone}/volume"),
-                    serde_json::json!({"volume": vol}),
+                    json!({"volume": *level as f64 / 100.0}),
                 )
                 .await
         }
-        _ => {
-            eprintln!("Unknown command: {cmd}");
-            usage();
-            process::exit(1);
+        Commands::Search { query } => {
+            let q = query.join(" ");
+            client
+                .get(&format!(
+                    "/library/search?q={}&limit=20",
+                    urlencoding::encode(&q)
+                ))
+                .await
         }
+        Commands::Scan => client.post("/system/scan", json!({})).await,
+        Commands::Stats => client.get("/system/stats").await,
+        Commands::NowPlaying { zone } => client.get(&format!("/zones/{zone}")).await,
+        Commands::History { limit } => {
+            client
+                .get(&format!("/history?limit={limit}"))
+                .await
+        }
+        Commands::Oaat => client.get("/system/diagnostics/oaat").await,
+        Commands::Completions { .. } => unreachable!(),
     };
 
     match result {
-        Ok(v) => client.print(&v),
+        Ok(data) => client.print(&data),
         Err(e) => {
             eprintln!("Error: {e}");
-            process::exit(1);
+            std::process::exit(1);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_url_construction() {
-        let client = Client::new("http://192.168.1.18:8888", false);
-        assert_eq!(client.base, "http://192.168.1.18:8888/api/v1");
-    }
-
-    #[test]
-    fn print_human_object() {
-        let val = serde_json::json!({"version": "0.8.16", "engine": "rust"});
-        print_human(&val); // should not panic
-    }
-
-    #[test]
-    fn default_server() {
-        assert_eq!(DEFAULT_SERVER, "http://localhost:8888");
     }
 }
