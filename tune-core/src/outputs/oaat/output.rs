@@ -40,6 +40,18 @@ struct NextTrackPrefetch {
     same_format: bool,
 }
 
+/// Observable OAAT diagnostics — safe to read from any thread.
+#[derive(Default)]
+pub struct OaatDiagnostics {
+    pub packets_sent: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub reconnects: AtomicU32,
+    pub last_packet_epoch_ms: AtomicU64,
+    pub format_desc: std::sync::Mutex<String>,
+    pub connected: AtomicBool,
+    pub is_flac: AtomicBool,
+}
+
 pub struct OaatOutput {
     name: String,
     device_id: String,
@@ -58,6 +70,7 @@ pub struct OaatOutput {
     stop_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(feature = "oaat")]
     command_tx: Mutex<Option<tokio::sync::mpsc::Sender<OaatCommand>>>,
+    pub diag: Arc<OaatDiagnostics>,
 }
 
 impl OaatOutput {
@@ -85,7 +98,38 @@ impl OaatOutput {
             stop_tx: Mutex::new(None),
             #[cfg(feature = "oaat")]
             command_tx: Mutex::new(None),
+            diag: Arc::new(OaatDiagnostics::default()),
         }
+    }
+
+    pub fn diagnostics_snapshot(&self) -> serde_json::Value {
+        let playing = self.playing.load(Ordering::Relaxed);
+        let last_pkt = self.diag.last_packet_epoch_ms.load(Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let stale_ms = if last_pkt > 0 && playing { now_ms.saturating_sub(last_pkt) } else { 0 };
+
+        serde_json::json!({
+            "device_id": self.device_id,
+            "name": self.name,
+            "host": self.host,
+            "port": self.port,
+            "controller_id": self.controller_id,
+            "connected": self.diag.connected.load(Ordering::Relaxed),
+            "playing": playing,
+            "paused": self.paused.load(Ordering::Relaxed),
+            "is_flac": self.diag.is_flac.load(Ordering::Relaxed),
+            "format": *self.diag.format_desc.lock().unwrap(),
+            "packets_sent": self.diag.packets_sent.load(Ordering::Relaxed),
+            "bytes_sent": self.diag.bytes_sent.load(Ordering::Relaxed),
+            "reconnects": self.diag.reconnects.load(Ordering::Relaxed),
+            "position_ms": self.position_ms.load(Ordering::Relaxed),
+            "duration_ms": self.duration_ms.load(Ordering::Relaxed),
+            "last_packet_age_ms": stale_ms,
+            "stall_detected": playing && !self.paused.load(Ordering::Relaxed) && stale_ms > 5000,
+        })
     }
 
     fn endpoint_addr(&self) -> std::net::SocketAddr {
@@ -219,6 +263,7 @@ impl OutputTarget for OaatOutput {
         let current_title = self.current_title.clone();
         let current_artist = self.current_artist.clone();
         let current_uri = self.current_uri.clone();
+        let diag = self.diag.clone();
         let device_name = self.name.clone();
         let controller_id = self.controller_id.clone();
         let stream_num = self.stream_counter.fetch_add(1, Ordering::SeqCst);
@@ -440,6 +485,11 @@ impl OutputTarget for OaatOutput {
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
+            diag.connected.store(true, Ordering::SeqCst);
+            diag.is_flac.store(is_flac, Ordering::SeqCst);
+            diag.packets_sent.store(0, Ordering::SeqCst);
+            diag.bytes_sent.store(0, Ordering::SeqCst);
+            *diag.format_desc.lock().unwrap() = format_rate_display(cur_sample_rate, cur_bits, is_flac);
             info!(device = %device_name, "oaat: streaming started");
 
             // Build StreamInfo for reconnection
@@ -462,11 +512,39 @@ impl OutputTarget for OaatOutput {
             let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> =
                 None;
 
+            let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(10));
+            watchdog.tick().await; // skip first immediate tick
+
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
                         debug!(device = %device_name, "oaat: stop signal");
                         break;
+                    }
+
+                    // Watchdog: detect stall (playing but no packets for 10s)
+                    _ = watchdog.tick() => {
+                        if playing.load(Ordering::Relaxed) && !paused.load(Ordering::Relaxed) {
+                            let last = diag.last_packet_epoch_ms.load(Ordering::Relaxed);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            if last > 0 && now.saturating_sub(last) > 10_000 {
+                                warn!(device = %device_name, stale_ms = now - last, "oaat: watchdog — stall detected, attempting reconnect");
+                                diag.reconnects.fetch_add(1, Ordering::Relaxed);
+                                match connect_and_setup(&config, endpoint_addr, &device_name, &stream_id, &cur_stream_info).await {
+                                    Some(new_ep) => {
+                                        endpoint = new_ep;
+                                        diag.connected.store(true, Ordering::SeqCst);
+                                        info!(device = %device_name, "oaat: watchdog reconnected");
+                                    }
+                                    None => {
+                                        warn!(device = %device_name, "oaat: watchdog reconnect failed");
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     result = async {
@@ -624,6 +702,15 @@ impl OutputTarget for OaatOutput {
                             match endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await {
                                 Ok(()) => {
                                     reconnect_attempts = 0;
+                                    diag.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    diag.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                    diag.last_packet_epoch_ms.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
                                 }
                                 Err(_) => {
                                     // Reconnection mid-stream
@@ -632,6 +719,7 @@ impl OutputTarget for OaatOutput {
                                         break;
                                     }
                                     reconnect_attempts += 1;
+                                    diag.reconnects.fetch_add(1, Ordering::Relaxed);
                                     warn!(device = %device_name, attempt = reconnect_attempts, "oaat: send_audio failed, reconnecting");
 
                                     // Put payload back
@@ -685,6 +773,7 @@ impl OutputTarget for OaatOutput {
 
             endpoint.send_stop(&stream_id).await.ok();
             playing.store(false, Ordering::SeqCst);
+            diag.connected.store(false, Ordering::SeqCst);
             let duration_s = start.elapsed().as_secs_f64();
             let packets = if is_flac {
                 byte_offset / FLAC_CHUNK_SIZE as u64
@@ -805,6 +894,10 @@ impl OutputTarget for OaatOutput {
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    fn diagnostics_json(&self) -> Option<serde_json::Value> {
+        Some(self.diagnostics_snapshot())
     }
 }
 

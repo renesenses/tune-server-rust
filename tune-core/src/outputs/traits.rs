@@ -101,4 +101,8 @@ pub trait OutputTarget: Send + Sync {
         self.set_next_url(media.url, media.mime_type, media.title, media.artist)
             .await
     }
+
+    fn diagnostics_json(&self) -> Option<serde_json::Value> {
+        None
+    }
 }

@@ -70,6 +70,23 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
     }))
 }
 
+pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Value> {
+    let outputs = state.outputs.lock().await;
+    let mut endpoints = Vec::new();
+    for id in outputs.list() {
+        if let Some(output) = outputs.get(&id) {
+            let output = output.lock().await;
+            if let Some(diag) = output.diagnostics_json() {
+                endpoints.push(diag);
+            }
+        }
+    }
+    Json(json!({
+        "oaat_endpoints": endpoints,
+        "count": endpoints.len(),
+    }))
+}
+
 pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
     let report = state.health_monitor.run_checks().await;
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
