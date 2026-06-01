@@ -86,9 +86,13 @@ jobs:
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
-      - name: Build (native, no local-audio on Linux/Windows)
-        if: "!matrix.cross && runner.os != 'macOS'"
+      - name: Build (native, Linux headless - no local-audio)
+        if: "!matrix.cross && runner.os == 'Linux'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+
+      - name: Build (native, Windows with local-audio)
+        if: "!matrix.cross && runner.os == 'Windows'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
