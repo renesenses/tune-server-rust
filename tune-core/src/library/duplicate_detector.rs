@@ -149,6 +149,49 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
     }
 }
 
+pub fn scan_fingerprint_duplicates(db: &SqliteDb) -> Vec<DuplicateGroup> {
+    let conn = db.read_connection().lock().unwrap();
+    let mut stmt = match conn.prepare(
+        "SELECT t.id, t.title, ar.name, t.file_path, t.acoustid_fingerprint
+         FROM tracks t
+         LEFT JOIN artists ar ON t.artist_id = ar.id
+         WHERE t.acoustid_fingerprint IS NOT NULL AND t.acoustid_fingerprint != ''
+         ORDER BY t.acoustid_fingerprint, t.id",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "fingerprint_duplicate_query_error");
+            return Vec::new();
+        }
+    };
+
+    let rows: Vec<(i64, String, Option<String>, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap_or_else(|_| panic!("query_map failed"))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default();
+    drop(stmt);
+    drop(conn);
+
+    let mut fp_map: HashMap<String, Vec<DuplicateEntry>> = HashMap::new();
+    for (id, title, artist, path, fp) in &rows {
+        fp_map.entry(fp.clone()).or_default().push(DuplicateEntry {
+            id: *id,
+            title: title.clone(),
+            artist_name: artist.clone(),
+            file_path: path.clone(),
+        });
+    }
+
+    fp_map
+        .into_iter()
+        .filter(|(_, g)| g.len() > 1)
+        .map(|(fp, tracks)| DuplicateGroup { hash: fp, tracks })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

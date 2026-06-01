@@ -195,6 +195,26 @@ impl TrackRepo {
         Ok(())
     }
 
+    pub fn get_trailing_silence(&self, track_id: i64) -> Result<Option<i64>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        conn.query_row(
+            "SELECT trailing_silence_ms FROM tracks WHERE id = ?",
+            rusqlite::params![track_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+        .map(|o| o.flatten())
+    }
+
+    pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE tracks SET trailing_silence_ms = ? WHERE id = ?",
+            &[&ms as &dyn rusqlite::types::ToSql, &track_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_acoustid(
         &self,
         track_id: i64,

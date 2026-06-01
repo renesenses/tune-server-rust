@@ -96,12 +96,24 @@ pub(super) async fn list_duplicates(
         (hash_dups, meta_dups)
     };
 
+    let fp_groups = tune_core::library::duplicate_detector::scan_fingerprint_duplicates(&state.db);
+    let fp_dups: Vec<Value> = fp_groups
+        .iter()
+        .map(|g| json!({
+            "fingerprint": g.hash,
+            "tracks": g.tracks.iter().map(|t| json!({
+                "id": t.id, "title": t.title, "artist": t.artist_name, "file_path": t.file_path,
+            })).collect::<Vec<_>>(),
+        }))
+        .collect();
+
     Ok(Json(json!({
         "duplicates": {
             "by_hash": hash_dups,
             "by_metadata": meta_dups,
+            "by_fingerprint": fp_dups,
         },
-        "total": hash_dups.len() + meta_dups.len(),
+        "total": hash_dups.len() + meta_dups.len() + fp_dups.len(),
     })))
 }
 
