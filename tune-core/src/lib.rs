@@ -47,7 +47,6 @@ pub mod streaming;
 pub mod updater;
 pub mod upnp_server;
 pub mod user_profiles;
-pub mod zone_manager;
 pub mod zones;
 
 // Re-exports for backward compatibility (modules moved into library/)
