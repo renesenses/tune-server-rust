@@ -1,0 +1,29 @@
+## Tune Server — Production Docker Compose
+##
+## Usage:
+##   1. Copy .env.tune.example to .env.tune and edit your music paths
+##   2. docker compose -f docker-compose.prod.yml up -d
+##   3. Open http://localhost:8888
+##
+## For DLNA/SSDP/mDNS discovery, network_mode: host is required.
+## On macOS/Windows Docker Desktop, host networking is not supported —
+## use bridge mode and accept that device discovery won't work.
+
+services:
+  tune:
+    image: renesenses/tune:latest
+    container_name: tune-server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - tune-data:/data
+      - ${TUNE_MUSIC_PATH:-/path/to/music}:/music:ro
+    env_file:
+      - .env.tune
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  tune-data:
