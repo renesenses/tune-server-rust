@@ -61,31 +61,52 @@ pub(super) async fn create_encrypted_backup(
 ) -> impl IntoResponse {
     let password = match body["password"].as_str() {
         Some(p) if !p.is_empty() => p.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({"error": "password required"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "password required"})),
+            )
+                .into_response();
+        }
     };
 
     let db_path = state.config.db_path.clone();
     let backup = tune_core::db_backup::create_backup(&db_path);
     let Some(info) = backup else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "backup creation failed"}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "backup creation failed"})),
+        )
+            .into_response();
     };
 
     let backup_path = format!("backups/{}", info.filename);
     let data = match std::fs::read(&backup_path) {
         Ok(d) => d,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+                .into_response();
+        }
     };
 
     let encrypted = tune_core::db_backup::encrypt_backup(&data, &password);
     let enc_filename = format!("{}.enc", info.filename);
     let enc_path = format!("backups/{enc_filename}");
     if let Err(e) = std::fs::write(&enc_path, &encrypted) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        )
+            .into_response();
     }
 
     Json(json!({
         "filename": enc_filename,
         "size": encrypted.len(),
         "encrypted": true,
-    })).into_response()
+    }))
+    .into_response()
 }

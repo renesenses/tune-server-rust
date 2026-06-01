@@ -83,13 +83,25 @@ async fn party_create_room(
 ) -> impl IntoResponse {
     let id = body["room_id"].as_str().unwrap_or("").to_string();
     if id.is_empty() {
-        return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "room_id required"}).to_string()).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "room_id required"}).to_string(),
+        )
+            .into_response();
     }
     let mut mgr = state.rooms.lock().await;
     if mgr.create_room(&id) {
-        (StatusCode::CREATED, axum::Json(serde_json::json!({"room_id": id}))).into_response()
+        (
+            StatusCode::CREATED,
+            axum::Json(serde_json::json!({"room_id": id})),
+        )
+            .into_response()
     } else {
-        (StatusCode::CONFLICT, serde_json::json!({"error": "room exists"}).to_string()).into_response()
+        (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "room exists"}).to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -109,24 +121,39 @@ async fn party_delete_room(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> StatusCode {
     let mut mgr = state.rooms.lock().await;
-    if mgr.delete_room(&id) { StatusCode::OK } else { StatusCode::NOT_FOUND }
+    if mgr.delete_room(&id) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn auto_dj_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let seed = q.get("seed_track").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-    let count = q.get("count").and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+    let seed = q
+        .get("seed_track")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let count = q
+        .get("count")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20);
     if seed == 0 {
-        return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "seed_track required"}).to_string()).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "seed_track required"}).to_string(),
+        )
+            .into_response();
     }
     let tracks = tune_core::playback::auto_dj::generate_queue(&state.db, seed, count);
     axum::Json(serde_json::json!({
         "seed_track": seed,
         "count": tracks.len(),
         "tracks": tracks,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn analytics_middleware(
@@ -139,7 +166,9 @@ async fn analytics_middleware(
     let start = std::time::Instant::now();
     let response = next.run(request).await;
     let latency_ms = start.elapsed().as_millis() as u32;
-    state.api_analytics.record(&path, &method, response.status().as_u16(), latency_ms);
+    state
+        .api_analytics
+        .record(&path, &method, response.status().as_u16(), latency_ms);
     response
 }
 
@@ -439,8 +468,14 @@ pub fn router(state: AppState) -> Router {
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())
         .route("/radio/auto", get(auto_dj_handler))
-        .route("/party/rooms", get(party_list_rooms).post(party_create_room))
-        .route("/party/rooms/{id}", get(party_room_info).delete(party_delete_room))
+        .route(
+            "/party/rooms",
+            get(party_list_rooms).post(party_create_room),
+        )
+        .route(
+            "/party/rooms/{id}",
+            get(party_room_info).delete(party_delete_room),
+        )
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())

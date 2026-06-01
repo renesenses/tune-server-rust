@@ -339,9 +339,7 @@ impl StreamingService for SpotifyService {
             self.username = me
                 .as_ref()
                 .and_then(|v| v["display_name"].as_str().map(Into::into));
-            self.user_id = me
-                .as_ref()
-                .and_then(|v| v["id"].as_str().map(Into::into));
+            self.user_id = me.as_ref().and_then(|v| v["id"].as_str().map(Into::into));
             info!(username = ?self.username, user_id = ?self.user_id, "spotify_authenticated");
             return Ok(self.auth_status().await);
         }
@@ -466,7 +464,10 @@ impl StreamingService for SpotifyService {
         name: &str,
         description: Option<&str>,
     ) -> Result<String, String> {
-        let user_id = self.user_id.as_deref().ok_or("spotify: not authenticated (no user_id)")?;
+        let user_id = self
+            .user_id
+            .as_deref()
+            .ok_or("spotify: not authenticated (no user_id)")?;
         let body = serde_json::json!({
             "name": name,
             "description": description.unwrap_or("Created by Tune"),

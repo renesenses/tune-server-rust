@@ -105,7 +105,8 @@ mod tests {
         let track = crate::db::models::Track::new("Test".into());
         let track_id = track_repo.create(&track).unwrap();
 
-        repo.upsert(track_id, "tidal", "tidal:123", 0.95, "exact").unwrap();
+        repo.upsert(track_id, "tidal", "tidal:123", 0.95, "exact")
+            .unwrap();
         let links = repo.get_by_track(track_id).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].service, "tidal");
@@ -121,8 +122,10 @@ mod tests {
         let track = crate::db::models::Track::new("Test".into());
         let track_id = track_repo.create(&track).unwrap();
 
-        repo.upsert(track_id, "tidal", "tidal:123", 0.8, "fuzzy").unwrap();
-        repo.upsert(track_id, "tidal", "tidal:456", 0.95, "exact").unwrap();
+        repo.upsert(track_id, "tidal", "tidal:123", 0.8, "fuzzy")
+            .unwrap();
+        repo.upsert(track_id, "tidal", "tidal:456", 0.95, "exact")
+            .unwrap();
         let links = repo.get_by_track(track_id).unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].service_track_id, "tidal:456");
@@ -139,7 +142,8 @@ mod tests {
         let track_id = track_repo.create(&track).unwrap();
 
         repo.upsert(track_id, "tidal", "t:1", 0.9, "exact").unwrap();
-        repo.upsert(track_id, "qobuz", "q:1", 0.85, "fuzzy").unwrap();
+        repo.upsert(track_id, "qobuz", "q:1", 0.85, "fuzzy")
+            .unwrap();
         let links = repo.get_by_track(track_id).unwrap();
         assert_eq!(links.len(), 2);
         assert_eq!(repo.count_by_service("tidal").unwrap(), 1);

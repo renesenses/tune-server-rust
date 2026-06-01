@@ -483,10 +483,15 @@ pub(super) async fn import_jriver(
         let settings = SettingsRepo::new(db);
         match result {
             Ok((imported, skipped)) => {
-                settings.set(&key, &format!("completed:{imported}:{skipped}")).ok();
-                event_bus.emit("import.completed", json!({
-                    "source": "jriver", "imported": imported, "skipped": skipped,
-                }));
+                settings
+                    .set(&key, &format!("completed:{imported}:{skipped}"))
+                    .ok();
+                event_bus.emit(
+                    "import.completed",
+                    json!({
+                        "source": "jriver", "imported": imported, "skipped": skipped,
+                    }),
+                );
             }
             Err(e) => {
                 settings.set(&key, &format!("error:{e}")).ok();
@@ -494,19 +499,22 @@ pub(super) async fn import_jriver(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(json!({
-        "status": "accepted",
-        "task_id": task_id,
-        "source": "jriver",
-    }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "task_id": task_id,
+            "source": "jriver",
+        })),
+    )
+        .into_response()
 }
 
 fn parse_jriver_xml(
     xml_path: &str,
     db: &tune_core::db::sqlite::SqliteDb,
 ) -> Result<(usize, usize), String> {
-    let content = std::fs::read_to_string(xml_path)
-        .map_err(|e| format!("read {xml_path}: {e}"))?;
+    let content = std::fs::read_to_string(xml_path).map_err(|e| format!("read {xml_path}: {e}"))?;
 
     let artist_repo = ArtistRepo::new(db.clone());
     let album_repo = AlbumRepo::new(db.clone());
@@ -529,9 +537,12 @@ fn parse_jriver_xml(
                     in_item = true;
                     fields.clear();
                 } else if name == "Field" && in_item {
-                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"Name") {
+                    if let Some(attr) = e.attributes().flatten().find(|a| a.key.as_ref() == b"Name")
+                    {
                         let field_name = String::from_utf8_lossy(&attr.value).to_string();
-                        if let Ok(quick_xml::events::Event::Text(t)) = reader.read_event_into(&mut buf) {
+                        if let Ok(quick_xml::events::Event::Text(t)) =
+                            reader.read_event_into(&mut buf)
+                        {
                             fields.insert(field_name, t.unescape().unwrap_or_default().to_string());
                         }
                     }
@@ -545,7 +556,10 @@ fn parse_jriver_xml(
                         skipped += 1;
                         continue;
                     }
-                    let artist_name = fields.get("Artist").cloned().unwrap_or_else(|| "Unknown Artist".into());
+                    let artist_name = fields
+                        .get("Artist")
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown Artist".into());
                     let album_title = fields.get("Album").cloned();
                     let file_path = fields.get("Filename").cloned();
 
@@ -557,9 +571,15 @@ fn parse_jriver_xml(
                         }
                     }
 
-                    let artist_id = artist_repo.get_or_create(&artist_name, None, None).ok().and_then(|a| a.id);
+                    let artist_id = artist_repo
+                        .get_or_create(&artist_name, None, None)
+                        .ok()
+                        .and_then(|a| a.id);
                     let album_id = album_title.as_deref().and_then(|t| {
-                        album_repo.get_or_create(t, artist_id.unwrap_or(0), None).ok().and_then(|a| a.id)
+                        album_repo
+                            .get_or_create(t, artist_id.unwrap_or(0), None)
+                            .ok()
+                            .and_then(|a| a.id)
                     });
 
                     let mut track = tune_core::db::models::Track::new(title);

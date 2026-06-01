@@ -3,9 +3,9 @@
 pub mod alarms;
 pub mod api_analytics;
 pub mod audio;
-pub mod collaborative;
 pub mod buffer;
 pub mod bug_report;
+pub mod collaborative;
 pub mod config;
 pub mod credentials_vault;
 pub mod dashboard;

@@ -667,7 +667,11 @@ impl StreamingService for QobuzService {
         let resp = self
             .api_post(
                 "/playlist/create",
-                &[("name", name), ("description", desc), ("is_public", "false")],
+                &[
+                    ("name", name),
+                    ("description", desc),
+                    ("is_public", "false"),
+                ],
             )
             .await?;
         resp["id"]

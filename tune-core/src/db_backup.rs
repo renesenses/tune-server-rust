@@ -270,7 +270,7 @@ const MAGIC: &[u8; 12] = b"TUNE_ENC_V1\0";
 const SALT_LEN: usize = 16;
 
 pub fn encrypt_backup(data: &[u8], password: &str) -> Vec<u8> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let mut salt = [0u8; SALT_LEN];
     let seed = std::time::SystemTime::now()
@@ -301,7 +301,7 @@ pub fn encrypt_backup(data: &[u8], password: &str) -> Vec<u8> {
 }
 
 pub fn decrypt_backup(encrypted: &[u8], password: &str) -> Result<Vec<u8>, String> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     if encrypted.len() < MAGIC.len() + SALT_LEN + 8 {
         return Err("data too short".into());

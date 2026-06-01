@@ -254,7 +254,10 @@ pub(super) async fn track_synced_lyrics(
             if !lines.is_empty() {
                 let json_str = serde_json::to_string(&lines).unwrap_or_default();
                 repo.set_synced_lyrics(id, &json_str).ok();
-                return Json(json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" })).into_response();
+                return Json(
+                    json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" }),
+                )
+                .into_response();
             }
         }
     }
@@ -277,41 +280,73 @@ pub(super) async fn identify_track(
 ) -> impl IntoResponse {
     let api_key = match state.config.acoustid_api_key.as_deref() {
         Some(k) if !k.is_empty() => k.to_string(),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "TUNE_ACOUSTID_API_KEY not configured"})),
+            )
+                .into_response();
+        }
     };
     if !tune_core::metadata::fingerprint::fpcalc_available() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "fpcalc not installed"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "fpcalc not installed"})),
+        )
+            .into_response();
     }
 
     let track_id = match body["track_id"].as_i64() {
         Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "track_id required"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "track_id required"})),
+            )
+                .into_response();
+        }
     };
 
     let repo = TrackRepo::new(state.db.clone());
     let track = match repo.get(track_id) {
         Ok(Some(t)) => t,
-        _ => return (StatusCode::NOT_FOUND, Json(json!({"error": "track not found"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "track not found"})),
+            )
+                .into_response();
+        }
     };
 
     let file_path = match track.file_path.as_deref() {
         Some(p) => p.to_string(),
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "track has no file"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "track has no file"})),
+            )
+                .into_response();
+        }
     };
 
     let fp = match tune_core::metadata::fingerprint::generate_fingerprint(&file_path).await {
         Ok(fp) => fp,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
-    let matches = tune_core::metadata::fingerprint::lookup_acoustid(&api_key, &fp.fingerprint, fp.duration)
-        .await
-        .unwrap_or_default();
+    let matches =
+        tune_core::metadata::fingerprint::lookup_acoustid(&api_key, &fp.fingerprint, fp.duration)
+            .await
+            .unwrap_or_default();
 
     let best = matches.first();
     let confidence = best.map(|m| m.score).unwrap_or(0.0);
 
-    repo.set_acoustid(track_id, &fp.fingerprint, confidence).ok();
+    repo.set_acoustid(track_id, &fp.fingerprint, confidence)
+        .ok();
 
     if let Some(m) = best {
         if m.score >= 0.8 && !m.title.is_empty() {
@@ -329,7 +364,8 @@ pub(super) async fn identify_track(
         "matched": best.is_some(),
         "confidence": confidence,
         "result": best,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 pub(super) async fn track_waveform(
@@ -352,7 +388,10 @@ pub(super) async fn track_waveform(
 
     let file_path = match track.file_path.as_deref() {
         Some(p) => p.to_string(),
-        None => return Json(json!({ "track_id": id, "waveform": null, "error": "no file path" })).into_response(),
+        None => {
+            return Json(json!({ "track_id": id, "waveform": null, "error": "no file path" }))
+                .into_response();
+        }
     };
 
     let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;

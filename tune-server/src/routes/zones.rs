@@ -133,10 +133,7 @@ async fn sync_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn network_health(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Json<Value> {
+async fn network_health(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let metrics = state.poller_metrics.lock().await;
     let poller = metrics.get(&id).cloned().unwrap_or_default();
     let ps = state.playback.get_state(id).await;
@@ -146,7 +143,8 @@ async fn network_health(
     {
         let sessions = state.streamer.sessions_state();
         let sessions = sessions.lock().await;
-        sessions.get(sid.as_str())
+        sessions
+            .get(sid.as_str())
             .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0)
     } else {

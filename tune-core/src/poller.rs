@@ -461,13 +461,16 @@ impl PositionPoller {
             }
 
             // Sync metrics to shared map for external visibility
-            self.shared_metrics.lock().await.insert(zone_id, ZonePollerMetrics {
-                total_polls: ps.total_polls,
-                total_errors: ps.total_errors,
-                consecutive_errors: ps.consecutive_errors,
-                last_latency_ms: ps.last_latency_ms,
-                max_latency_ms: ps.max_latency_ms,
-            });
+            self.shared_metrics.lock().await.insert(
+                zone_id,
+                ZonePollerMetrics {
+                    total_polls: ps.total_polls,
+                    total_errors: ps.total_errors,
+                    consecutive_errors: ps.consecutive_errors,
+                    last_latency_ms: ps.last_latency_ms,
+                    max_latency_ms: ps.max_latency_ms,
+                },
+            );
 
             if track_ended {
                 poll_states.remove(&zone_id);

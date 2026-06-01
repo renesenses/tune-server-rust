@@ -167,7 +167,13 @@ pub fn scan_fingerprint_duplicates(db: &SqliteDb) -> Vec<DuplicateGroup> {
 
     let rows: Vec<(i64, String, Option<String>, String, String)> = stmt
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .unwrap_or_else(|_| panic!("query_map failed"))
         .collect::<Result<Vec<_>, _>>()

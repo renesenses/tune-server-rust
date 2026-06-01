@@ -1025,7 +1025,9 @@ impl StreamingService for TidalService {
         name: &str,
         description: Option<&str>,
     ) -> Result<String, String> {
-        let user_id = self.user_id.ok_or("tidal: not authenticated (no user_id)")?;
+        let user_id = self
+            .user_id
+            .ok_or("tidal: not authenticated (no user_id)")?;
         let desc = description.unwrap_or("Created by Tune");
         let resp = self
             .api_post_form(

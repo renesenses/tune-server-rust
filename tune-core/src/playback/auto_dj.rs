@@ -34,7 +34,10 @@ pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Va
     }
 
     if let Some(y) = year {
-        conditions.push(format!("t.year BETWEEN ?{param_idx} AND ?{}", param_idx + 1));
+        conditions.push(format!(
+            "t.year BETWEEN ?{param_idx} AND ?{}",
+            param_idx + 1
+        ));
         params.push(Box::new(y - 5));
         params.push(Box::new(y + 5));
         param_idx += 2;
@@ -42,10 +45,7 @@ pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Va
 
     if let Some(b) = bpm {
         if b > 0.0 {
-            conditions.push(format!(
-                "t.bpm BETWEEN ?{param_idx} AND ?{}",
-                param_idx + 1
-            ));
+            conditions.push(format!("t.bpm BETWEEN ?{param_idx} AND ?{}", param_idx + 1));
             params.push(Box::new(b * 0.85));
             params.push(Box::new(b * 1.15));
         }
@@ -146,8 +146,13 @@ mod tests {
     fn generates_queue_from_seed() {
         let db = test_db();
         let conn = db.connection().lock().unwrap();
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", []).unwrap();
-        conn.execute("INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)", []).unwrap();
+        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            [],
+        )
+        .unwrap();
         for i in 1..=10 {
             conn.execute(
                 "INSERT INTO tracks (id, title, artist_id, album_id, genre, year, duration_ms) VALUES (?, ?, 1, 1, 'Jazz', 2000, 240000)",

@@ -20,19 +20,33 @@ impl Client {
 
     async fn get(&self, path: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}{path}", self.base);
-        let resp = self.http.get(&url).send().await.map_err(|e| format!("{e}"))?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("{e}"))?;
         resp.json().await.map_err(|e| format!("{e}"))
     }
 
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
         let url = format!("{}{path}", self.base);
-        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| format!("{e}"))?;
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("{e}"))?;
         resp.json().await.map_err(|e| format!("{e}"))
     }
 
     fn print(&self, value: &serde_json::Value) {
         if self.json_mode {
-            println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            );
         } else {
             print_human(value);
         }
@@ -97,10 +111,15 @@ async fn main() {
         match args[i].as_str() {
             "--server" => {
                 i += 1;
-                if i < args.len() { server = args[i].clone(); }
+                if i < args.len() {
+                    server = args[i].clone();
+                }
             }
             "--json" => json_mode = true,
-            "--help" | "-h" => { usage(); return; }
+            "--help" | "-h" => {
+                usage();
+                return;
+            }
             _ => cmd_args.push(args[i].clone()),
         }
         i += 1;
@@ -121,7 +140,9 @@ async fn main() {
         "scan" => client.post("/system/scan", serde_json::json!({})).await,
         "search" => {
             let q = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
-            client.get(&format!("/search?q={}", urlencoding::encode(q))).await
+            client
+                .get(&format!("/search?q={}", urlencoding::encode(q)))
+                .await
         }
         "now-playing" => {
             let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
@@ -129,21 +150,41 @@ async fn main() {
         }
         "play" => {
             let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            let track = cmd_args.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-            client.post(&format!("/zones/{zone}/play"), serde_json::json!({"track_id": track})).await
+            let track = cmd_args
+                .get(2)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            client
+                .post(
+                    &format!("/zones/{zone}/play"),
+                    serde_json::json!({"track_id": track}),
+                )
+                .await
         }
         "pause" => {
             let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            client.post(&format!("/zones/{zone}/pause"), serde_json::json!({})).await
+            client
+                .post(&format!("/zones/{zone}/pause"), serde_json::json!({}))
+                .await
         }
         "next" => {
             let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            client.post(&format!("/zones/{zone}/next"), serde_json::json!({})).await
+            client
+                .post(&format!("/zones/{zone}/next"), serde_json::json!({}))
+                .await
         }
         "volume" => {
             let zone = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("1");
-            let vol = cmd_args.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(50);
-            client.post(&format!("/zones/{zone}/volume"), serde_json::json!({"volume": vol})).await
+            let vol = cmd_args
+                .get(2)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(50);
+            client
+                .post(
+                    &format!("/zones/{zone}/volume"),
+                    serde_json::json!({"volume": vol}),
+                )
+                .await
         }
         _ => {
             eprintln!("Unknown command: {cmd}");
@@ -160,7 +201,6 @@ async fn main() {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

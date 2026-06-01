@@ -172,10 +172,7 @@ mod tests {
 
         let stats = analytics.stats();
         assert_eq!(stats.buffer_size, 3);
-        assert!(stats
-            .top_endpoints
-            .iter()
-            .all(|e| e.endpoint != "GET /a"));
+        assert!(stats.top_endpoints.iter().all(|e| e.endpoint != "GET /a"));
     }
 
     #[test]
@@ -187,7 +184,11 @@ mod tests {
         let stats = analytics.stats();
         let ep = &stats.top_endpoints[0];
         assert_eq!(ep.count, 100);
-        assert!((49..=51).contains(&ep.p50_latency_ms), "p50={}", ep.p50_latency_ms);
+        assert!(
+            (49..=51).contains(&ep.p50_latency_ms),
+            "p50={}",
+            ep.p50_latency_ms
+        );
         assert!(ep.p95_latency_ms >= 94);
         assert!(ep.p99_latency_ms >= 98);
         assert_eq!(ep.max_latency_ms, 100);

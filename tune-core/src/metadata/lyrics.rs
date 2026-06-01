@@ -14,7 +14,10 @@ pub fn parse_lrc(content: &str) -> Vec<LrcLine> {
             continue;
         }
         // Skip metadata tags like [ti:Title], [ar:Artist]
-        if line.starts_with('[') && line.contains(':') && !line[1..].starts_with(|c: char| c.is_ascii_digit()) {
+        if line.starts_with('[')
+            && line.contains(':')
+            && !line[1..].starts_with(|c: char| c.is_ascii_digit())
+        {
             continue;
         }
         // Parse [mm:ss.xx] text

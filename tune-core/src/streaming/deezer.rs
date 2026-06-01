@@ -622,8 +622,7 @@ impl StreamingService for DeezerService {
             .send()
             .await
             .map_err(|e| format!("deezer create_playlist: {e}"))?;
-        let data: serde_json::Value =
-            resp.json().await.map_err(|e| format!("deezer json: {e}"))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("deezer json: {e}"))?;
         data["id"]
             .as_u64()
             .map(|id| id.to_string())
