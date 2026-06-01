@@ -360,6 +360,24 @@ INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tra
         name: "add_acoustid_columns",
         up: "",
     },
+    Migration {
+        version: 22,
+        name: "add_track_source_links",
+        up: "
+CREATE TABLE IF NOT EXISTS track_source_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    service TEXT NOT NULL,
+    service_track_id TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    match_method TEXT,
+    linked_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(track_id, service)
+);
+CREATE INDEX IF NOT EXISTS idx_track_source_links_track ON track_source_links(track_id);
+CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(service);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

@@ -230,6 +230,15 @@ pub(super) async fn track_lyrics(
     }
 }
 
+pub(super) async fn track_source_links(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let repo = tune_core::db::source_link_repo::SourceLinkRepo::new(state.db);
+    let links = repo.get_by_track(id).unwrap_or_default();
+    Json(json!({ "track_id": id, "links": links }))
+}
+
 pub(super) async fn identify_track(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<Value>,

@@ -9,6 +9,7 @@ pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
 pub mod settings_repo;
+pub mod source_link_repo;
 pub mod sqlite;
 pub mod tag_repo;
 pub mod track_repo;
