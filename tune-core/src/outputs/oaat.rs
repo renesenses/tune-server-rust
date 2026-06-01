@@ -123,8 +123,13 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
-            if let Err(e) = endpoint.clock_sync_bootstrap().await {
-                debug!(error = %e, "oaat: clock sync failed, continuing");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.clock_sync_bootstrap(),
+            ).await {
+                Ok(Ok(())) => info!(device = %device_name, "oaat: clock sync ok"),
+                Ok(Err(e)) => info!(device = %device_name, error = %e, "oaat: clock sync failed, continuing"),
+                Err(_) => info!(device = %device_name, "oaat: clock sync timed out (5s), continuing"),
             }
 
             let stream_id = "tune-stream";
@@ -239,13 +244,51 @@ impl OutputTarget for OaatOutput {
                 )
                 .await
             {
-                error!(error = %e, "oaat: format propose failed");
+                error!(device = %device_name, error = %e, "oaat: format propose send failed");
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
 
+            // Wait for endpoint to accept/counter/reject the format
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.response_rx.recv(),
+            ).await {
+                Ok(Some(oaat_controller::EndpointResponse::FormatAccept(fa))) => {
+                    info!(device = %device_name, stream_id = %fa.stream_id, "oaat: format accepted");
+                }
+                Ok(Some(oaat_controller::EndpointResponse::FormatCounter(fc))) => {
+                    info!(
+                        device = %device_name,
+                        rate = fc.sample_rate,
+                        bits = fc.bits_per_sample,
+                        "oaat: format counter-proposed, aborting (re-negotiation not yet implemented)"
+                    );
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Ok(Some(oaat_controller::EndpointResponse::FormatReject(fr))) => {
+                    error!(device = %device_name, reason = %fr.reason, "oaat: format rejected by endpoint");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Ok(Some(other)) => {
+                    info!(device = %device_name, response = ?other, "oaat: unexpected response to format propose");
+                }
+                Ok(None) => {
+                    error!(device = %device_name, "oaat: endpoint closed connection during format negotiation");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                Err(_) => {
+                    error!(device = %device_name, "oaat: format negotiation timed out (5s)");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+
             let fmt_str = format!("PCM {bits_per_sample}/{}", sample_rate / 1000);
-            endpoint
+            if let Err(e) = endpoint
                 .send_metadata(oaat_core::message::TrackMetadata {
                     title,
                     artist,
@@ -255,9 +298,16 @@ impl OutputTarget for OaatOutput {
                     format: Some(fmt_str),
                 })
                 .await
-                .ok();
+            {
+                error!(device = %device_name, error = %e, "oaat: send_metadata failed");
+            }
 
-            endpoint.send_play(stream_id).await.ok();
+            if let Err(e) = endpoint.send_play(stream_id).await {
+                error!(device = %device_name, error = %e, "oaat: send_play failed");
+                playing.store(false, Ordering::SeqCst);
+                return;
+            }
+            info!(device = %device_name, "oaat: play command sent, starting audio stream");
 
             let mut sample_offset: u64 = 0;
             let start = std::time::Instant::now();
@@ -315,7 +365,9 @@ impl OutputTarget for OaatOutput {
 
             endpoint.send_stop(stream_id).await.ok();
             playing.store(false, Ordering::SeqCst);
-            info!(device = %device_name, samples = sample_offset, "oaat: complete");
+            let duration_s = start.elapsed().as_secs_f64();
+            let packets = sample_offset / samples_per_packet as u64;
+            info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat: playback complete");
         });
 
         Ok(())
@@ -390,8 +442,9 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn is_available(&self) -> bool {
-        tokio::net::TcpStream::connect(self.endpoint_addr())
-            .await
-            .is_ok()
+        // mDNS-discovered endpoints are available by definition.
+        // Do NOT TCP-probe: a bare connect+close causes the endpoint
+        // to see a ghost session ("Disconnected. 0 packets").
+        true
     }
 }
