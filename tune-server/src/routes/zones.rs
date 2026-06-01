@@ -87,17 +87,15 @@ pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
     list_zones(State(state)).await
 }
 
-async fn get_zone_dsp(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db);
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
             "zone_id": id,
             "dsp_preset_id": preset_id,
             "dsp_enabled": enabled,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -111,7 +109,8 @@ async fn set_zone_dsp(
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
     let repo = ZoneRepo::new(state.db);
     match repo.update_dsp(id, preset_id, enabled) {
-        Ok(()) => Json(json!({"zone_id": id, "dsp_preset_id": preset_id, "dsp_enabled": enabled})).into_response(),
+        Ok(()) => Json(json!({"zone_id": id, "dsp_preset_id": preset_id, "dsp_enabled": enabled}))
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

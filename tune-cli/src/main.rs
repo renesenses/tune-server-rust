@@ -178,11 +178,7 @@ async fn main() {
                 .post(&format!("/zones/{zone}/pause"), json!({}))
                 .await
         }
-        Commands::Next { zone } => {
-            client
-                .post(&format!("/zones/{zone}/next"), json!({}))
-                .await
-        }
+        Commands::Next { zone } => client.post(&format!("/zones/{zone}/next"), json!({})).await,
         Commands::Volume { zone, level } => {
             client
                 .post(
@@ -203,11 +199,7 @@ async fn main() {
         Commands::Scan => client.post("/system/scan", json!({})).await,
         Commands::Stats => client.get("/system/stats").await,
         Commands::NowPlaying { zone } => client.get(&format!("/zones/{zone}")).await,
-        Commands::History { limit } => {
-            client
-                .get(&format!("/history?limit={limit}"))
-                .await
-        }
+        Commands::History { limit } => client.get(&format!("/history?limit={limit}")).await,
         Commands::Oaat => client.get("/system/diagnostics/oaat").await,
         Commands::Completions { .. } => unreachable!(),
     };

@@ -350,16 +350,25 @@ pub(super) async fn merge_duplicate_albums_route(
 }
 
 const VARIANT_PATTERNS: &[&str] = &[
-    "deluxe", "remastered", "remaster", "anniversary", "expanded",
-    "special edition", "collector", "bonus track", "super deluxe",
-    "legacy edition", "platinum edition",
+    "deluxe",
+    "remastered",
+    "remaster",
+    "anniversary",
+    "expanded",
+    "special edition",
+    "collector",
+    "bonus track",
+    "super deluxe",
+    "legacy edition",
+    "platinum edition",
 ];
 
 fn strip_variant_suffix(title: &str) -> String {
     let lower = title.to_lowercase();
     for pat in VARIANT_PATTERNS {
         if let Some(pos) = lower.find(pat) {
-            let prefix = title[..pos].trim_end_matches(|c: char| c == '(' || c == '[' || c == '-' || c == ' ');
+            let prefix = title[..pos]
+                .trim_end_matches(|c: char| c == '(' || c == '[' || c == '-' || c == ' ');
             if !prefix.is_empty() {
                 return prefix.to_string();
             }
@@ -368,9 +377,7 @@ fn strip_variant_suffix(title: &str) -> String {
     title.to_string()
 }
 
-pub(super) async fn albums_grouped(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let repo = AlbumRepo::new(state.db.clone());
 
     // Group by MusicBrainz release group ID

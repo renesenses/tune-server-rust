@@ -182,8 +182,10 @@ impl OutputTarget for OaatMultiroomOutput {
                 }
             };
 
-            let mut stream: futures_util::stream::BoxStream<'_, Result<bytes::Bytes, reqwest::Error>> =
-                Box::pin(resp.bytes_stream());
+            let mut stream: futures_util::stream::BoxStream<
+                '_,
+                Result<bytes::Bytes, reqwest::Error>,
+            > = Box::pin(resp.bytes_stream());
             let mut buf = Vec::new();
 
             while buf.len() < 128 {
@@ -213,9 +215,17 @@ impl OutputTarget for OaatMultiroomOutput {
             let ch = si.channels.min(8) as u8;
             let layout = ChannelLayout::Stereo;
             let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
-            let packet_size = if is_flac { FLAC_CHUNK_SIZE } else { PCM_SAMPLES_PER_PACKET * bytes_per_frame };
+            let packet_size = if is_flac {
+                FLAC_CHUNK_SIZE
+            } else {
+                PCM_SAMPLES_PER_PACKET * bytes_per_frame
+            };
 
-            let track_duration_ms = if track_duration_ms > 0 { track_duration_ms } else { si.duration_ms };
+            let track_duration_ms = if track_duration_ms > 0 {
+                track_duration_ms
+            } else {
+                si.duration_ms
+            };
             duration_ms_arc.store(track_duration_ms, Ordering::SeqCst);
 
             info!(
@@ -224,7 +234,17 @@ impl OutputTarget for OaatMultiroomOutput {
                 "oaat-multiroom: format detected"
             );
 
-            if let Err(e) = zone.propose_format_all(&stream_id, cur_format, cur_sample_rate, ch, layout, cur_bits as u8).await {
+            if let Err(e) = zone
+                .propose_format_all(
+                    &stream_id,
+                    cur_format,
+                    cur_sample_rate,
+                    ch,
+                    layout,
+                    cur_bits as u8,
+                )
+                .await
+            {
                 error!(device = %device_name, error = %e, "oaat-multiroom: format negotiation failed");
                 playing.store(false, Ordering::SeqCst);
                 return;
@@ -232,11 +252,15 @@ impl OutputTarget for OaatMultiroomOutput {
 
             let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
             zone.send_metadata_all(oaat_core::message::TrackMetadata {
-                title, artist, album,
+                title,
+                artist,
+                album,
                 duration_ms: track_duration_ms,
                 artwork_url: cover_url,
                 format: Some(fmt_str),
-            }).await.ok();
+            })
+            .await
+            .ok();
 
             if let Err(e) = zone.play_all(&stream_id).await {
                 error!(device = %device_name, error = %e, "oaat-multiroom: play failed");
@@ -319,7 +343,11 @@ impl OutputTarget for OaatMultiroomOutput {
             zone.stop_all(&stream_id).await.ok();
             playing.store(false, Ordering::SeqCst);
             let duration_s = start.elapsed().as_secs_f64();
-            let packets = if is_flac { byte_offset / FLAC_CHUNK_SIZE as u64 } else { sample_offset / PCM_SAMPLES_PER_PACKET as u64 };
+            let packets = if is_flac {
+                byte_offset / FLAC_CHUNK_SIZE as u64
+            } else {
+                sample_offset / PCM_SAMPLES_PER_PACKET as u64
+            };
             info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat-multiroom: complete");
         });
 

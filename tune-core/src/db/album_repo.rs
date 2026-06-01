@@ -278,10 +278,7 @@ impl AlbumRepo {
                 groups.entry(gid.clone()).or_default().push(album);
             }
         }
-        Ok(groups
-            .into_iter()
-            .filter(|(_, v)| v.len() > 1)
-            .collect())
+        Ok(groups.into_iter().filter(|(_, v)| v.len() > 1).collect())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, String> {

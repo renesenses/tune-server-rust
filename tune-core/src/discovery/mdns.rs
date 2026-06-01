@@ -149,10 +149,7 @@ impl MdnsScanner {
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into());
 
-        let properties = [
-            ("version", version),
-            ("path", "/api/v1"),
-        ];
+        let properties = [("version", version), ("path", "/api/v1")];
 
         let svc = ServiceInfo::new(
             TUNE_SERVICE,

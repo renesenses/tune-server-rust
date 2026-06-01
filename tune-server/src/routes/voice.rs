@@ -17,7 +17,7 @@ pub async fn voice_search(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": "TUNE_OPENAI_API_KEY not configured"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -28,7 +28,7 @@ pub async fn voice_search(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "audio field required (base64-encoded)"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -40,7 +40,7 @@ pub async fn voice_search(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid base64 audio"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -55,7 +55,10 @@ pub async fn voice_search(
         .http_client
         .post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .body(body_bytes)
         .send()
         .await;
@@ -68,7 +71,7 @@ pub async fn voice_search(
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": format!("whisper parse: {e}")})),
                 )
-                    .into_response()
+                    .into_response();
             }
         },
         Err(e) => {
@@ -76,7 +79,7 @@ pub async fn voice_search(
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("whisper: {e}")})),
             )
-                .into_response()
+                .into_response();
         }
     };
 

@@ -160,11 +160,7 @@ impl ZoneRepo {
         let en = if enabled { 1i64 } else { 0i64 };
         self.db.execute(
             "UPDATE zones SET dsp_preset_id = ?, dsp_enabled = ? WHERE id = ?",
-            &[
-                &preset_id as &dyn rusqlite::types::ToSql,
-                &en,
-                &id,
-            ],
+            &[&preset_id as &dyn rusqlite::types::ToSql, &en, &id],
         )?;
         Ok(())
     }

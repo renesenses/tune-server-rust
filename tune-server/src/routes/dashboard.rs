@@ -157,7 +157,9 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
 fn is_consecutive_days(a: &str, b: &str) -> bool {
     fn to_days(s: &str) -> Option<i64> {
         let parts: Vec<&str> = s.split('-').collect();
-        if parts.len() != 3 { return None; }
+        if parts.len() != 3 {
+            return None;
+        }
         let y: i64 = parts[0].parse().ok()?;
         let m: i64 = parts[1].parse().ok()?;
         let d: i64 = parts[2].parse().ok()?;

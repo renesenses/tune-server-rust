@@ -258,10 +258,9 @@ mod tests {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 8192];
                 loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        s.recv(&mut buf),
-                    ).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), s.recv(&mut buf))
+                        .await
+                    {
                         Ok(Ok(n)) if n >= AUDIO_HEADER_SIZE => {
                             pc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -276,7 +275,9 @@ mod tests {
             let mut buf = [0u8; 64];
             loop {
                 match clock_udp.recv_from(&mut buf).await {
-                    Ok((n, peer)) if n >= 28 => { let _ = clock_udp.send_to(&buf[..n], peer).await; }
+                    Ok((n, peer)) if n >= 28 => {
+                        let _ = clock_udp.send_to(&buf[..n], peer).await;
+                    }
                     _ => break,
                 }
             }
@@ -284,9 +285,11 @@ mod tests {
 
         // Mock endpoint
         let mock = tokio::spawn(async move {
-            if let Ok((mut stream, _)) = tokio::time::timeout(
-                std::time::Duration::from_secs(5), tcp.accept()
-            ).await.unwrap_or(Err(std::io::Error::other("timeout"))) {
+            if let Ok((mut stream, _)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tcp.accept())
+                    .await
+                    .unwrap_or(Err(std::io::Error::other("timeout")))
+            {
                 let mut codec = FrameCodec::new();
                 let mut read_buf = [0u8; 8192];
                 let n = stream.read(&mut read_buf).await.unwrap_or(0);
@@ -298,12 +301,18 @@ mod tests {
                             endpoint_id: "mock-ep".into(),
                             endpoint_name: "Mock DAC".into(),
                             capabilities: EndpointCapabilities {
-                                pcm_max_rate: 192000, pcm_max_bits: 32,
-                                dsd_max_rate: None, channels_max: 2,
+                                pcm_max_rate: 192000,
+                                pcm_max_bits: 32,
+                                dsd_max_rate: None,
+                                channels_max: 2,
                                 formats: vec![oaat_core::format::AudioFormat::PcmS16le],
-                                volume: None, gapless: true, seek: false,
+                                volume: None,
+                                gapless: true,
+                                seek: false,
                             },
-                            audio_port, clock_port, buffer_size_ms: 100,
+                            audio_port,
+                            clock_port,
+                            buffer_size_ms: 100,
                         });
                         let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
 
@@ -312,7 +321,9 @@ mod tests {
                             let n = match tokio::time::timeout(
                                 std::time::Duration::from_secs(15),
                                 stream.read(&mut read_buf),
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                                 Ok(Ok(n)) => n,
                             };
@@ -369,14 +380,22 @@ mod tests {
         });
 
         let output = OaatOutput::new(
-            "Mock DAC".into(), "127.0.0.1".into(), control_port, "mock-ep".into(),
+            "Mock DAC".into(),
+            "127.0.0.1".into(),
+            control_port,
+            "mock-ep".into(),
         );
 
         let url = format!("http://127.0.0.1:{http_port}/test.wav");
-        output.play_media(&PlayMedia {
-            url: &url, mime_type: "audio/wav", title: Some("Load Test"),
-            ..Default::default()
-        }).await.unwrap();
+        output
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/wav",
+                title: Some("Load Test"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         // Wait for streaming to complete (5s audio + margin)
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -392,10 +411,7 @@ mod tests {
 
         // Position should be near 5000ms
         let pos = diag["position_ms"].as_u64().unwrap_or(0);
-        assert!(
-            pos >= 4000,
-            "position should be near 5000ms, got {pos}ms"
-        );
+        assert!(pos >= 4000, "position should be near 5000ms, got {pos}ms");
 
         // No stall detected
         assert!(
