@@ -68,7 +68,11 @@ async fn siri_play_radio(
     State(state): State<AppState>,
     Json(body): Json<PlayRadioBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     let pattern = format!("%{}%", body.name);
     let station: Option<Value> = conn
@@ -111,7 +115,11 @@ async fn siri_play_playlist(
     State(state): State<AppState>,
     Json(body): Json<PlayPlaylistBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     let pattern = format!("%{}%", body.name);
     let playlist: Option<Value> = conn
@@ -154,7 +162,11 @@ async fn siri_play_album(
     State(state): State<AppState>,
     Json(body): Json<PlayAlbumBody>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     let title_pattern = format!("%{}%", body.title);
     let album: Option<Value> = if let Some(ref artist) = body.artist {
@@ -263,7 +275,11 @@ async fn voice_command(
     // "play X" -> search and play
     if let Some(query) = text.strip_prefix("play ") {
         let query = query.trim();
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         let pattern = format!("%{query}%");
 
         let track: Option<Value> = conn

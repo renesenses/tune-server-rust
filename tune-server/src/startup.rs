@@ -4,8 +4,8 @@ use tracing::info;
 
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
-use crate::state::AppState;
 use crate::config::TuneConfig;
+use crate::state::AppState;
 
 /// Restore zone volumes from DB and persist config settings to DB.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
@@ -110,8 +110,7 @@ pub async fn register_local_outputs(state: &AppState) {
                 };
                 let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
                 if !name_taken
-                    && let Ok(zid) =
-                        zone_repo.create(&zone_name, Some("local"), Some(&device_id))
+                    && let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(&device_id))
                 {
                     info!(
                         name = %zone_name,

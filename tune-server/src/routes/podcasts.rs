@@ -40,7 +40,11 @@ async fn search_podcasts(Query(q): Query<SearchQuery>) -> Json<Value> {
 }
 
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, feed_url, title, author, image_url, description FROM podcast_subscriptions ORDER BY title")
         .and_then(|mut stmt| {
@@ -107,7 +111,11 @@ async fn podcast_episodes(
 ) -> Result<impl IntoResponse, AppError> {
     // Try to find feed URL from subscriptions (by ID first, then by title slug)
     let feed_url = {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         if let Ok(id) = podcast_id.parse::<i64>() {
             conn.query_row(
                 "SELECT feed_url FROM podcast_subscriptions WHERE id = ?",

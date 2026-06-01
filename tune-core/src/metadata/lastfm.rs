@@ -1,4 +1,3 @@
-
 const LASTFM_API: &str = "https://ws.audioscrobbler.com/2.0/";
 
 #[derive(Debug, Clone, Default)]

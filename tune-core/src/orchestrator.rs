@@ -804,11 +804,7 @@ impl PlaybackOrchestrator {
         Ok(result)
     }
 
-    pub async fn advance_queue_metadata(
-        &self,
-        zone_id: i64,
-        position: i64,
-    ) -> Result<(), String> {
+    pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
         let queue_repo = PlayQueueRepo::new(self.db.clone());
         queue_repo.set_current(zone_id, position).ok();
 

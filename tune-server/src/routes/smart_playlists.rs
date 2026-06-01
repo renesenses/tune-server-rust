@@ -51,7 +51,11 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists ORDER BY name")
         .and_then(|mut stmt| {
@@ -84,7 +88,11 @@ async fn create_smart_playlist(
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
     let result = {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         conn.execute(
             "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)",
             rusqlite::params![body.name, rules_json, sort_by, sort_order, body.max_tracks],
@@ -113,7 +121,11 @@ async fn get_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?",
         rusqlite::params![id],
@@ -308,8 +320,13 @@ fn execute_smart_track_query(
         play_count_join, where_clause, order, limit_clause
     );
 
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn.prepare(&sql)
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn
+        .prepare(&sql)
         .and_then(|mut stmt| {
             stmt.query_map([], |row| {
                 Ok(json!({
@@ -331,24 +348,35 @@ fn execute_smart_track_query(
 }
 
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
-fn load_smart_criteria(state: &AppState, id: i64) -> Result<Option<(String, String, String, Option<i64>)>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn.query_row(
-        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
-                row.get::<_, String>(1).unwrap_or_else(|_| "title".into()),
-                row.get::<_, String>(2).unwrap_or_else(|_| "asc".into()),
-                row.get::<_, Option<i64>>(3).ok().flatten(),
-            ))
-        },
-    )
-    .ok())
+fn load_smart_criteria(
+    state: &AppState,
+    id: i64,
+) -> Result<Option<(String, String, String, Option<i64>)>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn
+        .query_row(
+            "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
+                    row.get::<_, String>(1).unwrap_or_else(|_| "title".into()),
+                    row.get::<_, String>(2).unwrap_or_else(|_| "asc".into()),
+                    row.get::<_, Option<i64>>(3).ok().flatten(),
+                ))
+            },
+        )
+        .ok())
 }
 
-async fn resolve_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+async fn resolve_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
     let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)?
     else {
         return Ok(StatusCode::NOT_FOUND.into_response());

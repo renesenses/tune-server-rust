@@ -55,7 +55,9 @@ async fn enable_connect(
 
     let settings = SettingsRepo::new(state.db);
     settings.set("spotify_connect_enabled", "true").ok();
-    settings.set("spotify_connect_zone_id", &zone_id.to_string()).ok();
+    settings
+        .set("spotify_connect_zone_id", &zone_id.to_string())
+        .ok();
 
     Json(json!({"enabled": true, "zone_id": zone_id}))
 }

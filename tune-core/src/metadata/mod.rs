@@ -1,14 +1,14 @@
-pub mod enrichment;
-pub mod matcher;
-pub mod suggestions;
-pub mod batch;
-pub mod musicbrainz_release;
-pub mod lastfm;
 pub mod artist_enrichment;
-pub mod credit_enricher;
-pub mod tag_writer;
 pub mod auto_fix;
+pub mod batch;
+pub mod credit_enricher;
+pub mod enrichment;
 pub mod fingerprint;
+pub mod lastfm;
+pub mod matcher;
+pub mod musicbrainz_release;
+pub mod suggestions;
+pub mod tag_writer;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

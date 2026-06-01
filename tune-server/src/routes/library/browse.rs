@@ -1,8 +1,8 @@
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -25,7 +25,11 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
@@ -73,14 +77,20 @@ pub(super) async fn browse_directory(
         resolved.starts_with(&norm_dir)
     });
     let Some(music_root) = music_root else {
-        return Err(AppError::bad_request("path not under a configured music directory"));
+        return Err(AppError::bad_request(
+            "path not under a configured music directory",
+        ));
     };
     let music_root = tune_core::scanner::walker::normalize_path(music_root);
 
     // List subdirectories
     let mut subdirs: Vec<Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&q.path) {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -113,7 +123,11 @@ pub(super) async fn browse_directory(
     });
 
     // List tracks in this directory (not recursive — only direct children)
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Use a LIKE pattern that matches the directory prefix and filter in app
     // for direct children only.
     let dir_prefix = format!("{}%", q.path);

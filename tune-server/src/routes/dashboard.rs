@@ -97,7 +97,11 @@ async fn listening_history(
 }
 
 async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect raw genre + genres columns from tracks
     let raw: Vec<(Option<String>, Option<String>)> = conn
         .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")

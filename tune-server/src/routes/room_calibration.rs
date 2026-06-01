@@ -37,10 +37,7 @@ fn load_profiles(state: &AppState) -> Vec<Value> {
 fn save_profiles(state: &AppState, profiles: &[Value]) -> Result<(), AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     settings
-        .set(
-            "room_cal_profiles",
-            &serde_json::to_string(profiles)?,
-        )
+        .set("room_cal_profiles", &serde_json::to_string(profiles)?)
         .ok();
     Ok(())
 }

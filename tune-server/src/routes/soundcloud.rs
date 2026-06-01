@@ -104,7 +104,14 @@ async fn sc_track(State(state): State<AppState>, Path(id): Path<String>) -> impl
         return not_configured().into_response();
     };
 
-    match sc_get(&state.http_client, &client_id, &format!("/tracks/{id}"), &[]).await {
+    match sc_get(
+        &state.http_client,
+        &client_id,
+        &format!("/tracks/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -117,7 +124,14 @@ async fn sc_stream_url(State(state): State<AppState>, Path(id): Path<String>) ->
 
     // SoundCloud stream URLs require fetching the track first, then resolving the
     // transcodings/media URL. For now, return the expected structure with the API URL.
-    match sc_get(&state.http_client, &client_id, &format!("/tracks/{id}"), &[]).await {
+    match sc_get(
+        &state.http_client,
+        &client_id,
+        &format!("/tracks/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(track) => {
             let stream = track
                 .pointer("/media/transcodings")
@@ -186,7 +200,14 @@ async fn sc_playlist(State(state): State<AppState>, Path(id): Path<String>) -> i
         return not_configured().into_response();
     };
 
-    match sc_get(&state.http_client, &client_id, &format!("/playlists/{id}"), &[]).await {
+    match sc_get(
+        &state.http_client,
+        &client_id,
+        &format!("/playlists/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }

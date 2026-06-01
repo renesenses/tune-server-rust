@@ -21,7 +21,11 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn sync_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let track_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
         .unwrap_or(0);
@@ -184,7 +188,11 @@ async fn push_to_peer(
 }
 
 fn build_manifest(state: &AppState) -> Result<Value, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let tracks: Vec<Value> = conn
         .prepare(
             "SELECT id, path, title, artist_name, album_title, genre, year, duration, \

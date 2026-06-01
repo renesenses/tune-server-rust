@@ -40,7 +40,6 @@ fn lb_username(state: &AppState) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-
 async fn lb_status(State(state): State<AppState>) -> Json<Value> {
     let token_set = lb_token(&state).is_some();
     let username = lb_username(&state);
@@ -133,7 +132,11 @@ async fn update_now_playing(
     }
 }
 
-async fn lb_submit(client: &reqwest::Client, token: &str, payload: &Value) -> Result<Value, String> {
+async fn lb_submit(
+    client: &reqwest::Client,
+    token: &str,
+    payload: &Value,
+) -> Result<Value, String> {
     let resp = client
         .post(format!("{LB_API}/1/submit-listens"))
         .header("Authorization", format!("Token {token}"))

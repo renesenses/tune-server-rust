@@ -1,9 +1,9 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -149,7 +149,10 @@ pub(super) async fn update_config(
     let settings = SettingsRepo::new(state.db);
     for (key, value) in body.0 {
         let str_val = if value.is_string() {
-            value.as_str().ok_or_else(|| AppError::bad_request("expected string"))?.to_string()
+            value
+                .as_str()
+                .ok_or_else(|| AppError::bad_request("expected string"))?
+                .to_string()
         } else {
             value.to_string()
         };
@@ -165,7 +168,10 @@ pub(super) struct ThemeRequest {
     theme: String,
 }
 
-pub(super) async fn set_theme(State(state): State<AppState>, Json(body): Json<ThemeRequest>) -> Json<Value> {
+pub(super) async fn set_theme(
+    State(state): State<AppState>,
+    Json(body): Json<ThemeRequest>,
+) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set("theme", &body.theme).ok();
     Json(json!({ "theme": body.theme }))
@@ -202,7 +208,10 @@ pub(super) struct SetMode {
     mode: String,
 }
 
-pub(super) async fn set_mode(State(state): State<AppState>, Json(body): Json<SetMode>) -> Json<Value> {
+pub(super) async fn set_mode(
+    State(state): State<AppState>,
+    Json(body): Json<SetMode>,
+) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     settings.set("server_mode", &body.mode).ok();
     Json(json!({ "mode": body.mode }))
@@ -230,7 +239,10 @@ pub(super) async fn import_config(
     let mut imported = 0;
     for (key, value) in body {
         let str_val = if value.is_string() {
-            value.as_str().ok_or_else(|| AppError::bad_request("expected string"))?.to_string()
+            value
+                .as_str()
+                .ok_or_else(|| AppError::bad_request("expected string"))?
+                .to_string()
         } else {
             value.to_string()
         };

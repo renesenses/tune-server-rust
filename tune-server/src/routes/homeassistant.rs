@@ -29,7 +29,6 @@ fn ha_settings(state: &AppState) -> (Option<String>, Option<String>) {
     (url, token)
 }
 
-
 async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
     let (url, token) = ha_settings(&state);
     let (Some(url), Some(token)) = (url, token) else {
@@ -40,7 +39,13 @@ async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
         }))
         .into_response();
     };
-    match state.http_client.get(format!("{url}/api/")).bearer_auth(&token).send().await {
+    match state
+        .http_client
+        .get(format!("{url}/api/"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!({}));
             Json(json!({
@@ -110,7 +115,13 @@ async fn ha_entities(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state.http_client.get(format!("{url}/api/states")).bearer_auth(&token).send().await {
+    match state
+        .http_client
+        .get(format!("{url}/api/states"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             Json(body).into_response()
@@ -144,7 +155,8 @@ async fn ha_entity_state(
         )
             .into_response();
     };
-    match state.http_client
+    match state
+        .http_client
         .get(format!("{url}/api/states/{entity_id}"))
         .bearer_auth(&token)
         .send()
@@ -194,7 +206,14 @@ async fn ha_call_service(
         obj.insert("entity_id".into(), json!(entity_id));
     }
     let api_url = format!("{url}/api/services/{}/{}", body.domain, body.service);
-    match state.http_client.post(&api_url).bearer_auth(&token).json(&payload).send().await {
+    match state
+        .http_client
+        .post(&api_url)
+        .bearer_auth(&token)
+        .json(&payload)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let result: Value = resp.json().await.unwrap_or(json!([]));
             Json(json!({"success": true, "result": result})).into_response()
@@ -225,7 +244,13 @@ async fn ha_media_players(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state.http_client.get(format!("{url}/api/states")).bearer_auth(&token).send().await {
+    match state
+        .http_client
+        .get(format!("{url}/api/states"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             let players: Vec<&Value> = body
@@ -263,7 +288,13 @@ async fn ha_automations(State(state): State<AppState>) -> impl IntoResponse {
         )
             .into_response();
     };
-    match state.http_client.get(format!("{url}/api/states")).bearer_auth(&token).send().await {
+    match state
+        .http_client
+        .get(format!("{url}/api/states"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             let body: Value = resp.json().await.unwrap_or(json!([]));
             let automations: Vec<&Value> = body
@@ -310,7 +341,8 @@ async fn ha_trigger_automation(
             .into_response();
     };
     let payload = json!({"entity_id": body.entity_id});
-    match state.http_client
+    match state
+        .http_client
         .post(format!("{url}/api/services/automation/trigger"))
         .bearer_auth(&token)
         .json(&payload)

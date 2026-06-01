@@ -1,11 +1,11 @@
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::rating_repo::RatingRepo;
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::rating_repo::RatingRepo;
 
 #[derive(Deserialize)]
 pub(super) struct ExportRatingQuery {
@@ -30,7 +30,11 @@ pub(super) async fn export_ratings(
     Query(q): Query<ExportRatingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let profile_id = q.profile_id.unwrap_or(1);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT r.album_id, a.title, ar.name, r.rating, r.note, r.created_at \

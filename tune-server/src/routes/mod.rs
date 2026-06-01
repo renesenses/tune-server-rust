@@ -391,9 +391,10 @@ pub fn router(state: AppState) -> Router {
         ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
-    let upnp_routes = state.upnp.as_ref().map(|upnp_state| tune_core::upnp_server::standalone_router(
-            upnp_state.clone(),
-        ));
+    let upnp_routes = state
+        .upnp
+        .as_ref()
+        .map(|upnp_state| tune_core::upnp_server::standalone_router(upnp_state.clone()));
 
     let deezer_proxy = axum::Router::new()
         .route(
@@ -427,32 +428,30 @@ pub fn router(state: AppState) -> Router {
     };
 
     let index_path = format!("{web_dir}/index.html");
-    
 
-    app
-        .route(
-            "/",
-            get(move || async move {
-                match tokio::fs::read(&index_path).await {
-                    Ok(html) => {
-                        let mut headers = axum::http::HeaderMap::new();
-                        headers.insert(
-                            axum::http::header::CONTENT_TYPE,
-                            axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
-                        );
-                        headers.insert(
-                            axum::http::header::CACHE_CONTROL,
-                            axum::http::HeaderValue::from_static("no-cache, must-revalidate"),
-                        );
-                        (headers, html).into_response()
-                    }
-                    Err(_) => StatusCode::NOT_FOUND.into_response(),
+    app.route(
+        "/",
+        get(move || async move {
+            match tokio::fs::read(&index_path).await {
+                Ok(html) => {
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+                    );
+                    headers.insert(
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-cache, must-revalidate"),
+                    );
+                    (headers, html).into_response()
                 }
-            }),
-        )
-        .fallback_service(
-            ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
-        )
-        .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive())
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }),
+    )
+    .fallback_service(
+        ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
+    )
+    .layer(CompressionLayer::new())
+    .layer(CorsLayer::permissive())
 }

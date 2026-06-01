@@ -34,10 +34,8 @@ pub fn spawn_ssdp_handler(
         while let Some(event) = ssdp_rx.recv().await {
             match event {
                 SsdpEvent::DeviceDiscovered(dev) => {
-                    handle_ssdp_discovered(
-                        &dev, &outputs, &db, &config, &event_bus, &oh_listener,
-                    )
-                    .await;
+                    handle_ssdp_discovered(&dev, &outputs, &db, &config, &event_bus, &oh_listener)
+                        .await;
                 }
                 SsdpEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
@@ -154,12 +152,11 @@ async fn handle_ssdp_discovered(
         } else {
             short_name.to_string()
         };
-        let type_str =
-            if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
-                "openhome"
-            } else {
-                "dlna"
-            };
+        let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
+            "openhome"
+        } else {
+            "dlna"
+        };
         if let Ok(zid) = zone_repo.create(&zone_name, Some(type_str), Some(&dev.id)) {
             info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "zone_auto_created");
         }
@@ -169,9 +166,7 @@ async fn handle_ssdp_discovered(
 /// Spawn the mDNS handler that registers Chromecast/AirPlay/BluOS/OAAT/Squeezebox outputs.
 ///
 /// Returns the `MdnsScanner` handle (must be kept alive for the scanner to keep running).
-pub fn spawn_mdns_handler(
-    state: &AppState,
-) -> Option<tune_core::discovery::mdns::MdnsScanner> {
+pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns::MdnsScanner> {
     let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
     let handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
         let mut mdns = mdns
@@ -237,9 +232,8 @@ pub fn spawn_mdns_handler(
                             (Some(Box::new(oaat)), "oaat")
                         }
                         OutputType::Squeezebox => {
-                            let settings = tune_core::db::settings_repo::SettingsRepo::new(
-                                db.clone(),
-                            );
+                            let settings =
+                                tune_core::db::settings_repo::SettingsRepo::new(db.clone());
                             let current = settings
                                 .get("squeezebox_host")
                                 .ok()
@@ -261,8 +255,7 @@ pub fn spawn_mdns_handler(
                         reg.register(output);
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
-                        let zone_repo =
-                            tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+                        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
                         let existing = zone_repo.list().unwrap_or_default();
                         let already_by_device = existing
                             .iter()

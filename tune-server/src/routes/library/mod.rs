@@ -12,8 +12,8 @@ mod search;
 mod stats;
 mod tracks;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -127,14 +127,23 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/quick-fav", post(tracks::quick_fav_track))
         .route("/albums/{id}/quick-fav", post(albums::quick_fav_album))
-        .route("/genre-tree", get(genres::genre_tree).put(genres::update_genre_tree))
+        .route(
+            "/genre-tree",
+            get(genres::genre_tree).put(genres::update_genre_tree),
+        )
         .route("/albums/top-rated", get(albums::top_rated_albums))
         .route("/albums/{id}/rate", post(albums::rate_album))
         .route("/albums/{id}/rating", get(albums::get_album_rating))
         .route("/tracks/{id}/credits", get(credits::track_credits))
         .route("/artists/{id}/credits", get(credits::artist_credits))
-        .route("/tracks/{id}/credits/enrich", post(credits::enrich_track_credits))
-        .route("/albums/{id}/credits/enrich", post(credits::enrich_album_credits))
+        .route(
+            "/tracks/{id}/credits/enrich",
+            post(credits::enrich_track_credits),
+        )
+        .route(
+            "/albums/{id}/credits/enrich",
+            post(credits::enrich_album_credits),
+        )
         .route("/enrich-credits", post(credits::enrich_all_credits))
         .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
         .route("/browse", get(browse::browse_roots))
@@ -149,22 +158,37 @@ pub fn router() -> Router<AppState> {
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
         .route("/albums/{id}/artwork", get(artwork::album_artwork))
-        .route("/albums/{id}/artwork/enrich", post(artwork::enrich_album_artwork))
+        .route(
+            "/albums/{id}/artwork/enrich",
+            post(artwork::enrich_album_artwork),
+        )
         .route("/artwork/enrich", post(artwork::batch_enrich_artwork))
-        .route("/artwork/enrich/status", get(artwork::batch_enrich_artwork_status))
+        .route(
+            "/artwork/enrich/status",
+            get(artwork::batch_enrich_artwork_status),
+        )
         .route("/duplicates", get(duplicates::list_duplicates))
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
         .route("/albums/{id}/bio", get(albums::album_bio))
         .route("/albums/{id}/similar", get(albums::album_similar))
-        .route("/albums/{id}/artwork/rescan", post(artwork::rescan_album_artwork))
+        .route(
+            "/albums/{id}/artwork/rescan",
+            post(artwork::rescan_album_artwork),
+        )
         .route(
             "/albums/merge-duplicates",
             post(albums::merge_duplicate_albums_route),
         )
         .route("/artists/{id}/timeline", get(artists::artist_timeline))
-        .route("/artists/{id}/image/upload", post(artists::artist_image_upload))
-        .route("/artists/{id}/image/report", post(artists::artist_image_report))
+        .route(
+            "/artists/{id}/image/upload",
+            post(artists::artist_image_upload),
+        )
+        .route(
+            "/artists/{id}/image/report",
+            post(artists::artist_image_report),
+        )
         .route("/tracks/{id}/lyrics", get(tracks::track_lyrics))
         .route("/ratings/export", get(ratings::export_ratings))
         .route("/ratings/import", post(ratings::import_ratings))
@@ -180,9 +204,13 @@ pub fn router() -> Router<AppState> {
             "/collections/{id}",
             get(collections::get_collection).delete(collections::delete_collection),
         )
-        .route("/collections/{id}/albums", get(collections::collection_albums))
+        .route(
+            "/collections/{id}/albums",
+            get(collections::collection_albums),
+        )
         .route(
             "/collections/{id}/albums/{album_id}",
-            post(collections::add_album_to_collection).delete(collections::remove_album_from_collection),
+            post(collections::add_album_to_collection)
+                .delete(collections::remove_album_from_collection),
         )
 }

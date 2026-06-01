@@ -193,7 +193,10 @@ async fn update_preset(
 }
 
 /// Delete a preset.
-async fn delete_preset(State(state): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, AppError> {
+async fn delete_preset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
     let mut presets = load_presets(&state);
     let before = presets.len();
     presets.retain(|p| p["id"].as_str() != Some(&id));
@@ -273,7 +276,10 @@ struct SetBandsBody {
 }
 
 /// Set EQ bands directly (updates active preset or creates a transient one).
-async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>) -> Result<Json<Value>, AppError> {
+async fn set_bands(
+    State(state): State<AppState>,
+    Json(body): Json<SetBandsBody>,
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
 
@@ -290,10 +296,7 @@ async fn set_bands(State(state): State<AppState>, Json(body): Json<SetBandsBody>
     }
 
     settings
-        .set(
-            "eq_current_bands",
-            &serde_json::to_string(&bands_json)?,
-        )
+        .set("eq_current_bands", &serde_json::to_string(&bands_json)?)
         .ok();
 
     Ok(Json(json!({
@@ -394,7 +397,10 @@ struct GraphicBody {
 }
 
 /// Set graphic EQ bands.
-async fn set_graphic(State(state): State<AppState>, Json(body): Json<GraphicBody>) -> Result<Json<Value>, AppError> {
+async fn set_graphic(
+    State(state): State<AppState>,
+    Json(body): Json<GraphicBody>,
+) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut current: Value = settings
         .get("eq_graphic")
@@ -443,10 +449,7 @@ async fn apply_room_correction(
     });
 
     settings
-        .set(
-            "eq_room_correction",
-            &serde_json::to_string(&correction)?,
-        )
+        .set("eq_room_correction", &serde_json::to_string(&correction)?)
         .ok();
 
     Ok(Json(correction).into_response())

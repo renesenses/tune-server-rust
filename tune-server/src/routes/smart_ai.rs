@@ -242,8 +242,40 @@ async fn mood_playlist(
         .db
         .read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
-            let rows =
-                stmt.query_map(rusqlite::params![bpm_min, bpm_max, limit], |row| {
+            let rows = stmt.query_map(rusqlite::params![bpm_min, bpm_max, limit], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
+                    "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
+                    "genre": row.get::<_, Option<String>>(5).ok().flatten(),
+                    "year": row.get::<_, Option<i32>>(6).ok().flatten(),
+                    "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
+                    "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
+                }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "smart_ai_mood_query_failed");
+            vec![]
+        });
+
+    // If genre filter returned too few results, fall back to BPM-only
+    let tracks = if tracks.len() < 5 {
+        let fallback_sql = "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm, al.cover_path \
+             FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE (t.bpm IS NULL OR t.bpm BETWEEN ? AND ?) \
+             ORDER BY RANDOM() \
+             LIMIT ?";
+        state
+            .db
+            .read(|conn| {
+                let mut stmt = conn.prepare(fallback_sql)?;
+                let rows = stmt.query_map(rusqlite::params![bpm_min, bpm_max, limit], |row| {
                     Ok(json!({
                         "id": row.get::<_, Option<i64>>(0).ok().flatten(),
                         "title": row.get::<_, Option<String>>(1).ok().flatten(),
@@ -256,43 +288,6 @@ async fn mood_playlist(
                         "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
                     }))
                 })?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "smart_ai_mood_query_failed");
-            vec![]
-        });
-
-    // If genre filter returned too few results, fall back to BPM-only
-    let tracks = if tracks.len() < 5 {
-        let fallback_sql =
-            "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm, al.cover_path \
-             FROM tracks t \
-             LEFT JOIN albums al ON t.album_id = al.id \
-             LEFT JOIN artists ar ON t.artist_id = ar.id \
-             WHERE (t.bpm IS NULL OR t.bpm BETWEEN ? AND ?) \
-             ORDER BY RANDOM() \
-             LIMIT ?";
-        state
-            .db
-            .read(|conn| {
-                let mut stmt = conn.prepare(fallback_sql)?;
-                let rows = stmt.query_map(
-                    rusqlite::params![bpm_min, bpm_max, limit],
-                    |row| {
-                        Ok(json!({
-                            "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                            "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                            "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                            "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                            "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                            "genre": row.get::<_, Option<String>>(5).ok().flatten(),
-                            "year": row.get::<_, Option<i32>>(6).ok().flatten(),
-                            "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
-                            "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
-                        }))
-                    },
-                )?;
                 rows.collect::<Result<Vec<_>, _>>()
             })
             .unwrap_or_default()
@@ -499,8 +494,7 @@ async fn history_based_playlist(
                  ORDER BY cnt DESC \
                  LIMIT 5",
             )?;
-            let rows =
-                stmt.query_map(rusqlite::params![days], |row| row.get::<_, String>(0))?;
+            let rows = stmt.query_map(rusqlite::params![days], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
@@ -519,8 +513,7 @@ async fn history_based_playlist(
                  ORDER BY cnt DESC \
                  LIMIT 10",
             )?;
-            let rows =
-                stmt.query_map(rusqlite::params![days], |row| row.get::<_, i64>(0))?;
+            let rows = stmt.query_map(rusqlite::params![days], |row| row.get::<_, i64>(0))?;
             rows.collect::<Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
@@ -532,8 +525,7 @@ async fn history_based_playlist(
     let mut all_tracks = Vec::new();
 
     if !top_artist_ids.is_empty() {
-        let placeholders: Vec<String> =
-            top_artist_ids.iter().map(|id| id.to_string()).collect();
+        let placeholders: Vec<String> = top_artist_ids.iter().map(|id| id.to_string()).collect();
         let in_clause = placeholders.join(",");
         let sql = format!(
             "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm, al.cover_path \
@@ -548,21 +540,20 @@ async fn history_based_playlist(
             .db
             .read(|conn| {
                 let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(rusqlite::params![artist_limit], |row| {
-                        Ok(json!({
-                            "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                            "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                            "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                            "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                            "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                            "genre": row.get::<_, Option<String>>(5).ok().flatten(),
-                            "year": row.get::<_, Option<i32>>(6).ok().flatten(),
-                            "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
-                            "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
-                            "source_reason": "top_artist",
-                        }))
-                    })?;
+                let rows = stmt.query_map(rusqlite::params![artist_limit], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                        "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                        "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                        "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
+                        "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
+                        "genre": row.get::<_, Option<String>>(5).ok().flatten(),
+                        "year": row.get::<_, Option<i32>>(6).ok().flatten(),
+                        "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
+                        "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
+                        "source_reason": "top_artist",
+                    }))
+                })?;
                 rows.collect::<Result<Vec<_>, _>>()
             })
             .unwrap_or_default();
@@ -591,21 +582,20 @@ async fn history_based_playlist(
             .db
             .read(|conn| {
                 let mut stmt = conn.prepare(&sql)?;
-                let rows =
-                    stmt.query_map(rusqlite::params![genre_limit], |row| {
-                        Ok(json!({
-                            "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                            "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                            "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                            "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                            "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                            "genre": row.get::<_, Option<String>>(5).ok().flatten(),
-                            "year": row.get::<_, Option<i32>>(6).ok().flatten(),
-                            "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
-                            "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
-                            "source_reason": "genre_discovery",
-                        }))
-                    })?;
+                let rows = stmt.query_map(rusqlite::params![genre_limit], |row| {
+                    Ok(json!({
+                        "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                        "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                        "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                        "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
+                        "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
+                        "genre": row.get::<_, Option<String>>(5).ok().flatten(),
+                        "year": row.get::<_, Option<i32>>(6).ok().flatten(),
+                        "bpm": row.get::<_, Option<f64>>(7).ok().flatten(),
+                        "cover_path": row.get::<_, Option<String>>(8).ok().flatten(),
+                        "source_reason": "genre_discovery",
+                    }))
+                })?;
                 rows.collect::<Result<Vec<_>, _>>()
             })
             .unwrap_or_default();

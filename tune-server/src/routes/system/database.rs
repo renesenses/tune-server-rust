@@ -1,11 +1,11 @@
 use std::time::Instant;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -16,10 +16,16 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
-pub(super) async fn database_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+pub(super) async fn database_status(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
     let version = migrations::current_version(&state.db).unwrap_or(0);
     let latest = migrations::latest_version();
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let (artists, albums, tracks): (i64, i64, i64) = conn
         .query_row(
             "SELECT \
@@ -54,7 +60,9 @@ pub(super) async fn database_optimize(State(state): State<AppState>) -> impl Int
     }
 }
 
-pub(super) async fn export_database(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+pub(super) async fn export_database(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
     let db_path = std::env::var("TUNE_DB_PATH").unwrap_or_else(|_| "tune.db".into());
     if db_path == ":memory:" {
         return Ok((StatusCode::BAD_REQUEST, "cannot export in-memory database").into_response());

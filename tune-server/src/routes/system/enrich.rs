@@ -1,8 +1,8 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -47,7 +47,10 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
 }
 
 fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, AppError> {
-    let conn = db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let dupes: Vec<(String, String)> = conn
         .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
         .and_then(|mut stmt| {
@@ -102,7 +105,10 @@ fn cleanup_orphan_artwork(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, A
         return Ok(0);
     }
 
-    let conn = db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT cover_path FROM albums WHERE cover_path IS NOT NULL \
@@ -122,10 +128,7 @@ fn cleanup_orphan_artwork(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, A
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if !stem.is_empty() && !referenced.contains(stem) {
                     if std::fs::remove_file(&path).is_ok() {
                         deleted += 1;

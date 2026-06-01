@@ -158,33 +158,40 @@ async fn patch_zone(
 ) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db.clone());
     if let Some(ref name) = body.name
-        && let Err(e) = repo.update_name(id, name) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_name(id, name)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(vol) = body.volume
-        && let Err(e) = repo.update_volume(id, vol) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_volume(id, vol)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(muted) = body.muted
-        && let Err(e) = repo.update_muted(id, muted) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_muted(id, muted)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(ref device_id) = body.output_device_id
-        && let Err(e) = repo.update_output_device(id, device_id) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_output_device(id, device_id)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(ref ot) = body.output_type
-        && let Err(e) = repo.update_output_type(id, ot) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_output_type(id, ot)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(gapless) = body.gapless_enabled
-        && let Err(e) = repo.update_gapless_enabled(id, gapless) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_gapless_enabled(id, gapless)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     if let Some(ms) = body.sync_delay_ms
-        && let Err(e) = repo.update_sync_delay(id, ms) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-        }
+        && let Err(e) = repo.update_sync_delay(id, ms)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     get_zone(State(state), Path(id)).await.into_response()
 }
 
@@ -229,13 +236,13 @@ async fn create_zone(
             && zones
                 .iter()
                 .any(|z| z.output_device_id.as_deref() == Some(device_id))
-            {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({"detail": "Device already assigned to another zone"})),
-                )
-                    .into_response();
-            }
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"detail": "Device already assigned to another zone"})),
+            )
+                .into_response();
+        }
     }
 
     let repo = ZoneRepo::new(state.db.clone());

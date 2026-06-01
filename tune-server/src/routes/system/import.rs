@@ -1,9 +1,9 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -420,7 +420,10 @@ pub(super) async fn import_playlists_file() -> Json<Value> {
     }))
 }
 
-pub(super) async fn import_status(State(state): State<AppState>, Path(task_id): Path<String>) -> Json<Value> {
+pub(super) async fn import_status(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
     let key = format!("import_task_{task_id}");
     if let Some(data) = settings.get(&key).ok().flatten() {

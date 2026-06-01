@@ -292,7 +292,11 @@ async fn list_radio_favorites(
 ) -> Result<Json<Value>, AppError> {
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?")
         .and_then(|mut stmt| {
@@ -315,7 +319,11 @@ async fn list_radio_favorites(
 }
 
 async fn radio_favorites_count(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM radio_favorites", [], |row| row.get(0))
         .unwrap_or(0);
@@ -334,7 +342,11 @@ async fn is_radio_favorite(
     Query(q): Query<IsFavoriteQuery>,
 ) -> Result<Json<Value>, AppError> {
     let artist = q.artist.unwrap_or_default();
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?)",
@@ -446,7 +458,11 @@ async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let favorites: Vec<(String, String)> = conn
         .prepare("SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC")
         .and_then(|mut stmt| {
@@ -478,7 +494,9 @@ async fn create_playlist_from_favorites(
     let playlist_id = match repo.create(&name, None) {
         Ok(id) => id,
         Err(e) => {
-            return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response());
+            return Ok(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+            );
         }
     };
 
@@ -526,7 +544,11 @@ pub fn alarms_router() -> Router<AppState> {
 }
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time"
@@ -704,7 +726,11 @@ async fn update_alarm(
         .iter()
         .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql)
         .collect();
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
             drop(conn);

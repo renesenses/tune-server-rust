@@ -38,27 +38,32 @@ struct BatchFields {
 }
 
 fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Value)>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn.prepare(
-        "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1",
-    )
-    .ok()
-    .and_then(|mut stmt| {
-        stmt.query_row([track_id], |row| {
-            let path: String = row.get(0)?;
-            let info = json!({
-                "id": track_id,
-                "path": path.clone(),
-                "title": row.get::<_, Option<String>>(1).unwrap_or(None),
-                "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
-                "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
-                "year": row.get::<_, Option<String>>(5).unwrap_or(None),
-            });
-            Ok((path, info))
-        })
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn
+        .prepare(
+            "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1",
+        )
         .ok()
-    }))
+        .and_then(|mut stmt| {
+            stmt.query_row([track_id], |row| {
+                let path: String = row.get(0)?;
+                let info = json!({
+                    "id": track_id,
+                    "path": path.clone(),
+                    "title": row.get::<_, Option<String>>(1).unwrap_or(None),
+                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
+                    "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
+                    "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
+                    "year": row.get::<_, Option<String>>(5).unwrap_or(None),
+                });
+                Ok((path, info))
+            })
+            .ok()
+        }))
 }
 
 fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, String> {
@@ -151,7 +156,11 @@ async fn batch_edit_tags(
 }
 
 fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Result<(), AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     if let Some(title) = &fields.title {
         conn.execute(
             "UPDATE tracks SET title = ?1 WHERE id = ?2",
@@ -236,7 +245,11 @@ async fn auto_number_album(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let tracks: Vec<(i64, String, Option<String>)> = conn
         .prepare("SELECT id, path, title FROM tracks WHERE album_id = ?1 ORDER BY path ASC")
         .and_then(|mut stmt| {
@@ -272,7 +285,11 @@ async fn auto_number_album(
             Ok(())
         })();
 
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         conn.execute(
             "UPDATE tracks SET track_number = ?1 WHERE id = ?2",
             rusqlite::params![track_num, track_id],
@@ -307,7 +324,11 @@ async fn set_album_genre(
     Path(album_id): Path<i64>,
     Json(body): Json<SetGenreBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<(i64, String)> = conn
         .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
         .and_then(|mut stmt| {
@@ -360,7 +381,11 @@ async fn set_album_year(
     Path(album_id): Path<i64>,
     Json(body): Json<SetYearBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<(i64, String)> = conn
         .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
         .and_then(|mut stmt| {
@@ -421,7 +446,11 @@ async fn rename_by_pattern(
     let mut results: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         let track_info: Option<(String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = conn
             .prepare("SELECT path, title, artist_name, album_title, track_number, year FROM tracks WHERE id = ?1")
             .ok()
@@ -472,7 +501,11 @@ async fn rename_by_pattern(
         } else if path != new_path {
             match std::fs::rename(&path, &new_path) {
                 Ok(()) => {
-                    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+                    let conn = state
+                        .db
+                        .connection()
+                        .lock()
+                        .map_err(|e| AppError::internal(format!("{e}")))?;
                     conn.execute(
                         "UPDATE tracks SET path = ?1 WHERE id = ?2",
                         rusqlite::params![new_path, track_id],

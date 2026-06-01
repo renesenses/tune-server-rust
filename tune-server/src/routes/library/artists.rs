@@ -1,14 +1,14 @@
+use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::TrackRepo;
-use crate::state::AppState;
 
 use super::{Pagination, api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
 
@@ -22,7 +22,10 @@ pub(super) struct ImageReportBody {
     reason: Option<String>,
 }
 
-pub(super) async fn list_artists(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
+pub(super) async fn list_artists(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
     let repo = ArtistRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -31,7 +34,10 @@ pub(super) async fn list_artists(State(state): State<AppState>, Query(p): Query<
     Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
-pub(super) async fn get_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn get_artist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(artist)) => Json(json!(artist)).into_response(),
@@ -74,7 +80,10 @@ pub(super) async fn artist_bio(
     }
 }
 
-pub(super) async fn artist_similar(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn artist_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
@@ -102,7 +111,10 @@ pub(super) async fn artist_similar(State(state): State<AppState>, Path(id): Path
     }
 }
 
-pub(super) async fn artist_metadata(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn artist_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = ArtistRepo::new(state.db.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
@@ -130,20 +142,29 @@ pub(super) async fn artist_metadata(State(state): State<AppState>, Path(id): Pat
     }
 }
 
-pub(super) async fn artist_albums(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+pub(super) async fn artist_albums(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }
 
-pub(super) async fn artist_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+pub(super) async fn artist_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_artist(id).unwrap_or_default();
     Json(json!(items))
 }
 
-pub(super) async fn artist_timeline(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn artist_timeline(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db.clone());
     let artist_repo = ArtistRepo::new(state.db);
     let artist = match artist_repo.get(id) {

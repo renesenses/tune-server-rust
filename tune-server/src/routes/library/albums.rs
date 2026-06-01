@@ -1,17 +1,17 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::error::AppError;
+use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_repo::TrackRepo;
-use crate::error::AppError;
-use crate::state::AppState;
 
 use super::Pagination;
 
@@ -48,7 +48,10 @@ pub(super) struct LangQuery {
     lang: Option<String>,
 }
 
-pub(super) async fn list_albums(State(state): State<AppState>, Query(p): Query<AlbumFilters>) -> Json<Value> {
+pub(super) async fn list_albums(
+    State(state): State<AppState>,
+    Query(p): Query<AlbumFilters>,
+) -> Json<Value> {
     let repo = AlbumRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -75,7 +78,11 @@ pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let formats: Vec<String> = conn
         .prepare("SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format")
         .and_then(|mut stmt| {
@@ -91,10 +98,15 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
         })
         .unwrap_or_default();
     drop(conn);
-    Ok(Json(json!({ "formats": formats, "sample_rates": sample_rates })))
+    Ok(Json(
+        json!({ "formats": formats, "sample_rates": sample_rates }),
+    ))
 }
 
-pub(super) async fn recent_albums(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
+pub(super) async fn recent_albums(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_recent(limit).unwrap_or_default();
@@ -102,7 +114,10 @@ pub(super) async fn recent_albums(State(state): State<AppState>, Query(p): Query
     Json(json!(items))
 }
 
-pub(super) async fn get_album(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn get_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(album)) => Json(album.to_json()).into_response(),
@@ -111,7 +126,10 @@ pub(super) async fn get_album(State(state): State<AppState>, Path(id): Path<i64>
     }
 }
 
-pub(super) async fn album_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+pub(super) async fn album_tracks(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let items = repo.list_by_album(id).unwrap_or_default();
     Json(json!(items))
@@ -238,7 +256,10 @@ pub(super) async fn album_bio(
     }
 }
 
-pub(super) async fn album_similar(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn album_similar(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let album_repo = AlbumRepo::new(state.db.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
@@ -271,8 +292,14 @@ pub(super) async fn album_similar(State(state): State<AppState>, Path(id): Path<
     }
 }
 
-pub(super) async fn merge_duplicate_albums_route(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+pub(super) async fn merge_duplicate_albums_route(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let dupes: Vec<(String, String)> = conn
         .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
         .and_then(|mut stmt| {

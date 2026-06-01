@@ -34,7 +34,6 @@ fn hue_base_url(bridge_ip: &str, username: &str) -> String {
     format!("http://{bridge_ip}/api/{username}")
 }
 
-
 async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
     let (bridge_ip, username) = hue_settings(&state);
     let (Some(bridge_ip), Some(username)) = (bridge_ip, username) else {

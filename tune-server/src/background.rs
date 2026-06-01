@@ -27,8 +27,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         loop {
-            let settings =
-                tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
             let enabled = settings
                 .get("squeezebox_enabled")
                 .ok()

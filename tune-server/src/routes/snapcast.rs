@@ -29,7 +29,12 @@ fn snapcast_host(state: &AppState) -> String {
         .unwrap_or_else(|| "localhost:1705".into())
 }
 
-async fn jsonrpc_call(client: &reqwest::Client, host: &str, method: &str, params: Value) -> Result<Value, String> {
+async fn jsonrpc_call(
+    client: &reqwest::Client,
+    host: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let url = format!("http://{host}/jsonrpc");
     let body = json!({
         "id": 1,

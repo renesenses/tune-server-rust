@@ -60,7 +60,11 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts ORDER BY id")
         .and_then(|mut stmt| {
@@ -371,7 +375,11 @@ async fn trigger_smb_scan() -> impl IntoResponse {
 
 /// List all stored SMB mounts from the network_mounts table.
 async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, server, share, mount_path, username, active \
@@ -571,8 +579,15 @@ async fn test_mount(Json(body): Json<TestMountRequest>) -> impl IntoResponse {
     }))
 }
 
-async fn get_share_detail(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+async fn get_share_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts WHERE id = ?",
         rusqlite::params![id],

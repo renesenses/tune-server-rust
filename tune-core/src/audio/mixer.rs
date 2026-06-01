@@ -1,4 +1,3 @@
-
 pub struct PcmMixer {
     channels: u16,
     bit_depth: u16,

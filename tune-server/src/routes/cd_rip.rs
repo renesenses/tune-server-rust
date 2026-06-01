@@ -193,10 +193,7 @@ async fn start_rip(
     });
 
     settings
-        .set(
-            "cd_rip_current",
-            &serde_json::to_string(&rip_state)?,
-        )
+        .set("cd_rip_current", &serde_json::to_string(&rip_state)?)
         .ok();
 
     Ok(Json(json!({

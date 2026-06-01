@@ -1,8 +1,8 @@
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -23,7 +23,11 @@ pub(super) async fn list_duplicates(
     let offset = p.offset.unwrap_or(0);
 
     let (hash_dups, meta_dups) = {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
 
         // Duplicates by audio_hash
         let hash_dups: Vec<Value> = conn
@@ -105,7 +109,11 @@ pub(super) async fn resolve_duplicate(
     State(state): State<AppState>,
     Json(body): Json<ResolveDuplicate>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Verify both tracks exist
     let keep_exists: bool = conn
@@ -182,7 +190,11 @@ pub(super) async fn smart_duplicates(
     let limit = p.limit.unwrap_or(100);
     let offset = p.offset.unwrap_or(0);
 
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Find tracks with same title (case-insensitive), same artist, and similar duration (within 3 seconds)
     let items: Vec<Value> = conn
         .prepare(

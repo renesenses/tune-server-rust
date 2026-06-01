@@ -228,7 +228,10 @@ async fn duplicate_playlist(
         .into_response()
 }
 
-async fn export_m3u(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+async fn export_m3u(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
     let repo = PlaylistRepo::new(state.db.clone());
     let playlist = match repo.get(id) {
         Ok(Some(p)) => p,

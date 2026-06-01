@@ -59,7 +59,9 @@ async fn set_viz_config(
 ) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut config = load_viz_config(&state);
-    let obj = config.as_object_mut().ok_or_else(|| AppError::internal("visualizer config is not a JSON object"))?;
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| AppError::internal("visualizer config is not a JSON object"))?;
 
     if let Some(v) = body.enabled {
         obj.insert("enabled".into(), json!(v));
@@ -84,10 +86,7 @@ async fn set_viz_config(
     }
 
     settings
-        .set(
-            "visualizer_config",
-            &serde_json::to_string(&config)?,
-        )
+        .set("visualizer_config", &serde_json::to_string(&config)?)
         .ok();
     Ok(Json(json!({"saved": true, "config": config})))
 }

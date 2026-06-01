@@ -26,7 +26,10 @@ struct SearchQuery {
     q: String,
 }
 
-async fn bc_search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> impl IntoResponse {
+async fn bc_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> impl IntoResponse {
     let client = &state.http_client;
 
     let resp = client.get(BC_SEARCH_API).query(&[("q", &q.q)]).send().await;
@@ -70,7 +73,10 @@ fn default_sort() -> String {
     "top".into()
 }
 
-async fn bc_discover(State(state): State<AppState>, Query(q): Query<DiscoverQuery>) -> impl IntoResponse {
+async fn bc_discover(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverQuery>,
+) -> impl IntoResponse {
     let client = &state.http_client;
 
     let payload = json!({
@@ -141,7 +147,11 @@ struct TagQuery {
     page: u32,
 }
 
-async fn bc_tag_releases(State(state): State<AppState>, Path(tag): Path<String>, Query(q): Query<TagQuery>) -> impl IntoResponse {
+async fn bc_tag_releases(
+    State(state): State<AppState>,
+    Path(tag): Path<String>,
+    Query(q): Query<TagQuery>,
+) -> impl IntoResponse {
     let client = &state.http_client;
 
     let payload = json!({

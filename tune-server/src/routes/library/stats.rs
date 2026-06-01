@@ -1,15 +1,19 @@
-use axum::extract::{Query, State};
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::{Query, State};
+use serde_json::{Value, json};
 
-use tune_core::db::history_repo::HistoryRepo;
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::history_repo::HistoryRepo;
 
 use super::Pagination;
 
 pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let (artists, albums, tracks, zones, total_duration_ms, total_size_bytes): (
         i64,
         i64,
@@ -31,11 +35,7 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         )
         .unwrap_or((0, 0, 0, 0, 0, 0));
     let listens: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM listen_history",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
         .unwrap_or(0);
     drop(conn);
 
@@ -50,8 +50,14 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     })))
 }
 
-pub(super) async fn completeness_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+pub(super) async fn completeness_stats(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let total_tracks: i64 = conn
         .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
         .unwrap_or(0);
@@ -91,7 +97,11 @@ pub(super) async fn completeness_stats(State(state): State<AppState>) -> Result<
     drop(conn);
 
     let total_artists: i64 = {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))
             .unwrap_or(0)
     };

@@ -1,15 +1,22 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::track_repo::TrackRepo;
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::track_repo::TrackRepo;
 
-pub(super) async fn track_credits(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+pub(super) async fn track_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position")
         .and_then(|mut stmt| {
@@ -31,8 +38,15 @@ pub(super) async fn track_credits(State(state): State<AppState>, Path(id): Path<
     Ok(Json(json!(items)))
 }
 
-pub(super) async fn artist_credits(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+pub(super) async fn artist_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \

@@ -96,10 +96,7 @@ async fn start_sacd_rip(
     });
 
     settings
-        .set(
-            "sacd_rip_current",
-            &serde_json::to_string(&rip_state)?,
-        )
+        .set("sacd_rip_current", &serde_json::to_string(&rip_state)?)
         .ok();
 
     Ok(Json(rip_state))

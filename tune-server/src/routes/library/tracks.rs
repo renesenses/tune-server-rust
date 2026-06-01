@@ -1,15 +1,15 @@
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use lofty::file::TaggedFileExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::state::AppState;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::track_repo::TrackRepo;
-use crate::state::AppState;
 
 use super::Pagination;
 
@@ -18,7 +18,10 @@ pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
 }
 
-pub(super) async fn list_tracks(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
+pub(super) async fn list_tracks(
+    State(state): State<AppState>,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
     let repo = TrackRepo::new(state.db);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
@@ -32,7 +35,10 @@ pub(super) async fn track_count(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "count": count }))
 }
 
-pub(super) async fn get_track(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn get_track(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     match repo.get(id) {
         Ok(Some(track)) => Json(json!(track)).into_response(),
@@ -70,7 +76,11 @@ pub(super) async fn stream_track_audio(
         .unwrap_or_else(|| "application/octet-stream".into());
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&mime)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
     headers.insert("Content-Length", HeaderValue::from(file_size));
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
 
@@ -92,7 +102,10 @@ pub(super) async fn stream_track_audio(
     (StatusCode::OK, headers, body).into_response()
 }
 
-pub(super) async fn rescan_track(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn rescan_track(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
@@ -134,7 +147,10 @@ pub(super) async fn quick_fav_track(
     Json(json!({"is_favorite": !is_fav, "track_id": id}))
 }
 
-pub(super) async fn track_all_tags(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn track_all_tags(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db);
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
@@ -164,7 +180,10 @@ pub(super) async fn track_all_tags(State(state): State<AppState>, Path(id): Path
     Json(result).into_response()
 }
 
-pub(super) async fn track_lyrics(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn track_lyrics(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = TrackRepo::new(state.db.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,

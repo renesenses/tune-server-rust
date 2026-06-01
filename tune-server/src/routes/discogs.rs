@@ -130,7 +130,14 @@ async fn discogs_search(
     }
 
     let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    match discogs_get(&state.http_client, Some(&token), "/database/search", &param_refs).await {
+    match discogs_get(
+        &state.http_client,
+        Some(&token),
+        "/database/search",
+        &param_refs,
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -141,7 +148,14 @@ async fn discogs_release(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let token = discogs_token(&state);
-    match discogs_get(&state.http_client, token.as_deref(), &format!("/releases/{id}"), &[]).await {
+    match discogs_get(
+        &state.http_client,
+        token.as_deref(),
+        &format!("/releases/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -152,7 +166,14 @@ async fn discogs_artist(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let token = discogs_token(&state);
-    match discogs_get(&state.http_client, token.as_deref(), &format!("/artists/{id}"), &[]).await {
+    match discogs_get(
+        &state.http_client,
+        token.as_deref(),
+        &format!("/artists/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -202,7 +223,14 @@ async fn discogs_artist_releases(
 
 async fn discogs_label(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let token = discogs_token(&state);
-    match discogs_get(&state.http_client, token.as_deref(), &format!("/labels/{id}"), &[]).await {
+    match discogs_get(
+        &state.http_client,
+        token.as_deref(),
+        &format!("/labels/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }
@@ -238,7 +266,14 @@ async fn discogs_master(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let token = discogs_token(&state);
-    match discogs_get(&state.http_client, token.as_deref(), &format!("/masters/{id}"), &[]).await {
+    match discogs_get(
+        &state.http_client,
+        token.as_deref(),
+        &format!("/masters/{id}"),
+        &[],
+    )
+    .await
+    {
         Ok(data) => Json(data).into_response(),
         Err((status, msg)) => (status, Json(json!({"error": msg}))).into_response(),
     }

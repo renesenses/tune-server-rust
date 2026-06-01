@@ -1,13 +1,13 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::track_repo::TrackRepo;
-use crate::state::AppState;
 
 use super::artwork_cache_dir;
 
@@ -45,7 +45,10 @@ pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse
     StatusCode::NOT_FOUND.into_response()
 }
 
-pub(super) async fn album_artwork(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = AlbumRepo::new(state.db.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,

@@ -45,9 +45,16 @@ async fn mqa_status(State(state): State<AppState>) -> Json<Value> {
 ///
 /// MQA embeds data in the least significant bits of a FLAC/WAV file.
 /// Detection looks for specific bit patterns in the audio stream.
-async fn detect_mqa(State(state): State<AppState>, Path(track_id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+async fn detect_mqa(
+    State(state): State<AppState>,
+    Path(track_id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
     let track = {
-        let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
         conn.prepare("SELECT path, format, sample_rate, bit_depth FROM tracks WHERE id = ?1")
             .and_then(|mut stmt| {
                 stmt.query_row([track_id], |row| {

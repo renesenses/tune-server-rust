@@ -66,7 +66,9 @@ async fn set_kiosk_config(
 ) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::new(state.db.clone());
     let mut config = load_kiosk_settings(&state);
-    let obj = config.as_object_mut().ok_or_else(|| AppError::internal("kiosk config is not a JSON object"))?;
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| AppError::internal("kiosk config is not a JSON object"))?;
 
     if let Some(v) = body.enabled {
         obj.insert("enabled".into(), json!(v));
@@ -168,7 +170,11 @@ async fn kiosk_screensaver(
     Query(params): Query<ScreensaverParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = params.limit.unwrap_or(20);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     // Get random albums with artwork
     let albums: Vec<Value> = conn

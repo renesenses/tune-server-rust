@@ -62,7 +62,11 @@ fn offline_cache_dir(settings: &SettingsRepo) -> String {
 
 async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
 
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM offline_cache", [], |r| r.get(0))
@@ -241,7 +245,12 @@ async fn download_single_track(
         match stream_result {
             Ok(url) => {
                 // Download the file (use longer timeout for large audio files)
-                match http_client.get(&url).timeout(std::time::Duration::from_secs(300)).send().await {
+                match http_client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(300))
+                    .send()
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         let content_type = resp
                             .headers()
@@ -423,7 +432,11 @@ async fn download_playlist_tracks(
 
 async fn list_downloads(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, source, source_id, track_title, artist_name, album_title, file_size, quality, status, error, downloaded_at \
@@ -453,9 +466,16 @@ async fn list_downloads(State(state): State<AppState>) -> Result<Json<Value>, Ap
     Ok(Json(json!(items)))
 }
 
-async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+async fn download_status(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let result = conn.query_row(
         "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, quality, status, error, downloaded_at, expires_at \
          FROM offline_cache WHERE id = ?",
@@ -486,10 +506,17 @@ async fn download_status(State(state): State<AppState>, Path(id): Path<i64>) -> 
     }
 }
 
-async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse, AppError> {
+async fn delete_download(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let file_path: Option<String> = conn
         .query_row(
             "SELECT file_path FROM offline_cache WHERE id = ?",
@@ -519,7 +546,11 @@ async fn delete_download(State(state): State<AppState>, Path(id): Path<i64>) -> 
 
 async fn list_offline_albums(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT album_title, artist_name, COUNT(*) as track_count, COALESCE(SUM(file_size), 0), source \
@@ -548,7 +579,11 @@ async fn list_offline_albums(State(state): State<AppState>) -> Result<Json<Value
 
 async fn list_offline_tracks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare(
             "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, duration_ms, quality, downloaded_at \
@@ -583,7 +618,11 @@ async fn list_offline_tracks(State(state): State<AppState>) -> Result<Json<Value
 async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let completed: Vec<(i64, String)> = conn
         .prepare("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL")
         .and_then(|mut stmt| {
@@ -631,7 +670,11 @@ async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse
 async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let paths: Vec<String> = conn
         .prepare("SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL")
         .and_then(|mut stmt| {

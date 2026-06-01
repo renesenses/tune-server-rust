@@ -32,7 +32,10 @@ fn default_rows() -> u32 {
     50
 }
 
-async fn ia_search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> impl IntoResponse {
+async fn ia_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> impl IntoResponse {
     let client = &state.http_client;
 
     let page = q.page.unwrap_or(1);

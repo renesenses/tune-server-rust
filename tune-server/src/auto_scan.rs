@@ -25,9 +25,7 @@ pub fn build_track_from_metadata(
             .album_artist
             .as_deref()
             .map(|s| s.to_lowercase())
-            .map(|s| {
-                s == "various artists" || s == "various" || s == "va" || s == "compilations"
-            })
+            .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
             .unwrap_or(false);
 
     let album_artist_name = meta.album_artist.as_deref().unwrap_or_else(|| {
@@ -55,7 +53,11 @@ pub fn build_track_from_metadata(
 
     let track_artist = if is_compilation && track_artist_name != album_artist_name {
         artist_repo
-            .get_or_create(track_artist_name, meta.musicbrainz_artist_id.as_deref(), None)
+            .get_or_create(
+                track_artist_name,
+                meta.musicbrainz_artist_id.as_deref(),
+                None,
+            )
             .ok()
     } else {
         album_artist_entry.clone()
@@ -64,7 +66,11 @@ pub fn build_track_from_metadata(
 
     let album = meta.album.as_ref().and_then(|title| {
         album_repo
-            .get_or_create(title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
+            .get_or_create(
+                title,
+                album_artist_id.unwrap_or(0),
+                meta.year.map(|y| y as i32),
+            )
             .ok()
     });
     let album_id = album.as_ref().and_then(|a| a.id);
@@ -149,8 +155,7 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    let unchanged = existing_mtime
-                        .is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+                    let unchanged = existing_mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
                         && (existing_size == Some(file_meta.len() as i64));
                     return !unchanged;
                 }
@@ -303,10 +308,9 @@ pub fn spawn_file_watcher(db: SqliteDb) {
                             | tune_core::scanner::watcher::ChangeType::Modified => {
                                 let files: Vec<std::path::PathBuf> =
                                     vec![std::path::PathBuf::from(&change.path)];
-                                let (scanned, _) =
-                                    tune_core::scanner::walker::scan_files_parallel(
-                                        &files, true, None,
-                                    );
+                                let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(
+                                    &files, true, None,
+                                );
                                 let track_repo = TrackRepo::new(db.clone());
                                 let artist_repo = ArtistRepo::new(db.clone());
                                 let album_repo = AlbumRepo::new(db.clone());

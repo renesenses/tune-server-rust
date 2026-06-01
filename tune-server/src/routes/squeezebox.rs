@@ -39,7 +39,12 @@ fn lms_url(host: &str) -> String {
 
 /// Send a JSON-RPC request to LMS. LMS uses a "slim" protocol:
 /// `{ "id": 1, "method": "slim.request", "params": [player_id, [command, ...]] }`
-async fn lms_request(client: &reqwest::Client, host: &str, player: &str, cmd: Vec<Value>) -> Result<Value, String> {
+async fn lms_request(
+    client: &reqwest::Client,
+    host: &str,
+    player: &str,
+    cmd: Vec<Value>,
+) -> Result<Value, String> {
     let url = lms_url(host);
     let body = json!({
         "id": 1,
@@ -76,7 +81,14 @@ async fn lms_request(client: &reqwest::Client, host: &str, player: &str, cmd: Ve
 
 async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&state.http_client, &host, "", vec![json!("serverstatus"), json!(0), json!(100)]).await {
+    match lms_request(
+        &state.http_client,
+        &host,
+        "",
+        vec![json!("serverstatus"), json!(0), json!(100)],
+    )
+    .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
@@ -84,7 +96,14 @@ async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn list_players(State(state): State<AppState>) -> impl IntoResponse {
     let host = lms_host(&state);
-    match lms_request(&state.http_client, &host, "", vec![json!("players"), json!(0), json!(100)]).await {
+    match lms_request(
+        &state.http_client,
+        &host,
+        "",
+        vec![json!("players"), json!(0), json!(100)],
+    )
+    .await
+    {
         Ok(result) => {
             let players = result.get("players_loop").cloned().unwrap_or(json!([]));
             Json(players).into_response()
@@ -163,7 +182,13 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
         (host.clone(), 9000u16)
     };
 
-    let result = lms_request(&state.http_client, &host, "", vec![json!("players"), json!(0), json!(100)]).await?;
+    let result = lms_request(
+        &state.http_client,
+        &host,
+        "",
+        vec![json!("players"), json!(0), json!(100)],
+    )
+    .await?;
     let players = result
         .get("players_loop")
         .and_then(|v| v.as_array())

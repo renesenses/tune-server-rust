@@ -836,8 +836,15 @@ async fn transfer_playback(
     }
 }
 
-async fn get_alarms(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+async fn get_alarms(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     let items: Vec<Value> = conn
         .prepare("SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds FROM alarms WHERE zone_id = ? ORDER BY time")
         .and_then(|mut stmt| {

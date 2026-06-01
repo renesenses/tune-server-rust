@@ -1,12 +1,12 @@
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::album_repo::AlbumRepo;
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::album_repo::AlbumRepo;
 
 #[derive(Deserialize)]
 pub(super) struct GenreQuery {
@@ -14,7 +14,11 @@ pub(super) struct GenreQuery {
 }
 
 pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect all individual genres from both the `genres` JSON array
     // and the legacy `genre` text column (splitting multi-genre strings).
     let raw_genres: Vec<(Option<String>, Option<String>)> = conn
@@ -82,7 +86,11 @@ pub(super) async fn list_genres(
     State(state): State<AppState>,
     Query(params): Query<GenreQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state.db.connection().lock().map_err(|e| AppError::internal(format!("{e}")))?;
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
     // Collect genre + genres columns from all albums
     let raw: Vec<(Option<String>, Option<String>)> = conn
         .prepare("SELECT genre, genres FROM albums WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
@@ -138,7 +146,10 @@ pub(super) async fn list_genres(
     Ok(Json(json!(items)))
 }
 
-pub(super) async fn genre_albums(State(state): State<AppState>, Path(name): Path<String>) -> Json<Value> {
+pub(super) async fn genre_albums(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Json<Value> {
     let decoded = urlencoding::decode(&name).unwrap_or_else(|_| name.clone().into());
     let repo = AlbumRepo::new(state.db);
     let items = repo.list_by_genre(&decoded).unwrap_or_default();

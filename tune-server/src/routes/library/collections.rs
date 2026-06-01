@@ -1,13 +1,13 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use tune_core::db::album_repo::AlbumRepo;
 use crate::error::AppError;
 use crate::state::AppState;
+use tune_core::db::album_repo::AlbumRepo;
 
 use super::now_iso_utc;
 
@@ -68,7 +68,10 @@ pub(super) async fn create_collection(
     Ok((StatusCode::CREATED, Json(collection)))
 }
 
-pub(super) async fn get_collection(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+pub(super) async fn get_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
     let collections: Vec<Value> = settings
         .get("collections")
@@ -173,7 +176,9 @@ pub(super) async fn add_album_to_collection(
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
-    Ok(Json(json!({"added": true, "collection_id": path.id, "album_id": path.album_id})))
+    Ok(Json(
+        json!({"added": true, "collection_id": path.id, "album_id": path.album_id}),
+    ))
 }
 
 pub(super) async fn remove_album_from_collection(
@@ -202,5 +207,7 @@ pub(super) async fn remove_album_from_collection(
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
-    Ok(Json(json!({"removed": true, "collection_id": path.id, "album_id": path.album_id})))
+    Ok(Json(
+        json!({"removed": true, "collection_id": path.id, "album_id": path.album_id}),
+    ))
 }

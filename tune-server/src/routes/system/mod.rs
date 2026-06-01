@@ -10,8 +10,8 @@ mod remote;
 mod scan;
 mod update;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -22,7 +22,10 @@ pub fn router() -> Router<AppState> {
         .route("/version", get(config::version))
         .route("/health", get(config::health))
         .route("/stats", get(config::stats))
-        .route("/config", get(config::get_config).patch(config::update_config))
+        .route(
+            "/config",
+            get(config::get_config).patch(config::update_config),
+        )
         .route("/settings", get(config::get_settings))
         .route(
             "/settings/theme",
@@ -35,22 +38,34 @@ pub fn router() -> Router<AppState> {
         .route("/restart", post(config::restart))
         .route("/database/status", get(database::database_status))
         .route("/database/optimize", post(database::database_optimize))
-        .route("/music-dirs", get(config::get_music_dirs).post(config::add_music_dir))
+        .route(
+            "/music-dirs",
+            get(config::get_music_dirs).post(config::add_music_dir),
+        )
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
         .route("/cleanup", post(enrich::cleanup))
         .route("/logs", get(diagnostics::logs))
-        .route("/backups", get(backup::list_backups).post(backup::create_backup))
+        .route(
+            "/backups",
+            get(backup::list_backups).post(backup::create_backup),
+        )
         .route("/backups/{filename}/restore", post(backup::restore_backup))
         .route("/database/export", get(database::export_database))
         .route("/update/check", get(update::update_check))
         .route("/changelog", get(update::changelog))
         .route("/peers", get(admin::system_peers))
-        .route("/scan/schedule", get(scan::scan_schedule).post(scan::set_scan_schedule))
+        .route(
+            "/scan/schedule",
+            get(scan::scan_schedule).post(scan::set_scan_schedule),
+        )
         .route("/diagnostics/bundle", get(diagnostics::diagnostics_bundle))
-        .route("/diagnostics/network", get(diagnostics::diagnostics_network))
+        .route(
+            "/diagnostics/network",
+            get(diagnostics::diagnostics_network),
+        )
         .route("/health/monitor", get(diagnostics::health_monitor))
         .route("/health/alerts", get(diagnostics::health_alerts))
         .route("/clear-cache", post(config::clear_cache))
@@ -65,7 +80,10 @@ pub fn router() -> Router<AppState> {
         .route("/import/playlists", post(import::import_playlists_file))
         .route("/import/status/{task_id}", get(import::import_status))
         // Database engine routes
-        .route("/database/test-connection", post(database::test_db_connection))
+        .route(
+            "/database/test-connection",
+            post(database::test_db_connection),
+        )
         .route("/database/migrate", post(database::migrate_database))
         // Remote/proxy mode routes
         .route(
