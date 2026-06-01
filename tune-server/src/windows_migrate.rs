@@ -23,8 +23,8 @@ pub fn check_and_migrate() {
 
     // Detect if running from a restricted Program Files directory
     let exe_dir_lower = exe_dir.to_string_lossy().to_lowercase();
-    let in_program_files = exe_dir_lower.contains("program files (x86)")
-        || exe_dir_lower.contains("program files");
+    let in_program_files =
+        exe_dir_lower.contains("program files (x86)") || exe_dir_lower.contains("program files");
 
     if !in_program_files {
         return;

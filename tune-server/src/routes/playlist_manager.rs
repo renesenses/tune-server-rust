@@ -336,12 +336,56 @@ async fn transfer_playlist(
         }
     }
 
-    // Create local playlist if target is local and not dry run
+    // Create playlist on target
     let mut target_playlist_id: Option<i64> = None;
-    if body.target_service == "local" && !body.dry_run && !matched_track_ids.is_empty() {
-        if let Ok(id) = playlist_repo.create(&target_name, Some("Transferred playlist")) {
-            playlist_repo.add_tracks(id, &matched_track_ids, None).ok();
-            target_playlist_id = Some(id);
+    let mut remote_playlist_id: Option<String> = None;
+    if !body.dry_run && matched > 0 {
+        if body.target_service == "local" {
+            if let Ok(id) = playlist_repo.create(&target_name, Some("Transferred playlist")) {
+                playlist_repo.add_tracks(id, &matched_track_ids, None).ok();
+                target_playlist_id = Some(id);
+            }
+        } else {
+            // Create playlist on streaming service target
+            let matched_ids: Vec<String> = track_details
+                .iter()
+                .filter(|t| t["status"].as_str() == Some("matched"))
+                .filter_map(|t| t["matched_id"].as_str().map(|s| s.to_string()))
+                .collect();
+            if !matched_ids.is_empty() {
+                let registry = state.services.lock().await;
+                if let Some(svc_arc) = registry.get(&body.target_service) {
+                    drop(registry);
+                    let svc = svc_arc.lock().await;
+                    match svc
+                        .create_playlist(&target_name, Some("Created by Tune"))
+                        .await
+                    {
+                        Ok(pid) => match svc.add_tracks_to_playlist(&pid, &matched_ids).await {
+                            Ok(added) => {
+                                tracing::info!(
+                                    service = %body.target_service,
+                                    playlist_id = %pid,
+                                    added,
+                                    "playlist_created_on_service"
+                                );
+                                remote_playlist_id = Some(pid);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "add_tracks_to_service_playlist_failed");
+                                remote_playlist_id = Some(pid);
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                service = %body.target_service,
+                                error = %e,
+                                "create_playlist_on_service_failed (service may not support write)"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -374,6 +418,7 @@ async fn transfer_playlist(
         "target_service": body.target_service,
         "target_playlist_name": target_name,
         "target_playlist_id": target_playlist_id,
+        "remote_playlist_id": remote_playlist_id,
         "total_tracks": total,
         "matched": matched,
         "approximate": approximate,

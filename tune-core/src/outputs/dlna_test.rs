@@ -97,12 +97,16 @@ mod tests {
             }
             "GetTransportInfo" => {
                 let ts = state.transport_state.lock().await.clone();
-                soap_ok("GetTransportInfo", &format!(
-                    "<CurrentTransportState>{ts}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>"
-                ))
+                soap_ok(
+                    "GetTransportInfo",
+                    &format!(
+                        "<CurrentTransportState>{ts}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>"
+                    ),
+                )
             }
-            "GetPositionInfo" => soap_ok("GetPositionInfo",
-                "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>0:01:30</RelTime><AbsTime>0:01:30</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>"
+            "GetPositionInfo" => soap_ok(
+                "GetPositionInfo",
+                "<Track>1</Track><TrackDuration>0:05:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI></TrackURI><RelTime>0:01:30</RelTime><AbsTime>0:01:30</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>",
             ),
             _ => soap_ok(&action, ""),
         }

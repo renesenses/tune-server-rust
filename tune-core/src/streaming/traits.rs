@@ -141,6 +141,24 @@ pub trait StreamingService: Send + Sync {
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String>;
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String>;
 
+    async fn create_playlist(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<String, String> {
+        Err("create_playlist not supported by this service".into())
+    }
+    async fn add_tracks_to_playlist(
+        &self,
+        _playlist_id: &str,
+        _track_ids: &[String],
+    ) -> Result<usize, String> {
+        Err("add_tracks_to_playlist not supported by this service".into())
+    }
+    fn supports_write(&self) -> bool {
+        false
+    }
+
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
         Ok(vec![])
     }

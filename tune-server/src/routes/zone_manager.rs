@@ -41,7 +41,10 @@ pub fn router() -> Router<AppState> {
             "/oaat-groups",
             get(list_oaat_groups).post(create_oaat_group),
         )
-        .route("/oaat-groups/{id}", axum::routing::delete(delete_oaat_group))
+        .route(
+            "/oaat-groups/{id}",
+            axum::routing::delete(delete_oaat_group),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -847,10 +850,7 @@ async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "oaat_groups": groups }))
 }
 
-async fn create_oaat_group(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
+async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
         .as_array()
@@ -908,10 +908,7 @@ async fn create_oaat_group(
     }))
 }
 
-async fn delete_oaat_group(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Json<Value> {
+async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
     // Remove from registry
     let device_id = format!("oaat-group:{id}");
     {

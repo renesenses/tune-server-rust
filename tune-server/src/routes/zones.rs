@@ -726,7 +726,10 @@ async fn delete_stereo_pair(
 
 async fn list_group_delays(State(state): State<AppState>) -> Json<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
-    let raw = settings.get("group_delays").unwrap_or(None).unwrap_or_default();
+    let raw = settings
+        .get("group_delays")
+        .unwrap_or(None)
+        .unwrap_or_default();
     let delays: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
     Json(json!(delays))
 }
@@ -750,7 +753,10 @@ async fn set_group_delay(
     });
     delays.push(json!({"tech_a": tech_a, "tech_b": tech_b, "delay_ms": delay_ms}));
     settings
-        .set("group_delays", &serde_json::to_string(&delays).unwrap_or_default())
+        .set(
+            "group_delays",
+            &serde_json::to_string(&delays).unwrap_or_default(),
+        )
         .ok();
     Json(json!(delays))
 }

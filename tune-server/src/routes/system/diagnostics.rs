@@ -413,12 +413,19 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
 /// Returns the bug report as raw markdown (text/markdown) for direct forum paste.
 pub(super) async fn bug_report_markdown(
     State(state): State<AppState>,
-) -> (axum::http::StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
     let Json(report) = generate_bug_report(State(state)).await;
     let md = report["markdown"].as_str().unwrap_or("").to_string();
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
         md,
     )
 }

@@ -106,14 +106,39 @@ pub(super) async fn completeness_stats(
             .unwrap_or(0)
     };
 
-    let genre_pct = if total_tracks > 0 { with_genre as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
-    let year_pct = if total_tracks > 0 { with_year as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
-    let artist_pct = if total_tracks > 0 { with_artist as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
-    let cover_pct = if total_albums > 0 { with_cover as f64 / total_albums as f64 * 100.0 } else { 0.0 };
-    let mbid_pct = if total_tracks > 0 { with_mbid as f64 / total_tracks as f64 * 100.0 } else { 0.0 };
+    let genre_pct = if total_tracks > 0 {
+        with_genre as f64 / total_tracks as f64 * 100.0
+    } else {
+        0.0
+    };
+    let year_pct = if total_tracks > 0 {
+        with_year as f64 / total_tracks as f64 * 100.0
+    } else {
+        0.0
+    };
+    let artist_pct = if total_tracks > 0 {
+        with_artist as f64 / total_tracks as f64 * 100.0
+    } else {
+        0.0
+    };
+    let cover_pct = if total_albums > 0 {
+        with_cover as f64 / total_albums as f64 * 100.0
+    } else {
+        0.0
+    };
+    let mbid_pct = if total_tracks > 0 {
+        with_mbid as f64 / total_tracks as f64 * 100.0
+    } else {
+        0.0
+    };
 
     // Weighted health score: cover(30%) + genre(25%) + year(20%) + mbid(15%) + artist(10%)
-    let health_score = (cover_pct * 0.30 + genre_pct * 0.25 + year_pct * 0.20 + mbid_pct * 0.15 + artist_pct * 0.10).round();
+    let health_score = (cover_pct * 0.30
+        + genre_pct * 0.25
+        + year_pct * 0.20
+        + mbid_pct * 0.15
+        + artist_pct * 0.10)
+        .round();
 
     let grade = match health_score as u32 {
         90..=100 => "A",

@@ -366,18 +366,42 @@ mod tests {
 
     #[test]
     fn format_display() {
-        assert_eq!(format_rate_display(44100, 16, AudioFormat::PcmS16le), "PCM 16/44.1");
-        assert_eq!(format_rate_display(48000, 24, AudioFormat::PcmS24le), "PCM 24/48");
-        assert_eq!(format_rate_display(192000, 24, AudioFormat::PcmS24le), "PCM 24/192");
-        assert_eq!(format_rate_display(96000, 24, AudioFormat::Flac), "FLAC 24/96");
-        assert_eq!(format_rate_display(44100, 16, AudioFormat::Flac), "FLAC 16/44.1");
+        assert_eq!(
+            format_rate_display(44100, 16, AudioFormat::PcmS16le),
+            "PCM 16/44.1"
+        );
+        assert_eq!(
+            format_rate_display(48000, 24, AudioFormat::PcmS24le),
+            "PCM 24/48"
+        );
+        assert_eq!(
+            format_rate_display(192000, 24, AudioFormat::PcmS24le),
+            "PCM 24/192"
+        );
+        assert_eq!(
+            format_rate_display(96000, 24, AudioFormat::Flac),
+            "FLAC 24/96"
+        );
+        assert_eq!(
+            format_rate_display(44100, 16, AudioFormat::Flac),
+            "FLAC 16/44.1"
+        );
     }
 
     #[test]
     fn format_display_dsd() {
-        assert_eq!(format_rate_display(2_822_400, 1, AudioFormat::DsdU8), "DSD64");
-        assert_eq!(format_rate_display(5_644_800, 1, AudioFormat::DsdU16le), "DSD128");
-        assert_eq!(format_rate_display(11_289_600, 1, AudioFormat::DsdU32le), "DSD256");
+        assert_eq!(
+            format_rate_display(2_822_400, 1, AudioFormat::DsdU8),
+            "DSD64"
+        );
+        assert_eq!(
+            format_rate_display(5_644_800, 1, AudioFormat::DsdU16le),
+            "DSD128"
+        );
+        assert_eq!(
+            format_rate_display(11_289_600, 1, AudioFormat::DsdU32le),
+            "DSD256"
+        );
     }
 
     #[test]

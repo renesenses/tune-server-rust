@@ -357,7 +357,9 @@ impl AlbumRepo {
             ))
             .map_err(|e| e.to_string())?;
         let albums = stmt
-            .query_map(params![delimited_pattern, genre], |row| Ok(row_to_album(row)))
+            .query_map(params![delimited_pattern, genre], |row| {
+                Ok(row_to_album(row))
+            })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -648,11 +650,19 @@ mod tests {
 
         // Jazz: a1 (exact), a3 (JSON array), a4 (semicolon-separated)
         let jazz = repo.list_by_genre("Jazz").unwrap();
-        assert_eq!(jazz.len(), 3, "Jazz should match exact, JSON, and semicolon-separated");
+        assert_eq!(
+            jazz.len(),
+            3,
+            "Jazz should match exact, JSON, and semicolon-separated"
+        );
 
         // Blues: a4 (semicolon-separated), a5 (slash-separated)
         let blues = repo.list_by_genre("Blues").unwrap();
-        assert_eq!(blues.len(), 2, "Blues should match semicolon and slash-separated");
+        assert_eq!(
+            blues.len(),
+            2,
+            "Blues should match semicolon and slash-separated"
+        );
 
         // Rock: a2 (exact), a5 (slash-separated)
         let rock = repo.list_by_genre("Rock").unwrap();

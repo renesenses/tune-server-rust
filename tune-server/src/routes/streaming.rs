@@ -707,12 +707,20 @@ async fn compare_services(
 ) -> impl IntoResponse {
     let service_names: Vec<&str> = q.services.split(',').map(|s| s.trim()).collect();
     if service_names.len() < 2 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "need at least 2 services"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "need at least 2 services"})),
+        )
+            .into_response();
     }
 
     let query = q.artist.as_deref().or(q.album.as_deref()).unwrap_or("");
     if query.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "provide artist or album parameter"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "provide artist or album parameter"})),
+        )
+            .into_response();
     }
 
     let registry = state.services.lock().await;
@@ -729,12 +737,15 @@ async fn compare_services(
         let svc = svc.lock().await;
         match svc.search(query, 10).await {
             Ok(sr) => {
-                results.insert(name.to_string(), json!({
-                    "tracks": sr.tracks.len(),
-                    "albums": sr.albums.len(),
-                    "artists": sr.artists.len(),
-                    "results": sr,
-                }));
+                results.insert(
+                    name.to_string(),
+                    json!({
+                        "tracks": sr.tracks.len(),
+                        "albums": sr.albums.len(),
+                        "artists": sr.artists.len(),
+                        "results": sr,
+                    }),
+                );
             }
             Err(e) => {
                 results.insert(name.to_string(), json!({"error": e}));
@@ -746,5 +757,6 @@ async fn compare_services(
     Json(json!({
         "query": query,
         "services": results,
-    })).into_response()
+    }))
+    .into_response()
 }

@@ -129,7 +129,9 @@ async fn export_csv(
         let dur = item.duration_ms;
         let listened = item.listened_at.as_deref().unwrap_or("");
         let zone = item.zone_id.unwrap_or(0);
-        csv.push_str(&format!("{title},{artist},{album},{source},{dur},{listened},{zone}\n"));
+        csv.push_str(&format!(
+            "{title},{artist},{album},{source},{dur},{listened},{zone}\n"
+        ));
     }
 
     (

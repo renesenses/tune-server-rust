@@ -192,7 +192,9 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
-        let is_dsd = source_format.as_ref().is_some_and(|f| *f == AudioFormat::Dsd);
+        let is_dsd = source_format
+            .as_ref()
+            .is_some_and(|f| *f == AudioFormat::Dsd);
         let needs_transcode = source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna())

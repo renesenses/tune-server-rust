@@ -9,7 +9,9 @@ use tracing::{debug, error, warn};
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 #[cfg(feature = "oaat")]
-use super::helpers::{StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, format_rate_display};
+use super::helpers::{
+    StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, format_rate_display,
+};
 
 #[cfg(feature = "oaat")]
 enum OaatCommand {
@@ -17,7 +19,9 @@ enum OaatCommand {
     Resume,
     SetVolume(u8),
     Mute(bool),
-    Seek { position_ms: u64 },
+    Seek {
+        position_ms: u64,
+    },
     PrepareNext {
         url: String,
         title: String,
@@ -110,7 +114,11 @@ impl OaatOutput {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let stale_ms = if last_pkt > 0 && playing { now_ms.saturating_sub(last_pkt) } else { 0 };
+        let stale_ms = if last_pkt > 0 && playing {
+            now_ms.saturating_sub(last_pkt)
+        } else {
+            0
+        };
 
         serde_json::json!({
             "device_id": self.device_id,
@@ -476,8 +484,7 @@ impl OutputTarget for OaatOutput {
             }
 
             // Metadata + Play
-            let fmt_str =
-                format_rate_display(cur_sample_rate, cur_bits, cur_format);
+            let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
             endpoint
                 .send_metadata(oaat_core::message::TrackMetadata {
                     title,
@@ -499,7 +506,8 @@ impl OutputTarget for OaatOutput {
             diag.is_flac.store(is_flac, Ordering::SeqCst);
             diag.packets_sent.store(0, Ordering::SeqCst);
             diag.bytes_sent.store(0, Ordering::SeqCst);
-            *diag.format_desc.lock().unwrap() = format_rate_display(cur_sample_rate, cur_bits, cur_format);
+            *diag.format_desc.lock().unwrap() =
+                format_rate_display(cur_sample_rate, cur_bits, cur_format);
             info!(device = %device_name, "oaat: streaming started");
 
             // Build StreamInfo for reconnection

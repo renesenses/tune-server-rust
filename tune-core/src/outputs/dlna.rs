@@ -390,7 +390,11 @@ impl DlnaOutput {
             )
             .await?;
         let sink = extract_tag(&body, "Sink").unwrap_or_default();
-        Ok(sink.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        Ok(sink
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
     }
 }
 

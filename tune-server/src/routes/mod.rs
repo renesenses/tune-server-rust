@@ -76,16 +76,28 @@ async fn demo_library(
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
     let demo_enabled = settings.get("demo_enabled").ok().flatten().as_deref() == Some("true");
-    let demo_token = settings.get("demo_token").ok().flatten().unwrap_or_default();
+    let demo_token = settings
+        .get("demo_token")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     if !demo_enabled {
-        return (StatusCode::FORBIDDEN, serde_json::json!({"error": "demo mode disabled"}).to_string()).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "demo mode disabled"}).to_string(),
+        )
+            .into_response();
     }
 
     if !demo_token.is_empty() {
         let provided = q.get("token").map(|s| s.as_str()).unwrap_or("");
         if provided != demo_token {
-            return (StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid demo token"}).to_string()).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                serde_json::json!({"error": "invalid demo token"}).to_string(),
+            )
+                .into_response();
         }
     }
 
@@ -101,7 +113,8 @@ async fn demo_library(
         "read_only": true,
         "stats": { "tracks": stats },
         "albums": albums,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn service_tokens_list(

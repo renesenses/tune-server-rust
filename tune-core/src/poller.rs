@@ -17,6 +17,9 @@ const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 2;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
+/// Grace period after SetNextAVTransportURI during which we treat Stopped
+/// state and position resets as gapless transitions instead of track-end.
+const GAPLESS_GUARD_SECS: u64 = 5;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -50,6 +53,13 @@ struct ZonePollState {
     last_latency_ms: u32,
     max_latency_ms: u32,
     last_radio_poll: Instant,
+    /// When SetNextAVTransportURI was sent — used to guard against
+    /// false track-end detection during gapless transitions on renderers
+    /// like Eversolo DMP-A6 that briefly report Stopped or reset position.
+    gapless_sent_at: Option<Instant>,
+    /// Last polled position in milliseconds — used to detect position
+    /// resets (jumps from >30s to <5s) that signal a gapless transition.
+    last_position_ms: u64,
 }
 
 pub struct PositionPoller {
@@ -183,6 +193,8 @@ impl PositionPoller {
                 last_latency_ms: 0,
                 max_latency_ms: 0,
                 last_radio_poll: Instant::now(),
+                gapless_sent_at: None,
+                last_position_ms: 0,
             });
 
             if ps.backoff_remaining > 0 {
@@ -290,12 +302,72 @@ impl PositionPoller {
                 }
             }
 
+            // Detect position reset: position drops from >30s to <5s while
+            // inside the gapless guard window. This is a strong signal that
+            // the renderer performed a gapless transition (new track starts
+            // from 0).
+            let position_reset = ps.last_position_ms > 30_000
+                && status.position_ms < 5_000
+                && ps.gapless_sent_at.is_some();
+            ps.last_position_ms = status.position_ms;
+
+            if position_reset {
+                info!(
+                    zone_id,
+                    prev_pos = ps.last_position_ms,
+                    new_pos = status.position_ms,
+                    "gapless_position_reset_detected"
+                );
+                ps.gapless_sent = false;
+                ps.gapless_sent_at = None;
+                ps.stopped_ticks = 0;
+                if let Some(next_pos) = Self::next_position(zone_state) {
+                    info!(zone_id, next_pos, "gapless_advance_on_position_reset");
+                    if let Err(e) = self
+                        .orchestrator
+                        .advance_queue_metadata(zone_id, next_pos)
+                        .await
+                    {
+                        warn!(zone_id, error = %e, "gapless_advance_failed");
+                    }
+                    ps.gapless_cooldown = 4;
+                }
+            }
+
+            // Clear expired guard
+            if let Some(sent_at) = ps.gapless_sent_at {
+                if sent_at.elapsed() > std::time::Duration::from_secs(GAPLESS_GUARD_SECS) {
+                    debug!(zone_id, "gapless_guard_expired");
+                    ps.gapless_sent_at = None;
+                }
+            }
+
+            let in_gapless_guard = ps.gapless_sent_at.is_some();
+
             let mut track_ended = false;
             match status.state {
                 TransportState::Stopped => {
                     if ps.gapless_cooldown > 0 {
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
+                    } else if in_gapless_guard {
+                        // During the gapless guard period, a Stopped state
+                        // means the renderer transitioned via gapless —
+                        // advance metadata instead of triggering track end.
+                        info!(zone_id, "gapless_guard_stopped_advancing");
+                        ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
+                        ps.stopped_ticks = 0;
+                        if let Some(next_pos) = Self::next_position(zone_state) {
+                            if let Err(e) = self
+                                .orchestrator
+                                .advance_queue_metadata(zone_id, next_pos)
+                                .await
+                            {
+                                warn!(zone_id, error = %e, "gapless_advance_failed");
+                            }
+                            ps.gapless_cooldown = 4;
+                        }
                     } else {
                         ps.stopped_ticks += 1;
                         track_ended = ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD;
@@ -333,6 +405,7 @@ impl PositionPoller {
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -363,6 +436,7 @@ impl PositionPoller {
                             .unwrap_or(true);
                         if gapless_enabled {
                             self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                            ps.gapless_sent_at = Some(Instant::now());
                         } else {
                             debug!(zone_id, "gapless_disabled_for_zone");
                         }
@@ -490,6 +564,8 @@ mod tests {
             last_latency_ms: 0,
             max_latency_ms: 0,
             last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -521,6 +597,8 @@ mod tests {
             last_latency_ms: 0,
             max_latency_ms: 0,
             last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
         };
 
         // Simulates entering Playing state
@@ -607,6 +685,8 @@ mod tests {
             last_latency_ms: 0,
             max_latency_ms: 0,
             last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -626,5 +706,71 @@ mod tests {
         // Success resets
         ps.consecutive_errors = 0;
         assert_eq!(ps.consecutive_errors, 0);
+    }
+
+    #[test]
+    fn gapless_guard_suppresses_stopped() {
+        let mut ps = ZonePollState {
+            gapless_sent: true,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: Some(Instant::now()),
+            last_position_ms: 180_000,
+        };
+
+        // While gapless_sent_at is Some, stopped_ticks must not accumulate
+        // (the guard is active)
+        assert!(ps.gapless_sent_at.is_some());
+        assert_eq!(ps.stopped_ticks, 0);
+
+        // Simulate guard expiry
+        ps.gapless_sent_at = None;
+        // Now stopped_ticks can accumulate normally
+        ps.stopped_ticks = 1;
+        assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
+        ps.stopped_ticks = 2;
+        assert!(ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD);
+    }
+
+    #[test]
+    fn position_reset_detection() {
+        let ps = ZonePollState {
+            gapless_sent: true,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: Some(Instant::now()),
+            last_position_ms: 180_000,
+        };
+
+        // Position reset: from 180s to 2s while guard active
+        let new_position_ms: u64 = 2_000;
+        let is_reset =
+            ps.last_position_ms > 30_000 && new_position_ms < 5_000 && ps.gapless_sent_at.is_some();
+        assert!(is_reset);
+
+        // No reset without guard
+        let ps2 = ZonePollState {
+            gapless_sent_at: None,
+            last_position_ms: 180_000,
+            ..ps
+        };
+        let is_reset2 = ps2.last_position_ms > 30_000
+            && new_position_ms < 5_000
+            && ps2.gapless_sent_at.is_some();
+        assert!(!is_reset2);
     }
 }

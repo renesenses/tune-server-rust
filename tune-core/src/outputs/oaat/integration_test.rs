@@ -65,12 +65,10 @@ mod tests {
             });
 
             // Accept TCP
-            if let Ok((mut stream, _)) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tcp.accept(),
-            )
-            .await
-            .unwrap_or(Err(std::io::Error::other("timeout")))
+            if let Ok((mut stream, _)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tcp.accept())
+                    .await
+                    .unwrap_or(Err(std::io::Error::other("timeout")))
             {
                 let mut codec = FrameCodec::new();
                 let mut read_buf = [0u8; 8192];
@@ -174,13 +172,11 @@ mod tests {
         assert!(result.is_ok());
 
         // Wait for mock to finish
-        let (got_format, got_play, audio_packets) = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            mock_handle,
-        )
-        .await
-        .expect("mock timed out")
-        .expect("mock panicked");
+        let (got_format, got_play, audio_packets) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), mock_handle)
+                .await
+                .expect("mock timed out")
+                .expect("mock panicked");
 
         assert!(got_format, "endpoint should receive FormatPropose");
         assert!(got_play, "endpoint should receive Play");
