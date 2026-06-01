@@ -344,27 +344,24 @@ fn env_bool(key: &str, target: &mut bool) {
 }
 
 fn env_u16(key: &str, target: &mut u16) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(n) = val.parse() {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(n) = val.parse() {
             *target = n;
         }
-    }
 }
 
 fn env_u32(key: &str, target: &mut u32) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(n) = val.parse() {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(n) = val.parse() {
             *target = n;
         }
-    }
 }
 
 fn env_f64(key: &str, target: &mut f64) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(n) = val.parse() {
+    if let Ok(val) = std::env::var(key)
+        && let Ok(n) = val.parse() {
             *target = n;
         }
-    }
 }
 
 #[cfg(test)]

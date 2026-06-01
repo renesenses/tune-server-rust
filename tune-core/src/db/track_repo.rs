@@ -195,6 +195,30 @@ impl TrackRepo {
         Ok(())
     }
 
+    pub fn get_credits(&self, track_id: i64) -> Result<Vec<crate::db::models::TrackCredit>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, track_id, artist_id, artist_name, role, instrument, position \
+                 FROM track_credits WHERE track_id = ? ORDER BY position",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(rusqlite::params![track_id], |row| {
+            Ok(crate::db::models::TrackCredit {
+                id: row.get(0).ok(),
+                track_id: row.get(1)?,
+                artist_id: row.get(2).ok(),
+                artist_name: row.get(3)?,
+                role: row.get(4)?,
+                instrument: row.get(5).ok(),
+                position: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))

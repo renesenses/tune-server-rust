@@ -57,11 +57,10 @@ impl EventState {
             self.muted = Some(mute == "1" || mute.eq_ignore_ascii_case("true"));
         }
 
-        if let Some(uri) = props.get("Uri") {
-            if !uri.is_empty() {
+        if let Some(uri) = props.get("Uri")
+            && !uri.is_empty() {
                 self.track_uri = Some(uri.clone());
             }
-        }
 
         self.last_update = Some(Instant::now());
     }
@@ -176,8 +175,8 @@ impl OpenHomeEventListener {
 
     pub async fn unsubscribe(&self, path_id: &str) {
         self.handlers.write().await.remove(path_id);
-        if let Some(event_url) = self.subscriptions.write().await.remove(path_id) {
-            if let Ok(method) = reqwest::Method::from_bytes(b"UNSUBSCRIBE") {
+        if let Some(event_url) = self.subscriptions.write().await.remove(path_id)
+            && let Ok(method) = reqwest::Method::from_bytes(b"UNSUBSCRIBE") {
                 let _ = self
                     .client
                     .request(method, &event_url)
@@ -185,7 +184,6 @@ impl OpenHomeEventListener {
                     .send()
                     .await;
             }
-        }
     }
 }
 
@@ -299,14 +297,13 @@ fn parse_propertyset(xml: &str) -> HashMap<String, String> {
                 }
             }
             Ok(Event::Text(ref e)) => {
-                if in_property && !current_tag.is_empty() {
-                    if let Ok(text) = e.unescape() {
+                if in_property && !current_tag.is_empty()
+                    && let Ok(text) = e.unescape() {
                         let text = text.trim().to_string();
                         if !text.is_empty() {
                             result.insert(current_tag.clone(), text);
                         }
                     }
-                }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,

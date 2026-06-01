@@ -23,11 +23,10 @@ fn build_api_sig(params: &[(&str, String)], api_secret: &str) -> String {
 }
 
 pub fn should_scrobble(duration_ms: Option<i64>, listened_ms: i64) -> bool {
-    if let Some(d) = duration_ms {
-        if d < SCROBBLE_MIN_DURATION_MS {
+    if let Some(d) = duration_ms
+        && d < SCROBBLE_MIN_DURATION_MS {
             return false;
         }
-    }
     if listened_ms <= 0 {
         return false;
     }
@@ -116,11 +115,10 @@ pub async fn scrobble_full(
     if let Some(a) = album {
         params.push(("album", a.to_string()));
     }
-    if let Some(d) = duration_ms {
-        if d > 0 {
+    if let Some(d) = duration_ms
+        && d > 0 {
             params.push(("duration", (d / 1000).to_string()));
         }
-    }
     let sig = build_api_sig(&params, api_secret);
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));
@@ -173,11 +171,10 @@ pub async fn update_now_playing_full(
     if let Some(a) = album {
         params.push(("album", a.to_string()));
     }
-    if let Some(d) = duration_ms {
-        if d > 0 {
+    if let Some(d) = duration_ms
+        && d > 0 {
             params.push(("duration", (d / 1000).to_string()));
         }
-    }
     let sig = build_api_sig(&params, api_secret);
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));

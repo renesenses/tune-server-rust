@@ -48,7 +48,7 @@ pub fn normalize_path(path: &str) -> String {
     let normalized = trimmed.to_string();
 
     // Strip trailing separator, but keep root paths intact (e.g. `C:\` or `/`)
-    let result = normalized.trim_end_matches(|c| c == '/' || c == '\\');
+    let result = normalized.trim_end_matches(['/', '\\']);
     if result.is_empty() {
         // Was just "/" or "\"
         return normalized.chars().next().unwrap().to_string();

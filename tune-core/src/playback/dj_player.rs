@@ -111,13 +111,11 @@ impl DualDeckPlayer {
             Deck::B => &self.deck_b,
         };
         let mut s = state.lock().await;
-        if s.playing {
-            if let Some((d, start)) = self.play_start.lock().await.take() {
-                if d == deck {
+        if s.playing
+            && let Some((d, start)) = self.play_start.lock().await.take()
+                && d == deck {
                     s.position_ms += start.elapsed().as_millis() as i64;
                 }
-            }
-        }
         s.playing = false;
         debug!(zone_id = self.zone_id, deck = ?deck, "dj_deck_pause");
     }
@@ -157,13 +155,12 @@ impl DualDeckPlayer {
         let bpm_a = self.deck_a.lock().await.bpm;
         let bpm_b = self.deck_b.lock().await.bpm;
 
-        if let (Some(a), Some(b)) = (bpm_a, bpm_b) {
-            if a > 0.0 && b > 0.0 {
+        if let (Some(a), Some(b)) = (bpm_a, bpm_b)
+            && a > 0.0 && b > 0.0 {
                 let ratio = a / b;
                 self.deck_b.lock().await.tempo_ratio = ratio;
                 info!(bpm_a = a, bpm_b = b, ratio, "dj_bpm_synced");
             }
-        }
     }
 
     pub fn compute_deck_gains(crossfader: f64) -> (f32, f32) {

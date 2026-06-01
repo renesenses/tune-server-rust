@@ -198,15 +198,14 @@ async fn send_msearch(target: &str) -> Result<Vec<SsdpResponse>, String> {
             if iface.is_loopback() {
                 continue;
             }
-            if let std::net::IpAddr::V4(ip) = iface.ip() {
-                if !tried.contains(&ip) {
+            if let std::net::IpAddr::V4(ip) = iface.ip()
+                && !tried.contains(&ip) {
                     tried.insert(ip);
                     debug!(interface = %iface.name, ip = %ip, "ssdp_probing_interface");
                     if let Ok(resps) = send_msearch_from(target, ip).await {
                         all_responses.extend(resps);
                     }
                 }
-            }
         }
     }
 

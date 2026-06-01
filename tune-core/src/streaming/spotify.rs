@@ -55,16 +55,14 @@ impl SpotifyService {
     /// Create a SpotifyService with explicit client_id and redirect_uri from TuneConfig.
     pub fn with_config(client_id: Option<&str>, redirect_uri: Option<&str>) -> Self {
         let mut svc = Self::new();
-        if let Some(id) = client_id {
-            if !id.is_empty() {
+        if let Some(id) = client_id
+            && !id.is_empty() {
                 svc.client_id = id.to_string();
             }
-        }
-        if let Some(uri) = redirect_uri {
-            if !uri.is_empty() {
+        if let Some(uri) = redirect_uri
+            && !uri.is_empty() {
                 svc.redirect_uri = uri.to_string();
             }
-        }
         svc
     }
 

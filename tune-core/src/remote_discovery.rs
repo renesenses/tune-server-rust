@@ -139,12 +139,11 @@ impl PeerRegistry {
             match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
                 Ok(Ok((len, addr))) => {
                     let response = String::from_utf8_lossy(&buf[..len]);
-                    if let Some(peer) = parse_ssdp_response(&response, &addr) {
-                        if peer.server_id != self.server_id {
+                    if let Some(peer) = parse_ssdp_response(&response, &addr)
+                        && peer.server_id != self.server_id {
                             self.register_peer(peer.clone()).await;
                             found.push(peer);
                         }
-                    }
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "ssdp_recv_error");

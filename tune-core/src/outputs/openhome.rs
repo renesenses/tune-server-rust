@@ -222,8 +222,8 @@ impl OpenHomeOutput {
 
         let mut idx = 0u32;
         for chunk in xml.split("<Source>").skip(1) {
-            if let Some(stype) = extract_tag(chunk, "Type") {
-                if stype.trim() == "Playlist" {
+            if let Some(stype) = extract_tag(chunk, "Type")
+                && stype.trim() == "Playlist" {
                     if let Err(e) = self
                         .soap_call(
                             url,
@@ -239,7 +239,6 @@ impl OpenHomeOutput {
                     }
                     return;
                 }
-            }
             idx += 1;
         }
     }
@@ -273,12 +272,11 @@ impl OpenHomeOutput {
 
         let mut count = 0u32;
         for svc in &services {
-            if let Some(url) = self.event_sub_urls.get(*svc) {
-                if let Some(path_id) = listener.subscribe(url, state.clone()).await {
+            if let Some(url) = self.event_sub_urls.get(*svc)
+                && let Some(path_id) = listener.subscribe(url, state.clone()).await {
                     sub_ids.push(path_id);
                     count += 1;
                 }
-            }
         }
 
         if count > 0 {

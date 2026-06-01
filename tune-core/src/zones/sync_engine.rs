@@ -54,11 +54,10 @@ impl SyncEngine {
                     POLL_IDLE_MS
                 };
 
-                if has_active {
-                    if let Err(e) = self.sync_all().await {
+                if has_active
+                    && let Err(e) = self.sync_all().await {
                         warn!(error = %e, "sync_engine_error");
                     }
-                }
 
                 tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
             }
@@ -91,13 +90,11 @@ impl SyncEngine {
         // Check settle period
         {
             let groups = self.groups.lock().await;
-            if let Some(group) = groups.get_group(&group_info.group_id) {
-                if let Some(last_play) = group.last_play_time() {
-                    if last_play.elapsed().as_secs_f64() < COOLDOWN_COARSE_S {
+            if let Some(group) = groups.get_group(&group_info.group_id)
+                && let Some(last_play) = group.last_play_time()
+                    && last_play.elapsed().as_secs_f64() < COOLDOWN_COARSE_S {
                         return;
                     }
-                }
-            }
         }
 
         let outputs = self.outputs.lock().await;
@@ -135,9 +132,9 @@ impl SyncEngine {
                         .map(|t| t.elapsed().as_secs_f64() >= COOLDOWN_COARSE_S)
                         .unwrap_or(true)
                 };
-                if should_correct {
-                    if let Some(device_id) = self.get_device_id(follower_id) {
-                        if let Some(output) = outputs.get(&device_id) {
+                if should_correct
+                    && let Some(device_id) = self.get_device_id(follower_id)
+                        && let Some(output) = outputs.get(&device_id) {
                             info!(
                                 follower = follower_id,
                                 drift_ms = drift,
@@ -150,8 +147,6 @@ impl SyncEngine {
                                 .await
                                 .insert(follower_id, Instant::now());
                         }
-                    }
-                }
             } else if drift > DRIFT_FINE_MS {
                 let should_correct = {
                     let corrections = self.last_correction.lock().await;
@@ -160,9 +155,9 @@ impl SyncEngine {
                         .map(|t| t.elapsed().as_secs_f64() >= COOLDOWN_FINE_S)
                         .unwrap_or(true)
                 };
-                if should_correct {
-                    if let Some(device_id) = self.get_device_id(follower_id) {
-                        if let Some(output) = outputs.get(&device_id) {
+                if should_correct
+                    && let Some(device_id) = self.get_device_id(follower_id)
+                        && let Some(output) = outputs.get(&device_id) {
                             debug!(
                                 follower = follower_id,
                                 drift_ms = drift,
@@ -175,8 +170,6 @@ impl SyncEngine {
                                 .await
                                 .insert(follower_id, Instant::now());
                         }
-                    }
-                }
             }
         }
     }

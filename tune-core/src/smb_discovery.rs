@@ -90,14 +90,14 @@ impl Default for SmbAutoDiscovery {
 }
 
 async fn discover_smb_hosts() -> Vec<String> {
-    let hosts = if cfg!(target_os = "macos") {
+    
+    if cfg!(target_os = "macos") {
         discover_hosts_macos().await
     } else if cfg!(target_os = "linux") {
         discover_hosts_linux().await
     } else {
         vec![]
-    };
-    hosts
+    }
 }
 
 async fn discover_hosts_macos() -> Vec<String> {
@@ -210,13 +210,11 @@ fn parse_smbutil_shares(output: &str) -> Vec<String> {
     let mut shares = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.contains("Disk") {
-            if let Some(name) = trimmed.split_whitespace().next() {
-                if !name.ends_with('$') {
+        if trimmed.contains("Disk")
+            && let Some(name) = trimmed.split_whitespace().next()
+                && !name.ends_with('$') {
                     shares.push(name.to_string());
                 }
-            }
-        }
     }
     shares
 }

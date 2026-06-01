@@ -47,7 +47,7 @@ pub async fn lookup_track(title: &str, artist: &str, album: &str) -> Vec<TrackMa
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(&format!("{MB_API}/recording"))
+        .get(format!("{MB_API}/recording"))
         .query(&[
             ("query", &query),
             ("limit", &"5".to_string()),
@@ -156,7 +156,7 @@ pub async fn lookup_album(title: &str, artist: &str) -> Vec<AlbumMatch> {
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(&format!("{MB_API}/release"))
+        .get(format!("{MB_API}/release"))
         .query(&[
             ("query", &query),
             ("limit", &"5".to_string()),

@@ -41,12 +41,11 @@ impl StreamUrlCache {
 
     pub fn set(&mut self, track_id: &str, url: &str, ttl: Option<u64>) {
         let exists = self.cache.contains_key(track_id);
-        if !exists && self.cache.len() >= self.max_size {
-            if let Some(oldest) = self.insertion_order.first().cloned() {
+        if !exists && self.cache.len() >= self.max_size
+            && let Some(oldest) = self.insertion_order.first().cloned() {
                 self.cache.remove(&oldest);
                 self.insertion_order.remove(0);
             }
-        }
         let ttl = ttl.unwrap_or(self.ttl_secs);
         self.cache.insert(
             track_id.to_string(),

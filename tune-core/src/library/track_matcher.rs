@@ -116,8 +116,8 @@ pub fn similarity(a: &str, b: &str) -> f64 {
         return 0.0;
     }
 
-    let ratio = matches as f64 / len_a.max(len_b) as f64;
-    ratio
+    
+    matches as f64 / len_a.max(len_b) as f64
 }
 
 pub fn match_by_isrc(source_isrc: &str, candidates: &[MatchCandidate]) -> Option<MatchCandidate> {
@@ -186,8 +186,8 @@ pub fn match_fuzzy(
             score += dur_ratio * 0.1;
         }
 
-        if score >= threshold {
-            if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+        if score >= threshold
+            && best.as_ref().is_none_or(|(bs, _)| score > *bs) {
                 let mut result = c.clone();
                 result.score = score;
                 result.match_method = "fuzzy".into();
@@ -201,7 +201,6 @@ pub fn match_fuzzy(
                 .into();
                 best = Some((score, result));
             }
-        }
     }
 
     best.map(|(_, m)| m)

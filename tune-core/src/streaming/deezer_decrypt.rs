@@ -54,7 +54,7 @@ impl DeezerDecryptStream {
         let mut output = Vec::new();
         while self.buffer.len() >= CHUNK_SIZE {
             let chunk: Vec<u8> = self.buffer.drain(..CHUNK_SIZE).collect();
-            if self.chunk_index % 3 == 0 {
+            if self.chunk_index.is_multiple_of(3) {
                 output.push(decrypt_chunk(&chunk, &self.key));
             } else {
                 output.push(chunk);

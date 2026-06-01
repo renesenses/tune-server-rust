@@ -138,17 +138,16 @@ pub async fn search_covers(
 ) -> Vec<CoverResult> {
     let mut results = Vec::new();
 
-    if !musicbrainz_release_id.is_empty() {
-        if let Some(path) = fetch_cover_from_caa(musicbrainz_release_id, cache_dir).await {
+    if !musicbrainz_release_id.is_empty()
+        && let Some(path) = fetch_cover_from_caa(musicbrainz_release_id, cache_dir).await {
             results.push(CoverResult {
                 source: "coverartarchive".into(),
                 local_path: path,
             });
         }
-    }
 
-    if !discogs_token.is_empty() {
-        if let Some(path) =
+    if !discogs_token.is_empty()
+        && let Some(path) =
             fetch_cover_from_discogs(album_title, artist_name, discogs_token, cache_dir).await
         {
             results.push(CoverResult {
@@ -156,7 +155,6 @@ pub async fn search_covers(
                 local_path: path,
             });
         }
-    }
 
     results
 }

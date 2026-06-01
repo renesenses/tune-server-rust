@@ -52,9 +52,9 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
     let created = meta
         .modified()
         .ok()
-        .and_then(|t| {
+        .map(|t| {
             let dt: chrono::DateTime<chrono::Local> = t.into();
-            Some(dt.to_rfc3339())
+            dt.to_rfc3339()
         })
         .unwrap_or_default();
 
@@ -96,9 +96,9 @@ pub fn list_backups(db_path: &str) -> Vec<BackupInfo> {
                 let created = meta
                     .modified()
                     .ok()
-                    .and_then(|t| {
+                    .map(|t| {
                         let dt: chrono::DateTime<chrono::Local> = t.into();
-                        Some(dt.to_rfc3339())
+                        dt.to_rfc3339()
                     })
                     .unwrap_or_default();
                 Some((
@@ -131,14 +131,12 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
         return false;
     }
 
-    if let Ok(resolved) = backup_path.canonicalize() {
-        if let Ok(dir_resolved) = backup_dir.canonicalize() {
-            if !resolved.starts_with(&dir_resolved) {
+    if let Ok(resolved) = backup_path.canonicalize()
+        && let Ok(dir_resolved) = backup_dir.canonicalize()
+            && !resolved.starts_with(&dir_resolved) {
                 warn!("path_traversal_blocked");
                 return false;
             }
-        }
-    }
 
     for suffix in ["-wal", "-shm"] {
         let wal = db_file.with_file_name(format!(

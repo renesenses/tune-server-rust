@@ -159,7 +159,21 @@ async fn now_listening(State(state): State<AppState>) -> Json<Value> {
 
 async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let zone_state = state.playback.get_state(zone_id).await;
-    Json(json!(zone_state))
+    let mut v = serde_json::to_value(&zone_state).unwrap_or_default();
+    if let Some(track_id) = zone_state.now_playing.as_ref().and_then(|np| np.track_id) {
+        let credits = TrackRepo::new(state.db.clone())
+            .get_credits(track_id)
+            .unwrap_or_default();
+        if !credits.is_empty() {
+            if let Some(np) = v.get_mut("now_playing").and_then(|np| np.as_object_mut()) {
+                np.insert(
+                    "credits".into(),
+                    serde_json::to_value(&credits).unwrap_or_default(),
+                );
+            }
+        }
+    }
+    Json(v)
 }
 
 async fn play(

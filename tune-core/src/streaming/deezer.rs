@@ -88,11 +88,10 @@ impl DeezerService {
         }
         let data: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("deezer gw json: {e}"))?;
-        if let Some(err) = data.get("error").and_then(|e| e.as_object()) {
-            if !err.is_empty() {
+        if let Some(err) = data.get("error").and_then(|e| e.as_object())
+            && !err.is_empty() {
                 return Err(format!("deezer gw error: {}", serde_json::json!(err)));
             }
-        }
         Ok(data.get("results").cloned().unwrap_or_default())
     }
 
@@ -158,7 +157,7 @@ impl DeezerService {
             });
             let resp = self
                 .client
-                .post(&format!("{DEEZER_MEDIA_URL}/get_url"))
+                .post(format!("{DEEZER_MEDIA_URL}/get_url"))
                 .json(&body)
                 .send()
                 .await
@@ -189,8 +188,8 @@ impl DeezerService {
                 .as_array()
                 .map(|errs| errs.iter().any(|e| e["code"].as_u64() == Some(2002)))
                 .unwrap_or(false);
-            if rights_denied && attempt < max_fallbacks {
-                if let Some(fid) = result
+            if rights_denied && attempt < max_fallbacks
+                && let Some(fid) = result
                     .get("FALLBACK")
                     .and_then(|f| f.get("SNG_ID"))
                     .and_then(|v| {
@@ -198,14 +197,11 @@ impl DeezerService {
                             .map(|s| s.to_string())
                             .or_else(|| v.as_u64().map(|n| n.to_string()))
                     })
-                {
-                    if !fid.is_empty() && fid != current_id {
+                    && !fid.is_empty() && fid != current_id {
                         info!(original = %current_id, fallback = %fid, "deezer_track_fallback");
                         current_id = fid;
                         continue;
                     }
-                }
-            }
             break;
         }
         Err("no stream URL available".into())
@@ -499,8 +495,8 @@ impl StreamingService for DeezerService {
         }
 
         // Path 2: direct encrypted URL (only for clients that decrypt)
-        if self.has_full_streaming() {
-            if let Ok(url) = self.get_full_stream_url(track_id, 0).await {
+        if self.has_full_streaming()
+            && let Ok(url) = self.get_full_stream_url(track_id, 0).await {
                 let ext = if self.quality == "FLAC" {
                     "flac"
                 } else {
@@ -524,7 +520,6 @@ impl StreamingService for DeezerService {
                     expires_at: None,
                 });
             }
-        }
 
         // Fallback: 30s preview
         let data = self.api_get(&format!("/track/{track_id}")).await?;

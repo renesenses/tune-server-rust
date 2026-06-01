@@ -99,11 +99,10 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
         if line.contains("I:") && line.contains("LUFS") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, p) in parts.iter().enumerate() {
-                if *p == "I:" {
-                    if let Some(val) = parts.get(i + 1) {
+                if *p == "I:"
+                    && let Some(val) = parts.get(i + 1) {
                         return val.parse::<f64>().ok();
                     }
-                }
             }
         }
     }
@@ -127,13 +126,11 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut last_duration = 0.0_f64;
     for line in stderr.lines() {
-        if line.contains("silence_end") {
-            if let Some(dur_part) = line.split("silence_duration:").nth(1) {
-                if let Ok(d) = dur_part.trim().parse::<f64>() {
+        if line.contains("silence_end")
+            && let Some(dur_part) = line.split("silence_duration:").nth(1)
+                && let Ok(d) = dur_part.trim().parse::<f64>() {
                     last_duration = d;
                 }
-            }
-        }
     }
     last_duration
 }

@@ -68,11 +68,10 @@ pub async fn probe_minimal_dmr(
     let mut name = fallback_name.to_string();
 
     // 1. Try XML description with generous timeout
-    if let Some(desc_url) = description_url {
-        if let Some(result) = try_xml_description(&client, base, desc_url, &mut name).await {
+    if let Some(desc_url) = description_url
+        && let Some(result) = try_xml_description(&client, base, desc_url, &mut name).await {
             return Some(result);
         }
-    }
 
     // 2. Try alternative XML paths
     for xml_path in XML_DESC_PATHS {
@@ -168,13 +167,12 @@ async fn probe_common_paths(client: &Client, base: &str, name: &str) -> Option<P
             .body(soap.clone())
             .send()
             .await;
-        if let Ok(resp) = result {
-            if resp.status().is_success() {
+        if let Ok(resp) = result
+            && resp.status().is_success() {
                 info!(name, path, "minimal_dmr_avt_probed");
                 avt_url = Some(url);
                 break;
             }
-        }
     }
 
     let avt = avt_url?;
@@ -196,13 +194,12 @@ async fn probe_common_paths(client: &Client, base: &str, name: &str) -> Option<P
             .body(soap_rc.clone())
             .send()
             .await;
-        if let Ok(resp) = result {
-            if resp.status().is_success() {
+        if let Ok(resp) = result
+            && resp.status().is_success() {
                 info!(name, path, "minimal_dmr_rc_probed");
                 rc_url = Some(url);
                 break;
             }
-        }
     }
 
     Some(ProbeResult {

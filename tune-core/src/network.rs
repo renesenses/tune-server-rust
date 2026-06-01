@@ -227,15 +227,14 @@ pub async fn discover_smb_shares(subnet: Option<&str>) -> Result<Vec<DiscoveredS
         if line.is_empty() || line.starts_with("---") {
             continue;
         }
-        if let Some((name, rest)) = line.split_once(char::is_whitespace) {
-            if rest.to_lowercase().contains("disk") {
+        if let Some((name, rest)) = line.split_once(char::is_whitespace)
+            && rest.to_lowercase().contains("disk") {
                 shares.push(DiscoveredShare {
                     host: subnet.unwrap_or("unknown").into(),
                     name: name.trim().to_string(),
                     share_type: ShareType::Smb,
                 });
             }
-        }
     }
 
     Ok(shares)

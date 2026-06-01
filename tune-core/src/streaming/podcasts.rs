@@ -246,11 +246,10 @@ fn extract_channel_image(xml: &str) -> String {
     if let Some(href) = extract_attr(xml, "itunes:image", "href") {
         return href;
     }
-    if let Some(img) = extract_tag(xml, "image") {
-        if let Some(url) = extract_tag(&img, "url") {
+    if let Some(img) = extract_tag(xml, "image")
+        && let Some(url) = extract_tag(&img, "url") {
             return url;
         }
-    }
     String::new()
 }
 

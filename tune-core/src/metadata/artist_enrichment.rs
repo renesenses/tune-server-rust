@@ -42,9 +42,9 @@ impl ArtistEnrichmentClient {
         let data = self.request(&format!("/{mbid}")).await?;
         let mut artist = ArtistData { fields: data };
 
-        if let Some(inner) = artist.fields.get_mut("data") {
-            if let Some(img) = inner.get("image_url").and_then(|v| v.as_str()) {
-                if img.starts_with("/storage/") {
+        if let Some(inner) = artist.fields.get_mut("data")
+            && let Some(img) = inner.get("image_url").and_then(|v| v.as_str())
+                && img.starts_with("/storage/") {
                     let base = self
                         .base_url
                         .split("/api/")
@@ -53,8 +53,6 @@ impl ArtistEnrichmentClient {
                     let full = format!("{base}{img}");
                     inner["image_url"] = serde_json::json!(full);
                 }
-            }
-        }
 
         self.cache_set(mbid, artist.clone());
         Some(artist)

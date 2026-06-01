@@ -44,7 +44,7 @@ pub async fn lookup_release(
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(&format!("{MB_API}/release"))
+        .get(format!("{MB_API}/release"))
         .query(&[
             ("query", &query),
             ("limit", &"5".to_string()),

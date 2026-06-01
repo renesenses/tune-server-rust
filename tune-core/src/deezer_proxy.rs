@@ -41,7 +41,7 @@ pub fn decrypt_stream_buffer(
 ) {
     while buffer.len() >= CHUNK_SIZE {
         let chunk: Vec<u8> = buffer.drain(..CHUNK_SIZE).collect();
-        if *chunk_index % 3 == 0 {
+        if (*chunk_index).is_multiple_of(3) {
             output.extend(deezer_decrypt::decrypt_chunk(&chunk, key));
         } else {
             output.extend(&chunk);
