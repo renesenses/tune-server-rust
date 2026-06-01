@@ -662,4 +662,154 @@ mod tests {
         let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.flac"));
         assert!(result.is_err());
     }
+
+    // ── Parsing robustness tests ────────────────────────────────────
+
+    #[test]
+    fn normalize_format_mp4_variants() {
+        assert_eq!(normalize_format("mp4"), "aac");
+        assert_eq!(normalize_format("m4a"), "aac");
+    }
+
+    #[test]
+    fn normalize_format_unknown_passthrough() {
+        assert_eq!(normalize_format("ogg"), "ogg");
+        assert_eq!(normalize_format("opus"), "opus");
+        assert_eq!(normalize_format("wv"), "wv");
+        assert_eq!(normalize_format("ape"), "ape");
+    }
+
+    #[test]
+    fn split_genre_parenthesized_id3v1_numeric() {
+        // Some taggers write "(17)" for Rock — our splitter doesn't decode
+        // numeric ID3v1 codes, but it should not crash.
+        let genres = split_genre_tag("(17)Rock");
+        assert!(!genres.is_empty());
+    }
+
+    #[test]
+    fn split_genre_very_long() {
+        let long = (0..50).map(|i| format!("Genre{i}")).collect::<Vec<_>>().join(";");
+        let genres = split_genre_tag(&long);
+        assert_eq!(genres.len(), 50);
+    }
+
+    #[test]
+    fn track_metadata_all_optional_fields_none() {
+        let md = TrackMetadata::default();
+        let json = serde_json::to_value(&md).unwrap();
+        assert!(json["title"].is_null());
+        assert!(json["artist"].is_null());
+        assert!(json["album"].is_null());
+        assert!(json["album_artist"].is_null());
+        assert!(json["track_number"].is_null());
+        assert!(json["disc_number"].is_null());
+        assert!(json["year"].is_null());
+        assert!(json["sample_rate"].is_null());
+        assert!(json["bit_depth"].is_null());
+        assert!(json["duration_ms"].is_null());
+        assert_eq!(json["compilation"], false);
+        assert_eq!(json["has_cover"], false);
+    }
+
+    #[test]
+    fn track_metadata_json_types_stable() {
+        let md = TrackMetadata {
+            title: Some("Track".into()),
+            track_number: Some(3),
+            disc_number: Some(1),
+            total_tracks: Some(12),
+            total_discs: Some(2),
+            year: Some(2024),
+            duration_ms: Some(245_000),
+            sample_rate: Some(96000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            bpm: Some(120.5),
+            compilation: true,
+            has_cover: true,
+            genres: vec!["Jazz".into(), "Fusion".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&md).unwrap();
+
+        assert!(json["track_number"].is_number());
+        assert!(json["disc_number"].is_number());
+        assert!(json["total_tracks"].is_number());
+        assert!(json["total_discs"].is_number());
+        assert!(json["year"].is_number());
+        assert!(json["duration_ms"].is_number());
+        assert!(json["sample_rate"].is_number());
+        assert!(json["bit_depth"].is_number());
+        assert!(json["channels"].is_number());
+        assert!(json["bpm"].is_number());
+        assert_eq!(json["compilation"], true);
+        assert_eq!(json["has_cover"], true);
+        assert!(json["genres"].is_array());
+        assert_eq!(json["genres"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn track_metadata_credits_serialization() {
+        let md = TrackMetadata {
+            credits: vec![
+                TrackCredit {
+                    name: "John Doe".into(),
+                    role: "composer".into(),
+                    instrument: None,
+                },
+                TrackCredit {
+                    name: "Jane Doe".into(),
+                    role: "performer".into(),
+                    instrument: Some("piano".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&md).unwrap();
+        let credits = json["credits"].as_array().unwrap();
+        assert_eq!(credits.len(), 2);
+        assert_eq!(credits[0]["name"], "John Doe");
+        assert_eq!(credits[0]["role"], "composer");
+        assert!(credits[0]["instrument"].is_null());
+        assert_eq!(credits[1]["instrument"], "piano");
+    }
+
+    #[test]
+    fn track_metadata_musicbrainz_ids_serialization() {
+        let md = TrackMetadata {
+            musicbrainz_recording_id: Some("rec-uuid".into()),
+            musicbrainz_release_id: Some("rel-uuid".into()),
+            musicbrainz_artist_id: Some("art-uuid".into()),
+            musicbrainz_album_artist_id: Some("aa-uuid".into()),
+            musicbrainz_release_group_id: Some("rg-uuid".into()),
+            isrc: Some("USRC12345678".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&md).unwrap();
+        assert_eq!(json["musicbrainz_recording_id"], "rec-uuid");
+        assert_eq!(json["musicbrainz_release_id"], "rel-uuid");
+        assert_eq!(json["musicbrainz_artist_id"], "art-uuid");
+        assert_eq!(json["musicbrainz_album_artist_id"], "aa-uuid");
+        assert_eq!(json["musicbrainz_release_group_id"], "rg-uuid");
+        assert_eq!(json["isrc"], "USRC12345678");
+    }
+
+    #[test]
+    fn dsf_fallback_derives_album_and_artist_from_path() {
+        let meta = dsf_dff_fallback(Path::new("/music/Miles Davis/Kind of Blue/01-So What.dsf"));
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("01-So What"));
+        assert_eq!(meta.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+    }
+
+    #[test]
+    fn normalize_format_case_sensitivity() {
+        // normalize_format expects lowercase input (from format!("{:?}").to_lowercase())
+        assert_eq!(normalize_format("mpeg"), "mp3");
+        // uppercase should pass through unchanged (it's pre-lowercased)
+        assert_eq!(normalize_format("MPEG"), "MPEG");
+    }
 }

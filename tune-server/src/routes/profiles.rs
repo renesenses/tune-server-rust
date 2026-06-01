@@ -10,7 +10,6 @@ use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
-use crate::error::AppError;
 use crate::state::AppState;
 
 #[derive(Deserialize)]

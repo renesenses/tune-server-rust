@@ -229,3 +229,138 @@ async fn not_found() {
     let (status, _) = get(&app, "/api/v1/library/tracks/99999").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ── Zone consistency tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn stats_zone_count_matches_db() {
+    let app = make_app();
+
+    let (_, body) = get(&app, "/api/v1/system/stats").await;
+    assert_eq!(body["zones"], 0);
+
+    post_json(&app, "/api/v1/zones", json!({"name": "Salon"})).await;
+    post_json(&app, "/api/v1/zones", json!({"name": "Bureau"})).await;
+
+    let (_, body) = get(&app, "/api/v1/system/stats").await;
+    assert_eq!(body["zones"], 2);
+}
+
+#[tokio::test]
+async fn admin_health_zone_count_matches_db() {
+    let app = make_app();
+
+    post_json(&app, "/api/v1/zones", json!({"name": "Salon"})).await;
+    post_json(&app, "/api/v1/zones", json!({"name": "Bureau"})).await;
+    post_json(&app, "/api/v1/zones", json!({"name": "Chambre"})).await;
+
+    let (status, body) = get(&app, "/api/v1/system/admin/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["playback"]["zones_total"], 3, "admin/health must report DB zone count, not in-memory playback");
+}
+
+#[tokio::test]
+async fn admin_zones_returns_created_zones() {
+    let app = make_app();
+
+    post_json(&app, "/api/v1/zones", json!({"name": "Salon", "output_type": "dlna"})).await;
+    post_json(&app, "/api/v1/zones", json!({"name": "Bureau"})).await;
+
+    let (status, body) = get(&app, "/api/v1/system/admin/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zones = body.as_array().unwrap();
+    assert_eq!(zones.len(), 2);
+    assert!(zones.iter().any(|z| z["name"] == "Salon"));
+    assert!(zones.iter().any(|z| z["name"] == "Bureau"));
+}
+
+#[tokio::test]
+async fn zone_delete_updates_all_counts() {
+    let app = make_app();
+
+    let (_, body) = post_json(&app, "/api/v1/zones", json!({"name": "Temp"})).await;
+    let zone_id = body["id"].as_i64().unwrap();
+
+    let (_, body) = get(&app, "/api/v1/system/stats").await;
+    assert_eq!(body["zones"], 1);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::delete(&format!("/api/v1/zones/{zone_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let (_, body) = get(&app, "/api/v1/system/stats").await;
+    assert_eq!(body["zones"], 0);
+}
+
+// ── Response format / parsing robustness tests ──────────────────────
+
+#[tokio::test]
+async fn stats_response_has_all_fields() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    for field in ["artists", "albums", "tracks", "zones", "devices", "outputs", "server_version", "server_engine"] {
+        assert!(body.get(field).is_some(), "stats missing field: {field}");
+    }
+    assert!(body["artists"].is_number());
+    assert!(body["albums"].is_number());
+    assert!(body["tracks"].is_number());
+    assert!(body["zones"].is_number());
+}
+
+#[tokio::test]
+async fn admin_health_response_structure() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/admin/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["engine"], "rust");
+    assert!(body["uptime_seconds"].is_number());
+    assert!(body["database"]["tracks"].is_number());
+    assert!(body["database"]["albums"].is_number());
+    assert!(body["playback"]["zones_total"].is_number());
+    assert!(body["playback"]["zones_playing"].is_number());
+}
+
+#[tokio::test]
+async fn zone_response_has_required_fields() {
+    let app = make_app();
+    post_json(&app, "/api/v1/zones", json!({"name": "Test Zone"})).await;
+
+    let (_, body) = get(&app, "/api/v1/zones").await;
+    let zone = &body[0];
+    for field in ["id", "name", "volume", "muted"] {
+        assert!(zone.get(field).is_some(), "zone missing field: {field}");
+    }
+    assert!(zone["id"].is_number());
+    assert!(zone["name"].is_string());
+}
+
+#[tokio::test]
+async fn zone_status_response_fields() {
+    let app = make_app();
+    post_json(&app, "/api/v1/zones", json!({"name": "Test"})).await;
+
+    let (status, body) = get(&app, "/api/v1/zones/1/status").await;
+    assert_eq!(status, StatusCode::OK);
+    for field in ["state", "volume"] {
+        assert!(body.get(field).is_some(), "zone status missing field: {field}");
+    }
+    assert!(["playing", "paused", "stopped"].contains(&body["state"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn diagnostics_returns_ok() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/system/diagnostics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["engine"], "rust");
+    assert!(body["cpu_count"].as_u64().unwrap() > 0);
+}

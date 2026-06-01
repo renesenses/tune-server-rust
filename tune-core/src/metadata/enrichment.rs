@@ -8,7 +8,6 @@ use crate::db::track_repo::TrackRepo;
 
 const MUSICBRAINZ_API: &str = "https://musicbrainz.org/ws/2";
 const COVERART_API: &str = "https://coverartarchive.org";
-const ACOUSTID_API: &str = "https://api.acoustid.org/v2/lookup";
 const USER_AGENT: &str = "TuneServer/1.0 (https://mozaiklabs.fr)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -237,7 +237,7 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
             {
                 Ok(Ok(out)) => {
                     output = String::from_utf8_lossy(&out.stdout).to_string();
-                    success = true;
+                    let _ = success; // final fallback, no further check needed
                 }
                 Ok(Err(e)) => {
                     return (

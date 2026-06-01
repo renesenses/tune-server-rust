@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn parse_latin1_fallback() {
-        let mut content: Vec<u8> = b"#EXTINF:60,R\xe9sum\xe9 - Caf\xe9\n/file.mp3\n".to_vec();
+        let content: Vec<u8> = b"#EXTINF:60,R\xe9sum\xe9 - Caf\xe9\n/file.mp3\n".to_vec();
         let entries = parse_m3u_content(&content, false);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].artist.is_some());

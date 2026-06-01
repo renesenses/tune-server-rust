@@ -142,7 +142,7 @@ async fn delete_cal_profile(
         return Err(AppError::not_found("profile not found"));
     }
 
-    save_profiles(&state, &profiles);
+    let _ = save_profiles(&state, &profiles);
 
     // If this was the active profile, clear it
     let settings = SettingsRepo::new(state.db.clone());

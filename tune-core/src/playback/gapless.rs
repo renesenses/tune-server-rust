@@ -5,13 +5,11 @@ use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::traits::{OutputStatus, TransportState};
 
 const PREBUFFER_THRESHOLD_MS: u64 = 15_000;
-const POLL_INTERVAL_MS: u64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GaplessState {
     Idle,
     Monitoring,
-    Prebuffering,
     Ready,
 }
 

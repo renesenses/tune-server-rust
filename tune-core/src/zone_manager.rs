@@ -100,11 +100,12 @@ impl ZoneManager {
             "CREATE TABLE IF NOT EXISTS zones (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                output_type TEXT NOT NULL DEFAULT 'local',
+                output_type TEXT,
                 output_device_id TEXT,
-                volume REAL NOT NULL DEFAULT 0.5,
-                muted INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
+                volume INTEGER DEFAULT 50,
+                muted INTEGER DEFAULT 0,
+                online INTEGER DEFAULT 1,
+                gapless_enabled INTEGER DEFAULT 1,
                 group_id TEXT,
                 sync_delay_ms INTEGER NOT NULL DEFAULT 0
             );",
@@ -118,27 +119,30 @@ impl ZoneManager {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, name, output_type, output_device_id, volume, \
-                     muted, enabled, group_id, sync_delay_ms FROM zones WHERE enabled = 1",
+                     muted, online, gapless_enabled, group_id, sync_delay_ms FROM zones WHERE online = 1",
                 )
                 .map_err(|e| e.to_string())?;
 
             stmt.query_map([], |row| {
-                let ot_str: String = row.get(2)?;
+                let ot_str: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
                 Ok(ZoneConfig {
                     zone_id: row.get(0)?,
                     name: row.get(1)?,
                     output_type: OutputType::from_str(&ot_str).unwrap_or(OutputType::Local),
                     output_device_id: row.get(3)?,
-                    volume: row.get(4)?,
+                    volume: {
+                        let v: i64 = row.get(4)?;
+                        v as f64 / 100.0
+                    },
                     muted: row.get::<_, i64>(5)? != 0,
                     enabled: row.get::<_, i64>(6)? != 0,
-                    group_id: row.get(7)?,
-                    sync_delay_ms: row.get(8)?,
+                    group_id: row.get(8)?,
+                    sync_delay_ms: row.get(9)?,
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
         };
 
         for cfg in configs {
@@ -205,11 +209,12 @@ impl ZoneManager {
 
     pub fn set_volume(&mut self, zone_id: i64, volume: f64) -> Result<(), String> {
         let volume = volume.clamp(0.0, 1.0);
+        let db_volume = (volume * 100.0).round() as i64;
         let conn = self.db.connection();
         let conn = conn.lock().unwrap();
         conn.execute(
             "UPDATE zones SET volume = ?1 WHERE id = ?2",
-            rusqlite::params![volume, zone_id],
+            rusqlite::params![db_volume, zone_id],
         )
         .map_err(|e| e.to_string())?;
         if let Some(z) = self.zones.get_mut(&zone_id) {
@@ -272,7 +277,7 @@ mod tests {
 
     fn setup() -> ZoneManager {
         let db = SqliteDb::open_in_memory().unwrap();
-        let mut mgr = ZoneManager::new(db);
+        let mgr = ZoneManager::new(db);
         mgr.setup_table().unwrap();
         mgr
     }

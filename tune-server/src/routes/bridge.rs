@@ -31,7 +31,9 @@ struct BridgeDevice {
     id: String,
     name: String,
     device_type: String,
+    #[allow(dead_code)]
     host: String,
+    #[allow(dead_code)]
     port: u16,
     #[allow(dead_code)]
     manufacturer: Option<String>,
@@ -138,7 +140,6 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
     });
 
     // Reader loop: process bridge messages
-    use futures_util::StreamExt;
     loop {
         match ws_rx.next().await {
             Some(Ok(axum::extract::ws::Message::Text(text))) => {

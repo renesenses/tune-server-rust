@@ -7,6 +7,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
 
@@ -85,8 +86,9 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
-    let zones = state.playback.all_states().await;
-    let playing = zones
+    let zone_count = ZoneRepo::new(state.db.clone()).count().unwrap_or(0);
+    let playback_states = state.playback.all_states().await;
+    let playing = playback_states
         .iter()
         .filter(|z| z.state == tune_core::playback::PlayState::Playing)
         .count();
@@ -108,7 +110,7 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
             "engine": "sqlite",
         },
         "playback": {
-            "zones_total": zones.len(),
+            "zones_total": zone_count,
             "zones_playing": playing,
         },
         "outputs": output_count,
