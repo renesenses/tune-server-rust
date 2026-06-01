@@ -8,7 +8,7 @@ const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const API_BASE: &str = "https://api.spotify.com/v1";
 const DEFAULT_CLIENT_ID: &str = "placeholder";
-const SCOPES: &str = "user-read-private user-library-read playlist-read-private";
+const SCOPES: &str = "user-read-private user-library-read playlist-read-private playlist-modify-private playlist-modify-public";
 
 pub struct SpotifyService {
     client: Client,
@@ -16,6 +16,7 @@ pub struct SpotifyService {
     access_token: Option<String>,
     refresh_token: Option<String>,
     username: Option<String>,
+    user_id: Option<String>,
     code_verifier: Option<String>,
     redirect_uri: String,
     token_expires: Option<std::time::Instant>,
@@ -41,6 +42,7 @@ impl SpotifyService {
             access_token: None,
             refresh_token: None,
             username: None,
+            user_id: None,
             code_verifier: None,
             redirect_uri: std::env::var("TUNE_SPOTIFY_REDIRECT_URI")
                 .or_else(|_| std::env::var("SPOTIFY_REDIRECT_URI"))
@@ -254,6 +256,33 @@ impl SpotifyService {
         }
         Ok(())
     }
+
+    async fn api_post(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let token = self.access_token.as_deref().ok_or("not authenticated")?;
+        let resp = self
+            .client
+            .post(format!("{API_BASE}{path}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("spotify post: {e}"))?;
+        if resp.status() == 401 {
+            return Err("token expired".into());
+        }
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("spotify POST {path}: {status} — {text}"));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("spotify post parse: {e}"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -307,8 +336,13 @@ impl StreamingService for SpotifyService {
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(expires_in));
             let me = self.api_get("/me").await.ok();
-            self.username = me.and_then(|v| v["display_name"].as_str().map(Into::into));
-            info!(username = ?self.username, "spotify_authenticated");
+            self.username = me
+                .as_ref()
+                .and_then(|v| v["display_name"].as_str().map(Into::into));
+            self.user_id = me
+                .as_ref()
+                .and_then(|v| v["id"].as_str().map(Into::into));
+            info!(username = ?self.username, user_id = ?self.user_id, "spotify_authenticated");
             return Ok(self.auth_status().await);
         }
 
@@ -333,6 +367,7 @@ impl StreamingService for SpotifyService {
         self.access_token = None;
         self.refresh_token = None;
         self.username = None;
+        self.user_id = None;
         Ok(())
     }
 
@@ -424,6 +459,55 @@ impl StreamingService for SpotifyService {
                 .map(|i| i.iter().map(Self::map_playlist).collect())
                 .unwrap_or_default()
         })
+    }
+
+    async fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, String> {
+        let user_id = self.user_id.as_deref().ok_or("spotify: not authenticated (no user_id)")?;
+        let body = serde_json::json!({
+            "name": name,
+            "description": description.unwrap_or("Created by Tune"),
+            "public": false
+        });
+        let resp = self
+            .api_post(&format!("/users/{user_id}/playlists"), body)
+            .await?;
+        resp["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "spotify: no playlist id in response".into())
+    }
+
+    async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, String> {
+        let uris: Vec<String> = track_ids
+            .iter()
+            .map(|id| {
+                if id.starts_with("spotify:track:") {
+                    id.clone()
+                } else {
+                    format!("spotify:track:{id}")
+                }
+            })
+            .collect();
+        let mut added = 0;
+        for chunk in uris.chunks(100) {
+            let body = serde_json::json!({ "uris": chunk });
+            self.api_post(&format!("/playlists/{playlist_id}/tracks"), body)
+                .await?;
+            added += chunk.len();
+        }
+        Ok(added)
+    }
+
+    fn supports_write(&self) -> bool {
+        self.access_token.is_some() && self.user_id.is_some()
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {

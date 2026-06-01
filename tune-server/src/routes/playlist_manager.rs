@@ -102,7 +102,6 @@ fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
     let registry = state.services.lock().await;
     let status_all = registry.status_all().await;
-    drop(registry);
 
     let mut services = serde_json::Map::new();
     for svc_status in &status_all {
@@ -114,14 +113,20 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
             .get("authenticated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let write = if let Some(svc) = registry.get(name) {
+            svc.lock().await.supports_write()
+        } else {
+            false
+        };
         services.insert(
             name.to_string(),
             json!({
                 "authenticated": authenticated,
-                "supports_write": false,
+                "supports_write": write,
             }),
         );
     }
+    drop(registry);
     services.insert(
         "local".to_string(),
         json!({ "authenticated": true, "supports_write": true }),
