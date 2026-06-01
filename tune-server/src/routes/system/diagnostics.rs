@@ -505,3 +505,8 @@ pub(super) async fn telemetry_toggle(
     let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
     Json(json!({ "enabled": enabled }))
 }
+
+pub(super) async fn api_stats(State(state): State<AppState>) -> Json<Value> {
+    let stats = state.api_analytics.stats();
+    Json(serde_json::to_value(stats).unwrap_or_default())
+}

@@ -39,6 +39,7 @@ pub struct AppState {
     pub health_monitor: Arc<AdvancedHealthMonitor>,
     pub suggestion_store: Arc<SuggestionStore>,
     pub spotify_connect: Arc<SpotifyConnectManager>,
+    pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
 }
 
 impl AppState {
@@ -120,6 +121,7 @@ impl AppState {
             health_monitor,
             suggestion_store,
             spotify_connect,
+            api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
         })
     }
 

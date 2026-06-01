@@ -70,6 +70,20 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn analytics_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    let latency_ms = start.elapsed().as_millis() as u32;
+    state.api_analytics.record(&path, &method, response.status().as_u16(), latency_ms);
+    response
+}
+
 async fn demo_library(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -436,6 +450,10 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            analytics_middleware,
         ));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)

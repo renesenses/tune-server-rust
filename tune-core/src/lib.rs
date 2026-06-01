@@ -1,6 +1,7 @@
 #![deny(unused_imports)]
 
 pub mod alarms;
+pub mod api_analytics;
 pub mod audio;
 pub mod buffer;
 pub mod bug_report;

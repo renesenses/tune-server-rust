@@ -417,6 +417,20 @@ async fn telemetry_toggle() {
 }
 
 #[tokio::test]
+async fn api_stats_endpoint() {
+    let app = make_app();
+    get(&app, "/api/v1/system/version").await;
+    get(&app, "/api/v1/system/stats").await;
+    get(&app, "/api/v1/system/stats").await;
+
+    let (status, body) = get(&app, "/api/v1/system/api-stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["total_requests"].as_u64().unwrap() >= 3);
+    assert!(body["top_endpoints"].is_array());
+    assert!(body["slowest_endpoints"].is_array());
+}
+
+#[tokio::test]
 async fn changelog_has_entries() {
     let app = make_app();
     let (status, body) = get(&app, "/api/v1/system/changelog").await;
