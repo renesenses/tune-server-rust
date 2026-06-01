@@ -42,7 +42,7 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         // Try exact match with year first
         if let Some(y) = year {
             let mut stmt = conn
@@ -71,7 +71,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? LIMIT 1"))
             .map_err(|e| e.to_string())?;
@@ -81,7 +81,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"
@@ -342,16 +342,22 @@ impl AlbumRepo {
 
     pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        // Match against primary genre OR any genre in the JSON genres array.
-        // The JSON pattern matches `"Jazz"` as an element inside `["Jazz","Fusion"]`.
-        let json_pattern = format!("%\"{}%", genre.replace('"', ""));
+        // Match albums where the requested genre appears in either:
+        // 1) The legacy `genre` text column (may contain "Jazz; Blues" or "Jazz/Blues")
+        //    We normalize separators to commas and use delimiter-aware LIKE matching
+        //    so "Rock" does not accidentally match "Progressive Rock".
+        // 2) The structured `genres` JSON array via json_each() for exact element match.
+        let delimited_pattern = format!("%,{},%", genre.replace('%', "").replace('_', ""));
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.genre = ? OR a.genres LIKE ? COLLATE NOCASE ORDER BY a.title COLLATE NOCASE"
+                "{SELECT_ALBUM} WHERE \
+                 (',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE ? COLLATE NOCASE \
+                 OR a.id IN (SELECT a2.id FROM albums a2, json_each(a2.genres) WHERE json_each.value = ? COLLATE NOCASE) \
+                 ORDER BY a.title COLLATE NOCASE"
             ))
             .map_err(|e| e.to_string())?;
         let albums = stmt
-            .query_map(params![genre, json_pattern], |row| Ok(row_to_album(row)))
+            .query_map(params![delimited_pattern, genre], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -630,8 +636,38 @@ mod tests {
         a3.genres = Some(r#"["Jazz","Fusion"]"#.into());
         repo.create(&a3).unwrap();
 
+        // Semicolon-separated multi-genre in legacy column
+        let mut a4 = Album::new("Jazz Blues Album".into());
+        a4.genre = Some("Jazz; Blues".into());
+        repo.create(&a4).unwrap();
+
+        // Slash-separated multi-genre in legacy column
+        let mut a5 = Album::new("Blues Rock Album".into());
+        a5.genre = Some("Blues/Rock".into());
+        repo.create(&a5).unwrap();
+
+        // Jazz: a1 (exact), a3 (JSON array), a4 (semicolon-separated)
         let jazz = repo.list_by_genre("Jazz").unwrap();
-        assert_eq!(jazz.len(), 2);
+        assert_eq!(jazz.len(), 3, "Jazz should match exact, JSON, and semicolon-separated");
+
+        // Blues: a4 (semicolon-separated), a5 (slash-separated)
+        let blues = repo.list_by_genre("Blues").unwrap();
+        assert_eq!(blues.len(), 2, "Blues should match semicolon and slash-separated");
+
+        // Rock: a2 (exact), a5 (slash-separated)
+        let rock = repo.list_by_genre("Rock").unwrap();
+        assert_eq!(rock.len(), 2, "Rock should match exact and slash-separated");
+
+        // "Progressive Rock" should NOT match plain "Rock"
+        let mut a6 = Album::new("Prog Album".into());
+        a6.genre = Some("Progressive Rock".into());
+        repo.create(&a6).unwrap();
+        let rock2 = repo.list_by_genre("Rock").unwrap();
+        assert_eq!(rock2.len(), 2, "Rock should not match Progressive Rock");
+
+        // But "Progressive Rock" should match itself
+        let prog = repo.list_by_genre("Progressive Rock").unwrap();
+        assert_eq!(prog.len(), 1, "Progressive Rock should match exactly");
     }
 
     #[test]

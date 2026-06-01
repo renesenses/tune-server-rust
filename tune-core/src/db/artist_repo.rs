@@ -25,7 +25,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE")
             .map_err(|e| e.to_string())?;
@@ -37,7 +37,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?")
             .map_err(|e| e.to_string())?;
