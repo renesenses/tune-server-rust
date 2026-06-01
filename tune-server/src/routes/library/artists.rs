@@ -173,11 +173,22 @@ pub(super) async fn artist_timeline(
     };
     let mut albums = repo.list_by_artist(id).unwrap_or_default();
     albums.sort_by(|a, b| a.year.unwrap_or(0).cmp(&b.year.unwrap_or(0)));
+
+    let years: Vec<i32> = albums.iter().filter_map(|a| a.year).collect();
+    let mut gaps = Vec::new();
+    for w in years.windows(2) {
+        if w[1] - w[0] > 1 {
+            gaps.push(json!({"from": w[0], "to": w[1], "years": w[1] - w[0]}));
+        }
+    }
+
     let items: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     Json(json!({
         "artist": artist.name,
         "artist_id": id,
         "albums": items,
+        "gaps": gaps,
+        "career_span": if years.len() >= 2 { Some(json!({"first": years[0], "last": years[years.len()-1], "years": years[years.len()-1] - years[0]})) } else { None },
     }))
     .into_response()
 }
