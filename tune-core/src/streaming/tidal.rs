@@ -1020,6 +1020,48 @@ impl StreamingService for TidalService {
         Ok(all)
     }
 
+    async fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, String> {
+        let user_id = self.user_id.ok_or("tidal: not authenticated (no user_id)")?;
+        let desc = description.unwrap_or("Created by Tune");
+        let resp = self
+            .api_post_form(
+                &format!("/users/{user_id}/playlists"),
+                &[("title", name), ("description", desc)],
+            )
+            .await?;
+        resp["uuid"]
+            .as_str()
+            .or_else(|| resp["id"].as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "tidal: no playlist id in response".into())
+    }
+
+    async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, String> {
+        let mut added = 0;
+        for chunk in track_ids.chunks(100) {
+            let ids_csv = chunk.join(",");
+            self.api_post_form(
+                &format!("/playlists/{playlist_id}/items"),
+                &[("trackIds", &ids_csv)],
+            )
+            .await?;
+            added += chunk.len();
+        }
+        Ok(added)
+    }
+
+    fn supports_write(&self) -> bool {
+        self.user_id.is_some()
+    }
+
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;

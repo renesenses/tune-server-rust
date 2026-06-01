@@ -712,6 +712,7 @@ impl StreamingService for SpotifyService {
                 "access_token": t,
                 "refresh_token": self.refresh_token,
                 "username": self.username,
+                "user_id": self.user_id,
             })
         })
     }
@@ -721,6 +722,7 @@ impl StreamingService for SpotifyService {
             self.access_token = Some(at.into());
             self.refresh_token = tokens["refresh_token"].as_str().map(Into::into);
             self.username = tokens["username"].as_str().map(Into::into);
+            self.user_id = tokens["user_id"].as_str().map(Into::into);
             self.token_expires =
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
             true
@@ -732,6 +734,7 @@ impl StreamingService for SpotifyService {
     async fn post_restore(&mut self) {
         if let Ok(me) = self.api_get("/me").await {
             self.username = me["display_name"].as_str().map(Into::into);
+            self.user_id = me["id"].as_str().map(Into::into);
         }
     }
 }
