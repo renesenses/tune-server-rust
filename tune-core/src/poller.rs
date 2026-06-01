@@ -168,6 +168,15 @@ impl PositionPoller {
                 None => continue,
             };
 
+            let ps = poll_states.entry(zone_id).or_insert_with(|| ZonePollState {
+                gapless_sent: false,
+                stopped_ticks: 0,
+                gapless_cooldown: 0,
+                consecutive_errors: 0,
+                backoff_remaining: 0,
+                last_radio_poll: Instant::now(),
+            });
+
             if ps.backoff_remaining > 0 {
                 ps.backoff_remaining -= 1;
                 continue;
@@ -221,13 +230,8 @@ impl PositionPoller {
                 .map(|np| np.source == "radio")
                 .unwrap_or(false);
             if is_radio {
-                let should_poll = poll_states
-                    .get(&zone_id)
-                    .map(|ps| {
-                        ps.last_radio_poll.elapsed()
-                            > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS)
-                    })
-                    .unwrap_or(true);
+                let should_poll = ps.last_radio_poll.elapsed()
+                    > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS);
 
                 #[allow(clippy::collapsible_if)]
                 if should_poll {
@@ -266,22 +270,11 @@ impl PositionPoller {
                             }
                         }
                     }
-                    // Update the timestamp (or create entry if missing)
-                    if let Some(ps) = poll_states.get_mut(&zone_id) {
-                        ps.last_radio_poll = Instant::now();
-                    }
+                    ps.last_radio_poll = Instant::now();
                 }
             }
 
-            let ps = poll_states.entry(zone_id).or_insert(ZonePollState {
-                gapless_sent: false,
-                stopped_ticks: 0,
-                gapless_cooldown: 0,
-                consecutive_errors: 0,
-                backoff_remaining: 0,
-                last_radio_poll: Instant::now(),
-            });
-
+            let mut track_ended = false;
             match status.state {
                 TransportState::Stopped => {
                     if ps.gapless_cooldown > 0 {
@@ -289,10 +282,7 @@ impl PositionPoller {
                         ps.stopped_ticks = 0;
                     } else {
                         ps.stopped_ticks += 1;
-                        if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
-                            poll_states.remove(&zone_id);
-                            self.handle_track_end(zone_id, zone_state).await;
-                        }
+                        track_ended = ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD;
                     }
                 }
                 TransportState::Playing | TransportState::Transitioning => {
@@ -366,6 +356,11 @@ impl PositionPoller {
                 TransportState::Paused => {
                     ps.stopped_ticks = 0;
                 }
+            }
+
+            if track_ended {
+                poll_states.remove(&zone_id);
+                self.handle_track_end(zone_id, zone_state).await;
             }
         }
     }
