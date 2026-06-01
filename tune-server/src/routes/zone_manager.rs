@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tracing::info;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 
@@ -36,6 +37,11 @@ pub fn router() -> Router<AppState> {
         .route("/profiles/{id}/activate", post(activate_zone_profile))
         .route("/sync/stats", get(sync_stats))
         .route("/measure-latency", post(measure_latency))
+        .route(
+            "/oaat-groups",
+            get(list_oaat_groups).post(create_oaat_group),
+        )
+        .route("/oaat-groups/{id}", axum::routing::delete(delete_oaat_group))
 }
 
 // ---------------------------------------------------------------------------
@@ -829,4 +835,97 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
         "latencies": results,
         "measured_at": now_iso(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// OAAT Multiroom Groups
+// ---------------------------------------------------------------------------
+
+async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let groups = load_json_setting(&settings, "oaat_groups");
+    Json(json!({ "oaat_groups": groups }))
+}
+
+async fn create_oaat_group(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let name = body["name"].as_str().unwrap_or("OAAT Group");
+    let endpoints: Vec<(String, u16)> = body["endpoints"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|ep| {
+            let host = ep["host"].as_str()?.to_string();
+            let port = ep["port"].as_u64()? as u16;
+            Some((host, port))
+        })
+        .collect();
+
+    if endpoints.is_empty() {
+        return Json(json!({ "error": "at least one endpoint required" }));
+    }
+
+    let group_id = format!(
+        "oaat-mr-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    // Register the multiroom output
+    #[cfg(feature = "oaat")]
+    {
+        let output = tune_core::outputs::oaat::OaatMultiroomOutput::new(
+            name.to_string(),
+            group_id.clone(),
+            endpoints.clone(),
+        );
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(output));
+    }
+
+    // Persist to settings
+    let settings = SettingsRepo::new(state.db);
+    let mut groups = load_json_setting(&settings, "oaat_groups");
+    groups.push(json!({
+        "id": group_id,
+        "name": name,
+        "endpoints": endpoints.iter().map(|(h, p)| json!({"host": h, "port": p})).collect::<Vec<_>>(),
+        "created_at": now_iso(),
+    }));
+    save_json_setting(&settings, "oaat_groups", &groups);
+
+    info!(group_id = %group_id, name, endpoints = endpoints.len(), "oaat_multiroom_group_created");
+
+    Json(json!({
+        "id": group_id,
+        "name": name,
+        "endpoints": endpoints.len(),
+        "device_id": format!("oaat-group:{group_id}"),
+    }))
+}
+
+async fn delete_oaat_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Value> {
+    // Remove from registry
+    let device_id = format!("oaat-group:{id}");
+    {
+        let mut outputs = state.outputs.lock().await;
+        outputs.remove(&device_id);
+    }
+
+    // Remove from settings
+    let settings = SettingsRepo::new(state.db);
+    let mut groups = load_json_setting(&settings, "oaat_groups");
+    groups.retain(|g| g["id"].as_str() != Some(&id));
+    save_json_setting(&settings, "oaat_groups", &groups);
+
+    info!(group_id = %id, "oaat_multiroom_group_deleted");
+
+    Json(json!({ "deleted": id }))
 }
