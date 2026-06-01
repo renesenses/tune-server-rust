@@ -67,6 +67,10 @@ pub fn router() -> Router<AppState> {
             get(diagnostics::diagnostics_network),
         )
         .route("/diagnostics/oaat", get(diagnostics::diagnostics_oaat))
+        .route(
+            "/bug-report/markdown",
+            get(diagnostics::bug_report_markdown),
+        )
         .route("/health/monitor", get(diagnostics::health_monitor))
         .route("/health/alerts", get(diagnostics::health_alerts))
         .route("/clear-cache", post(config::clear_cache))

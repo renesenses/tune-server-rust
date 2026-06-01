@@ -226,9 +226,67 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         uptime_secs % 60,
     );
 
+    // FFmpeg version
+    let ffmpeg_version = ffmpeg.as_ref().and_then(|path| {
+        std::process::Command::new(path)
+            .arg("-version")
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .and_then(|s| s.lines().next().map(|l| l.to_string()))
+            })
+    });
+
+    // Memory RSS
+    let rss_mb = {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map(|pages| pages * 4096 / 1024 / 1024)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let pid = std::process::id();
+            std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8(o.stdout)
+                        .ok()?
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .map(|kb| kb / 1024)
+                })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None::<u64>
+        }
+    };
+
+    // OAAT diagnostics
+    let oaat_endpoints: Vec<Value> = {
+        let outputs = state.outputs.lock().await;
+        outputs
+            .list()
+            .iter()
+            .filter_map(|id| {
+                let output = outputs.get(id)?;
+                let output = output.try_lock().ok()?;
+                output.diagnostics_json()
+            })
+            .collect()
+    };
+
     // Build markdown text
     let mut md = String::new();
-    md.push_str(&format!("# Tune Bug Report\n\n"));
+    md.push_str("# Tune Bug Report\n\n");
     md.push_str(&format!(
         "**Version**: {} (engine: rust)\n",
         tune_core::version()
@@ -239,7 +297,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         std::env::consts::ARCH
     ));
     md.push_str(&format!("**Uptime**: {uptime_str}\n"));
-    md.push_str(&format!("**PID**: {}\n\n", std::process::id()));
+    md.push_str(&format!("**PID**: {}\n", std::process::id()));
+    if let Some(rss) = rss_mb {
+        md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
+    }
+    md.push('\n');
 
     md.push_str("## Library\n");
     md.push_str(&format!("- Tracks: {tracks}\n"));
@@ -256,7 +318,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             z["output_type"].as_str().unwrap_or("?")
         ));
     }
-    md.push_str("\n");
+    md.push('\n');
 
     md.push_str("## Streaming Services\n");
     for s in &service_status {
@@ -277,17 +339,38 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             auth
         ));
     }
-    md.push_str("\n");
+    md.push('\n');
 
-    md.push_str(&format!("## Network\n"));
+    md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
     md.push_str(&format!(
-        "- FFmpeg: {}\n\n",
-        ffmpeg.as_deref().unwrap_or("not found")
+        "- FFmpeg: {}\n",
+        ffmpeg_version
+            .as_deref()
+            .unwrap_or(ffmpeg.as_deref().unwrap_or("not found"))
     ));
+    md.push('\n');
 
-    md.push_str(&format!("## Database\n"));
+    if !oaat_endpoints.is_empty() {
+        md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
+        for ep in &oaat_endpoints {
+            md.push_str(&format!(
+                "- {} ({}): connected={}, packets={}, format={}\n",
+                ep["name"].as_str().unwrap_or("?"),
+                ep["host"].as_str().unwrap_or("?"),
+                ep["connected"].as_bool().unwrap_or(false),
+                ep["packets_sent"].as_u64().unwrap_or(0),
+                ep["format"].as_str().unwrap_or("?"),
+            ));
+            if ep["stall_detected"].as_bool().unwrap_or(false) {
+                md.push_str("  **⚠ STALL DETECTED**\n");
+            }
+        }
+        md.push('\n');
+    }
+
+    md.push_str("## Database\n");
     md.push_str(&format!("- Engine: sqlite\n"));
     md.push_str(&format!("- Migration version: {db_version}\n"));
 
@@ -299,6 +382,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         "uptime_seconds": uptime_secs,
         "uptime": uptime_str,
         "pid": std::process::id(),
+        "rss_mb": rss_mb,
         "library": {
             "tracks": tracks,
             "albums": albums,
@@ -316,12 +400,27 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "registered_outputs": output_count,
         },
         "ffmpeg": ffmpeg,
+        "ffmpeg_version": ffmpeg_version,
+        "oaat_endpoints": oaat_endpoints,
         "database": {
             "engine": "sqlite",
             "migration_version": db_version,
         },
         "markdown": md,
     }))
+}
+
+/// Returns the bug report as raw markdown (text/markdown) for direct forum paste.
+pub(super) async fn bug_report_markdown(
+    State(state): State<AppState>,
+) -> (axum::http::StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+    let Json(report) = generate_bug_report(State(state)).await;
+    let md = report["markdown"].as_str().unwrap_or("").to_string();
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        md,
+    )
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
