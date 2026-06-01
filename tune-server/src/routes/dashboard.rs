@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/top-tracks", get(top_tracks))
         .route("/genre-breakdown", get(genre_breakdown))
         .route("/listening-history", get(listening_history))
+        .route("/wrapped", get(wrapped))
 }
 
 async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
@@ -151,4 +152,141 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
         .collect();
 
     Ok(Json(serde_json::json!(items)))
+}
+
+fn is_consecutive_days(a: &str, b: &str) -> bool {
+    fn to_days(s: &str) -> Option<i64> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 { return None; }
+        let y: i64 = parts[0].parse().ok()?;
+        let m: i64 = parts[1].parse().ok()?;
+        let d: i64 = parts[2].parse().ok()?;
+        Some(y * 366 + m * 31 + d)
+    }
+    match (to_days(a), to_days(b)) {
+        (Some(da), Some(db)) => db - da == 1,
+        _ => false,
+    }
+}
+
+#[derive(Deserialize)]
+struct WrappedParams {
+    year: Option<i32>,
+}
+
+async fn wrapped(
+    State(state): State<AppState>,
+    Query(p): Query<WrappedParams>,
+) -> Result<Json<Value>, AppError> {
+    let year = p.year.unwrap_or(2026);
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+
+    let year_start = format!("{year}-01-01");
+    let year_end = format!("{}-01-01", year + 1);
+
+    let total_listens: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            rusqlite::params![year_start, year_end],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let total_ms: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            rusqlite::params![year_start, year_end],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let total_hours = (total_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+
+    let top_artists: Vec<Value> = conn
+        .prepare(
+            "SELECT artist_name, COUNT(*) as plays FROM listen_history \
+             WHERE listened_at >= ? AND listened_at < ? AND artist_name IS NOT NULL \
+             GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![year_start, year_end], |row| {
+                Ok(json!({"artist": row.get::<_, String>(0)?, "plays": row.get::<_, i64>(1)?}))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+
+    let top_tracks: Vec<Value> = conn
+        .prepare(
+            "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
+             WHERE listened_at >= ? AND listened_at < ? \
+             GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![year_start, year_end], |row| {
+                Ok(json!({"title": row.get::<_, String>(0)?, "artist": row.get::<_, Option<String>>(1)?, "plays": row.get::<_, i64>(2)?}))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+
+    // Listening streak (consecutive days)
+    let days: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT DATE(listened_at) as d FROM listen_history \
+             WHERE listened_at >= ? AND listened_at < ? ORDER BY d",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![year_start, year_end], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut max_streak = if days.is_empty() { 0u32 } else { 1u32 };
+    let mut current_streak = 1u32;
+    for w in days.windows(2) {
+        // Compare YYYY-MM-DD strings — consecutive days differ by 1 in the DD part
+        // Simple heuristic: if both dates parse to day-of-year and differ by 1
+        let consecutive = is_consecutive_days(&w[0], &w[1]);
+        if consecutive {
+            current_streak += 1;
+        } else {
+            max_streak = max_streak.max(current_streak);
+            current_streak = 1;
+        }
+    }
+    max_streak = max_streak.max(current_streak);
+
+    let unique_artists: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            rusqlite::params![year_start, year_end],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let unique_tracks: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            rusqlite::params![year_start, year_end],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    drop(conn);
+
+    Ok(Json(json!({
+        "year": year,
+        "total_listens": total_listens,
+        "total_hours": total_hours,
+        "unique_artists": unique_artists,
+        "unique_tracks": unique_tracks,
+        "max_streak_days": max_streak,
+        "top_artists": top_artists,
+        "top_tracks": top_tracks,
+    })))
 }

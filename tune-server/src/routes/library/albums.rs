@@ -348,3 +348,81 @@ pub(super) async fn merge_duplicate_albums_route(
     drop(conn);
     Ok(Json(json!({ "merged": deleted })))
 }
+
+const VARIANT_PATTERNS: &[&str] = &[
+    "deluxe", "remastered", "remaster", "anniversary", "expanded",
+    "special edition", "collector", "bonus track", "super deluxe",
+    "legacy edition", "platinum edition",
+];
+
+fn strip_variant_suffix(title: &str) -> String {
+    let lower = title.to_lowercase();
+    for pat in VARIANT_PATTERNS {
+        if let Some(pos) = lower.find(pat) {
+            let prefix = title[..pos].trim_end_matches(|c: char| c == '(' || c == '[' || c == '-' || c == ' ');
+            if !prefix.is_empty() {
+                return prefix.to_string();
+            }
+        }
+    }
+    title.to_string()
+}
+
+pub(super) async fn albums_grouped(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let repo = AlbumRepo::new(state.db.clone());
+
+    // Group by MusicBrainz release group ID
+    let mbid_groups = repo.list_release_groups().unwrap_or_default();
+
+    let mut groups: Vec<Value> = mbid_groups
+        .iter()
+        .map(|(gid, albums)| {
+            let original = &albums[0];
+            json!({
+                "group_id": gid,
+                "method": "musicbrainz",
+                "original": original.to_json(),
+                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": albums.len(),
+            })
+        })
+        .collect();
+
+    // Group by title similarity (regex) for albums without MBID
+    let all_albums = repo.list(5000, 0).unwrap_or_default();
+    let grouped_ids: std::collections::HashSet<i64> = mbid_groups
+        .iter()
+        .flat_map(|(_, albums)| albums.iter().filter_map(|a| a.id))
+        .collect();
+
+    let ungrouped: Vec<_> = all_albums
+        .iter()
+        .filter(|a| a.id.is_some() && !grouped_ids.contains(&a.id.unwrap()))
+        .collect();
+
+    let mut title_map: std::collections::HashMap<String, Vec<&tune_core::db::models::Album>> =
+        std::collections::HashMap::new();
+    for album in &ungrouped {
+        let base = strip_variant_suffix(&album.title);
+        title_map.entry(base).or_default().push(album);
+    }
+
+    for (base_title, albums) in &title_map {
+        if albums.len() > 1 {
+            groups.push(json!({
+                "group_id": base_title,
+                "method": "title_similarity",
+                "original": albums[0].to_json(),
+                "variants": albums[1..].iter().map(|a| a.to_json()).collect::<Vec<_>>(),
+                "count": albums.len(),
+            }));
+        }
+    }
+
+    Ok(Json(json!({
+        "groups": groups,
+        "total_groups": groups.len(),
+    })))
+}

@@ -241,6 +241,49 @@ impl AlbumRepo {
         Ok(items)
     }
 
+    pub fn list_by_release_group(&self, group_id: &str) -> Result<Vec<Album>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.musicbrainz_release_group_id = ? ORDER BY a.year, a.title"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![group_id], |row| Ok(row_to_album(row)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_release_groups(&self) -> Result<Vec<(String, Vec<Album>)>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_ALBUM} WHERE a.musicbrainz_release_group_id IS NOT NULL \
+                 AND a.musicbrainz_release_group_id != '' \
+                 ORDER BY a.musicbrainz_release_group_id, a.year"
+            ))
+            .map_err(|e| e.to_string())?;
+        let albums: Vec<Album> = stmt
+            .query_map([], |row| Ok(row_to_album(row)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        drop(stmt);
+        drop(conn);
+
+        let mut groups: std::collections::HashMap<String, Vec<Album>> =
+            std::collections::HashMap::new();
+        for album in albums {
+            if let Some(ref gid) = album.musicbrainz_release_group_id {
+                groups.entry(gid.clone()).or_default().push(album);
+            }
+        }
+        Ok(groups
+            .into_iter()
+            .filter(|(_, v)| v.len() > 1)
+            .collect())
+    }
+
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, String> {
         self.list_sorted(limit, offset, "title", "asc")
     }
