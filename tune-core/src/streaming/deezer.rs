@@ -89,9 +89,10 @@ impl DeezerService {
         let data: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("deezer gw json: {e}"))?;
         if let Some(err) = data.get("error").and_then(|e| e.as_object())
-            && !err.is_empty() {
-                return Err(format!("deezer gw error: {}", serde_json::json!(err)));
-            }
+            && !err.is_empty()
+        {
+            return Err(format!("deezer gw error: {}", serde_json::json!(err)));
+        }
         Ok(data.get("results").cloned().unwrap_or_default())
     }
 
@@ -188,7 +189,8 @@ impl DeezerService {
                 .as_array()
                 .map(|errs| errs.iter().any(|e| e["code"].as_u64() == Some(2002)))
                 .unwrap_or(false);
-            if rights_denied && attempt < max_fallbacks
+            if rights_denied
+                && attempt < max_fallbacks
                 && let Some(fid) = result
                     .get("FALLBACK")
                     .and_then(|f| f.get("SNG_ID"))
@@ -197,11 +199,13 @@ impl DeezerService {
                             .map(|s| s.to_string())
                             .or_else(|| v.as_u64().map(|n| n.to_string()))
                     })
-                    && !fid.is_empty() && fid != current_id {
-                        info!(original = %current_id, fallback = %fid, "deezer_track_fallback");
-                        current_id = fid;
-                        continue;
-                    }
+                && !fid.is_empty()
+                && fid != current_id
+            {
+                info!(original = %current_id, fallback = %fid, "deezer_track_fallback");
+                current_id = fid;
+                continue;
+            }
             break;
         }
         Err("no stream URL available".into())
@@ -496,30 +500,31 @@ impl StreamingService for DeezerService {
 
         // Path 2: direct encrypted URL (only for clients that decrypt)
         if self.has_full_streaming()
-            && let Ok(url) = self.get_full_stream_url(track_id, 0).await {
-                let ext = if self.quality == "FLAC" {
-                    "flac"
+            && let Ok(url) = self.get_full_stream_url(track_id, 0).await
+        {
+            let ext = if self.quality == "FLAC" {
+                "flac"
+            } else {
+                "mp3"
+            };
+            return Ok(StreamUrl {
+                url,
+                mime_type: if ext == "flac" {
+                    "audio/flac"
                 } else {
-                    "mp3"
-                };
-                return Ok(StreamUrl {
-                    url,
-                    mime_type: if ext == "flac" {
-                        "audio/flac"
-                    } else {
-                        "audio/mpeg"
-                    }
-                    .into(),
-                    quality: StreamQuality {
-                        codec: if ext == "flac" { "FLAC" } else { "MP3" }.into(),
-                        sample_rate: 44100,
-                        bit_depth: 16,
-                        bitrate: if ext == "flac" { None } else { Some(320) },
-                        channels: 2,
-                    },
-                    expires_at: None,
-                });
-            }
+                    "audio/mpeg"
+                }
+                .into(),
+                quality: StreamQuality {
+                    codec: if ext == "flac" { "FLAC" } else { "MP3" }.into(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    bitrate: if ext == "flac" { None } else { Some(320) },
+                    channels: 2,
+                },
+                expires_at: None,
+            });
+        }
 
         // Fallback: 30s preview
         let data = self.api_get(&format!("/track/{track_id}")).await?;

@@ -41,6 +41,10 @@ struct ZonePollState {
     /// poller doesn't re-send play_from_queue to a renderer that already
     /// transitioned via SetNextAVTransportURI.
     gapless_cooldown: u8,
+    /// Consecutive poll failures — used for exponential backoff.
+    /// After N failures, skip 2^min(N,4) ticks before retrying.
+    consecutive_errors: u8,
+    backoff_remaining: u8,
     last_radio_poll: Instant,
 }
 
@@ -164,6 +168,11 @@ impl PositionPoller {
                 None => continue,
             };
 
+            if ps.backoff_remaining > 0 {
+                ps.backoff_remaining -= 1;
+                continue;
+            }
+
             let status = {
                 let outputs = self.outputs.lock().await;
                 let output = match outputs.get(&device_id) {
@@ -172,9 +181,20 @@ impl PositionPoller {
                 };
                 let output = output.lock().await;
                 match output.get_status().await {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        ps.consecutive_errors = 0;
+                        s
+                    }
                     Err(e) => {
-                        debug!(zone_id, device = %device_id, error = %e, "poll_failed");
+                        ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
+                        ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
+                        debug!(
+                            zone_id,
+                            device = %device_id,
+                            error = %e,
+                            backoff = ps.backoff_remaining,
+                            "poll_failed_backing_off"
+                        );
                         continue;
                     }
                 }
@@ -257,6 +277,8 @@ impl PositionPoller {
                 gapless_sent: false,
                 stopped_ticks: 0,
                 gapless_cooldown: 0,
+                consecutive_errors: 0,
+                backoff_remaining: 0,
                 last_radio_poll: Instant::now(),
             });
 
@@ -450,6 +472,8 @@ mod tests {
             gapless_sent: false,
             stopped_ticks: 0,
             gapless_cooldown: 4,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
             last_radio_poll: Instant::now(),
         };
 
@@ -475,6 +499,8 @@ mod tests {
             gapless_sent: true,
             stopped_ticks: 0,
             gapless_cooldown: 3,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
             last_radio_poll: Instant::now(),
         };
 
@@ -547,5 +573,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position(&state), None);
+    }
+
+    #[test]
+    fn backoff_exponential() {
+        let mut ps = ZonePollState {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            last_radio_poll: Instant::now(),
+        };
+
+        // Simulate consecutive errors with exponential backoff
+        for expected_errors in 1u8..=5 {
+            ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
+            ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
+            assert_eq!(ps.consecutive_errors, expected_errors);
+        }
+        // After 4 errors: backoff = 2^4 = 16
+        assert_eq!(ps.backoff_remaining, 16);
+
+        // After 5 errors: still capped at 2^4 = 16
+        ps.consecutive_errors = 5;
+        ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
+        assert_eq!(ps.backoff_remaining, 16);
+
+        // Success resets
+        ps.consecutive_errors = 0;
+        assert_eq!(ps.consecutive_errors, 0);
     }
 }

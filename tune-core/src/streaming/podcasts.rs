@@ -247,9 +247,10 @@ fn extract_channel_image(xml: &str) -> String {
         return href;
     }
     if let Some(img) = extract_tag(xml, "image")
-        && let Some(url) = extract_tag(&img, "url") {
-            return url;
-        }
+        && let Some(url) = extract_tag(&img, "url")
+    {
+        return url;
+    }
     String::new()
 }
 

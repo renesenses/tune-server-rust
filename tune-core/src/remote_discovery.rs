@@ -140,10 +140,11 @@ impl PeerRegistry {
                 Ok(Ok((len, addr))) => {
                     let response = String::from_utf8_lossy(&buf[..len]);
                     if let Some(peer) = parse_ssdp_response(&response, &addr)
-                        && peer.server_id != self.server_id {
-                            self.register_peer(peer.clone()).await;
-                            found.push(peer);
-                        }
+                        && peer.server_id != self.server_id
+                    {
+                        self.register_peer(peer.clone()).await;
+                        found.push(peer);
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "ssdp_recv_error");

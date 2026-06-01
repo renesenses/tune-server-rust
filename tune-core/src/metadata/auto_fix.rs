@@ -130,29 +130,32 @@ impl AutoFixEngine {
                     };
 
                     if let Some(ref genre) = result.genre
-                        && (track.genre.is_none() || track.genre.as_deref() == Some("")) {
-                            self.add_suggestion(*track_id, "genre", "", genre, 0.85, "musicbrainz")
-                                .await;
-                        }
+                        && (track.genre.is_none() || track.genre.as_deref() == Some(""))
+                    {
+                        self.add_suggestion(*track_id, "genre", "", genre, 0.85, "musicbrainz")
+                            .await;
+                    }
 
                     if let Some(year) = result.year
-                        && (track.year.is_none() || track.year == Some(0)) {
-                            self.add_suggestion(
-                                *track_id,
-                                "year",
-                                "",
-                                &year.to_string(),
-                                0.9,
-                                "musicbrainz",
-                            )
-                            .await;
-                        }
+                        && (track.year.is_none() || track.year == Some(0))
+                    {
+                        self.add_suggestion(
+                            *track_id,
+                            "year",
+                            "",
+                            &year.to_string(),
+                            0.9,
+                            "musicbrainz",
+                        )
+                        .await;
+                    }
 
                     if let Some(ref isrc) = result.isrc
-                        && track.isrc.is_none() {
-                            self.add_suggestion(*track_id, "isrc", "", isrc, 0.95, "musicbrainz")
-                                .await;
-                        }
+                        && track.isrc.is_none()
+                    {
+                        self.add_suggestion(*track_id, "isrc", "", isrc, 0.95, "musicbrainz")
+                            .await;
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {

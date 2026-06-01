@@ -133,10 +133,11 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
 
     if let Ok(resolved) = backup_path.canonicalize()
         && let Ok(dir_resolved) = backup_dir.canonicalize()
-            && !resolved.starts_with(&dir_resolved) {
-                warn!("path_traversal_blocked");
-                return false;
-            }
+        && !resolved.starts_with(&dir_resolved)
+    {
+        warn!("path_traversal_blocked");
+        return false;
+    }
 
     for suffix in ["-wal", "-shm"] {
         let wal = db_file.with_file_name(format!(

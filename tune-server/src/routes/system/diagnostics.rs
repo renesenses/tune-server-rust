@@ -348,12 +348,7 @@ fn which_cmd(name: &str) -> Option<String> {
 /// is enabled. No data leaves the server unless the user explicitly opts in.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db.clone());
-    let enabled = settings
-        .get("telemetry_enabled")
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
+    let enabled = settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true");
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
     let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);

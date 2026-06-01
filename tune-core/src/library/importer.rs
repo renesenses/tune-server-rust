@@ -139,17 +139,19 @@ pub fn parse_roon_csv(raw: &str) -> Vec<ImportedTrack> {
             });
         }
         if let Some(i) = col_play
-            && let Some(s) = record.get(i) {
-                t.play_count = s.trim().parse().unwrap_or(0);
-            }
+            && let Some(s) = record.get(i)
+        {
+            t.play_count = s.trim().parse().unwrap_or(0);
+        }
         if let Some(i) = col_rating
             && let Some(s) = record.get(i)
-                && let Ok(r) = s.trim().parse::<f64>() {
-                    let r = r as i32;
-                    if r > 0 {
-                        t.rating = Some(r.clamp(1, 5));
-                    }
-                }
+            && let Ok(r) = s.trim().parse::<f64>()
+        {
+            let r = r as i32;
+            if r > 0 {
+                t.rating = Some(r.clamp(1, 5));
+            }
+        }
 
         if t.title.is_some() || t.file_path.is_some() {
             tracks.push(t);
@@ -183,10 +185,9 @@ pub fn parse_plex_xml(raw: &str) -> Vec<ImportedTrack> {
                     let val = String::from_utf8_lossy(&attr.value).to_string();
                     match key.as_str() {
                         "title" => t.title = Some(val),
-                        "grandparenttitle" | "originaltitle"
-                            if t.artist.is_none() => {
-                                t.artist = Some(val);
-                            }
+                        "grandparenttitle" | "originaltitle" if t.artist.is_none() => {
+                            t.artist = Some(val);
+                        }
                         "parenttitle" => t.album = Some(val),
                         "viewcount" => t.play_count = val.parse().unwrap_or(0),
                         "userrating" => {

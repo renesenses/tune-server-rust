@@ -195,7 +195,10 @@ impl TrackRepo {
         Ok(())
     }
 
-    pub fn get_credits(&self, track_id: i64) -> Result<Vec<crate::db::models::TrackCredit>, String> {
+    pub fn get_credits(
+        &self,
+        track_id: i64,
+    ) -> Result<Vec<crate::db::models::TrackCredit>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(

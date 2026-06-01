@@ -529,12 +529,11 @@ impl StreamingService for AmazonMusicService {
     }
 
     async fn post_restore(&mut self) {
-        if self.refresh_token.is_some()
-            && !self.refresh_access_token().await {
-                self.access_token = None;
-                self.refresh_token = None;
-                warn!("amazon_restore_token_invalid");
-            }
+        if self.refresh_token.is_some() && !self.refresh_access_token().await {
+            self.access_token = None;
+            self.refresh_token = None;
+            warn!("amazon_restore_token_invalid");
+        }
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, String> {

@@ -226,19 +226,21 @@ pub async fn lookup_artist_instrument(
                 .send()
                 .await
                 && let Ok(detail) = resp2.json::<serde_json::Value>().await
-                    && let Some(rels) = detail["relations"].as_array() {
-                        for rel in rels {
-                            if rel["type"].as_str() == Some("member of band")
-                                && let Some(attrs) = rel["attributes"].as_array() {
-                                    for attr in attrs {
-                                        let a = attr.as_str().unwrap_or("");
-                                        if !["original", "current", "past"].contains(&a) {
-                                            return Some(a.to_string());
-                                        }
-                                    }
-                                }
+                && let Some(rels) = detail["relations"].as_array()
+            {
+                for rel in rels {
+                    if rel["type"].as_str() == Some("member of band")
+                        && let Some(attrs) = rel["attributes"].as_array()
+                    {
+                        for attr in attrs {
+                            let a = attr.as_str().unwrap_or("");
+                            if !["original", "current", "past"].contains(&a) {
+                                return Some(a.to_string());
+                            }
                         }
                     }
+                }
+            }
         }
 
         return None;

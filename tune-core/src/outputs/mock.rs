@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -199,7 +199,10 @@ mod tests {
 
         mock.stop().await.unwrap();
         assert_eq!(mock.stop_call_count(), 1);
-        assert_eq!(mock.get_status().await.unwrap().state, TransportState::Stopped);
+        assert_eq!(
+            mock.get_status().await.unwrap().state,
+            TransportState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -238,7 +241,11 @@ mod tests {
         );
 
         // play_media should NOT have been called for the gapless transition
-        assert_eq!(mock.play_call_count().await, 1, "gapless should not trigger extra play_media");
+        assert_eq!(
+            mock.play_call_count().await,
+            1,
+            "gapless should not trigger extra play_media"
+        );
         assert_eq!(mock.stop_call_count(), 0, "gapless should not trigger stop");
     }
 

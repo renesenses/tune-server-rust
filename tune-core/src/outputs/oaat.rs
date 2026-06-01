@@ -92,11 +92,19 @@ impl OaatOutput {
     }
 }
 
-/// Parse WAV header from buffer. Returns (sample_rate, channels, bits_per_sample)
-/// and drains the header from buf, leaving only PCM data.
-/// Returns None if the buffer is not a valid WAV.
+/// Parsed WAV header info.
 #[cfg(feature = "oaat")]
-fn parse_wav_header(buf: &mut Vec<u8>) -> Option<(u32, u16, u16)> {
+struct WavInfo {
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    /// Duration in ms derived from the data chunk size, or 0 if unknown.
+    duration_ms: u64,
+}
+
+/// Parse WAV header from buffer. Drains the header, leaving only PCM data.
+#[cfg(feature = "oaat")]
+fn parse_wav_header(buf: &mut Vec<u8>) -> Option<WavInfo> {
     if buf.len() < 44 || &buf[..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
         return None;
     }
@@ -105,6 +113,7 @@ fn parse_wav_header(buf: &mut Vec<u8>) -> Option<(u32, u16, u16)> {
     let bits_per_sample = u16::from_le_bytes([buf[34], buf[35]]);
 
     let mut data_offset = 12;
+    let mut data_size: u64 = 0;
     let mut found_data = false;
     while data_offset + 8 <= buf.len() {
         let chunk_id = &buf[data_offset..data_offset + 4];
@@ -113,18 +122,32 @@ fn parse_wav_header(buf: &mut Vec<u8>) -> Option<(u32, u16, u16)> {
             buf[data_offset + 5],
             buf[data_offset + 6],
             buf[data_offset + 7],
-        ]) as usize;
+        ]);
         if chunk_id == b"data" {
+            data_size = chunk_size as u64;
             buf.drain(..data_offset + 8);
             found_data = true;
             break;
         }
-        data_offset += 8 + chunk_size;
+        data_offset += 8 + chunk_size as usize;
     }
     if !found_data {
         buf.drain(..44);
     }
-    Some((sample_rate, channels, bits_per_sample))
+
+    let bytes_per_frame = (bits_per_sample as u64 / 8) * channels as u64;
+    let duration_ms = if bytes_per_frame > 0 && sample_rate > 0 && data_size > 0 {
+        data_size * 1000 / (sample_rate as u64 * bytes_per_frame)
+    } else {
+        0
+    };
+
+    Some(WavInfo {
+        sample_rate,
+        channels,
+        bits_per_sample,
+        duration_ms,
+    })
 }
 
 #[cfg(feature = "oaat")]
@@ -280,8 +303,10 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
-            let mut stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>> =
-                Box::pin(resp.bytes_stream());
+            let mut stream: futures_util::stream::BoxStream<
+                'static,
+                Result<bytes::Bytes, reqwest::Error>,
+            > = Box::pin(resp.bytes_stream());
             let mut buf = Vec::new();
 
             while buf.len() < 128 {
@@ -295,8 +320,8 @@ impl OutputTarget for OaatOutput {
                 }
             }
 
-            let (mut cur_sample_rate, cur_channels, mut cur_bits) = match parse_wav_header(&mut buf) {
-                Some(info) => info,
+            let wav = match parse_wav_header(&mut buf) {
+                Some(w) => w,
                 None => {
                     let sig: Vec<u8> = buf.iter().take(12).copied().collect();
                     error!(
@@ -308,6 +333,17 @@ impl OutputTarget for OaatOutput {
                     return;
                 }
             };
+
+            let mut cur_sample_rate = wav.sample_rate;
+            let cur_channels = wav.channels;
+            let mut cur_bits = wav.bits_per_sample;
+            // Use WAV-derived duration if orchestrator didn't provide one
+            let track_duration_ms = if track_duration_ms > 0 {
+                track_duration_ms
+            } else {
+                wav.duration_ms
+            };
+            duration_ms_arc.store(track_duration_ms, Ordering::SeqCst);
 
             let mut cur_format = bits_to_format(cur_bits);
             let ch = cur_channels.min(8) as u8;
@@ -325,7 +361,14 @@ impl OutputTarget for OaatOutput {
 
             // Format negotiation
             if let Err(e) = endpoint
-                .propose_format(&stream_id, cur_format, cur_sample_rate, ch, layout, cur_bits as u8)
+                .propose_format(
+                    &stream_id,
+                    cur_format,
+                    cur_sample_rate,
+                    ch,
+                    layout,
+                    cur_bits as u8,
+                )
                 .await
             {
                 error!(device = %device_name, error = %e, "oaat: format propose send failed");
@@ -405,7 +448,8 @@ impl OutputTarget for OaatOutput {
             // Gapless: prefetched next track, ready to transition
             let mut next_track: Option<NextTrackPrefetch> = None;
             // Channel for receiving prefetch results from background task
-            let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> = None;
+            let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> =
+                None;
 
             loop {
                 tokio::select! {
@@ -614,7 +658,16 @@ impl OutputTarget for OaatOutput {
                             };
 
                             if endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await.is_err() {
+                                error!(device = %device_name, sample_offset, "oaat: send_audio failed");
                                 break;
+                            }
+
+                            if sample_offset == 0 {
+                                info!(
+                                    device = %device_name,
+                                    payload_bytes = payload.len(),
+                                    "oaat: first audio packet sent to endpoint"
+                                );
                             }
 
                             sample_offset += samples_per_packet as u64;
@@ -799,18 +852,24 @@ async fn prefetch_next_track(
         }
     }
 
-    let (sample_rate, _channels, bits_per_sample) = match parse_wav_header(&mut buf) {
-        Some(info) => info,
+    let wav = match parse_wav_header(&mut buf) {
+        Some(w) => w,
         None => {
             error!(device = %device_name, "oaat: next track is not WAV");
             return None;
         }
     };
 
+    let sample_rate = wav.sample_rate;
+    let bits_per_sample = wav.bits_per_sample;
+    let duration_ms = if duration_ms > 0 {
+        duration_ms
+    } else {
+        wav.duration_ms
+    };
     let format = bits_to_format(bits_per_sample);
-    let same_format = format == cur_format
-        && sample_rate == cur_sample_rate
-        && bits_per_sample == cur_bits;
+    let same_format =
+        format == cur_format && sample_rate == cur_sample_rate && bits_per_sample == cur_bits;
 
     info!(
         device = %device_name,

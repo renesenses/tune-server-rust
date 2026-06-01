@@ -407,7 +407,8 @@ async fn telemetry_snapshot_default_disabled() {
 async fn telemetry_toggle() {
     let app = make_app();
 
-    let (status, body) = post_json(&app, "/api/v1/system/telemetry", json!({"enabled": true})).await;
+    let (status, body) =
+        post_json(&app, "/api/v1/system/telemetry", json!({"enabled": true})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["enabled"], true);
 
@@ -422,7 +423,10 @@ async fn changelog_has_entries() {
     assert_eq!(status, StatusCode::OK);
     assert!(body["version"].is_string());
     let entries = body["entries"].as_array().unwrap();
-    assert!(entries.len() >= 5, "changelog should have at least 5 versions");
+    assert!(
+        entries.len() >= 5,
+        "changelog should have at least 5 versions"
+    );
     assert_eq!(entries[0]["version"], "0.8.15");
 }
 
@@ -433,7 +437,12 @@ async fn playback_zone_with_mock_output() {
     let (app, state) = make_app_with_state();
 
     // Create zone
-    let (status, body) = post_json(&app, "/api/v1/zones", json!({"name": "MockZone", "output_type": "mock", "output_device_id": "mock-dev-1"})).await;
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/zones",
+        json!({"name": "MockZone", "output_type": "mock", "output_device_id": "mock-dev-1"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     let zone_id = body["id"].as_i64().unwrap();
 
@@ -474,7 +483,12 @@ async fn mock_output_status_reflects_in_admin_zones() {
     let (app, state) = make_app_with_state();
 
     // Create zone linked to mock output
-    post_json(&app, "/api/v1/zones", json!({"name": "Living Room", "output_type": "mock", "output_device_id": "mock-living"})).await;
+    post_json(
+        &app,
+        "/api/v1/zones",
+        json!({"name": "Living Room", "output_type": "mock", "output_device_id": "mock-living"}),
+    )
+    .await;
 
     let mock = tune_core::outputs::mock::MockOutput::new("mock-living", "Living Room Speaker");
     {
@@ -495,7 +509,9 @@ async fn playback_manager_state_transitions() {
 
     // Create a zone in DB
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-    let zone_id = zone_repo.create("Test", Some("mock"), Some("mock-1")).unwrap();
+    let zone_id = zone_repo
+        .create("Test", Some("mock"), Some("mock-1"))
+        .unwrap();
 
     // Initially stopped
     let zs = state.playback.get_state(zone_id).await;
@@ -535,7 +551,10 @@ async fn playback_manager_state_transitions() {
     let zs = state.playback.get_state(zone_id).await;
     assert_eq!(zs.state, tune_core::playback::PlayState::Playing);
     assert_eq!(zs.now_playing.as_ref().unwrap().title, "Track B");
-    assert!(zs.now_playing.as_ref().unwrap().stream_id.is_none(), "gapless advance should have stream_id=None");
+    assert!(
+        zs.now_playing.as_ref().unwrap().stream_id.is_none(),
+        "gapless advance should have stream_id=None"
+    );
 
     // Stop
     state.playback.stop(zone_id).await;

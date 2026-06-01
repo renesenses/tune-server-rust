@@ -54,10 +54,9 @@ impl SyncEngine {
                     POLL_IDLE_MS
                 };
 
-                if has_active
-                    && let Err(e) = self.sync_all().await {
-                        warn!(error = %e, "sync_engine_error");
-                    }
+                if has_active && let Err(e) = self.sync_all().await {
+                    warn!(error = %e, "sync_engine_error");
+                }
 
                 tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
             }
@@ -92,9 +91,10 @@ impl SyncEngine {
             let groups = self.groups.lock().await;
             if let Some(group) = groups.get_group(&group_info.group_id)
                 && let Some(last_play) = group.last_play_time()
-                    && last_play.elapsed().as_secs_f64() < COOLDOWN_COARSE_S {
-                        return;
-                    }
+                && last_play.elapsed().as_secs_f64() < COOLDOWN_COARSE_S
+            {
+                return;
+            }
         }
 
         let outputs = self.outputs.lock().await;
@@ -134,19 +134,20 @@ impl SyncEngine {
                 };
                 if should_correct
                     && let Some(device_id) = self.get_device_id(follower_id)
-                        && let Some(output) = outputs.get(&device_id) {
-                            info!(
-                                follower = follower_id,
-                                drift_ms = drift,
-                                target_ms = target,
-                                "sync_coarse_correction"
-                            );
-                            let _ = output.lock().await.seek(target as u64).await;
-                            self.last_correction
-                                .lock()
-                                .await
-                                .insert(follower_id, Instant::now());
-                        }
+                    && let Some(output) = outputs.get(&device_id)
+                {
+                    info!(
+                        follower = follower_id,
+                        drift_ms = drift,
+                        target_ms = target,
+                        "sync_coarse_correction"
+                    );
+                    let _ = output.lock().await.seek(target as u64).await;
+                    self.last_correction
+                        .lock()
+                        .await
+                        .insert(follower_id, Instant::now());
+                }
             } else if drift > DRIFT_FINE_MS {
                 let should_correct = {
                     let corrections = self.last_correction.lock().await;
@@ -157,19 +158,20 @@ impl SyncEngine {
                 };
                 if should_correct
                     && let Some(device_id) = self.get_device_id(follower_id)
-                        && let Some(output) = outputs.get(&device_id) {
-                            debug!(
-                                follower = follower_id,
-                                drift_ms = drift,
-                                target_ms = target,
-                                "sync_fine_correction"
-                            );
-                            let _ = output.lock().await.seek(target as u64).await;
-                            self.last_correction
-                                .lock()
-                                .await
-                                .insert(follower_id, Instant::now());
-                        }
+                    && let Some(output) = outputs.get(&device_id)
+                {
+                    debug!(
+                        follower = follower_id,
+                        drift_ms = drift,
+                        target_ms = target,
+                        "sync_fine_correction"
+                    );
+                    let _ = output.lock().await.seek(target as u64).await;
+                    self.last_correction
+                        .lock()
+                        .await
+                        .insert(follower_id, Instant::now());
+                }
             }
         }
     }

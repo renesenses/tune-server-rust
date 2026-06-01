@@ -100,9 +100,10 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, p) in parts.iter().enumerate() {
                 if *p == "I:"
-                    && let Some(val) = parts.get(i + 1) {
-                        return val.parse::<f64>().ok();
-                    }
+                    && let Some(val) = parts.get(i + 1)
+                {
+                    return val.parse::<f64>().ok();
+                }
             }
         }
     }
@@ -128,9 +129,10 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
     for line in stderr.lines() {
         if line.contains("silence_end")
             && let Some(dur_part) = line.split("silence_duration:").nth(1)
-                && let Ok(d) = dur_part.trim().parse::<f64>() {
-                    last_duration = d;
-                }
+            && let Ok(d) = dur_part.trim().parse::<f64>()
+        {
+            last_duration = d;
+        }
     }
     last_duration
 }

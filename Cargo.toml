@@ -49,6 +49,10 @@ csv = "1"
 oaat-core = { version = "0.1.1", default-features = false }
 oaat-controller = { version = "0.1.1", default-features = false }
 
+[profile.dev]
+opt-level = 0
+debug = 0
+
 [profile.release]
 opt-level = "z"
 lto = true

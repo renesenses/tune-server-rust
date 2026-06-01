@@ -44,15 +44,16 @@ impl ArtistEnrichmentClient {
 
         if let Some(inner) = artist.fields.get_mut("data")
             && let Some(img) = inner.get("image_url").and_then(|v| v.as_str())
-                && img.starts_with("/storage/") {
-                    let base = self
-                        .base_url
-                        .split("/api/")
-                        .next()
-                        .unwrap_or(&self.base_url);
-                    let full = format!("{base}{img}");
-                    inner["image_url"] = serde_json::json!(full);
-                }
+            && img.starts_with("/storage/")
+        {
+            let base = self
+                .base_url
+                .split("/api/")
+                .next()
+                .unwrap_or(&self.base_url);
+            let full = format!("{base}{img}");
+            inner["image_url"] = serde_json::json!(full);
+        }
 
         self.cache_set(mbid, artist.clone());
         Some(artist)

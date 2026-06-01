@@ -259,9 +259,10 @@ impl PlayQueue {
         }
         self.position = pos as i64;
         if self.shuffle
-            && let Some(idx) = self.shuffle_order.iter().position(|&i| i == pos) {
-                self.shuffle_index = idx as i64;
-            }
+            && let Some(idx) = self.shuffle_order.iter().position(|&i| i == pos)
+        {
+            self.shuffle_index = idx as i64;
+        }
         self.current()
     }
 
