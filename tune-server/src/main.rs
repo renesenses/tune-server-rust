@@ -30,6 +30,10 @@ async fn main() {
 
     eprintln!("tune-server starting (pid {})", std::process::id());
 
+    // On Windows, detect Program Files installs and migrate data to %LOCALAPPDATA%
+    #[cfg(target_os = "windows")]
+    tune_server::windows_migrate::check_and_migrate();
+
     // Install rustls CryptoProvider before any TLS operation (reqwest, etc.)
     rustls::crypto::ring::default_provider()
         .install_default()

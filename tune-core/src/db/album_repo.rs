@@ -127,6 +127,30 @@ impl AlbumRepo {
         Ok(album)
     }
 
+    pub fn get_or_create_with_mbid(
+        &self,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+        mbid: Option<&str>,
+    ) -> Result<Album, String> {
+        if let Some(release_id) = mbid {
+            if let Some(album) = self.get_by_musicbrainz_release_id(release_id)? {
+                return Ok(album);
+            }
+        }
+        if let Some(album) = self.get_by_title_and_artist(title, artist_id, year)? {
+            return Ok(album);
+        }
+        let mut album = Album::new(title.to_string());
+        album.artist_id = Some(artist_id);
+        album.year = year;
+        album.musicbrainz_release_id = mbid.map(String::from);
+        let id = self.create(&album)?;
+        album.id = Some(id);
+        Ok(album)
+    }
+
     pub fn update(&self, album: &Album) -> Result<(), String> {
         let id = album.id.ok_or("album has no id")?;
         self.db.execute(

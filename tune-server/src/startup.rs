@@ -11,6 +11,16 @@ use crate::state::AppState;
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_zone_volumes(state).await;
     persist_initial_settings(state, config);
+    warm_sqlite_cache(&state.db);
+}
+
+/// Touch key tables so SQLite page cache is warm for the first UI load.
+fn warm_sqlite_cache(db: &tune_core::db::sqlite::SqliteDb) {
+    use tune_core::db::{album_repo::AlbumRepo, artist_repo::ArtistRepo, track_repo::TrackRepo};
+    let _ = TrackRepo::new(db.clone()).count();
+    let _ = AlbumRepo::new(db.clone()).count();
+    let _ = ArtistRepo::new(db.clone()).count();
+    info!("sqlite_cache_warmed");
 }
 
 /// Initialize PlaybackManager volume from DB-stored zone volumes and mark devices offline.

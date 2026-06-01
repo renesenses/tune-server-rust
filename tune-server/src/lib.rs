@@ -9,3 +9,4 @@ pub mod error;
 pub mod routes;
 pub mod startup;
 pub mod state;
+pub mod windows_migrate;
