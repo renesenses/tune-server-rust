@@ -129,15 +129,14 @@ impl AutoFixEngine {
                         _ => continue,
                     };
 
-                    if let Some(ref genre) = result.genre {
-                        if track.genre.is_none() || track.genre.as_deref() == Some("") {
+                    if let Some(ref genre) = result.genre
+                        && (track.genre.is_none() || track.genre.as_deref() == Some("")) {
                             self.add_suggestion(*track_id, "genre", "", genre, 0.85, "musicbrainz")
                                 .await;
                         }
-                    }
 
-                    if let Some(year) = result.year {
-                        if track.year.is_none() || track.year == Some(0) {
+                    if let Some(year) = result.year
+                        && (track.year.is_none() || track.year == Some(0)) {
                             self.add_suggestion(
                                 *track_id,
                                 "year",
@@ -148,14 +147,12 @@ impl AutoFixEngine {
                             )
                             .await;
                         }
-                    }
 
-                    if let Some(ref isrc) = result.isrc {
-                        if track.isrc.is_none() {
+                    if let Some(ref isrc) = result.isrc
+                        && track.isrc.is_none() {
                             self.add_suggestion(*track_id, "isrc", "", isrc, 0.95, "musicbrainz")
                                 .await;
                         }
-                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -240,7 +237,7 @@ fn find_incomplete_tracks(repo: &TrackRepo) -> Vec<i64> {
     )
     .and_then(|mut stmt| {
         stmt.query_map([], |row| row.get::<_, i64>(0))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
     })
     .unwrap_or_default()
 }

@@ -238,8 +238,8 @@ impl SmartCollectionRepo {
                 })
             })
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
 
         Ok(collections)
     }
@@ -263,8 +263,8 @@ impl SmartCollectionRepo {
         let ids = stmt
             .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
 
         Ok(ids)
     }

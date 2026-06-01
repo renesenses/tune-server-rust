@@ -422,8 +422,8 @@ fn browse_genres(state: &UpnpState) -> DidlResult {
     let genres: Vec<String> = stmt
         .query_map([], |row| row.get(0))
         .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default();
     drop(stmt);
     drop(conn);
 

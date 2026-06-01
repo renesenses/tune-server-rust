@@ -103,8 +103,8 @@ pub fn fts_search(conn: &Connection, table_name: &str, query: &str, limit: i64) 
 
     stmt.query_map(rusqlite::params![escaped, limit], |row| row.get(0))
         .unwrap_or_else(|_| panic!("fts query_map failed"))
-        .filter_map(|r| r.ok())
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
 }
 
 fn escape_fts_query(query: &str) -> String {

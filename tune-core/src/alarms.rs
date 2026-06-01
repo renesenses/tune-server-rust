@@ -218,12 +218,11 @@ impl AlarmScheduler {
         // Check snoozed alarms
         let snoozed_ready = self.snooze.lock().await.pop_ready();
         for alarm_id in snoozed_ready {
-            if let Ok(Some(alarm)) = self.get_alarm(alarm_id) {
-                if alarm_enabled(&alarm) {
+            if let Ok(Some(alarm)) = self.get_alarm(alarm_id)
+                && alarm_enabled(&alarm) {
                     fired_today.insert(alarm_id);
                     self.fire_alarm(&alarm).await;
                 }
-            }
         }
 
         // Check scheduled alarms
@@ -249,13 +248,11 @@ impl AlarmScheduler {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
                 != 0
-            {
-                if is_french_holiday(now.year(), now.month(), now.day()) {
+                && is_french_holiday(now.year(), now.month(), now.day()) {
                     info!(alarm_id, date = %today, "alarm_skipped_holiday");
                     fired_today.insert(alarm_id);
                     continue;
                 }
-            }
 
             let alarm_time = alarm.get("time").and_then(|v| v.as_str()).unwrap_or("");
             let parts: Vec<&str> = alarm_time.split(':').collect();
@@ -386,7 +383,7 @@ impl AlarmScheduler {
                 }))
             })
             .map_err(|e| format!("alarm rows: {e}"))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?)
     }
 
     fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
