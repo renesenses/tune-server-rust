@@ -178,6 +178,13 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
         if let Err(e) = mdns.start() {
             tracing::warn!(error = %e, "mdns_start_failed");
         }
+        let port = std::env::var("TUNE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8888u16);
+        if let Err(e) = mdns.register_self(port, tune_core::version()) {
+            tracing::warn!(error = %e, "mdns_register_self_failed");
+        }
         Some(mdns)
     } else {
         None

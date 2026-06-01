@@ -137,6 +137,47 @@ impl MdnsScanner {
         self
     }
 
+    /// Announce this Tune server instance via mDNS so HomeAssistant
+    /// and other clients can auto-discover it.
+    pub fn register_self(&self, port: u16, version: &str) -> Result<(), String> {
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "tune-server".into());
+        let service_name = format!("Tune ({})", hostname);
+
+        let local_ip = crate::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into());
+
+        let properties = [
+            ("version", version),
+            ("path", "/api/v1"),
+        ];
+
+        let svc = ServiceInfo::new(
+            TUNE_SERVICE,
+            &service_name,
+            &format!("{hostname}.local."),
+            &local_ip,
+            port,
+            &properties[..],
+        )
+        .map_err(|e| format!("mDNS register: {e}"))?;
+
+        self.daemon
+            .register(svc)
+            .map_err(|e| format!("mDNS register: {e}"))?;
+
+        info!(
+            service = TUNE_SERVICE,
+            name = %service_name,
+            ip = %local_ip,
+            port,
+            "mdns_service_registered"
+        );
+        Ok(())
+    }
+
     pub fn start(&mut self) -> Result<(), String> {
         for config in &self.configs {
             let receiver = self
