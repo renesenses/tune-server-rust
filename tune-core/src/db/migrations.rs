@@ -350,6 +350,11 @@ INSERT OR IGNORE INTO smart_playlists (name, rules, sort_by, sort_order, max_tra
     WHERE NOT EXISTS (SELECT 1 FROM smart_playlists WHERE name = 'Never Played');
 ",
     },
+    Migration {
+        version: 20,
+        name: "add_waveform_column",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -572,6 +577,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 18 {
             add_column_if_missing(db, "zones", "group_id", "TEXT");
             add_column_if_missing(db, "zones", "sync_delay_ms", "INTEGER NOT NULL DEFAULT 0");
+        }
+        if migration.version == 20 {
+            add_column_if_missing(db, "tracks", "waveform_json", "TEXT");
         }
 
         db.execute(

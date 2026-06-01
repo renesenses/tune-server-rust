@@ -229,3 +229,37 @@ pub(super) async fn track_lyrics(
             .into_response(),
     }
 }
+
+pub(super) async fn track_waveform(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::new(state.db.clone());
+
+    // Return cached waveform if available
+    if let Ok(Some(cached)) = repo.get_waveform(id) {
+        return Json(json!({ "track_id": id, "waveform": serde_json::from_str::<Value>(&cached).unwrap_or(Value::Null) })).into_response();
+    }
+
+    // Generate on demand
+    let track = match repo.get(id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let file_path = match track.file_path.as_deref() {
+        Some(p) => p.to_string(),
+        None => return Json(json!({ "track_id": id, "waveform": null, "error": "no file path" })).into_response(),
+    };
+
+    let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
+    if points.is_empty() {
+        return Json(json!({ "track_id": id, "waveform": null, "error": "ffmpeg unavailable or file unreadable" })).into_response();
+    }
+
+    let json_str = serde_json::to_string(&points).unwrap_or_default();
+    repo.set_waveform(id, &json_str).ok();
+
+    Json(json!({ "track_id": id, "waveform": points })).into_response()
+}

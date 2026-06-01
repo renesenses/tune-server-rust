@@ -195,6 +195,26 @@ impl TrackRepo {
         Ok(())
     }
 
+    pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        conn.query_row(
+            "SELECT waveform_json FROM tracks WHERE id = ?",
+            rusqlite::params![track_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+        .map(|o| o.flatten())
+    }
+
+    pub fn set_waveform(&self, track_id: i64, json: &str) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE tracks SET waveform_json = ? WHERE id = ?",
+            &[&json as &dyn rusqlite::types::ToSql, &track_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_credits(
         &self,
         track_id: i64,
