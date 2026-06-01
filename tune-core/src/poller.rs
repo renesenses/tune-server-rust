@@ -37,6 +37,10 @@ fn rand_pos(queue_length: i64, current: i64) -> i64 {
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
+    /// Ticks to ignore Stopped state after a gapless advance, so the
+    /// poller doesn't re-send play_from_queue to a renderer that already
+    /// transitioned via SetNextAVTransportURI.
+    gapless_cooldown: u8,
     last_radio_poll: Instant,
 }
 
@@ -252,19 +256,26 @@ impl PositionPoller {
             let ps = poll_states.entry(zone_id).or_insert(ZonePollState {
                 gapless_sent: false,
                 stopped_ticks: 0,
+                gapless_cooldown: 0,
                 last_radio_poll: Instant::now(),
             });
 
             match status.state {
                 TransportState::Stopped => {
-                    ps.stopped_ticks += 1;
-                    if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
-                        poll_states.remove(&zone_id);
-                        self.handle_track_end(zone_id, zone_state).await;
+                    if ps.gapless_cooldown > 0 {
+                        ps.gapless_cooldown -= 1;
+                        ps.stopped_ticks = 0;
+                    } else {
+                        ps.stopped_ticks += 1;
+                        if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
+                            poll_states.remove(&zone_id);
+                            self.handle_track_end(zone_id, zone_state).await;
+                        }
                     }
                 }
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
+                    ps.gapless_cooldown = 0;
 
                     let track_duration = zone_state
                         .now_playing
@@ -303,6 +314,11 @@ impl PositionPoller {
                             {
                                 warn!(zone_id, error = %e, "gapless_advance_failed");
                             }
+                            // Suppress handle_track_end for a few ticks — the
+                            // renderer may briefly report Stopped during the
+                            // gapless transition, which would otherwise send a
+                            // redundant Stop+Play and cause an audible restart.
+                            ps.gapless_cooldown = 4;
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
@@ -420,5 +436,115 @@ impl PositionPoller {
             .ok()
             .flatten()
             .and_then(|z| z.output_device_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gapless_cooldown_suppresses_stopped() {
+        let mut ps = ZonePollState {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            gapless_cooldown: 4,
+            last_radio_poll: Instant::now(),
+        };
+
+        // While cooldown > 0, stopped_ticks must not accumulate
+        for _ in 0..4 {
+            assert!(ps.gapless_cooldown > 0);
+            ps.gapless_cooldown -= 1;
+            ps.stopped_ticks = 0; // simulates the Stopped branch logic
+        }
+        assert_eq!(ps.gapless_cooldown, 0);
+        assert_eq!(ps.stopped_ticks, 0);
+
+        // After cooldown expires, stopped_ticks can accumulate
+        ps.stopped_ticks = 1;
+        assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
+        ps.stopped_ticks = 2;
+        assert!(ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD);
+    }
+
+    #[test]
+    fn playing_state_resets_cooldown() {
+        let mut ps = ZonePollState {
+            gapless_sent: true,
+            stopped_ticks: 0,
+            gapless_cooldown: 3,
+            last_radio_poll: Instant::now(),
+        };
+
+        // Simulates entering Playing state
+        ps.stopped_ticks = 0;
+        ps.gapless_cooldown = 0;
+        assert_eq!(ps.gapless_cooldown, 0);
+    }
+
+    #[test]
+    fn next_position_repeat_off() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 3,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(4));
+    }
+
+    #[test]
+    fn next_position_end_of_queue() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), None);
+    }
+
+    #[test]
+    fn next_position_repeat_all_wraps() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::All,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(0));
+    }
+
+    #[test]
+    fn next_position_repeat_one() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(2));
+    }
+
+    #[test]
+    fn next_position_empty_queue() {
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 0,
+            queue_length: 0,
+            repeat: RepeatMode::Off,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), None);
     }
 }

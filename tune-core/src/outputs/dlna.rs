@@ -501,4 +501,35 @@ mod tests {
         assert!(didl.contains("AC/DC"));
         assert!(didl.contains("a=1&amp;b=2"));
     }
+
+    #[test]
+    fn parse_time_edge_cases() {
+        assert_eq!(DlnaOutput::parse_time(""), 0);
+        assert_eq!(DlnaOutput::parse_time("NOT_A_TIME"), 0);
+        assert_eq!(DlnaOutput::parse_time("0:00:00"), 0);
+        assert_eq!(DlnaOutput::parse_time("0:00:01"), 1_000);
+        assert_eq!(DlnaOutput::parse_time("23:59:59.999"), 86_399_999);
+    }
+
+    #[test]
+    fn parse_time_dmp_a6_scenario() {
+        // DMP-A6 reports "0:03:46" for a track that's actually 4:16.487.
+        // With fractional parsing, "0:03:46.000" should give exactly 226000ms,
+        // and "0:04:16.487" should give exactly 256487ms.
+        let renderer_dur = DlnaOutput::parse_time("0:03:46");
+        let track_dur = DlnaOutput::parse_time("0:04:16.487");
+        assert_eq!(renderer_dur, 226_000);
+        assert_eq!(track_dur, 256_487);
+        let diff = (track_dur as i64 - renderer_dur as i64).unsigned_abs();
+        assert!(diff > 2000, "difference should exceed gapless threshold");
+    }
+
+    #[test]
+    fn format_time_roundtrip() {
+        for ms in [0, 1000, 60_000, 225_000, 3_600_000, 86_399_000] {
+            let formatted = DlnaOutput::format_time(ms);
+            let parsed = DlnaOutput::parse_time(&formatted);
+            assert_eq!(parsed, ms, "roundtrip failed for {ms}ms -> {formatted}");
+        }
+    }
 }
