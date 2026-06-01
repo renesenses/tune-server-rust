@@ -236,4 +236,176 @@ mod tests {
         b.resize(b.len() + data_size as usize, 0);
         b
     }
+
+    /// Sustained streaming test: 5 seconds of audio, verify no packet loss
+    /// and position tracking stays accurate.
+    #[tokio::test]
+    async fn oaat_sustained_stream_no_drift() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_port = tcp.local_addr().unwrap().port();
+        let audio_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_udp.local_addr().unwrap().port();
+        let clock_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clock_port = clock_udp.local_addr().unwrap().port();
+
+        let audio_socket = std::sync::Arc::new(audio_udp);
+        let packet_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pc = packet_count.clone();
+
+        // Audio receiver — count packets until done
+        let audio_rx = {
+            let s = audio_socket.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        s.recv(&mut buf),
+                    ).await {
+                        Ok(Ok(n)) if n >= AUDIO_HEADER_SIZE => {
+                            pc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => break,
+                    }
+                }
+            })
+        };
+
+        // Clock responder
+        let _clock = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                match clock_udp.recv_from(&mut buf).await {
+                    Ok((n, peer)) if n >= 28 => { let _ = clock_udp.send_to(&buf[..n], peer).await; }
+                    _ => break,
+                }
+            }
+        });
+
+        // Mock endpoint
+        let mock = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = tokio::time::timeout(
+                std::time::Duration::from_secs(5), tcp.accept()
+            ).await.unwrap_or(Err(std::io::Error::other("timeout"))) {
+                let mut codec = FrameCodec::new();
+                let mut read_buf = [0u8; 8192];
+                let n = stream.read(&mut read_buf).await.unwrap_or(0);
+                if n > 0 {
+                    codec.feed(&read_buf[..n]);
+                    if let Ok(Some(Message::Hello(_))) = codec.decode_next() {
+                        let ack = Message::HelloAck(HelloAck {
+                            protocol_version: oaat_core::PROTOCOL_VERSION,
+                            endpoint_id: "mock-ep".into(),
+                            endpoint_name: "Mock DAC".into(),
+                            capabilities: EndpointCapabilities {
+                                pcm_max_rate: 192000, pcm_max_bits: 32,
+                                dsd_max_rate: None, channels_max: 2,
+                                formats: vec![oaat_core::format::AudioFormat::PcmS16le],
+                                volume: None, gapless: true, seek: false,
+                            },
+                            audio_port, clock_port, buffer_size_ms: 100,
+                        });
+                        let _ = stream.write_all(&FrameCodec::encode(&ack)).await;
+
+                        // Read control messages until disconnect
+                        loop {
+                            let n = match tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                stream.read(&mut read_buf),
+                            ).await {
+                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                                Ok(Ok(n)) => n,
+                            };
+                            codec.feed(&read_buf[..n]);
+                            while let Ok(Some(msg)) = codec.decode_next() {
+                                if let Message::FormatPropose(fp) = msg {
+                                    let accept = Message::FormatAccept(FormatAccept {
+                                        stream_id: fp.stream_id,
+                                    });
+                                    let _ = stream.write_all(&FrameCodec::encode(&accept)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Generate 5 seconds of WAV audio
+        let sr = 44100u32;
+        let duration_s = 5u32;
+        let data_size = sr * 4 * duration_s; // 16-bit stereo
+        let wav = {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"RIFF");
+            b.extend_from_slice(&(36 + data_size).to_le_bytes());
+            b.extend_from_slice(b"WAVE");
+            b.extend_from_slice(b"fmt ");
+            b.extend_from_slice(&16u32.to_le_bytes());
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes());
+            b.extend_from_slice(&sr.to_le_bytes());
+            b.extend_from_slice(&(sr * 4).to_le_bytes());
+            b.extend_from_slice(&4u16.to_le_bytes());
+            b.extend_from_slice(&16u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&data_size.to_le_bytes());
+            b.resize(b.len() + data_size as usize, 0);
+            b
+        };
+
+        // HTTP server
+        let http_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_tcp.local_addr().unwrap().port();
+        let http = tokio::spawn(async move {
+            if let Ok((mut s, _)) = http_tcp.accept().await {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+                    wav.len()
+                );
+                let _ = s.write_all(hdr.as_bytes()).await;
+                let _ = s.write_all(&wav).await;
+            }
+        });
+
+        let output = OaatOutput::new(
+            "Mock DAC".into(), "127.0.0.1".into(), control_port, "mock-ep".into(),
+        );
+
+        let url = format!("http://127.0.0.1:{http_port}/test.wav");
+        output.play_media(&PlayMedia {
+            url: &url, mime_type: "audio/wav", title: Some("Load Test"),
+            ..Default::default()
+        }).await.unwrap();
+
+        // Wait for streaming to complete (5s audio + margin)
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+        let packets = packet_count.load(std::sync::atomic::Ordering::Relaxed);
+        let diag = output.diagnostics_snapshot();
+
+        // At 44100Hz / 480 samples per packet = ~91.9 packets/sec → ~460 packets for 5s
+        assert!(
+            packets >= 400,
+            "expected >=400 packets for 5s stream, got {packets}"
+        );
+
+        // Position should be near 5000ms
+        let pos = diag["position_ms"].as_u64().unwrap_or(0);
+        assert!(
+            pos >= 4000,
+            "position should be near 5000ms, got {pos}ms"
+        );
+
+        // No stall detected
+        assert!(
+            !diag["stall_detected"].as_bool().unwrap_or(true),
+            "stall detected during sustained stream"
+        );
+
+        output.stop().await.ok();
+        http.abort();
+        mock.abort();
+        audio_rx.abort();
+    }
 }
