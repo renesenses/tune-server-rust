@@ -272,16 +272,21 @@ impl PositionPoller {
                         .map(|np| np.duration_ms as u64)
                         .unwrap_or(0);
 
-                    // Detect gapless transition: renderer reports a different duration
-                    // than the current track, meaning it moved to the next track.
-                    // Use 2s tolerance to avoid false positives from rounding (WAV).
-                    // Ignore if renderer reports duration 0 (no metadata).
+                    // Detect gapless transition: renderer reports a different
+                    // duration than the current track AND the position confirms
+                    // the track actually ended (near end or reset to start).
+                    // Some DLNA renderers (DMP-A6/A8) report inaccurate durations
+                    // from the start, so duration mismatch alone is insufficient.
                     let duration_changed = ps.gapless_sent
                         && track_duration > 0
                         && status.duration_ms > 0
                         && (status.duration_ms as i64 - track_duration as i64).unsigned_abs()
                             > 2000;
-                    if duration_changed {
+                    let position_confirms_transition = status.position_ms < 5000
+                        || (track_duration > 0
+                            && status.position_ms
+                                >= track_duration.saturating_sub(GAPLESS_WINDOW_MS));
+                    if duration_changed && position_confirms_transition {
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
