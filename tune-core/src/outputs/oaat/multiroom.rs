@@ -239,7 +239,7 @@ impl OutputTarget for OaatMultiroomOutput {
                 return;
             }
 
-            let fmt_str = format_rate_display(cur_sample_rate, cur_bits, is_flac);
+            let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
             zone.send_metadata_all(oaat_core::message::TrackMetadata {
                 title, artist, album,
                 duration_ms: track_duration_ms,

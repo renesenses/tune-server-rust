@@ -9,7 +9,7 @@ use tracing::{debug, error, warn};
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 #[cfg(feature = "oaat")]
-use super::helpers::{StreamInfo, detect_and_parse, format_rate_display};
+use super::helpers::{StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, format_rate_display};
 
 #[cfg(feature = "oaat")]
 enum OaatCommand {
@@ -17,6 +17,7 @@ enum OaatCommand {
     Resume,
     SetVolume(u8),
     Mute(bool),
+    Seek { position_ms: u64 },
     PrepareNext {
         url: String,
         title: String,
@@ -139,6 +140,8 @@ impl OaatOutput {
 
 #[cfg(feature = "oaat")]
 const FLAC_CHUNK_SIZE: usize = 4096;
+#[cfg(feature = "oaat")]
+const DSD_CHUNK_SIZE: usize = 4096;
 #[cfg(feature = "oaat")]
 const PCM_SAMPLES_PER_PACKET: usize = 480;
 #[cfg(feature = "oaat")]
@@ -379,6 +382,8 @@ impl OutputTarget for OaatOutput {
             };
 
             let is_flac = si.format == AudioFormat::Flac;
+            let is_dsd = si.format.is_dsd();
+            let uses_byte_offset = is_flac || is_dsd;
             let mut cur_format = si.format;
             let mut cur_sample_rate = si.sample_rate;
             let mut cur_bits = si.bits_per_sample;
@@ -394,7 +399,9 @@ impl OutputTarget for OaatOutput {
             duration_ms_arc.store(track_duration_ms, Ordering::SeqCst);
 
             let mut bytes_per_frame = (cur_bits as usize / 8) * cur_channels as usize;
-            let mut packet_size = if is_flac {
+            let mut packet_size = if is_dsd {
+                DSD_CHUNK_SIZE
+            } else if is_flac {
                 FLAC_CHUNK_SIZE
             } else {
                 PCM_SAMPLES_PER_PACKET * bytes_per_frame
@@ -407,16 +414,19 @@ impl OutputTarget for OaatOutput {
                 "oaat: audio format detected"
             );
 
-            // Format negotiation
+            // Format negotiation (use send_message directly to include dsd_rate)
             if let Err(e) = endpoint
-                .propose_format(
-                    &stream_id,
-                    cur_format,
-                    cur_sample_rate,
-                    ch,
-                    layout,
-                    cur_bits as u8,
-                )
+                .send_message(&oaat_core::Message::FormatPropose(
+                    oaat_core::message::FormatPropose {
+                        stream_id: stream_id.clone(),
+                        format: cur_format,
+                        sample_rate: cur_sample_rate,
+                        channels: ch,
+                        channel_layout: layout,
+                        bits_per_sample: cur_bits as u8,
+                        dsd_rate: si.dsd_rate,
+                    },
+                ))
                 .await
             {
                 error!(device = %device_name, error = %e, "oaat: format propose failed");
@@ -467,7 +477,7 @@ impl OutputTarget for OaatOutput {
 
             // Metadata + Play
             let fmt_str =
-                format_rate_display(cur_sample_rate, cur_bits, cur_format == AudioFormat::Flac);
+                format_rate_display(cur_sample_rate, cur_bits, cur_format);
             endpoint
                 .send_metadata(oaat_core::message::TrackMetadata {
                     title,
@@ -489,7 +499,7 @@ impl OutputTarget for OaatOutput {
             diag.is_flac.store(is_flac, Ordering::SeqCst);
             diag.packets_sent.store(0, Ordering::SeqCst);
             diag.bytes_sent.store(0, Ordering::SeqCst);
-            *diag.format_desc.lock().unwrap() = format_rate_display(cur_sample_rate, cur_bits, is_flac);
+            *diag.format_desc.lock().unwrap() = format_rate_display(cur_sample_rate, cur_bits, cur_format);
             info!(device = %device_name, "oaat: streaming started");
 
             // Build StreamInfo for reconnection
@@ -499,6 +509,8 @@ impl OutputTarget for OaatOutput {
                 bits_per_sample: cur_bits,
                 format: cur_format,
                 duration_ms: track_duration_ms,
+                dsd_rate: dsd_rate_from_sample_rate(cur_sample_rate),
+                data_offset: 0,
             };
 
             // Streaming loop
@@ -595,6 +607,44 @@ impl OutputTarget for OaatOutput {
                             }
                             OaatCommand::SetVolume(level) => { endpoint.send_volume(level).await.ok(); }
                             OaatCommand::Mute(muted) => { endpoint.send_mute(muted).await.ok(); }
+                            OaatCommand::Seek { position_ms: seek_pos } => {
+                                // Tell endpoint about seek
+                                endpoint.send_message(&oaat_core::Message::Seek(oaat_core::message::Seek {
+                                    stream_id: stream_id.clone(),
+                                    position_ms: seek_pos,
+                                })).await.ok();
+
+                                if is_flac {
+                                    warn!(device = %device_name, "oaat: seek not supported for FLAC");
+                                } else {
+                                    // Calculate byte offset
+                                    let bytes_per_sec = if is_dsd {
+                                        cur_sample_rate as u64 * cur_channels as u64 / 8
+                                    } else {
+                                        cur_sample_rate as u64 * bytes_per_frame as u64
+                                    };
+                                    let data_byte = seek_pos * bytes_per_sec / 1000;
+                                    let frame_align = if is_dsd { 4096 * cur_channels as u64 } else { bytes_per_frame as u64 };
+                                    let aligned = (data_byte / frame_align) * frame_align;
+                                    let file_offset = aligned + cur_stream_info.data_offset as u64;
+
+                                    let range = format!("bytes={file_offset}-");
+                                    match http_client.get(&url).header("Range", &range).send().await {
+                                        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
+                                            stream = Box::pin(resp.bytes_stream());
+                                            buf.clear();
+                                            if uses_byte_offset { byte_offset = aligned; } else { sample_offset = aligned / bytes_per_frame as u64; }
+                                            let elapsed_eq = std::time::Duration::from_millis(seek_pos);
+                                            start = std::time::Instant::now() - elapsed_eq;
+                                            pause_offset = std::time::Duration::ZERO;
+                                            position_ms.store(seek_pos, Ordering::SeqCst);
+                                            info!(device = %device_name, seek_pos, file_offset, "oaat: seek complete");
+                                        }
+                                        Ok(resp) => warn!(device = %device_name, status = %resp.status(), "oaat: seek Range failed"),
+                                        Err(e) => warn!(device = %device_name, error = %e, "oaat: seek request failed"),
+                                    }
+                                }
+                            }
                             OaatCommand::PrepareNext { url, title, artist, album, cover_url, duration_ms } => {
                                 let client = http_client.clone();
                                 let dev = device_name.clone();
@@ -621,16 +671,16 @@ impl OutputTarget for OaatOutput {
                                 // Flush remaining buffer
                                 while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
                                     let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                                    let pts_ns = if is_flac {
+                                    let pts_ns = if uses_byte_offset {
                                         (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                                     } else {
                                         (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
                                     };
                                     let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, PacketFlags::empty()).await;
-                                    if is_flac { byte_offset += payload.len() as u64; }
+                                    if uses_byte_offset { byte_offset += payload.len() as u64; }
                                     else { sample_offset += PCM_SAMPLES_PER_PACKET as u64; }
                                     position_ms.store(
-                                        if is_flac { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
+                                        if uses_byte_offset { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
                                         else { sample_offset * 1000 / cur_sample_rate as u64 },
                                         Ordering::Relaxed,
                                     );
@@ -663,7 +713,7 @@ impl OutputTarget for OaatOutput {
                                     *current_uri.lock().await = Some(String::new());
                                     duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
 
-                                    let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format == AudioFormat::Flac);
+                                    let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
                                     endpoint.send_metadata(oaat_core::message::TrackMetadata {
                                         title: next.title, artist: next.artist, album: next.album,
                                         duration_ms: next.duration_ms, artwork_url: next.cover_url,
@@ -688,7 +738,7 @@ impl OutputTarget for OaatOutput {
                             && !paused.load(Ordering::Relaxed)
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                            let pts_ns = if is_flac {
+                            let pts_ns = if uses_byte_offset {
                                 (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
                                 (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
@@ -745,19 +795,19 @@ impl OutputTarget for OaatOutput {
                                 info!(device = %device_name, payload_bytes = payload.len(), "oaat: first audio packet sent");
                             }
 
-                            if is_flac {
+                            if uses_byte_offset {
                                 byte_offset += payload.len() as u64;
                             } else {
                                 sample_offset += PCM_SAMPLES_PER_PACKET as u64;
                             }
                             position_ms.store(
-                                if is_flac { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
+                                if uses_byte_offset { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
                                 else { sample_offset * 1000 / cur_sample_rate as u64 },
                                 Ordering::Relaxed,
                             );
 
                             // Real-time pacing
-                            let expected = if is_flac {
+                            let expected = if uses_byte_offset {
                                 let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
                                 std::time::Duration::from_nanos(
                                     (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
@@ -780,7 +830,7 @@ impl OutputTarget for OaatOutput {
             playing.store(false, Ordering::SeqCst);
             diag.connected.store(false, Ordering::SeqCst);
             let duration_s = start.elapsed().as_secs_f64();
-            let packets = if is_flac {
+            let packets = if uses_byte_offset {
                 byte_offset / FLAC_CHUNK_SIZE as u64
             } else {
                 sample_offset / PCM_SAMPLES_PER_PACKET as u64
@@ -831,7 +881,12 @@ impl OutputTarget for OaatOutput {
         Ok(())
     }
 
-    async fn seek(&self, _position_ms: u64) -> Result<(), String> {
+    async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        #[cfg(feature = "oaat")]
+        if let Some(tx) = self.command_tx.lock().await.as_ref() {
+            let _ = tx.send(OaatCommand::Seek { position_ms }).await;
+        }
+        info!(device = %self.name, position_ms, "oaat: seek");
         Ok(())
     }
 
