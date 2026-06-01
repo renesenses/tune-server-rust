@@ -10,6 +10,7 @@ use crate::state::AppState;
 /// Restore zone volumes from DB and persist config settings to DB.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_zone_volumes(state).await;
+    restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(&state.db);
 }
@@ -39,6 +40,60 @@ async fn restore_zone_volumes(state: &AppState) {
         }
     }
 }
+
+/// Restore persisted OAAT multiroom groups from the settings DB.
+#[cfg(feature = "oaat")]
+async fn restore_oaat_groups(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let groups_json = settings
+        .get("oaat_groups")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "[]".into());
+    let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
+
+    let mut restored = 0usize;
+    for group in &groups {
+        let id = match group["id"].as_str() {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let name = group["name"].as_str().unwrap_or("OAAT Group").to_string();
+        let endpoints: Vec<(String, u16)> = group["endpoints"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|ep| {
+                let host = ep["host"].as_str()?.to_string();
+                let port = ep["port"].as_u64()? as u16;
+                Some((host, port))
+            })
+            .collect();
+
+        if endpoints.is_empty() {
+            continue;
+        }
+
+        let output = tune_core::outputs::oaat::OaatMultiroomOutput::new(
+            name.clone(),
+            id.clone(),
+            endpoints.clone(),
+        );
+        let mut outputs = state.outputs.lock().await;
+        outputs.register(Box::new(output));
+        drop(outputs);
+
+        info!(group_id = %id, name = %name, endpoints = endpoints.len(), "oaat_group_restored");
+        restored += 1;
+    }
+
+    if restored > 0 {
+        info!(count = restored, "oaat_groups_restore_complete");
+    }
+}
+
+#[cfg(not(feature = "oaat"))]
+async fn restore_oaat_groups(_state: &AppState) {}
 
 /// Create the OpenHome event listener (shared between SSDP handler and outputs).
 pub async fn create_oh_listener() -> Option<Arc<OpenHomeEventListener>> {
