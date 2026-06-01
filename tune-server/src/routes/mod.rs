@@ -70,6 +70,23 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn auto_dj_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let seed = q.get("seed_track").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let count = q.get("count").and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+    if seed == 0 {
+        return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "seed_track required"}).to_string()).into_response();
+    }
+    let tracks = tune_core::playback::auto_dj::generate_queue(&state.db, seed, count);
+    axum::Json(serde_json::json!({
+        "seed_track": seed,
+        "count": tracks.len(),
+        "tracks": tracks,
+    })).into_response()
+}
+
 async fn analytics_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: axum::http::Request<axum::body::Body>,
@@ -379,6 +396,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())
+        .route("/radio/auto", get(auto_dj_handler))
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())

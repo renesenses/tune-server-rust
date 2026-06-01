@@ -1,3 +1,4 @@
+pub mod auto_dj;
 pub mod crossfade;
 pub mod dj_player;
 pub mod gapless;
