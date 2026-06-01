@@ -4,6 +4,8 @@ pub mod bridge;
 pub mod chromecast;
 pub mod dlna;
 pub mod dlna_buffer_stats;
+#[cfg(test)]
+mod dlna_test;
 #[cfg(feature = "local-audio")]
 pub mod local;
 pub mod mock;
