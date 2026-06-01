@@ -126,6 +126,7 @@ pub fn router() -> Router<AppState> {
         .route("/tracks/{id}/audio", get(tracks::stream_track_audio))
         .route("/tracks/{id}/rescan", post(tracks::rescan_track))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        .route("/tracks/{id}/synced-lyrics", get(tracks::track_synced_lyrics))
         .route("/identify", post(tracks::identify_track))
         .route("/tracks/{id}/source-links", get(tracks::track_source_links))
         .route("/tracks/{id}/quick-fav", post(tracks::quick_fav_track))

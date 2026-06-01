@@ -1,4 +1,5 @@
 pub mod artist_enrichment;
+pub mod lyrics;
 pub mod auto_fix;
 pub mod batch;
 pub mod credit_enricher;

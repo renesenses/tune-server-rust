@@ -230,6 +230,38 @@ pub(super) async fn track_lyrics(
     }
 }
 
+pub(super) async fn track_synced_lyrics(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = TrackRepo::new(state.db.clone());
+
+    // Check DB cache
+    if let Ok(Some(cached)) = repo.get_synced_lyrics(id) {
+        let lines: Value = serde_json::from_str(&cached).unwrap_or(Value::Null);
+        return Json(json!({ "track_id": id, "synced": true, "lines": lines })).into_response();
+    }
+
+    // Try sidecar .lrc file
+    let track = match repo.get(id) {
+        Ok(Some(t)) => t,
+        _ => return (StatusCode::NOT_FOUND, "track not found").into_response(),
+    };
+
+    if let Some(ref path) = track.file_path {
+        if let Some(lrc_content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
+            let lines = tune_core::metadata::lyrics::parse_lrc(&lrc_content);
+            if !lines.is_empty() {
+                let json_str = serde_json::to_string(&lines).unwrap_or_default();
+                repo.set_synced_lyrics(id, &json_str).ok();
+                return Json(json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" })).into_response();
+            }
+        }
+    }
+
+    Json(json!({ "track_id": id, "synced": false, "lines": null })).into_response()
+}
+
 pub(super) async fn track_source_links(
     State(state): State<AppState>,
     Path(id): Path<i64>,

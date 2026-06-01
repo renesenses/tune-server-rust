@@ -383,6 +383,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_trailing_silence",
         up: "",
     },
+    Migration {
+        version: 24,
+        name: "add_synced_lyrics",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -615,6 +620,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 23 {
             add_column_if_missing(db, "tracks", "trailing_silence_ms", "INTEGER");
+        }
+        if migration.version == 24 {
+            add_column_if_missing(db, "tracks", "synced_lyrics", "TEXT");
         }
 
         db.execute(
