@@ -70,6 +70,48 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::state::AppState;
 
+async fn party_list_rooms(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let mgr = state.rooms.lock().await;
+    axum::Json(serde_json::json!({ "rooms": mgr.list_rooms() }))
+}
+
+async fn party_create_room(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = body["room_id"].as_str().unwrap_or("").to_string();
+    if id.is_empty() {
+        return (StatusCode::BAD_REQUEST, serde_json::json!({"error": "room_id required"}).to_string()).into_response();
+    }
+    let mut mgr = state.rooms.lock().await;
+    if mgr.create_room(&id) {
+        (StatusCode::CREATED, axum::Json(serde_json::json!({"room_id": id}))).into_response()
+    } else {
+        (StatusCode::CONFLICT, serde_json::json!({"error": "room exists"}).to_string()).into_response()
+    }
+}
+
+async fn party_room_info(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mgr = state.rooms.lock().await;
+    match mgr.room_info(&id) {
+        Some(info) => axum::Json(info).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn party_delete_room(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> StatusCode {
+    let mut mgr = state.rooms.lock().await;
+    if mgr.delete_room(&id) { StatusCode::OK } else { StatusCode::NOT_FOUND }
+}
+
 async fn auto_dj_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -397,6 +439,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())
         .route("/radio/auto", get(auto_dj_handler))
+        .route("/party/rooms", get(party_list_rooms).post(party_create_room))
+        .route("/party/rooms/{id}", get(party_room_info).delete(party_delete_room))
         .nest("/alarms", radios::alarms_router())
         .nest("/search", search::router())
         .nest("/devices", devices::router())
