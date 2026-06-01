@@ -602,6 +602,63 @@ impl StreamingService for DeezerService {
         Ok(Self::collect_data(&data, Self::map_playlist))
     }
 
+    async fn create_playlist(
+        &self,
+        name: &str,
+        _description: Option<&str>,
+    ) -> Result<String, String> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("deezer: not authenticated")?;
+        let user_id = self.user_id.ok_or("deezer: no user_id")?;
+        let url = format!(
+            "{API_BASE}/user/{user_id}/playlists?title={}&access_token={token}",
+            urlencoding::encode(name)
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| format!("deezer create_playlist: {e}"))?;
+        let data: serde_json::Value =
+            resp.json().await.map_err(|e| format!("deezer json: {e}"))?;
+        data["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .ok_or_else(|| format!("deezer: no playlist id in response: {data}"))
+    }
+
+    async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, String> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or("deezer: not authenticated")?;
+        let mut added = 0;
+        for chunk in track_ids.chunks(100) {
+            let songs = chunk.join(",");
+            let url = format!(
+                "{API_BASE}/playlist/{playlist_id}/tracks?songs={songs}&access_token={token}"
+            );
+            self.client
+                .post(&url)
+                .send()
+                .await
+                .map_err(|e| format!("deezer add_tracks: {e}"))?;
+            added += chunk.len();
+        }
+        Ok(added)
+    }
+
+    fn supports_write(&self) -> bool {
+        self.access_token.is_some() && self.user_id.is_some()
+    }
+
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         self.access_token
             .as_ref()
@@ -1050,5 +1107,15 @@ mod tests {
         let mut svc = DeezerService::new();
         let tokens = json!({"nothing": "here"});
         assert!(!svc.restore_tokens(&tokens));
+    }
+
+    #[test]
+    fn deezer_supports_write() {
+        let mut svc = DeezerService::new();
+        assert!(!svc.supports_write());
+        svc.access_token = Some("token".into());
+        assert!(!svc.supports_write()); // need user_id too
+        svc.user_id = Some(12345);
+        assert!(svc.supports_write());
     }
 }

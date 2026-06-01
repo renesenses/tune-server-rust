@@ -658,6 +658,47 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
+    async fn create_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<String, String> {
+        let desc = description.unwrap_or("Created by Tune");
+        let resp = self
+            .api_post(
+                "/playlist/create",
+                &[("name", name), ("description", desc), ("is_public", "false")],
+            )
+            .await?;
+        resp["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .or_else(|| resp["id"].as_str().map(|s| s.to_string()))
+            .ok_or_else(|| "qobuz: no playlist id in response".into())
+    }
+
+    async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, String> {
+        let mut added = 0;
+        for chunk in track_ids.chunks(50) {
+            let ids_csv = chunk.join(",");
+            self.api_post(
+                "/playlist/addTracks",
+                &[("playlist_id", playlist_id), ("track_ids", &ids_csv)],
+            )
+            .await?;
+            added += chunk.len();
+        }
+        Ok(added)
+    }
+
+    fn supports_write(&self) -> bool {
+        self.user_auth_token.is_some()
+    }
+
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
         let data = self
             .api_get(
@@ -1020,5 +1061,13 @@ mod tests {
         // MD5 of empty string is d41d8cd98f00b204e9800998ecf8427e
         let result = md5_hex("");
         assert_eq!(result, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn qobuz_supports_write() {
+        let mut svc = QobuzService::new("app_id".into(), "secret".into());
+        assert!(!svc.supports_write());
+        svc.user_auth_token = Some("token".into());
+        assert!(svc.supports_write());
     }
 }

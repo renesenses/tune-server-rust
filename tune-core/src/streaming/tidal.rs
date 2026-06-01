@@ -1562,4 +1562,12 @@ mod tests {
         svc.set_enabled(true);
         assert!(svc.enabled());
     }
+
+    #[test]
+    fn tidal_supports_write() {
+        let mut svc = TidalService::new();
+        assert!(!svc.supports_write());
+        svc.user_id = Some(12345);
+        assert!(svc.supports_write());
+    }
 }

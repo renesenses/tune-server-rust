@@ -936,7 +936,34 @@ mod tests {
     fn base64url_encode_known() {
         let data = b"Hello";
         let result = base64url_encode(data);
-        // Standard base64 is "SGVsbG8=" but base64url has no padding and uses -_ instead of +/
         assert_eq!(result, "SGVsbG8");
+    }
+
+    #[test]
+    fn spotify_save_restore_user_id() {
+        let mut svc = SpotifyService::new();
+        svc.access_token = Some("token".into());
+        svc.user_id = Some("user123".into());
+        svc.username = Some("Display Name".into());
+
+        let tokens = svc.save_tokens().unwrap();
+        assert_eq!(tokens["user_id"], "user123");
+
+        let mut svc2 = SpotifyService::new();
+        assert!(svc2.restore_tokens(&tokens));
+        assert_eq!(svc2.user_id.as_deref(), Some("user123"));
+        assert!(svc2.supports_write());
+    }
+
+    #[test]
+    fn spotify_supports_write_requires_both() {
+        let mut svc = SpotifyService::new();
+        assert!(!svc.supports_write());
+
+        svc.access_token = Some("token".into());
+        assert!(!svc.supports_write());
+
+        svc.user_id = Some("user123".into());
+        assert!(svc.supports_write());
     }
 }
