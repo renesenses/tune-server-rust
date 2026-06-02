@@ -211,8 +211,8 @@ impl PlaybackOrchestrator {
             let src_fmt = source_format.unwrap(); // safe: needs_transcode is true
             let target_fmt = src_fmt.dlna_transcode_target();
             let out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
-            let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
-                24
+            let out_bd: u16 = if src_fmt == AudioFormat::Dsd || oaat_needs_wav {
+                24 // OAAT DACs typically require 24/32-bit; DSD transcodes to 24-bit
             } else {
                 bit_depth.max(16)
             };
