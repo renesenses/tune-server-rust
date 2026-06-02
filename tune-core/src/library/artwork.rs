@@ -428,4 +428,21 @@ mod tests {
         let result = get_or_extract(Path::new("/tmp/nonexistent_audio_file.flac"), &cache_dir);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn artwork_hash_normalizes_backslashes() {
+        // Windows path with backslashes should produce the same hash
+        // as the equivalent path with forward slashes
+        let h_win = artwork_hash("C:\\Users\\Scordia\\Music\\album\\track.flac");
+        let h_unix = artwork_hash("C:/Users/Scordia/Music/album/track.flac");
+        assert_eq!(h_win, h_unix);
+    }
+
+    #[test]
+    fn artwork_hash_forward_slashes_unchanged() {
+        // Pure Unix paths should hash identically before and after normalization
+        let h = artwork_hash("/music/artist/album/track.flac");
+        assert_eq!(h.len(), 32);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

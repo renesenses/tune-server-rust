@@ -126,6 +126,26 @@ async fn main() {
 
     info!(%addr, "listening");
 
+    // Open browser after listener is bound (server is ready to accept connections).
+    // Only when TUNE_OPEN_BROWSER=1 — set by launcher scripts (start-tune-server.bat/.command).
+    if std::env::var("TUNE_OPEN_BROWSER").ok().as_deref() == Some("1") {
+        let port = config.port;
+        tokio::spawn(async move {
+            // Small grace period so axum::serve is fully running before the browser connects
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let url = format!("http://localhost:{port}");
+            info!(url = %url, "opening_browser");
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", &url])
+                .spawn();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        });
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

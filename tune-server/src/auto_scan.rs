@@ -189,9 +189,8 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
             }),
         );
 
-        let cache_dir = std::env::var("TUNE_ARTWORK_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("artwork_cache"));
+        let cache_dir = crate::routes::library::artwork_cache_dir();
+        info!(cache_dir = %cache_dir.display(), "artwork_cache_dir_resolved");
         let mut albums_with_cover: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
         let mut inserted = 0u64;
@@ -342,11 +341,7 @@ pub fn spawn_file_watcher(db: SqliteDb) {
                                     };
 
                                     if let Some(aid) = album_id {
-                                        let cache_dir = std::env::var("TUNE_ARTWORK_DIR")
-                                            .map(std::path::PathBuf::from)
-                                            .unwrap_or_else(|_| {
-                                                std::path::PathBuf::from("artwork_cache")
-                                            });
+                                        let cache_dir = crate::routes::library::artwork_cache_dir();
                                         if let Some(hash) = tune_core::artwork::get_or_extract(
                                             std::path::Path::new(&sf.path),
                                             &cache_dir,

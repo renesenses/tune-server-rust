@@ -101,8 +101,22 @@ pub(super) fn now_iso_utc() -> String {
 }
 
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
-    let dir = std::env::var("TUNE_ARTWORK_DIR").unwrap_or_else(|_| "artwork_cache".into());
-    std::path::PathBuf::from(dir)
+    if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
+        return std::path::PathBuf::from(v);
+    }
+
+    // On Windows, resolve relative artwork_cache to %LOCALAPPDATA%\TuneServer\
+    // to avoid writing into read-only Program Files or an unpredictable CWD.
+    #[cfg(target_os = "windows")]
+    {
+        let data_dir = std::env::var("LOCALAPPDATA")
+            .map(|d| format!("{d}\\TuneServer"))
+            .unwrap_or_else(|_| "TuneServer".into());
+        return std::path::PathBuf::from(format!("{data_dir}\\artwork_cache"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    std::path::PathBuf::from("artwork_cache")
 }
 
 pub fn router() -> Router<AppState> {
