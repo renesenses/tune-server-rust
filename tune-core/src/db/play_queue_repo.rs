@@ -41,6 +41,26 @@ impl PlayQueueRepo {
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        if !items.is_empty() {
+            return Ok(items);
+        }
+        drop(stmt);
+        drop(conn);
+
+        // WAL visibility: the read-only connection may not yet see recently
+        // committed rows.  Fall back to the write connection which always has
+        // an up-to-date view of its own commits.
+        let wconn = self.db.connection().lock().unwrap();
+        let mut wstmt = wconn
+            .prepare(&format!(
+                "{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"
+            ))
+            .map_err(|e| e.to_string())?;
+        let items = wstmt
+            .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(items)
     }
 
@@ -240,12 +260,27 @@ impl PlayQueueRepo {
 
     pub fn count(&self, zone_id: i64) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
-            params![zone_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
+                params![zone_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            return Ok(n);
+        }
+        drop(conn);
+
+        // WAL fallback: read connection may lag behind the write connection
+        let wconn = self.db.connection().lock().unwrap();
+        wconn
+            .query_row(
+                "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
+                params![zone_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
     }
 }
 

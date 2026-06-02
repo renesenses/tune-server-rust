@@ -10,6 +10,7 @@ const SOAP_MAX_RETRIES: usize = 2;
 pub struct DlnaOutput {
     name: String,
     device_id: String,
+    host: String,
     av_transport_url: String,
     rendering_control_url: String,
     client: Client,
@@ -20,13 +21,14 @@ impl DlnaOutput {
     pub fn new(
         name: String,
         device_id: String,
-        _host: String,
+        host: String,
         av_transport_url: String,
         rendering_control_url: String,
     ) -> Self {
         Self {
             name,
             device_id,
+            host,
             av_transport_url,
             rendering_control_url,
             client: Client::builder()
@@ -203,6 +205,10 @@ impl OutputTarget for DlnaOutput {
 
     fn output_type(&self) -> &str {
         "dlna"
+    }
+
+    fn host(&self) -> Option<&str> {
+        Some(&self.host)
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

@@ -40,7 +40,10 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
 
     let outputs = state.outputs.lock().await;
     let registered_ids: std::collections::HashSet<String> = outputs.list().into_iter().collect();
-    let all_output_status = outputs.status_all().await;
+    // Use info_all() instead of status_all() to avoid sequential is_available() probes
+    // that can block for seconds per unreachable DLNA device, causing the entire
+    // endpoint to time out and return 0 DLNA devices.
+    let all_output_info = outputs.info_all().await;
     drop(outputs);
 
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -59,11 +62,15 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
         })
         .collect();
 
-    for output_info in &all_output_status {
+    // Add any registered outputs not already present from SSDP discovery.
+    // This ensures DLNA/OpenHome devices appear even when the SSDP scanner's
+    // internal device list is empty (e.g., between scan cycles or after restart).
+    for output_info in &all_output_info {
         if let Some(device_id) = output_info.get("device_id").and_then(|v| v.as_str()) {
             if seen_ids.contains(device_id) {
                 continue;
             }
+            seen_ids.insert(device_id.to_string());
             let name = output_info
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -72,10 +79,6 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let available = output_info
-                .get("available")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             let host = output_info
                 .get("host")
                 .and_then(|v| v.as_str())
@@ -86,7 +89,7 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
                 "type": output_type,
                 "host": host,
                 "port": 0,
-                "available": available,
+                "available": true,
                 "registered": true,
             }));
         }

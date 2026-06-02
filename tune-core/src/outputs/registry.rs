@@ -60,4 +60,26 @@ impl OutputRegistry {
         }
         results
     }
+
+    /// Return basic info for every registered output without calling `is_available()`.
+    /// This avoids sequential HTTP probes that can block for seconds per device.
+    pub async fn info_all(&self) -> Vec<serde_json::Value> {
+        let mut results = Vec::new();
+        for (id, output) in &self.outputs {
+            let output = output.lock().await;
+            let mut entry = serde_json::json!({
+                "device_id": id,
+                "name": output.name(),
+                "type": output.output_type(),
+            });
+            if let Some(host) = output.host() {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("host".into(), serde_json::json!(host));
+            }
+            results.push(entry);
+        }
+        results
+    }
 }

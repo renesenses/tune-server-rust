@@ -629,13 +629,21 @@ async fn queue_add(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueAddRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
     match queue_repo.add_tracks(zone_id, &body.track_ids, body.position) {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(json!({ "added": body.track_ids.len() })),
-        )
-            .into_response(),
+        Ok(_) => {
+            let new_length = queue_repo.count(zone_id).unwrap_or(0);
+            let current_pos = state.playback.get_state(zone_id).await.queue_position;
+            state
+                .playback
+                .update_queue_info(zone_id, current_pos, new_length)
+                .await;
+            (
+                StatusCode::CREATED,
+                Json(json!({ "added": body.track_ids.len(), "queue_length": new_length })),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

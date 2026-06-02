@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 lofty = { workspace = true }
+id3 = { workspace = true }
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
