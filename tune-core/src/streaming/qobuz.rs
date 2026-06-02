@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::traits::*;
 
@@ -94,6 +94,61 @@ impl QobuzService {
         }
 
         resp.json().await.map_err(|e| format!("qobuz json: {e}"))
+    }
+
+    /// Fetch all pages from a paginated Qobuz endpoint.
+    ///
+    /// `path` / `base_params` define the request. `items_key` is the top-level
+    /// JSON key that wraps the `items` array (e.g. "tracks", "albums", "artists").
+    /// The Qobuz API caps each page at 50 items regardless of the requested limit.
+    async fn api_get_all_pages(
+        &self,
+        path: &str,
+        base_params: &[(&str, &str)],
+        items_key: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        const PAGE_SIZE: usize = 50;
+        let mut all_items: Vec<serde_json::Value> = Vec::new();
+        let mut offset: usize = 0;
+
+        loop {
+            let offset_str = offset.to_string();
+            let limit_str = PAGE_SIZE.to_string();
+            let mut params: Vec<(&str, &str)> = base_params.to_vec();
+            params.push(("limit", &limit_str));
+            params.push(("offset", &offset_str));
+
+            let data = self.api_get(path, &params).await?;
+
+            let items = data[items_key]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            let count = items.len();
+            all_items.extend(items);
+
+            let total = data[items_key]["total"].as_u64().unwrap_or(0) as usize;
+
+            debug!(
+                path,
+                items_key,
+                offset,
+                count,
+                total,
+                accumulated = all_items.len(),
+                "qobuz_paginate"
+            );
+
+            offset += count;
+
+            // Stop when we got fewer items than a full page, or we've reached the total
+            if count < PAGE_SIZE || offset >= total {
+                break;
+            }
+        }
+
+        Ok(all_items)
     }
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
@@ -563,17 +618,14 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
-        let data = self
-            .api_get(
+        let items = self
+            .api_get_all_pages(
                 "/favorite/getUserFavorites",
-                &[("type", "tracks"), ("limit", "500")],
+                &[("type", "tracks")],
+                "tracks",
             )
             .await?;
-        let tracks = data["tracks"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        Ok(tracks)
+        Ok(items.iter().map(Self::map_track).collect())
     }
 
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
@@ -704,31 +756,25 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
-        let data = self
-            .api_get(
+        let items = self
+            .api_get_all_pages(
                 "/favorite/getUserFavorites",
-                &[("type", "albums"), ("limit", "500")],
+                &[("type", "albums")],
+                "albums",
             )
             .await?;
-        let albums = data["albums"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_album).collect())
-            .unwrap_or_default();
-        Ok(albums)
+        Ok(items.iter().map(Self::map_album).collect())
     }
 
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
-        let data = self
-            .api_get(
+        let items = self
+            .api_get_all_pages(
                 "/favorite/getUserFavorites",
-                &[("type", "artists"), ("limit", "500")],
+                &[("type", "artists")],
+                "artists",
             )
             .await?;
-        let artists = data["artists"]["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_artist).collect())
-            .unwrap_or_default();
-        Ok(artists)
+        Ok(items.iter().map(Self::map_artist).collect())
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, String> {
