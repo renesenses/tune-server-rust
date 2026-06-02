@@ -3,7 +3,26 @@
 **Axe 6 de la roadmap v0.9.0**
 **Effort total estimé** : 14 jours-homme
 **Priorité** : P1
-**Statut** : Draft (2026-06-02)
+**Statut** : Phase 1 + portage partiel des repos en cours sur `feature/postgres-support` (2026-06-02)
+
+## Progrès
+
+### Fait
+- Phase 1 abstraction : `Engine` + `SqlDialect` (SQLite / Postgres impls) + `PostgresDb` skeleton (sqlx pool) + workflow CI `test-postgres.yml`
+- Wiring : feature `postgres = ["dep:sqlx"]`, `SqliteDb::dialect()` / `engine()`
+- **11 repos sur 14 portés** vers le `SqlDialect` (placeholders + LOWER au lieu de COLLATE NOCASE + ON CONFLICT DO NOTHING portable au lieu de INSERT OR IGNORE) :
+  - settings_repo, profile_repo, rating_repo, tag_repo, radio_repo
+  - source_link_repo, play_queue_repo, history_repo (partiel : full_dashboard reporté)
+  - zone_repo, artist_repo, playlist_repo
+- 909 tests `tune-core` verts, dont ~20 tests dialecte explicites (SQLite `?` + Postgres `$1, $2, ...`)
+
+### Reste
+- album_repo (~1054 LOC, 1 session dédiée)
+- track_repo (~1124 LOC, 1 session dédiée)
+- full_text_search.rs (~214 LOC, FTS5 → tsvector — phase 4 helper requis)
+- Backend Postgres réellement utilisé end-to-end (PgPool dans AppState, migrations PG, repos pluggables)
+- Outil CLI `tune-cli db migrate-to-postgres`
+- Endpoints REST `/system/database/migrate` réellement implémentés
 
 ---
 
