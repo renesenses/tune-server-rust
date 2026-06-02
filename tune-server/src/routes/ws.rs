@@ -66,7 +66,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         tracing::warn!("WebSocket playback broadcast lagged, skipped {n} messages");
                         continue;
                     }
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("WebSocket broadcast closed, resubscribing");
+                        rx = state.playback.subscribe();
+                        continue;
+                    }
                 }
             }
             event = event_rx.recv() => {
@@ -96,7 +100,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         tracing::warn!("WebSocket event_bus broadcast lagged, skipped {n} messages");
                         continue;
                     }
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("WebSocket event_bus broadcast closed, resubscribing");
+                        event_rx = state.event_bus.subscribe();
+                        continue;
+                    }
                 }
             }
             _ = ping_interval.tick() => {
