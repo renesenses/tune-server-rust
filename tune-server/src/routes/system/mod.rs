@@ -44,6 +44,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/music-dirs/add", post(config::add_music_dir))
         .route("/music-dirs/remove", post(config::remove_music_dir))
+        .route("/browse-dirs", get(config::browse_dirs))
         .route("/env", get(config::get_env))
         .route("/diagnostics", get(diagnostics::diagnostics))
         .route("/cleanup", post(enrich::cleanup))

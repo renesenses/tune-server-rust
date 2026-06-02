@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -262,6 +262,87 @@ pub(super) async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
 pub(super) async fn get_music_dirs(State(state): State<AppState>) -> Json<Value> {
     let dirs = super::get_music_dirs_list(&state.db);
     Json(json!({ "dirs": dirs }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct BrowseDirsQuery {
+    path: Option<String>,
+}
+
+pub(super) async fn browse_dirs(Query(q): Query<BrowseDirsQuery>) -> Json<Value> {
+    let base = q.path.unwrap_or_else(|| {
+        if cfg!(target_os = "windows") {
+            "C:\\".into()
+        } else {
+            "/".into()
+        }
+    });
+
+    let base_path = std::path::Path::new(&base);
+    if !base_path.exists() || !base_path.is_dir() {
+        return Json(
+            json!({ "dirs": [], "parent": null, "current": base, "error": "not a directory" }),
+        );
+    }
+
+    let parent = base_path.parent().map(|p| p.to_string_lossy().to_string());
+
+    let mut dirs: Vec<Value> = Vec::new();
+
+    // On Windows, list drives when at root
+    #[cfg(target_os = "windows")]
+    if base == "C:\\" || base == "\\" || base == "/" {
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:\\", letter as char);
+            if std::path::Path::new(&drive).exists() {
+                dirs.push(json!({
+                    "name": format!("{} Drive", letter as char),
+                    "path": drive,
+                    "has_children": true,
+                }));
+            }
+        }
+        return Json(json!({ "dirs": dirs, "parent": null, "current": base }));
+    }
+
+    if let Ok(entries) = std::fs::read_dir(base_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip hidden dirs and system dirs
+            if name.starts_with('.')
+                || name == "$RECYCLE.BIN"
+                || name == "System Volume Information"
+            {
+                continue;
+            }
+            let has_children = std::fs::read_dir(&path)
+                .map(|mut rd| rd.any(|e| e.is_ok_and(|e| e.path().is_dir())))
+                .unwrap_or(false);
+            dirs.push(json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "has_children": has_children,
+            }));
+        }
+    }
+
+    dirs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+    });
+
+    Json(json!({
+        "dirs": dirs,
+        "parent": parent,
+        "current": base_path.to_string_lossy(),
+    }))
 }
 
 #[derive(Deserialize)]
