@@ -55,15 +55,26 @@ impl ZoneRepo {
         output_type: Option<&str>,
         output_device_id: Option<&str>,
     ) -> Result<i64, String> {
-        self.db.execute(
-            "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
-            &[
-                &name as &dyn rusqlite::types::ToSql,
-                &output_type,
-                &output_device_id,
-            ],
-        )?;
-        Ok(self.db.last_insert_rowid())
+        // Use a single connection lock so INSERT + last_insert_rowid are atomic.
+        // If a scan transaction is open on the write connection, the INSERT would
+        // be invisible to the read connection until the scan commits — causing
+        // GET /zones to return [] even though the zone was created.
+        // Detect this case and force-commit so the zone is immediately visible.
+        self.db.write(|conn| {
+            let was_autocommit = conn.is_autocommit();
+            conn.execute(
+                "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
+                rusqlite::params![name, output_type, output_device_id],
+            )?;
+            let id = conn.last_insert_rowid();
+            if !was_autocommit {
+                // We're inside another transaction (e.g. library scan).
+                // Force-commit so the zone is immediately visible to the read connection.
+                // The scan will start a new transaction for its next batch.
+                conn.execute_batch("COMMIT")?;
+            }
+            Ok(id)
+        })
     }
 
     pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
@@ -348,5 +359,33 @@ mod tests {
         assert_eq!(zones[0].name, "Bureau");
         assert_eq!(zones[1].name, "Chambre");
         assert_eq!(zones[2].name, "Salon");
+    }
+
+    #[test]
+    fn create_zone_during_open_transaction() {
+        // Simulate the bug: a scan holds BEGIN IMMEDIATE on the write connection,
+        // then zone create is called. The zone must be visible via list() immediately.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = SqliteDb::open(path.to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        // Simulate scan starting a transaction
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // Zone creation during the scan — should force-commit
+        let repo = ZoneRepo::new(db.clone());
+        let id = repo
+            .create("Living Room", Some("dlna"), Some("uuid:123"))
+            .unwrap();
+        assert!(id > 0);
+
+        // Zone must be visible via the read connection immediately
+        let zones = repo.list().unwrap();
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].name, "Living Room");
+
+        // The scan's subsequent COMMIT should not panic (no-op or error is fine)
+        let _ = db.execute_batch("COMMIT");
     }
 }
