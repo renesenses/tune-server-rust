@@ -2,21 +2,41 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
+/// Candidate filenames for folder-level cover art.
+///
+/// On case-insensitive filesystems (NTFS, APFS) duplicates are harmless.
+/// On case-sensitive mounts (some NAS/SMB) we need several variants.
 const FOLDER_COVER_NAMES: &[&str] = &[
     "cover.jpg",
+    "cover.jpeg",
     "cover.png",
     "folder.jpg",
+    "folder.jpeg",
     "folder.png",
     "front.jpg",
+    "front.jpeg",
     "front.png",
     "album.jpg",
+    "album.jpeg",
     "album.png",
     "Cover.jpg",
+    "Cover.jpeg",
     "Cover.png",
     "Folder.jpg",
+    "Folder.jpeg",
     "Folder.png",
     "Front.jpg",
+    "Front.jpeg",
     "Front.png",
+    "COVER.JPG",
+    "COVER.JPEG",
+    "COVER.PNG",
+    "FOLDER.JPG",
+    "FOLDER.JPEG",
+    "FOLDER.PNG",
+    "FRONT.JPG",
+    "FRONT.JPEG",
+    "FRONT.PNG",
 ];
 
 const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
@@ -24,7 +44,17 @@ const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    let tagged = lofty::read_from_path(audio_path).ok()?;
+    let tagged = match lofty::read_from_path(audio_path) {
+        Ok(t) => t,
+        Err(e) => {
+            debug!(
+                path = %audio_path.display(),
+                error = %e,
+                "artwork_lofty_read_failed"
+            );
+            return None;
+        }
+    };
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     let pic = tag.pictures().first()?;
 
@@ -50,17 +80,39 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
 }
 
 pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
-    std::fs::create_dir_all(cache_dir).ok()?;
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        warn!(
+            dir = %cache_dir.display(),
+            error = %e,
+            "artwork_cache_dir_create_failed — check directory permissions"
+        );
+        return None;
+    }
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
-    std::fs::write(&path, data).ok()?;
+    if let Err(e) = std::fs::write(&path, data) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            size = data.len(),
+            "artwork_cache_write_failed — check directory permissions"
+        );
+        return None;
+    }
     Some(path)
 }
 
+/// Compute a deterministic hash for an artwork cache key.
+///
+/// On Windows, backslashes are normalized to forward slashes so that the
+/// same audio file always produces the same hash regardless of how the
+/// path was constructed (e.g. `C:\Music\a.flac` and `C:/Music/a.flac`
+/// yield the same hash).
 pub fn artwork_hash(file_path: &str) -> String {
     use md5::{Digest, Md5};
+    let normalized = file_path.replace('\\', "/");
     let mut hasher = Md5::new();
-    hasher.update(file_path.as_bytes());
+    hasher.update(normalized.as_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -234,6 +286,7 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 
+    // Check if already cached
     let cached_jpg = cache_dir.join(format!("{hash}.jpg"));
     let cached_png = cache_dir.join(format!("{hash}.png"));
     if cached_jpg.exists() {
@@ -243,21 +296,49 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
         return Some(hash);
     }
 
+    // Try embedded cover art from the audio file tags
     if let Some((data, mime)) = extract_cover_art(audio_path) {
         let ext = if mime.contains("png") { "png" } else { "jpg" };
-        save_to_cache(&data, cache_dir, &hash, ext);
-        return Some(hash);
+        if save_to_cache(&data, cache_dir, &hash, ext).is_some() {
+            return Some(hash);
+        }
+        warn!(
+            path = %audio_path.display(),
+            cache_dir = %cache_dir.display(),
+            "artwork_extracted_but_save_failed"
+        );
+        return None;
     }
 
-    if let Some(folder_cover) = find_folder_cover(audio_path)
-        && let Ok(data) = std::fs::read(&folder_cover)
-    {
-        let ext = folder_cover
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("jpg");
-        save_to_cache(&data, cache_dir, &hash, ext);
-        return Some(hash);
+    // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.)
+    if let Some(folder_cover) = find_folder_cover(audio_path) {
+        match std::fs::read(&folder_cover) {
+            Ok(data) => {
+                let ext = folder_cover
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                if save_to_cache(&data, cache_dir, &hash, ext).is_some() {
+                    debug!(
+                        folder_cover = %folder_cover.display(),
+                        "artwork_from_folder_cover"
+                    );
+                    return Some(hash);
+                }
+                warn!(
+                    path = %folder_cover.display(),
+                    cache_dir = %cache_dir.display(),
+                    "folder_cover_read_but_save_failed"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    path = %folder_cover.display(),
+                    error = %e,
+                    "folder_cover_read_failed"
+                );
+            }
+        }
     }
 
     None

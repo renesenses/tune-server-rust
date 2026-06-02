@@ -54,8 +54,8 @@ opt-level = 0
 debug = 0
 
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 2
+lto = "thin"
 strip = true
-codegen-units = 1
+codegen-units = 4
 panic = "abort"
