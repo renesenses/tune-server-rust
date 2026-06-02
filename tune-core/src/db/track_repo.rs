@@ -381,6 +381,46 @@ impl TrackRepo {
         Ok(map)
     }
 
+    /// Returns the set of `(audio_hash, album_id)` pairs for all local tracks.
+    /// Used by the scanner to skip duplicate files (same content in the same album)
+    /// that are reachable via different paths (e.g. NFS mount + local path).
+    pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT audio_hash, album_id FROM tracks \
+                 WHERE source = 'local' AND audio_hash IS NOT NULL AND album_id IS NOT NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let set = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        Ok(set)
+    }
+
+    /// Check whether a track with the given `audio_hash` already exists in the given album.
+    pub fn exists_by_audio_hash_and_album(
+        &self,
+        audio_hash: &str,
+        album_id: i64,
+    ) -> Result<bool, String> {
+        let conn = self.db.read_connection().lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE audio_hash = ? AND album_id = ?",
+                params![audio_hash, album_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    }
+
     pub fn update_mtime_and_size(
         &self,
         file_path: &str,
@@ -1010,5 +1050,75 @@ mod tests {
         assert_eq!(fetched.genre.as_deref(), Some("Jazz"));
         assert_eq!(fetched.composer.as_deref(), Some("Miles Davis"));
         assert_eq!(fetched.label.as_deref(), Some("Columbia"));
+    }
+
+    #[test]
+    fn get_existing_audio_hash_album_pairs() {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let alid = album_repo
+            .create(&crate::db::models::Album::new("Album A".into()))
+            .unwrap();
+
+        let mut t1 = Track::new("Track 1".into());
+        t1.file_path = Some("/a/track1.flac".into());
+        t1.audio_hash = Some("hash_aaa".into());
+        t1.album_id = Some(alid);
+        repo.create(&t1).unwrap();
+
+        // Same hash, same album (duplicate via different path)
+        let mut t2 = Track::new("Track 1 dup".into());
+        t2.file_path = Some("/b/track1.flac".into());
+        t2.audio_hash = Some("hash_aaa".into());
+        t2.album_id = Some(alid);
+        repo.create(&t2).unwrap();
+
+        // No audio_hash - should not appear
+        let mut t3 = Track::new("Track 2".into());
+        t3.file_path = Some("/a/track2.flac".into());
+        t3.album_id = Some(alid);
+        repo.create(&t3).unwrap();
+
+        let pairs = repo.get_existing_audio_hash_album_pairs().unwrap();
+        // hash_aaa + alid appears (deduplicated in the set)
+        assert!(pairs.contains(&("hash_aaa".to_string(), alid)));
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn exists_by_audio_hash_and_album() {
+        let db = test_db();
+        let album_repo = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db);
+
+        let alid1 = album_repo
+            .create(&crate::db::models::Album::new("Album 1".into()))
+            .unwrap();
+        let alid2 = album_repo
+            .create(&crate::db::models::Album::new("Album 2".into()))
+            .unwrap();
+
+        let mut t = Track::new("Track".into());
+        t.file_path = Some("/x.flac".into());
+        t.audio_hash = Some("hash_xyz".into());
+        t.album_id = Some(alid1);
+        repo.create(&t).unwrap();
+
+        assert!(
+            repo.exists_by_audio_hash_and_album("hash_xyz", alid1)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .exists_by_audio_hash_and_album("hash_xyz", alid2)
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .exists_by_audio_hash_and_album("nonexistent", alid1)
+                .unwrap()
+        );
     }
 }

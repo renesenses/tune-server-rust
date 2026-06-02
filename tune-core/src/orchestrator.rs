@@ -218,7 +218,7 @@ impl PlaybackOrchestrator {
             let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
                 24
             } else if oaat_needs_wav {
-                bit_depth.max(16).min(32)
+                16 // temporary: 16-bit until endpoint clamp fix is deployed
             } else {
                 bit_depth.max(16)
             };

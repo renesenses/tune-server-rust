@@ -147,6 +147,9 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
         let album_repo = AlbumRepo::new(db.clone());
 
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
+        let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
+            .get_existing_audio_hash_album_pairs()
+            .unwrap_or_default();
 
         let files_to_scan: Vec<std::path::PathBuf> = files
             .into_iter()
@@ -240,6 +243,23 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
                         track.id = Some(existing_id);
                         to_update.push(track);
                         continue;
+                    }
+
+                    // Deduplicate by audio_hash + album_id: if the same content
+                    // already exists in this album (via a different path), skip it.
+                    if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
+                        let key = (hash.clone(), aid);
+                        if known_hashes.contains(&key) {
+                            tracing::debug!(
+                                audio_hash = %hash,
+                                album_id = aid,
+                                path = %sf.path,
+                                "skip_duplicate_audio_hash"
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                        known_hashes.insert(key);
                     }
 
                     to_insert.push(track);
@@ -339,6 +359,22 @@ pub fn spawn_file_watcher(db: SqliteDb) {
                                     else {
                                         continue;
                                     };
+
+                                    // Skip duplicate: same audio content already in this album
+                                    if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
+                                        if track_repo
+                                            .exists_by_audio_hash_and_album(hash, aid)
+                                            .unwrap_or(false)
+                                        {
+                                            tracing::debug!(
+                                                audio_hash = %hash,
+                                                album_id = aid,
+                                                path = %sf.path,
+                                                "watcher_skip_duplicate_audio_hash"
+                                            );
+                                            continue;
+                                        }
+                                    }
 
                                     if let Some(aid) = album_id {
                                         let cache_dir = crate::routes::library::artwork_cache_dir();
