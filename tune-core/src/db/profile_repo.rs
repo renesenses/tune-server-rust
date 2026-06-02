@@ -35,7 +35,7 @@ impl ProfileRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Profile>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT id, username, display_name, avatar_path, is_admin, created_at FROM profiles WHERE id = ?",
             params![id],
@@ -46,7 +46,7 @@ impl ProfileRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Profile>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, username, display_name, avatar_path, is_admin, created_at FROM profiles ORDER BY id")
             .map_err(|e| e.to_string())?;
@@ -128,7 +128,7 @@ impl ProfileRepo {
         item_type: &str,
         item_id: i64,
     ) -> Result<bool, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let count: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM favorites WHERE profile_id = ? AND item_type = ? AND item_id = ?",
@@ -144,7 +144,7 @@ impl ProfileRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<Favorite>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) =
             item_type
         {

@@ -25,7 +25,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE")
             .map_err(|e| e.to_string())?;
@@ -37,7 +37,7 @@ impl ArtistRepo {
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?")
             .map_err(|e| e.to_string())?;
@@ -64,26 +64,49 @@ impl ArtistRepo {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// Look up or create an artist, using the write connection for the entire
+    /// read-then-write sequence. This ensures that during a scan transaction
+    /// (BEGIN IMMEDIATE), the lookup sees artists created earlier in the same
+    /// batch, preventing duplicates.
     pub fn get_or_create(
         &self,
         name: &str,
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, String> {
-        if let Some(mbid) = musicbrainz_id
-            && let Some(artist) = self.get_by_musicbrainz_id(mbid)?
-        {
-            return Ok(artist);
-        }
-        if let Some(artist) = self.get_by_name(name)? {
-            return Ok(artist);
-        }
-        let mut artist = Artist::new(name.to_string());
-        artist.sort_name = sort_name.map(|s| s.to_string());
-        artist.musicbrainz_id = musicbrainz_id.map(|s| s.to_string());
-        let id = self.create(&artist)?;
-        artist.id = Some(id);
-        Ok(artist)
+        self.db.write(|conn| {
+            if let Some(mbid) = musicbrainz_id {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?",
+                )?;
+                if let Some(artist) = stmt.query_row(params![mbid], |row| Ok(row_to_artist(row))).optional()? {
+                    return Ok(artist);
+                }
+            }
+            {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE",
+                )?;
+                if let Some(artist) = stmt.query_row(params![name], |row| Ok(row_to_artist(row))).optional()? {
+                    return Ok(artist);
+                }
+            }
+            conn.execute(
+                "INSERT INTO artists (name, sort_name, musicbrainz_id) VALUES (?, ?, ?)",
+                rusqlite::params![name, sort_name, musicbrainz_id],
+            )?;
+            let id = conn.last_insert_rowid();
+            Ok(Artist {
+                id: Some(id),
+                name: name.to_string(),
+                sort_name: sort_name.map(|s| s.to_string()),
+                musicbrainz_id: musicbrainz_id.map(|s| s.to_string()),
+                discogs_id: None,
+                bio: None,
+                image_path: None,
+                image_source: None,
+            })
+        })
     }
 
     pub fn update(&self, artist: &Artist) -> Result<(), String> {

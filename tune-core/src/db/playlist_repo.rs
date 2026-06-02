@@ -29,7 +29,7 @@ impl PlaylistRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.id = ?")
             .map_err(|e| e.to_string())?;
@@ -46,7 +46,7 @@ impl PlaylistRepo {
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p ORDER BY p.name COLLATE NOCASE LIMIT ? OFFSET ?")
             .map_err(|e| e.to_string())?;
@@ -152,7 +152,7 @@ impl PlaylistRepo {
     }
 
     pub fn get_track_ids(&self, playlist_id: i64) -> Result<Vec<i64>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position")
             .map_err(|e| e.to_string())?;
@@ -186,7 +186,7 @@ impl PlaylistRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM playlists", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }

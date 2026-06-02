@@ -20,7 +20,7 @@ impl TagRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Tag>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, color FROM tags ORDER BY name")
             .map_err(|e| e.to_string())?;
@@ -50,7 +50,7 @@ impl TagRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT id, name, color FROM tags WHERE id = ?",
             params![id],
@@ -88,7 +88,7 @@ impl TagRepo {
     }
 
     pub fn all_items_by_tag(&self, tag_id: i64) -> Result<Vec<(String, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT item_type, item_id FROM item_tags WHERE tag_id = ? ORDER BY item_type, item_id")
             .map_err(|e| e.to_string())?;
@@ -122,7 +122,7 @@ impl TagRepo {
     }
 
     pub fn items_by_tag(&self, tag_id: i64, item_type: &str) -> Result<Vec<i64>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT item_id FROM item_tags WHERE tag_id = ? AND item_type = ? ORDER BY item_id",
@@ -137,7 +137,7 @@ impl TagRepo {
     }
 
     pub fn tags_for_item(&self, item_type: &str, item_id: i64) -> Result<Vec<Tag>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT t.id, t.name, t.color FROM tags t JOIN item_tags it ON t.id = it.tag_id WHERE it.item_type = ? AND it.item_id = ? ORDER BY t.name")
             .map_err(|e| e.to_string())?;

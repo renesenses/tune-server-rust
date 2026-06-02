@@ -12,7 +12,7 @@ impl SettingsRepo {
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT value FROM settings WHERE key = ?",
             params![key],
@@ -37,7 +37,7 @@ impl SettingsRepo {
     }
 
     pub fn all(&self) -> Result<Vec<(String, String)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM settings ORDER BY key")
             .map_err(|e| e.to_string())?;

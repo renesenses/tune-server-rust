@@ -30,7 +30,7 @@ impl RadioRepo {
     }
 
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE id = ?")
             .map_err(|e| e.to_string())?;
@@ -40,7 +40,7 @@ impl RadioRepo {
     }
 
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations ORDER BY is_favorite DESC, name COLLATE NOCASE")
             .map_err(|e| e.to_string())?;
@@ -53,7 +53,7 @@ impl RadioRepo {
     }
 
     pub fn favorites(&self) -> Result<Vec<RadioStation>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE is_favorite = 1 ORDER BY name COLLATE NOCASE")
             .map_err(|e| e.to_string())?;
@@ -108,7 +108,7 @@ impl RadioRepo {
 
     pub fn search(&self, query: &str) -> Result<Vec<RadioStation>, String> {
         let like = format!("%{query}%");
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE name LIKE ? OR genre LIKE ? OR country LIKE ? ORDER BY is_favorite DESC, name COLLATE NOCASE LIMIT 50")
             .map_err(|e| e.to_string())?;
@@ -143,7 +143,7 @@ impl RadioRepo {
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }

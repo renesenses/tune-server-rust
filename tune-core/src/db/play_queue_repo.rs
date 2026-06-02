@@ -30,7 +30,7 @@ impl PlayQueueRepo {
     }
 
     pub fn get_queue(&self, zone_id: i64) -> Result<Vec<QueueItem>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"
@@ -45,7 +45,7 @@ impl PlayQueueRepo {
     }
 
     pub fn get_current(&self, zone_id: i64) -> Result<Option<QueueItem>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_QUEUE} WHERE pq.zone_id = ? AND pq.is_current = 1"
@@ -239,7 +239,7 @@ impl PlayQueueRepo {
     }
 
     pub fn count(&self, zone_id: i64) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
             params![zone_id],

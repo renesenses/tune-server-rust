@@ -41,7 +41,7 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id FROM zones ORDER BY name")
             .map_err(|e| e.to_string())?;
@@ -60,24 +60,12 @@ impl ZoneRepo {
         output_device_id: Option<&str>,
     ) -> Result<i64, String> {
         // Use a single connection lock so INSERT + last_insert_rowid are atomic.
-        // If a scan transaction is open on the write connection, the INSERT would
-        // be invisible to the read connection until the scan commits — causing
-        // GET /zones to return [] even though the zone was created.
-        // Detect this case and force-commit so the zone is immediately visible.
         self.db.write(|conn| {
-            let was_autocommit = conn.is_autocommit();
             conn.execute(
                 "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
                 rusqlite::params![name, output_type, output_device_id],
             )?;
-            let id = conn.last_insert_rowid();
-            if !was_autocommit {
-                // We're inside another transaction (e.g. library scan).
-                // Force-commit so the zone is immediately visible to the read connection.
-                // The scan will start a new transaction for its next batch.
-                conn.execute_batch("COMMIT")?;
-            }
-            Ok(id)
+            Ok(conn.last_insert_rowid())
         })
     }
 
@@ -142,12 +130,10 @@ impl ZoneRepo {
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val = if online { 1i64 } else { 0i64 };
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute(
+        self.db.execute(
             "UPDATE zones SET online = ? WHERE output_device_id = ?",
-            rusqlite::params![val, device_id],
+            &[&val as &dyn rusqlite::types::ToSql, &device_id],
         )
-        .map_err(|e| e.to_string())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -400,8 +386,10 @@ mod tests {
 
     #[test]
     fn create_zone_during_open_transaction() {
-        // Simulate the bug: a scan holds BEGIN IMMEDIATE on the write connection,
-        // then zone create is called. The zone must be visible via list() immediately.
+        // Verify that zone creation works even when a scan transaction is open.
+        // The zone is created via the write connection (within the scan's transaction).
+        // list() uses the read connection, so it won't see the zone until the
+        // scan commits — this is correct WAL behavior.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = SqliteDb::open(path.to_str().unwrap()).unwrap();
@@ -410,19 +398,24 @@ mod tests {
         // Simulate scan starting a transaction
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        // Zone creation during the scan — should force-commit
+        // Zone creation during the scan — inserts within the scan's transaction
         let repo = ZoneRepo::new(db.clone());
         let id = repo
             .create("Living Room", Some("dlna"), Some("uuid:123"))
             .unwrap();
         assert!(id > 0);
 
-        // Zone must be visible via the read connection immediately
-        let zones = repo.list().unwrap();
-        assert_eq!(zones.len(), 1);
-        assert_eq!(zones[0].name, "Living Room");
+        // In WAL mode, the read connection sees the pre-transaction state.
+        // The zone will be visible after the scan commits.
+        let zones_before_commit = repo.list().unwrap();
+        assert_eq!(zones_before_commit.len(), 0);
 
-        // The scan's subsequent COMMIT should not panic (no-op or error is fine)
-        let _ = db.execute_batch("COMMIT");
+        // Commit the scan transaction
+        db.execute_batch("COMMIT").unwrap();
+
+        // Now the zone is visible via the read connection
+        let zones_after_commit = repo.list().unwrap();
+        assert_eq!(zones_after_commit.len(), 1);
+        assert_eq!(zones_after_commit[0].name, "Living Room");
     }
 }

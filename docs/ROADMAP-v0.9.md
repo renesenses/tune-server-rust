@@ -18,8 +18,9 @@ Document de cadrage pour la prochaine release majeure de Tune. Cinq axes priorit
 | 3 | AI assistant intégré | 8j | P2 | Endpoint Anthropic/OpenAI |
 | 4 | Performance 500K+ pistes | 12j | P1 | Refacto FTS5 + scan |
 | 5 | Intégration Mozaiklabs.fr | 6j | P2 | OAuth côté site PHP |
+| 6 | Support PostgreSQL | 14j | P1 | sqlx déjà déclarée, abstraction repo à faire |
 
-**Total estimé** : ~51 jours-homme. Cible release : 2026-09 si on enchaîne sans accroc.
+**Total estimé** : ~65 jours-homme. Cible release : 2026-09 si on enchaîne sans accroc.
 
 ---
 
@@ -191,13 +192,59 @@ Voir `project_tune_plugin_rfc` en mémoire pour le détail technique.
 
 ---
 
+## 6. Support PostgreSQL
+
+> **Plan détaillé** : voir [POSTGRES-PLAN.md](POSTGRES-PLAN.md).
+
+### Scope
+**In** :
+- Abstraction `DbBackend` (trait) au-dessus de `rusqlite` / `sqlx-postgres`
+- Migrations SQL portables (séparation `migrations/sqlite/` et `migrations/postgres/`)
+- Portage des 14 repos vers le trait commun (track, album, artist, playlist, zone, history, rating, tag, profile, radio, settings, queue, source_link, plugin)
+- FTS5 → tsvector + GIN index côté Postgres (full_text_search.rs)
+- Outil CLI `tune-cli db migrate-to-postgres` (export SQLite → import PG, row-by-row, idempotent)
+- Endpoint `POST /system/database/migrate` réellement implémenté (déjà stubbé `tune-server/src/routes/system/database.rs:211`)
+- Tests d'intégration dual-engine en CI (matrix : sqlite + postgres16)
+
+**Out** :
+- Sharding / réplication → out
+- Migration retour PG → SQLite → out
+- Support MySQL / MariaDB → out (jamais demandé)
+
+### Pourquoi maintenant
+- v0.7.x sur .15 prod tournait en PostgreSQL avec le serveur Python — feedback `sqlite_pg_drift` documenté
+- Bibliothèques 500K+ pistes : SQLite reste viable mais Postgres scale mieux sur les écritures concurrentes (recorder, playlists collaboratives, multi-user de l'axe 2)
+- L'axe 2 (multi-user) + axe 5 (intégration Mozaiklabs) impliquent des écritures concurrentes plus nombreuses → meilleur fit Postgres
+
+### Dépendances techniques
+- `sqlx 0.8` déjà déclarée (`Cargo.toml`) avec features `sqlite` + `postgres` — préparation faite
+- Refacto `tune-core/src/db/` : 17 fichiers, ~8000 lignes, 14 repos, 55 statements CREATE en migrations
+- Choix : garder `rusqlite` direct pour SQLite (perf, embedded), `sqlx` pour Postgres
+- Connection pool : `r2d2` (sync, déjà utilisé) ou `bb8` (async sqlx natif)
+
+### Risques
+- **FTS5 vs tsvector** : syntaxe `MATCH` ≠ `@@ to_tsquery()`. Mitigation : adapter le query builder dans `full_text_search.rs`
+- **Transactions imbriquées** : SQLite tolère via SAVEPOINT, Postgres aussi mais avec sémantique différente. Mitigation : audit des `BEGIN/COMMIT` existants, tests dual-engine
+- **JSON columns** : SQLite stocke `TEXT`, Postgres a `JSONB`. Mitigation : type `Json<T>` côté Rust pour les deux
+- **Coût onboarding** : utilisateurs lambda ne veulent pas installer PG. Mitigation : SQLite reste défaut, PG en option pour gros déploiements
+- **Drift entre engines** : risque de bugs spécifiques à un seul engine. Mitigation : CI matrix systématique + suite de tests partagée
+
+### Critères de succès
+- Sur prod .15 : migration SQLite→PG réussie sans perte (22884 tracks transférés, checksum identiques)
+- Perf : P95 endpoints inchangé ±10% entre SQLite et Postgres sur bib 100K
+- Doc utilisateur : guide migration en 5 étapes, < 30 min sur bib 100K
+- CI : matrix dual-engine 100% verte sur 3 derniers tags
+- Aucune régression côté SQLite (la majorité des utilisateurs reste dessus)
+
+---
+
 ## Matrice priorité × effort
 
 ```
 Priorité ↑
    P0  | 1. Plugin SDK
        |
-   P1  | 4. Perf 500K        2. Multi-user
+   P1  | 4. Perf 500K        2. Multi-user      6. PostgreSQL
        |
    P2  | 5. Mozaiklabs       3. AI assistant
        |
@@ -207,10 +254,11 @@ Priorité ↑
 
 **Ordre d'exécution suggéré** :
 1. **Plugin SDK** d'abord (débloque la communauté, archi prête)
-2. **Perf 500K** en parallèle (pas de dépendance entre les deux, équipe split)
-3. **Multi-user** ensuite (prérequis pour Mozaiklabs OAuth)
-4. **Mozaiklabs intégration** (post multi-user)
-5. **AI assistant** en dernier (le plus exploratoire, peut être différé à v0.9.1)
+2. **PostgreSQL** en parallèle de Plugin SDK (équipe split) — chantier indépendant qui débloque axes 2 et 5
+3. **Perf 500K** ensuite (peut tirer parti du PG si dispo, sinon reste sur SQLite)
+4. **Multi-user** ensuite (prérequis pour Mozaiklabs OAuth, bénéficie du PG pour les écritures concurrentes)
+5. **Mozaiklabs intégration** (post multi-user)
+6. **AI assistant** en dernier (le plus exploratoire, peut être différé à v0.9.1)
 
 ---
 
@@ -223,6 +271,8 @@ Repoussé à v1.0 ou ultérieur :
 - Apple Watch app — post v1.0
 - HomePod direct (sans AirPlay routing)
 - Mode offline iPad complet
+- MySQL / MariaDB support (jamais demandé, hors scope)
+- Sharding / réplication Postgres (entreprise → post v1.0)
 
 ---
 

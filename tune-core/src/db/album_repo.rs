@@ -42,7 +42,7 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         // Try exact match with year first
         if let Some(y) = year {
             let mut stmt = conn
@@ -71,7 +71,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? LIMIT 1"))
             .map_err(|e| e.to_string())?;
@@ -81,7 +81,7 @@ impl AlbumRepo {
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"
@@ -110,23 +110,34 @@ impl AlbumRepo {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// Look up or create an album, using the write connection for the entire
+    /// read-then-write sequence. This ensures that during a scan transaction
+    /// (BEGIN IMMEDIATE), the lookup sees albums created earlier in the same
+    /// batch, preventing duplicates.
     pub fn get_or_create(
         &self,
         title: &str,
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Album, String> {
-        if let Some(album) = self.get_by_title_and_artist(title, artist_id, year)? {
-            return Ok(album);
-        }
-        let mut album = Album::new(title.to_string());
-        album.artist_id = Some(artist_id);
-        album.year = year;
-        let id = self.create(&album)?;
-        album.id = Some(id);
-        Ok(album)
+        self.db.write(|conn| {
+            if let Some(album) = lookup_album(conn, title, artist_id, year)? {
+                return Ok(album);
+            }
+            conn.execute(
+                "INSERT INTO albums (title, artist_id, year) VALUES (?, ?, ?)",
+                rusqlite::params![title, artist_id, year],
+            )?;
+            let id = conn.last_insert_rowid();
+            let mut album = Album::new(title.to_string());
+            album.id = Some(id);
+            album.artist_id = Some(artist_id);
+            album.year = year;
+            Ok(album)
+        })
     }
 
+    /// Like `get_or_create` but also checks MusicBrainz release ID first.
     pub fn get_or_create_with_mbid(
         &self,
         title: &str,
@@ -134,21 +145,33 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, String> {
-        if let Some(release_id) = mbid {
-            if let Some(album) = self.get_by_musicbrainz_release_id(release_id)? {
+        self.db.write(|conn| {
+            if let Some(release_id) = mbid {
+                let mut stmt = conn.prepare_cached(
+                    &format!("{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"),
+                )?;
+                if let Some(album) = stmt
+                    .query_row(params![release_id], |row| Ok(row_to_album(row)))
+                    .optional()?
+                {
+                    return Ok(album);
+                }
+            }
+            if let Some(album) = lookup_album(conn, title, artist_id, year)? {
                 return Ok(album);
             }
-        }
-        if let Some(album) = self.get_by_title_and_artist(title, artist_id, year)? {
-            return Ok(album);
-        }
-        let mut album = Album::new(title.to_string());
-        album.artist_id = Some(artist_id);
-        album.year = year;
-        album.musicbrainz_release_id = mbid.map(String::from);
-        let id = self.create(&album)?;
-        album.id = Some(id);
-        Ok(album)
+            conn.execute(
+                "INSERT INTO albums (title, artist_id, year, musicbrainz_release_id) VALUES (?, ?, ?, ?)",
+                rusqlite::params![title, artist_id, year, mbid],
+            )?;
+            let id = conn.last_insert_rowid();
+            let mut album = Album::new(title.to_string());
+            album.id = Some(id);
+            album.artist_id = Some(artist_id);
+            album.year = year;
+            album.musicbrainz_release_id = mbid.map(String::from);
+            Ok(album)
+        })
     }
 
     pub fn update(&self, album: &Album) -> Result<(), String> {
@@ -454,6 +477,32 @@ impl AlbumRepo {
             .map_err(|e| e.to_string())?;
         Ok(albums)
     }
+}
+
+/// Shared lookup logic used by `get_or_create` and `get_or_create_with_mbid`.
+/// Runs on an already-locked write connection to see uncommitted rows.
+fn lookup_album(
+    conn: &rusqlite::Connection,
+    title: &str,
+    artist_id: i64,
+    year: Option<i32>,
+) -> Result<Option<Album>, rusqlite::Error> {
+    if let Some(y) = year {
+        let mut stmt = conn.prepare_cached(&format!(
+            "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"
+        ))?;
+        if let Some(album) = stmt
+            .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
+            .optional()?
+        {
+            return Ok(Some(album));
+        }
+    }
+    let mut stmt = conn.prepare_cached(&format!(
+        "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
+    ))?;
+    stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
+        .optional()
 }
 
 fn row_to_album(row: &rusqlite::Row) -> Album {

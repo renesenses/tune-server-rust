@@ -44,7 +44,7 @@ impl RatingRepo {
         album_id: i64,
         profile_id: i64,
     ) -> Result<Option<AlbumRating>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT id, album_id, profile_id, rating, note, created_at FROM album_ratings WHERE album_id = ? AND profile_id = ?",
             params![album_id, profile_id],
@@ -62,7 +62,7 @@ impl RatingRepo {
     }
 
     pub fn top_rated(&self, limit: i64) -> Result<Vec<(i64, f64, i64)>, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT album_id, AVG(rating) as avg_rating, COUNT(*) as count FROM album_ratings GROUP BY album_id ORDER BY avg_rating DESC LIMIT ?")
             .map_err(|e| e.to_string())?;
