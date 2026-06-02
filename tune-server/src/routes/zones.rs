@@ -54,7 +54,6 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
-        .route("/{id}/sleep", axum::routing::post(sleep_timer))
         .route("/{id}/name", put(rename_zone))
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
