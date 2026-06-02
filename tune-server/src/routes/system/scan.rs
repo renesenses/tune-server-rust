@@ -508,6 +508,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         tracing::info!(
             discovered = total_discovered,
             parsed = scan_stats.total_files,
+            timeout = scan_stats.metadata_timeout,
             inserted,
             updated,
             skipped,
@@ -524,6 +525,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
+                    "metadata_timeout": scan_stats.metadata_timeout,
                     "inserted": inserted,
                     "updated": updated,
                     "skipped": skipped,
@@ -539,6 +541,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 "total_files": total_discovered,
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
+                "metadata_timeout": scan_stats.metadata_timeout,
                 "inserted": inserted,
                 "updated": updated,
                 "skipped": skipped,

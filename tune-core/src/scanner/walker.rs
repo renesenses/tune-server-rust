@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rayon::prelude::*;
 use tracing::{info, warn};
@@ -9,6 +11,11 @@ use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
 use crate::metadata::{TrackMetadata, try_read_metadata};
+
+/// Maximum time allowed for reading metadata + computing hash for a single file.
+/// Files on NAS over a flaky network can hang indefinitely; this prevents the
+/// entire scan from stalling on a single corrupt or unreachable file.
+const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
@@ -77,7 +84,43 @@ pub struct ScanStats {
     pub total_files: usize,
     pub metadata_ok: usize,
     pub metadata_failed: usize,
+    pub metadata_timeout: usize,
     pub hash_ok: usize,
+}
+
+/// Read metadata (and optionally compute hash) for a single file, with a
+/// [`FILE_TIMEOUT`] guard.  If the underlying I/O does not complete in time
+/// the file is skipped and `Err("timeout")` is returned.
+///
+/// We spawn a real OS thread because the metadata/hash reads are blocking I/O
+/// that can hang on NAS mounts — `rayon` tasks must not block indefinitely.
+fn read_file_with_timeout(
+    path: &PathBuf,
+    with_hash: bool,
+) -> Result<(Option<TrackMetadata>, Option<String>), String> {
+    let path = path.clone();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let metadata = match try_read_metadata(&path) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // Send the error string through the channel so the caller
+                // can log it. We still return None for metadata.
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        let hash = if with_hash {
+            compute_audio_hash(&path)
+        } else {
+            None
+        };
+        let _ = tx.send(Ok((metadata, hash)));
+    });
+
+    rx.recv_timeout(FILE_TIMEOUT)
+        .map_err(|_| "timeout".to_string())?
 }
 
 pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
@@ -173,6 +216,7 @@ pub fn scan_files_parallel(
     progress_callback: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
 ) -> (Vec<ScannedFile>, ScanStats) {
     let counter = AtomicUsize::new(0);
+    let timeout_counter = AtomicUsize::new(0);
     let total = files.len();
     let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -196,8 +240,23 @@ pub fn scan_files_parallel(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let metadata = match try_read_metadata(path) {
-                Ok(meta) => Some(meta),
+            let (metadata, audio_hash) = match read_file_with_timeout(path, with_hash) {
+                Ok((meta, hash)) => {
+                    if meta.is_none() {
+                        // try_read_metadata returned an error (already logged
+                        // inside read_file_with_timeout via the Err branch)
+                    }
+                    (meta, hash)
+                }
+                Err(ref reason) if reason == "timeout" => {
+                    warn!(
+                        path = %path_str,
+                        timeout_secs = FILE_TIMEOUT.as_secs(),
+                        "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                    );
+                    timeout_counter.fetch_add(1, Ordering::Relaxed);
+                    (None, None)
+                }
                 Err(err) => {
                     warn!(
                         path = %path_str,
@@ -205,14 +264,8 @@ pub fn scan_files_parallel(
                         "scan_file_failed"
                     );
                     failed_files.lock().unwrap().push((path_str.clone(), err));
-                    None
+                    (None, None)
                 }
-            };
-
-            let audio_hash = if with_hash {
-                compute_audio_hash(path)
-            } else {
-                None
             };
 
             ScannedFile {
@@ -225,10 +278,12 @@ pub fn scan_files_parallel(
         })
         .collect();
 
+    let timed_out = timeout_counter.load(Ordering::Relaxed);
     let stats = ScanStats {
         total_files: results.len(),
         metadata_ok: results.iter().filter(|f| f.metadata.is_some()).count(),
         metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
+        metadata_timeout: timed_out,
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
     };
 
@@ -246,10 +301,19 @@ pub fn scan_files_parallel(
     }
     drop(failed);
 
+    if timed_out > 0 {
+        warn!(
+            count = timed_out,
+            timeout_secs = FILE_TIMEOUT.as_secs(),
+            "scan_timeout_summary — files skipped due to timeout"
+        );
+    }
+
     info!(
         total = stats.total_files,
         metadata_ok = stats.metadata_ok,
         metadata_failed = stats.metadata_failed,
+        metadata_timeout = stats.metadata_timeout,
         "parallel_scan_complete"
     );
 
@@ -289,6 +353,7 @@ pub fn scan_files_batched(
     for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let batch_timeout_counter = AtomicUsize::new(0);
 
         let batch: Vec<ScannedFile> = chunk
             .par_iter()
@@ -303,8 +368,17 @@ pub fn scan_files_batched(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                let metadata = match try_read_metadata(path) {
-                    Ok(meta) => Some(meta),
+                let (metadata, audio_hash) = match read_file_with_timeout(path, with_hash) {
+                    Ok((meta, hash)) => (meta, hash),
+                    Err(ref reason) if reason == "timeout" => {
+                        warn!(
+                            path = %path_str,
+                            timeout_secs = FILE_TIMEOUT.as_secs(),
+                            "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                        );
+                        batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
+                        (None, None)
+                    }
                     Err(err) => {
                         warn!(
                             path = %path_str,
@@ -312,14 +386,8 @@ pub fn scan_files_batched(
                             "scan_file_failed"
                         );
                         failed_files.lock().unwrap().push((path_str.clone(), err));
-                        None
+                        (None, None)
                     }
-                };
-
-                let audio_hash = if with_hash {
-                    compute_audio_hash(path)
-                } else {
-                    None
                 };
 
                 ScannedFile {
@@ -332,9 +400,12 @@ pub fn scan_files_batched(
             })
             .collect();
 
+        let batch_timeouts = batch_timeout_counter.load(Ordering::Relaxed);
+
         // Update aggregate stats
         aggregate.metadata_ok += batch.iter().filter(|f| f.metadata.is_some()).count();
         aggregate.metadata_failed += batch.iter().filter(|f| f.metadata.is_none()).count();
+        aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
 
         let failed = failed_files.lock().unwrap();
@@ -353,6 +424,15 @@ pub fn scan_files_batched(
         }
         drop(failed);
 
+        if batch_timeouts > 0 {
+            warn!(
+                count = batch_timeouts,
+                batch = batch_idx,
+                timeout_secs = FILE_TIMEOUT.as_secs(),
+                "scan_batch_timeouts — files skipped due to timeout"
+            );
+        }
+
         info!(
             batch = batch_idx,
             batch_size = batch.len(),
@@ -364,10 +444,19 @@ pub fn scan_files_batched(
         on_batch(batch, batch_idx, total);
     }
 
+    if aggregate.metadata_timeout > 0 {
+        warn!(
+            count = aggregate.metadata_timeout,
+            timeout_secs = FILE_TIMEOUT.as_secs(),
+            "scan_timeout_summary — files skipped due to timeout"
+        );
+    }
+
     info!(
         total = aggregate.total_files,
         metadata_ok = aggregate.metadata_ok,
         metadata_failed = aggregate.metadata_failed,
+        metadata_timeout = aggregate.metadata_timeout,
         "batched_scan_complete"
     );
 
