@@ -106,6 +106,7 @@ fn scan_directories<'py>(
     stats_dict.set_item("total_files", stats.total_files)?;
     stats_dict.set_item("metadata_ok", stats.metadata_ok)?;
     stats_dict.set_item("metadata_failed", stats.metadata_failed)?;
+    stats_dict.set_item("metadata_timeout", stats.metadata_timeout)?;
     stats_dict.set_item("hash_ok", stats.hash_ok)?;
     dict.set_item("stats", stats_dict)?;
 
