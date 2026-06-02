@@ -85,12 +85,22 @@ pub fn split_genre_tag(raw: &str) -> Vec<String> {
 ///   - `Mpeg` -> `mp3`
 ///   - `Dsf`  -> `dsd` (DSD over PCM, stored in .dsf container)
 ///   - `Dff`  -> `dsd` (DSD Interchange File Format)
+///   - `Mp4`  -> `alac` when bit_depth is present (ALAC is lossless, has bit depth)
+///             -> `aac` otherwise (AAC is lossy, no bit depth reported by lofty)
 ///   - Other values pass through unchanged (already lowercase).
-pub fn normalize_format(raw: &str) -> String {
+pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
     match raw {
         "mpeg" => "mp3".to_string(),
         "dsf" | "dff" => "dsd".to_string(),
-        "mp4" | "m4a" => "aac".to_string(),
+        "mp4" | "m4a" => {
+            // ALAC (Apple Lossless) files in M4A containers report a bit depth
+            // (typically 16 or 24), while AAC (lossy) does not.
+            if bit_depth.is_some() {
+                "alac".to_string()
+            } else {
+                "aac".to_string()
+            }
+        }
         other => other.to_string(),
     }
 }
@@ -765,6 +775,7 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         channels: props.channels().map(|c| c as u16),
         format: Some(normalize_format(
             &format!("{:?}", tagged.file_type()).to_lowercase(),
+            props.bit_depth(),
         )),
         file_size: std::fs::metadata(path).ok().map(|m| m.len()),
         bpm,
@@ -1108,32 +1119,32 @@ mod tests {
 
     #[test]
     fn normalize_format_mpeg_to_mp3() {
-        assert_eq!(normalize_format("mpeg"), "mp3");
+        assert_eq!(normalize_format("mpeg", None), "mp3");
     }
 
     #[test]
     fn normalize_format_dsf_to_dsd() {
-        assert_eq!(normalize_format("dsf"), "dsd");
+        assert_eq!(normalize_format("dsf", None), "dsd");
     }
 
     #[test]
     fn normalize_format_dff_to_dsd() {
-        assert_eq!(normalize_format("dff"), "dsd");
+        assert_eq!(normalize_format("dff", None), "dsd");
     }
 
     #[test]
     fn normalize_format_flac_unchanged() {
-        assert_eq!(normalize_format("flac"), "flac");
+        assert_eq!(normalize_format("flac", None), "flac");
     }
 
     #[test]
     fn normalize_format_wav_unchanged() {
-        assert_eq!(normalize_format("wav"), "wav");
+        assert_eq!(normalize_format("wav", None), "wav");
     }
 
     #[test]
     fn normalize_format_aiff_unchanged() {
-        assert_eq!(normalize_format("aiff"), "aiff");
+        assert_eq!(normalize_format("aiff", None), "aiff");
     }
 
     #[test]
@@ -1268,17 +1279,27 @@ mod tests {
     }
 
     #[test]
-    fn normalize_format_mp4_variants() {
-        assert_eq!(normalize_format("mp4"), "aac");
-        assert_eq!(normalize_format("m4a"), "aac");
+    fn normalize_format_mp4_aac_no_bit_depth() {
+        // AAC (lossy) in M4A container: lofty reports no bit depth
+        assert_eq!(normalize_format("mp4", None), "aac");
+        assert_eq!(normalize_format("m4a", None), "aac");
+    }
+
+    #[test]
+    fn normalize_format_mp4_alac_with_bit_depth() {
+        // ALAC (lossless) in M4A container: lofty reports bit depth (16 or 24)
+        assert_eq!(normalize_format("mp4", Some(16)), "alac");
+        assert_eq!(normalize_format("mp4", Some(24)), "alac");
+        assert_eq!(normalize_format("m4a", Some(16)), "alac");
+        assert_eq!(normalize_format("m4a", Some(24)), "alac");
     }
 
     #[test]
     fn normalize_format_unknown_passthrough() {
-        assert_eq!(normalize_format("ogg"), "ogg");
-        assert_eq!(normalize_format("opus"), "opus");
-        assert_eq!(normalize_format("wv"), "wv");
-        assert_eq!(normalize_format("ape"), "ape");
+        assert_eq!(normalize_format("ogg", None), "ogg");
+        assert_eq!(normalize_format("opus", None), "opus");
+        assert_eq!(normalize_format("wv", None), "wv");
+        assert_eq!(normalize_format("ape", None), "ape");
     }
 
     #[test]
@@ -1409,8 +1430,8 @@ mod tests {
 
     #[test]
     fn normalize_format_case_sensitivity() {
-        assert_eq!(normalize_format("mpeg"), "mp3");
-        assert_eq!(normalize_format("MPEG"), "MPEG");
+        assert_eq!(normalize_format("mpeg", None), "mp3");
+        assert_eq!(normalize_format("MPEG", None), "MPEG");
     }
 
     #[test]
