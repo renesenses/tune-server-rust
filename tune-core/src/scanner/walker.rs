@@ -173,8 +173,24 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str())
                         && extensions.contains(ext.to_lowercase().as_str())
                     {
-                        files.push(path.to_path_buf());
-                        dir_file_count += 1;
+                        // ISO SACD: extract DSF tracks instead of adding the ISO directly
+                        if ext.eq_ignore_ascii_case("iso")
+                            && crate::audio::iso_sacd::is_sacd_iso(path)
+                        {
+                            match crate::audio::iso_sacd::extract_iso_to_dsf(path) {
+                                Ok(dsf_files) => {
+                                    dir_file_count += dsf_files.len();
+                                    files.extend(dsf_files);
+                                }
+                                Err(e) => {
+                                    warn!(path = %path.display(), error = %e, "sacd_iso_extract_failed");
+                                    dir_error_count += 1;
+                                }
+                            }
+                        } else {
+                            files.push(path.to_path_buf());
+                            dir_file_count += 1;
+                        }
                     }
                 }
                 Err(err) => {
