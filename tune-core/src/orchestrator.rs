@@ -215,8 +215,10 @@ impl PlaybackOrchestrator {
                 src_fmt.dlna_transcode_target()
             };
             let out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
-            let out_bd: u16 = if src_fmt == AudioFormat::Dsd || oaat_needs_wav {
+            let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
                 24
+            } else if oaat_needs_wav {
+                bit_depth.max(16).min(32)
             } else {
                 bit_depth.max(16)
             };
