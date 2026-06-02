@@ -58,8 +58,13 @@ pub fn router() -> Router<AppState> {
         .route("/sync-status", get(sync_status))
         .route("/{id}/network-health", get(network_health))
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
+        .route("/group", get(list_groups).post(create_group))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
+        .route(
+            "/group/{group_id}",
+            axum::routing::patch(patch_group).delete(delete_group),
+        )
         .route(
             "/groups/{group_id}",
             axum::routing::patch(patch_group).delete(delete_group),
