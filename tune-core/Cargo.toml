@@ -38,6 +38,7 @@ regex = { workspace = true }
 csv = { workspace = true }
 oaat-core = { workspace = true, optional = true }
 oaat-controller = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -46,3 +47,4 @@ tempfile = "3"
 default = ["local-audio"]
 local-audio = ["cpal"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
+postgres = ["dep:sqlx"]
