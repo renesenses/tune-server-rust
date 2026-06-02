@@ -410,28 +410,97 @@ impl PlaybackOrchestrator {
         };
 
         let is_https = stream_data.url.starts_with("https://");
-        let (stream_url, sid) = if is_https {
+        let is_oaat_stream = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+
+        let (stream_url, sid) = if is_https && is_oaat_stream {
+            // OAAT needs WAV — transcode the HTTPS stream via FFmpeg
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: stream_data.quality.sample_rate,
+                bit_depth: stream_data.quality.bit_depth.max(16),
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+            };
+            let (session_id, tx) = self.streamer.create_session(wav_info, false, 256).await;
+            let ffmpeg_path = find_ffmpeg().ok_or("FFmpeg not found")?;
+            let bd = stream_data.quality.bit_depth.max(16);
+            let codec = match bd {
+                24 => "pcm_s24le",
+                32 => "pcm_s32le",
+                _ => "pcm_s16le",
+            };
+            let ffmpeg_fmt = match bd {
+                24 => "s24le",
+                32 => "s32le",
+                _ => "s16le",
+            };
+            let upstream = stream_data.url.clone();
+            let sr = stream_data.quality.sample_rate;
+            tokio::spawn(async move {
+                let child = tokio::process::Command::new(&ffmpeg_path)
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "warning",
+                        "-i",
+                        &upstream,
+                        "-vn",
+                        "-f",
+                        ffmpeg_fmt,
+                        "-acodec",
+                        codec,
+                        "-ar",
+                        &sr.to_string(),
+                        "-ac",
+                        "2",
+                        "pipe:1",
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn();
+                if let Ok(mut child) = child {
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut reader = tokio::io::BufReader::with_capacity(65536, stdout);
+                        let mut buf = vec![0u8; 32768];
+                        loop {
+                            match reader.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if tx.send(buf[..n].to_vec()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            });
+            let server_ip = crate::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (url, Some(session_id))
+        } else if is_https {
             let session_id = self
                 .streamer
                 .create_proxy_session(info, stream_data.url.clone(), false)
                 .await;
-
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            // OAAT outputs only support WAV/FLAC/DSD — force WAV for other codecs
-            let is_oaat_stream = req
-                .output_device_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
-            let stream_ext = if is_oaat_stream {
-                "wav".to_string()
-            } else {
-                stream_data.quality.codec.to_lowercase()
-            };
-            let url = self
-                .streamer
-                .get_stream_url(&session_id, &server_ip, &stream_ext);
+            let url = self.streamer.get_stream_url(
+                &session_id,
+                &server_ip,
+                &stream_data.quality.codec.to_lowercase(),
+            );
             (url, Some(session_id))
         } else {
             (stream_data.url.clone(), None)
