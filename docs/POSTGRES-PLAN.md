@@ -10,19 +10,23 @@
 ### Fait
 - Phase 1 abstraction : `Engine` + `SqlDialect` (SQLite / Postgres impls) + `PostgresDb` skeleton (sqlx pool) + workflow CI `test-postgres.yml`
 - Wiring : feature `postgres = ["dep:sqlx"]`, `SqliteDb::dialect()` / `engine()`
-- **11 repos sur 14 portés** vers le `SqlDialect` (placeholders + LOWER au lieu de COLLATE NOCASE + ON CONFLICT DO NOTHING portable au lieu de INSERT OR IGNORE) :
+- **13 repos sur 13 portés** vers le `SqlDialect` (placeholders + LOWER au lieu de COLLATE NOCASE + ON CONFLICT DO NOTHING portable au lieu de INSERT OR IGNORE) :
   - settings_repo, profile_repo, rating_repo, tag_repo, radio_repo
   - source_link_repo, play_queue_repo, history_repo (partiel : full_dashboard reporté)
   - zone_repo, artist_repo, playlist_repo
-- 909 tests `tune-core` verts, dont ~20 tests dialecte explicites (SQLite `?` + Postgres `$1, $2, ...`)
+  - **album_repo (1054 LOC, 19 builders)**
+  - **track_repo (1124 LOC, 13 builders)**
+- `full_text_search.rs` : doc note en tête, le PG `tsvector + GIN` viendra en phase 4
+- 957 tests `tune-core` verts, dont ~30 tests dialecte explicites (SQLite `?` + Postgres `$1, $2, ...`)
 
-### Reste
-- album_repo (~1054 LOC, 1 session dédiée)
-- track_repo (~1124 LOC, 1 session dédiée)
-- full_text_search.rs (~214 LOC, FTS5 → tsvector — phase 4 helper requis)
-- Backend Postgres réellement utilisé end-to-end (PgPool dans AppState, migrations PG, repos pluggables)
-- Outil CLI `tune-cli db migrate-to-postgres`
-- Endpoints REST `/system/database/migrate` réellement implémentés
+### Reste (phase 4 — wiring backend + migration tool)
+- Backend Postgres réellement utilisé end-to-end (PgPool dans AppState, migrations PG, sélecteur engine au boot, repos pluggables via trait)
+- FTS5 → tsvector côté `full_text_search.rs` (split sqlite/postgres modules, helper `dialect.fts_match()`)
+- Outil CLI `tune-cli db migrate-to-postgres` (export SQLite → import PG)
+- Endpoints REST `/system/database/migrate` et `/system/database/test-connection` réellement implémentés
+- Helpers dialect pour `strftime`/`json_each` (resp. `to_char`/`jsonb_array_elements_text`)
+- Migration des CREATE TABLE inline (`streaming_queue` dans play_queue_repo) vers une migration portable
+- `full_dashboard` du history_repo : rewrite avec dialect helpers date
 
 ---
 
