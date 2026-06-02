@@ -110,6 +110,19 @@ impl PlaybackManager {
         })
     }
 
+    /// Restore a saved playback position into the zone state.
+    /// Called on startup to remember where playback left off.
+    pub async fn restore_position(&self, zone_id: i64, position_ms: i64, np: NowPlaying) {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.position_ms = position_ms;
+        state.now_playing = Some(np);
+        state.state = PlayState::Stopped;
+    }
+
     pub async fn all_states(&self) -> Vec<ZoneState> {
         let zones = self.zones.lock().await;
         zones.values().cloned().collect()
@@ -168,8 +181,8 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         let np_data = if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
-            state.position_ms = 0;
-            // Keep now_playing so Play can resume the same track
+            // Keep position_ms and now_playing so the UI shows where
+            // playback left off and can resume from the same position.
             state.now_playing.as_ref().map(|np| {
                 serde_json::json!({
                     "track_id": np.track_id,

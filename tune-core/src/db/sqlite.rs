@@ -239,7 +239,11 @@ CREATE TABLE IF NOT EXISTS zones (
     online INTEGER DEFAULT 1,
     gapless_enabled INTEGER DEFAULT 1,
     group_id TEXT,
-    sync_delay_ms INTEGER NOT NULL DEFAULT 0
+    sync_delay_ms INTEGER NOT NULL DEFAULT 0,
+    last_position_ms INTEGER NOT NULL DEFAULT 0,
+    last_track_id INTEGER,
+    last_track_source TEXT,
+    last_track_source_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (

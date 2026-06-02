@@ -31,6 +31,8 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 5;
+/// How often (in ticks) to persist the playback position to the database.
+const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -71,6 +73,8 @@ struct ZonePollState {
     /// Last polled position in milliseconds — used to detect position
     /// resets (jumps from >30s to <5s) that signal a gapless transition.
     last_position_ms: u64,
+    /// Tick counter for throttling DB position saves.
+    ticks_since_db_save: u64,
 }
 
 pub struct PositionPoller {
@@ -209,6 +213,7 @@ impl PositionPoller {
                 last_radio_poll: Instant::now(),
                 gapless_sent_at: None,
                 last_position_ms: 0,
+                ticks_since_db_save: 0,
             });
 
             if ps.backoff_remaining > 0 {
@@ -264,6 +269,25 @@ impl PositionPoller {
             }
             self.playback
                 .emit_position(zone_id, status.position_ms as i64);
+
+            // --- Persist position to DB periodically ---
+            ps.ticks_since_db_save += 1;
+            if ps.ticks_since_db_save >= POSITION_SAVE_INTERVAL_TICKS {
+                ps.ticks_since_db_save = 0;
+                let np = zone_state.now_playing.as_ref();
+                let track_id = np.and_then(|n| n.track_id);
+                let source = np.map(|n| n.source.as_str());
+                let source_id = np.and_then(|n| n.source_id.as_deref());
+                ZoneRepo::new(self.db.clone())
+                    .save_playback_position(
+                        zone_id,
+                        status.position_ms as i64,
+                        track_id,
+                        source,
+                        source_id,
+                    )
+                    .ok();
+            }
 
             // --- Radio metadata polling ---
             let is_radio = zone_state
@@ -590,6 +614,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            ticks_since_db_save: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -623,6 +648,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            ticks_since_db_save: 0,
         };
 
         // Simulates entering Playing state
@@ -711,6 +737,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            ticks_since_db_save: 0,
         };
 
         // Simulate consecutive errors with exponential backoff

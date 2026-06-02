@@ -393,6 +393,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_zone_dsp",
         up: "",
     },
+    Migration {
+        version: 26,
+        name: "add_zone_playback_position",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -632,6 +637,17 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 25 {
             add_column_if_missing(db, "zones", "dsp_preset_id", "INTEGER");
             add_column_if_missing(db, "zones", "dsp_enabled", "INTEGER DEFAULT 0");
+        }
+        if migration.version == 26 {
+            add_column_if_missing(
+                db,
+                "zones",
+                "last_position_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
+            add_column_if_missing(db, "zones", "last_track_id", "INTEGER");
+            add_column_if_missing(db, "zones", "last_track_source", "TEXT");
+            add_column_if_missing(db, "zones", "last_track_source_id", "TEXT");
         }
 
         db.execute(
