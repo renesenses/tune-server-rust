@@ -1,0 +1,47 @@
+name: Forum Watch
+
+# Poll the mozaiklabs.fr forum every 30min and create GitHub issues for new
+# tester posts and replies. State is persisted in a gist between runs.
+#
+# Required secrets:
+# - FORUM_TOKEN: bearer token for mozaiklabs forum API
+# - GIST_TOKEN: PAT with gist scope
+# - GIST_ID: id of the gist used for state persistence
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      reset_state:
+        description: "Reset state (treat all current threads as new)"
+        type: boolean
+        default: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reset state if requested
+        if: ${{ inputs.reset_state }}
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: token $GIST_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"files":{"forum-state.json":{"content":"{}"}}}' \
+            https://api.github.com/gists/$GIST_ID
+
+      - name: Poll forum and create issues
+        env:
+          FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python3 .github/scripts/forum-watch.py
