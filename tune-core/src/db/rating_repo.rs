@@ -1,7 +1,46 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for rating_repo.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn upsert_rating<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO album_ratings (album_id, profile_id, rating, note) VALUES ({}, {}, {}, {}) ON CONFLICT(album_id, profile_id) DO UPDATE SET rating = excluded.rating, note = excluded.note",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    pub fn get_rating<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, album_id, profile_id, rating, note, created_at FROM album_ratings WHERE album_id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn top_rated<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT album_id, AVG(rating) as avg_rating, COUNT(*) as count FROM album_ratings GROUP BY album_id ORDER BY avg_rating DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn delete_rating<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM album_ratings WHERE album_id = {} AND profile_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlbumRating {
@@ -33,8 +72,13 @@ impl RatingRepo {
             return Err("rating must be 1-5".into());
         }
         self.db.execute(
-            "INSERT INTO album_ratings (album_id, profile_id, rating, note) VALUES (?, ?, ?, ?) ON CONFLICT(album_id, profile_id) DO UPDATE SET rating = excluded.rating, note = excluded.note",
-            &[&album_id as &dyn rusqlite::types::ToSql, &profile_id, &rating, &note],
+            &sql::upsert_rating(&self.db.dialect()),
+            &[
+                &album_id as &dyn rusqlite::types::ToSql,
+                &profile_id,
+                &rating,
+                &note,
+            ],
         )?;
         Ok(())
     }
@@ -46,16 +90,18 @@ impl RatingRepo {
     ) -> Result<Option<AlbumRating>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         conn.query_row(
-            "SELECT id, album_id, profile_id, rating, note, created_at FROM album_ratings WHERE album_id = ? AND profile_id = ?",
+            &sql::get_rating(&self.db.dialect()),
             params![album_id, profile_id],
-            |row| Ok(AlbumRating {
-                id: row.get(0).ok(),
-                album_id: row.get(1).unwrap_or(0),
-                profile_id: row.get(2).unwrap_or(1),
-                rating: row.get(3).unwrap_or(0),
-                note: row.get(4).ok().flatten(),
-                created_at: row.get(5).ok().flatten(),
-            }),
+            |row| {
+                Ok(AlbumRating {
+                    id: row.get(0).ok(),
+                    album_id: row.get(1).unwrap_or(0),
+                    profile_id: row.get(2).unwrap_or(1),
+                    rating: row.get(3).unwrap_or(0),
+                    note: row.get(4).ok().flatten(),
+                    created_at: row.get(5).ok().flatten(),
+                })
+            },
         )
         .optional()
         .map_err(|e| e.to_string())
@@ -64,7 +110,7 @@ impl RatingRepo {
     pub fn top_rated(&self, limit: i64) -> Result<Vec<(i64, f64, i64)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT album_id, AVG(rating) as avg_rating, COUNT(*) as count FROM album_ratings GROUP BY album_id ORDER BY avg_rating DESC LIMIT ?")
+            .prepare(&sql::top_rated(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| {
@@ -82,7 +128,7 @@ impl RatingRepo {
 
     pub fn delete_rating(&self, album_id: i64, profile_id: i64) -> Result<(), String> {
         self.db.execute(
-            "DELETE FROM album_ratings WHERE album_id = ? AND profile_id = ?",
+            &sql::delete_rating(&self.db.dialect()),
             &[&album_id as &dyn rusqlite::types::ToSql, &profile_id],
         )?;
         Ok(())
@@ -221,6 +267,17 @@ mod tests {
         assert_eq!(top[0].0, a3); // highest first
         assert_eq!(top[1].0, a2);
         assert_eq!(top[2].0, a1);
+    }
+
+    #[test]
+    fn sql_builders_dialect_specific_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::upsert_rating(&s).contains("VALUES (?, ?, ?, ?)"));
+        assert!(sql::upsert_rating(&p).contains("VALUES ($1, $2, $3, $4)"));
+        assert!(sql::top_rated(&s).ends_with("LIMIT ?"));
+        assert!(sql::top_rated(&p).ends_with("LIMIT $1"));
     }
 
     #[test]
