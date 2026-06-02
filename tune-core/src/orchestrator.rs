@@ -209,15 +209,27 @@ impl PlaybackOrchestrator {
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
             let src_fmt = source_format.unwrap(); // safe: needs_transcode is true
-            let target_fmt = src_fmt.dlna_transcode_target();
+            let target_fmt = if oaat_needs_wav {
+                AudioFormat::Wav
+            } else {
+                src_fmt.dlna_transcode_target()
+            };
             let out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
             let out_bd: u16 = if src_fmt == AudioFormat::Dsd || oaat_needs_wav {
-                24 // OAAT DACs typically require 24/32-bit; DSD transcodes to 24-bit
+                24
             } else {
                 bit_depth.max(16)
             };
-            let out_mime = target_fmt.mime_type().to_string();
-            let out_ext = target_fmt.ffmpeg_format_arg().to_string();
+            let out_mime = if oaat_needs_wav {
+                "audio/wav".to_string()
+            } else {
+                target_fmt.mime_type().to_string()
+            };
+            let out_ext = if oaat_needs_wav {
+                "wav".to_string()
+            } else {
+                target_fmt.ffmpeg_format_arg().to_string()
+            };
 
             info!(
                 file = %file_path,
