@@ -510,3 +510,239 @@ pub(super) async fn api_stats(State(state): State<AppState>) -> Json<Value> {
     let stats = state.api_analytics.stats();
     Json(serde_json::to_value(stats).unwrap_or_default())
 }
+
+pub(super) async fn api_insights(State(state): State<AppState>) -> Json<Value> {
+    let stats = state.api_analytics.stats();
+    let mut issues: Vec<Value> = Vec::new();
+
+    // High error rate
+    if stats.error_rate_pct > 5.0 {
+        issues.push(json!({
+            "severity": "warning",
+            "type": "high_error_rate",
+            "message": format!("API error rate is {:.1}% (threshold: 5%)", stats.error_rate_pct),
+        }));
+    }
+
+    // Slow endpoints (P95 > 500ms)
+    for ep in &stats.slowest_endpoints {
+        if ep.p95_latency_ms > 500 {
+            issues.push(json!({
+                "severity": "warning",
+                "type": "slow_endpoint",
+                "endpoint": ep.endpoint,
+                "p95_ms": ep.p95_latency_ms,
+                "message": format!("{} P95 latency {}ms (threshold: 500ms)", ep.endpoint, ep.p95_latency_ms),
+            }));
+        }
+    }
+
+    // Zone poller issues
+    let metrics = state.poller_metrics.lock().await;
+    for (zone_id, m) in metrics.iter() {
+        if m.total_polls > 10 && m.total_errors > 0 {
+            let err_pct = m.total_errors as f64 / m.total_polls as f64 * 100.0;
+            if err_pct > 10.0 {
+                issues.push(json!({
+                    "severity": "error",
+                    "type": "zone_poll_failures",
+                    "zone_id": zone_id,
+                    "error_rate_pct": (err_pct * 10.0).round() / 10.0,
+                    "message": format!("Zone {} has {:.0}% poll error rate", zone_id, err_pct),
+                }));
+            }
+        }
+        if m.max_latency_ms > 2000 {
+            issues.push(json!({
+                "severity": "warning",
+                "type": "zone_high_latency",
+                "zone_id": zone_id,
+                "max_latency_ms": m.max_latency_ms,
+                "message": format!("Zone {} max latency {}ms", zone_id, m.max_latency_ms),
+            }));
+        }
+    }
+    drop(metrics);
+
+    let status = if issues.iter().any(|i| i["severity"] == "error") {
+        "degraded"
+    } else if issues.is_empty() {
+        "healthy"
+    } else {
+        "warning"
+    };
+
+    Json(json!({
+        "status": status,
+        "issues": issues,
+        "total_issues": issues.len(),
+        "api_requests_analyzed": stats.total_requests,
+    }))
+}
+
+pub(super) async fn api_docs() -> Json<Value> {
+    let routes = vec![
+        // System
+        ("GET", "/system/version", "Server version and engine"),
+        ("GET", "/system/health", "Health check"),
+        (
+            "GET",
+            "/system/stats",
+            "Library statistics (tracks, albums, artists, zones)",
+        ),
+        ("GET", "/system/diagnostics", "Full diagnostic report"),
+        ("GET", "/system/changelog", "Version changelog"),
+        (
+            "GET",
+            "/system/api-stats",
+            "Per-endpoint latency and error analytics",
+        ),
+        (
+            "GET",
+            "/system/api-docs",
+            "This endpoint — API documentation",
+        ),
+        ("GET", "/system/telemetry", "Telemetry snapshot (opt-in)"),
+        ("POST", "/system/scan", "Trigger library scan"),
+        ("GET", "/system/scan/status", "Scan progress"),
+        ("GET", "/system/logs", "Server logs"),
+        ("GET", "/system/backups", "List backups"),
+        ("POST", "/system/backups", "Create backup"),
+        ("POST", "/system/backups/encrypt", "Create encrypted backup"),
+        ("POST", "/system/import/roon", "Import from Roon"),
+        ("POST", "/system/import/jriver", "Import from JRiver XML"),
+        ("POST", "/system/import/plex", "Import from Plex"),
+        // Library
+        (
+            "GET",
+            "/library/albums",
+            "List albums (paginated, filterable)",
+        ),
+        (
+            "GET",
+            "/library/albums/grouped",
+            "Albums grouped by release (deluxe/remastered)",
+        ),
+        ("GET", "/library/albums/{id}", "Album details"),
+        ("GET", "/library/albums/{id}/tracks", "Album tracks"),
+        (
+            "GET",
+            "/library/albums/{id}/completeness",
+            "Album track completeness check",
+        ),
+        ("GET", "/library/artists", "List artists"),
+        (
+            "GET",
+            "/library/artists/{id}/timeline",
+            "Artist discography with gaps",
+        ),
+        ("GET", "/library/tracks", "List tracks (paginated)"),
+        (
+            "GET",
+            "/library/tracks/{id}/waveform",
+            "Track waveform (200-point amplitude)",
+        ),
+        (
+            "GET",
+            "/library/tracks/{id}/synced-lyrics",
+            "Synchronized lyrics (.lrc)",
+        ),
+        (
+            "GET",
+            "/library/tracks/{id}/source-links",
+            "Cross-service matches",
+        ),
+        (
+            "POST",
+            "/library/identify",
+            "Identify track via AcoustID fingerprint",
+        ),
+        (
+            "GET",
+            "/library/duplicates",
+            "Duplicate tracks (hash + fingerprint + metadata)",
+        ),
+        (
+            "GET",
+            "/library/stats/completeness",
+            "Library health score (A-F grade)",
+        ),
+        ("GET", "/library/genre-tree", "Hierarchical genre tree"),
+        ("GET", "/search", "Federated search (local + streaming)"),
+        // Zones & Playback
+        ("GET", "/zones", "List zones"),
+        ("POST", "/zones", "Create zone"),
+        (
+            "GET",
+            "/zones/{id}/status",
+            "Zone playback status + credits",
+        ),
+        (
+            "GET",
+            "/zones/{id}/network-health",
+            "Zone network quality metrics",
+        ),
+        ("GET", "/zones/sync-status", "All zones with poller metrics"),
+        ("POST", "/zones/{id}/play", "Play track/album/playlist"),
+        ("POST", "/zones/{id}/pause", "Pause"),
+        ("POST", "/zones/{id}/next", "Next track"),
+        ("POST", "/zones/{id}/sleep", "Sleep timer with fade"),
+        ("GET", "/zones/{id}/dsp", "Zone DSP/EQ config"),
+        // Streaming
+        (
+            "GET",
+            "/streaming/services",
+            "List streaming services status",
+        ),
+        (
+            "GET",
+            "/streaming/compare",
+            "Compare search across services",
+        ),
+        (
+            "GET",
+            "/streaming/{service}/search",
+            "Search a streaming service",
+        ),
+        // Playlists
+        ("GET", "/playlists", "List playlists"),
+        ("POST", "/playlists", "Create playlist"),
+        (
+            "GET",
+            "/playlists/{id}/export",
+            "Export (format=m3u|json|csv|xspf)",
+        ),
+        // Radio & DJ
+        ("GET", "/radio/auto", "Auto-DJ playlist from seed track"),
+        ("GET", "/radios", "List radio stations"),
+        // Dashboard
+        ("GET", "/dashboard/stats", "Listening dashboard"),
+        ("GET", "/dashboard/wrapped", "Year-in-review Wrapped stats"),
+        ("GET", "/dashboard/top-artists", "Top artists"),
+        ("GET", "/dashboard/genre-breakdown", "Genre distribution"),
+        // Party
+        ("POST", "/party/rooms", "Create collaborative room"),
+        ("GET", "/party/rooms", "List rooms"),
+        // Other
+        (
+            "POST",
+            "/voice-search",
+            "Voice search via Whisper transcription",
+        ),
+        (
+            "GET",
+            "/demo/library",
+            "Read-only library browse (demo mode)",
+        ),
+    ];
+
+    let endpoints: Vec<Value> = routes.iter().map(|(method, path, desc)| {
+        json!({"method": method, "path": format!("/api/v1{path}"), "description": desc})
+    }).collect();
+
+    Json(json!({
+        "version": tune_core::version(),
+        "total_endpoints": endpoints.len(),
+        "endpoints": endpoints,
+    }))
+}

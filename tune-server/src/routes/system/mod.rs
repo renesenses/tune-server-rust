@@ -114,6 +114,8 @@ pub fn router() -> Router<AppState> {
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),
         )
         .route("/api-stats", get(diagnostics::api_stats))
+        .route("/api-docs", get(diagnostics::api_docs))
+        .route("/api-insights", get(diagnostics::api_insights))
         .route("/enrich", post(enrich::system_enrich))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
