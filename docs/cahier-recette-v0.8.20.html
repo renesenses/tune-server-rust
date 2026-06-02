@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Cahier de recette Tune v0.8.22</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+  <link rel="stylesheet" href="/dev/fd/11" />
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Cahier de recette Tune v0.8.22</h1>
+</header>
+<h1 id="cahier-de-recette-tune-v0.8.20">Cahier de recette — Tune
+v0.8.20</h1>
+<p><strong>Date</strong> : 2 juin 2026 <strong>Testeurs</strong> :
+Babacar, Sergio, Dominique, Pascal, Benjithom, Laurent
+<strong>Plateformes</strong> : macOS (DMG/Homebrew), Windows (NSIS),
+Linux (Docker), iPad (TestFlight)</p>
+<hr />
+<h2 id="instructions">Instructions</h2>
+<p>Ouvrir le client web Tune dans un navigateur :
+<code>http://&lt;adresse-serveur&gt;:8888</code></p>
+<p>Pour chaque test : - Suivre les etapes dans l’interface web - Noter
+OK ou KO dans la colonne Resultat - Si KO, decrire le comportement
+observe dans Commentaire</p>
+<hr />
+<h2 id="dashboard-statistiques">1. Dashboard &amp; Statistiques</h2>
+<h3 id="page-daccueil-compteurs">1.1 Page d’accueil — Compteurs</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Ouvrir la page d’accueil (icone maison)</td>
+<td>Les compteurs Pistes, Albums, Artistes, Zones s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Verifier que Zones &gt; 0</td>
+<td>Le nombre de zones correspond aux appareils detectes</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Lancer un scan (Reglages &gt; Scanner la bibliotheque)</td>
+<td>Le compteur de progression s’affiche en temps reel</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Attendre la fin du scan</td>
+<td>Les compteurs se mettent a jour</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="dashboard-ecoutes">1.2 Dashboard ecoutes</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Jouer quelques pistes pendant 30 secondes chacune</td>
+<td>La lecture fonctionne normalement</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Ouvrir la page Dashboard (si disponible dans le menu)</td>
+<td>Top artistes, top pistes, historique par jour s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="wrapped-annee-en-musique-api-uniquement">1.3 Wrapped — Annee en
+musique (API uniquement)</h3>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> http://SERVER:8888/api/v1/dashboard/wrapped<span class="pp">?</span>year=2026</span></code></pre></div>
+<p><strong>Attendu</strong> : total_listens, total_hours, top_artists
+(top 10), max_streak_days.</p>
+<hr />
+<h2 id="bibliotheque">2. Bibliotheque</h2>
+<h3 id="navigation-albums">2.1 Navigation albums</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Bibliotheque &gt; Albums</td>
+<td>La liste des albums s’affiche avec pochettes</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Cliquer sur un album</td>
+<td>Les pistes de l’album s’affichent avec numeros de piste</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Verifier la pochette</td>
+<td>L’image de couverture s’affiche correctement</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="navigation-artistes-timeline">2.2 Navigation artistes +
+timeline</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Bibliotheque &gt; Artistes</td>
+<td>La liste des artistes s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Cliquer sur un artiste avec plusieurs albums</td>
+<td>Ses albums s’affichent tries par annee</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="recherche">2.3 Recherche</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Cliquer sur la loupe de recherche</td>
+<td>Le champ de recherche s’ouvre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Taper “miles davis”</td>
+<td>Des resultats apparaissent (artistes, albums, pistes)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Taper un mot avec accent “musique experimentale”</td>
+<td>Les resultats ignorent les accents</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Taper un mot sans accent “cafe” pour trouver “Cafe”</td>
+<td>La recherche trouve les correspondances accentuees</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="arbre-de-genres">2.4 Arbre de genres</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Bibliotheque &gt; Genres</td>
+<td>L’arbre hierarchique de genres s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Cliquer sur un genre (ex: Jazz)</td>
+<td>Les albums/pistes du genre s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="lecture-zones">3. Lecture &amp; Zones</h2>
+<h3 id="lecture-basique">3.1 Lecture basique</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Choisir une zone dans le selecteur de zone</td>
+<td>La zone est selectionnee</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Lancer un album en cliquant sur Play</td>
+<td>La lecture demarre sur la zone choisie</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Appuyer sur Pause</td>
+<td>La lecture se met en pause</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Appuyer sur Play (reprendre)</td>
+<td>La lecture reprend a la meme position</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>5</td>
+<td>Appuyer sur Suivant</td>
+<td>La piste suivante demarre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>6</td>
+<td>Ajuster le volume</td>
+<td>Le volume change sur l’appareil</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="transition-entre-pistes-gapless">3.2 Transition entre pistes
+(gapless)</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Lancer un album complet sur une zone DLNA</td>
+<td>La lecture demarre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Attendre la fin de la 1ere piste</td>
+<td>La transition vers la 2e piste est fluide, sans coupure</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Verifier que la piste ne “redemarre” pas</td>
+<td>Pas de saut audible ni de restart a 1-2 secondes</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="file-dattente">3.3 File d’attente</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Lancer un album</td>
+<td>Les pistes apparaissent dans la file d’attente</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Ouvrir la vue File d’attente</td>
+<td>Toutes les pistes de l’album sont listees</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>La piste en cours est surlignee</td>
+<td>La position actuelle est visible</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="sleep-timer">3.4 Sleep timer</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Lancer une piste en lecture</td>
+<td>La lecture est en cours</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Activer le sleep timer (si disponible dans l’UI zone, sinon curl
+ci-dessous)</td>
+<td>Le timer demarre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Attendre la duree configuree</td>
+<td>Le volume baisse progressivement puis la lecture s’arrete</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>Si pas d’UI :</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST http://SERVER:8888/api/v1/zones/1/sleep <span class="at">-H</span> <span class="st">&quot;Content-Type: application/json&quot;</span> <span class="at">-d</span> <span class="st">&#39;{&quot;minutes&quot;: 1}&#39;</span></span></code></pre></div>
+<hr />
+<h2 id="services-de-streaming">4. Services de streaming</h2>
+<h3 id="connexion-qobuztidal">4.1 Connexion Qobuz/Tidal</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Reglages &gt; Services de streaming</td>
+<td>La liste des services s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Se connecter a Qobuz (ou Tidal)</td>
+<td>L’indicateur passe au vert</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Aller dans Streaming &gt; Qobuz</td>
+<td>Le contenu Qobuz s’affiche (nouveautes, playlists)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Rechercher un artiste dans Qobuz</td>
+<td>Des resultats apparaissent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>5</td>
+<td>Lancer une piste Qobuz</td>
+<td>La lecture demarre sur la zone selectionnee</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="navigation-genres-streaming">4.2 Navigation genres
+streaming</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Streaming &gt; Qobuz &gt; Genres</td>
+<td>Les genres s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Cliquer sur un genre</td>
+<td>Les albums du genre s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="playlists">5. Playlists</h2>
+<h3 id="creation-et-gestion">5.1 Creation et gestion</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Playlists</td>
+<td>La liste des playlists s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Creer une nouvelle playlist</td>
+<td>La playlist est creee et apparait dans la liste</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Ajouter des pistes a la playlist</td>
+<td>Les pistes sont ajoutees</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Lancer la playlist</td>
+<td>Les pistes sont jouees dans l’ordre</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="export-api">5.2 Export (API)</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Export JSON</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="st">&quot;http://SERVER:8888/api/v1/playlists/1/export?format=json&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Export M3U (defaut)</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="st">&quot;http://SERVER:8888/api/v1/playlists/1/export&quot;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Export CSV</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="st">&quot;http://SERVER:8888/api/v1/playlists/1/export?format=csv&quot;</span></span></code></pre></div>
+<p><strong>Attendu</strong> : le fichier est telecharge dans le bon
+format.</p>
+<hr />
+<h2 id="reglages-administration">6. Reglages &amp; Administration</h2>
+<h3 id="dossiers-musicaux">6.1 Dossiers musicaux</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Reglages &gt; Dossiers musicaux</td>
+<td>Les dossiers configures s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Ajouter un nouveau dossier</td>
+<td>Le dossier est ajoute</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Lancer un scan</td>
+<td>Les fichiers du nouveau dossier sont indexes</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="appareils-detectes">6.2 Appareils detectes</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Reglages &gt; Appareils</td>
+<td>Les appareils DLNA/AirPlay/Chromecast detectes s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Verifier que chaque appareil a un nom et un type</td>
+<td>Noms corrects, types affiches</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="zones">6.3 Zones</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Reglages &gt; Zones</td>
+<td>Les zones creees s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Creer une nouvelle zone associee a un appareil</td>
+<td>La zone est creee et fonctionnelle</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="diagnostics">6.4 Diagnostics</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Aller dans Reglages &gt; Diagnostics</td>
+<td>Les infos systeme s’affichent (version, moteur, FFmpeg, zones)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Verifier que la version affichee est 0.8.20</td>
+<td>Version correcte</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="client-web-stabilite">7. Client web — Stabilite</h2>
+<h3 id="connexion-websocket">7.1 Connexion WebSocket</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Ouvrir le client web</td>
+<td>Le voyant de connexion est vert (stable)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Attendre 5 minutes sans action</td>
+<td>Le voyant reste vert (pas de deconnexion)</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Lancer une piste</td>
+<td>La position de lecture se met a jour en temps reel</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="responsive">7.2 Responsive</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Redimensionner la fenetre en mode tablette (~768px)</td>
+<td>L’interface s’adapte avec icones sidebar</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Redimensionner en mode mobile (~375px)</td>
+<td>La barre de navigation passe en bas</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="tests-specifiques-par-plateforme">8. Tests specifiques par
+plateforme</h2>
+<h3 id="windows">8.1 Windows</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Lancer tune-server.exe</td>
+<td>Le terminal s’ouvre avec les logs, pas de crash</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Ouvrir http://localhost:8888</td>
+<td>L’interface web s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Verifier la detection des sorties audio USB</td>
+<td>Les DAC USB apparaissent dans les zones</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="docker">8.2 Docker</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>docker pull renesenses/tune:latest</code></td>
+<td>L’image se telecharge</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Lancer le conteneur avec <code>network_mode: host</code></td>
+<td>Le serveur demarre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Verifier la detection DLNA/AirPlay</td>
+<td>Les appareils sont detectes</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="macos-homebrew">8.3 macOS (Homebrew)</h3>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 14%" />
+<col style="width: 33%" />
+<col style="width: 17%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>brew install renesenses/tap/tune-server</code></td>
+<td>Installation reussie</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>tune-server-launcher</code></td>
+<td>Le serveur demarre</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Ouvrir http://localhost:8888</td>
+<td>L’interface web s’affiche</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="ipad-testflight">8.4 iPad (TestFlight)</h3>
+<table>
+<thead>
+<tr>
+<th>Etape</th>
+<th>Action</th>
+<th>Resultat attendu</th>
+<th>Resultat</th>
+<th>Commentaire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Ouvrir Tune sur iPad</td>
+<td>L’app se lance</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Renseigner l’adresse du serveur</td>
+<td>La connexion s’etablit</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Verifier les zones</td>
+<td>Les zones du serveur s’affichent</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Lancer une piste</td>
+<td>La lecture demarre</td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="tests-api-uniquement-pas-dui">9. Tests API uniquement (pas
+d’UI)</h2>
+<p>Ces endpoints n’ont pas encore d’interface web. Tester avec curl
+:</p>
+<h3 id="documentation-api">Documentation API</h3>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> http://SERVER:8888/api/v1/system/api-docs <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span></code></pre></div>
+<p><strong>Attendu</strong> : liste de 60+ endpoints.</p>
+<h3 id="monitoring-proactif">Monitoring proactif</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> http://SERVER:8888/api/v1/system/api-insights <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span></code></pre></div>
+<p><strong>Attendu</strong> : <code>status: "healthy"</code> ou issues
+detectees.</p>
+<h3 id="auto-dj">Auto-DJ</h3>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="st">&quot;http://SERVER:8888/api/v1/radio/auto?seed_track=1&amp;count=10&quot;</span> <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span></code></pre></div>
+<p><strong>Attendu</strong> : liste de pistes similaires a la seed.</p>
+<h3 id="sante-bibliotheque">Sante bibliotheque</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> http://SERVER:8888/api/v1/library/stats/completeness <span class="kw">|</span> <span class="ex">python3</span> <span class="at">-m</span> json.tool</span></code></pre></div>
+<p><strong>Attendu</strong> : <code>health_score</code> (0-100),
+<code>health_grade</code> (A-F).</p>
+<hr />
+<h2 id="synthese">Synthese</h2>
+<table>
+<thead>
+<tr>
+<th>Categorie</th>
+<th>Tests</th>
+<th>OK</th>
+<th>KO</th>
+<th>Non teste</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dashboard</td>
+<td>4</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Bibliotheque</td>
+<td>8</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Lecture &amp; Zones</td>
+<td>10</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Streaming</td>
+<td>5</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Playlists</td>
+<td>5</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Reglages</td>
+<td>8</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Stabilite web</td>
+<td>4</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>Plateforme</td>
+<td>10</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>API only</td>
+<td>4</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>58</strong></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Testeur</strong> : _______________ <strong>Date</strong> :
+_______________ <strong>Version</strong> : _______________
+<strong>Plateforme</strong> : _______________</p>
+<p><strong>Commentaire general</strong> :</p>
+</body>
+</html>
