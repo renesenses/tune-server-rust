@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OpenFlags};
 use tracing::info;
 
+use crate::db::engine::{Engine, SqliteDialect};
+
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
     read_conn: Arc<Mutex<Connection>>,
@@ -121,6 +123,18 @@ impl SqliteDb {
             tracing::warn!(query = label, ms = elapsed.as_millis() as u64, "slow_query");
         }
         result
+    }
+
+    /// Returns the SQL dialect handle for this backend. Repos that build
+    /// engine-agnostic queries use it to emit placeholders, FTS matches
+    /// and JSON-extract clauses.
+    pub fn dialect(&self) -> SqliteDialect {
+        SqliteDialect
+    }
+
+    /// Identifies the engine. Always `Engine::Sqlite` for this type.
+    pub fn engine(&self) -> Engine {
+        Engine::Sqlite
     }
 }
 
