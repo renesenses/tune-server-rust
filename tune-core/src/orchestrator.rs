@@ -419,11 +419,19 @@ impl PlaybackOrchestrator {
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            let url = self.streamer.get_stream_url(
-                &session_id,
-                &server_ip,
-                &stream_data.quality.codec.to_lowercase(),
-            );
+            // OAAT outputs only support WAV/FLAC/DSD — force WAV for other codecs
+            let is_oaat_stream = req
+                .output_device_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+            let stream_ext = if is_oaat_stream {
+                "wav".to_string()
+            } else {
+                stream_data.quality.codec.to_lowercase()
+            };
+            let url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, &stream_ext);
             (url, Some(session_id))
         } else {
             (stream_data.url.clone(), None)
