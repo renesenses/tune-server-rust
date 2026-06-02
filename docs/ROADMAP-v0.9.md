@@ -3,6 +3,7 @@
 Document de cadrage pour la prochaine release majeure de Tune. Cinq axes prioritaires définis post-v0.8.22.
 
 **Cible** : Q3 2026
+**Trigger de lancement** : v0.8.50 (palier de stabilisation atteint sur la branche v0.8.x)
 **Statut** : Draft (2026-06-02)
 **Audience** : équipe + testeurs avancés (relecture Pascal, Dominique attendue)
 
@@ -230,7 +231,8 @@ Repoussé à v1.0 ou ultérieur :
 - **Relecture** : Pascal (bluevelvet, audiophile Windows), Dominique (Windows, métadonnées), Yves (DMG/DLNA)
 - **Issues GitHub** : chaque axe créé comme `Epic` avec checklist
 - **Communication forum** : annonce roadmap dès validation (post Mozaiklabs `[Roadmap] v0.9.0`)
-- **Cadence** : milestones intermédiaires v0.8.30, v0.8.40, v0.8.50 avant la bascule v0.9.0
+- **Cadence** : milestones intermédiaires v0.8.30, v0.8.40, puis **v0.8.50 = bascule sur la roadmap v0.9.0**
+- **Critère de bascule** : à v0.8.50, geler les nouvelles features v0.8.x et ouvrir la branche `release/v0.9` pour démarrer les 5 axes dans l'ordre suggéré
 
 ---
 
