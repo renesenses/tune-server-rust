@@ -1,9 +1,206 @@
 use rusqlite::{OptionalExtension, params};
 
+use super::engine::SqlDialect;
 use super::models::Album;
 use super::sqlite::SqliteDb;
 
-const SELECT_ALBUM: &str = "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id";
+/// Engine-agnostic SQL builders for album_repo.
+///
+/// The `search()` and `list_by_genre()` methods retain SQLite-specific
+/// fragments (FTS5 MATCH, `json_each()`); phase 4 will swap them via
+/// dialect helpers (tsvector match and `jsonb_array_elements_text`).
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn select_album() -> &'static str {
+        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
+    }
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!("{} WHERE a.id = {}", select_album(), d.placeholder(1))
+    }
+
+    pub fn get_by_title<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE LOWER(a.title) = LOWER({}) LIMIT 1",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_by_title_only<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.title = {} LIMIT 1",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_by_title_artist_year<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.title = {} AND a.artist_id = {} AND a.year = {}",
+            select_album(),
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn get_by_title_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.title = {} AND a.artist_id = {}",
+            select_album(),
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_by_musicbrainz_release_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.musicbrainz_release_id = {}",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn create<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11),
+            d.placeholder(12),
+            d.placeholder(13),
+            d.placeholder(14),
+            d.placeholder(15),
+            d.placeholder(16),
+            d.placeholder(17),
+            d.placeholder(18),
+            d.placeholder(19),
+            d.placeholder(20),
+            d.placeholder(21),
+            d.placeholder(22),
+        )
+    }
+
+    pub fn create_minimal<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO albums (title, artist_id, year) VALUES ({}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn create_with_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO albums (title, artist_id, year, musicbrainz_release_id) VALUES ({}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    pub fn update<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11),
+            d.placeholder(12),
+            d.placeholder(13),
+            d.placeholder(14),
+            d.placeholder(15),
+            d.placeholder(16),
+            d.placeholder(17),
+            d.placeholder(18),
+        )
+    }
+
+    pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = {} WHERE id = {} AND (cover_path IS NULL OR cover_path = '')",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn update_track_count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = {}) WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM albums WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn count_orphans() -> &'static str {
+        "SELECT COUNT(*) FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)"
+    }
+
+    pub fn delete_orphans() -> &'static str {
+        "DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)"
+    }
+
+    pub fn count() -> &'static str {
+        "SELECT COUNT(*) FROM albums"
+    }
+
+    pub fn list_recent<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} ORDER BY a.id DESC LIMIT {}",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_by_release_group<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.musicbrainz_release_group_id = {} ORDER BY a.year, a.title",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_release_groups() -> String {
+        format!(
+            "{} WHERE a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.musicbrainz_release_group_id, a.year",
+            select_album()
+        )
+    }
+
+    pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE a.artist_id = {} ORDER BY a.year, a.title",
+            select_album(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_without_cover() -> &'static str {
+        "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.cover_path IS NULL OR a.cover_path = '') AND a.source = 'local' ORDER BY a.id"
+    }
+}
 
 pub struct AlbumRepo {
     db: SqliteDb,
@@ -17,7 +214,7 @@ impl AlbumRepo {
     pub fn get(&self, id: i64) -> Result<Option<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.id = ?"))
+            .prepare(&sql::get_by_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_album(row)))
             .optional()
@@ -27,9 +224,7 @@ impl AlbumRepo {
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.title = ? COLLATE NOCASE LIMIT 1"
-            ))
+            .prepare(&sql::get_by_title(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![title], |row| Ok(row_to_album(row)))
             .optional()
@@ -46,9 +241,7 @@ impl AlbumRepo {
         // Try exact match with year first
         if let Some(y) = year {
             let mut stmt = conn
-                .prepare(&format!(
-                    "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"
-                ))
+                .prepare(&sql::get_by_title_artist_year(&self.db.dialect()))
                 .map_err(|e| e.to_string())?;
             if let Some(album) = stmt
                 .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
@@ -61,9 +254,7 @@ impl AlbumRepo {
         // Fallback: match by title + artist without year (avoids duplicate albums
         // when tracks from the same album have different or missing year tags)
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
-            ))
+            .prepare(&sql::get_by_title_artist(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
             .optional()
@@ -73,7 +264,7 @@ impl AlbumRepo {
     pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.title = ? LIMIT 1"))
+            .prepare(&sql::get_by_title_only(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![title], |row| Ok(row_to_album(row)))
             .optional()
@@ -83,9 +274,7 @@ impl AlbumRepo {
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"
-            ))
+            .prepare(&sql::get_by_musicbrainz_release_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![release_id], |row| Ok(row_to_album(row)))
             .optional()
@@ -94,17 +283,30 @@ impl AlbumRepo {
 
     pub fn create(&self, album: &Album) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &sql::create(&self.db.dialect()),
             &[
                 &album.title as &dyn rusqlite::types::ToSql,
-                &album.artist_id, &album.year, &album.original_year,
-                &album.genre, &album.genres, &album.disc_count, &album.track_count,
-                &album.cover_path, &album.source, &album.source_id,
-                &album.label, &album.catalog_number, &album.barcode,
-                &album.format, &album.sample_rate, &album.bit_depth,
-                &album.bio, &album.musicbrainz_release_id,
+                &album.artist_id,
+                &album.year,
+                &album.original_year,
+                &album.genre,
+                &album.genres,
+                &album.disc_count,
+                &album.track_count,
+                &album.cover_path,
+                &album.source,
+                &album.source_id,
+                &album.label,
+                &album.catalog_number,
+                &album.barcode,
+                &album.format,
+                &album.sample_rate,
+                &album.bit_depth,
+                &album.bio,
+                &album.musicbrainz_release_id,
                 &album.musicbrainz_release_group_id,
-                &album.release_date, &album.original_date,
+                &album.release_date,
+                &album.original_date,
             ],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -120,14 +322,22 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Album, String> {
+        let d = self.db.dialect();
+        let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
+        let by_title_artist_sql = sql::get_by_title_artist(&d);
+        let create_sql = sql::create_minimal(&d);
         self.db.write(|conn| {
-            if let Some(album) = lookup_album(conn, title, artist_id, year)? {
+            if let Some(album) = lookup_album(
+                conn,
+                title,
+                artist_id,
+                year,
+                &by_title_artist_year_sql,
+                &by_title_artist_sql,
+            )? {
                 return Ok(album);
             }
-            conn.execute(
-                "INSERT INTO albums (title, artist_id, year) VALUES (?, ?, ?)",
-                rusqlite::params![title, artist_id, year],
-            )?;
+            conn.execute(&create_sql, rusqlite::params![title, artist_id, year])?;
             let id = conn.last_insert_rowid();
             let mut album = Album::new(title.to_string());
             album.id = Some(id);
@@ -145,11 +355,14 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, String> {
+        let d = self.db.dialect();
+        let by_mbid_sql = sql::get_by_musicbrainz_release_id(&d);
+        let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
+        let by_title_artist_sql = sql::get_by_title_artist(&d);
+        let create_sql = sql::create_with_mbid(&d);
         self.db.write(|conn| {
             if let Some(release_id) = mbid {
-                let mut stmt = conn.prepare_cached(
-                    &format!("{SELECT_ALBUM} WHERE a.musicbrainz_release_id = ?"),
-                )?;
+                let mut stmt = conn.prepare_cached(&by_mbid_sql)?;
                 if let Some(album) = stmt
                     .query_row(params![release_id], |row| Ok(row_to_album(row)))
                     .optional()?
@@ -157,13 +370,17 @@ impl AlbumRepo {
                     return Ok(album);
                 }
             }
-            if let Some(album) = lookup_album(conn, title, artist_id, year)? {
+            if let Some(album) = lookup_album(
+                conn,
+                title,
+                artist_id,
+                year,
+                &by_title_artist_year_sql,
+                &by_title_artist_sql,
+            )? {
                 return Ok(album);
             }
-            conn.execute(
-                "INSERT INTO albums (title, artist_id, year, musicbrainz_release_id) VALUES (?, ?, ?, ?)",
-                rusqlite::params![title, artist_id, year, mbid],
-            )?;
+            conn.execute(&create_sql, rusqlite::params![title, artist_id, year, mbid])?;
             let id = conn.last_insert_rowid();
             let mut album = Album::new(title.to_string());
             album.id = Some(id);
@@ -177,15 +394,26 @@ impl AlbumRepo {
     pub fn update(&self, album: &Album) -> Result<(), String> {
         let id = album.id.ok_or("album has no id")?;
         self.db.execute(
-            "UPDATE albums SET title = ?, artist_id = ?, year = ?, original_year = ?, genre = ?, genres = ?, disc_count = ?, track_count = ?, cover_path = ?, label = ?, catalog_number = ?, format = ?, sample_rate = ?, bit_depth = ?, bio = ?, musicbrainz_release_id = ?, musicbrainz_release_group_id = ? WHERE id = ?",
+            &sql::update(&self.db.dialect()),
             &[
                 &album.title as &dyn rusqlite::types::ToSql,
-                &album.artist_id, &album.year, &album.original_year,
-                &album.genre, &album.genres, &album.disc_count, &album.track_count,
-                &album.cover_path, &album.label, &album.catalog_number,
-                &album.format, &album.sample_rate, &album.bit_depth,
-                &album.bio, &album.musicbrainz_release_id,
-                &album.musicbrainz_release_group_id, &id,
+                &album.artist_id,
+                &album.year,
+                &album.original_year,
+                &album.genre,
+                &album.genres,
+                &album.disc_count,
+                &album.track_count,
+                &album.cover_path,
+                &album.label,
+                &album.catalog_number,
+                &album.format,
+                &album.sample_rate,
+                &album.bit_depth,
+                &album.bio,
+                &album.musicbrainz_release_id,
+                &album.musicbrainz_release_group_id,
+                &id,
             ],
         )?;
         Ok(())
@@ -193,7 +421,7 @@ impl AlbumRepo {
 
     pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
         self.db.execute(
-            "UPDATE albums SET cover_path = ? WHERE id = ? AND (cover_path IS NULL OR cover_path = '')",
+            &sql::update_cover_path(&self.db.dialect()),
             &[&cover_path as &dyn rusqlite::types::ToSql, &album_id],
         )?;
         Ok(())
@@ -201,7 +429,7 @@ impl AlbumRepo {
 
     pub fn update_track_count(&self, album_id: i64) -> Result<(), String> {
         self.db.execute(
-            "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = ?) WHERE id = ?",
+            &sql::update_track_count(&self.db.dialect()),
             &[&album_id, &album_id],
         )?;
         Ok(())
@@ -223,38 +451,32 @@ impl AlbumRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM albums WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
     pub fn delete_orphans(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(sql::count_orphans(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         if count > 0 {
-            conn.execute(
-                "DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)",
-                [],
-            ).map_err(|e| e.to_string())?;
+            conn.execute(sql::delete_orphans(), [])
+                .map_err(|e| e.to_string())?;
         }
         Ok(count)
     }
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
+        conn.query_row(sql::count(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} ORDER BY a.id DESC LIMIT ?"))
+            .prepare(&sql::list_recent(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| Ok(row_to_album(row)))
@@ -267,9 +489,7 @@ impl AlbumRepo {
     pub fn list_by_release_group(&self, group_id: &str) -> Result<Vec<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.musicbrainz_release_group_id = ? ORDER BY a.year, a.title"
-            ))
+            .prepare(&sql::list_by_release_group(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_map(params![group_id], |row| Ok(row_to_album(row)))
             .map_err(|e| e.to_string())?
@@ -280,11 +500,7 @@ impl AlbumRepo {
     pub fn list_release_groups(&self) -> Result<Vec<(String, Vec<Album>)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.musicbrainz_release_group_id IS NOT NULL \
-                 AND a.musicbrainz_release_group_id != '' \
-                 ORDER BY a.musicbrainz_release_group_id, a.year"
-            ))
+            .prepare(&sql::list_release_groups())
             .map_err(|e| e.to_string())?;
         let albums: Vec<Album> = stmt
             .query_map([], |row| Ok(row_to_album(row)))
@@ -333,10 +549,10 @@ impl AlbumRepo {
             "ASC"
         };
         let order_clause = match sort {
-            "title" => format!("a.title COLLATE NOCASE {dir}"),
-            "release_date" | "year" => format!("a.year {dir}, a.title COLLATE NOCASE ASC"),
+            "title" => format!("LOWER(a.title) {dir}"),
+            "release_date" | "year" => format!("a.year {dir}, LOWER(a.title) ASC"),
             "artist" => {
-                format!("ar.name COLLATE NOCASE {dir}, a.year ASC, a.title COLLATE NOCASE ASC")
+                format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
             _ => format!("a.id {dir}"),
         };
@@ -371,7 +587,10 @@ impl AlbumRepo {
             format!(" WHERE {}", wheres.join(" AND "))
         };
 
-        let sql = format!("{SELECT_ALBUM}{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?");
+        let sql = format!(
+            "{}{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+            sql::select_album()
+        );
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
@@ -391,9 +610,7 @@ impl AlbumRepo {
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_ALBUM} WHERE a.artist_id = ? ORDER BY a.year, a.title"
-            ))
+            .prepare(&sql::list_by_artist(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(params![artist_id], |row| Ok(row_to_album(row)))
@@ -410,13 +627,18 @@ impl AlbumRepo {
         //    We normalize separators to commas and use delimiter-aware LIKE matching
         //    so "Rock" does not accidentally match "Progressive Rock".
         // 2) The structured `genres` JSON array via json_each() for exact element match.
+        //
+        // The `json_each()` table-valued function is SQLite-only. Phase 4 will
+        // swap it for `jsonb_array_elements_text(a2.genres)` on Postgres via a
+        // dialect helper.
         let delimited_pattern = format!("%,{},%", genre.replace('%', "").replace('_', ""));
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_ALBUM} WHERE \
-                 (',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE ? COLLATE NOCASE \
-                 OR a.id IN (SELECT a2.id FROM albums a2, json_each(a2.genres) WHERE json_each.value = ? COLLATE NOCASE) \
-                 ORDER BY a.title COLLATE NOCASE"
+                "{} WHERE \
+                 LOWER(',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE LOWER(?) \
+                 OR a.id IN (SELECT a2.id FROM albums a2, json_each(a2.genres) WHERE LOWER(json_each.value) = LOWER(?)) \
+                 ORDER BY LOWER(a.title)",
+                sql::select_album()
             ))
             .map_err(|e| e.to_string())?;
         let albums = stmt
@@ -437,13 +659,7 @@ impl AlbumRepo {
     ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id \
-                 FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
-                 WHERE (a.cover_path IS NULL OR a.cover_path = '') \
-                 AND a.source = 'local' \
-                 ORDER BY a.id",
-            )
+            .prepare(sql::list_without_cover())
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map([], |row| {
@@ -464,8 +680,10 @@ impl AlbumRepo {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
+        // The FTS5 MATCH subquery is SQLite-only; phase 4 swaps it for a
+        // tsvector @@ to_tsquery clause via the dialect helper.
         let mut stmt = conn
-            .prepare(&format!("{SELECT_ALBUM} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR a.title LIKE ? COLLATE NOCASE OR ar.name LIKE ? COLLATE NOCASE OR a.genre LIKE ? COLLATE NOCASE OR CAST(a.year AS TEXT) = ? OR a.label LIKE ? COLLATE NOCASE LIMIT ?"))
+            .prepare(&format!("{} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR LOWER(a.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(a.genre) LIKE LOWER(?) OR CAST(a.year AS TEXT) = ? OR LOWER(a.label) LIKE LOWER(?) LIMIT ?", sql::select_album()))
             .map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(
@@ -486,11 +704,11 @@ fn lookup_album(
     title: &str,
     artist_id: i64,
     year: Option<i32>,
+    by_title_artist_year_sql: &str,
+    by_title_artist_sql: &str,
 ) -> Result<Option<Album>, rusqlite::Error> {
     if let Some(y) = year {
-        let mut stmt = conn.prepare_cached(&format!(
-            "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ? AND a.year = ?"
-        ))?;
+        let mut stmt = conn.prepare_cached(by_title_artist_year_sql)?;
         if let Some(album) = stmt
             .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
             .optional()?
@@ -498,9 +716,7 @@ fn lookup_album(
             return Ok(Some(album));
         }
     }
-    let mut stmt = conn.prepare_cached(&format!(
-        "{SELECT_ALBUM} WHERE a.title = ? AND a.artist_id = ?"
-    ))?;
+    let mut stmt = conn.prepare_cached(by_title_artist_sql)?;
     stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
         .optional()
 }
@@ -1032,6 +1248,19 @@ mod tests {
 
         let desc = repo.list_sorted(100, 0, "artist", "desc").unwrap();
         assert_eq!(desc[0].title, "Hot Rats"); // Zappa first
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::get_by_id(&s).ends_with("WHERE a.id = ?"));
+        assert!(sql::get_by_id(&p).ends_with("WHERE a.id = $1"));
+        assert!(sql::get_by_title(&p).contains("LOWER(a.title) = LOWER($1)"));
+        assert!(sql::create_minimal(&p).contains("VALUES ($1, $2, $3)"));
+        // No more COLLATE in the canonical builders.
+        assert!(!sql::list_by_artist(&p).contains("COLLATE"));
     }
 
     #[test]
