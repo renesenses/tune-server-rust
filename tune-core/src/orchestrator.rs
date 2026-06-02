@@ -195,10 +195,17 @@ impl PlaybackOrchestrator {
         let is_dsd = source_format
             .as_ref()
             .is_some_and(|f| *f == AudioFormat::Dsd);
-        let needs_transcode = source_format
+        // OAAT endpoints need WAV (FLAC passthrough has decoder issues on endpoints)
+        let oaat_needs_wav = is_oaat_output
+            && !is_dsd
+            && source_format
+                .as_ref()
+                .is_some_and(|f| *f != AudioFormat::Wav);
+        let needs_transcode = (source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna())
-            && !(is_oaat_output && is_dsd);
+            && !(is_oaat_output && is_dsd))
+            || oaat_needs_wav;
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
             let src_fmt = source_format.unwrap(); // safe: needs_transcode is true
