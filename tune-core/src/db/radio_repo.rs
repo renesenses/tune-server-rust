@@ -1,7 +1,103 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for radio_repo.
+///
+/// SQLite's `COLLATE NOCASE` is replaced by `LOWER(col)` for case-
+/// insensitive ordering, which works identically on both engines.
+/// The `LIKE` search uses `LOWER(col) LIKE LOWER(?)` for the same
+/// reason — avoiding ILIKE keeps the query portable.
+pub mod sql {
+    use super::SqlDialect;
+
+    const COLS: &str = "id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count";
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM radio_stations WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_all() -> String {
+        format!("SELECT {COLS} FROM radio_stations ORDER BY is_favorite DESC, LOWER(name)")
+    }
+
+    pub fn favorites() -> String {
+        format!("SELECT {COLS} FROM radio_stations WHERE is_favorite = 1 ORDER BY LOWER(name)")
+    }
+
+    pub fn create<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO radio_stations (name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10)
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM radio_stations WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn set_favorite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET is_favorite = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` is SQLite. The portable
+    /// equivalent for PG is `to_char(now() AT TIME ZONE 'UTC',
+    /// 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`. The phase 4 PG impl will swap
+    /// the function via a dialect helper; for now this stays SQLite.
+    pub fn record_play<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET play_count = play_count + 1, last_played = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM radio_stations WHERE LOWER(name) LIKE LOWER({}) OR LOWER(genre) LIKE LOWER({}) OR LOWER(country) LIKE LOWER({}) ORDER BY is_favorite DESC, LOWER(name) LIMIT 50",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn update<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE radio_stations SET name = {}, url = {}, homepage = {}, logo_url = {}, country = {}, language = {}, genre = {}, codec = {}, bitrate = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10)
+        )
+    }
+
+    pub fn count() -> &'static str {
+        "SELECT COUNT(*) FROM radio_stations"
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioStation {
@@ -32,7 +128,7 @@ impl RadioRepo {
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE id = ?")
+            .prepare(&sql::get_by_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_radio(row)))
             .optional()
@@ -41,9 +137,7 @@ impl RadioRepo {
 
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations ORDER BY is_favorite DESC, name COLLATE NOCASE")
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&sql::list_all()).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map([], |row| Ok(row_to_radio(row)))
             .map_err(|e| e.to_string())?
@@ -54,9 +148,7 @@ impl RadioRepo {
 
     pub fn favorites(&self) -> Result<Vec<RadioStation>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE is_favorite = 1 ORDER BY name COLLATE NOCASE")
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&sql::favorites()).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map([], |row| Ok(row_to_radio(row)))
             .map_err(|e| e.to_string())?
@@ -67,7 +159,7 @@ impl RadioRepo {
 
     pub fn create(&self, station: &RadioStation) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO radio_stations (name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &sql::create(&self.db.dialect()),
             &[
                 &station.name as &dyn rusqlite::types::ToSql,
                 &station.url,
@@ -85,24 +177,21 @@ impl RadioRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM radio_stations WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
     pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<(), String> {
         self.db.execute(
-            "UPDATE radio_stations SET is_favorite = ? WHERE id = ?",
+            &sql::set_favorite(&self.db.dialect()),
             &[&favorite as &dyn rusqlite::types::ToSql, &id],
         )?;
         Ok(())
     }
 
     pub fn record_play(&self, id: i64) -> Result<(), String> {
-        self.db.execute(
-            "UPDATE radio_stations SET play_count = play_count + 1, last_played = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-            &[&id],
-        )?;
+        self.db
+            .execute(&sql::record_play(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
@@ -110,7 +199,7 @@ impl RadioRepo {
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite, last_played, play_count FROM radio_stations WHERE name LIKE ? OR genre LIKE ? OR country LIKE ? ORDER BY is_favorite DESC, name COLLATE NOCASE LIMIT 50")
+            .prepare(&sql::search(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![like, like, like], |row| Ok(row_to_radio(row)))
@@ -125,7 +214,7 @@ impl RadioRepo {
             return Err("station has no id".into());
         };
         self.db.execute(
-            "UPDATE radio_stations SET name = ?, url = ?, homepage = ?, logo_url = ?, country = ?, language = ?, genre = ?, codec = ?, bitrate = ? WHERE id = ?",
+            &sql::update(&self.db.dialect()),
             &[
                 &station.name as &dyn rusqlite::types::ToSql,
                 &station.url,
@@ -144,7 +233,7 @@ impl RadioRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM radio_stations", [], |row| row.get(0))
+        conn.query_row(sql::count(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 }
@@ -374,6 +463,21 @@ mod tests {
 
         let repo = RadioRepo::new(db);
         assert!(repo.favorites().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sql_builders_replace_collate_with_lower() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        // No more COLLATE NOCASE anywhere.
+        assert!(!sql::list_all().contains("COLLATE"));
+        assert!(!sql::favorites().contains("COLLATE"));
+        assert!(!sql::search(&s).contains("COLLATE"));
+        // Search uses LOWER for case-insensitive matching, portable.
+        let pg_search = sql::search(&p);
+        assert!(pg_search.contains("LOWER(name) LIKE LOWER($1)"));
+        assert!(pg_search.ends_with("LIMIT 50"));
     }
 
     #[test]
