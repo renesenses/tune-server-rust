@@ -150,7 +150,7 @@ jobs:
             FileWrite `$0 'cd /d "%~dp0"$\r$\n'
             FileWrite `$0 'set "TUNE_WEB_DIR=%~dp0web"$\r$\n'
             FileWrite `$0 'set "TUNE_PORT=8888"$\r$\n'
-            FileWrite `$0 'start http://localhost:%TUNE_PORT%$\r$\n'
+            FileWrite `$0 'set "TUNE_OPEN_BROWSER=1"$\r$\n'
             FileWrite `$0 'tune-server.exe$\r$\n'
             FileClose `$0
 
@@ -208,7 +208,7 @@ jobs:
           DIR="$(cd "$(dirname "$0")" && pwd)"
           export TUNE_WEB_DIR="$DIR/web"
           export TUNE_PORT="${TUNE_PORT:-8888}"
-          open "http://localhost:$TUNE_PORT" &
+          export TUNE_OPEN_BROWSER=1
           exec "$DIR/tune-server"
           SCRIPT
           chmod +x "$APP_DIR/start-tune-server.command"
