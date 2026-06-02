@@ -31,6 +31,11 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 5;
+/// Minimum fraction of track duration that must have been played before a
+/// gapless transition is accepted.  Prevents false transitions when a
+/// renderer (e.g. DMP-A8) reports state changes immediately after
+/// SetNextAVTransportURI.
+const MIN_PLAYED_FRACTION: f64 = 0.80;
 /// How often (in ticks) to persist the playback position to the database.
 const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 
@@ -73,6 +78,10 @@ struct ZonePollState {
     /// Last polled position in milliseconds — used to detect position
     /// resets (jumps from >30s to <5s) that signal a gapless transition.
     last_position_ms: u64,
+    /// Peak position reached in the current track — high-water mark used
+    /// to verify that enough of the track was actually played before
+    /// accepting a gapless transition.
+    peak_position_ms: u64,
     /// Tick counter for throttling DB position saves.
     ticks_since_db_save: u64,
 }
@@ -213,6 +222,7 @@ impl PositionPoller {
                 last_radio_poll: Instant::now(),
                 gapless_sent_at: None,
                 last_position_ms: 0,
+                peak_position_ms: 0,
                 ticks_since_db_save: 0,
             });
 
@@ -340,6 +350,26 @@ impl PositionPoller {
                 }
             }
 
+            // Track the high-water mark for position — used to verify that
+            // enough of the track was actually played before accepting a
+            // gapless transition.  We update this BEFORE checking for resets
+            // so the peak reflects the last known good position.
+            if status.position_ms > ps.peak_position_ms {
+                ps.peak_position_ms = status.position_ms;
+            }
+
+            let track_duration_ms = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.duration_ms as u64)
+                .unwrap_or(0);
+
+            // Helper: has enough of the track been played?
+            // True when peak_position_ms >= 80% of track_duration, or
+            // when track_duration is unknown/zero (no guard possible).
+            let played_enough = track_duration_ms == 0
+                || ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION;
+
             // Detect position reset: position drops from >30s to <5s.
             // This is a strong signal that the renderer performed a gapless
             // transition (the new track starts from 0).
@@ -349,25 +379,35 @@ impl PositionPoller {
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
-                info!(
-                    zone_id,
-                    prev_pos = ps.last_position_ms,
-                    new_pos = status.position_ms,
-                    "gapless_position_reset_detected"
-                );
-                ps.gapless_sent = false;
-                ps.gapless_sent_at = None;
-                ps.stopped_ticks = 0;
-                if let Some(next_pos) = Self::next_position(zone_state) {
-                    info!(zone_id, next_pos, "gapless_advance_on_position_reset");
-                    if let Err(e) = self
-                        .orchestrator
-                        .advance_queue_metadata(zone_id, next_pos)
-                        .await
-                    {
-                        warn!(zone_id, error = %e, "gapless_advance_failed");
+                if !played_enough {
+                    warn!(
+                        zone_id,
+                        peak_pos = ps.peak_position_ms,
+                        track_dur = track_duration_ms,
+                        "gapless_position_reset_ignored_not_enough_played"
+                    );
+                } else {
+                    info!(
+                        zone_id,
+                        prev_pos = ps.last_position_ms,
+                        new_pos = status.position_ms,
+                        "gapless_position_reset_detected"
+                    );
+                    ps.gapless_sent = false;
+                    ps.gapless_sent_at = None;
+                    ps.stopped_ticks = 0;
+                    ps.peak_position_ms = 0;
+                    if let Some(next_pos) = Self::next_position(zone_state) {
+                        info!(zone_id, next_pos, "gapless_advance_on_position_reset");
+                        if let Err(e) = self
+                            .orchestrator
+                            .advance_queue_metadata(zone_id, next_pos)
+                            .await
+                        {
+                            warn!(zone_id, error = %e, "gapless_advance_failed");
+                        }
+                        ps.gapless_cooldown = 4;
                     }
-                    ps.gapless_cooldown = 4;
                 }
             }
 
@@ -388,22 +428,35 @@ impl PositionPoller {
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
                     } else if in_gapless_guard {
-                        // During the gapless guard period, a Stopped state
-                        // means the renderer transitioned via gapless —
-                        // advance metadata instead of triggering track end.
-                        info!(zone_id, "gapless_guard_stopped_advancing");
-                        ps.gapless_sent = false;
-                        ps.gapless_sent_at = None;
-                        ps.stopped_ticks = 0;
-                        if let Some(next_pos) = Self::next_position(zone_state) {
-                            if let Err(e) = self
-                                .orchestrator
-                                .advance_queue_metadata(zone_id, next_pos)
-                                .await
-                            {
-                                warn!(zone_id, error = %e, "gapless_advance_failed");
+                        if !played_enough {
+                            // Renderer reported Stopped during guard but not
+                            // enough of the track was played — ignore to avoid
+                            // false skip (DMP-A8 quirk).
+                            debug!(
+                                zone_id,
+                                peak_pos = ps.peak_position_ms,
+                                track_dur = track_duration_ms,
+                                "gapless_guard_stopped_ignored_not_enough_played"
+                            );
+                        } else {
+                            // During the gapless guard period, a Stopped state
+                            // means the renderer transitioned via gapless —
+                            // advance metadata instead of triggering track end.
+                            info!(zone_id, "gapless_guard_stopped_advancing");
+                            ps.gapless_sent = false;
+                            ps.gapless_sent_at = None;
+                            ps.stopped_ticks = 0;
+                            ps.peak_position_ms = 0;
+                            if let Some(next_pos) = Self::next_position(zone_state) {
+                                if let Err(e) = self
+                                    .orchestrator
+                                    .advance_queue_metadata(zone_id, next_pos)
+                                    .await
+                                {
+                                    warn!(zone_id, error = %e, "gapless_advance_failed");
+                                }
+                                ps.gapless_cooldown = 4;
                             }
-                            ps.gapless_cooldown = 4;
                         }
                     } else {
                         ps.stopped_ticks += 1;
@@ -414,34 +467,36 @@ impl PositionPoller {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
 
-                    let track_duration = zone_state
-                        .now_playing
-                        .as_ref()
-                        .map(|np| np.duration_ms as u64)
-                        .unwrap_or(0);
-
                     // Detect gapless transition: renderer reports a different
                     // duration than the current track AND the position confirms
                     // the track actually ended (near end or reset to start).
                     // Some DLNA renderers (DMP-A6/A8) report inaccurate durations
                     // from the start, so duration mismatch alone is insufficient.
                     let duration_changed = ps.gapless_sent
-                        && track_duration > 0
+                        && track_duration_ms > 0
                         && status.duration_ms > 0
-                        && (status.duration_ms as i64 - track_duration as i64).unsigned_abs()
+                        && (status.duration_ms as i64 - track_duration_ms as i64).unsigned_abs()
                             > 2000;
-                    let position_confirms_transition = status.position_ms < 5000
-                        || (track_duration > 0
-                            && status.position_ms
-                                >= track_duration.saturating_sub(GAPLESS_WINDOW_MS));
+                    // Position must confirm we are actually at the end of the
+                    // current track OR that the position has reset to the
+                    // start of the next track.  The played_enough guard
+                    // prevents false transitions when a renderer (DMP-A8)
+                    // reports position < 5s immediately after SetNext.
+                    let position_confirms_transition = played_enough
+                        && (status.position_ms < 5000
+                            || (track_duration_ms > 0
+                                && status.position_ms
+                                    >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)));
                     if duration_changed && position_confirms_transition {
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
-                            track_dur = track_duration,
+                            track_dur = track_duration_ms,
+                            peak_pos = ps.peak_position_ms,
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
+                        ps.peak_position_ms = 0;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -614,6 +669,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            peak_position_ms: 0,
             ticks_since_db_save: 0,
         };
 
@@ -648,6 +704,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            peak_position_ms: 0,
             ticks_since_db_save: 0,
         };
 
@@ -737,6 +794,7 @@ mod tests {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            peak_position_ms: 0,
             ticks_since_db_save: 0,
         };
 
@@ -757,5 +815,38 @@ mod tests {
         // Success resets
         ps.consecutive_errors = 0;
         assert_eq!(ps.consecutive_errors, 0);
+    }
+
+    #[test]
+    fn played_enough_rejects_early_transition() {
+        // Track is 300 seconds (300_000 ms).  Peak at 10s — only 3.3% played.
+        let peak_ms: u64 = 10_000;
+        let duration_ms: u64 = 300_000;
+        let played_enough =
+            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
+        assert!(
+            !played_enough,
+            "10s into a 5-min track should NOT be enough"
+        );
+    }
+
+    #[test]
+    fn played_enough_accepts_late_transition() {
+        // Track is 300 seconds.  Peak at 280s — 93% played.
+        let peak_ms: u64 = 280_000;
+        let duration_ms: u64 = 300_000;
+        let played_enough =
+            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
+        assert!(played_enough, "280s into a 5-min track should be enough");
+    }
+
+    #[test]
+    fn played_enough_unknown_duration() {
+        // When duration is unknown (0), we cannot guard — allow transition.
+        let peak_ms: u64 = 5_000;
+        let duration_ms: u64 = 0;
+        let played_enough =
+            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
+        assert!(played_enough, "unknown duration should always pass");
     }
 }
