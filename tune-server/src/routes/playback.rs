@@ -122,6 +122,10 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/move", post(queue_move))
         .route("/{id}/queue/jump", post(queue_jump))
         .route("/{id}/queue/clear", post(queue_clear))
+        .route(
+            "/{id}/queue/{position}",
+            axum::routing::delete(queue_remove),
+        )
         .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
@@ -685,6 +689,39 @@ async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         serde_json::json!({ "zone_id": zone_id }),
     );
     StatusCode::NO_CONTENT
+}
+
+async fn queue_remove(
+    State(state): State<AppState>,
+    Path((zone_id, position)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    let queue_repo = PlayQueueRepo::new(state.db);
+    match queue_repo.remove_at(zone_id, position) {
+        Ok(true) => {
+            let new_length = queue_repo.count(zone_id).unwrap_or(0);
+            let current_pos = state.playback.get_state(zone_id).await.queue_position;
+            let adjusted_pos = if position < current_pos {
+                current_pos - 1
+            } else {
+                current_pos
+            };
+            state
+                .playback
+                .update_queue_info(zone_id, adjusted_pos, new_length)
+                .await;
+            state.event_bus.emit(
+                "playback.queue.track_removed",
+                json!({ "zone_id": zone_id, "position": position }),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "position not found in queue" })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn save_queue_as_playlist(

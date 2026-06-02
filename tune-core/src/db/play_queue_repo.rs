@@ -119,6 +119,27 @@ impl PlayQueueRepo {
         Ok(())
     }
 
+    pub fn remove_at(&self, zone_id: i64, position: i64) -> Result<bool, String> {
+        let mut conn = self.db.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM play_queue WHERE zone_id = ? AND position = ?",
+                params![zone_id, position],
+            )
+            .map_err(|e| e.to_string())?;
+        if deleted > 0 {
+            // Reindex positions so they stay contiguous
+            tx.execute(
+                "UPDATE play_queue SET position = position - 1 WHERE zone_id = ? AND position > ?",
+                params![zone_id, position],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted > 0)
+    }
+
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
         self.db
             .execute("DELETE FROM play_queue WHERE zone_id = ?", &[&zone_id])?;
