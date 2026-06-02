@@ -95,57 +95,20 @@ pub fn normalize_format(raw: &str) -> String {
     }
 }
 
-/// Fallback metadata extraction for DSF/DFF files when lofty fails.
-///
-/// Reads the DSF file header to extract sample rate, channel count, and
-/// duration.  For DFF files (or if DSF header parsing fails), returns a
-/// minimal `TrackMetadata` with at least the title, format, and file size.
-fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
-    let ext = path.extension()?.to_str()?.to_lowercase();
-    if ext != "dsf" && ext != "dff" {
-        return None;
-    }
+// ── DSF / DFF support ──────────────────────────────────────────────────
 
-    let title = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
-
-    // Derive album from parent dir, artist from grandparent (Artist/Album/track.dsf)
-    let album = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string());
-    let artist = path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().to_string());
-
-    let (sample_rate, channels, duration_ms) = if ext == "dsf" {
-        parse_dsf_header(path).unwrap_or((None, None, None))
-    } else {
-        (None, None, None)
-    };
-
-    Some(TrackMetadata {
-        title: Some(title),
-        album,
-        artist: artist.clone(),
-        album_artist: artist,
-        format: Some("dsd".to_string()),
-        file_size,
-        sample_rate,
-        channels,
-        duration_ms: duration_ms.or(Some(0)),
-        ..Default::default()
-    })
+/// Parsed DSF header information.
+struct DsfHeaderInfo {
+    sample_rate: Option<u32>,
+    channels: Option<u16>,
+    duration_ms: Option<u64>,
+    /// Byte offset of the ID3v2 metadata chunk (0 means no metadata).
+    metadata_offset: Option<u64>,
 }
 
-/// Parse a DSF file header to extract sample rate, channel count, and duration.
-#[allow(clippy::type_complexity)]
-fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64>), ()> {
+/// Parse a DSF file header to extract sample rate, channel count, duration,
+/// and the metadata (ID3v2) offset.
+fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
     use std::io::Read;
 
     let mut f = std::fs::File::open(path).map_err(|_| ())?;
@@ -157,24 +120,29 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
         return Err(());
     }
 
-    // DSD chunk size (bytes 4-11, little-endian u64) — should be 28
-    // Total file size at bytes 12-19
-    // Metadata offset at bytes 20-27
+    // DSD chunk: bytes 4-11 = chunk size (u64 LE, should be 28)
+    //            bytes 12-19 = total file size
+    //            bytes 20-27 = metadata offset (0 = none)
+    let metadata_offset = u64::from_le_bytes([
+        header[20], header[21], header[22], header[23], header[24], header[25], header[26],
+        header[27],
+    ]);
 
     // fmt chunk should start at offset 28
     if &header[28..32] != b"fmt " {
         return Err(());
     }
 
-    // fmt chunk: offset 28 is "fmt ", 32-39 is chunk size (u64 LE)
-    // 40-43: format version
-    // 44-47: format ID
-    // 48-51: channel type
-    // 52-55: channel count (u32 LE)
-    // 56-59: sample rate (u32 LE)
-    // 60-61: bits per sample (u16? actually u32 at 60-63)
-    // 64-71: sample count per channel (u64 LE)
-
+    // fmt chunk layout (all little-endian):
+    //   28-31: "fmt " magic
+    //   32-39: chunk size (u64)
+    //   40-43: format version (u32)
+    //   44-47: format ID (u32)
+    //   48-51: channel type (u32)
+    //   52-55: channel count (u32)
+    //   56-59: sample rate (u32)
+    //   60-63: bits per sample (u32)
+    //   64-71: sample count per channel (u64)
     let channels = u32::from_le_bytes([header[52], header[53], header[54], header[55]]);
     let sample_rate = u32::from_le_bytes([header[56], header[57], header[58], header[59]]);
     let bits_per_sample = u32::from_le_bytes([header[60], header[61], header[62], header[63]]);
@@ -185,7 +153,6 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
 
     let duration_ms = if sample_rate > 0 {
         // DSD sample rate is 1-bit rate (e.g. 2_822_400 for DSD64).
-        // Duration = sample_count / sample_rate * 1000
         Some(sample_count * 1000 / sample_rate as u64)
     } else {
         None
@@ -193,7 +160,540 @@ fn parse_dsf_header(path: &Path) -> Result<(Option<u32>, Option<u16>, Option<u64
 
     let _ = bits_per_sample; // typically 1 for DSD
 
-    Ok((Some(sample_rate), Some(channels as u16), duration_ms))
+    Ok(DsfHeaderInfo {
+        sample_rate: Some(sample_rate),
+        channels: Some(channels as u16),
+        duration_ms,
+        metadata_offset: if metadata_offset > 0 {
+            Some(metadata_offset)
+        } else {
+            None
+        },
+    })
+}
+
+/// A parsed ID3v2 text frame (frame ID -> text value).
+#[derive(Debug, Default)]
+struct Id3v2Tags {
+    /// Standard text frames: frame_id (e.g. "TIT2") -> value
+    text_frames: Vec<(String, String)>,
+    /// TXXX user-defined text frames: description -> value
+    txxx_frames: Vec<(String, String)>,
+    /// Whether an APIC (picture) frame was found
+    has_picture: bool,
+}
+
+impl Id3v2Tags {
+    /// Get the first text frame matching the given ID.
+    fn get(&self, frame_id: &str) -> Option<&str> {
+        self.text_frames
+            .iter()
+            .find(|(id, _)| id == frame_id)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Get a TXXX frame by description (case-insensitive).
+    fn get_txxx(&self, description: &str) -> Option<&str> {
+        self.txxx_frames
+            .iter()
+            .find(|(desc, _)| desc.eq_ignore_ascii_case(description))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.get("TIT2")
+    }
+    fn artist(&self) -> Option<&str> {
+        self.get("TPE1")
+    }
+    fn album(&self) -> Option<&str> {
+        self.get("TALB")
+    }
+    fn album_artist(&self) -> Option<&str> {
+        self.get("TPE2")
+    }
+    fn genre(&self) -> Option<&str> {
+        self.get("TCON")
+    }
+
+    /// Parse track number from TRCK frame ("7" or "7/11").
+    fn track_number(&self) -> Option<u32> {
+        let raw = self.get("TRCK")?;
+        raw.split('/').next()?.trim().parse().ok()
+    }
+
+    /// Parse total tracks from TRCK frame ("7/11").
+    fn total_tracks(&self) -> Option<u32> {
+        let raw = self.get("TRCK")?;
+        raw.split('/').nth(1)?.trim().parse().ok()
+    }
+
+    /// Parse disc number from TPOS frame ("1" or "1/2").
+    fn disc_number(&self) -> Option<u32> {
+        let raw = self.get("TPOS")?;
+        raw.split('/').next()?.trim().parse().ok()
+    }
+
+    /// Parse total discs from TPOS frame ("1/2").
+    fn total_discs(&self) -> Option<u32> {
+        let raw = self.get("TPOS")?;
+        raw.split('/').nth(1)?.trim().parse().ok()
+    }
+
+    /// Parse year from TDRC (recording date) or TYER (legacy year) frame.
+    fn year(&self) -> Option<u32> {
+        self.get("TDRC")
+            .or_else(|| self.get("TYER"))
+            .and_then(|s| s.get(..4)?.parse().ok())
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.get("TPUB")
+    }
+
+    fn composer(&self) -> Option<&str> {
+        self.get("TCOM")
+    }
+
+    fn album_artist_sort(&self) -> Option<&str> {
+        self.get("TSO2").or_else(|| self.get("TSOA"))
+    }
+
+    fn original_date(&self) -> Option<&str> {
+        self.get("TDOR")
+    }
+
+    fn original_year(&self) -> Option<u32> {
+        self.original_date().and_then(|s| s.get(..4)?.parse().ok())
+    }
+
+    fn isrc(&self) -> Option<&str> {
+        self.get("TSRC")
+    }
+}
+
+/// Decode an ID3v2 syncsafe integer (7 bits per byte).
+fn syncsafe_to_u32(bytes: &[u8]) -> u32 {
+    debug_assert!(bytes.len() == 4);
+    ((bytes[0] as u32) << 21)
+        | ((bytes[1] as u32) << 14)
+        | ((bytes[2] as u32) << 7)
+        | (bytes[3] as u32)
+}
+
+/// Read and parse an ID3v2 tag from a byte slice starting at "ID3".
+///
+/// Supports ID3v2.3 and ID3v2.4 text frames (TIT2, TPE1, TALB, etc.)
+/// and TXXX user-defined text frames. Skips binary frames (APIC, etc.)
+/// but notes their presence.
+fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
+    if data.len() < 10 || &data[0..3] != b"ID3" {
+        return None;
+    }
+
+    let major_version = data[3]; // 3 = ID3v2.3, 4 = ID3v2.4
+    let _minor_version = data[4];
+    let flags = data[5];
+    let tag_size = syncsafe_to_u32(&data[6..10]) as usize;
+
+    // We only handle ID3v2.3 and ID3v2.4
+    if major_version < 3 || major_version > 4 {
+        return None;
+    }
+
+    // Check for extended header
+    let mut pos = 10;
+    if flags & 0x40 != 0 {
+        // Extended header present, skip it
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let ext_size = if major_version == 4 {
+            syncsafe_to_u32(&data[pos..pos + 4]) as usize
+        } else {
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize
+        };
+        pos += ext_size.max(4);
+    }
+
+    let tag_end = (10 + tag_size).min(data.len());
+    let mut tags = Id3v2Tags::default();
+
+    while pos + 10 <= tag_end {
+        // Frame header: 4 bytes ID, 4 bytes size, 2 bytes flags
+        let frame_id = match std::str::from_utf8(&data[pos..pos + 4]) {
+            Ok(s) => s.to_string(),
+            Err(_) => break,
+        };
+
+        // Stop on padding (null bytes)
+        if frame_id.starts_with('\0') {
+            break;
+        }
+
+        let frame_size = if major_version == 4 {
+            syncsafe_to_u32(&data[pos + 4..pos + 8]) as usize
+        } else {
+            // ID3v2.3 uses regular big-endian u32 for frame size
+            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize
+        };
+
+        let _frame_flags = u16::from_be_bytes([data[pos + 8], data[pos + 9]]);
+        pos += 10; // skip frame header
+
+        if frame_size == 0 || pos + frame_size > tag_end {
+            break;
+        }
+
+        let frame_data = &data[pos..pos + frame_size];
+        pos += frame_size;
+
+        // Check for picture frames
+        if frame_id == "APIC" {
+            tags.has_picture = true;
+            continue;
+        }
+
+        // Only process text frames (start with 'T') and TXXX
+        if !frame_id.starts_with('T') {
+            continue;
+        }
+
+        // Text frame: first byte is encoding, rest is the string
+        if frame_data.is_empty() {
+            continue;
+        }
+
+        let encoding = frame_data[0];
+        let text_data = &frame_data[1..];
+
+        let text = decode_id3v2_string(encoding, text_data);
+        let text = text.trim_end_matches('\0').trim().to_string();
+
+        if text.is_empty() {
+            continue;
+        }
+
+        if frame_id == "TXXX" {
+            // TXXX: encoding byte + null-terminated description + value
+            // The `text` we decoded contains "description\0value"
+            if let Some(null_pos) = text.find('\0') {
+                let desc = text[..null_pos].trim().to_string();
+                let val = text[null_pos + 1..].trim().to_string();
+                if !desc.is_empty() && !val.is_empty() {
+                    tags.txxx_frames.push((desc, val));
+                }
+            }
+        } else {
+            tags.text_frames.push((frame_id, text));
+        }
+    }
+
+    Some(tags)
+}
+
+/// Decode an ID3v2 text string given its encoding byte.
+///
+/// Encodings:
+///   0 = ISO-8859-1 (Latin-1)
+///   1 = UTF-16 with BOM
+///   2 = UTF-16BE without BOM
+///   3 = UTF-8
+fn decode_id3v2_string(encoding: u8, data: &[u8]) -> String {
+    match encoding {
+        0 => {
+            // ISO-8859-1: each byte maps directly to a Unicode code point
+            data.iter().map(|&b| b as char).collect()
+        }
+        1 => {
+            // UTF-16 with BOM
+            if data.len() < 2 {
+                return String::new();
+            }
+            let is_le = data[0] == 0xFF && data[1] == 0xFE;
+            let payload = &data[2..];
+            decode_utf16(payload, is_le)
+        }
+        2 => {
+            // UTF-16BE without BOM
+            decode_utf16(data, false)
+        }
+        3 => {
+            // UTF-8
+            String::from_utf8_lossy(data).to_string()
+        }
+        _ => String::from_utf8_lossy(data).to_string(),
+    }
+}
+
+/// Decode a UTF-16 byte slice to a String.
+fn decode_utf16(data: &[u8], little_endian: bool) -> String {
+    let pairs = data.chunks_exact(2);
+    let code_units: Vec<u16> = pairs
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&code_units)
+}
+
+/// Read and parse the ID3v2 metadata chunk from a DSF file.
+///
+/// DSF files store an ID3v2 tag at the byte offset specified in the DSD
+/// chunk header (bytes 20-27).
+fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v2Tags> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let offset = metadata_offset?;
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+
+    // Sanity check: offset must be within the file, with room for at least
+    // the 10-byte ID3v2 header.
+    if offset + 10 > file_len {
+        return None;
+    }
+
+    f.seek(SeekFrom::Start(offset)).ok()?;
+
+    // Read the ID3v2 header to get the tag size
+    let mut header = [0u8; 10];
+    f.read_exact(&mut header).ok()?;
+
+    if &header[0..3] != b"ID3" {
+        return None;
+    }
+
+    let tag_size = syncsafe_to_u32(&header[6..10]) as usize;
+    let total_tag_bytes = 10 + tag_size;
+
+    // Cap read at 1 MB to avoid OOM on corrupt files
+    if total_tag_bytes > 1_048_576 {
+        return None;
+    }
+
+    // Read the full tag into memory
+    let mut tag_data = vec![0u8; total_tag_bytes];
+    tag_data[..10].copy_from_slice(&header);
+    f.read_exact(&mut tag_data[10..]).ok()?;
+
+    parse_id3v2_tag(&tag_data)
+}
+
+/// Fallback metadata extraction for DSF/DFF files when lofty fails.
+///
+/// DSF files contain an ID3v2 tag at an offset specified in the DSD chunk
+/// header (bytes 20-27).  This function reads that offset, seeks to the
+/// ID3v2 data, and parses the embedded tags.  Audio properties (sample rate,
+/// channels, duration) come from the fmt chunk header.
+///
+/// For DFF files (or if DSF header / ID3v2 parsing fails), we fall back to
+/// deriving title/album/artist from the file path.
+fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext != "dsf" && ext != "dff" {
+        return None;
+    }
+
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    let (sample_rate, channels, duration_ms, metadata_offset) = if ext == "dsf" {
+        match parse_dsf_header_full(path) {
+            Ok(info) => (
+                info.sample_rate,
+                info.channels,
+                info.duration_ms,
+                info.metadata_offset,
+            ),
+            Err(_) => (None, None, None, None),
+        }
+    } else {
+        (None, None, None, None)
+    };
+
+    // Try to read ID3v2 tags from the DSF metadata chunk
+    let id3_tags = if ext == "dsf" {
+        read_dsf_id3v2_tags(path, metadata_offset)
+    } else {
+        None
+    };
+
+    let (
+        title,
+        artist,
+        album,
+        album_artist,
+        album_artist_sort,
+        track_number,
+        disc_number,
+        total_tracks,
+        total_discs,
+        year,
+        original_year,
+        original_date,
+        genre,
+        genres,
+        has_cover,
+        label,
+        isrc,
+        compilation,
+        credits,
+    ) = if let Some(ref tags) = id3_tags {
+        let raw_genre = tags.genre().map(|s| s.to_string());
+        let genres = raw_genre
+            .as_deref()
+            .map(split_genre_tag)
+            .unwrap_or_default();
+        let genre = genres.first().cloned().or(raw_genre);
+
+        let compilation_str = tags.get("TCMP").unwrap_or("");
+        let compilation = matches!(compilation_str, "1" | "true" | "True");
+
+        let mut credits = Vec::new();
+        if let Some(composer) = tags.composer() {
+            credits.push(TrackCredit {
+                name: composer.to_string(),
+                role: "composer".into(),
+                instrument: None,
+            });
+        }
+        if let Some(conductor) = tags.get("TPE3") {
+            credits.push(TrackCredit {
+                name: conductor.to_string(),
+                role: "conductor".into(),
+                instrument: None,
+            });
+        }
+
+        (
+            tags.title().map(|s| s.to_string()),
+            tags.artist().map(|s| s.to_string()),
+            tags.album().map(|s| s.to_string()),
+            tags.album_artist().map(|s| s.to_string()),
+            tags.album_artist_sort().map(|s| s.to_string()),
+            tags.track_number(),
+            tags.disc_number(),
+            tags.total_tracks(),
+            tags.total_discs(),
+            tags.year(),
+            tags.original_year(),
+            tags.original_date().map(|s| s.to_string()),
+            genre,
+            genres,
+            tags.has_picture,
+            tags.label().map(|s| s.to_string()),
+            tags.isrc().map(|s| s.to_string()),
+            compilation,
+            credits,
+        )
+    } else {
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+    };
+
+    // Fall back to filename/directory for fields the ID3v2 tag didn't provide
+    let title = title.or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let album = album.or_else(|| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+    });
+    let artist_fallback = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_string());
+    let artist = artist.or(artist_fallback.clone());
+    let album_artist = album_artist.or(artist_fallback);
+
+    // Extract MusicBrainz IDs from TXXX frames
+    let (
+        mb_recording_id,
+        mb_release_id,
+        mb_artist_id,
+        mb_album_artist_id,
+        mb_release_group_id,
+        catalog_number,
+    ) = if let Some(ref tags) = id3_tags {
+        (
+            tags.get_txxx("MusicBrainz Recording Id")
+                .map(|s| s.to_string()),
+            tags.get_txxx("MusicBrainz Album Id").map(|s| s.to_string()),
+            tags.get_txxx("MusicBrainz Artist Id")
+                .map(|s| s.to_string()),
+            tags.get_txxx("MusicBrainz Album Artist Id")
+                .map(|s| s.to_string()),
+            tags.get_txxx("MusicBrainz Release Group Id")
+                .map(|s| s.to_string()),
+            tags.get_txxx("CATALOGNUMBER")
+                .or_else(|| tags.get_txxx("CatalogNumber"))
+                .map(|s| s.to_string()),
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
+
+    Some(TrackMetadata {
+        title,
+        album,
+        artist,
+        album_artist,
+        album_artist_sort,
+        track_number,
+        disc_number,
+        total_tracks,
+        total_discs,
+        disc_subtitle: None,
+        year,
+        original_year,
+        release_date: None,
+        original_date,
+        genre,
+        genres,
+        format: Some("dsd".to_string()),
+        file_size,
+        sample_rate,
+        channels,
+        duration_ms: duration_ms.or(Some(0)),
+        bit_depth: Some(1), // DSD is always 1-bit
+        bpm: None,
+        compilation,
+        label,
+        catalog_number,
+        musicbrainz_recording_id: mb_recording_id,
+        musicbrainz_release_id: mb_release_id,
+        musicbrainz_artist_id: mb_artist_id,
+        musicbrainz_album_artist_id: mb_album_artist_id,
+        musicbrainz_release_group_id: mb_release_group_id,
+        isrc,
+        has_cover,
+        credits,
+    })
 }
 
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
@@ -399,6 +899,75 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
     credits
 }
 
+/// Helper: build a minimal DSF file with the given audio properties
+/// and optional ID3v2 tag appended.
+#[cfg(test)]
+fn build_dsf_bytes(id3v2_tag: Option<&[u8]>) -> Vec<u8> {
+    let metadata_offset: u64 = if id3v2_tag.is_some() { 92 } else { 0 };
+    let id3_len = id3v2_tag.map(|t| t.len()).unwrap_or(0);
+    let total_size: u64 = 92 + id3_len as u64;
+
+    let mut buf = vec![0u8; 92];
+    // DSD chunk (28 bytes)
+    buf[0..4].copy_from_slice(b"DSD ");
+    buf[4..12].copy_from_slice(&28u64.to_le_bytes());
+    buf[12..20].copy_from_slice(&total_size.to_le_bytes());
+    buf[20..28].copy_from_slice(&metadata_offset.to_le_bytes());
+    // fmt chunk (64 bytes)
+    buf[28..32].copy_from_slice(b"fmt ");
+    buf[32..40].copy_from_slice(&52u64.to_le_bytes());
+    buf[40..44].copy_from_slice(&1u32.to_le_bytes()); // version
+    buf[44..48].copy_from_slice(&0u32.to_le_bytes()); // format ID
+    buf[48..52].copy_from_slice(&2u32.to_le_bytes()); // channel type
+    buf[52..56].copy_from_slice(&2u32.to_le_bytes()); // channel count = 2
+    buf[56..60].copy_from_slice(&2_822_400u32.to_le_bytes()); // DSD64
+    buf[60..64].copy_from_slice(&1u32.to_le_bytes()); // bits per sample
+    let samples: u64 = 2_822_400 * 180; // 3 minutes
+    buf[64..72].copy_from_slice(&samples.to_le_bytes());
+
+    if let Some(tag) = id3v2_tag {
+        buf.extend_from_slice(tag);
+    }
+    buf
+}
+
+/// Helper: build a minimal ID3v2.3 tag with the given text frames.
+/// Each entry is (frame_id, text_value), using ISO-8859-1 encoding.
+#[cfg(test)]
+fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
+    let mut frame_bytes = Vec::new();
+    for (id, text) in frames {
+        assert_eq!(id.len(), 4);
+        // Frame header: 4-byte ID + 4-byte size (big-endian) + 2-byte flags
+        // Frame data: 1-byte encoding (0 = ISO-8859-1) + text bytes
+        let text_bytes = text.as_bytes();
+        let frame_size = 1 + text_bytes.len(); // encoding byte + text
+        frame_bytes.extend_from_slice(id.as_bytes());
+        frame_bytes.extend_from_slice(&(frame_size as u32).to_be_bytes());
+        frame_bytes.extend_from_slice(&[0u8; 2]); // flags
+        frame_bytes.push(0); // encoding = ISO-8859-1
+        frame_bytes.extend_from_slice(text_bytes);
+    }
+
+    let tag_size = frame_bytes.len();
+    // Encode tag_size as syncsafe integer
+    let ss = [
+        ((tag_size >> 21) & 0x7F) as u8,
+        ((tag_size >> 14) & 0x7F) as u8,
+        ((tag_size >> 7) & 0x7F) as u8,
+        (tag_size & 0x7F) as u8,
+    ];
+
+    let mut tag = Vec::new();
+    tag.extend_from_slice(b"ID3");
+    tag.push(3); // version major = ID3v2.3
+    tag.push(0); // version minor
+    tag.push(0); // flags
+    tag.extend_from_slice(&ss);
+    tag.extend_from_slice(&frame_bytes);
+    tag
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,8 +1144,6 @@ mod tests {
 
     #[test]
     fn dsf_dff_fallback_returns_dsd_format() {
-        // Even if the file does not exist, the fallback should return
-        // a minimal metadata with format "dsd" for .dsf / .dff extensions.
         let meta = dsf_dff_fallback(Path::new("/tmp/nonexistent_track.dsf"));
         assert!(meta.is_some());
         let meta = meta.unwrap();
@@ -594,52 +1161,19 @@ mod tests {
     #[test]
     fn dsf_fallback_with_valid_header() {
         use std::io::Write;
-        // Build a minimal DSF file header to test header parsing.
-        // DSD chunk (28 bytes) + fmt chunk (52 bytes)
         let tmp = std::env::temp_dir().join("tune_test_dsf_fallback.dsf");
-        let mut buf = vec![0u8; 92];
-        // DSD chunk
-        buf[0..4].copy_from_slice(b"DSD ");
-        // DSD chunk size = 28 (LE u64)
-        buf[4..12].copy_from_slice(&28u64.to_le_bytes());
-        // total file size (doesn't matter for test)
-        buf[12..20].copy_from_slice(&92u64.to_le_bytes());
-        // metadata offset = 0
-        buf[20..28].copy_from_slice(&0u64.to_le_bytes());
-        // fmt chunk
-        buf[28..32].copy_from_slice(b"fmt ");
-        // fmt chunk size = 52 (LE u64)
-        buf[32..40].copy_from_slice(&52u64.to_le_bytes());
-        // format version = 1
-        buf[40..44].copy_from_slice(&1u32.to_le_bytes());
-        // format ID = 0
-        buf[44..48].copy_from_slice(&0u32.to_le_bytes());
-        // channel type = 2 (stereo)
-        buf[48..52].copy_from_slice(&2u32.to_le_bytes());
-        // channel count = 2
-        buf[52..56].copy_from_slice(&2u32.to_le_bytes());
-        // sample rate = 2_822_400 (DSD64)
-        buf[56..60].copy_from_slice(&2_822_400u32.to_le_bytes());
-        // bits per sample = 1
-        buf[60..64].copy_from_slice(&1u32.to_le_bytes());
-        // sample count per channel = 2_822_400 * 180 (= 3 minutes at DSD64)
-        let samples: u64 = 2_822_400 * 180;
-        buf[64..72].copy_from_slice(&samples.to_le_bytes());
-
+        let buf = build_dsf_bytes(None);
         std::fs::File::create(&tmp)
             .unwrap()
             .write_all(&buf)
             .unwrap();
-
         let meta = dsf_dff_fallback(&tmp);
         std::fs::remove_file(&tmp).ok();
-
         assert!(meta.is_some());
         let meta = meta.unwrap();
         assert_eq!(meta.format.as_deref(), Some("dsd"));
         assert_eq!(meta.sample_rate, Some(2_822_400));
         assert_eq!(meta.channels, Some(2));
-        // Duration should be approximately 180_000 ms (3 minutes)
         let dur = meta.duration_ms.unwrap();
         assert!(
             (179_000..=181_000).contains(&dur),
@@ -648,9 +1182,79 @@ mod tests {
     }
 
     #[test]
+    fn dsf_fallback_reads_id3v2_tags() {
+        use std::io::Write;
+        let id3_tag = build_id3v2_tag(&[
+            ("TIT2", "Man On The Corner"),
+            ("TPE1", "Genesis"),
+            ("TALB", "Abacab"),
+            ("TPE2", "Genesis"),
+            ("TRCK", "7/11"),
+            ("TPOS", "1/2"),
+            ("TDRC", "1981"),
+            ("TCON", "Rock"),
+            ("TPUB", "Virgin Records"),
+        ]);
+        let buf = build_dsf_bytes(Some(&id3_tag));
+        let tmp = std::env::temp_dir().join("tune_test_dsf_id3v2.dsf");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let meta = dsf_dff_fallback(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            meta.is_some(),
+            "dsf_dff_fallback should return Some for DSF with ID3v2"
+        );
+        let meta = meta.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.artist.as_deref(), Some("Genesis"));
+        assert_eq!(meta.album.as_deref(), Some("Abacab"));
+        assert_eq!(meta.album_artist.as_deref(), Some("Genesis"));
+        assert_eq!(meta.track_number, Some(7));
+        assert_eq!(meta.total_tracks, Some(11));
+        assert_eq!(meta.disc_number, Some(1));
+        assert_eq!(meta.total_discs, Some(2));
+        assert_eq!(meta.year, Some(1981));
+        assert_eq!(meta.genre.as_deref(), Some("Rock"));
+        assert_eq!(meta.label.as_deref(), Some("Virgin Records"));
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
+        assert_eq!(meta.sample_rate, Some(2_822_400));
+        assert_eq!(meta.channels, Some(2));
+        assert_eq!(meta.bit_depth, Some(1));
+    }
+
+    #[test]
+    fn dsf_fallback_id3v2_overrides_path() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("V_DSF").join("Genesis - Abacab");
+        std::fs::create_dir_all(&dir).ok();
+        let file_path = dir.join("07 - Man On The Corner.dsf");
+        let id3_tag = build_id3v2_tag(&[
+            ("TIT2", "Man On The Corner"),
+            ("TPE1", "Genesis"),
+            ("TALB", "Abacab"),
+            ("TRCK", "7"),
+        ]);
+        let buf = build_dsf_bytes(Some(&id3_tag));
+        std::fs::File::create(&file_path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let meta = dsf_dff_fallback(&file_path);
+        std::fs::remove_file(&file_path).ok();
+        std::fs::remove_dir_all(std::env::temp_dir().join("V_DSF")).ok();
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Man On The Corner"));
+        assert_eq!(meta.artist.as_deref(), Some("Genesis"));
+        assert_eq!(meta.album.as_deref(), Some("Abacab"));
+        assert_eq!(meta.track_number, Some(7));
+    }
+
+    #[test]
     fn try_read_metadata_dsf_fallback() {
-        // A nonexistent .dsf file should trigger the fallback and return Ok
-        // (not an error), since we recognize the extension.
         let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.dsf"));
         assert!(result.is_ok());
         let meta = result.unwrap();
@@ -659,12 +1263,9 @@ mod tests {
 
     #[test]
     fn try_read_metadata_non_dsd_still_errors() {
-        // A nonexistent .flac file should still return Err
         let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.flac"));
         assert!(result.is_err());
     }
-
-    // ── Parsing robustness tests ────────────────────────────────────
 
     #[test]
     fn normalize_format_mp4_variants() {
@@ -682,8 +1283,6 @@ mod tests {
 
     #[test]
     fn split_genre_parenthesized_id3v1_numeric() {
-        // Some taggers write "(17)" for Rock — our splitter doesn't decode
-        // numeric ID3v1 codes, but it should not crash.
         let genres = split_genre_tag("(17)Rock");
         assert!(!genres.is_empty());
     }
@@ -736,7 +1335,6 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_value(&md).unwrap();
-
         assert!(json["track_number"].is_number());
         assert!(json["disc_number"].is_number());
         assert!(json["total_tracks"].is_number());
@@ -811,9 +1409,49 @@ mod tests {
 
     #[test]
     fn normalize_format_case_sensitivity() {
-        // normalize_format expects lowercase input (from format!("{:?}").to_lowercase())
         assert_eq!(normalize_format("mpeg"), "mp3");
-        // uppercase should pass through unchanged (it's pre-lowercased)
         assert_eq!(normalize_format("MPEG"), "MPEG");
+    }
+
+    #[test]
+    fn parse_id3v2_basic_text_frames() {
+        let tag_bytes = build_id3v2_tag(&[
+            ("TIT2", "Test Title"),
+            ("TPE1", "Test Artist"),
+            ("TALB", "Test Album"),
+        ]);
+        let tags = parse_id3v2_tag(&tag_bytes).unwrap();
+        assert_eq!(tags.title(), Some("Test Title"));
+        assert_eq!(tags.artist(), Some("Test Artist"));
+        assert_eq!(tags.album(), Some("Test Album"));
+    }
+
+    #[test]
+    fn parse_id3v2_track_disc_parsing() {
+        let tag_bytes = build_id3v2_tag(&[("TRCK", "7/11"), ("TPOS", "2/3")]);
+        let tags = parse_id3v2_tag(&tag_bytes).unwrap();
+        assert_eq!(tags.track_number(), Some(7));
+        assert_eq!(tags.total_tracks(), Some(11));
+        assert_eq!(tags.disc_number(), Some(2));
+        assert_eq!(tags.total_discs(), Some(3));
+    }
+
+    #[test]
+    fn parse_id3v2_year_from_tdrc() {
+        let tag_bytes = build_id3v2_tag(&[("TDRC", "1981")]);
+        let tags = parse_id3v2_tag(&tag_bytes).unwrap();
+        assert_eq!(tags.year(), Some(1981));
+    }
+
+    #[test]
+    fn parse_id3v2_invalid_magic() {
+        assert!(parse_id3v2_tag(b"NOT_ID3_").is_none());
+    }
+
+    #[test]
+    fn syncsafe_integer_values() {
+        assert_eq!(syncsafe_to_u32(&[0, 0, 0, 127]), 127);
+        assert_eq!(syncsafe_to_u32(&[0, 0, 1, 0]), 128);
+        assert_eq!(syncsafe_to_u32(&[0, 0, 2, 0]), 256);
     }
 }
