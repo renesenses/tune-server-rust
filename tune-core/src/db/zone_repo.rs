@@ -41,7 +41,7 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id FROM zones ORDER BY name")
             .map_err(|e| e.to_string())?;
