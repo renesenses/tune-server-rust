@@ -19,7 +19,7 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
-    "alac", "ape",
+    "alac", "ape", "iso",
 ];
 
 const SKIP_DIRS: &[&str] = &[
