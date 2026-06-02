@@ -7,9 +7,10 @@ use tune_core::outputs::oh_events::OpenHomeEventListener;
 use crate::config::TuneConfig;
 use crate::state::AppState;
 
-/// Restore zone volumes from DB and persist config settings to DB.
+/// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_zone_volumes(state).await;
+    restore_playback_positions(state).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(&state.db);
@@ -37,6 +38,53 @@ async fn restore_zone_volumes(state: &AppState) {
                 }
                 info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
             }
+        }
+    }
+}
+
+/// Restore last playback positions from DB so the UI shows where playback left off.
+async fn restore_playback_positions(state: &AppState) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db.clone());
+    if let Ok(zones) = zone_repo.list() {
+        for zone in &zones {
+            let Some(zone_id) = zone.id else { continue };
+            if zone.last_position_ms == 0 && zone.last_track_id.is_none() {
+                continue;
+            }
+            let np = if let Some(track_id) = zone.last_track_id {
+                if let Ok(Some(track)) = track_repo.get(track_id) {
+                    tune_core::playback::NowPlaying {
+                        track_id: Some(track_id),
+                        title: track.title.clone(),
+                        artist_name: track.artist_name.clone(),
+                        album_title: track.album_title.clone(),
+                        cover_path: track.cover_path.clone(),
+                        duration_ms: track.duration_ms,
+                        source: zone
+                            .last_track_source
+                            .clone()
+                            .unwrap_or_else(|| "local".into()),
+                        source_id: zone.last_track_source_id.clone(),
+                        stream_id: None,
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+            state
+                .playback
+                .restore_position(zone_id, zone.last_position_ms, np)
+                .await;
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                position_ms = zone.last_position_ms,
+                track_id = ?zone.last_track_id,
+                "playback_position_restored"
+            );
         }
     }
 }

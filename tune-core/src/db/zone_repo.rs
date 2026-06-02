@@ -15,6 +15,10 @@ pub struct Zone {
     pub gapless_enabled: bool,
     pub group_id: Option<String>,
     pub sync_delay_ms: i32,
+    pub last_position_ms: i64,
+    pub last_track_id: Option<i64>,
+    pub last_track_source: Option<String>,
+    pub last_track_source_id: Option<String>,
 }
 
 pub struct ZoneRepo {
@@ -29,7 +33,7 @@ impl ZoneRepo {
     pub fn get(&self, id: i64) -> Result<Option<Zone>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms FROM zones WHERE id = ?")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id FROM zones WHERE id = ?")
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_zone(row)))
             .optional()
@@ -39,7 +43,7 @@ impl ZoneRepo {
     pub fn list(&self) -> Result<Vec<Zone>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms FROM zones ORDER BY name")
+            .prepare("SELECT id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id FROM zones ORDER BY name")
             .map_err(|e| e.to_string())?;
         let zones = stmt
             .query_map([], |row| Ok(row_to_zone(row)))
@@ -167,6 +171,35 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn save_playback_position(
+        &self,
+        id: i64,
+        position_ms: i64,
+        track_id: Option<i64>,
+        source: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET last_position_ms = ?, last_track_id = ?, last_track_source = ?, last_track_source_id = ? WHERE id = ?",
+            &[
+                &position_ms as &dyn rusqlite::types::ToSql,
+                &track_id,
+                &source,
+                &source_id,
+                &id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_playback_position(&self, id: i64) -> Result<(), String> {
+        self.db.execute(
+            "UPDATE zones SET last_position_ms = 0, last_track_id = NULL, last_track_source = NULL, last_track_source_id = NULL WHERE id = ?",
+            &[&id as &dyn rusqlite::types::ToSql],
+        )?;
+        Ok(())
+    }
+
     pub fn update_dsp(&self, id: i64, preset_id: Option<i64>, enabled: bool) -> Result<(), String> {
         let en = if enabled { 1i64 } else { 0i64 };
         self.db.execute(
@@ -205,6 +238,10 @@ fn row_to_zone(row: &rusqlite::Row) -> Zone {
         gapless_enabled: row.get::<_, i64>(7).unwrap_or(1) != 0,
         group_id: row.get(8).ok(),
         sync_delay_ms: row.get(9).unwrap_or(0),
+        last_position_ms: row.get(10).unwrap_or(0),
+        last_track_id: row.get(11).ok().flatten(),
+        last_track_source: row.get(12).ok().flatten(),
+        last_track_source_id: row.get(13).ok().flatten(),
     }
 }
 

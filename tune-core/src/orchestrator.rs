@@ -689,6 +689,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) {
+        self.persist_position(zone_id).await;
         self.playback.pause(zone_id).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
@@ -709,6 +710,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
+        self.persist_position(zone_id).await;
         // Clean up stream session before stopping
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing
@@ -727,6 +729,18 @@ impl PlaybackOrchestrator {
 
     pub async fn seek(&self, zone_id: i64, position_ms: u64, device_id: Option<&str>) {
         self.playback.seek(zone_id, position_ms as i64).await;
+        let state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = state.now_playing {
+            ZoneRepo::new(self.db.clone())
+                .save_playback_position(
+                    zone_id,
+                    position_ms as i64,
+                    np.track_id,
+                    Some(np.source.as_str()),
+                    np.source_id.as_deref(),
+                )
+                .ok();
+        }
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
@@ -914,5 +928,21 @@ impl PlaybackOrchestrator {
             cover_url: Self::resolve_cover_url(raw_cover.as_deref()),
             duration_ms: None,
         })
+    }
+
+    /// Persist the current playback position to the database.
+    async fn persist_position(&self, zone_id: i64) {
+        let state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = state.now_playing {
+            ZoneRepo::new(self.db.clone())
+                .save_playback_position(
+                    zone_id,
+                    state.position_ms,
+                    np.track_id,
+                    Some(np.source.as_str()),
+                    np.source_id.as_deref(),
+                )
+                .ok();
+        }
     }
 }

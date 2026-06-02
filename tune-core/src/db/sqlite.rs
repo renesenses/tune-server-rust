@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags};
 use tracing::info;
 
@@ -17,30 +18,63 @@ const PRAGMAS: &str = "PRAGMA journal_mode=WAL;
              PRAGMA mmap_size=268435456;
              PRAGMA analysis_limit=400;";
 
+fn strip_accents(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .flat_map(|c| match c {
+            '\u{00e0}' | '\u{00e1}' | '\u{00e2}' | '\u{00e3}' | '\u{00e4}' | '\u{00e5}' => {
+                vec!['a']
+            }
+            '\u{00e8}' | '\u{00e9}' | '\u{00ea}' | '\u{00eb}' => vec!['e'],
+            '\u{00ec}' | '\u{00ed}' | '\u{00ee}' | '\u{00ef}' => vec!['i'],
+            '\u{00f2}' | '\u{00f3}' | '\u{00f4}' | '\u{00f5}' | '\u{00f6}' => vec!['o'],
+            '\u{00f9}' | '\u{00fa}' | '\u{00fb}' | '\u{00fc}' => vec!['u'],
+            '\u{00f1}' => vec!['n'],
+            '\u{00e7}' => vec!['c'],
+            '\u{00ff}' | '\u{00fd}' => vec!['y'],
+            '\u{00e6}' => vec!['a', 'e'],
+            '\u{0153}' => vec!['o', 'e'],
+            '\u{00df}' => vec!['s', 's'],
+            c if ('\u{0300}'..='\u{036F}').contains(&c) => vec![],
+            c => vec![c],
+        })
+        .collect()
+}
+
+fn register_unaccent(conn: &Connection) -> Result<(), String> {
+    conn.create_scalar_function(
+        "tune_unaccent",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(strip_accents(&text))
+        },
+    )
+    .map_err(|e| format!("register tune_unaccent: {e}"))
+}
+
 impl SqliteDb {
     pub fn open(path: &str) -> Result<Self, String> {
         if path == ":memory:" {
             return Self::open_in_memory();
         }
-
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| format!("sqlite open {path}: {e}"))?;
         conn.execute_batch(PRAGMAS)
             .map_err(|e| format!("pragma: {e}"))?;
-
+        register_unaccent(&conn)?;
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let read_conn = Connection::open_with_flags(path, read_flags)
             .map_err(|e| format!("sqlite open read {path}: {e}"))?;
         read_conn
             .execute_batch(PRAGMAS)
             .map_err(|e| format!("pragma read: {e}"))?;
-
+        register_unaccent(&read_conn)?;
         info!(path, "sqlite_opened");
-
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             read_conn: Arc::new(Mutex::new(read_conn)),
@@ -49,12 +83,9 @@ impl SqliteDb {
 
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("sqlite memory: {e}"))?;
-
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| format!("pragma: {e}"))?;
-
-        // In-memory DBs: share the same connection for reads and writes
-        // (separate in-memory connections don't share data)
+        register_unaccent(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             read_conn: conn.clone(),
@@ -65,7 +96,6 @@ impl SqliteDb {
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
-
     pub fn read_connection(&self) -> &Arc<Mutex<Connection>> {
         &self.read_conn
     }
@@ -94,7 +124,6 @@ impl SqliteDb {
         conn.last_insert_rowid()
     }
 
-    /// Execute a read-only closure on the read connection.
     pub fn read<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
@@ -103,7 +132,6 @@ impl SqliteDb {
         f(&conn).map_err(|e| format!("db read: {e}"))
     }
 
-    /// Execute a write closure on the write connection.
     pub fn write<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
@@ -134,207 +162,35 @@ impl Clone for SqliteDb {
 }
 
 const CORE_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS artists (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    sort_name TEXT,
-    musicbrainz_id TEXT,
-    discogs_id TEXT,
-    bio TEXT,
-    image_path TEXT,
-    image_source TEXT
-);
-
-CREATE TABLE IF NOT EXISTS albums (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    artist_id INTEGER REFERENCES artists(id),
-    year INTEGER,
-    original_year INTEGER,
-    genre TEXT,
-    genres TEXT,
-    disc_count INTEGER DEFAULT 1,
-    track_count INTEGER DEFAULT 0,
-    cover_path TEXT,
-    source TEXT DEFAULT 'local',
-    source_id TEXT,
-    label TEXT,
-    catalog_number TEXT,
-    barcode TEXT,
-    format TEXT,
-    sample_rate INTEGER,
-    bit_depth INTEGER,
-    bio TEXT,
-    musicbrainz_release_id TEXT,
-    musicbrainz_release_group_id TEXT,
-    release_date TEXT,
-    original_date TEXT
-);
-
-CREATE TABLE IF NOT EXISTS tracks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    album_id INTEGER REFERENCES albums(id),
-    artist_id INTEGER REFERENCES artists(id),
-    album_artist TEXT,
-    disc_number INTEGER DEFAULT 1,
-    disc_subtitle TEXT,
-    track_number INTEGER DEFAULT 0,
-    duration_ms INTEGER DEFAULT 0,
-    file_path TEXT UNIQUE,
-    format TEXT,
-    sample_rate INTEGER,
-    bit_depth INTEGER,
-    channels INTEGER DEFAULT 2,
-    file_mtime REAL,
-    file_size INTEGER,
-    audio_hash TEXT,
-    source TEXT DEFAULT 'local',
-    source_id TEXT,
-    isrc TEXT,
-    genre TEXT,
-    genres TEXT,
-    composer TEXT,
-    year INTEGER,
-    bpm REAL,
-    label TEXT,
-    musicbrainz_recording_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS track_credits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    artist_id INTEGER REFERENCES artists(id),
-    artist_name TEXT NOT NULL,
-    role TEXT DEFAULT 'performer',
-    instrument TEXT,
-    position INTEGER DEFAULT 0
-);
-
+CREATE TABLE IF NOT EXISTS artists (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, sort_name TEXT, musicbrainz_id TEXT, discogs_id TEXT, bio TEXT, image_path TEXT, image_source TEXT);
+CREATE TABLE IF NOT EXISTS albums (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, artist_id INTEGER REFERENCES artists(id), year INTEGER, original_year INTEGER, genre TEXT, genres TEXT, disc_count INTEGER DEFAULT 1, track_count INTEGER DEFAULT 0, cover_path TEXT, source TEXT DEFAULT 'local', source_id TEXT, label TEXT, catalog_number TEXT, barcode TEXT, format TEXT, sample_rate INTEGER, bit_depth INTEGER, bio TEXT, musicbrainz_release_id TEXT, musicbrainz_release_group_id TEXT, release_date TEXT, original_date TEXT);
+CREATE TABLE IF NOT EXISTS tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, album_id INTEGER REFERENCES albums(id), artist_id INTEGER REFERENCES artists(id), album_artist TEXT, disc_number INTEGER DEFAULT 1, disc_subtitle TEXT, track_number INTEGER DEFAULT 0, duration_ms INTEGER DEFAULT 0, file_path TEXT UNIQUE, format TEXT, sample_rate INTEGER, bit_depth INTEGER, channels INTEGER DEFAULT 2, file_mtime REAL, file_size INTEGER, audio_hash TEXT, source TEXT DEFAULT 'local', source_id TEXT, isrc TEXT, genre TEXT, genres TEXT, composer TEXT, year INTEGER, bpm REAL, label TEXT, musicbrainz_recording_id TEXT);
+CREATE TABLE IF NOT EXISTS track_credits (id INTEGER PRIMARY KEY AUTOINCREMENT, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, artist_id INTEGER REFERENCES artists(id), artist_name TEXT NOT NULL, role TEXT DEFAULT 'performer', instrument TEXT, position INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_audio_hash ON tracks(audio_hash);
 CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
-CREATE TABLE IF NOT EXISTS playlists (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT
-);
-
-CREATE TABLE IF NOT EXISTS playlist_tracks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS zones (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    output_type TEXT,
-    output_device_id TEXT,
-    volume INTEGER DEFAULT 50,
-    muted INTEGER DEFAULT 0,
-    online INTEGER DEFAULT 1,
-    gapless_enabled INTEGER DEFAULT 1,
-    group_id TEXT,
-    sync_delay_ms INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS play_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0,
-    is_current INTEGER DEFAULT 0
-);
-
+CREATE TABLE IF NOT EXISTS playlists (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT);
+CREATE TABLE IF NOT EXISTS playlist_tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS zones (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, output_type TEXT, output_device_id TEXT, volume INTEGER DEFAULT 50, muted INTEGER DEFAULT 0, online INTEGER DEFAULT 1, gapless_enabled INTEGER DEFAULT 1, group_id TEXT, sync_delay_ms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS play_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE, track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, is_current INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_play_queue_zone_id ON play_queue(zone_id);
-
--- FTS5 virtual tables for full-text search (accent-insensitive, multi-column)
-CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
-    title, artist_name, album_title, genre, composer,
-    tokenize='unicode61 remove_diacritics 2',
-    content='tracks', content_rowid='id'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
-    title, artist_name, genre,
-    tokenize='unicode61 remove_diacritics 2',
-    content='albums', content_rowid='id'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
-    name, sort_name,
-    tokenize='unicode61 remove_diacritics 2',
-    content='artists', content_rowid='id'
-);
-
--- FTS sync triggers: tracks
-CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
-    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            (SELECT title FROM albums WHERE id = new.album_id),
-            new.genre, new.composer);
-END;
-CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            (SELECT title FROM albums WHERE id = old.album_id),
-            old.genre, old.composer);
-    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            (SELECT title FROM albums WHERE id = new.album_id),
-            new.genre, new.composer);
-END;
-CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            (SELECT title FROM albums WHERE id = old.album_id),
-            old.genre, old.composer);
-END;
-
--- FTS sync triggers: albums
-CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN
-    INSERT INTO albums_fts(rowid, title, artist_name, genre)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            new.genre);
-END;
-CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            old.genre);
-    INSERT INTO albums_fts(rowid, title, artist_name, genre)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            new.genre);
-END;
-CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            old.genre);
-END;
-
--- FTS sync triggers: artists
-CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN
-    INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
-END;
-CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN
-    INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
-    INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name);
-END;
-CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN
-    INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name);
-END;
+CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(title, artist_name, album_title, genre, composer, tokenize='unicode61 remove_diacritics 2', content='tracks', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(title, artist_name, genre, tokenize='unicode61 remove_diacritics 2', content='albums', content_rowid='id');
+CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(name, sort_name, tokenize='unicode61 remove_diacritics 2', content='artists', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), (SELECT title FROM albums WHERE id = new.album_id), new.genre, new.composer); END;
+CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer) VALUES ('delete', old.id, old.title, (SELECT name FROM artists WHERE id = old.artist_id), (SELECT title FROM albums WHERE id = old.album_id), old.genre, old.composer); INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), (SELECT title FROM albums WHERE id = new.album_id), new.genre, new.composer); END;
+CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer) VALUES ('delete', old.id, old.title, (SELECT name FROM artists WHERE id = old.artist_id), (SELECT title FROM albums WHERE id = old.album_id), old.genre, old.composer); END;
+CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN INSERT INTO albums_fts(rowid, title, artist_name, genre) VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), new.genre); END;
+CREATE TRIGGER IF NOT EXISTS albums_fts_update AFTER UPDATE ON albums BEGIN INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre) VALUES ('delete', old.id, old.title, (SELECT name FROM artists WHERE id = old.artist_id), old.genre); INSERT INTO albums_fts(rowid, title, artist_name, genre) VALUES (new.id, new.title, (SELECT name FROM artists WHERE id = new.artist_id), new.genre); END;
+CREATE TRIGGER IF NOT EXISTS albums_fts_delete AFTER DELETE ON albums BEGIN INSERT INTO albums_fts(albums_fts, rowid, title, artist_name, genre) VALUES ('delete', old.id, old.title, (SELECT name FROM artists WHERE id = old.artist_id), old.genre); END;
+CREATE TRIGGER IF NOT EXISTS artists_fts_insert AFTER INSERT ON artists BEGIN INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); END;
+CREATE TRIGGER IF NOT EXISTS artists_fts_update AFTER UPDATE ON artists BEGIN INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name); INSERT INTO artists_fts(rowid, name, sort_name) VALUES (new.id, new.name, new.sort_name); END;
+CREATE TRIGGER IF NOT EXISTS artists_fts_delete AFTER DELETE ON artists BEGIN INSERT INTO artists_fts(artists_fts, rowid, name, sort_name) VALUES ('delete', old.id, old.name, old.sort_name); END;
 ";
 
 #[cfg(test)]
@@ -348,10 +204,19 @@ mod tests {
     }
 
     #[test]
+    fn tune_unaccent_function() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let result: String = conn
+            .query_row("SELECT tune_unaccent('Carl\u{00e3}o')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(result, "carlao");
+    }
+
+    #[test]
     fn schema_creates_tables() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-
         let conn = db.conn.lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -361,7 +226,6 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-
         assert!(tables.contains(&"artists".to_string()));
         assert!(tables.contains(&"albums".to_string()));
         assert!(tables.contains(&"tracks".to_string()));
