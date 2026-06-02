@@ -1,7 +1,110 @@
 use rusqlite::params;
 
+use super::engine::SqlDialect;
 use super::models::Artist;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for artist_repo.
+///
+/// `COLLATE NOCASE` (SQLite-only) is replaced by `LOWER(col)` for
+/// portability. The search() FTS query is SQLite-only for now; phase
+/// 4 will inject a `dialect.fts_match` clause and emit a PG-shape
+/// query against a tsvector column.
+pub mod sql {
+    use super::SqlDialect;
+
+    const COLS: &str =
+        "id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source";
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!("SELECT {COLS} FROM artists WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn get_by_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM artists WHERE LOWER(name) = LOWER({})",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_by_musicbrainz_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM artists WHERE musicbrainz_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn create<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO artists (name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source) VALUES ({}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7)
+        )
+    }
+
+    pub fn create_minimal<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO artists (name, sort_name, musicbrainz_id) VALUES ({}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn update<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET name = {}, sort_name = {}, musicbrainz_id = {}, discogs_id = {}, bio = {}, image_path = {}, image_source = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8)
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM artists WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn count() -> &'static str {
+        "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+    }
+
+    pub fn list<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) ORDER BY LOWER(COALESCE(sort_name, name)) LIMIT {} OFFSET {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn count_orphans() -> &'static str {
+        "SELECT COUNT(*) FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
+    }
+
+    pub fn delete_orphans() -> &'static str {
+        "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
+    }
+
+    /// SQLite FTS5 query against the artists_fts virtual table.
+    /// PG variant will be added in phase 4 (against a tsvector column).
+    pub fn search_sqlite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH {}) OR LOWER(name) LIKE LOWER({}) LIMIT {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+}
 
 pub struct ArtistRepo {
     db: SqliteDb,
@@ -15,7 +118,7 @@ impl ArtistRepo {
     pub fn get(&self, id: i64) -> Result<Option<Artist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id = ?")
+            .prepare(&sql::get_by_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let result = stmt
             .query_row(params![id], |row| Ok(row_to_artist(row)))
@@ -27,7 +130,7 @@ impl ArtistRepo {
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE")
+            .prepare(&sql::get_by_name(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let result = stmt
             .query_row(params![name], |row| Ok(row_to_artist(row)))
@@ -39,7 +142,7 @@ impl ArtistRepo {
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?")
+            .prepare(&sql::get_by_musicbrainz_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let result = stmt
             .query_row(params![mbid], |row| Ok(row_to_artist(row)))
@@ -50,7 +153,7 @@ impl ArtistRepo {
 
     pub fn create(&self, artist: &Artist) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO artists (name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &sql::create(&self.db.dialect()),
             &[
                 &artist.name as &dyn rusqlite::types::ToSql,
                 &artist.sort_name,
@@ -74,25 +177,31 @@ impl ArtistRepo {
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, String> {
+        let d = self.db.dialect();
+        let by_mbid_sql = sql::get_by_musicbrainz_id(&d);
+        let by_name_sql = sql::get_by_name(&d);
+        let create_sql = sql::create_minimal(&d);
         self.db.write(|conn| {
             if let Some(mbid) = musicbrainz_id {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE musicbrainz_id = ?",
-                )?;
-                if let Some(artist) = stmt.query_row(params![mbid], |row| Ok(row_to_artist(row))).optional()? {
+                let mut stmt = conn.prepare_cached(&by_mbid_sql)?;
+                if let Some(artist) = stmt
+                    .query_row(params![mbid], |row| Ok(row_to_artist(row)))
+                    .optional()?
+                {
                     return Ok(artist);
                 }
             }
             {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE name = ? COLLATE NOCASE",
-                )?;
-                if let Some(artist) = stmt.query_row(params![name], |row| Ok(row_to_artist(row))).optional()? {
+                let mut stmt = conn.prepare_cached(&by_name_sql)?;
+                if let Some(artist) = stmt
+                    .query_row(params![name], |row| Ok(row_to_artist(row)))
+                    .optional()?
+                {
                     return Ok(artist);
                 }
             }
             conn.execute(
-                "INSERT INTO artists (name, sort_name, musicbrainz_id) VALUES (?, ?, ?)",
+                &create_sql,
                 rusqlite::params![name, sort_name, musicbrainz_id],
             )?;
             let id = conn.last_insert_rowid();
@@ -112,7 +221,7 @@ impl ArtistRepo {
     pub fn update(&self, artist: &Artist) -> Result<(), String> {
         let id = artist.id.ok_or("artist has no id")?;
         self.db.execute(
-            "UPDATE artists SET name = ?, sort_name = ?, musicbrainz_id = ?, discogs_id = ?, bio = ?, image_path = ?, image_source = ? WHERE id = ?",
+            &sql::update(&self.db.dialect()),
             &[
                 &artist.name as &dyn rusqlite::types::ToSql,
                 &artist.sort_name,
@@ -128,21 +237,20 @@ impl ArtistRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM artists WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)", [], |row| row.get(0))
+        conn.query_row(sql::count(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) ORDER BY COALESCE(sort_name, name) COLLATE NOCASE LIMIT ? OFFSET ?")
+            .prepare(&sql::list(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let artists = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_artist(row)))
@@ -156,18 +264,11 @@ impl ArtistRepo {
     pub fn cleanup_orphans(&self) -> Result<i64, String> {
         let conn = self.db.connection().lock().unwrap();
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(sql::count_orphans(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         if count > 0 {
-            conn.execute(
-                "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
+            conn.execute(sql::delete_orphans(), [])
+                .map_err(|e| e.to_string())?;
         }
         Ok(count)
     }
@@ -177,7 +278,7 @@ impl ArtistRepo {
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, sort_name, musicbrainz_id, discogs_id, bio, image_path, image_source FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?) OR name LIKE ? COLLATE NOCASE LIMIT ?")
+            .prepare(&sql::search_sqlite(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let artists = stmt
             .query_map(params![fts_query, like, limit], |row| {
@@ -415,6 +516,17 @@ mod tests {
         let db = test_db();
         let repo = ArtistRepo::new(db);
         assert!(repo.get_by_name("Nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::get_by_name(&s).contains("LOWER(name) = LOWER(?)"));
+        assert!(sql::get_by_name(&p).contains("LOWER(name) = LOWER($1)"));
+        assert!(!sql::list(&p).contains("COLLATE"));
+        assert!(sql::list(&p).contains("LOWER(COALESCE(sort_name, name))"));
     }
 
     #[test]
