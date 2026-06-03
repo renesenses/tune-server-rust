@@ -1,15 +1,16 @@
-use rusqlite::params;
+use std::sync::Arc;
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Artist;
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for artist_repo.
 ///
 /// `COLLATE NOCASE` (SQLite-only) is replaced by `LOWER(col)` for
-/// portability. The search() FTS query is SQLite-only for now; phase
-/// 4 will inject a `dialect.fts_match` clause and emit a PG-shape
-/// query against a tsvector column.
+/// portability. The search() FTS predicate dispatches through
+/// `dialect.fts_where` so the same call emits the SQLite FTS5
+/// subquery or the Postgres `@@` tsvector predicate.
 pub mod sql {
     use super::SqlDialect;
 
@@ -94,10 +95,7 @@ pub mod sql {
         "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
     }
 
-    /// Engine-agnostic full-text search. The FTS predicate is built
-    /// via `dialect.fts_where` so the same Rust call site emits the
-    /// SQLite FTS5 subquery on SQLite and the tsvector `@@` predicate
-    /// on Postgres (see tune-core/migrations/postgres/002_fts_tsvector.sql).
+    /// Engine-agnostic full-text search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT {COLS} FROM artists a WHERE {} OR LOWER(a.name) LIKE LOWER({}) LIMIT {}",
@@ -109,105 +107,109 @@ pub mod sql {
 }
 
 pub struct ArtistRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl ArtistRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let result = stmt
-            .query_row(params![id], |row| Ok(row_to_artist(row)))
-            .optional()
-            .map_err(|e| e.to_string())?;
-        Ok(result)
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_artist))
     }
 
     pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_name(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let result = stmt
-            .query_row(params![name], |row| Ok(row_to_artist(row)))
-            .optional()
-            .map_err(|e| e.to_string())?;
-        Ok(result)
+        let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
+        let params: [&dyn ToSqlValue; 1] = [&name];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_artist))
     }
 
     pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_musicbrainz_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let result = stmt
-            .query_row(params![mbid], |row| Ok(row_to_artist(row)))
-            .optional()
-            .map_err(|e| e.to_string())?;
-        Ok(result)
+        let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
+        let params: [&dyn ToSqlValue; 1] = [&mbid];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_artist))
     }
 
     pub fn create(&self, artist: &Artist) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create(&self.db.dialect()),
-            &[
-                &artist.name as &dyn rusqlite::types::ToSql,
-                &artist.sort_name,
-                &artist.musicbrainz_id,
-                &artist.discogs_id,
-                &artist.bio,
-                &artist.image_path,
-                &artist.image_source,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 7] = [
+            &artist.name,
+            &artist.sort_name,
+            &artist.musicbrainz_id,
+            &artist.discogs_id,
+            &artist.bio,
+            &artist.image_path,
+            &artist.image_source,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Look up or create an artist, using the write connection for the entire
-    /// read-then-write sequence. This ensures that during a scan transaction
-    /// (BEGIN IMMEDIATE), the lookup sees artists created earlier in the same
-    /// batch, preventing duplicates.
+    /// Look up or create an artist, atomically read-then-write inside
+    /// a single transaction. During a scan, this guarantees the lookup
+    /// sees artists created earlier in the same batch — preventing
+    /// duplicates — and that the conditional INSERT can't race with
+    /// another scanner adding the same artist.
     pub fn get_or_create(
         &self,
         name: &str,
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, String> {
-        let d = self.db.dialect();
-        let by_mbid_sql = sql::get_by_musicbrainz_id(&d);
-        let by_name_sql = sql::get_by_name(&d);
-        let create_sql = sql::create_minimal(&d);
-        self.db.write(|conn| {
+        let by_mbid_sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
+        let by_name_sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
+        let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
+
+        // Output slot for the result. The closure writes to it.
+        let mut out: Option<Artist> = None;
+        let out_ref = &mut out;
+        self.db.write_tx(&mut |tx| {
             if let Some(mbid) = musicbrainz_id {
-                let mut stmt = conn.prepare_cached(&by_mbid_sql)?;
-                if let Some(artist) = stmt
-                    .query_row(params![mbid], |row| Ok(row_to_artist(row)))
-                    .optional()?
-                {
-                    return Ok(artist);
+                let p: [&dyn ToSqlValue; 1] = [&mbid];
+                if let Some(row) = tx.query_one(&by_mbid_sql, &p)? {
+                    *out_ref = Some(row_to_artist(&row));
+                    return Ok(());
                 }
             }
-            {
-                let mut stmt = conn.prepare_cached(&by_name_sql)?;
-                if let Some(artist) = stmt
-                    .query_row(params![name], |row| Ok(row_to_artist(row)))
-                    .optional()?
-                {
-                    return Ok(artist);
-                }
+            let p: [&dyn ToSqlValue; 1] = [&name];
+            if let Some(row) = tx.query_one(&by_name_sql, &p)? {
+                *out_ref = Some(row_to_artist(&row));
+                return Ok(());
             }
-            conn.execute(
-                &create_sql,
-                rusqlite::params![name, sort_name, musicbrainz_id],
-            )?;
-            let id = conn.last_insert_rowid();
-            Ok(Artist {
+            let p: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
+            tx.execute(&create_sql, &p)?;
+            let id = tx.last_insert_rowid();
+            *out_ref = Some(Artist {
                 id: Some(id),
                 name: name.to_string(),
                 sort_name: sort_name.map(|s| s.to_string()),
@@ -216,98 +218,91 @@ impl ArtistRepo {
                 bio: None,
                 image_path: None,
                 image_source: None,
-            })
-        })
+            });
+            Ok(())
+        })?;
+        out.ok_or_else(|| "get_or_create: closure left no result".into())
     }
 
     pub fn update(&self, artist: &Artist) -> Result<(), String> {
         let id = artist.id.ok_or("artist has no id")?;
-        self.db.execute(
-            &sql::update(&self.db.dialect()),
-            &[
-                &artist.name as &dyn rusqlite::types::ToSql,
-                &artist.sort_name,
-                &artist.musicbrainz_id,
-                &artist.discogs_id,
-                &artist.bio,
-                &artist.image_path,
-                &artist.image_source,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::update, sql::update);
+        let params: [&dyn ToSqlValue; 8] = [
+            &artist.name,
+            &artist.sort_name,
+            &artist.musicbrainz_id,
+            &artist.discogs_id,
+            &artist.bio,
+            &artist.image_path,
+            &artist.image_source,
+            &id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let artists = stmt
-            .query_map(params![limit, offset], |row| Ok(row_to_artist(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(artists)
+        let sql = self.dialect_sql(sql::list, sql::list);
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_artist).collect())
     }
 
     /// Delete artists that have zero tracks referencing them.
+    /// Single tx for count-then-delete atomicity.
     pub fn cleanup_orphans(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let count: i64 = conn
-            .query_row(sql::count_orphans(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        if count > 0 {
-            conn.execute(sql::delete_orphans(), [])
-                .map_err(|e| e.to_string())?;
-        }
+        let mut count: i64 = 0;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            *count_ref = tx
+                .query_one(sql::count_orphans(), &[])?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            if *count_ref > 0 {
+                tx.execute(sql::delete_orphans(), &[])?;
+            }
+            Ok(())
+        })?;
         Ok(count)
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
-        // Engine-specific tokenization + prefix wrapping.
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::search(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let artists = stmt
-            .query_map(params![fts_query, like, limit], |row| {
-                Ok(row_to_artist(row))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(artists)
+        let sql = self.dialect_sql(sql::search, sql::search);
+        let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_artist).collect())
     }
 }
 
-fn row_to_artist(row: &rusqlite::Row) -> Artist {
+fn row_to_artist(cols: &Vec<SqlValue>) -> Artist {
     Artist {
-        id: row.get(0).ok(),
-        name: row.get(1).unwrap_or_default(),
-        sort_name: row.get(2).ok(),
-        musicbrainz_id: row.get(3).ok(),
-        discogs_id: row.get(4).ok(),
-        bio: row.get(5).ok(),
-        image_path: row.get(6).ok(),
-        image_source: row.get(7).ok(),
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        sort_name: cols.get(2).and_then(|v| v.as_string()),
+        musicbrainz_id: cols.get(3).and_then(|v| v.as_string()),
+        discogs_id: cols.get(4).and_then(|v| v.as_string()),
+        bio: cols.get(5).and_then(|v| v.as_string()),
+        image_path: cols.get(6).and_then(|v| v.as_string()),
+        image_source: cols.get(7).and_then(|v| v.as_string()),
     }
 }
-
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
@@ -523,7 +518,6 @@ mod tests {
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::get_by_name(&s).contains("LOWER(name) = LOWER(?)"));
@@ -534,16 +528,12 @@ mod tests {
 
     #[test]
     fn search_uses_engine_specific_fts_clause() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
-        // SQLite branch keeps the FTS5 subquery against artists_fts.
         let s_sql = sql::search(&SqliteDialect);
         assert!(
             s_sql.contains("a.id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?)")
         );
-        // PG branch hits the tsvector column directly.
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
-        // Both share the LIKE fallback for fuzzy name matches.
         assert!(s_sql.contains("LOWER(a.name) LIKE LOWER(?)"));
         assert!(p_sql.contains("LOWER(a.name) LIKE LOWER($2)"));
     }
@@ -558,5 +548,14 @@ mod tests {
 
         let results = repo.search("Jazz", 10).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = test_db();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ArtistRepo::with_backend(backend);
+        let id = repo.create(&Artist::new("X".into())).unwrap();
+        assert!(repo.get(id).unwrap().is_some());
     }
 }

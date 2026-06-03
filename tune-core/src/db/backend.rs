@@ -77,6 +77,31 @@ pub trait DbBackend: Send + Sync {
         &self,
         f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
     ) -> Result<(), String>;
+
+    /// Same as `query_many`, but reads through the write path so the
+    /// query sees commits made by the write connection that haven't
+    /// yet propagated to the read snapshot.
+    ///
+    /// SQLite + WAL: the read-only connection takes a snapshot at open
+    /// time. During a long-running write tx, that snapshot can lag —
+    /// `list()` may return 0 rows for a row that was just committed by
+    /// the write conn. Calling `query_many_strong` instead reads via
+    /// the write conn, which always sees its own commits. This is the
+    /// pattern from commit `8af95ec` (play_queue) and the `zone_repo`
+    /// P0 fix for forum bugs #2 and #6.
+    ///
+    /// On Postgres, the same `PgPool` is used regardless, so this
+    /// method is functionally identical to `query_many` — the call
+    /// site documents its own intent.
+    ///
+    /// Default impl delegates to `query_many`; SQLite overrides.
+    fn query_many_strong(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.query_many(sql, params)
+    }
 }
 
 /// Transaction handle. Mirror of `DbBackend`'s execution surface, but
@@ -373,6 +398,40 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
                 Err(e)
             }
         }
+    }
+
+    fn query_many_strong(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        // Same body as query_many but uses the *write* connection so
+        // the query sees the writer's own commits — circumvents the
+        // WAL snapshot lag on the read-only conn. See the trait
+        // docstring + commit 8af95ec for the motivating bug.
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.connection().lock().unwrap();
+        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("query: {e}"))?;
+        let mut out: Vec<Vec<SqlValue>> = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(cols);
+        }
+        Ok(out)
     }
 }
 

@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for zone_repo.
@@ -105,54 +107,56 @@ pub struct Zone {
 }
 
 pub struct ZoneRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl ZoneRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
+    fn update_field_sql(&self, field: &str) -> String {
+        match self.db.engine() {
+            Engine::Sqlite => sql::update_field(&SqliteDialect, field),
+            Engine::Postgres => sql::update_field(&PostgresDialect, field),
+        }
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Zone>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![id], |row| Ok(row_to_zone(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_zone))
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        // First try the read connection (cheap, no contention with writes).
+        // First try the read path (cheap, no contention with writes).
+        // If empty, fall back to query_many_strong — under WAL the
+        // read-only snapshot can lag behind the write conn's commits,
+        // which surfaced as the "zone disappears after create" P0
+        // (forum #2, #6). The strong path always sees the writer's
+        // own commits. Pattern preserved from commit 8af95ec.
         let query = sql::list_all();
-        let read_zones: Vec<Zone> = {
-            let conn = self.db.read_connection().lock().unwrap();
-            let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| Ok(row_to_zone(row)))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-
-        // WAL visibility: the read-only connection takes a snapshot at
-        // open time and may not see commits from the write connection
-        // until the snapshot is released. For a 0-result list — which
-        // is the symptom users saw on the "zone disappears after
-        // create" P0 (#2, #6) — re-query through the write connection
-        // which always sees its own commits.
-        // Same pattern as 8af95ec on play_queue/queue.
-        if !read_zones.is_empty() {
-            return Ok(read_zones);
+        let rows = self.db.query_many(&query, &[])?;
+        if !rows.is_empty() {
+            return Ok(rows.iter().map(row_to_zone).collect());
         }
-        let wconn = self.db.connection().lock().unwrap();
-        let mut wstmt = wconn.prepare(&query).map_err(|e| e.to_string())?;
-        let write_zones = wstmt
-            .query_map([], |row| Ok(row_to_zone(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(write_zones)
+        let strong = self.db.query_many_strong(&query, &[])?;
+        Ok(strong.iter().map(row_to_zone).collect())
     }
 
     pub fn create(
@@ -161,103 +165,97 @@ impl ZoneRepo {
         output_type: Option<&str>,
         output_device_id: Option<&str>,
     ) -> Result<i64, String> {
-        // Use a single connection lock so INSERT + last_insert_rowid are atomic.
-        let create_sql = sql::create(&self.db.dialect());
-        self.db.write(|conn| {
-            conn.execute(
-                &create_sql,
-                rusqlite::params![name, output_type, output_device_id],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })
+        // INSERT + last_insert_rowid. We deliberately do NOT use
+        // write_tx here: a write tx wraps in `BEGIN DEFERRED`, which
+        // fails when a SQLite-level transaction is already in progress
+        // (cf. the `create_zone_during_open_transaction` test, where
+        // a scan tx is active). Sequential `execute` + `last_insert_rowid`
+        // each take the write lock briefly and don't try to start a
+        // new tx; both calls share the same rusqlite mutex on SQLite so
+        // the rowid we read reflects the INSERT we just did.
+        let create_sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
+        self.db.execute(&create_sql, &params)?;
+        Ok(self.db.last_insert_rowid())
     }
 
     pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "volume"),
-            &[&volume as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("volume");
+        let params: [&dyn ToSqlValue; 2] = [&volume, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_muted(&self, id: i64, muted: bool) -> Result<(), String> {
         let val = if muted { 1i64 } else { 0i64 };
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "muted"),
-            &[&val as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("muted");
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_name(&self, id: i64, name: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "name"),
-            &[&name as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("name");
+        let params: [&dyn ToSqlValue; 2] = [&name, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_output_device(&self, id: i64, device_id: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "output_device_id"),
-            &[&device_id as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("output_device_id");
+        let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_output_type(&self, id: i64, output_type: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "output_type"),
-            &[&output_type as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("output_type");
+        let params: [&dyn ToSqlValue; 2] = [&output_type, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
         let val = if online { 1i64 } else { 0i64 };
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "online"),
-            &[&val as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("online");
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
         let val = if enabled { 1i64 } else { 0i64 };
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "gapless_enabled"),
-            &[&val as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("gapless_enabled");
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val = if online { 1i64 } else { 0i64 };
-        self.db.execute(
-            &sql::set_online_by_device(&self.db.dialect()),
-            &[&val as &dyn rusqlite::types::ToSql, &device_id],
-        )
+        let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
+        let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
+        self.db.execute(&sql, &params)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute(&sql::delete_by_id(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_group(&self, id: i64, group_id: Option<&str>) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "group_id"),
-            &[&group_id as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("group_id");
+        let params: [&dyn ToSqlValue; 2] = [&group_id, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_sync_delay(&self, id: i64, ms: i32) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_field(&self.db.dialect(), "sync_delay_ms"),
-            &[&ms as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.update_field_sql("sync_delay_ms");
+        let params: [&dyn ToSqlValue; 2] = [&ms, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -269,69 +267,63 @@ impl ZoneRepo {
         source: Option<&str>,
         source_id: Option<&str>,
     ) -> Result<(), String> {
-        self.db.execute(
-            &sql::save_playback_position(&self.db.dialect()),
-            &[
-                &position_ms as &dyn rusqlite::types::ToSql,
-                &track_id,
-                &source,
-                &source_id,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::save_playback_position, sql::save_playback_position);
+        let params: [&dyn ToSqlValue; 5] = [&position_ms, &track_id, &source, &source_id, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn clear_playback_position(&self, id: i64) -> Result<(), String> {
-        self.db.execute(
-            &sql::clear_playback_position(&self.db.dialect()),
-            &[&id as &dyn rusqlite::types::ToSql],
-        )?;
+        let sql = self.dialect_sql(sql::clear_playback_position, sql::clear_playback_position);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_dsp(&self, id: i64, preset_id: Option<i64>, enabled: bool) -> Result<(), String> {
         let en = if enabled { 1i64 } else { 0i64 };
-        self.db.execute(
-            &sql::update_dsp(&self.db.dialect()),
-            &[&preset_id as &dyn rusqlite::types::ToSql, &en, &id],
-        )?;
+        let sql = self.dialect_sql(sql::update_dsp, sql::update_dsp);
+        let params: [&dyn ToSqlValue; 3] = [&preset_id, &en, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn get_dsp_config(&self, id: i64) -> Result<(Option<i64>, bool), String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(
-            &sql::get_dsp_config(&self.db.dialect()),
-            params![id],
-            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
-        )
-        .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_dsp_config, sql::get_dsp_config);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let row = self
+            .db
+            .query_one(&sql, &params)?
+            .ok_or_else(|| format!("zone {id} not found"))?;
+        let preset = row.first().and_then(|v| v.as_i64());
+        let enabled = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+        Ok((preset, enabled))
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 }
 
-fn row_to_zone(row: &rusqlite::Row) -> Zone {
+fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
     Zone {
-        id: row.get(0).ok(),
-        name: row.get(1).unwrap_or_default(),
-        output_type: row.get(2).ok(),
-        output_device_id: row.get(3).ok(),
-        volume: row.get(4).unwrap_or(50),
-        muted: row.get::<_, i64>(5).unwrap_or(0) != 0,
-        online: row.get::<_, i64>(6).unwrap_or(1) != 0,
-        gapless_enabled: row.get::<_, i64>(7).unwrap_or(1) != 0,
-        group_id: row.get(8).ok(),
-        sync_delay_ms: row.get(9).unwrap_or(0),
-        last_position_ms: row.get(10).unwrap_or(0),
-        last_track_id: row.get(11).ok().flatten(),
-        last_track_source: row.get(12).ok().flatten(),
-        last_track_source_id: row.get(13).ok().flatten(),
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        output_type: cols.get(2).and_then(|v| v.as_string()),
+        output_device_id: cols.get(3).and_then(|v| v.as_string()),
+        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(50) as i32,
+        muted: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        online: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+        gapless_enabled: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+        group_id: cols.get(8).and_then(|v| v.as_string()),
+        sync_delay_ms: cols.get(9).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        last_position_ms: cols.get(10).and_then(|v| v.as_i64()).unwrap_or(0),
+        last_track_id: cols.get(11).and_then(|v| v.as_i64()),
+        last_track_source: cols.get(12).and_then(|v| v.as_string()),
+        last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
     }
 }
 
@@ -490,7 +482,6 @@ mod tests {
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::create(&s).contains("VALUES (?, ?, ?)"));
@@ -501,45 +492,45 @@ mod tests {
 
     #[test]
     fn create_zone_during_open_transaction() {
-        // Verify that zone creation is visible to list() even while a
-        // scan transaction is still open on the write connection.
+        // Regression test for forum P0 #2 (Dimitri) and #6 (Dominique):
+        // a zone created during an open scan tx flashes green then
+        // disappears because list() used the read-only snapshot that
+        // pre-dated the commit.
         //
-        // This is the regression fix for forum bugs #2 (Dimitri,
-        // macOS) and #6 (Dominique COMET, Windows): "zone créée"
-        // flashed green then disappeared because list() used the
-        // read-only connection whose snapshot pre-dated the commit.
-        //
-        // The fix: when the read connection returns 0 zones, fall
-        // back to the write connection, which always sees its own
-        // pending writes.
+        // With the port to query_many_strong as the fallback path,
+        // list() now sees the writer's own pending writes — same
+        // observable behavior as the original 8af95ec fix.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = SqliteDb::open(path.to_str().unwrap()).unwrap();
         db.init_schema().unwrap();
 
-        // Simulate scan starting a transaction
+        // Simulate the scan starting a transaction on the write conn.
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        // Zone creation during the scan — inserts within the scan's transaction
         let repo = ZoneRepo::new(db.clone());
         let id = repo
             .create("Living Room", Some("dlna"), Some("uuid:123"))
             .unwrap();
         assert!(id > 0);
 
-        // With the fix in place, list() now sees the zone even though
-        // the scan hasn't committed yet — the write-connection
-        // fallback exposes the pending insert.
         let zones_before_commit = repo.list().unwrap();
         assert_eq!(zones_before_commit.len(), 1);
         assert_eq!(zones_before_commit[0].name, "Living Room");
 
-        // Commit the scan transaction
         db.execute_batch("COMMIT").unwrap();
 
-        // Still visible after commit (now via the read connection).
         let zones_after_commit = repo.list().unwrap();
         assert_eq!(zones_after_commit.len(), 1);
         assert_eq!(zones_after_commit[0].name, "Living Room");
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = test_db();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(backend);
+        let id = repo.create("X", None, None).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "X");
     }
 }
