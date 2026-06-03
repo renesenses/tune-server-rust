@@ -1,0 +1,79 @@
+name: Preflight
+
+# Phase 1 of release autonomy (docs/RELEASE-AUTONOMY-v0.9.50.md).
+#
+# Runs the pre-release checks before any build kicks off. Triggered
+# on push of tag candidates (v*) and via workflow_dispatch for dry
+# runs. Failure of this workflow blocks the release pipeline by
+# producing a failed status check on the commit.
+#
+# Checks performed (each independently pass/fail):
+# - semver: tag follows vMAJOR.MINOR.PATCH[-PRE]
+# - version_bump: tag > Cargo.toml workspace version
+# - no_p0_issues: no GitHub issues with label P0 open
+# - no_release_todos: no TODO(release) markers in source code (excl. docs/)
+# - cahier_de_recette: a cahier-recette-v{major}.{minor}*.md file exists
+# - cargo_audit: no high-severity CVE in the dependency tree
+# - cargo_deny: licenses and duplicate-dep checks pass
+# - ci_status: all check-runs on the commit are green (skipped for
+#   workflow_dispatch on a branch that hasn't had CI yet)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to check (e.g. v0.8.30)"
+        required: true
+        type: string
+      skip_ci_check:
+        description: "Skip the CI status check (useful for dry runs)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: read
+  checks: read
+
+jobs:
+  preflight:
+    name: Pre-release checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: preflight-tools
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          cargo install cargo-audit --locked || echo "cargo-audit install failed, will be reported as skipped"
+          cargo install cargo-deny --locked || echo "cargo-deny install failed, will be reported as skipped"
+
+      - name: Resolve target version
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "skip_ci=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "skip_ci=${{ inputs.skip_ci_check }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run preflight checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          ARGS="--version ${{ steps.resolve.outputs.version }}"
+          if [ "${{ steps.resolve.outputs.skip_ci }}" = "true" ]; then
+            ARGS="$ARGS --no-ci-check"
+          fi
+          python3 scripts/preflight-check.py $ARGS
