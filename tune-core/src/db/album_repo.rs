@@ -1,14 +1,13 @@
+use std::sync::Arc;
+
 use rusqlite::{OptionalExtension, params};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Album;
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for album_repo.
-///
-/// The `search()` and `list_by_genre()` methods retain SQLite-specific
-/// fragments (FTS5 MATCH, `json_each()`); phase 4 will swap them via
-/// dialect helpers (tsvector match and `jsonb_array_elements_text`).
 pub mod sql {
     use super::SqlDialect;
 
@@ -136,7 +135,7 @@ pub mod sql {
 
     pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET cover_path = {} WHERE id = {} AND (cover_path IS NULL OR cover_path = '')",
+            "UPDATE albums SET cover_path = COALESCE(cover_path, {}) WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -176,7 +175,7 @@ pub mod sql {
 
     pub fn list_by_release_group<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE a.musicbrainz_release_group_id = {} ORDER BY a.year, a.title",
+            "{} WHERE a.musicbrainz_release_group_id = {} ORDER BY a.year ASC, LOWER(a.title) ASC",
             select_album(),
             d.placeholder(1)
         )
@@ -184,14 +183,14 @@ pub mod sql {
 
     pub fn list_release_groups() -> String {
         format!(
-            "{} WHERE a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.musicbrainz_release_group_id, a.year",
+            "{} WHERE a.musicbrainz_release_group_id IS NOT NULL ORDER BY a.musicbrainz_release_group_id, a.year ASC",
             select_album()
         )
     }
 
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE a.artist_id = {} ORDER BY a.year, a.title",
+            "{} WHERE a.artist_id = {} ORDER BY a.year ASC, LOWER(a.title) ASC",
             select_album(),
             d.placeholder(1)
         )
@@ -201,12 +200,9 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.cover_path IS NULL OR a.cover_path = '') AND a.source = 'local' ORDER BY a.id"
     }
 
-    /// Engine-agnostic search across albums + their artist name.
-    /// The FTS predicate is built by `dialect.fts_where` (SQLite uses
-    /// the FTS5 subquery; PG hits the tsvector column directly).
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR CAST(a.year AS TEXT) = {} OR LOWER(a.label) LIKE LOWER({}) LIMIT {}",
+            "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
             select_album(),
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
@@ -214,38 +210,64 @@ pub mod sql {
             d.placeholder(4),
             d.placeholder(5),
             d.placeholder(6),
-            d.placeholder(7),
+            d.placeholder(7)
         )
     }
 }
 
 pub struct AlbumRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
+    /// SQLite-specific handle for methods that haven't yet been ported
+    /// (`get_or_create*` use the write-lock + closure pattern, and
+    /// `list_by_genre` uses SQLite's `json_each` table-valued function).
+    /// Populated by `new(SqliteDb)`; `None` for `with_backend`, in which
+    /// case those methods return an explicit "not implemented" error.
+    /// Removed once the deferred methods are ported.
+    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl AlbumRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db }
+        Self {
+            sqlite_legacy: Some(db.clone()),
+            db: Arc::new(db),
+        }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
+        Self {
+            db,
+            sqlite_legacy: None,
+        }
+    }
+
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
+    fn legacy(&self) -> Result<&SqliteDb, String> {
+        self.sqlite_legacy
+            .as_ref()
+            .ok_or_else(|| "method not yet ported for non-SQLite backends".into())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![id], |row| Ok(row_to_album(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
     pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_title(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![title], |row| Ok(row_to_album(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_title, sql::get_by_title);
+        let params: [&dyn ToSqlValue; 1] = [&title];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
     pub fn get_by_title_and_artist(
@@ -254,96 +276,79 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        // Try exact match with year first
         if let Some(y) = year {
-            let mut stmt = conn
-                .prepare(&sql::get_by_title_artist_year(&self.db.dialect()))
-                .map_err(|e| e.to_string())?;
-            if let Some(album) = stmt
-                .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
-                .optional()
-                .map_err(|e| e.to_string())?
-            {
-                return Ok(Some(album));
+            let sql =
+                self.dialect_sql(sql::get_by_title_artist_year, sql::get_by_title_artist_year);
+            let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &y];
+            if let Some(row) = self.db.query_one(&sql, &params)? {
+                return Ok(Some(row_to_album(&row)));
             }
         }
-        // Fallback: match by title + artist without year (avoids duplicate albums
-        // when tracks from the same album have different or missing year tags)
-        let mut stmt = conn
-            .prepare(&sql::get_by_title_artist(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_title_artist, sql::get_by_title_artist);
+        let params: [&dyn ToSqlValue; 2] = [&title, &artist_id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
     pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_title_only(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![title], |row| Ok(row_to_album(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_title_only, sql::get_by_title_only);
+        let params: [&dyn ToSqlValue; 1] = [&title];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_musicbrainz_release_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![release_id], |row| Ok(row_to_album(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(
+            sql::get_by_musicbrainz_release_id,
+            sql::get_by_musicbrainz_release_id,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&release_id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
     pub fn create(&self, album: &Album) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create(&self.db.dialect()),
-            &[
-                &album.title as &dyn rusqlite::types::ToSql,
-                &album.artist_id,
-                &album.year,
-                &album.original_year,
-                &album.genre,
-                &album.genres,
-                &album.disc_count,
-                &album.track_count,
-                &album.cover_path,
-                &album.source,
-                &album.source_id,
-                &album.label,
-                &album.catalog_number,
-                &album.barcode,
-                &album.format,
-                &album.sample_rate,
-                &album.bit_depth,
-                &album.bio,
-                &album.musicbrainz_release_id,
-                &album.musicbrainz_release_group_id,
-                &album.release_date,
-                &album.original_date,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 22] = [
+            &album.title,
+            &album.artist_id,
+            &album.year,
+            &album.original_year,
+            &album.genre,
+            &album.genres,
+            &album.disc_count,
+            &album.track_count,
+            &album.cover_path,
+            &album.source,
+            &album.source_id,
+            &album.label,
+            &album.catalog_number,
+            &album.barcode,
+            &album.format,
+            &album.sample_rate,
+            &album.bit_depth,
+            &album.bio,
+            &album.musicbrainz_release_id,
+            &album.musicbrainz_release_group_id,
+            &album.release_date,
+            &album.original_date,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Look up or create an album, using the write connection for the entire
-    /// read-then-write sequence. This ensures that during a scan transaction
-    /// (BEGIN IMMEDIATE), the lookup sees albums created earlier in the same
-    /// batch, preventing duplicates.
+    /// Look up or create an album. **SQLite-only** until the read-then-
+    /// write-with-conn closure is migrated to `write_tx`. Returns an
+    /// error when constructed via `with_backend`.
     pub fn get_or_create(
         &self,
         title: &str,
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Album, String> {
-        let d = self.db.dialect();
+        let db = self.legacy()?;
+        let d = SqliteDialect;
         let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
         let by_title_artist_sql = sql::get_by_title_artist(&d);
         let create_sql = sql::create_minimal(&d);
-        self.db.write(|conn| {
+        db.write(|conn| {
             if let Some(album) = lookup_album(
                 conn,
                 title,
@@ -364,7 +369,8 @@ impl AlbumRepo {
         })
     }
 
-    /// Like `get_or_create` but also checks MusicBrainz release ID first.
+    /// Like `get_or_create` but also checks MusicBrainz release ID
+    /// first. **SQLite-only** for the same reason.
     pub fn get_or_create_with_mbid(
         &self,
         title: &str,
@@ -372,16 +378,17 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, String> {
-        let d = self.db.dialect();
+        let db = self.legacy()?;
+        let d = SqliteDialect;
         let by_mbid_sql = sql::get_by_musicbrainz_release_id(&d);
         let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
         let by_title_artist_sql = sql::get_by_title_artist(&d);
         let create_sql = sql::create_with_mbid(&d);
-        self.db.write(|conn| {
+        db.write(|conn| {
             if let Some(release_id) = mbid {
                 let mut stmt = conn.prepare_cached(&by_mbid_sql)?;
                 if let Some(album) = stmt
-                    .query_row(params![release_id], |row| Ok(row_to_album(row)))
+                    .query_row(params![release_id], |row| Ok(row_to_album_rusqlite(row)))
                     .optional()?
                 {
                     return Ok(album);
@@ -410,122 +417,126 @@ impl AlbumRepo {
 
     pub fn update(&self, album: &Album) -> Result<(), String> {
         let id = album.id.ok_or("album has no id")?;
-        self.db.execute(
-            &sql::update(&self.db.dialect()),
-            &[
-                &album.title as &dyn rusqlite::types::ToSql,
-                &album.artist_id,
-                &album.year,
-                &album.original_year,
-                &album.genre,
-                &album.genres,
-                &album.disc_count,
-                &album.track_count,
-                &album.cover_path,
-                &album.label,
-                &album.catalog_number,
-                &album.format,
-                &album.sample_rate,
-                &album.bit_depth,
-                &album.bio,
-                &album.musicbrainz_release_id,
-                &album.musicbrainz_release_group_id,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::update, sql::update);
+        let params: [&dyn ToSqlValue; 18] = [
+            &album.title,
+            &album.artist_id,
+            &album.year,
+            &album.original_year,
+            &album.genre,
+            &album.genres,
+            &album.disc_count,
+            &album.track_count,
+            &album.cover_path,
+            &album.label,
+            &album.catalog_number,
+            &album.format,
+            &album.sample_rate,
+            &album.bit_depth,
+            &album.bio,
+            &album.musicbrainz_release_id,
+            &album.musicbrainz_release_group_id,
+            &id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_cover_path(&self.db.dialect()),
-            &[&cover_path as &dyn rusqlite::types::ToSql, &album_id],
-        )?;
+        let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
+        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_track_count(&self, album_id: i64) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_track_count(&self.db.dialect()),
-            &[&album_id, &album_id],
-        )?;
+        let sql = self.dialect_sql(sql::update_track_count, sql::update_track_count);
+        let params: [&dyn ToSqlValue; 2] = [&album_id, &album_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), String> {
-        self.db.execute(
+        // 7 references to the same album_id parameter. SQLite uses `?`
+        // for each; PG would use $1..$7 — we build the placeholder list
+        // via the dialect to keep both engines happy.
+        let p = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let plist = (1..=7)
+            .map(|i| match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(i),
+                Engine::Postgres => PostgresDialect.placeholder(i),
+            })
+            .collect::<Vec<_>>();
+        let _ = p;
+        let sql = format!(
             "UPDATE albums SET
-                format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = ? AND t.format IS NOT NULL LIMIT 1)),
-                sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = ?)),
-                bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = ?)),
-                genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = ? AND t.genre IS NOT NULL LIMIT 1)),
-                genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = ? AND t.genres IS NOT NULL LIMIT 1)),
-                disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = ?))
-            WHERE id = ?",
-            &[&album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id],
-        )?;
+                format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = {} AND t.format IS NOT NULL LIMIT 1)),
+                sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = {})),
+                bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = {})),
+                genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = {} AND t.genre IS NOT NULL LIMIT 1)),
+                genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = {} AND t.genres IS NOT NULL LIMIT 1)),
+                disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = {}))
+            WHERE id = {}",
+            plist[0], plist[1], plist[2], plist[3], plist[4], plist[5], plist[6]
+        );
+        let params: [&dyn ToSqlValue; 7] = [
+            &album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn delete_orphans(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let count: i64 = conn
-            .query_row(sql::count_orphans(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        if count > 0 {
-            conn.execute(sql::delete_orphans(), [])
-                .map_err(|e| e.to_string())?;
-        }
+        let mut count: i64 = 0;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            *count_ref = tx
+                .query_one(sql::count_orphans(), &[])?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            if *count_ref > 0 {
+                tx.execute(sql::delete_orphans(), &[])?;
+            }
+            Ok(())
+        })?;
         Ok(count)
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list_recent(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit], |row| Ok(row_to_album(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let sql = self.dialect_sql(sql::list_recent, sql::list_recent);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 
     pub fn list_by_release_group(&self, group_id: &str) -> Result<Vec<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list_by_release_group(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_map(params![group_id], |row| Ok(row_to_album(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::list_by_release_group, sql::list_by_release_group);
+        let params: [&dyn ToSqlValue; 1] = [&group_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 
     pub fn list_release_groups(&self) -> Result<Vec<(String, Vec<Album>)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list_release_groups())
-            .map_err(|e| e.to_string())?;
-        let albums: Vec<Album> = stmt
-            .query_map([], |row| Ok(row_to_album(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        drop(stmt);
-        drop(conn);
+        let rows = self.db.query_many(&sql::list_release_groups(), &[])?;
+        let albums: Vec<Album> = rows.iter().map(row_to_album).collect();
 
         let mut groups: std::collections::HashMap<String, Vec<Album>> =
             std::collections::HashMap::new();
@@ -573,14 +584,23 @@ impl AlbumRepo {
             }
             _ => format!("a.id {dir}"),
         };
-        let mut wheres = Vec::new();
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+
+        let mut wheres: Vec<String> = Vec::new();
+        let mut bind_values: Vec<SqlValue> = Vec::new();
+        let mut next_ph = 1usize;
 
         if let Some(fmt) = format {
-            wheres.push(
-                "a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format = ?)".to_string(),
-            );
-            bind_values.push(Box::new(fmt.to_string()));
+            wheres.push(format!(
+                "a.id IN (SELECT DISTINCT album_id FROM tracks WHERE format = {})",
+                make_ph(next_ph)
+            ));
+            bind_values.push(SqlValue::Text(fmt.to_string()));
+            next_ph += 1;
         }
         match quality {
             Some("dsd") => {
@@ -604,50 +624,37 @@ impl AlbumRepo {
             format!(" WHERE {}", wheres.join(" AND "))
         };
 
+        let limit_ph = make_ph(next_ph);
+        next_ph += 1;
+        let offset_ph = make_ph(next_ph);
+
         let sql = format!(
-            "{}{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+            "{}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}",
             sql::select_album()
         );
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
-        let mut params_vec: Vec<&dyn rusqlite::types::ToSql> =
-            bind_values.iter().map(|b| b.as_ref()).collect();
-        params_vec.push(&limit);
-        params_vec.push(&offset);
+        bind_values.push(SqlValue::Int(limit));
+        bind_values.push(SqlValue::Int(offset));
 
-        let albums = stmt
-            .query_map(params_vec.as_slice(), |row| Ok(row_to_album(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(albums)
+        let refs: Vec<&dyn ToSqlValue> = bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let rows = self.db.query_many(&sql, &refs)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list_by_artist(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let albums = stmt
-            .query_map(params![artist_id], |row| Ok(row_to_album(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(albums)
+        let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
+        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// SQLite-only — uses `json_each()` (table-valued function) for
+    /// the JSON-array genre matching. Returns an error on the
+    /// `with_backend` path until a PG-compatible builder lands using
+    /// `jsonb_array_elements_text` via a dialect helper.
     pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        // Match albums where the requested genre appears in either:
-        // 1) The legacy `genre` text column (may contain "Jazz; Blues" or "Jazz/Blues")
-        //    We normalize separators to commas and use delimiter-aware LIKE matching
-        //    so "Rock" does not accidentally match "Progressive Rock".
-        // 2) The structured `genres` JSON array via json_each() for exact element match.
-        //
-        // The `json_each()` table-valued function is SQLite-only. Phase 4 will
-        // swap it for `jsonb_array_elements_text(a2.genres)` on Postgres via a
-        // dialect helper.
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let delimited_pattern = format!("%,{},%", genre.replace('%', "").replace('_', ""));
         let mut stmt = conn
             .prepare(&format!(
@@ -660,7 +667,7 @@ impl AlbumRepo {
             .map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(params![delimited_pattern, genre], |row| {
-                Ok(row_to_album(row))
+                Ok(row_to_album_rusqlite(row))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
@@ -674,46 +681,33 @@ impl AlbumRepo {
     pub fn list_without_cover(
         &self,
     ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(sql::list_without_cover())
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
+        let rows = self.db.query_many(sql::list_without_cover(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                    cols.get(3).and_then(|v| v.as_string()),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::search(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let albums = stmt
-            .query_map(
-                params![fts_query, like, like, like, query.trim(), like, limit],
-                |row| Ok(row_to_album(row)),
-            )
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(albums)
+        let trimmed = query.trim();
+        let sql = self.dialect_sql(sql::search, sql::search);
+        let params: [&dyn ToSqlValue; 7] =
+            [&fts_query, &like, &like, &like, &trimmed, &like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 }
 
 /// Shared lookup logic used by `get_or_create` and `get_or_create_with_mbid`.
-/// Runs on an already-locked write connection to see uncommitted rows.
 fn lookup_album(
     conn: &rusqlite::Connection,
     title: &str,
@@ -725,18 +719,55 @@ fn lookup_album(
     if let Some(y) = year {
         let mut stmt = conn.prepare_cached(by_title_artist_year_sql)?;
         if let Some(album) = stmt
-            .query_row(params![title, artist_id, y], |row| Ok(row_to_album(row)))
+            .query_row(params![title, artist_id, y], |row| {
+                Ok(row_to_album_rusqlite(row))
+            })
             .optional()?
         {
             return Ok(Some(album));
         }
     }
     let mut stmt = conn.prepare_cached(by_title_artist_sql)?;
-    stmt.query_row(params![title, artist_id], |row| Ok(row_to_album(row)))
-        .optional()
+    stmt.query_row(params![title, artist_id], |row| {
+        Ok(row_to_album_rusqlite(row))
+    })
+    .optional()
 }
 
-fn row_to_album(row: &rusqlite::Row) -> Album {
+fn row_to_album(cols: &Vec<SqlValue>) -> Album {
+    Album {
+        id: cols.first().and_then(|v| v.as_i64()),
+        title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        artist_id: cols.get(2).and_then(|v| v.as_i64()),
+        artist_name: cols.get(3).and_then(|v| v.as_string()),
+        year: cols.get(4).and_then(|v| v.as_i64()).map(|n| n as i32),
+        original_year: cols.get(5).and_then(|v| v.as_i64()).map(|n| n as i32),
+        genre: cols.get(6).and_then(|v| v.as_string()),
+        // Index 23 (after the 23-col select): a.genres
+        genres: cols.get(23).and_then(|v| v.as_string()),
+        disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
+        track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
+        cover_path: cols.get(9).and_then(|v| v.as_string()),
+        source: cols
+            .get(10)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "local".into()),
+        source_id: cols.get(11).and_then(|v| v.as_string()),
+        label: cols.get(12).and_then(|v| v.as_string()),
+        catalog_number: cols.get(13).and_then(|v| v.as_string()),
+        barcode: cols.get(14).and_then(|v| v.as_string()),
+        format: cols.get(15).and_then(|v| v.as_string()),
+        sample_rate: cols.get(16).and_then(|v| v.as_i64()).map(|n| n as i32),
+        bit_depth: cols.get(17).and_then(|v| v.as_i64()).map(|n| n as i32),
+        bio: cols.get(18).and_then(|v| v.as_string()),
+        musicbrainz_release_id: cols.get(19).and_then(|v| v.as_string()),
+        musicbrainz_release_group_id: cols.get(20).and_then(|v| v.as_string()),
+        release_date: cols.get(21).and_then(|v| v.as_string()),
+        original_date: cols.get(22).and_then(|v| v.as_string()),
+    }
+}
+
+fn row_to_album_rusqlite(row: &rusqlite::Row) -> Album {
     Album {
         id: row.get(0).ok(),
         title: row.get(1).unwrap_or_default(),
@@ -865,7 +896,6 @@ mod tests {
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
-        // Should not overwrite existing cover
         repo.update_cover_path(id, "new_hash").unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("abc123"));
@@ -886,9 +916,8 @@ mod tests {
 
         let all = repo.list(100, 0).unwrap();
         assert_eq!(all.len(), 5);
-        // Should be sorted by title (COLLATE NOCASE)
         assert_eq!(all[0].title, "Alpha");
-        assert_eq!(all[4].title, "Gamma"); // G after E
+        assert_eq!(all[4].title, "Gamma");
 
         let page = repo.list(2, 2).unwrap();
         assert_eq!(page.len(), 2);
@@ -905,7 +934,6 @@ mod tests {
 
         let recent = repo.list_recent(3).unwrap();
         assert_eq!(recent.len(), 3);
-        // Most recent first (highest id)
         assert_eq!(recent[0].title, "Album 4");
     }
 
@@ -936,7 +964,6 @@ mod tests {
 
         let miles_albums = repo.list_by_artist(aid1).unwrap();
         assert_eq!(miles_albums.len(), 2);
-        // Should be sorted by year
         assert_eq!(miles_albums[0].title, "Kind of Blue");
         assert_eq!(miles_albums[1].title, "Bitches Brew");
     }
@@ -958,46 +985,31 @@ mod tests {
         a3.genres = Some(r#"["Jazz","Fusion"]"#.into());
         repo.create(&a3).unwrap();
 
-        // Semicolon-separated multi-genre in legacy column
         let mut a4 = Album::new("Jazz Blues Album".into());
         a4.genre = Some("Jazz; Blues".into());
         repo.create(&a4).unwrap();
 
-        // Slash-separated multi-genre in legacy column
         let mut a5 = Album::new("Blues Rock Album".into());
         a5.genre = Some("Blues/Rock".into());
         repo.create(&a5).unwrap();
 
-        // Jazz: a1 (exact), a3 (JSON array), a4 (semicolon-separated)
         let jazz = repo.list_by_genre("Jazz").unwrap();
-        assert_eq!(
-            jazz.len(),
-            3,
-            "Jazz should match exact, JSON, and semicolon-separated"
-        );
+        assert_eq!(jazz.len(), 3);
 
-        // Blues: a4 (semicolon-separated), a5 (slash-separated)
         let blues = repo.list_by_genre("Blues").unwrap();
-        assert_eq!(
-            blues.len(),
-            2,
-            "Blues should match semicolon and slash-separated"
-        );
+        assert_eq!(blues.len(), 2);
 
-        // Rock: a2 (exact), a5 (slash-separated)
         let rock = repo.list_by_genre("Rock").unwrap();
-        assert_eq!(rock.len(), 2, "Rock should match exact and slash-separated");
+        assert_eq!(rock.len(), 2);
 
-        // "Progressive Rock" should NOT match plain "Rock"
         let mut a6 = Album::new("Prog Album".into());
         a6.genre = Some("Progressive Rock".into());
         repo.create(&a6).unwrap();
         let rock2 = repo.list_by_genre("Rock").unwrap();
-        assert_eq!(rock2.len(), 2, "Rock should not match Progressive Rock");
+        assert_eq!(rock2.len(), 2);
 
-        // But "Progressive Rock" should match itself
         let prog = repo.list_by_genre("Progressive Rock").unwrap();
-        assert_eq!(prog.len(), 1, "Progressive Rock should match exactly");
+        assert_eq!(prog.len(), 1);
     }
 
     #[test]
@@ -1187,7 +1199,6 @@ mod tests {
     fn delete_nonexistent_album() {
         let db = test_db();
         let repo = AlbumRepo::new(db);
-        // Should not error
         repo.delete(999).unwrap();
     }
 
@@ -1258,29 +1269,26 @@ mod tests {
         repo.create(&a2).unwrap();
 
         let asc = repo.list_sorted(100, 0, "artist", "asc").unwrap();
-        assert_eq!(asc[0].title, "Arrival"); // Abba first
-        assert_eq!(asc[1].title, "Hot Rats"); // Zappa second
+        assert_eq!(asc[0].title, "Arrival");
+        assert_eq!(asc[1].title, "Hot Rats");
 
         let desc = repo.list_sorted(100, 0, "artist", "desc").unwrap();
-        assert_eq!(desc[0].title, "Hot Rats"); // Zappa first
+        assert_eq!(desc[0].title, "Hot Rats");
     }
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::get_by_id(&s).ends_with("WHERE a.id = ?"));
         assert!(sql::get_by_id(&p).ends_with("WHERE a.id = $1"));
         assert!(sql::get_by_title(&p).contains("LOWER(a.title) = LOWER($1)"));
         assert!(sql::create_minimal(&p).contains("VALUES ($1, $2, $3)"));
-        // No more COLLATE in the canonical builders.
         assert!(!sql::list_by_artist(&p).contains("COLLATE"));
     }
 
     #[test]
     fn search_uses_engine_specific_fts_clause() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s_sql = sql::search(&SqliteDialect);
         assert!(s_sql.contains("a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?)"));
         let p_sql = sql::search(&PostgresDialect);
@@ -1303,5 +1311,17 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn with_backend_constructor_partial() {
+        let db = test_db();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend);
+        let id = repo.create(&Album::new("X".into())).unwrap();
+        assert!(repo.get(id).unwrap().is_some());
+        // Legacy-only methods must explicitly refuse on backend-only.
+        assert!(repo.get_or_create("X", 0, None).is_err());
+        assert!(repo.list_by_genre("Jazz").is_err());
     }
 }
