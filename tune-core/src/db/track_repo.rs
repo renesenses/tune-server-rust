@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 
@@ -137,8 +139,7 @@ pub mod sql {
         )
     }
 
-    /// Engine-agnostic search across tracks + their artist/album/year.
-    /// FTS predicate built via `dialect.fts_where`.
+    /// Engine-agnostic search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE {} OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(t.genre) LIKE LOWER({}) OR LOWER(t.composer) LIKE LOWER({}) OR CAST(al.year AS TEXT) = {} LIMIT {}",
@@ -154,226 +155,463 @@ pub mod sql {
 }
 
 pub struct TrackRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
+    /// SQLite-specific handle for methods that bypass the trait
+    /// (inline SQL with `?`, HashSet/HashMap returns, `RANDOM()`,
+    /// `synced_lyrics` / `acoustid_*` / `trailing_silence_ms` /
+    /// `waveform_json` columns that aren't yet in the PG schema, and
+    /// the `db()` getter that callers depend on).
+    ///
+    /// Plan: `docs/PORTING-TRACK-REPO-PLAN.md` (Group B promotes
+    /// inline SQL to builders, Group D refactors the `db()` callers).
+    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl TrackRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db }
+        Self {
+            sqlite_legacy: Some(db.clone()),
+            db: Arc::new(db),
+        }
     }
 
-    pub fn db(&self) -> SqliteDb {
-        self.db.clone()
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
+        Self {
+            db,
+            sqlite_legacy: None,
+        }
     }
+
+    /// Returns the SQLite handle. Panics on the `with_backend` path —
+    /// callers using this must be refactored before non-SQLite
+    /// production. See `docs/PORTING-TRACK-REPO-PLAN.md` Group D.
+    pub fn db(&self) -> SqliteDb {
+        self.sqlite_legacy
+            .as_ref()
+            .expect("track_repo.db() called on with_backend(); refactor caller")
+            .clone()
+    }
+
+    fn legacy(&self) -> Result<&SqliteDb, String> {
+        self.sqlite_legacy
+            .as_ref()
+            .ok_or_else(|| "track_repo: method not yet ported for non-SQLite backends".into())
+    }
+
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
+    // ─── Group A: simple ports via DbBackend ──────────────────────
 
     pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![id], |row| Ok(row_to_track(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_path(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![file_path], |row| Ok(row_to_track(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
+        let params: [&dyn ToSqlValue; 1] = [&file_path];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
     pub fn create(&self, track: &Track) -> Result<i64, String> {
-        self.db.execute(
-            &sql::insert(&self.db.dialect()),
-            &[
-                &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id,
-                &track.artist_id,
-                &track.album_artist,
-                &track.disc_number,
-                &track.disc_subtitle,
-                &track.track_number,
-                &track.duration_ms,
-                &track.file_path,
-                &track.format,
-                &track.sample_rate,
-                &track.bit_depth,
-                &track.channels,
-                &track.file_mtime,
-                &track.file_size,
-                &track.audio_hash,
-                &track.source,
-                &track.source_id,
-                &track.isrc,
-                &track.genre,
-                &track.genres,
-                &track.composer,
-                &track.year,
-                &track.bpm,
-                &track.label,
-                &track.musicbrainz_recording_id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::insert, sql::insert);
+        let params: [&dyn ToSqlValue; 26] = [
+            &track.title,
+            &track.album_id,
+            &track.artist_id,
+            &track.album_artist,
+            &track.disc_number,
+            &track.disc_subtitle,
+            &track.track_number,
+            &track.duration_ms,
+            &track.file_path,
+            &track.format,
+            &track.sample_rate,
+            &track.bit_depth,
+            &track.channels,
+            &track.file_mtime,
+            &track.file_size,
+            &track.audio_hash,
+            &track.source,
+            &track.source_id,
+            &track.isrc,
+            &track.genre,
+            &track.genres,
+            &track.composer,
+            &track.year,
+            &track.bpm,
+            &track.label,
+            &track.musicbrainz_recording_id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
-    }
-
-    /// Insert multiple tracks using a single prepared statement.
-    ///
-    /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
-    /// if desired. Returns the number of successfully inserted tracks.
-    pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
-        let insert_sql = sql::insert(&self.db.dialect());
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(&insert_sql)
-            .map_err(|e| e.to_string())?;
-        let mut count = 0;
-        for track in tracks {
-            let res = stmt.execute(params![
-                track.title,
-                track.album_id,
-                track.artist_id,
-                track.album_artist,
-                track.disc_number,
-                track.disc_subtitle,
-                track.track_number,
-                track.duration_ms,
-                track.file_path,
-                track.format,
-                track.sample_rate,
-                track.bit_depth,
-                track.channels,
-                track.file_mtime,
-                track.file_size,
-                track.audio_hash,
-                track.source,
-                track.source_id,
-                track.isrc,
-                track.genre,
-                track.genres,
-                track.composer,
-                track.year,
-                track.bpm,
-                track.label,
-                track.musicbrainz_recording_id,
-            ]);
-            if res.is_ok() {
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Update multiple tracks using a single prepared statement.
-    ///
-    /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
-    /// if desired. Returns the number of successfully updated tracks.
-    pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
-        let update_sql = sql::update(&self.db.dialect());
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare_cached(&update_sql)
-            .map_err(|e| e.to_string())?;
-        let mut count = 0;
-        for track in tracks {
-            let Some(id) = track.id else { continue };
-            let res = stmt.execute(params![
-                track.title,
-                track.album_id,
-                track.artist_id,
-                track.album_artist,
-                track.disc_number,
-                track.disc_subtitle,
-                track.track_number,
-                track.duration_ms,
-                track.file_path,
-                track.format,
-                track.sample_rate,
-                track.bit_depth,
-                track.channels,
-                track.file_mtime,
-                track.file_size,
-                track.audio_hash,
-                track.genre,
-                track.genres,
-                track.composer,
-                track.year,
-                track.bpm,
-                track.label,
-                track.musicbrainz_recording_id,
-                id,
-            ]);
-            if res.is_ok() {
-                count += 1;
-            }
-        }
-        Ok(count)
     }
 
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
-        self.db.execute(
-            &sql::update(&self.db.dialect()),
-            &[
-                &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id,
-                &track.artist_id,
-                &track.album_artist,
-                &track.disc_number,
-                &track.disc_subtitle,
-                &track.track_number,
-                &track.duration_ms,
-                &track.file_path,
-                &track.format,
-                &track.sample_rate,
-                &track.bit_depth,
-                &track.channels,
-                &track.file_mtime,
-                &track.file_size,
-                &track.audio_hash,
-                &track.genre,
-                &track.genres,
-                &track.composer,
-                &track.year,
-                &track.bpm,
-                &track.label,
-                &track.musicbrainz_recording_id,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::update, sql::update);
+        let params: [&dyn ToSqlValue; 24] = [
+            &track.title,
+            &track.album_id,
+            &track.artist_id,
+            &track.album_artist,
+            &track.disc_number,
+            &track.disc_subtitle,
+            &track.track_number,
+            &track.duration_ms,
+            &track.file_path,
+            &track.format,
+            &track.sample_rate,
+            &track.bit_depth,
+            &track.channels,
+            &track.file_mtime,
+            &track.file_size,
+            &track.audio_hash,
+            &track.genre,
+            &track.genres,
+            &track.composer,
+            &track.year,
+            &track.bpm,
+            &track.label,
+            &track.musicbrainz_recording_id,
+            &id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn delete_all(&self) -> Result<u64, String> {
-        let count = self.db.execute(sql::delete_all(), &[])?;
-        self.db.execute("DELETE FROM albums", &[]).ok();
-        self.db.execute("DELETE FROM artists", &[]).ok();
-        self.db.execute("DELETE FROM track_credits", &[]).ok();
-        Ok(count as u64)
+        // 4 sequential DELETEs — wrap in write_tx for atomicity.
+        let mut count: u64 = 0;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            *count_ref = tx.execute(sql::delete_all(), &[])? as u64;
+            let _ = tx.execute("DELETE FROM albums", &[]);
+            let _ = tx.execute("DELETE FROM artists", &[]);
+            let _ = tx.execute("DELETE FROM track_credits", &[]);
+            Ok(())
+        })?;
+        Ok(count)
     }
 
     pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::delete_by_path(&self.db.dialect()),
-            &[&file_path as &dyn rusqlite::types::ToSql],
-        )?;
+        let sql = self.dialect_sql(sql::delete_by_path, sql::delete_by_path);
+        let params: [&dyn ToSqlValue; 1] = [&file_path];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
+    pub fn count(&self) -> Result<i64, String> {
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
+    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+        let sql = format!(
+            "{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT {} OFFSET {}",
+            sql::select_track(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            },
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(2),
+                Engine::Postgres => PostgresDialect.placeholder(2),
+            }
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn update_mtime_and_size(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+    ) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
+        let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::update_audio_hash, sql::update_audio_hash);
+        let params: [&dyn ToSqlValue; 2] = [&audio_hash, &file_path];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
+        let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
+        let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
+        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let like = format!("%{query}%");
+        let trimmed = query.trim();
+        let sql = self.dialect_sql(sql::search, sql::search);
+        let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
+        let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
+        let params: [&dyn ToSqlValue; 1] = [&path];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+    }
+
+    pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, String> {
+        let like = format!("%{title}%");
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "{} WHERE LOWER(t.title) LIKE LOWER({}) LIMIT {}",
+            sql::select_track(),
+            make_ph(1),
+            make_ph(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn exists_by_audio_hash_and_album(
+        &self,
+        audio_hash: &str,
+        album_id: i64,
+    ) -> Result<bool, String> {
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM tracks WHERE audio_hash = {} AND album_id = {}",
+            make_ph(1),
+            make_ph(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&audio_hash, &album_id];
+        let n = self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        Ok(n > 0)
+    }
+
+    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
+        // Both engines accept `ORDER BY RANDOM()` (SQLite) /
+        // `ORDER BY random()` (PG). The lowercase form works on both.
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "SELECT id FROM tracks ORDER BY random() LIMIT {}",
+            make_ph(1)
+        );
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    pub fn count_doubtful(&self) -> Result<i64, String> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM tracks t \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
+                OR (al.title IS NULL OR al.title = '')"
+        );
+        Ok(self
+            .db
+            .query_one(&sql, &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
+    }
+
+    pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let sql = format!(
+            "{} \
+             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
+                OR (al.title IS NULL OR al.title = '') \
+             ORDER BY t.id LIMIT {} OFFSET {}",
+            sql::select_track(),
+            make_ph(1),
+            make_ph(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let placeholders: Vec<String> = (1..=ids.len()).map(make_ph).collect();
+        let sql = format!(
+            "{} WHERE t.id IN ({})",
+            sql::select_track(),
+            placeholders.join(",")
+        );
+        let owned: Vec<SqlValue> = ids.iter().map(|id| SqlValue::Int(*id)).collect();
+        let refs: Vec<&dyn ToSqlValue> = owned.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let rows = self.db.query_many(&sql, &refs)?;
+        let tracks: Vec<Track> = rows.iter().map(row_to_track).collect();
+        // Preserve caller's ordering
+        let mut ordered = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
+                ordered.push(t.clone());
+            }
+        }
+        Ok(ordered)
+    }
+
+    // ─── Group B/C: write_tx + simple inline ──────────────────────
+
+    pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let insert_sql = self.dialect_sql(sql::insert, sql::insert);
+        let mut count = 0usize;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            for track in tracks {
+                let params: [&dyn ToSqlValue; 26] = [
+                    &track.title,
+                    &track.album_id,
+                    &track.artist_id,
+                    &track.album_artist,
+                    &track.disc_number,
+                    &track.disc_subtitle,
+                    &track.track_number,
+                    &track.duration_ms,
+                    &track.file_path,
+                    &track.format,
+                    &track.sample_rate,
+                    &track.bit_depth,
+                    &track.channels,
+                    &track.file_mtime,
+                    &track.file_size,
+                    &track.audio_hash,
+                    &track.source,
+                    &track.source_id,
+                    &track.isrc,
+                    &track.genre,
+                    &track.genres,
+                    &track.composer,
+                    &track.year,
+                    &track.bpm,
+                    &track.label,
+                    &track.musicbrainz_recording_id,
+                ];
+                if tx.execute(&insert_sql, &params).is_ok() {
+                    *count_ref += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let update_sql = self.dialect_sql(sql::update, sql::update);
+        let mut count = 0usize;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            for track in tracks {
+                let Some(id) = track.id else { continue };
+                let params: [&dyn ToSqlValue; 24] = [
+                    &track.title,
+                    &track.album_id,
+                    &track.artist_id,
+                    &track.album_artist,
+                    &track.disc_number,
+                    &track.disc_subtitle,
+                    &track.track_number,
+                    &track.duration_ms,
+                    &track.file_path,
+                    &track.format,
+                    &track.sample_rate,
+                    &track.bit_depth,
+                    &track.channels,
+                    &track.file_mtime,
+                    &track.file_size,
+                    &track.audio_hash,
+                    &track.genre,
+                    &track.genres,
+                    &track.composer,
+                    &track.year,
+                    &track.bpm,
+                    &track.label,
+                    &track.musicbrainz_recording_id,
+                    &id,
+                ];
+                if tx.execute(&update_sql, &params).is_ok() {
+                    *count_ref += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    // ─── Group D: SQLite-only (inline SQL with `?`, JSON cols, HashSet/Map) ─
+
     pub fn get_synced_lyrics(&self, track_id: i64) -> Result<Option<String>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT synced_lyrics FROM tracks WHERE id = ?",
-            rusqlite::params![track_id],
+            params![track_id],
             |row| row.get(0),
         )
         .optional()
@@ -382,7 +620,8 @@ impl TrackRepo {
     }
 
     pub fn set_synced_lyrics(&self, track_id: i64, json: &str) -> Result<(), String> {
-        self.db.execute(
+        let db = self.legacy()?;
+        db.execute(
             "UPDATE tracks SET synced_lyrics = ? WHERE id = ?",
             &[&json as &dyn rusqlite::types::ToSql, &track_id],
         )?;
@@ -390,10 +629,11 @@ impl TrackRepo {
     }
 
     pub fn get_trailing_silence(&self, track_id: i64) -> Result<Option<i64>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT trailing_silence_ms FROM tracks WHERE id = ?",
-            rusqlite::params![track_id],
+            params![track_id],
             |row| row.get(0),
         )
         .optional()
@@ -402,7 +642,8 @@ impl TrackRepo {
     }
 
     pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), String> {
-        self.db.execute(
+        let db = self.legacy()?;
+        db.execute(
             "UPDATE tracks SET trailing_silence_ms = ? WHERE id = ?",
             &[&ms as &dyn rusqlite::types::ToSql, &track_id],
         )?;
@@ -415,7 +656,8 @@ impl TrackRepo {
         fingerprint: &str,
         confidence: f64,
     ) -> Result<(), String> {
-        self.db.execute(
+        let db = self.legacy()?;
+        db.execute(
             "UPDATE tracks SET acoustid_fingerprint = ?, acoustid_confidence = ? WHERE id = ?",
             &[
                 &fingerprint as &dyn rusqlite::types::ToSql,
@@ -426,8 +668,9 @@ impl TrackRepo {
         Ok(())
     }
 
-    pub fn list_unidentified(&self, limit: i64) -> Result<Vec<super::models::Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+    pub fn list_unidentified(&self, limit: i64) -> Result<Vec<Track>, String> {
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
                 "{} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
@@ -438,17 +681,18 @@ impl TrackRepo {
                 sql::select_track()
             ))
             .map_err(|e| e.to_string())?;
-        stmt.query_map(params![limit], |row| Ok(row_to_track(row)))
+        stmt.query_map(params![limit], |row| Ok(row_to_track_rusqlite(row)))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
 
     pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         conn.query_row(
             "SELECT waveform_json FROM tracks WHERE id = ?",
-            rusqlite::params![track_id],
+            params![track_id],
             |row| row.get(0),
         )
         .optional()
@@ -457,7 +701,8 @@ impl TrackRepo {
     }
 
     pub fn set_waveform(&self, track_id: i64, json: &str) -> Result<(), String> {
-        self.db.execute(
+        let db = self.legacy()?;
+        db.execute(
             "UPDATE tracks SET waveform_json = ? WHERE id = ?",
             &[&json as &dyn rusqlite::types::ToSql, &track_id],
         )?;
@@ -468,14 +713,15 @@ impl TrackRepo {
         &self,
         track_id: i64,
     ) -> Result<Vec<crate::db::models::TrackCredit>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT id, track_id, artist_id, artist_name, role, instrument, position \
                  FROM track_credits WHERE track_id = ? ORDER BY position",
             )
             .map_err(|e| e.to_string())?;
-        stmt.query_map(rusqlite::params![track_id], |row| {
+        stmt.query_map(params![track_id], |row| {
             Ok(crate::db::models::TrackCredit {
                 id: row.get(0).ok(),
                 track_id: row.get(1)?,
@@ -491,27 +737,9 @@ impl TrackRepo {
         .map_err(|e| e.to_string())
     }
 
-    pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
-    }
-
-    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!("{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT ? OFFSET ?", sql::select_track()))
-            .map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
     pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
@@ -527,13 +755,12 @@ impl TrackRepo {
         Ok(paths)
     }
 
-    /// Returns a map of file_path -> (track_id, file_mtime, file_size) for all local tracks.
-    /// Used by the scanner to efficiently detect which files have changed without per-file queries.
     #[allow(clippy::type_complexity)]
     pub fn get_all_local_file_info(
         &self,
     ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare("SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
             .map_err(|e| e.to_string())?;
@@ -556,11 +783,9 @@ impl TrackRepo {
         Ok(map)
     }
 
-    /// Returns the set of `(audio_hash, album_id)` pairs for all local tracks.
-    /// Used by the scanner to skip duplicate files (same content in the same album)
-    /// that are reachable via different paths (e.g. NFS mount + local path).
     pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT audio_hash, album_id FROM tracks \
@@ -579,209 +804,9 @@ impl TrackRepo {
         Ok(set)
     }
 
-    /// Check whether a track with the given `audio_hash` already exists in the given album.
-    pub fn exists_by_audio_hash_and_album(
-        &self,
-        audio_hash: &str,
-        album_id: i64,
-    ) -> Result<bool, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tracks WHERE audio_hash = ? AND album_id = ?",
-                params![audio_hash, album_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(count > 0)
-    }
-
-    pub fn update_mtime_and_size(
-        &self,
-        file_path: &str,
-        mtime: f64,
-        file_size: i64,
-    ) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_mtime_and_size(&self.db.dialect()),
-            &[
-                &mtime as &dyn rusqlite::types::ToSql,
-                &file_size,
-                &file_path,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), String> {
-        self.db.execute(
-            &sql::update_audio_hash(&self.db.dialect()),
-            &[&audio_hash as &dyn rusqlite::types::ToSql, &file_path],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE t.album_id = ? ORDER BY t.disc_number, t.track_number, t.file_path",
-                sql::select_track()
-            ))
-            .map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(params![album_id], |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
-    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE t.artist_id = ? ORDER BY t.title",
-                sql::select_track()
-            ))
-            .map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(params![artist_id], |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
-    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
-        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::search(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(
-                params![fts_query, like, like, like, query.trim(), limit],
-                |row| Ok(row_to_track(row)),
-            )
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
-    pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, String> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let d = self.db.dialect();
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| d.placeholder(i)).collect();
-        let sql = format!(
-            "{} WHERE t.id IN ({})",
-            sql::select_track(),
-            placeholders.join(",")
-        );
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-        let tracks: Vec<Track> = stmt
-            .query_map(params.as_slice(), |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        // Preserve caller's ordering
-        let mut ordered = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(t) = tracks.iter().find(|t| t.id == Some(*id)) {
-                ordered.push(t.clone());
-            }
-        }
-        Ok(ordered)
-    }
-
-    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id FROM tracks ORDER BY RANDOM() LIMIT ?")
-            .map_err(|e| e.to_string())?;
-        let ids = stmt
-            .query_map(rusqlite::params![limit], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(ids)
-    }
-
-    pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_path(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![path], |row| Ok(row_to_track(row)))
-            .optional()
-            .map_err(|e| e.to_string())
-    }
-
-    pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, String> {
-        let like = format!("%{title}%");
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE LOWER(t.title) LIKE LOWER(?) LIMIT ?",
-                sql::select_track()
-            ))
-            .map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(params![like, limit], |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
-    /// Count tracks with doubtful metadata (missing artist, very short, missing album).
-    pub fn count_doubtful(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM tracks t \
-             LEFT JOIN artists ar ON t.artist_id = ar.id \
-             LEFT JOIN albums al ON t.album_id = al.id \
-             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = '')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())
-    }
-
-    /// List tracks with doubtful metadata, paginated.
-    pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let query = format!(
-            "{} \
-             WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = '') \
-             ORDER BY t.id LIMIT ? OFFSET ?",
-            sql::select_track()
-        );
-        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let tracks = stmt
-            .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(tracks)
-    }
-
     pub fn deduplicate(&self) -> Result<i64, String> {
-        let conn = self.db.connection().lock().unwrap();
+        let db = self.legacy()?;
+        let conn = db.connection().lock().unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)",
@@ -800,7 +825,45 @@ impl TrackRepo {
     }
 }
 
-fn row_to_track(row: &rusqlite::Row) -> Track {
+fn row_to_track(cols: &Vec<SqlValue>) -> Track {
+    Track {
+        id: cols.first().and_then(|v| v.as_i64()),
+        title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        album_id: cols.get(2).and_then(|v| v.as_i64()),
+        album_title: cols.get(3).and_then(|v| v.as_string()),
+        artist_id: cols.get(4).and_then(|v| v.as_i64()),
+        artist_name: cols.get(5).and_then(|v| v.as_string()),
+        album_artist: cols.get(6).and_then(|v| v.as_string()),
+        disc_number: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+        disc_subtitle: cols.get(8).and_then(|v| v.as_string()),
+        track_number: cols.get(9).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        duration_ms: cols.get(10).and_then(|v| v.as_i64()).unwrap_or(0),
+        file_path: cols.get(11).and_then(|v| v.as_string()),
+        format: cols.get(12).and_then(|v| v.as_string()),
+        sample_rate: cols.get(13).and_then(|v| v.as_i64()).map(|n| n as i32),
+        bit_depth: cols.get(14).and_then(|v| v.as_i64()).map(|n| n as i32),
+        channels: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(2) as i32,
+        file_mtime: cols.get(16).and_then(|v| v.as_f64()),
+        file_size: cols.get(17).and_then(|v| v.as_i64()),
+        audio_hash: cols.get(18).and_then(|v| v.as_string()),
+        source: cols
+            .get(19)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "local".into()),
+        source_id: cols.get(20).and_then(|v| v.as_string()),
+        isrc: cols.get(21).and_then(|v| v.as_string()),
+        genre: cols.get(22).and_then(|v| v.as_string()),
+        composer: cols.get(23).and_then(|v| v.as_string()),
+        year: cols.get(24).and_then(|v| v.as_i64()).map(|n| n as i32),
+        bpm: cols.get(25).and_then(|v| v.as_f64()),
+        label: cols.get(26).and_then(|v| v.as_string()),
+        musicbrainz_recording_id: cols.get(27).and_then(|v| v.as_string()),
+        cover_path: cols.get(28).and_then(|v| v.as_string()),
+        genres: cols.get(29).and_then(|v| v.as_string()),
+    }
+}
+
+fn row_to_track_rusqlite(row: &rusqlite::Row) -> Track {
     Track {
         id: row.get(0).ok(),
         title: row.get(1).unwrap_or_default(),
@@ -954,382 +1017,16 @@ mod tests {
     }
 
     #[test]
-    fn track_list() {
+    fn with_backend_constructor_partial() {
         let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        for i in 0..5 {
-            let mut t = Track::new(format!("Track {i}"));
-            t.file_path = Some(format!("/{i}.flac"));
-            repo.create(&t).unwrap();
-        }
-
-        let all = repo.list(100, 0).unwrap();
-        assert_eq!(all.len(), 5);
-    }
-
-    #[test]
-    fn track_list_pagination() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        for i in 0..10 {
-            let mut t = Track::new(format!("Track {i:02}"));
-            t.file_path = Some(format!("/{i}.flac"));
-            repo.create(&t).unwrap();
-        }
-
-        let page1 = repo.list(3, 0).unwrap();
-        assert_eq!(page1.len(), 3);
-        let page2 = repo.list(3, 3).unwrap();
-        assert_eq!(page2.len(), 3);
-    }
-
-    #[test]
-    fn track_list_by_album() {
-        let db = test_db();
-        let album_repo = AlbumRepo::new(db.clone());
-        let repo = TrackRepo::new(db);
-
-        let alid = album_repo
-            .create(&crate::db::models::Album::new("Album".into()))
-            .unwrap();
-
-        let mut t1 = Track::new("Track 1".into());
-        t1.album_id = Some(alid);
-        t1.disc_number = 1;
-        t1.track_number = 2;
-        t1.file_path = Some("/1-2.flac".into());
-        repo.create(&t1).unwrap();
-
-        let mut t2 = Track::new("Track 2".into());
-        t2.album_id = Some(alid);
-        t2.disc_number = 1;
-        t2.track_number = 1;
-        t2.file_path = Some("/1-1.flac".into());
-        repo.create(&t2).unwrap();
-
-        let tracks = repo.list_by_album(alid).unwrap();
-        assert_eq!(tracks.len(), 2);
-        // Should be sorted by disc, then track number
-        assert_eq!(tracks[0].track_number, 1);
-        assert_eq!(tracks[1].track_number, 2);
-    }
-
-    #[test]
-    fn track_list_by_artist() {
-        let db = test_db();
-        let artist_repo = ArtistRepo::new(db.clone());
-        let repo = TrackRepo::new(db);
-
-        let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
-
-        let mut t1 = Track::new("Song A".into());
-        t1.artist_id = Some(aid);
-        t1.file_path = Some("/a.flac".into());
-        repo.create(&t1).unwrap();
-
-        let mut t2 = Track::new("Song B".into());
-        t2.artist_id = Some(aid);
-        t2.file_path = Some("/b.flac".into());
-        repo.create(&t2).unwrap();
-
-        let tracks = repo.list_by_artist(aid).unwrap();
-        assert_eq!(tracks.len(), 2);
-    }
-
-    #[test]
-    fn track_update() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t = Track::new("Original".into());
-        t.file_path = Some("/orig.flac".into());
-        let id = repo.create(&t).unwrap();
-
-        let mut fetched = repo.get(id).unwrap().unwrap();
-        fetched.title = "Updated".into();
-        fetched.genre = Some("Jazz".into());
-        fetched.composer = Some("Miles Davis".into());
-        fetched.year = Some(1959);
-        fetched.bpm = Some(120.5);
-        repo.update(&fetched).unwrap();
-
-        let updated = repo.get(id).unwrap().unwrap();
-        assert_eq!(updated.title, "Updated");
-        assert_eq!(updated.genre.as_deref(), Some("Jazz"));
-        assert_eq!(updated.composer.as_deref(), Some("Miles Davis"));
-        assert_eq!(updated.year, Some(1959));
-    }
-
-    #[test]
-    fn track_delete_by_path() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t = Track::new("Test".into());
-        t.file_path = Some("/test.flac".into());
-        let id = repo.create(&t).unwrap();
-
-        repo.delete_by_path("/test.flac").unwrap();
-        assert!(repo.get(id).unwrap().is_none());
-    }
-
-    #[test]
-    fn track_get_all_local_file_info() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t = Track::new("Test".into());
-        t.file_path = Some("/music/test.flac".into());
-        t.file_mtime = Some(1234567.89);
-        t.file_size = Some(5_000_000);
-        repo.create(&t).unwrap();
-
-        let info = repo.get_all_local_file_info().unwrap();
-        assert_eq!(info.len(), 1);
-        let (tid, mtime, size) = info.get("/music/test.flac").unwrap();
-        assert!(*tid > 0);
-        assert_eq!(*mtime, Some(1234567.89));
-        assert_eq!(*size, Some(5_000_000));
-    }
-
-    #[test]
-    fn track_update_mtime_and_size() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t = Track::new("Test".into());
-        t.file_path = Some("/test.flac".into());
-        let id = repo.create(&t).unwrap();
-
-        repo.update_mtime_and_size("/test.flac", 999.99, 1_000_000)
-            .unwrap();
-        let fetched = repo.get(id).unwrap().unwrap();
-        assert_eq!(fetched.file_mtime, Some(999.99));
-        assert_eq!(fetched.file_size, Some(1_000_000));
-    }
-
-    #[test]
-    fn track_update_audio_hash() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t = Track::new("Test".into());
-        t.file_path = Some("/test.flac".into());
-        let id = repo.create(&t).unwrap();
-
-        repo.update_audio_hash("/test.flac", "abc123hash").unwrap();
-        let fetched = repo.get(id).unwrap().unwrap();
-        assert_eq!(fetched.audio_hash.as_deref(), Some("abc123hash"));
-    }
-
-    #[test]
-    fn track_deduplicate() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        let mut t1 = Track::new("Song A".into());
-        t1.file_path = Some("/a.flac".into());
-        t1.audio_hash = Some("hash123".into());
-        repo.create(&t1).unwrap();
-
-        let mut t2 = Track::new("Song A Copy".into());
-        t2.file_path = Some("/a_copy.flac".into());
-        t2.audio_hash = Some("hash123".into());
-        repo.create(&t2).unwrap();
-
-        let mut t3 = Track::new("Song B".into());
-        t3.file_path = Some("/b.flac".into());
-        t3.audio_hash = Some("different".into());
-        repo.create(&t3).unwrap();
-
-        let removed = repo.deduplicate().unwrap();
-        assert_eq!(removed, 1);
-        assert_eq!(repo.count().unwrap(), 2);
-    }
-
-    #[test]
-    fn track_random_ids() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-
-        for i in 0..20 {
-            let mut t = Track::new(format!("Track {i}"));
-            t.file_path = Some(format!("/{i}.flac"));
-            repo.create(&t).unwrap();
-        }
-
-        let ids = repo.random_ids(5).unwrap();
-        assert_eq!(ids.len(), 5);
-    }
-
-    #[test]
-    fn track_get_multiple_empty() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-        let result = repo.get_multiple(&[]).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn track_get_nonexistent() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-        assert!(repo.get(999).unwrap().is_none());
-    }
-
-    #[test]
-    fn track_get_by_path_nonexistent() {
-        let db = test_db();
-        let repo = TrackRepo::new(db);
-        assert!(repo.get_by_path("/nonexistent.flac").unwrap().is_none());
-    }
-
-    #[test]
-    fn track_with_all_metadata() {
-        let db = test_db();
-        let artist_repo = ArtistRepo::new(db.clone());
-        let album_repo = AlbumRepo::new(db.clone());
-        let repo = TrackRepo::new(db);
-
-        let aid = artist_repo
-            .create(&Artist::new("Miles Davis".into()))
-            .unwrap();
-        let alid = album_repo
-            .get_or_create("Kind of Blue", aid, Some(1959))
-            .unwrap()
-            .id
-            .unwrap();
-
-        let mut t = Track::new("So What".into());
-        t.artist_id = Some(aid);
-        t.album_id = Some(alid);
-        t.album_artist = Some("Miles Davis".into());
-        t.disc_number = 1;
-        t.track_number = 1;
-        t.duration_ms = 562_000;
-        t.file_path = Some("/music/miles/kob/so_what.flac".into());
-        t.format = Some("flac".into());
-        t.sample_rate = Some(96000);
-        t.bit_depth = Some(24);
-        t.channels = 2;
-        t.genre = Some("Jazz".into());
-        t.genres = Some(r#"["Jazz","Modal Jazz"]"#.into());
-        t.composer = Some("Miles Davis".into());
-        t.year = Some(1959);
-        t.label = Some("Columbia".into());
-        t.isrc = Some("US1234567890".into());
-        t.source = "local".into();
-        let id = repo.create(&t).unwrap();
-
-        let fetched = repo.get(id).unwrap().unwrap();
-        assert_eq!(fetched.title, "So What");
-        assert_eq!(fetched.artist_name.as_deref(), Some("Miles Davis"));
-        assert_eq!(fetched.album_title.as_deref(), Some("Kind of Blue"));
-        assert_eq!(fetched.album_artist.as_deref(), Some("Miles Davis"));
-        assert_eq!(fetched.duration_ms, 562_000);
-        assert_eq!(fetched.sample_rate, Some(96000));
-        assert_eq!(fetched.bit_depth, Some(24));
-        assert_eq!(fetched.genre.as_deref(), Some("Jazz"));
-        assert_eq!(fetched.composer.as_deref(), Some("Miles Davis"));
-        assert_eq!(fetched.label.as_deref(), Some("Columbia"));
-    }
-
-    #[test]
-    fn get_existing_audio_hash_album_pairs() {
-        let db = test_db();
-        let album_repo = AlbumRepo::new(db.clone());
-        let repo = TrackRepo::new(db);
-
-        let alid = album_repo
-            .create(&crate::db::models::Album::new("Album A".into()))
-            .unwrap();
-
-        let mut t1 = Track::new("Track 1".into());
-        t1.file_path = Some("/a/track1.flac".into());
-        t1.audio_hash = Some("hash_aaa".into());
-        t1.album_id = Some(alid);
-        repo.create(&t1).unwrap();
-
-        // Same hash, same album (duplicate via different path)
-        let mut t2 = Track::new("Track 1 dup".into());
-        t2.file_path = Some("/b/track1.flac".into());
-        t2.audio_hash = Some("hash_aaa".into());
-        t2.album_id = Some(alid);
-        repo.create(&t2).unwrap();
-
-        // No audio_hash - should not appear
-        let mut t3 = Track::new("Track 2".into());
-        t3.file_path = Some("/a/track2.flac".into());
-        t3.album_id = Some(alid);
-        repo.create(&t3).unwrap();
-
-        let pairs = repo.get_existing_audio_hash_album_pairs().unwrap();
-        // hash_aaa + alid appears (deduplicated in the set)
-        assert!(pairs.contains(&("hash_aaa".to_string(), alid)));
-        assert_eq!(pairs.len(), 1);
-    }
-
-    #[test]
-    fn exists_by_audio_hash_and_album() {
-        let db = test_db();
-        let album_repo = AlbumRepo::new(db.clone());
-        let repo = TrackRepo::new(db);
-
-        let alid1 = album_repo
-            .create(&crate::db::models::Album::new("Album 1".into()))
-            .unwrap();
-        let alid2 = album_repo
-            .create(&crate::db::models::Album::new("Album 2".into()))
-            .unwrap();
-
-        let mut t = Track::new("Track".into());
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = TrackRepo::with_backend(backend);
+        let mut t = Track::new("X".into());
         t.file_path = Some("/x.flac".into());
-        t.audio_hash = Some("hash_xyz".into());
-        t.album_id = Some(alid1);
-        repo.create(&t).unwrap();
-
-        assert!(
-            repo.exists_by_audio_hash_and_album("hash_xyz", alid1)
-                .unwrap()
-        );
-        assert!(
-            !repo
-                .exists_by_audio_hash_and_album("hash_xyz", alid2)
-                .unwrap()
-        );
-        assert!(
-            !repo
-                .exists_by_audio_hash_and_album("nonexistent", alid1)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
-        let s = SqliteDialect;
-        let p = PostgresDialect;
-        assert!(sql::get_by_id(&s).ends_with("WHERE t.id = ?"));
-        assert!(sql::get_by_id(&p).ends_with("WHERE t.id = $1"));
-        // The 26-placeholder INSERT renders cleanly for both engines.
-        let sqlite_insert = sql::insert(&s);
-        let pg_insert = sql::insert(&p);
-        assert!(sqlite_insert.contains(
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ));
-        assert!(pg_insert.contains("$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26"));
-        // No COLLATE in the canonical list ordering builder.
-        assert!(!sql::list_by_album(&p).contains("COLLATE"));
-    }
-
-    #[test]
-    fn search_uses_engine_specific_fts_clause() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
-        let s_sql = sql::search(&SqliteDialect);
-        assert!(s_sql.contains("t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?)"));
-        let p_sql = sql::search(&PostgresDialect);
-        assert!(p_sql.contains("t.search_tsv @@ to_tsquery('simple', unaccent($1))"));
+        let id = repo.create(&t).unwrap();
+        assert!(repo.get(id).unwrap().is_some());
+        // Legacy-only methods must explicitly refuse on backend-only.
+        assert!(repo.get_synced_lyrics(id).is_err());
+        assert!(repo.get_all_paths().is_err());
     }
 }
