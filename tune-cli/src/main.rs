@@ -76,6 +76,26 @@ enum Commands {
         /// Shell type
         shell: Shell,
     },
+    /// Release tooling (offline — operates on the local repo)
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseAction {
+    /// Bump the workspace version (semver). Prints the planned bump
+    /// in dry-run mode; pass --apply to actually edit Cargo.toml and
+    /// regenerate Cargo.lock.
+    Bump {
+        /// Bump level: patch, minor, or major
+        #[arg(value_parser = ["patch", "minor", "major"])]
+        level: String,
+        /// Actually apply the bump (default is dry-run)
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 struct Client {
@@ -128,6 +148,124 @@ impl Client {
     }
 }
 
+// ─── Release tooling (offline) ────────────────────────────────────────
+
+/// Locate the workspace root by walking up from the binary's working
+/// directory until we find a Cargo.toml that declares `[workspace]`.
+fn find_workspace_root() -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let mut dir = cwd.as_path();
+    loop {
+        let cargo = dir.join("Cargo.toml");
+        if cargo.exists() {
+            let s = std::fs::read_to_string(&cargo).map_err(|e| format!("read {cargo:?}: {e}"))?;
+            if s.contains("[workspace]") {
+                return Ok(dir.to_path_buf());
+            }
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => {
+                return Err("could not find workspace root (no Cargo.toml with [workspace])".into());
+            }
+        }
+    }
+}
+
+fn read_workspace_version(root: &std::path::Path) -> Result<(u64, u64, u64), String> {
+    let cargo = root.join("Cargo.toml");
+    let s = std::fs::read_to_string(&cargo).map_err(|e| format!("read {cargo:?}: {e}"))?;
+    for line in s.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("version") {
+            let after_eq = rest.split('=').nth(1).unwrap_or("").trim();
+            let lit = after_eq.trim_matches('"');
+            if lit.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = lit.split('.').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let parse = |p: &str| p.parse::<u64>().map_err(|e| format!("parse {p}: {e}"));
+            return Ok((parse(parts[0])?, parse(parts[1])?, parse(parts[2])?));
+        }
+    }
+    Err("no `version = \"X.Y.Z\"` found in workspace Cargo.toml".into())
+}
+
+fn bump_version(v: (u64, u64, u64), level: &str) -> Result<(u64, u64, u64), String> {
+    match level {
+        "patch" => Ok((v.0, v.1, v.2 + 1)),
+        "minor" => Ok((v.0, v.1 + 1, 0)),
+        "major" => Ok((v.0 + 1, 0, 0)),
+        other => Err(format!("unknown bump level: {other}")),
+    }
+}
+
+fn write_workspace_version(root: &std::path::Path, new: (u64, u64, u64)) -> Result<(), String> {
+    let cargo = root.join("Cargo.toml");
+    let s = std::fs::read_to_string(&cargo).map_err(|e| format!("read {cargo:?}: {e}"))?;
+    let mut out = String::with_capacity(s.len());
+    let mut found = false;
+    for line in s.lines() {
+        if !found && line.trim_start().starts_with("version") && line.contains('=') {
+            let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            out.push_str(&format!(
+                "{indent}version = \"{}.{}.{}\"\n",
+                new.0, new.1, new.2
+            ));
+            found = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !found {
+        return Err("could not locate version line to rewrite".into());
+    }
+    std::fs::write(&cargo, out).map_err(|e| format!("write {cargo:?}: {e}"))?;
+    Ok(())
+}
+
+fn release_run(action: &ReleaseAction) -> Result<(), String> {
+    match action {
+        ReleaseAction::Bump { level, apply } => {
+            let root = find_workspace_root()?;
+            let current = read_workspace_version(&root)?;
+            let new = bump_version(current, level)?;
+            println!("  Current : {}.{}.{}", current.0, current.1, current.2);
+            println!("  Bump    : {level}");
+            println!("  Next    : {}.{}.{}", new.0, new.1, new.2);
+            if !*apply {
+                println!("\nDry run. Pass --apply to actually rewrite Cargo.toml + Cargo.lock.");
+                return Ok(());
+            }
+            write_workspace_version(&root, new)?;
+            println!("\n  [ok] Cargo.toml rewritten");
+            // Regenerate Cargo.lock via cargo update -w
+            let status = std::process::Command::new("cargo")
+                .arg("update")
+                .arg("-w")
+                .current_dir(&root)
+                .status()
+                .map_err(|e| format!("spawn cargo update: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "cargo update -w failed (exit {})",
+                    status.code().unwrap_or(-1)
+                ));
+            }
+            println!("  [ok] Cargo.lock regenerated");
+            println!(
+                "\nNext steps:\n  git add Cargo.toml Cargo.lock\n  git commit -m 'bump v{}.{}.{}'\n  git tag v{}.{}.{}\n  git push origin main --tags",
+                new.0, new.1, new.2, new.0, new.1, new.2
+            );
+            Ok(())
+        }
+    }
+}
+
 fn print_human(value: &serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -158,6 +296,16 @@ async fn main() {
     if let Commands::Completions { shell } = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "tune", &mut std::io::stdout());
         return;
+    }
+
+    if let Commands::Release { action } = &cli.command {
+        match release_run(action) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let client = Client::new(&cli.server, cli.json);
@@ -202,6 +350,7 @@ async fn main() {
         Commands::History { limit } => client.get(&format!("/history?limit={limit}")).await,
         Commands::Oaat => client.get("/system/diagnostics/oaat").await,
         Commands::Completions { .. } => unreachable!(),
+        Commands::Release { .. } => unreachable!(),
     };
 
     match result {
