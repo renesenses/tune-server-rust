@@ -166,7 +166,9 @@ fn find_workspace_root() -> Result<std::path::PathBuf, String> {
         match dir.parent() {
             Some(p) => dir = p,
             None => {
-                return Err("could not find workspace root (no Cargo.toml with [workspace])".into());
+                return Err(
+                    "could not find workspace root (no Cargo.toml with [workspace])".into(),
+                );
             }
         }
     }
