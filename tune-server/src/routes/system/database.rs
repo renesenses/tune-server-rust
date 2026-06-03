@@ -178,24 +178,49 @@ pub(super) struct DbConnectionTest {
 pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> impl IntoResponse {
     match body.engine.as_str() {
         "sqlite" => Json(json!({"status": "ok", "engine": "sqlite"})).into_response(),
-        "postgresql" => {
+        "postgresql" | "postgres" => {
             let conn_str = body
                 .connection_string
                 .as_deref()
                 .unwrap_or("postgresql://localhost/tune");
-            if conn_str.starts_with("postgresql://") || conn_str.starts_with("postgres://") {
-                Json(json!({
-                    "status": "ok",
-                    "engine": "postgresql",
-                    "message": "PostgreSQL support planned for v2.1. Connection string format is valid.",
-                }))
-                .into_response()
-            } else {
-                (
+            if !conn_str.starts_with("postgresql://") && !conn_str.starts_with("postgres://") {
+                return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error": "invalid connection string, must start with postgresql:// or postgres://"})),
                 )
-                    .into_response()
+                    .into_response();
+            }
+            #[cfg(feature = "postgres")]
+            {
+                match tune_core::db::postgres::PostgresDb::connect(conn_str).await {
+                    Ok(pg) => match pg.server_version().await {
+                        Ok(version) => Json(json!({
+                            "status": "ok",
+                            "engine": "postgresql",
+                            "server_version": version,
+                        }))
+                        .into_response(),
+                        Err(e) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"status": "error", "engine": "postgresql", "error": e})),
+                        )
+                            .into_response(),
+                    },
+                    Err(e) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"status": "error", "engine": "postgresql", "error": e})),
+                    )
+                        .into_response(),
+                }
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                Json(json!({
+                    "status": "unsupported",
+                    "engine": "postgresql",
+                    "message": "this build does not include the postgres feature; rebuild with --features postgres to enable",
+                }))
+                .into_response()
             }
         }
         other => (
