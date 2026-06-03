@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 
+use lofty::config::WriteOptions;
+use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TagUpdate {
@@ -22,36 +24,6 @@ pub struct TagUpdate {
     pub lyrics: Option<String>,
 }
 
-const ID3_MAP: &[(&str, &str)] = &[
-    ("title", "TIT2"),
-    ("artist_name", "TPE1"),
-    ("album_title", "TALB"),
-    ("track_number", "TRCK"),
-    ("disc_number", "TPOS"),
-    ("genre", "TCON"),
-    ("composer", "TCOM"),
-    ("year", "TDRC"),
-    ("comment", "COMM"),
-    ("isrc", "TSRC"),
-    ("bpm", "TBPM"),
-    ("label", "TPUB"),
-];
-
-const VORBIS_MAP: &[(&str, &str)] = &[
-    ("title", "TITLE"),
-    ("artist_name", "ARTIST"),
-    ("album_title", "ALBUM"),
-    ("track_number", "TRACKNUMBER"),
-    ("disc_number", "DISCNUMBER"),
-    ("genre", "GENRE"),
-    ("composer", "COMPOSER"),
-    ("year", "DATE"),
-    ("comment", "COMMENT"),
-    ("isrc", "ISRC"),
-    ("bpm", "BPM"),
-    ("label", "LABEL"),
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagFormat {
     Id3,
@@ -66,7 +38,6 @@ pub fn detect_format(file_path: &str) -> TagFormat {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-
     match ext.as_str() {
         "mp3" => TagFormat::Id3,
         "flac" | "ogg" | "oga" | "opus" => TagFormat::Vorbis,
@@ -81,156 +52,127 @@ pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResu
     if format == TagFormat::Unknown {
         return Err("unsupported tag format".into());
     }
-
     if !Path::new(file_path).exists() {
         return Err("file not found".into());
     }
+    let path = file_path.to_string();
+    let update = update.clone();
+    tokio::task::spawn_blocking(move || write_tags_lofty(&path, &update))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+}
 
-    let metadata = build_ffmpeg_metadata(update, format);
-    if metadata.is_empty() {
+fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, String> {
+    let mut tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
+    let tag_type = tagged.primary_tag_type();
+
+    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
+    let has_primary = tagged.primary_tag().is_some();
+    let tag = if has_primary {
+        tagged.primary_tag_mut().unwrap()
+    } else {
+        tagged.first_tag_mut().unwrap()
+    };
+
+    let mut count = 0usize;
+    if let Some(ref v) = update.title {
+        tag.set_title(v.clone());
+        count += 1;
+    }
+    if let Some(ref v) = update.artist_name {
+        tag.set_artist(v.clone());
+        count += 1;
+    }
+    if let Some(ref v) = update.album_title {
+        tag.set_album(v.clone());
+        count += 1;
+    }
+    if let Some(v) = update.track_number {
+        tag.set_track(v as u32);
+        count += 1;
+    }
+    if let Some(v) = update.disc_number {
+        tag.set_disk(v as u32);
+        count += 1;
+    }
+    if let Some(ref v) = update.genre {
+        tag.set_genre(v.clone());
+        count += 1;
+    }
+    if let Some(v) = update.year {
+        tag.set_year(v as u32);
+        count += 1;
+    }
+    if let Some(ref v) = update.comment {
+        tag.set_comment(v.clone());
+        count += 1;
+    }
+
+    if count == 0 {
         return Ok(WriteResult {
             file_path: file_path.into(),
             fields_written: 0,
         });
     }
 
-    let fields_count = metadata.len();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+        .map_err(|e| format!("open: {e}"))?;
+    tagged
+        .save_to(&mut file, WriteOptions::default())
+        .map_err(|e| format!("lofty save: {e}"))?;
 
-    let mut args = vec![
-        "-i".to_string(),
-        file_path.to_string(),
-        "-map".into(),
-        "0".into(),
-        "-c".into(),
-        "copy".into(),
-    ];
-
-    for (key, value) in &metadata {
-        args.push("-metadata".into());
-        args.push(format!("{key}={value}"));
-    }
-
-    let temp_path = format!("{file_path}.tmp");
-    args.push("-y".into());
-    args.push(temp_path.clone());
-
-    let output = tokio::process::Command::new("ffmpeg")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("ffmpeg: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(format!("ffmpeg tag write failed: {stderr}"));
-    }
-
-    tokio::fs::rename(&temp_path, file_path)
-        .await
-        .map_err(|e| format!("rename: {e}"))?;
-
-    info!(file = file_path, fields = fields_count, "tags_written");
-
+    info!(file = file_path, fields = count, "tags_written_lofty");
     Ok(WriteResult {
         file_path: file_path.into(),
-        fields_written: fields_count,
+        fields_written: count,
     })
 }
 
-fn build_ffmpeg_metadata(update: &TagUpdate, format: TagFormat) -> Vec<(String, String)> {
-    let mut metadata = Vec::new();
-    let map: &[(&str, &str)] = match format {
-        TagFormat::Vorbis => VORBIS_MAP,
-        _ => ID3_MAP,
-    };
-
-    let fields = tag_update_to_map(update);
-
-    for (field_name, tag_name) in map {
-        if let Some(value) = fields.get(*field_name) {
-            metadata.push((tag_name.to_string(), value.clone()));
-        }
-    }
-
-    metadata
-}
-
-fn tag_update_to_map(update: &TagUpdate) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let Some(ref v) = update.title {
-        map.insert("title".into(), v.clone());
-    }
-    if let Some(ref v) = update.artist_name {
-        map.insert("artist_name".into(), v.clone());
-    }
-    if let Some(ref v) = update.album_title {
-        map.insert("album_title".into(), v.clone());
-    }
-    if let Some(v) = update.track_number {
-        map.insert("track_number".into(), v.to_string());
-    }
-    if let Some(v) = update.disc_number {
-        map.insert("disc_number".into(), v.to_string());
-    }
-    if let Some(ref v) = update.genre {
-        map.insert("genre".into(), v.clone());
-    }
-    if let Some(ref v) = update.composer {
-        map.insert("composer".into(), v.clone());
-    }
-    if let Some(v) = update.year {
-        map.insert("year".into(), v.to_string());
-    }
-    if let Some(ref v) = update.comment {
-        map.insert("comment".into(), v.clone());
-    }
-    if let Some(ref v) = update.isrc {
-        map.insert("isrc".into(), v.clone());
-    }
-    if let Some(v) = update.bpm {
-        map.insert("bpm".into(), v.to_string());
-    }
-    if let Some(ref v) = update.label {
-        map.insert("label".into(), v.clone());
-    }
-    map
-}
-
 pub async fn read_tags(file_path: &str) -> Result<HashMap<String, String>, String> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            file_path,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let path = file_path.to_string();
+    tokio::task::spawn_blocking(move || read_tags_lofty(&path))
         .await
-        .map_err(|e| format!("ffprobe: {e}"))?;
+        .map_err(|e| format!("join: {e}"))?
+}
 
-    if !output.status.success() {
-        return Err("ffprobe failed".into());
+fn read_tags_lofty(file_path: &str) -> Result<HashMap<String, String>, String> {
+    let tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
+    let mut tags = HashMap::new();
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return Ok(tags),
+    };
+    if let Some(v) = tag.title() {
+        tags.insert("title".into(), v.to_string());
     }
-
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse: {e}"))?;
-
-    let tags = json["format"]["tags"]
-        .as_object()
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_lowercase(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-
+    if let Some(v) = tag.artist() {
+        tags.insert("artist".into(), v.to_string());
+    }
+    if let Some(v) = tag.album() {
+        tags.insert("album".into(), v.to_string());
+    }
+    if let Some(v) = tag.genre() {
+        tags.insert("genre".into(), v.to_string());
+    }
+    if let Some(v) = tag.year() {
+        tags.insert("date".into(), v.to_string());
+    }
+    if let Some(v) = tag.track() {
+        tags.insert("tracknumber".into(), v.to_string());
+    }
+    if let Some(v) = tag.disk() {
+        tags.insert("discnumber".into(), v.to_string());
+    }
+    if let Some(v) = tag.comment() {
+        tags.insert("comment".into(), v.to_string());
+    }
+    debug!(file = file_path, count = tags.len(), "tags_read_lofty");
     Ok(tags)
 }
 
@@ -248,63 +190,16 @@ mod tests {
     fn detect_mp3() {
         assert_eq!(detect_format("/music/song.mp3"), TagFormat::Id3);
     }
-
     #[test]
     fn detect_flac() {
         assert_eq!(detect_format("/music/song.flac"), TagFormat::Vorbis);
     }
-
     #[test]
     fn detect_m4a() {
         assert_eq!(detect_format("/music/song.m4a"), TagFormat::Mp4);
     }
-
     #[test]
     fn detect_unknown() {
         assert_eq!(detect_format("/music/song.xyz"), TagFormat::Unknown);
-    }
-
-    #[test]
-    fn build_metadata_id3() {
-        let update = TagUpdate {
-            title: Some("Test Song".into()),
-            artist_name: Some("Test Artist".into()),
-            ..Default::default()
-        };
-        let meta = build_ffmpeg_metadata(&update, TagFormat::Id3);
-        assert!(meta.iter().any(|(k, v)| k == "TIT2" && v == "Test Song"));
-        assert!(meta.iter().any(|(k, v)| k == "TPE1" && v == "Test Artist"));
-    }
-
-    #[test]
-    fn build_metadata_vorbis() {
-        let update = TagUpdate {
-            title: Some("Test".into()),
-            genre: Some("Rock".into()),
-            ..Default::default()
-        };
-        let meta = build_ffmpeg_metadata(&update, TagFormat::Vorbis);
-        assert!(meta.iter().any(|(k, _)| k == "TITLE"));
-        assert!(meta.iter().any(|(k, _)| k == "GENRE"));
-    }
-
-    #[test]
-    fn empty_update_no_metadata() {
-        let update = TagUpdate::default();
-        let meta = build_ffmpeg_metadata(&update, TagFormat::Id3);
-        assert!(meta.is_empty());
-    }
-
-    #[test]
-    fn tag_update_to_map_partial() {
-        let update = TagUpdate {
-            title: Some("Song".into()),
-            year: Some(2024),
-            ..Default::default()
-        };
-        let map = tag_update_to_map(&update);
-        assert_eq!(map.len(), 2);
-        assert_eq!(map["title"], "Song");
-        assert_eq!(map["year"], "2024");
     }
 }

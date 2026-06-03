@@ -1,3 +1,4 @@
+use lofty::file::AudioFile;
 use std::process::Stdio;
 
 use tracing::{debug, info, warn};
@@ -55,26 +56,14 @@ pub async fn ffmpeg_pcm(
 }
 
 pub async fn get_duration(file_path: &str) -> Result<f64, String> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "csv=p=0",
-            file_path,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("ffprobe: {e}"))?;
-
-    let s = String::from_utf8_lossy(&output.stdout);
-    s.trim()
-        .parse::<f64>()
-        .map_err(|_| "no duration from ffprobe".into())
+    let path = file_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let tagged = lofty::read_from_path(&path).map_err(|e| format!("lofty duration: {e}"))?;
+        let duration = tagged.properties().duration();
+        Ok(duration.as_secs_f64())
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
 }
 
 pub async fn measure_loudness(file_path: &str) -> Option<f64> {
