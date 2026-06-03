@@ -135,9 +135,24 @@ pub trait ToSqlValue: Send + Sync {
 
 /// Type-erased SQL parameter value. The backend impls translate this
 /// to their native parameter type at execute time.
+///
+/// The typed `Null*` variants exist because PostgreSQL is strict
+/// about parameter types — sending `NULL` as TEXT for a `BIGINT`
+/// column raises a parse-time error. SQLite ignores the type tag.
 #[derive(Debug, Clone)]
 pub enum SqlValue {
+    /// NULL with unspecified type. Defaults to BIGINT NULL on PG.
     Null,
+    /// NULL targeting a BIGINT / INT4 / INT2 column.
+    NullInt,
+    /// NULL targeting a TEXT / VARCHAR column.
+    NullText,
+    /// NULL targeting a DOUBLE PRECISION / REAL column.
+    NullReal,
+    /// NULL targeting a BOOLEAN column.
+    NullBool,
+    /// NULL targeting a BYTEA column.
+    NullBlob,
     Bool(bool),
     Int(i64),
     Real(f64),
@@ -146,9 +161,17 @@ pub enum SqlValue {
 }
 
 impl SqlValue {
-    /// Returns true if this is the SQL `NULL` value.
+    /// Returns true if this is any SQL `NULL` variant.
     pub fn is_null(&self) -> bool {
-        matches!(self, SqlValue::Null)
+        matches!(
+            self,
+            SqlValue::Null
+                | SqlValue::NullInt
+                | SqlValue::NullText
+                | SqlValue::NullReal
+                | SqlValue::NullBool
+                | SqlValue::NullBlob
+        )
     }
 
     /// Decode as `i64`. Returns `None` for `Null`; coerces `Bool` to 0/1.
@@ -593,13 +616,27 @@ impl DbBackend for PostgresBackend {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
         let pool = self.pool.clone();
         let last_id_handle = self.last_id.clone();
-        let sql_owned = sql.to_string();
-        // Case-insensitive check for the conventional `RETURNING id` tail.
-        let returning = sql_owned
-            .to_ascii_uppercase()
-            .trim_end_matches(';')
-            .trim_end()
-            .ends_with("RETURNING ID");
+        let mut sql_owned = sql.to_string();
+        // Auto-append `RETURNING id` to bare INSERT statements so
+        // `last_insert_rowid()` works on PG (it has no equivalent of
+        // SQLite's per-connection last-insert id). Detection is
+        // syntactic: case-insensitive INSERT INTO prefix, no existing
+        // RETURNING clause. Statements that already specify RETURNING
+        // (or that aren't INSERTs) pass through unchanged.
+        let upper = sql_owned.to_ascii_uppercase();
+        let trimmed = upper.trim_end_matches(';').trim_end();
+        let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
+        let has_returning = trimmed.contains("RETURNING");
+        if is_insert && !has_returning {
+            let trailing_semi = sql_owned.ends_with(';');
+            // Strip trailing whitespace + ';' before adding the clause.
+            sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
+            sql_owned.push_str(" RETURNING id");
+            if trailing_semi {
+                sql_owned.push(';');
+            }
+        }
+        let returning = is_insert || trimmed.ends_with("RETURNING ID");
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
