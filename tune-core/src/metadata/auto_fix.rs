@@ -229,7 +229,7 @@ impl AutoFixEngine {
 }
 
 fn find_incomplete_tracks(repo: &TrackRepo) -> Vec<i64> {
-    let db = repo.db();
+    let db = repo.backend();
     let conn = db.connection().lock().unwrap();
     conn.prepare(
         "SELECT id FROM tracks WHERE \

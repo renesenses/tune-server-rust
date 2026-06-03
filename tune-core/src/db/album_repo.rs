@@ -665,31 +665,32 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
-    /// SQLite-only — uses `json_each()` (table-valued function) for
-    /// the JSON-array genre matching. Returns an error on the
-    /// `with_backend` path until a PG-compatible builder lands using
-    /// `jsonb_array_elements_text` via a dialect helper.
+    /// Match albums where `genre` appears in either the legacy
+    /// delimiter-separated text column or the structured `genres`
+    /// JSON array (via `dialect.json_array_contains_lower`). Now
+    /// PG-compatible.
     pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+        let json_contains = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.json_array_contains_lower("a.genres", &make_ph(2)),
+            Engine::Postgres => PostgresDialect.json_array_contains_lower("a.genres", &make_ph(2)),
+        };
         let delimited_pattern = format!("%,{},%", genre.replace('%', "").replace('_', ""));
-        let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE \
-                 LOWER(',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE LOWER(?) \
-                 OR a.id IN (SELECT a2.id FROM albums a2, json_each(a2.genres) WHERE LOWER(json_each.value) = LOWER(?)) \
-                 ORDER BY LOWER(a.title)",
-                sql::select_album()
-            ))
-            .map_err(|e| e.to_string())?;
-        let albums = stmt
-            .query_map(params![delimited_pattern, genre], |row| {
-                Ok(row_to_album_rusqlite(row))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(albums)
+        let sql = format!(
+            "{} WHERE \
+             LOWER(',' || REPLACE(REPLACE(REPLACE(REPLACE(a.genre, '; ', ','), ';', ','), '/ ', ','), '/', ',') || ',') LIKE LOWER({}) \
+             OR {} \
+             ORDER BY LOWER(a.title)",
+            sql::select_album(),
+            make_ph(1),
+            json_contains,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&delimited_pattern, &genre];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
     }
 
     /// Return all local albums that have no cover art set.

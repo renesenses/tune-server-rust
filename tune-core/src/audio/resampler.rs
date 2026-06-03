@@ -1,7 +1,4 @@
-use std::process::Stdio;
-
-use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use rubato::{FftFixedIn, Resampler as RubatoResampler};
 use tracing::debug;
 
 fn pcm_format(depth: u32) -> &'static str {
@@ -19,7 +16,7 @@ pub struct Resampler {
     target_depth: u32,
     channels: u32,
     needs_resample: bool,
-    process: Option<Child>,
+    resampler: Option<FftFixedIn<f64>>,
 }
 
 impl Resampler {
@@ -40,7 +37,7 @@ impl Resampler {
             target_depth: actual_target_depth,
             channels,
             needs_resample: needs,
-            process: None,
+            resampler: None,
         }
     }
 
@@ -61,47 +58,24 @@ impl Resampler {
             return Ok(());
         }
 
-        let in_fmt = pcm_format(self.source_depth);
-        let out_fmt = pcm_format(self.target_depth);
-        let af = format!(
-            "aresample=resampler=soxr:out_sample_rate={}",
-            self.target_rate
-        );
-
         debug!(
             source_rate = self.source_rate,
             target_rate = self.target_rate,
-            "resampler_start"
+            channels = self.channels,
+            "resampler_start_rubato"
         );
 
-        let child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                in_fmt,
-                "-ar",
-                &self.source_rate.to_string(),
-                "-ac",
-                &self.channels.to_string(),
-                "-i",
-                "pipe:0",
-                "-af",
-                &af,
-                "-f",
-                out_fmt,
-                "-ac",
-                &self.channels.to_string(),
-                "pipe:1",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("resampler spawn: {e}"))?;
+        let chunk_size = 1024;
+        let resampler = FftFixedIn::<f64>::new(
+            self.source_rate as usize,
+            self.target_rate as usize,
+            chunk_size,
+            2,
+            self.channels as usize,
+        )
+        .map_err(|e| format!("rubato init: {e}"))?;
 
-        self.process = Some(child);
+        self.resampler = Some(resampler);
         Ok(())
     }
 
@@ -110,60 +84,101 @@ impl Resampler {
             return Ok(pcm_data.to_vec());
         }
 
-        let child = self.process.as_mut().ok_or("resampler not started")?;
-        let stdin = child.stdin.as_mut().ok_or("no stdin")?;
-        stdin
-            .write_all(pcm_data)
-            .await
-            .map_err(|e| format!("resampler write: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("resampler flush: {e}"))?;
+        let resampler = self.resampler.as_mut().ok_or("resampler not started")?;
+        let bytes_per_sample = (self.source_depth as usize + 7) / 8;
+        let channels = self.channels as usize;
+        let frames = pcm_data.len() / (bytes_per_sample * channels);
 
-        let stdout = child.stdout.as_mut().ok_or("no stdout")?;
-        let mut buf = vec![0u8; pcm_data.len()];
-        let n = tokio::io::AsyncReadExt::read(stdout, &mut buf)
-            .await
-            .map_err(|e| format!("resampler read: {e}"))?;
-        buf.truncate(n);
-        Ok(buf)
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Deinterleave PCM bytes → Vec<Vec<f64>> per channel
+        let mut channel_data: Vec<Vec<f64>> = vec![Vec::with_capacity(frames); channels];
+        for frame in 0..frames {
+            for ch in 0..channels {
+                let offset = (frame * channels + ch) * bytes_per_sample;
+                let sample = match bytes_per_sample {
+                    2 => {
+                        let s = i16::from_le_bytes([pcm_data[offset], pcm_data[offset + 1]]);
+                        s as f64 / 32768.0
+                    }
+                    3 => {
+                        let s = i32::from_le_bytes([
+                            pcm_data[offset],
+                            pcm_data[offset + 1],
+                            pcm_data[offset + 2],
+                            if pcm_data[offset + 2] & 0x80 != 0 {
+                                0xFF
+                            } else {
+                                0
+                            },
+                        ]);
+                        s as f64 / 8388608.0
+                    }
+                    4 => {
+                        let s = i32::from_le_bytes([
+                            pcm_data[offset],
+                            pcm_data[offset + 1],
+                            pcm_data[offset + 2],
+                            pcm_data[offset + 3],
+                        ]);
+                        s as f64 / 2147483648.0
+                    }
+                    _ => 0.0,
+                };
+                channel_data[ch].push(sample);
+            }
+        }
+
+        // Resample
+        let resampled = resampler
+            .process(&channel_data, None)
+            .map_err(|e| format!("rubato process: {e}"))?;
+
+        // Interleave back to PCM bytes
+        let out_bytes_per_sample = (self.target_depth as usize + 7) / 8;
+        let out_frames = resampled[0].len();
+        let mut output = Vec::with_capacity(out_frames * channels * out_bytes_per_sample);
+
+        for frame in 0..out_frames {
+            for ch in 0..channels {
+                let sample = resampled[ch][frame];
+                match out_bytes_per_sample {
+                    2 => {
+                        let s = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+                        output.extend_from_slice(&s.to_le_bytes());
+                    }
+                    3 => {
+                        let s = (sample * 8388607.0).round().clamp(-8388608.0, 8388607.0) as i32;
+                        let bytes = s.to_le_bytes();
+                        output.extend_from_slice(&bytes[..3]);
+                    }
+                    4 => {
+                        let s = (sample * 2147483647.0)
+                            .round()
+                            .clamp(-2147483648.0, 2147483647.0)
+                            as i32;
+                        output.extend_from_slice(&s.to_le_bytes());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     pub async fn finish(&mut self) -> Result<Vec<u8>, String> {
         if !self.needs_resample {
             return Ok(Vec::new());
         }
-
-        if let Some(mut child) = self.process.take() {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.shutdown().await;
-            }
-
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("resampler finish: {e}"))?;
-
-            Ok(output.stdout)
-        } else {
-            Ok(Vec::new())
-        }
+        self.resampler = None;
+        Ok(Vec::new())
     }
 
     pub async fn stop(&mut self) {
-        if let Some(ref mut child) = self.process {
-            let _ = child.kill().await;
-        }
-        self.process = None;
-    }
-}
-
-impl Drop for Resampler {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.process {
-            let _ = child.start_kill();
-        }
+        self.resampler = None;
     }
 }
 
@@ -214,5 +229,17 @@ mod tests {
         let mut r = Resampler::new(44100, 44100, 16, 16, 2);
         let remaining = r.finish().await.unwrap();
         assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resample_produces_output() {
+        let mut r = Resampler::new(96000, 44100, 16, 16, 2);
+        r.start().await.unwrap();
+        // 1024 frames of silence (stereo 16-bit = 4096 bytes)
+        let data = vec![0u8; 1024 * 2 * 2];
+        let out = r.process_chunk(&data).await.unwrap();
+        // Output should be shorter (downsampled)
+        assert!(!out.is_empty());
+        assert!(out.len() < data.len());
     }
 }

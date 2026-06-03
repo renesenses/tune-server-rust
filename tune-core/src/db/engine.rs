@@ -177,6 +177,14 @@ pub trait SqlDialect {
     /// SQLite: `DATE(<column>)`
     /// Postgres: `to_char(<column>::timestamp, 'YYYY-MM-DD')`
     fn date_trunc_day(&self, column: &str) -> String;
+
+    /// Build a predicate that's true when a JSON-array text column
+    /// contains a value (case-insensitive). Used by
+    /// `album_repo::list_by_genre` for the structured `genres` column.
+    ///
+    /// SQLite: `EXISTS (SELECT 1 FROM json_each(<column>) WHERE LOWER(value) = LOWER(<placeholder>))`
+    /// Postgres: `EXISTS (SELECT 1 FROM jsonb_array_elements_text(<column>::jsonb) AS x(v) WHERE LOWER(v) = LOWER(<placeholder>))`
+    fn json_array_contains_lower(&self, column: &str, placeholder: &str) -> String;
 }
 
 /// Zero-cost dialect for SQLite. Repos hold one of these.
@@ -224,6 +232,12 @@ impl SqlDialect for SqliteDialect {
 
     fn date_trunc_day(&self, column: &str) -> String {
         format!("DATE({column})")
+    }
+
+    fn json_array_contains_lower(&self, column: &str, placeholder: &str) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM json_each({column}) WHERE LOWER(value) = LOWER({placeholder}))"
+        )
     }
 }
 
@@ -285,6 +299,12 @@ impl SqlDialect for PostgresDialect {
         // `listened_at` is stored as TEXT on both engines (ISO-8601),
         // so cast to timestamp before format.
         format!("to_char({column}::timestamp, 'YYYY-MM-DD')")
+    }
+
+    fn json_array_contains_lower(&self, column: &str, placeholder: &str) -> String {
+        format!(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements_text({column}::jsonb) AS x(v) WHERE LOWER(v) = LOWER({placeholder}))"
+        )
     }
 }
 

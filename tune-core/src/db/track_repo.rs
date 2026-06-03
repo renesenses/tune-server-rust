@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension, params};
-
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
@@ -139,6 +137,95 @@ pub mod sql {
         )
     }
 
+    // ─── Track metadata column helpers (see migration 003) ─────────
+
+    pub fn get_synced_lyrics<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT synced_lyrics FROM tracks WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_synced_lyrics<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET synced_lyrics = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_trailing_silence<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT trailing_silence_ms FROM tracks WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_trailing_silence<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET trailing_silence_ms = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_waveform<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT waveform_json FROM tracks WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_waveform<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET waveform_json = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn set_acoustid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET acoustid_fingerprint = {}, acoustid_confidence = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn list_unidentified<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
+             OR ar.name = 'Unknown Artist' OR ar.name IS NULL) \
+             AND t.acoustid_fingerprint IS NULL \
+             AND t.file_path IS NOT NULL \
+             ORDER BY t.id LIMIT {}",
+            select_track(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_credits<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, track_id, artist_id, artist_name, role, instrument, position \
+             FROM track_credits WHERE track_id = {} ORDER BY position",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_all_paths() -> &'static str {
+        "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
+    }
+
+    pub fn get_all_local_file_info() -> &'static str {
+        "SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL"
+    }
+
+    pub fn get_existing_audio_hash_album_pairs() -> &'static str {
+        "SELECT audio_hash, album_id FROM tracks \
+         WHERE source = 'local' AND audio_hash IS NOT NULL AND album_id IS NOT NULL"
+    }
+
     /// Engine-agnostic search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -156,46 +243,18 @@ pub mod sql {
 
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
-    /// SQLite-specific handle for methods that bypass the trait
-    /// (inline SQL with `?`, HashSet/HashMap returns, `RANDOM()`,
-    /// `synced_lyrics` / `acoustid_*` / `trailing_silence_ms` /
-    /// `waveform_json` columns that aren't yet in the PG schema, and
-    /// the `db()` getter that callers depend on).
-    ///
-    /// Plan: `docs/PORTING-TRACK-REPO-PLAN.md` (Group B promotes
-    /// inline SQL to builders, Group D refactors the `db()` callers).
-    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl TrackRepo {
+    pub fn backend(&self) -> &dyn DbBackend {
+        &*self.db
+    }
     pub fn new(db: SqliteDb) -> Self {
-        Self {
-            sqlite_legacy: Some(db.clone()),
-            db: Arc::new(db),
-        }
+        Self { db: Arc::new(db) }
     }
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
-        Self {
-            db,
-            sqlite_legacy: None,
-        }
-    }
-
-    /// Returns the SQLite handle. Panics on the `with_backend` path —
-    /// callers using this must be refactored before non-SQLite
-    /// production. See `docs/PORTING-TRACK-REPO-PLAN.md` Group D.
-    pub fn db(&self) -> SqliteDb {
-        self.sqlite_legacy
-            .as_ref()
-            .expect("track_repo.db() called on with_backend(); refactor caller")
-            .clone()
-    }
-
-    fn legacy(&self) -> Result<&SqliteDb, String> {
-        self.sqlite_legacy
-            .as_ref()
-            .ok_or_else(|| "track_repo: method not yet ported for non-SQLite backends".into())
+        Self { db }
     }
 
     fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
@@ -604,49 +663,40 @@ impl TrackRepo {
         Ok(count)
     }
 
-    // ─── Group D: SQLite-only (inline SQL with `?`, JSON cols, HashSet/Map) ─
+    // ─── Group B: metadata accessors via DbBackend ───────────────────
+    // Backed by migration `003_track_metadata_columns.sql` on PG.
 
     pub fn get_synced_lyrics(&self, track_id: i64) -> Result<Option<String>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT synced_lyrics FROM tracks WHERE id = ?",
-            params![track_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-        .map(|o| o.flatten())
+        let sql = self.dialect_sql(sql::get_synced_lyrics, sql::get_synced_lyrics);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
     pub fn set_synced_lyrics(&self, track_id: i64, json: &str) -> Result<(), String> {
-        let db = self.legacy()?;
-        db.execute(
-            "UPDATE tracks SET synced_lyrics = ? WHERE id = ?",
-            &[&json as &dyn rusqlite::types::ToSql, &track_id],
-        )?;
+        let sql = self.dialect_sql(sql::set_synced_lyrics, sql::set_synced_lyrics);
+        let params: [&dyn ToSqlValue; 2] = [&json, &track_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn get_trailing_silence(&self, track_id: i64) -> Result<Option<i64>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT trailing_silence_ms FROM tracks WHERE id = ?",
-            params![track_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-        .map(|o| o.flatten())
+        let sql = self.dialect_sql(sql::get_trailing_silence, sql::get_trailing_silence);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64())))
     }
 
     pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), String> {
-        let db = self.legacy()?;
-        db.execute(
-            "UPDATE tracks SET trailing_silence_ms = ? WHERE id = ?",
-            &[&ms as &dyn rusqlite::types::ToSql, &track_id],
-        )?;
+        let sql = self.dialect_sql(sql::set_trailing_silence, sql::set_trailing_silence);
+        let params: [&dyn ToSqlValue; 2] = [&ms, &track_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -656,56 +706,33 @@ impl TrackRepo {
         fingerprint: &str,
         confidence: f64,
     ) -> Result<(), String> {
-        let db = self.legacy()?;
-        db.execute(
-            "UPDATE tracks SET acoustid_fingerprint = ?, acoustid_confidence = ? WHERE id = ?",
-            &[
-                &fingerprint as &dyn rusqlite::types::ToSql,
-                &confidence,
-                &track_id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::set_acoustid, sql::set_acoustid);
+        let params: [&dyn ToSqlValue; 3] = [&fingerprint, &confidence, &track_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn list_unidentified(&self, limit: i64) -> Result<Vec<Track>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
-                 OR ar.name = 'Unknown Artist' OR ar.name IS NULL) \
-                 AND t.acoustid_fingerprint IS NULL \
-                 AND t.file_path IS NOT NULL \
-                 ORDER BY t.id LIMIT ?",
-                sql::select_track()
-            ))
-            .map_err(|e| e.to_string())?;
-        stmt.query_map(params![limit], |row| Ok(row_to_track_rusqlite(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::list_unidentified, sql::list_unidentified);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
     }
 
     pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT waveform_json FROM tracks WHERE id = ?",
-            params![track_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-        .map(|o| o.flatten())
+        let sql = self.dialect_sql(sql::get_waveform, sql::get_waveform);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
     pub fn set_waveform(&self, track_id: i64, json: &str) -> Result<(), String> {
-        let db = self.legacy()?;
-        db.execute(
-            "UPDATE tracks SET waveform_json = ? WHERE id = ?",
-            &[&json as &dyn rusqlite::types::ToSql, &track_id],
-        )?;
+        let sql = self.dialect_sql(sql::set_waveform, sql::set_waveform);
+        let params: [&dyn ToSqlValue; 2] = [&json, &track_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -713,114 +740,78 @@ impl TrackRepo {
         &self,
         track_id: i64,
     ) -> Result<Vec<crate::db::models::TrackCredit>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, artist_id, artist_name, role, instrument, position \
-                 FROM track_credits WHERE track_id = ? ORDER BY position",
-            )
-            .map_err(|e| e.to_string())?;
-        stmt.query_map(params![track_id], |row| {
-            Ok(crate::db::models::TrackCredit {
-                id: row.get(0).ok(),
-                track_id: row.get(1)?,
-                artist_id: row.get(2).ok(),
-                artist_name: row.get(3)?,
-                role: row.get(4)?,
-                instrument: row.get(5).ok(),
-                position: row.get(6)?,
+        let sql = self.dialect_sql(sql::get_credits, sql::get_credits);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| crate::db::models::TrackCredit {
+                id: cols.first().and_then(|v| v.as_i64()),
+                track_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                artist_id: cols.get(2).and_then(|v| v.as_i64()),
+                artist_name: cols.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+                role: cols.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+                instrument: cols.get(5).and_then(|v| v.as_string()),
+                position: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+            .collect())
     }
 
     pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
-            )
-            .map_err(|e| e.to_string())?;
-        let paths = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        let rows = self.db.query_many(sql::get_all_paths(), &[])?;
+        Ok(rows
             .into_iter()
-            .collect();
-        Ok(paths)
+            .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+            .collect())
     }
 
     #[allow(clippy::type_complexity)]
     pub fn get_all_local_file_info(
         &self,
     ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, file_path, file_mtime, file_size FROM tracks WHERE source = 'local' AND file_path IS NOT NULL")
-            .map_err(|e| e.to_string())?;
-        let map = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    (
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<f64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ),
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        let rows = self.db.query_many(sql::get_all_local_file_info(), &[])?;
+        Ok(rows
             .into_iter()
-            .collect();
-        Ok(map)
+            .filter_map(|cols| {
+                let id = cols.first().and_then(|v| v.as_i64())?;
+                let path = cols.get(1).and_then(|v| v.as_string())?;
+                let mtime = cols.get(2).and_then(|v| v.as_f64());
+                let size = cols.get(3).and_then(|v| v.as_i64());
+                Some((path, (id, mtime, size)))
+            })
+            .collect())
     }
 
     pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, String> {
-        let db = self.legacy()?;
-        let conn = db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT audio_hash, album_id FROM tracks \
-                 WHERE source = 'local' AND audio_hash IS NOT NULL AND album_id IS NOT NULL",
-            )
-            .map_err(|e| e.to_string())?;
-        let set = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        let rows = self
+            .db
+            .query_many(sql::get_existing_audio_hash_album_pairs(), &[])?;
+        Ok(rows
             .into_iter()
-            .collect();
-        Ok(set)
+            .filter_map(|cols| {
+                let hash = cols.first().and_then(|v| v.as_string())?;
+                let album_id = cols.get(1).and_then(|v| v.as_i64())?;
+                Some((hash, album_id))
+            })
+            .collect())
     }
 
     pub fn deduplicate(&self) -> Result<i64, String> {
-        let db = self.legacy()?;
-        let conn = db.connection().lock().unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-
-        if count > 0 {
-            conn.execute(
-                "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))",
-                [],
-            ).map_err(|e| e.to_string())?;
-        }
+        let count_sql = "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)";
+        let delete_sql = "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))";
+        let mut count: i64 = 0;
+        let count_ref = &mut count;
+        self.db.write_tx(&mut |tx| {
+            *count_ref = tx
+                .query_one(count_sql, &[])?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0);
+            if *count_ref > 0 {
+                tx.execute(delete_sql, &[])?;
+            }
+            Ok(())
+        })?;
         Ok(count)
     }
 }
@@ -860,41 +851,6 @@ fn row_to_track(cols: &Vec<SqlValue>) -> Track {
         musicbrainz_recording_id: cols.get(27).and_then(|v| v.as_string()),
         cover_path: cols.get(28).and_then(|v| v.as_string()),
         genres: cols.get(29).and_then(|v| v.as_string()),
-    }
-}
-
-fn row_to_track_rusqlite(row: &rusqlite::Row) -> Track {
-    Track {
-        id: row.get(0).ok(),
-        title: row.get(1).unwrap_or_default(),
-        album_id: row.get(2).ok(),
-        album_title: row.get(3).ok(),
-        artist_id: row.get(4).ok(),
-        artist_name: row.get(5).ok(),
-        album_artist: row.get(6).ok(),
-        disc_number: row.get(7).unwrap_or(1),
-        disc_subtitle: row.get(8).ok(),
-        track_number: row.get(9).unwrap_or(0),
-        duration_ms: row.get(10).unwrap_or(0),
-        file_path: row.get(11).ok(),
-        format: row.get(12).ok(),
-        sample_rate: row.get(13).ok(),
-        bit_depth: row.get(14).ok(),
-        channels: row.get(15).unwrap_or(2),
-        file_mtime: row.get(16).ok(),
-        file_size: row.get(17).ok(),
-        audio_hash: row.get(18).ok(),
-        source: row.get(19).unwrap_or_else(|_| "local".into()),
-        source_id: row.get(20).ok(),
-        isrc: row.get(21).ok(),
-        genre: row.get(22).ok(),
-        composer: row.get(23).ok(),
-        year: row.get(24).ok(),
-        bpm: row.get(25).ok(),
-        label: row.get(26).ok(),
-        musicbrainz_recording_id: row.get(27).ok(),
-        cover_path: row.get(28).ok(),
-        genres: row.get(29).ok().flatten(),
     }
 }
 
@@ -1017,7 +973,9 @@ mod tests {
     }
 
     #[test]
-    fn with_backend_constructor_partial() {
+    fn with_backend_constructor_full() {
+        // All methods now go through DbBackend — no more sqlite_legacy
+        // fallback. The with_backend path is fully functional on SQLite.
         let db = test_db();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = TrackRepo::with_backend(backend);
@@ -1025,8 +983,13 @@ mod tests {
         t.file_path = Some("/x.flac".into());
         let id = repo.create(&t).unwrap();
         assert!(repo.get(id).unwrap().is_some());
-        // Legacy-only methods must explicitly refuse on backend-only.
-        assert!(repo.get_synced_lyrics(id).is_err());
-        assert!(repo.get_all_paths().is_err());
+        // Methods previously requiring sqlite_legacy now work via
+        // DbBackend. get_all_paths reads from the base schema.
+        assert!(repo.get_all_paths().unwrap().contains("/x.flac"));
+        assert!(
+            repo.get_existing_audio_hash_album_pairs()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
