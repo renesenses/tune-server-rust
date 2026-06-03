@@ -47,6 +47,22 @@ pub trait DbBackend: Send + Sync {
     /// On Postgres, the impl manages this via `RETURNING id` under the
     /// hood and exposes the latest value here.
     fn last_insert_rowid(&self) -> i64;
+
+    /// Read at most one row. Returns the row's columns as `SqlValue`s
+    /// in declaration order. The repo decodes them via the `as_i64` /
+    /// `as_str` / `as_f64` helpers on `SqlValue`.
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String>;
+
+    /// Read all matching rows. Same row representation as `query_one`.
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String>;
 }
 
 /// A trait-object-safe wrapper for SQL parameter values. Implemented
@@ -69,6 +85,71 @@ pub enum SqlValue {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+impl SqlValue {
+    /// Returns true if this is the SQL `NULL` value.
+    pub fn is_null(&self) -> bool {
+        matches!(self, SqlValue::Null)
+    }
+
+    /// Decode as `i64`. Returns `None` for `Null`; coerces `Bool` to 0/1.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            SqlValue::Null => None,
+            SqlValue::Int(i) => Some(*i),
+            SqlValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+            SqlValue::Real(f) => Some(*f as i64),
+            SqlValue::Text(s) => s.parse().ok(),
+            SqlValue::Blob(_) => None,
+        }
+    }
+
+    /// Decode as `f64`. Returns `None` for `Null`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            SqlValue::Null => None,
+            SqlValue::Real(f) => Some(*f),
+            SqlValue::Int(i) => Some(*i as f64),
+            SqlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            SqlValue::Text(s) => s.parse().ok(),
+            SqlValue::Blob(_) => None,
+        }
+    }
+
+    /// Decode as `bool`. SQLite stores bools as INT; we accept either.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            SqlValue::Null => None,
+            SqlValue::Bool(b) => Some(*b),
+            SqlValue::Int(i) => Some(*i != 0),
+            _ => None,
+        }
+    }
+
+    /// Decode as `&str`. Returns `None` for `Null`.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            SqlValue::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Decode as owned `String`. Returns `None` for `Null`.
+    pub fn as_string(&self) -> Option<String> {
+        match self {
+            SqlValue::Text(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Decode as `&[u8]`. Returns `None` for `Null`.
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            SqlValue::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 // ─── ToSqlValue impls for common types ──────────────────────────────
@@ -149,6 +230,18 @@ impl rusqlite::types::ToSql for SqlValue {
     }
 }
 
+/// Translate a single rusqlite column to `SqlValue` using its runtime type.
+fn rusqlite_value_to_sqlvalue(v: rusqlite::types::ValueRef<'_>) -> SqlValue {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => SqlValue::Null,
+        ValueRef::Integer(i) => SqlValue::Int(i),
+        ValueRef::Real(f) => SqlValue::Real(f),
+        ValueRef::Text(b) => SqlValue::Text(String::from_utf8_lossy(b).into_owned()),
+        ValueRef::Blob(b) => SqlValue::Blob(b.to_vec()),
+    }
+}
+
 impl DbBackend for crate::db::sqlite::SqliteDb {
     fn engine(&self) -> Engine {
         Engine::Sqlite
@@ -168,6 +261,66 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
 
     fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid()
+    }
+
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.read_connection().lock().unwrap();
+        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("query: {e}"))?;
+        if let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(cols))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.read_connection().lock().unwrap();
+        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("query: {e}"))?;
+        let mut out: Vec<Vec<SqlValue>> = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(cols);
+        }
+        Ok(out)
     }
 }
 
@@ -281,6 +434,109 @@ impl DbBackend for PostgresBackend {
     fn last_insert_rowid(&self) -> i64 {
         *self.last_id.lock().unwrap()
     }
+
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let pool = self.pool.clone();
+        let sql_owned = sql.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut q = sqlx::query(&sql_owned);
+                for v in &owned {
+                    q = bind_sqlvalue(q, v);
+                }
+                let row_opt = q
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| format!("pg query_one: {e}"))?;
+                match row_opt {
+                    None => Ok(None),
+                    Some(row) => Ok(Some(pgrow_to_sqlvalues(&row)?)),
+                }
+            })
+        })
+    }
+
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let pool = self.pool.clone();
+        let sql_owned = sql.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut q = sqlx::query(&sql_owned);
+                for v in &owned {
+                    q = bind_sqlvalue(q, v);
+                }
+                let rows = q
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| format!("pg query_many: {e}"))?;
+                rows.iter().map(pgrow_to_sqlvalues).collect()
+            })
+        })
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn pgrow_to_sqlvalues(row: &sqlx::postgres::PgRow) -> Result<Vec<SqlValue>, String> {
+    use sqlx::{Column, Row, TypeInfo};
+    let n = row.columns().len();
+    let mut out: Vec<SqlValue> = Vec::with_capacity(n);
+    for i in 0..n {
+        let col = &row.columns()[i];
+        let type_name = col.type_info().name();
+        // Try NULL first via try_get::<Option<T>, _>. Dispatch on type name
+        // to pick the right Rust type. List covers the types Tune actually
+        // stores (cf. migrations/postgres/001_initial_schema.sql).
+        let v = match type_name {
+            "INT2" | "SMALLINT" => row
+                .try_get::<Option<i16>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, |v| SqlValue::Int(v as i64)))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "INT4" | "INTEGER" | "INT" => row
+                .try_get::<Option<i32>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, |v| SqlValue::Int(v as i64)))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "INT8" | "BIGINT" => row
+                .try_get::<Option<i64>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Int))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "FLOAT4" | "REAL" => row
+                .try_get::<Option<f32>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, |v| SqlValue::Real(v as f64)))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "FLOAT8" | "DOUBLE PRECISION" => row
+                .try_get::<Option<f64>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "BOOL" => row
+                .try_get::<Option<bool>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Bool))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            "BYTEA" => row
+                .try_get::<Option<Vec<u8>>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Blob))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+            // TEXT, VARCHAR, BPCHAR, CITEXT, NAME, JSON, JSONB, UUID, TIMESTAMP*, DATE
+            // all decode cleanly via try_get::<Option<String>, _>().
+            _ => row
+                .try_get::<Option<String>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Text))
+                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+        };
+        out.push(v);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
