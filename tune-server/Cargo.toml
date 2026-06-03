@@ -8,6 +8,7 @@ license.workspace = true
 default = ["local-audio", "oaat"]
 local-audio = ["tune-core/local-audio"]
 oaat = ["tune-core/oaat"]
+postgres = ["tune-core/postgres"]
 
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false }

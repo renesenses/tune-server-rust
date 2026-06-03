@@ -2,6 +2,42 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::info;
 
+/// Engine backing the persistence layer.
+///
+/// Phase 2 of the PostgreSQL support roadmap
+/// (docs/POSTGRES-PLAN.md). Currently `Sqlite` is the only engine
+/// actually used at runtime; `Postgres` is read from config and used
+/// to open a PgPool at boot but the repos still run on SQLite.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseEngine {
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    pub engine: DatabaseEngine,
+    /// libpq DSN, only used when `engine = "postgres"`.
+    /// Example: `postgresql://user:pass@host:5432/dbname`.
+    pub connection_string: Option<String>,
+    pub max_connections: u32,
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            engine: DatabaseEngine::Sqlite,
+            connection_string: None,
+            max_connections: 16,
+            acquire_timeout_secs: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TuneConfig {
@@ -27,6 +63,8 @@ pub struct TuneConfig {
     pub acoustid_api_key: Option<String>,
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 impl TuneConfig {
@@ -58,6 +96,7 @@ impl Default for TuneConfig {
             discogs_token: None,
             acoustid_api_key: None,
             openai_api_key: None,
+            database: DatabaseConfig::default(),
         }
     }
 }
@@ -96,6 +135,19 @@ impl TuneConfig {
         }
         if let Ok(v) = std::env::var("TUNE_DB_PATH") {
             config.db_path = v;
+        }
+        // TUNE_DATABASE_URL overrides the config-file engine choice.
+        // Any DSN starting with `postgresql://` or `postgres://` flips
+        // the engine to Postgres; anything else is treated as a SQLite
+        // path (synonymous with TUNE_DB_PATH for backward compat).
+        if let Ok(v) = std::env::var("TUNE_DATABASE_URL") {
+            if v.starts_with("postgresql://") || v.starts_with("postgres://") {
+                config.database.engine = DatabaseEngine::Postgres;
+                config.database.connection_string = Some(v);
+            } else {
+                config.database.engine = DatabaseEngine::Sqlite;
+                config.db_path = v;
+            }
         }
 
         // On Windows, resolve relative db_path to a writable location

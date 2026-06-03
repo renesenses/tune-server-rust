@@ -60,8 +60,21 @@ async fn main() {
         )
         .init();
 
+    #[cfg(feature = "postgres")]
+    let mut state = AppState::new(&config.db_path, config.port, config.clone())
+        .expect("failed to init app state");
+    #[cfg(not(feature = "postgres"))]
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
+
+    // Optional PostgreSQL pool (phase 2 of PG roadmap). Only opens
+    // when built with --features postgres AND config selects it.
+    #[cfg(feature = "postgres")]
+    {
+        if let Err(e) = state.try_open_postgres(&config.database).await {
+            tracing::error!(error = %e, "postgres_open_failed");
+        }
+    }
 
     state.restore_tokens().await;
 

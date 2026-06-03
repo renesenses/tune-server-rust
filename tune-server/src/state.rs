@@ -22,6 +22,12 @@ use crate::config::TuneConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqliteDb,
+    /// Optional PostgreSQL pool, only populated when the `postgres`
+    /// feature is built and the runtime config selects it. The repos
+    /// still run on SQLite — this field is a smoke-test handle until
+    /// phase 3 of the PG roadmap makes the repos pluggable.
+    #[cfg(feature = "postgres")]
+    pub postgres: Option<Arc<tune_core::db::postgres::PostgresDb>>,
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
     pub services: Arc<Mutex<ServiceRegistry>>,
@@ -45,6 +51,30 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(feature = "postgres")]
+    /// Open a PostgreSQL pool using the runtime config and store it on
+    /// the state. Returns `Ok(())` whether or not a pool was actually
+    /// opened (only opens when `engine = "postgres"` and a connection
+    /// string is set). Errors propagate from the pool open / ping.
+    pub async fn try_open_postgres(
+        &mut self,
+        cfg: &crate::config::DatabaseConfig,
+    ) -> Result<(), String> {
+        if cfg.engine != crate::config::DatabaseEngine::Postgres {
+            return Ok(());
+        }
+        let Some(conn_str) = cfg.connection_string.as_deref() else {
+            tracing::warn!("postgres_engine_selected_without_connection_string");
+            return Ok(());
+        };
+        let pg = tune_core::db::postgres::PostgresDb::connect(conn_str).await?;
+        pg.ping().await?;
+        let version = pg.server_version().await.unwrap_or_default();
+        tracing::info!(server_version = %version, "postgres_connected");
+        self.postgres = Some(Arc::new(pg));
+        Ok(())
+    }
+
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
         let db = SqliteDb::open(db_path)?;
         db.init_schema()?;
@@ -107,6 +137,8 @@ impl AppState {
 
         Ok(Self {
             db,
+            #[cfg(feature = "postgres")]
+            postgres: None,
             streamer,
             playback,
             services,
