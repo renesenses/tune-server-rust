@@ -1,5 +1,6 @@
 pub mod album_repo;
 pub mod artist_repo;
+pub mod backend;
 pub mod engine;
 pub mod history_repo;
 pub mod migrations;
