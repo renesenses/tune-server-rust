@@ -1,7 +1,95 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for tag_repo.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn list_all() -> &'static str {
+        "SELECT id, name, color FROM tags ORDER BY name"
+    }
+
+    pub fn create_tag<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO tags (name, color) VALUES ({}, {})",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, name, color FROM tags WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn update_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tags SET name = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn update_color<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tags SET color = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM tags WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn all_items_by_tag<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT item_type, item_id FROM item_tags WHERE tag_id = {} ORDER BY item_type, item_id",
+            d.placeholder(1)
+        )
+    }
+
+    /// INSERT OR IGNORE rewritten to portable ON CONFLICT DO NOTHING.
+    /// UNIQUE(tag_id, item_type, item_id) is enforced by the schema.
+    pub fn tag_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO item_tags (tag_id, item_type, item_id) VALUES ({}, {}, {}) ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn untag_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM item_tags WHERE tag_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn items_by_tag<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT item_id FROM item_tags WHERE tag_id = {} AND item_type = {} ORDER BY item_id",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn tags_for_item<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.id, t.name, t.color FROM tags t JOIN item_tags it ON t.id = it.tag_id WHERE it.item_type = {} AND it.item_id = {} ORDER BY t.name",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
@@ -21,9 +109,7 @@ impl TagRepo {
 
     pub fn list(&self) -> Result<Vec<Tag>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, color FROM tags ORDER BY name")
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(sql::list_all()).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map([], |row| {
                 Ok(Tag {
@@ -40,7 +126,7 @@ impl TagRepo {
 
     pub fn create(&self, name: &str, color: Option<&str>) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO tags (name, color) VALUES (?, ?)",
+            &sql::create_tag(&self.db.dialect()),
             &[
                 &name as &dyn rusqlite::types::ToSql,
                 &color.unwrap_or("#808080"),
@@ -51,17 +137,13 @@ impl TagRepo {
 
     pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT id, name, color FROM tags WHERE id = ?",
-            params![id],
-            |row| {
-                Ok(Tag {
-                    id: row.get(0).ok(),
-                    name: row.get(1).unwrap_or_default(),
-                    color: row.get(2).unwrap_or_else(|_| "#808080".into()),
-                })
-            },
-        )
+        conn.query_row(&sql::get_by_id(&self.db.dialect()), params![id], |row| {
+            Ok(Tag {
+                id: row.get(0).ok(),
+                name: row.get(1).unwrap_or_default(),
+                color: row.get(2).unwrap_or_else(|_| "#808080".into()),
+            })
+        })
         .optional()
         .map_err(|e| e.to_string())
     }
@@ -69,13 +151,13 @@ impl TagRepo {
     pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
         if let Some(name) = name {
             self.db.execute(
-                "UPDATE tags SET name = ? WHERE id = ?",
+                &sql::update_name(&self.db.dialect()),
                 &[&name as &dyn rusqlite::types::ToSql, &id],
             )?;
         }
         if let Some(color) = color {
             self.db.execute(
-                "UPDATE tags SET color = ? WHERE id = ?",
+                &sql::update_color(&self.db.dialect()),
                 &[&color as &dyn rusqlite::types::ToSql, &id],
             )?;
         }
@@ -83,14 +165,15 @@ impl TagRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM tags WHERE id = ?", &[&id])?;
+        self.db
+            .execute(&sql::delete_by_id(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
     pub fn all_items_by_tag(&self, tag_id: i64) -> Result<Vec<(String, i64)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT item_type, item_id FROM item_tags WHERE tag_id = ? ORDER BY item_type, item_id")
+            .prepare(&sql::all_items_by_tag(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![tag_id], |row| {
@@ -107,7 +190,7 @@ impl TagRepo {
 
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
         self.db.execute(
-            "INSERT OR IGNORE INTO item_tags (tag_id, item_type, item_id) VALUES (?, ?, ?)",
+            &sql::tag_item(&self.db.dialect()),
             &[&tag_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
         )?;
         Ok(())
@@ -115,7 +198,7 @@ impl TagRepo {
 
     pub fn untag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
         self.db.execute(
-            "DELETE FROM item_tags WHERE tag_id = ? AND item_type = ? AND item_id = ?",
+            &sql::untag_item(&self.db.dialect()),
             &[&tag_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
         )?;
         Ok(())
@@ -124,9 +207,7 @@ impl TagRepo {
     pub fn items_by_tag(&self, tag_id: i64, item_type: &str) -> Result<Vec<i64>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT item_id FROM item_tags WHERE tag_id = ? AND item_type = ? ORDER BY item_id",
-            )
+            .prepare(&sql::items_by_tag(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let ids = stmt
             .query_map(params![tag_id, item_type], |row| row.get(0))
@@ -139,7 +220,7 @@ impl TagRepo {
     pub fn tags_for_item(&self, item_type: &str, item_id: i64) -> Result<Vec<Tag>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT t.id, t.name, t.color FROM tags t JOIN item_tags it ON t.id = it.tag_id WHERE it.item_type = ? AND it.item_id = ? ORDER BY t.name")
+            .prepare(&sql::tags_for_item(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![item_type, item_id], |row| {
@@ -296,6 +377,16 @@ mod tests {
         repo.delete(tag_id).unwrap();
         // After deleting the tag, item_tags should be cascade-deleted
         assert!(repo.get(tag_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::create_tag(&s).contains("VALUES (?, ?)"));
+        assert!(sql::create_tag(&p).contains("VALUES ($1, $2)"));
+        assert!(sql::tag_item(&p).ends_with("ON CONFLICT (tag_id, item_type, item_id) DO NOTHING"));
     }
 
     #[test]

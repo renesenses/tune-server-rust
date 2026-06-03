@@ -3,7 +3,30 @@
 **Axe 6 de la roadmap v0.9.0**
 **Effort total estimé** : 14 jours-homme
 **Priorité** : P1
-**Statut** : Draft (2026-06-02)
+**Statut** : Phase 1 + portage partiel des repos en cours sur `feature/postgres-support` (2026-06-02)
+
+## Progrès
+
+### Fait
+- Phase 1 abstraction : `Engine` + `SqlDialect` (SQLite / Postgres impls) + `PostgresDb` skeleton (sqlx pool) + workflow CI `test-postgres.yml`
+- Wiring : feature `postgres = ["dep:sqlx"]`, `SqliteDb::dialect()` / `engine()`
+- **13 repos sur 13 portés** vers le `SqlDialect` (placeholders + LOWER au lieu de COLLATE NOCASE + ON CONFLICT DO NOTHING portable au lieu de INSERT OR IGNORE) :
+  - settings_repo, profile_repo, rating_repo, tag_repo, radio_repo
+  - source_link_repo, play_queue_repo, history_repo (partiel : full_dashboard reporté)
+  - zone_repo, artist_repo, playlist_repo
+  - **album_repo (1054 LOC, 19 builders)**
+  - **track_repo (1124 LOC, 13 builders)**
+- `full_text_search.rs` : doc note en tête, le PG `tsvector + GIN` viendra en phase 4
+- 957 tests `tune-core` verts, dont ~30 tests dialecte explicites (SQLite `?` + Postgres `$1, $2, ...`)
+
+### Reste (phase 4 — wiring backend + migration tool)
+- Backend Postgres réellement utilisé end-to-end (PgPool dans AppState, migrations PG, sélecteur engine au boot, repos pluggables via trait)
+- FTS5 → tsvector côté `full_text_search.rs` (split sqlite/postgres modules, helper `dialect.fts_match()`)
+- Outil CLI `tune-cli db migrate-to-postgres` (export SQLite → import PG)
+- Endpoints REST `/system/database/migrate` et `/system/database/test-connection` réellement implémentés
+- Helpers dialect pour `strftime`/`json_each` (resp. `to_char`/`jsonb_array_elements_text`)
+- Migration des CREATE TABLE inline (`streaming_queue` dans play_queue_repo) vers une migration portable
+- `full_dashboard` du history_repo : rewrite avec dialect helpers date
 
 ---
 

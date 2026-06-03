@@ -1,7 +1,91 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for profile_repo.
+pub mod sql {
+    use super::SqlDialect;
+
+    const PROFILE_COLS: &str = "id, username, display_name, avatar_path, is_admin, created_at";
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {PROFILE_COLS} FROM profiles WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_all() -> &'static str {
+        "SELECT id, username, display_name, avatar_path, is_admin, created_at FROM profiles ORDER BY id"
+    }
+
+    pub fn create<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO profiles (username, display_name) VALUES ({}, {})",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn update<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE profiles SET display_name = COALESCE({}, display_name), avatar_path = COALESCE({}, avatar_path) WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM profiles WHERE id = {}", d.placeholder(1))
+    }
+
+    /// INSERT OR IGNORE form. Uses the portable ON CONFLICT DO NOTHING
+    /// (SQLite 3.24+, PG 9.5+) so the same SQL runs on both engines.
+    pub fn add_favorite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO favorites (profile_id, item_type, item_id) VALUES ({}, {}, {}) ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn remove_favorite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM favorites WHERE profile_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn count_favorite<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM favorites WHERE profile_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn list_favorites_all<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, profile_id, item_type, item_id, created_at FROM favorites WHERE profile_id = {} ORDER BY created_at DESC",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_favorites_by_type<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, profile_id, item_type, item_id, created_at FROM favorites WHERE profile_id = {} AND item_type = {} ORDER BY created_at DESC",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -36,20 +120,16 @@ impl ProfileRepo {
 
     pub fn get(&self, id: i64) -> Result<Option<Profile>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(
-            "SELECT id, username, display_name, avatar_path, is_admin, created_at FROM profiles WHERE id = ?",
-            params![id],
-            |row| Ok(row_to_profile(row)),
-        )
+        conn.query_row(&sql::get_by_id(&self.db.dialect()), params![id], |row| {
+            Ok(row_to_profile(row))
+        })
         .optional()
         .map_err(|e| e.to_string())
     }
 
     pub fn list(&self) -> Result<Vec<Profile>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, username, display_name, avatar_path, is_admin, created_at FROM profiles ORDER BY id")
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(sql::list_all()).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map([], |row| Ok(row_to_profile(row)))
             .map_err(|e| e.to_string())?
@@ -60,7 +140,7 @@ impl ProfileRepo {
 
     pub fn create(&self, username: &str, display_name: Option<&str>) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO profiles (username, display_name) VALUES (?, ?)",
+            &sql::create(&self.db.dialect()),
             &[&username as &dyn rusqlite::types::ToSql, &display_name],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -73,8 +153,12 @@ impl ProfileRepo {
         avatar_path: Option<&str>,
     ) -> Result<(), String> {
         self.db.execute(
-            "UPDATE profiles SET display_name = COALESCE(?, display_name), avatar_path = COALESCE(?, avatar_path) WHERE id = ?",
-            &[&display_name as &dyn rusqlite::types::ToSql, &avatar_path, &id],
+            &sql::update(&self.db.dialect()),
+            &[
+                &display_name as &dyn rusqlite::types::ToSql,
+                &avatar_path,
+                &id,
+            ],
         )?;
         Ok(())
     }
@@ -83,8 +167,7 @@ impl ProfileRepo {
         if id == 1 {
             return Err("cannot delete default profile".into());
         }
-        self.db
-            .execute("DELETE FROM profiles WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
@@ -95,7 +178,7 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         self.db.execute(
-            "INSERT OR IGNORE INTO favorites (profile_id, item_type, item_id) VALUES (?, ?, ?)",
+            &sql::add_favorite(&self.db.dialect()),
             &[
                 &profile_id as &dyn rusqlite::types::ToSql,
                 &item_type,
@@ -112,7 +195,7 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         self.db.execute(
-            "DELETE FROM favorites WHERE profile_id = ? AND item_type = ? AND item_id = ?",
+            &sql::remove_favorite(&self.db.dialect()),
             &[
                 &profile_id as &dyn rusqlite::types::ToSql,
                 &item_type,
@@ -131,7 +214,7 @@ impl ProfileRepo {
         let conn = self.db.read_connection().lock().unwrap();
         let count: i32 = conn
             .query_row(
-                "SELECT COUNT(*) FROM favorites WHERE profile_id = ? AND item_type = ? AND item_id = ?",
+                &sql::count_favorite(&self.db.dialect()),
                 params![profile_id, item_type, item_id],
                 |row| row.get(0),
             )
@@ -145,20 +228,17 @@ impl ProfileRepo {
         item_type: Option<&str>,
     ) -> Result<Vec<Favorite>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) =
-            item_type
-        {
-            (
-                "SELECT id, profile_id, item_type, item_id, created_at FROM favorites WHERE profile_id = ? AND item_type = ? ORDER BY created_at DESC".into(),
-                vec![Box::new(profile_id), Box::new(t.to_string())],
-            )
-        } else {
-            (
-                "SELECT id, profile_id, item_type, item_id, created_at FROM favorites WHERE profile_id = ? ORDER BY created_at DESC".into(),
-                vec![Box::new(profile_id)],
-            )
-        };
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let d = self.db.dialect();
+        let (query, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(t) = item_type {
+                (
+                    sql::list_favorites_by_type(&d),
+                    vec![Box::new(profile_id), Box::new(t.to_string())],
+                )
+            } else {
+                (sql::list_favorites_all(&d), vec![Box::new(profile_id)])
+            };
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|b| b.as_ref()).collect();
         let items = stmt
@@ -330,5 +410,25 @@ mod tests {
 
         let all = repo.list().unwrap();
         assert_eq!(all.len(), 3); // default + alice + bob
+    }
+
+    #[test]
+    fn sql_builders_emit_dialect_specific_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+
+        // Single-placeholder query.
+        assert!(sql::get_by_id(&s).ends_with("WHERE id = ?"));
+        assert!(sql::get_by_id(&p).ends_with("WHERE id = $1"));
+
+        // Three-placeholder query: numbered $1/$2/$3 on Postgres.
+        let pg_add = sql::add_favorite(&p);
+        assert!(pg_add.contains("VALUES ($1, $2, $3)"));
+        assert!(pg_add.ends_with("ON CONFLICT (profile_id, item_type, item_id) DO NOTHING"));
+
+        let sqlite_add = sql::add_favorite(&s);
+        assert!(sqlite_add.contains("VALUES (?, ?, ?)"));
+        assert!(sqlite_add.ends_with("ON CONFLICT (profile_id, item_type, item_id) DO NOTHING"));
     }
 }

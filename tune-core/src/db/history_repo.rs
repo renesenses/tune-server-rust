@@ -1,7 +1,86 @@
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for history_repo.
+///
+/// `full_dashboard` keeps its dynamic SQL (heavy use of `strftime` and
+/// `DATE()` SQLite-specific functions). Phase 4 will introduce dialect
+/// helpers for date arithmetic (PG: `now() - interval '... days'`, day
+/// truncation: `DATE_TRUNC('day', ts)`) and rewrite this method then.
+pub mod sql {
+    use super::SqlDialect;
+
+    const RECORD_COLS: &str =
+        "id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id";
+
+    pub fn record<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, duration_ms, zone_id) VALUES ({}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7)
+        )
+    }
+
+    pub fn recent<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {} OFFSET {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn count_all() -> &'static str {
+        "SELECT COUNT(*) FROM listen_history"
+    }
+
+    pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT title, artist_name, COUNT(*) as plays FROM listen_history GROUP BY title, artist_name ORDER BY plays DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn top_artists<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn top_albums<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn dashboard_total_duration() -> &'static str {
+        "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history"
+    }
+
+    pub fn dashboard_unique_tracks() -> &'static str {
+        "SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history"
+    }
+
+    pub fn dashboard_unique_artists() -> &'static str {
+        "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL"
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenRecord {
@@ -27,7 +106,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, duration_ms, zone_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &sql::record(&self.db.dialect()),
             &[
                 &rec.track_id as &dyn rusqlite::types::ToSql,
                 &rec.title,
@@ -44,7 +123,7 @@ impl HistoryRepo {
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id FROM listen_history ORDER BY listened_at DESC LIMIT ?")
+            .prepare(&sql::recent(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| Ok(row_to_listen(row)))
@@ -61,10 +140,10 @@ impl HistoryRepo {
     ) -> Result<(Vec<ListenRecord>, i64), String> {
         let conn = self.db.read_connection().lock().unwrap();
         let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
+            .query_row(sql::count_all(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id FROM listen_history ORDER BY listened_at DESC LIMIT ? OFFSET ?")
+            .prepare(&sql::recent_paginated(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_listen(row)))
@@ -77,7 +156,7 @@ impl HistoryRepo {
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT title, artist_name, COUNT(*) as plays FROM listen_history GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?")
+            .prepare(&sql::top_tracks(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| {
@@ -96,7 +175,7 @@ impl HistoryRepo {
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL GROUP BY artist_name ORDER BY plays DESC LIMIT ?")
+            .prepare(&sql::top_artists(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| {
@@ -114,7 +193,7 @@ impl HistoryRepo {
     pub fn top_albums(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT ?")
+            .prepare(&sql::top_albums(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit], |row| {
@@ -151,7 +230,7 @@ impl HistoryRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
+        conn.query_row(sql::count_all(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
@@ -159,27 +238,19 @@ impl HistoryRepo {
         let conn = self.db.read_connection().lock().unwrap();
 
         let total_listens: i64 = conn
-            .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
+            .query_row(sql::count_all(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
         let total_duration_ms: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(sql::dashboard_total_duration(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
         let unique_tracks: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(sql::dashboard_unique_tracks(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
         let unique_artists: i64 = conn
-            .query_row("SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL", [], |row| row.get(0))
+            .query_row(sql::dashboard_unique_artists(), [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
         Ok(DashboardStats {
@@ -840,6 +911,16 @@ mod tests {
         assert_eq!(recent.len(), 3);
         // Most recent first
         assert_eq!(recent[0].title, "Third");
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7)"));
+        assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
     }
 
     #[test]

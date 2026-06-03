@@ -1,7 +1,137 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for play_queue_repo.
+///
+/// The CREATE TABLE for streaming_queue (referenced inline in this
+/// repo) is SQLite-specific (INTEGER PRIMARY KEY AUTOINCREMENT). It
+/// stays in the impl for now; the phase 3 migration sweep will move it
+/// to a portable migration file.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn queue_select_base() -> &'static str {
+        "SELECT pq.id, pq.zone_id, pq.track_id, pq.position, pq.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path FROM play_queue pq LEFT JOIN tracks t ON pq.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+    }
+
+    pub fn get_queue<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE pq.zone_id = {} ORDER BY pq.position",
+            queue_select_base(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_current<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE pq.zone_id = {} AND pq.is_current = 1",
+            queue_select_base(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn delete_for_zone<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM play_queue WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn insert_queue_row<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES ({}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    pub fn max_position<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COALESCE(MAX(position), -1) FROM play_queue WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn insert_queue_row_no_current<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES ({}, {}, {}, 0)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn unset_current<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE play_queue SET is_current = 0 WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_current_at<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE play_queue SET is_current = 1 WHERE zone_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete_at<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM play_queue WHERE zone_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn reindex_after_delete<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE play_queue SET position = position - 1 WHERE zone_id = {} AND position > {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete_streaming<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM streaming_queue WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8)
+        )
+    }
+
+    pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position FROM streaming_queue WHERE zone_id = {} ORDER BY position",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn count_queue<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM play_queue WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
@@ -18,8 +148,6 @@ pub struct QueueItem {
     pub cover_path: Option<String>,
 }
 
-const SELECT_QUEUE: &str = "SELECT pq.id, pq.zone_id, pq.track_id, pq.position, pq.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path FROM play_queue pq LEFT JOIN tracks t ON pq.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
-
 pub struct PlayQueueRepo {
     db: SqliteDb,
 }
@@ -30,12 +158,9 @@ impl PlayQueueRepo {
     }
 
     pub fn get_queue(&self, zone_id: i64) -> Result<Vec<QueueItem>, String> {
+        let query = sql::get_queue(&self.db.dialect());
         let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"
-            ))
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
             .map_err(|e| e.to_string())?
@@ -51,11 +176,7 @@ impl PlayQueueRepo {
         // committed rows.  Fall back to the write connection which always has
         // an up-to-date view of its own commits.
         let wconn = self.db.connection().lock().unwrap();
-        let mut wstmt = wconn
-            .prepare(&format!(
-                "{SELECT_QUEUE} WHERE pq.zone_id = ? ORDER BY pq.position"
-            ))
-            .map_err(|e| e.to_string())?;
+        let mut wstmt = wconn.prepare(&query).map_err(|e| e.to_string())?;
         let items = wstmt
             .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
             .map_err(|e| e.to_string())?
@@ -67,9 +188,7 @@ impl PlayQueueRepo {
     pub fn get_current(&self, zone_id: i64) -> Result<Option<QueueItem>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_QUEUE} WHERE pq.zone_id = ? AND pq.is_current = 1"
-            ))
+            .prepare(&sql::get_current(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![zone_id], |row| Ok(row_to_queue_item(row)))
             .optional()
@@ -77,14 +196,15 @@ impl PlayQueueRepo {
     }
 
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        let d = self.db.dialect();
+        let delete_sql = sql::delete_for_zone(&d);
+        let insert_sql = sql::insert_queue_row(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
+        tx.execute(&delete_sql, params![zone_id])
             .map_err(|e| e.to_string())?;
         {
-            let mut stmt = tx
-                .prepare_cached("INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, ?)")
-                .map_err(|e| e.to_string())?;
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
             for (i, tid) in track_ids.iter().enumerate() {
                 let is_current = if i == 0 { 1i64 } else { 0i64 };
                 stmt.execute(params![zone_id, tid, i as i64, is_current])
@@ -101,20 +221,17 @@ impl PlayQueueRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<(), String> {
+        let d = self.db.dialect();
+        let max_pos_sql = sql::max_position(&d);
+        let insert_sql = sql::insert_queue_row_no_current(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let max_pos: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(position), -1) FROM play_queue WHERE zone_id = ?",
-                params![zone_id],
-                |row| row.get(0),
-            )
+            .query_row(&max_pos_sql, params![zone_id], |row| row.get(0))
             .unwrap_or(-1);
         let start = position.unwrap_or(max_pos + 1);
         {
-            let mut stmt = tx
-                .prepare_cached("INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES (?, ?, ?, 0)")
-                .map_err(|e| e.to_string())?;
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
             for (i, tid) in track_ids.iter().enumerate() {
                 stmt.execute(params![zone_id, tid, start + i as i64])
                     .map_err(|e| e.to_string())?;
@@ -125,36 +242,30 @@ impl PlayQueueRepo {
     }
 
     pub fn set_current(&self, zone_id: i64, position: i64) -> Result<(), String> {
+        let d = self.db.dialect();
+        let unset_sql = sql::unset_current(&d);
+        let set_sql = sql::set_current_at(&d);
         let conn = self.db.connection().lock().unwrap();
-        conn.execute(
-            "UPDATE play_queue SET is_current = 0 WHERE zone_id = ?",
-            params![zone_id],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE play_queue SET is_current = 1 WHERE zone_id = ? AND position = ?",
-            params![zone_id, position],
-        )
-        .map_err(|e| e.to_string())?;
+        conn.execute(&unset_sql, params![zone_id])
+            .map_err(|e| e.to_string())?;
+        conn.execute(&set_sql, params![zone_id, position])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn remove_at(&self, zone_id: i64, position: i64) -> Result<bool, String> {
+        let d = self.db.dialect();
+        let delete_sql = sql::delete_at(&d);
+        let reindex_sql = sql::reindex_after_delete(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let deleted = tx
-            .execute(
-                "DELETE FROM play_queue WHERE zone_id = ? AND position = ?",
-                params![zone_id, position],
-            )
+            .execute(&delete_sql, params![zone_id, position])
             .map_err(|e| e.to_string())?;
         if deleted > 0 {
             // Reindex positions so they stay contiguous
-            tx.execute(
-                "UPDATE play_queue SET position = position - 1 WHERE zone_id = ? AND position > ?",
-                params![zone_id, position],
-            )
-            .map_err(|e| e.to_string())?;
+            tx.execute(&reindex_sql, params![zone_id, position])
+                .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(deleted > 0)
@@ -162,7 +273,7 @@ impl PlayQueueRepo {
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
         self.db
-            .execute("DELETE FROM play_queue WHERE zone_id = ?", &[&zone_id])?;
+            .execute(&sql::delete_for_zone(&self.db.dialect()), &[&zone_id])?;
         Ok(())
     }
 
@@ -172,10 +283,16 @@ impl PlayQueueRepo {
         zone_id: i64,
         tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
     ) -> Result<(), String> {
+        let d = self.db.dialect();
+        let delete_queue_sql = sql::delete_for_zone(&d);
+        let delete_streaming_sql = sql::delete_streaming(&d);
+        let insert_streaming_sql = sql::insert_streaming(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM play_queue WHERE zone_id = ?", params![zone_id])
+        tx.execute(&delete_queue_sql, params![zone_id])
             .map_err(|e| e.to_string())?;
+        // SQLite-specific CREATE TABLE (INTEGER PRIMARY KEY AUTOINCREMENT).
+        // Phase 3 of the PG roadmap will move this to migrations.
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS streaming_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,14 +308,11 @@ impl PlayQueueRepo {
             )",
         )
         .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM streaming_queue WHERE zone_id = ?",
-            params![zone_id],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.execute(&delete_streaming_sql, params![zone_id])
+            .map_err(|e| e.to_string())?;
         {
             let mut stmt = tx
-                .prepare_cached("INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                .prepare_cached(&insert_streaming_sql)
                 .map_err(|e| e.to_string())?;
             for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
                 tracks.iter().enumerate()
@@ -221,6 +335,7 @@ impl PlayQueueRepo {
     }
 
     pub fn get_streaming_queue(&self, zone_id: i64) -> Result<Vec<serde_json::Value>, String> {
+        let select_sql = sql::select_streaming(&self.db.dialect());
         let conn = self.db.connection().lock().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS streaming_queue (
@@ -237,9 +352,7 @@ impl PlayQueueRepo {
             )",
         )
         .map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare("SELECT source_id, title, artist, album, cover_url, duration_ms, position FROM streaming_queue WHERE zone_id = ? ORDER BY position")
-            .map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&select_sql).map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![zone_id], |row| {
                 Ok(serde_json::json!({
@@ -259,13 +372,10 @@ impl PlayQueueRepo {
     }
 
     pub fn count(&self, zone_id: i64) -> Result<i64, String> {
+        let count_sql = sql::count_queue(&self.db.dialect());
         let conn = self.db.read_connection().lock().unwrap();
         let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
-                params![zone_id],
-                |row| row.get(0),
-            )
+            .query_row(&count_sql, params![zone_id], |row| row.get(0))
             .map_err(|e| e.to_string())?;
         if n > 0 {
             return Ok(n);
@@ -275,11 +385,7 @@ impl PlayQueueRepo {
         // WAL fallback: read connection may lag behind the write connection
         let wconn = self.db.connection().lock().unwrap();
         wconn
-            .query_row(
-                "SELECT COUNT(*) FROM play_queue WHERE zone_id = ?",
-                params![zone_id],
-                |row| row.get(0),
-            )
+            .query_row(&count_sql, params![zone_id], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 }
@@ -507,6 +613,16 @@ mod tests {
         let queue = repo.get_streaming_queue(1).unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0]["title"], "New");
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?)"));
+        assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4)"));
+        assert!(sql::insert_streaming(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"));
     }
 
     #[test]

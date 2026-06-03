@@ -2,10 +2,141 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{OptionalExtension, params};
 
+use super::engine::SqlDialect;
 use super::models::Track;
 use super::sqlite::SqliteDb;
 
-const SELECT_TRACK: &str = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id";
+/// Engine-agnostic SQL builders for track_repo.
+///
+/// Complex dynamic queries (search() FTS5, list_doubtful() aggregate,
+/// deduplicate(), random_ids() with RANDOM()) retain SQLite-specific
+/// fragments behind TODO comments; phase 4 swaps them for PG
+/// equivalents via dialect helpers.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn select_track() -> &'static str {
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+    }
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!("{} WHERE t.id = {}", select_track(), d.placeholder(1))
+    }
+
+    pub fn get_by_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE t.file_path = {}",
+            select_track(),
+            d.placeholder(1)
+        )
+    }
+
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id";
+
+    pub fn insert<D: SqlDialect>(d: &D) -> String {
+        let placeholders: Vec<String> = (1..=26).map(|i| d.placeholder(i)).collect();
+        format!(
+            "INSERT INTO tracks ({INSERT_COLS}) VALUES ({})",
+            placeholders.join(", ")
+        )
+    }
+
+    pub fn update<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET title = {}, album_id = {}, artist_id = {}, album_artist = {}, disc_number = {}, disc_subtitle = {}, track_number = {}, duration_ms = {}, file_path = {}, format = {}, sample_rate = {}, bit_depth = {}, channels = {}, file_mtime = {}, file_size = {}, audio_hash = {}, genre = {}, genres = {}, composer = {}, year = {}, bpm = {}, label = {}, musicbrainz_recording_id = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11),
+            d.placeholder(12),
+            d.placeholder(13),
+            d.placeholder(14),
+            d.placeholder(15),
+            d.placeholder(16),
+            d.placeholder(17),
+            d.placeholder(18),
+            d.placeholder(19),
+            d.placeholder(20),
+            d.placeholder(21),
+            d.placeholder(22),
+            d.placeholder(23),
+            d.placeholder(24),
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM tracks WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn delete_all() -> &'static str {
+        "DELETE FROM tracks"
+    }
+
+    pub fn delete_by_path<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM tracks WHERE file_path = {}", d.placeholder(1))
+    }
+
+    pub fn count() -> &'static str {
+        "SELECT COUNT(*) FROM tracks"
+    }
+
+    pub fn list_paginated<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} ORDER BY t.id LIMIT {} OFFSET {}",
+            select_track(),
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn list_by_album<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE t.album_id = {} ORDER BY t.disc_number, t.track_number, t.title",
+            select_track(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, t.disc_number, t.track_number",
+            select_track(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list_by_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE t.file_path = {}",
+            select_track(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn update_mtime_and_size<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET file_mtime = {}, file_size = {} WHERE file_path = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn update_audio_hash<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET audio_hash = {} WHERE file_path = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+}
 
 pub struct TrackRepo {
     db: SqliteDb,
@@ -23,7 +154,7 @@ impl TrackRepo {
     pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.id = ?"))
+            .prepare(&sql::get_by_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| Ok(row_to_track(row)))
             .optional()
@@ -33,7 +164,7 @@ impl TrackRepo {
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
+            .prepare(&sql::get_by_path(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![file_path], |row| Ok(row_to_track(row)))
             .optional()
@@ -42,18 +173,34 @@ impl TrackRepo {
 
     pub fn create(&self, track: &Track) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &sql::insert(&self.db.dialect()),
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id, &track.artist_id, &track.album_artist,
-                &track.disc_number, &track.disc_subtitle,
-                &track.track_number, &track.duration_ms,
-                &track.file_path, &track.format,
-                &track.sample_rate, &track.bit_depth, &track.channels,
-                &track.file_mtime, &track.file_size, &track.audio_hash,
-                &track.source, &track.source_id, &track.isrc,
-                &track.genre, &track.genres, &track.composer, &track.year,
-                &track.bpm, &track.label, &track.musicbrainz_recording_id,
+                &track.album_id,
+                &track.artist_id,
+                &track.album_artist,
+                &track.disc_number,
+                &track.disc_subtitle,
+                &track.track_number,
+                &track.duration_ms,
+                &track.file_path,
+                &track.format,
+                &track.sample_rate,
+                &track.bit_depth,
+                &track.channels,
+                &track.file_mtime,
+                &track.file_size,
+                &track.audio_hash,
+                &track.source,
+                &track.source_id,
+                &track.isrc,
+                &track.genre,
+                &track.genres,
+                &track.composer,
+                &track.year,
+                &track.bpm,
+                &track.label,
+                &track.musicbrainz_recording_id,
             ],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -64,11 +211,10 @@ impl TrackRepo {
     /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
     /// if desired. Returns the number of successfully inserted tracks.
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let insert_sql = sql::insert(&self.db.dialect());
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO tracks (title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
+            .prepare_cached(&insert_sql)
             .map_err(|e| e.to_string())?;
         let mut count = 0;
         for track in tracks {
@@ -112,11 +258,10 @@ impl TrackRepo {
     /// The caller is responsible for wrapping this in a transaction (BEGIN/COMMIT)
     /// if desired. Returns the number of successfully updated tracks.
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+        let update_sql = sql::update(&self.db.dialect());
         let conn = self.db.connection().lock().unwrap();
         let mut stmt = conn
-            .prepare_cached(
-                "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, genres = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
-            )
+            .prepare_cached(&update_sql)
             .map_err(|e| e.to_string())?;
         let mut count = 0;
         for track in tracks {
@@ -157,17 +302,31 @@ impl TrackRepo {
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
         self.db.execute(
-            "UPDATE tracks SET title = ?, album_id = ?, artist_id = ?, album_artist = ?, disc_number = ?, disc_subtitle = ?, track_number = ?, duration_ms = ?, file_path = ?, format = ?, sample_rate = ?, bit_depth = ?, channels = ?, file_mtime = ?, file_size = ?, audio_hash = ?, genre = ?, genres = ?, composer = ?, year = ?, bpm = ?, label = ?, musicbrainz_recording_id = ? WHERE id = ?",
+            &sql::update(&self.db.dialect()),
             &[
                 &track.title as &dyn rusqlite::types::ToSql,
-                &track.album_id, &track.artist_id, &track.album_artist,
-                &track.disc_number, &track.disc_subtitle,
-                &track.track_number, &track.duration_ms,
-                &track.file_path, &track.format,
-                &track.sample_rate, &track.bit_depth, &track.channels,
-                &track.file_mtime, &track.file_size, &track.audio_hash,
-                &track.genre, &track.genres, &track.composer, &track.year,
-                &track.bpm, &track.label, &track.musicbrainz_recording_id,
+                &track.album_id,
+                &track.artist_id,
+                &track.album_artist,
+                &track.disc_number,
+                &track.disc_subtitle,
+                &track.track_number,
+                &track.duration_ms,
+                &track.file_path,
+                &track.format,
+                &track.sample_rate,
+                &track.bit_depth,
+                &track.channels,
+                &track.file_mtime,
+                &track.file_size,
+                &track.audio_hash,
+                &track.genre,
+                &track.genres,
+                &track.composer,
+                &track.year,
+                &track.bpm,
+                &track.label,
+                &track.musicbrainz_recording_id,
                 &id,
             ],
         )?;
@@ -175,12 +334,12 @@ impl TrackRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute("DELETE FROM tracks WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
     pub fn delete_all(&self) -> Result<u64, String> {
-        let count = self.db.execute("DELETE FROM tracks", &[])?;
+        let count = self.db.execute(sql::delete_all(), &[])?;
         self.db.execute("DELETE FROM albums", &[]).ok();
         self.db.execute("DELETE FROM artists", &[]).ok();
         self.db.execute("DELETE FROM track_credits", &[]).ok();
@@ -189,7 +348,7 @@ impl TrackRepo {
 
     pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
         self.db.execute(
-            "DELETE FROM tracks WHERE file_path = ?",
+            &sql::delete_by_path(&self.db.dialect()),
             &[&file_path as &dyn rusqlite::types::ToSql],
         )?;
         Ok(())
@@ -256,11 +415,12 @@ impl TrackRepo {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_TRACK} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
+                "{} WHERE (t.title LIKE 'Track %' OR t.title LIKE 'Unknown%' \
                  OR ar.name = 'Unknown Artist' OR ar.name IS NULL) \
                  AND t.acoustid_fingerprint IS NULL \
                  AND t.file_path IS NOT NULL \
-                 ORDER BY t.id LIMIT ?"
+                 ORDER BY t.id LIMIT ?",
+                sql::select_track()
             ))
             .map_err(|e| e.to_string())?;
         stmt.query_map(params![limit], |row| Ok(row_to_track(row)))
@@ -318,14 +478,14 @@ impl TrackRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))
+        conn.query_row(sql::count(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} ORDER BY ar.name COLLATE NOCASE, al.title COLLATE NOCASE, t.disc_number, t.track_number LIMIT ? OFFSET ?"))
+            .prepare(&format!("{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT ? OFFSET ?", sql::select_track()))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
@@ -428,7 +588,7 @@ impl TrackRepo {
         file_size: i64,
     ) -> Result<(), String> {
         self.db.execute(
-            "UPDATE tracks SET file_mtime = ?, file_size = ? WHERE file_path = ?",
+            &sql::update_mtime_and_size(&self.db.dialect()),
             &[
                 &mtime as &dyn rusqlite::types::ToSql,
                 &file_size,
@@ -440,7 +600,7 @@ impl TrackRepo {
 
     pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), String> {
         self.db.execute(
-            "UPDATE tracks SET audio_hash = ? WHERE file_path = ?",
+            &sql::update_audio_hash(&self.db.dialect()),
             &[&audio_hash as &dyn rusqlite::types::ToSql, &file_path],
         )?;
         Ok(())
@@ -449,7 +609,10 @@ impl TrackRepo {
     pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.album_id = ? ORDER BY t.disc_number, t.track_number, t.file_path"))
+            .prepare(&format!(
+                "{} WHERE t.album_id = ? ORDER BY t.disc_number, t.track_number, t.file_path",
+                sql::select_track()
+            ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
             .query_map(params![album_id], |row| Ok(row_to_track(row)))
@@ -463,7 +626,8 @@ impl TrackRepo {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_TRACK} WHERE t.artist_id = ? ORDER BY t.title"
+                "{} WHERE t.artist_id = ? ORDER BY t.title",
+                sql::select_track()
             ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
@@ -478,9 +642,11 @@ impl TrackRepo {
         let fts_query = format!("{query}*");
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
+        // FTS5 MATCH retained; phase 4 will swap for tsvector @@ to_tsquery on PG.
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_TRACK} WHERE t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?) OR ar.name LIKE ? COLLATE NOCASE OR t.genre LIKE ? COLLATE NOCASE OR t.composer LIKE ? COLLATE NOCASE OR CAST(al.year AS TEXT) = ? LIMIT ?"
+                "{} WHERE t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(t.genre) LIKE LOWER(?) OR LOWER(t.composer) LIKE LOWER(?) OR CAST(al.year AS TEXT) = ? LIMIT ?",
+                sql::select_track()
             ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
@@ -498,8 +664,13 @@ impl TrackRepo {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!("{SELECT_TRACK} WHERE t.id IN ({})", placeholders.join(","));
+        let d = self.db.dialect();
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| d.placeholder(i)).collect();
+        let sql = format!(
+            "{} WHERE t.id IN ({})",
+            sql::select_track(),
+            placeholders.join(",")
+        );
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let params: Vec<&dyn rusqlite::types::ToSql> = ids
@@ -538,7 +709,7 @@ impl TrackRepo {
     pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&format!("{SELECT_TRACK} WHERE t.file_path = ?"))
+            .prepare(&sql::get_by_path(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![path], |row| Ok(row_to_track(row)))
             .optional()
@@ -550,7 +721,8 @@ impl TrackRepo {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_TRACK} WHERE t.title LIKE ? COLLATE NOCASE LIMIT ?"
+                "{} WHERE LOWER(t.title) LIKE LOWER(?) LIMIT ?",
+                sql::select_track()
             ))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
@@ -580,14 +752,15 @@ impl TrackRepo {
     /// List tracks with doubtful metadata, paginated.
     pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        let sql = format!(
-            "{SELECT_TRACK} \
+        let query = format!(
+            "{} \
              WHERE (ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
                 OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
                 OR (al.title IS NULL OR al.title = '') \
-             ORDER BY t.id LIMIT ? OFFSET ?"
+             ORDER BY t.id LIMIT ? OFFSET ?",
+            sql::select_track()
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let tracks = stmt
             .query_map(params![limit, offset], |row| Ok(row_to_track(row)))
             .map_err(|e| e.to_string())?
@@ -1120,5 +1293,23 @@ mod tests {
                 .exists_by_audio_hash_and_album("nonexistent", alid1)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::get_by_id(&s).ends_with("WHERE t.id = ?"));
+        assert!(sql::get_by_id(&p).ends_with("WHERE t.id = $1"));
+        // The 26-placeholder INSERT renders cleanly for both engines.
+        let sqlite_insert = sql::insert(&s);
+        let pg_insert = sql::insert(&p);
+        assert!(sqlite_insert.contains(
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ));
+        assert!(pg_insert.contains("$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26"));
+        // No COLLATE in the canonical list ordering builder.
+        assert!(!sql::list_by_album(&p).contains("COLLATE"));
     }
 }

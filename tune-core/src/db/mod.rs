@@ -6,6 +6,8 @@ pub mod migrations;
 pub mod models;
 pub mod play_queue_repo;
 pub mod playlist_repo;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;

@@ -1,3 +1,14 @@
+//! Full-text search — SQLite-only implementation using FTS5 virtual tables.
+//!
+//! Phase 4 of the PostgreSQL support roadmap will introduce a parallel
+//! module (or trait split) that targets PostgreSQL: tsvector columns
+//! materialised on the source tables, GIN indexes, and `@@ to_tsquery`
+//! search predicates. The repos' search() methods will then call
+//! `dialect.fts_match(column, placeholder)` to emit the right clause
+//! for whichever engine is active.
+//!
+//! See docs/POSTGRES-PLAN.md.
+
 use rusqlite::Connection;
 use tracing::{info, warn};
 

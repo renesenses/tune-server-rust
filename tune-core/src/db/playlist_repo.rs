@@ -1,7 +1,90 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::engine::SqlDialect;
 use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for playlist_repo.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn create<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO playlists (name, description) VALUES ({}, {})",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn list<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM playlists WHERE id = {}", d.placeholder(1))
+    }
+
+    pub fn update_field<D: SqlDialect>(d: &D, field: &str) -> String {
+        format!(
+            "UPDATE playlists SET {field} = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn max_position<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn insert_playlist_track<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ({}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn delete_track_at_position<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM playlist_tracks WHERE playlist_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn get_track_ids<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = {} ORDER BY position",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn delete_all_tracks<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM playlist_tracks WHERE playlist_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn count() -> &'static str {
+        "SELECT COUNT(*) FROM playlists"
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
@@ -22,7 +105,7 @@ impl PlaylistRepo {
 
     pub fn create(&self, name: &str, description: Option<&str>) -> Result<i64, String> {
         self.db.execute(
-            "INSERT INTO playlists (name, description) VALUES (?, ?)",
+            &sql::create(&self.db.dialect()),
             &[&name as &dyn rusqlite::types::ToSql, &description],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -31,7 +114,7 @@ impl PlaylistRepo {
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.id = ?")
+            .prepare(&sql::get_by_id(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         stmt.query_row(params![id], |row| {
             Ok(Playlist {
@@ -48,7 +131,7 @@ impl PlaylistRepo {
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p ORDER BY p.name COLLATE NOCASE LIMIT ? OFFSET ?")
+            .prepare(&sql::list(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let items = stmt
             .query_map(params![limit, offset], |row| {
@@ -66,8 +149,7 @@ impl PlaylistRepo {
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM playlists WHERE id = ?", &[&id])?;
+        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
         Ok(())
     }
 
@@ -79,13 +161,13 @@ impl PlaylistRepo {
     ) -> Result<(), String> {
         if let Some(n) = name {
             self.db.execute(
-                "UPDATE playlists SET name = ? WHERE id = ?",
+                &sql::update_field(&self.db.dialect(), "name"),
                 &[&n as &dyn rusqlite::types::ToSql, &id],
             )?;
         }
         if let Some(d) = description {
             self.db.execute(
-                "UPDATE playlists SET description = ? WHERE id = ?",
+                &sql::update_field(&self.db.dialect(), "description"),
                 &[&d as &dyn rusqlite::types::ToSql, &id],
             )?;
         }
@@ -98,21 +180,18 @@ impl PlaylistRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<Vec<i64>, String> {
+        let d = self.db.dialect();
+        let max_pos_sql = sql::max_position(&d);
+        let insert_sql = sql::insert_playlist_track(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let max_pos: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(position), -1) FROM playlist_tracks WHERE playlist_id = ?",
-                params![playlist_id],
-                |row| row.get(0),
-            )
+            .query_row(&max_pos_sql, params![playlist_id], |row| row.get(0))
             .unwrap_or(-1);
         let start_pos = position.unwrap_or(max_pos + 1);
         let mut inserted = Vec::new();
         {
-            let mut stmt = tx
-                .prepare_cached("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)")
-                .map_err(|e| e.to_string())?;
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = start_pos + i as i64;
                 stmt.execute(params![playlist_id, tid, pos])
@@ -129,14 +208,12 @@ impl PlaylistRepo {
         playlist_id: i64,
         positions: &[i64],
     ) -> Result<usize, String> {
+        let delete_sql = sql::delete_track_at_position(&self.db.dialect());
         let conn = self.db.connection().lock().unwrap();
         let mut removed = 0usize;
         for pos in positions {
             let n = conn
-                .execute(
-                    "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND position = ?2",
-                    params![playlist_id, pos],
-                )
+                .execute(&delete_sql, params![playlist_id, pos])
                 .map_err(|e| e.to_string())?;
             removed += n;
         }
@@ -145,7 +222,7 @@ impl PlaylistRepo {
 
     pub fn remove_track(&self, playlist_id: i64, position: i64) -> Result<(), String> {
         self.db.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id = ? AND position = ?",
+            &sql::delete_track_at_position(&self.db.dialect()),
             &[&playlist_id, &position],
         )?;
         Ok(())
@@ -154,7 +231,7 @@ impl PlaylistRepo {
     pub fn get_track_ids(&self, playlist_id: i64) -> Result<Vec<i64>, String> {
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position")
+            .prepare(&sql::get_track_ids(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let ids = stmt
             .query_map(params![playlist_id], |row| row.get::<_, i64>(0))
@@ -165,17 +242,15 @@ impl PlaylistRepo {
     }
 
     pub fn reorder_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        let d = self.db.dialect();
+        let delete_sql = sql::delete_all_tracks(&d);
+        let insert_sql = sql::insert_playlist_track(&d);
         let mut conn = self.db.connection().lock().unwrap();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id = ?",
-            params![playlist_id],
-        )
-        .map_err(|e| e.to_string())?;
+        tx.execute(&delete_sql, params![playlist_id])
+            .map_err(|e| e.to_string())?;
         {
-            let mut stmt = tx
-                .prepare_cached("INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)")
-                .map_err(|e| e.to_string())?;
+            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
             for (i, tid) in track_ids.iter().enumerate() {
                 stmt.execute(params![playlist_id, tid, i as i64])
                     .map_err(|e| e.to_string())?;
@@ -187,7 +262,7 @@ impl PlaylistRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM playlists", [], |row| row.get(0))
+        conn.query_row(sql::count(), [], |row| row.get(0))
             .map_err(|e| e.to_string())
     }
 }
@@ -420,5 +495,16 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
         assert!(repo.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn sql_builders_dialect_placeholders() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s = SqliteDialect;
+        let p = PostgresDialect;
+        assert!(sql::create(&s).contains("VALUES (?, ?)"));
+        assert!(sql::create(&p).contains("VALUES ($1, $2)"));
+        assert!(!sql::list(&p).contains("COLLATE"));
+        assert!(sql::list(&p).contains("LOWER(p.name)"));
     }
 }

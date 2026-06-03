@@ -1,0 +1,66 @@
+name: Tests (PostgreSQL)
+
+# Dual-engine test workflow.
+#
+# The default `cargo test` covers SQLite. This workflow boots a real
+# PostgreSQL 16 server and runs the `tune-core` tests with the
+# `postgres` feature enabled. It currently only exercises the
+# PostgresDb smoke tests (ping + version); per-repo PG tests will be
+# added as repos are migrated in subsequent phases.
+
+on:
+  push:
+    branches: [main, "feature/postgres-support"]
+    paths:
+      - "tune-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/test-postgres.yml"
+  pull_request:
+    paths:
+      - "tune-core/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/test-postgres.yml"
+  workflow_dispatch:
+
+jobs:
+  test-postgres:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tune
+          POSTGRES_PASSWORD: tune
+          POSTGRES_DB: tune_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tune -d tune_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tune-core-postgres
+
+      # `--no-default-features` drops `local-audio` (which pulls
+      # alsa-sys via cpal). The CI runner doesn't have libasound2-dev
+      # and we don't need it to exercise the engine + postgres modules.
+      - name: Engine module tests (no DB needed)
+        run: cargo test -p tune-core --no-default-features --features postgres db::engine
+
+      - name: PostgresDb smoke tests
+        run: cargo test -p tune-core --no-default-features --features postgres db::postgres
