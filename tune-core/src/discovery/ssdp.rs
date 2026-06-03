@@ -412,7 +412,22 @@ async fn process_responses(
                     OutputType::Openhome
                 } else if desc.is_media_renderer() {
                     OutputType::Dlna
+                } else if desc.has_av_transport() {
+                    // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
+                    debug!(
+                        id = %dev_id,
+                        name = %desc.friendly_name,
+                        device_type = %desc.device_type,
+                        "ssdp_non_standard_renderer_accepted"
+                    );
+                    OutputType::Dlna
                 } else {
+                    debug!(
+                        id = %dev_id,
+                        name = %desc.friendly_name,
+                        device_type = %desc.device_type,
+                        "ssdp_device_skipped_no_renderer"
+                    );
                     continue;
                 };
 

@@ -38,6 +38,15 @@ impl DeviceDescription {
             .any(|s| s.service_type.contains("av-openhome-org"))
     }
 
+    /// Returns true if the device exposes an AVTransport service, regardless of deviceType.
+    /// This catches renderers (WiiM, foobar2000 foo_upnp, etc.) that use non-standard
+    /// device types but still support DLNA playback via AVTransport.
+    pub fn has_av_transport(&self) -> bool {
+        self.services
+            .iter()
+            .any(|s| s.service_type.contains("AVTransport"))
+    }
+
     pub fn service_urls(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for svc in &self.services {
@@ -253,5 +262,109 @@ mod tests {
         let urls = desc.service_urls();
         assert!(urls.contains_key("product"));
         assert!(urls.contains_key("playlist"));
+    }
+
+    /// WiiM devices may advertise as PlayGroupManager instead of MediaRenderer,
+    /// but they still expose AVTransport and should be discovered as DLNA renderers.
+    const WIIM_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-wiimu-com:device:PlayGroupManager:1</deviceType>
+    <friendlyName>WiiM Pro</friendlyName>
+    <manufacturer>Linkplay Technology Inc.</manufacturer>
+    <modelName>WiiM Pro</modelName>
+    <UDN>uuid:wiim-1234</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+        <controlURL>/upnp/control/AVTransport</controlURL>
+        <eventSubURL>/upnp/event/AVTransport</eventSubURL>
+        <SCPDURL>/AVTransport/scpd.xml</SCPDURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+        <controlURL>/upnp/control/RenderingControl</controlURL>
+        <eventSubURL>/upnp/event/RenderingControl</eventSubURL>
+        <SCPDURL>/RenderingControl/scpd.xml</SCPDURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    #[test]
+    fn parse_wiim_non_standard_device_type() {
+        let desc = parse_device_description(WIIM_XML).unwrap();
+        assert_eq!(desc.friendly_name, "WiiM Pro");
+        assert_eq!(desc.manufacturer, "Linkplay Technology Inc.");
+        // Not a standard MediaRenderer deviceType
+        assert!(!desc.is_media_renderer());
+        // But has AVTransport => should be accepted as DLNA renderer
+        assert!(desc.has_av_transport());
+        assert!(!desc.is_openhome());
+        let urls = desc.service_urls();
+        assert!(urls.contains_key("avtransport"));
+        assert!(urls.contains_key("renderingcontrol"));
+    }
+
+    /// foobar2000 with foo_upnp may advertise with a non-standard device type
+    /// but still support AVTransport for DLNA playback.
+    const FOOBAR_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:Basic:1</deviceType>
+    <friendlyName>foobar2000</friendlyName>
+    <manufacturer>Peter Pawlowski</manufacturer>
+    <modelName>foobar2000</modelName>
+    <UDN>uuid:foobar-5678</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+        <controlURL>/ctrl/AVTransport</controlURL>
+        <eventSubURL>/evt/AVTransport</eventSubURL>
+        <SCPDURL>/AVTransport/scpd.xml</SCPDURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    #[test]
+    fn parse_foobar_basic_device_with_avtransport() {
+        let desc = parse_device_description(FOOBAR_XML).unwrap();
+        assert_eq!(desc.friendly_name, "foobar2000");
+        assert!(!desc.is_media_renderer());
+        assert!(desc.has_av_transport());
+        let urls = desc.service_urls();
+        assert!(urls.contains_key("avtransport"));
+    }
+
+    /// A pure media server without AVTransport should NOT be accepted.
+    const PURE_SERVER_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>MinimServer</friendlyName>
+    <manufacturer>MinimServer</manufacturer>
+    <UDN>uuid:ms-1</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>
+        <controlURL>/ctrl/ContentDirectory</controlURL>
+        <eventSubURL>/evt/ContentDirectory</eventSubURL>
+        <SCPDURL>/ContentDirectory/scpd.xml</SCPDURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    #[test]
+    fn pure_media_server_has_no_avtransport() {
+        let desc = parse_device_description(PURE_SERVER_XML).unwrap();
+        assert!(!desc.is_media_renderer());
+        assert!(!desc.has_av_transport());
+        assert!(desc.is_media_server());
     }
 }
