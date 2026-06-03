@@ -156,6 +156,27 @@ pub trait SqlDialect {
     fn limit_offset(&self, limit: i64, offset: i64) -> String {
         format!(" LIMIT {limit} OFFSET {offset}")
     }
+
+    /// Current UTC timestamp formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).
+    /// Used by `history_repo` (and friends) for `WHERE listened_at >=
+    /// (now - N days)` aggregations.
+    ///
+    /// SQLite: `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`
+    /// Postgres: `to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`
+    fn now_iso8601(&self) -> &'static str;
+
+    /// SQL fragment computing `<column> >= now - N days`. Used for
+    /// rolling-window aggregations in `history_repo::full_dashboard`.
+    ///
+    /// SQLite: `<column> >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{days} days')`
+    /// Postgres: `<column> >= to_char(now() - interval '{days} days', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`
+    fn since_days(&self, column: &str, days: i64) -> String;
+
+    /// Date truncation to the day, returned as ISO date `YYYY-MM-DD`.
+    ///
+    /// SQLite: `DATE(<column>)`
+    /// Postgres: `to_char(<column>::timestamp, 'YYYY-MM-DD')`
+    fn date_trunc_day(&self, column: &str) -> String;
 }
 
 /// Zero-cost dialect for SQLite. Repos hold one of these.
@@ -190,6 +211,19 @@ impl SqlDialect for SqliteDialect {
 
     fn returning_id_clause(&self) -> &'static str {
         ""
+    }
+
+    fn now_iso8601(&self) -> &'static str {
+        "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
+    }
+
+    fn since_days(&self, column: &str, days: i64) -> String {
+        // SQLite's modifier syntax: 'now', '-N days' → relative to now.
+        format!("{column} >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{days} days')")
+    }
+
+    fn date_trunc_day(&self, column: &str) -> String {
+        format!("DATE({column})")
     }
 }
 
@@ -233,6 +267,24 @@ impl SqlDialect for PostgresDialect {
 
     fn returning_id_clause(&self) -> &'static str {
         " RETURNING id"
+    }
+
+    fn now_iso8601(&self) -> &'static str {
+        // The `T` and `Z` literals need to be quoted within to_char's
+        // format string.
+        "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+    }
+
+    fn since_days(&self, column: &str, days: i64) -> String {
+        format!(
+            "{column} >= to_char(now() - interval '{days} days', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+        )
+    }
+
+    fn date_trunc_day(&self, column: &str) -> String {
+        // `listened_at` is stored as TEXT on both engines (ISO-8601),
+        // so cast to timestamp before format.
+        format!("to_char({column}::timestamp, 'YYYY-MM-DD')")
     }
 }
 
@@ -365,5 +417,30 @@ mod tests {
     fn engine_display_matches_as_str() {
         assert_eq!(format!("{}", Engine::Sqlite), "sqlite");
         assert_eq!(format!("{}", Engine::Postgres), "postgres");
+    }
+
+    #[test]
+    fn date_helpers_dialect_specific() {
+        let s = SqliteDialect;
+        assert_eq!(s.now_iso8601(), "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')");
+        assert_eq!(
+            s.since_days("listened_at", 7),
+            "listened_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days')"
+        );
+        assert_eq!(s.date_trunc_day("listened_at"), "DATE(listened_at)");
+
+        let p = PostgresDialect;
+        assert_eq!(
+            p.now_iso8601(),
+            "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+        );
+        assert!(
+            p.since_days("listened_at", 30)
+                .contains("interval '30 days'")
+        );
+        assert!(
+            p.date_trunc_day("listened_at")
+                .starts_with("to_char(listened_at::timestamp")
+        );
     }
 }

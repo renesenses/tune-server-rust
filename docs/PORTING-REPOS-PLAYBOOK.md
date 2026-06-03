@@ -178,15 +178,17 @@ Suggested order — easiest first, build confidence, hardest last:
 3. ~~`rating_repo`~~ ✅ (145ceb3)
 4. ~~`tag_repo`~~ ✅ (ea1f1aa)
 5. ~~`profile_repo`~~ ✅ (ea1f1aa)
-6. ~~`radio_repo`~~ ✅ (this commit)
-7. `history_repo` — heavy aggregation, no transactions — port next
-8. **Transactions blocker**: `playlist_repo`, `zone_repo`, `artist_repo`,
-   `play_queue_repo`, `album_repo`, `track_repo` all use rusqlite
-   `conn.transaction()`. The `DbBackend` trait doesn't yet expose
-   transactions. **Land a `write_tx(closure)` extension first** — see
-   the "Transaction abstraction" section below.
-9. After tx extension: port the 6 transactional repos in the order
-   above, smallest first.
+6. ~~`radio_repo`~~ ✅ (2e915ad)
+7. ~~`playlist_repo`~~ ✅ (this commit — first tx user via `write_tx`)
+8. `zone_repo` — 6 tx sites, has WAL fallback to preserve
+9. `artist_repo` — 2 tx sites (FTS rebuild paths)
+10. `play_queue_repo` — 12 tx sites, parallel-agent territory
+11. `history_repo` — 952 LOC, `full_dashboard` is a 300-line method
+    building 10 sub-queries. Needs the date helpers (✅ landed) plus
+    careful systematic rewrite of the inline format strings into
+    dialect-driven builders. Plan as a dedicated session.
+12. `album_repo`, `track_repo` — the big ones (1307 / 1335 LOC),
+    plenty of FTS + joins + complex filters. Dedicated session each.
 
 Each step is independent. Stop after any step and the workspace still
 compiles + runs on SQLite. Postgres production rollout waits for the

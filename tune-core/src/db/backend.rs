@@ -63,6 +63,39 @@ pub trait DbBackend: Send + Sync {
         sql: &str,
         params: &[&dyn ToSqlValue],
     ) -> Result<Vec<Vec<SqlValue>>, String>;
+
+    /// Run a sequence of writes inside a transaction. The closure
+    /// receives a handle that has the same trait surface as
+    /// `DbBackend` for `execute` / `query_one` / `query_many` /
+    /// `last_insert_rowid`. The impl commits on `Ok` return and rolls
+    /// back on `Err` or panic.
+    ///
+    /// The repo that needs to atomically read-then-write (e.g.
+    /// `playlist_repo::add_tracks`) calls this instead of taking the
+    /// connection lock directly.
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String>;
+}
+
+/// Transaction handle. Mirror of `DbBackend`'s execution surface, but
+/// scoped to a single transaction. Live only inside the
+/// `DbBackend::write_tx` closure — the trait object goes out of scope
+/// as soon as the closure returns.
+pub trait DbTxHandle {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String>;
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String>;
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String>;
+    fn last_insert_rowid(&self) -> i64;
 }
 
 /// A trait-object-safe wrapper for SQL parameter values. Implemented
@@ -322,6 +355,112 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
         }
         Ok(out)
     }
+
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut conn = self.connection().lock().unwrap();
+        let tx = conn.transaction().map_err(|e| format!("begin tx: {e}"))?;
+        let result = {
+            let handle = SqliteTxHandle { tx: &tx };
+            f(&handle)
+        };
+        match result {
+            Ok(()) => tx.commit().map_err(|e| format!("commit: {e}")),
+            Err(e) => {
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
+    }
+}
+
+/// SQLite-backed transaction handle. Wraps a `rusqlite::Transaction`
+/// for the duration of the `write_tx` closure.
+pub struct SqliteTxHandle<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+}
+
+impl DbTxHandle for SqliteTxHandle<'_> {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        self.tx
+            .execute(sql, refs.as_slice())
+            .map_err(|e| format!("tx execute: {e}"))
+    }
+
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = self
+            .tx
+            .prepare(sql)
+            .map_err(|e| format!("tx prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("tx query: {e}"))?;
+        if let Some(row) = rows.next().map_err(|e| format!("tx row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("tx col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(cols))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = self
+            .tx
+            .prepare(sql)
+            .map_err(|e| format!("tx prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("tx query: {e}"))?;
+        let mut out: Vec<Vec<SqlValue>> = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("tx row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("tx col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push(cols);
+        }
+        Ok(out)
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        self.tx.last_insert_rowid()
+    }
 }
 
 // ─── Postgres bridging ────────────────────────────────────────────────
@@ -485,6 +624,19 @@ impl DbBackend for PostgresBackend {
             })
         })
     }
+
+    fn write_tx(
+        &self,
+        _f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // Bridging sqlx's owned async Transaction to a sync trait
+        // object on a closure that may itself want to call block_on is
+        // non-trivial and out of scope for phase 5. SQLite is the only
+        // engine used in production today; the 6 transactional repos
+        // ship with SQLite-only correctness, and PG support is added
+        // when a deploy actually needs it.
+        Err("write_tx: Postgres support not yet implemented (phase 6)".into())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -575,6 +727,83 @@ mod tests {
     fn bool_maps_to_bool_variant() {
         assert!(matches!(true.to_sql_value(), SqlValue::Bool(true)));
         assert!(matches!(false.to_sql_value(), SqlValue::Bool(false)));
+    }
+
+    #[test]
+    fn sqlite_write_tx_commits_on_ok() {
+        use std::sync::Arc;
+
+        use super::super::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score REAL);",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+
+        let name = String::from("inside-tx");
+        backend
+            .write_tx(&mut |tx| {
+                let n: &dyn ToSqlValue = &name;
+                tx.execute("INSERT INTO t (name) VALUES (?)", &[n])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn sqlite_write_tx_rolls_back_on_err() {
+        use std::sync::Arc;
+
+        use super::super::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);")
+            .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db.clone());
+
+        let name = String::from("would-rollback");
+        let _ = backend.write_tx(&mut |tx| {
+            let n: &dyn ToSqlValue = &name;
+            tx.execute("INSERT INTO t (name) VALUES (?)", &[n])?;
+            Err("intentional".into())
+        });
+
+        let conn = db.connection().lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "rollback should have undone the INSERT");
+    }
+
+    #[test]
+    fn sqlite_write_tx_last_insert_rowid() {
+        use std::sync::Arc;
+
+        use super::super::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);")
+            .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        let captured = std::cell::Cell::new(0i64);
+        backend
+            .write_tx(&mut |tx| {
+                let n: &dyn ToSqlValue = &"x".to_string();
+                tx.execute("INSERT INTO t (name) VALUES (?)", &[n])?;
+                captured.set(tx.last_insert_rowid());
+                Ok(())
+            })
+            .unwrap();
+        assert!(captured.get() > 0);
     }
 
     #[test]

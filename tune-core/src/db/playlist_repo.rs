@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for playlist_repo.
@@ -95,61 +97,57 @@ pub struct Playlist {
 }
 
 pub struct PlaylistRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl PlaylistRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
     pub fn create(&self, name: &str, description: Option<&str>) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create(&self.db.dialect()),
-            &[&name as &dyn rusqlite::types::ToSql, &description],
-        )?;
+        let sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 2] = [&name, &description];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Playlist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![id], |row| {
-            Ok(Playlist {
-                id: row.get(0).ok(),
-                name: row.get(1).unwrap_or_default(),
-                description: row.get(2).ok(),
-                track_count: row.get(3).unwrap_or(0),
-            })
-        })
-        .optional()
-        .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_playlist))
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::list(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit, offset], |row| {
-                Ok(Playlist {
-                    id: row.get(0).ok(),
-                    name: row.get(1).unwrap_or_default(),
-                    description: row.get(2).ok(),
-                    track_count: row.get(3).unwrap_or(0),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let sql = self.dialect_sql(sql::list, sql::list);
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_playlist).collect())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -160,16 +158,20 @@ impl PlaylistRepo {
         description: Option<&str>,
     ) -> Result<(), String> {
         if let Some(n) = name {
-            self.db.execute(
-                &sql::update_field(&self.db.dialect(), "name"),
-                &[&n as &dyn rusqlite::types::ToSql, &id],
-            )?;
+            let sql = self.dialect_sql(
+                |d| sql::update_field(d, "name"),
+                |d| sql::update_field(d, "name"),
+            );
+            let params: [&dyn ToSqlValue; 2] = [&n, &id];
+            self.db.execute(&sql, &params)?;
         }
         if let Some(d) = description {
-            self.db.execute(
-                &sql::update_field(&self.db.dialect(), "description"),
-                &[&d as &dyn rusqlite::types::ToSql, &id],
-            )?;
+            let sql = self.dialect_sql(
+                |dlc| sql::update_field(dlc, "description"),
+                |dlc| sql::update_field(dlc, "description"),
+            );
+            let params: [&dyn ToSqlValue; 2] = [&d, &id];
+            self.db.execute(&sql, &params)?;
         }
         Ok(())
     }
@@ -180,26 +182,26 @@ impl PlaylistRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<Vec<i64>, String> {
-        let d = self.db.dialect();
-        let max_pos_sql = sql::max_position(&d);
-        let insert_sql = sql::insert_playlist_track(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let max_pos: i64 = tx
-            .query_row(&max_pos_sql, params![playlist_id], |row| row.get(0))
-            .unwrap_or(-1);
-        let start_pos = position.unwrap_or(max_pos + 1);
-        let mut inserted = Vec::new();
-        {
-            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
+        let max_pos_sql = self.dialect_sql(sql::max_position, sql::max_position);
+        let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+        let mut inserted = Vec::with_capacity(track_ids.len());
+        let inserted_ref = &mut inserted;
+        self.db.write_tx(&mut |tx| {
+            let max_pos_params: [&dyn ToSqlValue; 1] = [&playlist_id];
+            let max_pos: i64 = tx
+                .query_one(&max_pos_sql, &max_pos_params)?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(-1);
+            let start_pos = position.unwrap_or(max_pos + 1);
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = start_pos + i as i64;
-                stmt.execute(params![playlist_id, tid, pos])
-                    .map_err(|e| e.to_string())?;
-                inserted.push(*tid);
+                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                tx.execute(&insert_sql, &p)?;
+                inserted_ref.push(*tid);
             }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
         Ok(inserted)
     }
 
@@ -208,62 +210,66 @@ impl PlaylistRepo {
         playlist_id: i64,
         positions: &[i64],
     ) -> Result<usize, String> {
-        let delete_sql = sql::delete_track_at_position(&self.db.dialect());
-        let conn = self.db.connection().lock().unwrap();
+        let delete_sql =
+            self.dialect_sql(sql::delete_track_at_position, sql::delete_track_at_position);
         let mut removed = 0usize;
-        for pos in positions {
-            let n = conn
-                .execute(&delete_sql, params![playlist_id, pos])
-                .map_err(|e| e.to_string())?;
-            removed += n;
-        }
+        let removed_ref = &mut removed;
+        self.db.write_tx(&mut |tx| {
+            for pos in positions {
+                let p: [&dyn ToSqlValue; 2] = [&playlist_id, pos];
+                *removed_ref += tx.execute(&delete_sql, &p)?;
+            }
+            Ok(())
+        })?;
         Ok(removed)
     }
 
     pub fn remove_track(&self, playlist_id: i64, position: i64) -> Result<(), String> {
-        self.db.execute(
-            &sql::delete_track_at_position(&self.db.dialect()),
-            &[&playlist_id, &position],
-        )?;
+        let sql = self.dialect_sql(sql::delete_track_at_position, sql::delete_track_at_position);
+        let params: [&dyn ToSqlValue; 2] = [&playlist_id, &position];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn get_track_ids(&self, playlist_id: i64) -> Result<Vec<i64>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_track_ids(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let ids = stmt
-            .query_map(params![playlist_id], |row| row.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(ids)
+        let sql = self.dialect_sql(sql::get_track_ids, sql::get_track_ids);
+        let params: [&dyn ToSqlValue; 1] = [&playlist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
     }
 
     pub fn reorder_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
-        let d = self.db.dialect();
-        let delete_sql = sql::delete_all_tracks(&d);
-        let insert_sql = sql::insert_playlist_track(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(&delete_sql, params![playlist_id])
-            .map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
+        let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
+        let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 1] = [&playlist_id];
+            tx.execute(&delete_sql, &p)?;
             for (i, tid) in track_ids.iter().enumerate() {
-                stmt.execute(params![playlist_id, tid, i as i64])
-                    .map_err(|e| e.to_string())?;
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                tx.execute(&insert_sql, &p)?;
             }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+}
+
+fn row_to_playlist(cols: &Vec<SqlValue>) -> Playlist {
+    Playlist {
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        description: cols.get(2).and_then(|v| v.as_string()),
+        track_count: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
     }
 }
 
@@ -345,7 +351,6 @@ mod tests {
 
         let all = repo.list(100, 0).unwrap();
         assert_eq!(all.len(), 3);
-        // Sorted by name NOCASE
         assert_eq!(all[0].name, "Alpha");
         assert_eq!(all[2].name, "Zebra");
     }
@@ -374,7 +379,7 @@ mod tests {
         let id = repo.create("Test", Some("Initial")).unwrap();
         repo.update(id, None, Some("Updated desc")).unwrap();
         let pl = repo.get(id).unwrap().unwrap();
-        assert_eq!(pl.name, "Test"); // Name unchanged
+        assert_eq!(pl.name, "Test");
         assert_eq!(pl.description.as_deref(), Some("Updated desc"));
     }
 
@@ -396,7 +401,6 @@ mod tests {
 
         let plid = repo.create("Test", None).unwrap();
         repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
-        // Insert tid3 at position 1
         repo.add_tracks(plid, &[tid3], Some(1)).unwrap();
 
         let pl = repo.get(plid).unwrap().unwrap();
@@ -455,7 +459,6 @@ mod tests {
     fn playlist_empty_name() {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
-        // Empty name should still work
         let id = repo.create("", None).unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "");
@@ -486,7 +489,6 @@ mod tests {
         repo.add_tracks(plid, &[tid], None).unwrap();
         repo.delete(plid).unwrap();
 
-        // Playlist tracks should also be deleted (CASCADE)
         assert!(repo.get(plid).unwrap().is_none());
     }
 
@@ -499,12 +501,20 @@ mod tests {
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::create(&s).contains("VALUES (?, ?)"));
         assert!(sql::create(&p).contains("VALUES ($1, $2)"));
         assert!(!sql::list(&p).contains("COLLATE"));
         assert!(sql::list(&p).contains("LOWER(p.name)"));
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = test_db();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = PlaylistRepo::with_backend(backend);
+        let id = repo.create("X", None).unwrap();
+        assert!(repo.get(id).unwrap().is_some());
     }
 }
