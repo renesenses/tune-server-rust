@@ -351,11 +351,15 @@ jobs:
         id: notes
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          git-cliff --tag "$VERSION" --latest --output FORUM_BODY.md
+          # Write git-cliff output to an intermediate file so the
+          # following assembly doesn't race with itself (cat reading
+          # a file that is also the redirection target crashes with
+          # "input file is output file").
+          git-cliff --tag "$VERSION" --latest --output CHANGELOG_SECTION.md
           {
             echo "Version $VERSION disponible — résumé :"
             echo
-            cat FORUM_BODY.md
+            cat CHANGELOG_SECTION.md
             echo
             echo "Téléchargements : https://github.com/${GITHUB_REPOSITORY}/releases/tag/$VERSION"
             echo "Image Docker : \`renesenses/tune:$VERSION\` (multi-arch amd64/arm64)"
