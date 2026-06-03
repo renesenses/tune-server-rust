@@ -121,3 +121,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p tune-core -p tune-server --all-targets --no-default-features --features oaat -- -D clippy::correctness
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/audit@v1
