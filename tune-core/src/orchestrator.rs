@@ -448,15 +448,9 @@ impl PlaybackOrchestrator {
             };
             let (session_id, tx) = self.streamer.create_session(wav_info, false, 256).await;
             let ffmpeg_path = find_ffmpeg().ok_or("FFmpeg not found")?;
-            let bd = stream_data.quality.bit_depth.max(16);
-            let codec = match bd {
-                24 => "pcm_s24le",
-                32 => "pcm_s32le",
-                _ => "pcm_s16le",
-            };
-            // Use WAV muxer instead of raw PCM — more widely supported by
-            // minimal FFmpeg builds (e.g., --enable-muxer='flac,wav' only).
-            let ffmpeg_fmt = "wav";
+            // Use WAV muxer without explicit codec — the WAV muxer picks the
+            // right PCM encoder automatically, avoiding "Unknown encoder
+            // 'pcm_s24le'" on minimal FFmpeg builds.
             let upstream = stream_data.url.clone();
             let sr = stream_data.quality.sample_rate;
             tokio::spawn(async move {
@@ -469,9 +463,7 @@ impl PlaybackOrchestrator {
                         &upstream,
                         "-vn",
                         "-f",
-                        ffmpeg_fmt,
-                        "-acodec",
-                        codec,
+                        "wav",
                         "-ar",
                         &sr.to_string(),
                         "-ac",
