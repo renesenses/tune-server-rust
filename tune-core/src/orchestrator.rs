@@ -207,7 +207,7 @@ impl PlaybackOrchestrator {
             || oaat_needs_wav;
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
-            let src_fmt = source_format.unwrap(); // safe: needs_transcode is true
+            let src_fmt = source_format.expect("guarded by needs_transcode check"); // safe: needs_transcode is true
             let target_fmt = if oaat_needs_wav {
                 AudioFormat::Wav
             } else {
@@ -538,7 +538,7 @@ impl PlaybackOrchestrator {
 
         let (title, artist, duration_ms, cover_path) = if req.title.is_some() {
             (
-                req.title.clone().unwrap(),
+                req.title.clone().unwrap_or_default(),
                 req.artist_name.clone(),
                 req.duration_ms,
                 None,
@@ -801,7 +801,9 @@ impl PlaybackOrchestrator {
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                output.lock().await.pause().await.ok();
+                if let Err(e) = output.lock().await.pause().await {
+                    warn!(zone_id, error = %e, "device_pause_failed");
+                }
             }
         }
     }
@@ -811,7 +813,9 @@ impl PlaybackOrchestrator {
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                output.lock().await.resume().await.ok();
+                if let Err(e) = output.lock().await.resume().await {
+                    warn!(zone_id, error = %e, "device_resume_failed");
+                }
             }
         }
     }
@@ -829,7 +833,9 @@ impl PlaybackOrchestrator {
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                output.lock().await.stop().await.ok();
+                if let Err(e) = output.lock().await.stop().await {
+                    warn!(zone_id, error = %e, "device_stop_failed");
+                }
             }
         }
     }
@@ -838,20 +844,22 @@ impl PlaybackOrchestrator {
         self.playback.seek(zone_id, position_ms as i64).await;
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
-            ZoneRepo::new(self.db.clone())
-                .save_playback_position(
-                    zone_id,
-                    position_ms as i64,
-                    np.track_id,
-                    Some(np.source.as_str()),
-                    np.source_id.as_deref(),
-                )
-                .ok();
+            if let Err(e) = ZoneRepo::new(self.db.clone()).save_playback_position(
+                zone_id,
+                position_ms as i64,
+                np.track_id,
+                Some(np.source.as_str()),
+                np.source_id.as_deref(),
+            ) {
+                warn!(zone_id, error = %e, "persist_seek_position_failed");
+            }
         }
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                output.lock().await.seek(position_ms).await.ok();
+                if let Err(e) = output.lock().await.seek(position_ms).await {
+                    warn!(zone_id, error = %e, "device_seek_failed");
+                }
             }
         }
     }
@@ -861,7 +869,9 @@ impl PlaybackOrchestrator {
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                output.lock().await.set_volume(volume).await.ok();
+                if let Err(e) = output.lock().await.set_volume(volume).await {
+                    warn!(zone_id, error = %e, "device_set_volume_failed");
+                }
             }
         }
     }
