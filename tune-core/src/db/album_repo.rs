@@ -200,6 +200,23 @@ pub mod sql {
     pub fn list_without_cover() -> &'static str {
         "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.cover_path IS NULL OR a.cover_path = '') AND a.source = 'local' ORDER BY a.id"
     }
+
+    /// Engine-agnostic search across albums + their artist name.
+    /// The FTS predicate is built by `dialect.fts_where` (SQLite uses
+    /// the FTS5 subquery; PG hits the tsvector column directly).
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR CAST(a.year AS TEXT) = {} OR LOWER(a.label) LIKE LOWER({}) LIMIT {}",
+            select_album(),
+            d.fts_where("albums", "a", &d.placeholder(1)),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+        )
+    }
 }
 
 pub struct AlbumRepo {
@@ -677,13 +694,14 @@ impl AlbumRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
-        let fts_query = format!("{query}*");
+        let fts_query = match self.db.engine() {
+            crate::db::engine::Engine::Sqlite => format!("{query}*"),
+            crate::db::engine::Engine::Postgres => format!("{query}:*"),
+        };
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
-        // The FTS5 MATCH subquery is SQLite-only; phase 4 swaps it for a
-        // tsvector @@ to_tsquery clause via the dialect helper.
         let mut stmt = conn
-            .prepare(&format!("{} WHERE a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?) OR LOWER(a.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(a.genre) LIKE LOWER(?) OR CAST(a.year AS TEXT) = ? OR LOWER(a.label) LIKE LOWER(?) LIMIT ?", sql::select_album()))
+            .prepare(&sql::search(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let albums = stmt
             .query_map(
@@ -1261,6 +1279,15 @@ mod tests {
         assert!(sql::create_minimal(&p).contains("VALUES ($1, $2, $3)"));
         // No more COLLATE in the canonical builders.
         assert!(!sql::list_by_artist(&p).contains("COLLATE"));
+    }
+
+    #[test]
+    fn search_uses_engine_specific_fts_clause() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s_sql = sql::search(&SqliteDialect);
+        assert!(s_sql.contains("a.id IN (SELECT rowid FROM albums_fts WHERE albums_fts MATCH ?)"));
+        let p_sql = sql::search(&PostgresDialect);
+        assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
     }
 
     #[test]

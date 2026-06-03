@@ -63,10 +63,29 @@ pub trait SqlDialect {
     /// SQLite: `?`. Postgres: `$1`, `$2`, ...
     fn placeholder(&self, idx: usize) -> String;
 
-    /// Full-text MATCH clause builder.
+    /// Full-text MATCH clause builder (low-level column fragment).
     /// SQLite (FTS5): `<column> MATCH <placeholder>`
     /// Postgres (tsvector): `<column> @@ to_tsquery('simple', <placeholder>)`
     fn fts_match(&self, column: &str, placeholder: &str) -> String;
+
+    /// Full-text search WHERE clause for a base table.
+    ///
+    /// Different engines need fundamentally different shapes here:
+    /// SQLite goes through the FTS5 virtual table so the predicate is
+    /// `id IN (SELECT rowid FROM <table>_fts WHERE …)`; Postgres has
+    /// the tsvector on the base table itself, so the predicate is a
+    /// direct `<alias>.search_tsv @@ …`.
+    ///
+    /// `table_alias` is the alias used in the outer query (`a` for
+    /// albums, `t` for tracks, etc.) so the SQLite branch can emit
+    /// `<alias>.id IN (...)`.
+    ///
+    /// `query_placeholder` is the bound parameter for the search
+    /// query string (e.g. `$1` or `?`). The caller is responsible for
+    /// formatting the user's input so it's valid for both backends:
+    /// FTS5 wants `term*`, tsquery wants `term:*`. The repos pass
+    /// engine-specific strings in.
+    fn fts_where(&self, table: &str, table_alias: &str, query_placeholder: &str) -> String;
 
     /// JSON path extraction (returns text).
     /// SQLite: `json_extract(<column>, '<path>')`
@@ -109,6 +128,12 @@ impl SqlDialect for SqliteDialect {
         format!("{column} MATCH {placeholder}")
     }
 
+    fn fts_where(&self, table: &str, table_alias: &str, query_placeholder: &str) -> String {
+        format!(
+            "{table_alias}.id IN (SELECT rowid FROM {table}_fts WHERE {table}_fts MATCH {query_placeholder})"
+        )
+    }
+
     fn json_extract_text(&self, column: &str, path: &str) -> String {
         // Caller is responsible for passing a path that is already
         // single-quote-safe (we don't allow user input here in practice;
@@ -138,7 +163,17 @@ impl SqlDialect for PostgresDialect {
         // We use the 'simple' dictionary by default; per-language
         // configuration (french, english, ...) is a follow-up decided in
         // the FTS migration phase.
-        format!("{column} @@ to_tsquery('simple', {placeholder})")
+        format!("{column} @@ to_tsquery('simple', unaccent({placeholder}))")
+    }
+
+    fn fts_where(&self, _table: &str, table_alias: &str, query_placeholder: &str) -> String {
+        // PG has the tsvector on the base table itself (see
+        // tune-core/migrations/postgres/002_fts_tsvector.sql), so the
+        // predicate is a direct @@ on <alias>.search_tsv. Wrapping the
+        // placeholder in unaccent() makes the search accent-insensitive,
+        // matching the behaviour of FTS5's `tokenize='unicode61
+        // remove_diacritics 2'`.
+        format!("{table_alias}.search_tsv @@ to_tsquery('simple', unaccent({query_placeholder}))")
     }
 
     fn json_extract_text(&self, column: &str, path: &str) -> String {
@@ -202,9 +237,23 @@ mod tests {
         assert_eq!(d.placeholder(7), "$7");
         assert_eq!(
             d.fts_match("search_tsv", d.placeholder(1).as_str()),
-            "search_tsv @@ to_tsquery('simple', $1)"
+            "search_tsv @@ to_tsquery('simple', unaccent($1))"
         );
         assert_eq!(d.returning_id_clause(), " RETURNING id");
+    }
+
+    #[test]
+    fn fts_where_uses_engine_specific_shape() {
+        let s = SqliteDialect;
+        assert_eq!(
+            s.fts_where("artists", "a", &s.placeholder(1)),
+            "a.id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?)"
+        );
+        let p = PostgresDialect;
+        assert_eq!(
+            p.fts_where("artists", "a", &p.placeholder(1)),
+            "a.search_tsv @@ to_tsquery('simple', unaccent($1))"
+        );
     }
 
     #[test]

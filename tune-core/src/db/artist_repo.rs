@@ -94,12 +94,14 @@ pub mod sql {
         "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
     }
 
-    /// SQLite FTS5 query against the artists_fts virtual table.
-    /// PG variant will be added in phase 4 (against a tsvector column).
-    pub fn search_sqlite<D: SqlDialect>(d: &D) -> String {
+    /// Engine-agnostic full-text search. The FTS predicate is built
+    /// via `dialect.fts_where` so the same Rust call site emits the
+    /// SQLite FTS5 subquery on SQLite and the tsvector `@@` predicate
+    /// on Postgres (see tune-core/migrations/postgres/002_fts_tsvector.sql).
+    pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM artists WHERE id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH {}) OR LOWER(name) LIKE LOWER({}) LIMIT {}",
-            d.placeholder(1),
+            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(a.name) LIKE LOWER({}) LIMIT {}",
+            d.fts_where("artists", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3)
         )
@@ -274,11 +276,16 @@ impl ArtistRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
-        let fts_query = format!("{query}*");
+        // FTS5 uses bare `term*` for prefix; tsquery uses `term:*`.
+        // The repo formats per engine so callers don't have to.
+        let fts_query = match self.db.engine() {
+            crate::db::engine::Engine::Sqlite => format!("{query}*"),
+            crate::db::engine::Engine::Postgres => format!("{query}:*"),
+        };
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
-            .prepare(&sql::search_sqlite(&self.db.dialect()))
+            .prepare(&sql::search(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let artists = stmt
             .query_map(params![fts_query, like, limit], |row| {
@@ -527,6 +534,22 @@ mod tests {
         assert!(sql::get_by_name(&p).contains("LOWER(name) = LOWER($1)"));
         assert!(!sql::list(&p).contains("COLLATE"));
         assert!(sql::list(&p).contains("LOWER(COALESCE(sort_name, name))"));
+    }
+
+    #[test]
+    fn search_uses_engine_specific_fts_clause() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        // SQLite branch keeps the FTS5 subquery against artists_fts.
+        let s_sql = sql::search(&SqliteDialect);
+        assert!(
+            s_sql.contains("a.id IN (SELECT rowid FROM artists_fts WHERE artists_fts MATCH ?)")
+        );
+        // PG branch hits the tsvector column directly.
+        let p_sql = sql::search(&PostgresDialect);
+        assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
+        // Both share the LIKE fallback for fuzzy name matches.
+        assert!(s_sql.contains("LOWER(a.name) LIKE LOWER(?)"));
+        assert!(p_sql.contains("LOWER(a.name) LIKE LOWER($2)"));
     }
 
     #[test]

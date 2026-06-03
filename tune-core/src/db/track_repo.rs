@@ -136,6 +136,21 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+
+    /// Engine-agnostic search across tracks + their artist/album/year.
+    /// FTS predicate built via `dialect.fts_where`.
+    pub fn search<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE {} OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(t.genre) LIKE LOWER({}) OR LOWER(t.composer) LIKE LOWER({}) OR CAST(al.year AS TEXT) = {} LIMIT {}",
+            select_track(),
+            d.fts_where("tracks", "t", &d.placeholder(1)),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+        )
+    }
 }
 
 pub struct TrackRepo {
@@ -639,15 +654,14 @@ impl TrackRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
-        let fts_query = format!("{query}*");
+        let fts_query = match self.db.engine() {
+            crate::db::engine::Engine::Sqlite => format!("{query}*"),
+            crate::db::engine::Engine::Postgres => format!("{query}:*"),
+        };
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
-        // FTS5 MATCH retained; phase 4 will swap for tsvector @@ to_tsquery on PG.
         let mut stmt = conn
-            .prepare(&format!(
-                "{} WHERE t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(t.genre) LIKE LOWER(?) OR LOWER(t.composer) LIKE LOWER(?) OR CAST(al.year AS TEXT) = ? LIMIT ?",
-                sql::select_track()
-            ))
+            .prepare(&sql::search(&self.db.dialect()))
             .map_err(|e| e.to_string())?;
         let tracks = stmt
             .query_map(
@@ -1311,5 +1325,14 @@ mod tests {
         assert!(pg_insert.contains("$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26"));
         // No COLLATE in the canonical list ordering builder.
         assert!(!sql::list_by_album(&p).contains("COLLATE"));
+    }
+
+    #[test]
+    fn search_uses_engine_specific_fts_clause() {
+        use crate::db::engine::{PostgresDialect, SqliteDialect};
+        let s_sql = sql::search(&SqliteDialect);
+        assert!(s_sql.contains("t.id IN (SELECT rowid FROM tracks_fts WHERE tracks_fts MATCH ?)"));
+        let p_sql = sql::search(&PostgresDialect);
+        assert!(p_sql.contains("t.search_tsv @@ to_tsquery('simple', unaccent($1))"));
     }
 }
