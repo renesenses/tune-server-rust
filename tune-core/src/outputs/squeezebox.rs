@@ -99,6 +99,8 @@ impl OutputTarget for SqueezeboxOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         info!(player = %self.device_id, url = media.url, "squeezebox_play");
+        // Wake the player from standby before sending audio
+        self.lms_request(vec![json!("power"), json!(1)]).await.ok();
         self.lms_request(vec![json!("playlist"), json!("play"), json!(media.url)])
             .await?;
         Ok(())
@@ -110,6 +112,7 @@ impl OutputTarget for SqueezeboxOutput {
     }
 
     async fn resume(&self) -> Result<(), String> {
+        self.lms_request(vec![json!("power"), json!(1)]).await.ok();
         self.lms_request(vec![json!("pause"), json!(0)]).await?;
         Ok(())
     }

@@ -230,19 +230,18 @@ impl AutoFixEngine {
 
 fn find_incomplete_tracks(repo: &TrackRepo) -> Vec<i64> {
     let db = repo.backend();
-    let conn = db.connection().lock().unwrap();
-    conn.prepare(
+    db.query_many(
         "SELECT id FROM tracks WHERE \
          (genre IS NULL OR genre = '') OR \
          (year IS NULL OR year = 0) OR \
          isrc IS NULL \
          ORDER BY id LIMIT 5000",
+        &[],
     )
-    .and_then(|mut stmt| {
-        stmt.query_map([], |row| row.get::<_, i64>(0))
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-    })
     .unwrap_or_default()
+    .into_iter()
+    .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+    .collect()
 }
 
 #[cfg(test)]

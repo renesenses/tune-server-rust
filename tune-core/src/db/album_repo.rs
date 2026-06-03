@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension, params};
-
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Album;
@@ -225,28 +223,15 @@ pub mod sql {
 
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
-    /// SQLite-specific handle for methods that haven't yet been ported
-    /// (`get_or_create*` use the write-lock + closure pattern, and
-    /// `list_by_genre` uses SQLite's `json_each` table-valued function).
-    /// Populated by `new(SqliteDb)`; `None` for `with_backend`, in which
-    /// case those methods return an explicit "not implemented" error.
-    /// Removed once the deferred methods are ported.
-    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl AlbumRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self {
-            sqlite_legacy: Some(db.clone()),
-            db: Arc::new(db),
-        }
+        Self { db: Arc::new(db) }
     }
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
-        Self {
-            db,
-            sqlite_legacy: None,
-        }
+        Self { db }
     }
 
     fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
@@ -258,12 +243,6 @@ impl AlbumRepo {
             Engine::Sqlite => sqlite(&SqliteDialect),
             Engine::Postgres => postgres(&PostgresDialect),
         }
-    }
-
-    fn legacy(&self) -> Result<&SqliteDb, String> {
-        self.sqlite_legacy
-            .as_ref()
-            .ok_or_else(|| "method not yet ported for non-SQLite backends".into())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Album>, String> {
@@ -342,43 +321,36 @@ impl AlbumRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Look up or create an album. **SQLite-only** until the read-then-
-    /// write-with-conn closure is migrated to `write_tx`. Returns an
-    /// error when constructed via `with_backend`.
+    /// Look up an album by (title, artist, year), or create it.
+    /// Sequential `query_one` + `execute` + `last_insert_rowid` (not
+    /// `write_tx`) because the scanner holds `BEGIN IMMEDIATE` while
+    /// calling this, and `write_tx` would try to start a nested
+    /// `BEGIN DEFERRED` — same constraint as `zone_repo::create` (cf.
+    /// commit `9f502c0`). On SQLite the write mutex serializes the
+    /// three calls, so a concurrent `get_or_create` on another thread
+    /// can't shift the rowid we read.
     pub fn get_or_create(
         &self,
         title: &str,
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Album, String> {
-        let db = self.legacy()?;
-        let d = SqliteDialect;
-        let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
-        let by_title_artist_sql = sql::get_by_title_artist(&d);
-        let create_sql = sql::create_minimal(&d);
-        db.write(|conn| {
-            if let Some(album) = lookup_album(
-                conn,
-                title,
-                artist_id,
-                year,
-                &by_title_artist_year_sql,
-                &by_title_artist_sql,
-            )? {
-                return Ok(album);
-            }
-            conn.execute(&create_sql, rusqlite::params![title, artist_id, year])?;
-            let id = conn.last_insert_rowid();
-            let mut album = Album::new(title.to_string());
-            album.id = Some(id);
-            album.artist_id = Some(artist_id);
-            album.year = year;
-            Ok(album)
-        })
+        if let Some(found) = self.get_by_title_and_artist(title, artist_id, year)? {
+            return Ok(found);
+        }
+        let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
+        let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &year];
+        self.db.execute(&create_sql, &params)?;
+        let id = self.db.last_insert_rowid();
+        let mut album = Album::new(title.to_string());
+        album.id = Some(id);
+        album.artist_id = Some(artist_id);
+        album.year = year;
+        Ok(album)
     }
 
     /// Like `get_or_create` but also checks MusicBrainz release ID
-    /// first. **SQLite-only** for the same reason.
+    /// first.
     pub fn get_or_create_with_mbid(
         &self,
         title: &str,
@@ -386,41 +358,24 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, String> {
-        let db = self.legacy()?;
-        let d = SqliteDialect;
-        let by_mbid_sql = sql::get_by_musicbrainz_release_id(&d);
-        let by_title_artist_year_sql = sql::get_by_title_artist_year(&d);
-        let by_title_artist_sql = sql::get_by_title_artist(&d);
-        let create_sql = sql::create_with_mbid(&d);
-        db.write(|conn| {
-            if let Some(release_id) = mbid {
-                let mut stmt = conn.prepare_cached(&by_mbid_sql)?;
-                if let Some(album) = stmt
-                    .query_row(params![release_id], |row| Ok(row_to_album_rusqlite(row)))
-                    .optional()?
-                {
-                    return Ok(album);
-                }
+        if let Some(release_id) = mbid {
+            if let Some(found) = self.get_by_musicbrainz_release_id(release_id)? {
+                return Ok(found);
             }
-            if let Some(album) = lookup_album(
-                conn,
-                title,
-                artist_id,
-                year,
-                &by_title_artist_year_sql,
-                &by_title_artist_sql,
-            )? {
-                return Ok(album);
-            }
-            conn.execute(&create_sql, rusqlite::params![title, artist_id, year, mbid])?;
-            let id = conn.last_insert_rowid();
-            let mut album = Album::new(title.to_string());
-            album.id = Some(id);
-            album.artist_id = Some(artist_id);
-            album.year = year;
-            album.musicbrainz_release_id = mbid.map(String::from);
-            Ok(album)
-        })
+        }
+        if let Some(found) = self.get_by_title_and_artist(title, artist_id, year)? {
+            return Ok(found);
+        }
+        let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
+        let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &year, &mbid];
+        self.db.execute(&create_sql, &params)?;
+        let id = self.db.last_insert_rowid();
+        let mut album = Album::new(title.to_string());
+        album.id = Some(id);
+        album.artist_id = Some(artist_id);
+        album.year = year;
+        album.musicbrainz_release_id = mbid.map(String::from);
+        Ok(album)
     }
 
     pub fn update(&self, album: &Album) -> Result<(), String> {
@@ -725,33 +680,6 @@ impl AlbumRepo {
     }
 }
 
-/// Shared lookup logic used by `get_or_create` and `get_or_create_with_mbid`.
-fn lookup_album(
-    conn: &rusqlite::Connection,
-    title: &str,
-    artist_id: i64,
-    year: Option<i32>,
-    by_title_artist_year_sql: &str,
-    by_title_artist_sql: &str,
-) -> Result<Option<Album>, rusqlite::Error> {
-    if let Some(y) = year {
-        let mut stmt = conn.prepare_cached(by_title_artist_year_sql)?;
-        if let Some(album) = stmt
-            .query_row(params![title, artist_id, y], |row| {
-                Ok(row_to_album_rusqlite(row))
-            })
-            .optional()?
-        {
-            return Ok(Some(album));
-        }
-    }
-    let mut stmt = conn.prepare_cached(by_title_artist_sql)?;
-    stmt.query_row(params![title, artist_id], |row| {
-        Ok(row_to_album_rusqlite(row))
-    })
-    .optional()
-}
-
 fn row_to_album(cols: &Vec<SqlValue>) -> Album {
     Album {
         id: cols.first().and_then(|v| v.as_i64()),
@@ -782,35 +710,6 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         musicbrainz_release_group_id: cols.get(20).and_then(|v| v.as_string()),
         release_date: cols.get(21).and_then(|v| v.as_string()),
         original_date: cols.get(22).and_then(|v| v.as_string()),
-    }
-}
-
-fn row_to_album_rusqlite(row: &rusqlite::Row) -> Album {
-    Album {
-        id: row.get(0).ok(),
-        title: row.get(1).unwrap_or_default(),
-        artist_id: row.get(2).ok(),
-        artist_name: row.get(3).ok(),
-        year: row.get(4).ok(),
-        original_year: row.get(5).ok(),
-        genre: row.get(6).ok(),
-        genres: row.get::<_, Option<String>>(23).ok().flatten(),
-        disc_count: row.get(7).ok(),
-        track_count: row.get(8).ok(),
-        cover_path: row.get(9).ok(),
-        source: row.get(10).unwrap_or_else(|_| "local".into()),
-        source_id: row.get(11).ok(),
-        label: row.get(12).ok(),
-        catalog_number: row.get(13).ok(),
-        barcode: row.get(14).ok(),
-        format: row.get(15).ok(),
-        sample_rate: row.get(16).ok(),
-        bit_depth: row.get(17).ok(),
-        bio: row.get(18).ok(),
-        musicbrainz_release_id: row.get(19).ok(),
-        musicbrainz_release_group_id: row.get(20).ok(),
-        release_date: row.get(21).ok(),
-        original_date: row.get(22).ok(),
     }
 }
 
@@ -1350,14 +1249,22 @@ mod tests {
     }
 
     #[test]
-    fn with_backend_constructor_partial() {
+    fn with_backend_constructor_full() {
+        // All methods now go through DbBackend — no more sqlite_legacy.
         let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let aid = artist_repo.create(&Artist::new("X".into())).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = AlbumRepo::with_backend(backend);
-        let id = repo.create(&Album::new("X".into())).unwrap();
+        let id = repo.create(&Album::new("Album X".into())).unwrap();
         assert!(repo.get(id).unwrap().is_some());
-        // Legacy-only methods must explicitly refuse on backend-only.
-        assert!(repo.get_or_create("X", 0, None).is_err());
-        assert!(repo.list_by_genre("Jazz").is_err());
+        // Previously-legacy methods now work via DbBackend.
+        let a = repo.get_or_create("Created", aid, Some(2024)).unwrap();
+        assert!(a.id.is_some());
+        // Idempotent — second call returns the same row.
+        let a2 = repo.get_or_create("Created", aid, Some(2024)).unwrap();
+        assert_eq!(a.id, a2.id);
+        // list_by_genre returns an empty list rather than erroring.
+        assert!(repo.list_by_genre("Jazz").unwrap().is_empty());
     }
 }

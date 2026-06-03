@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/players/{id}/play", post(play_player))
         .route("/players/{id}/pause", post(pause_player))
         .route("/players/{id}/volume", post(set_player_volume))
+        .route("/players/{id}/power", post(power_player))
 }
 
 fn lms_host(state: &AppState) -> String {
@@ -131,6 +132,16 @@ async fn pause_player(State(state): State<AppState>, Path(id): Path<String>) -> 
 #[derive(Deserialize)]
 struct VolumeBody {
     volume: u8,
+}
+
+#[derive(Deserialize)]
+struct PowerBody {
+    #[serde(default = "default_power_on")]
+    state: u8,
+}
+
+fn default_power_on() -> u8 {
+    1
 }
 
 async fn set_player_volume(
