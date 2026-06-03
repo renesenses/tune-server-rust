@@ -1,0 +1,19 @@
+# Cargo build configuration.
+#
+# Windows: link the C runtime statically so the produced .exe does not
+# require the user to install the "Microsoft Visual C++ Redistributable"
+# separately. Without this flag, vcruntime140.dll / msvcp140.dll are
+# loaded dynamically at startup, and Windows users whose system lacks
+# the runtime see "tune-server.exe a cessé de fonctionner" with no
+# message — exactly the symptom on forum bugs #23 (Bilou v0.8.10) and
+# #26 (bluevelvet v0.8.x). Confirmed prereq diagnosis by tester
+# dimitrios in #9 ("ok resolu : faut installer visuel c++").
+#
+# Static linking adds ~1 MB to the .exe but removes the prerequisite
+# entirely. This is the recommended distribution shape for end-user
+# Windows binaries built with the MSVC toolchain.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
