@@ -173,7 +173,23 @@ sur le week-end 2-3 juin). Dates ajustables selon flux de bugs forum.
 | Tag | Date | Notes |
 |---|---|---|
 | v0.8.27 | 2026-06-03 | Bump avant lancement de la nouvelle release autonomy |
-| **v0.8.28** | **2026-06-03** | **Validation end-to-end du release pipeline** (preflight + bump CLI + auto-changelog + Homebrew tap + forum announce + Docker Hub). Premier tag avec l'infra autonomy complète. Aucune feature visible utilisateur. |
+| v0.8.28 | 2026-06-03 | Validation end-to-end du release pipeline (preflight + bump CLI + auto-changelog + Homebrew tap + forum announce + Docker Hub). Premier tag avec l'infra autonomy complète. Aucune feature visible utilisateur. 1 bug CI fixé en live (git-cliff Debian buster EOL). |
+| v0.8.29 | 2026-06-03 | **Fix P0 zone creation** (#2, #6 — WAL read lag sur `ZoneRepo::list()`). Forum auto-post validé (#441). 1 bug CI fixé en live (forum shell aliasing `cat F > F`). |
+| **v0.8.30** | **2026-06-03** | **Premier vrai release autonome avec contenu utilisateur** : 5 P0 fixés en une release (#2 #6 zone WAL + #9 #23 #26 Windows CRT static), FTS multi-mots, OAAT gapless + FLAC revert (autre agent), 3 fixes CI. Forum #443 + Homebrew + Docker auto-publiés. Release autonomy 5/5 validée en prod. |
+
+## P0 status à fin v0.8.30
+
+| Issue | Statut | Notes |
+|---|---|---|
+| #2 Dimitri macOS zone creation | **Fixé en code** | Attente confirmation testeur sur v0.8.30 |
+| #6 Dominique Windows zone creation | **Fixé en code** | Attente confirmation testeur sur v0.8.30 |
+| #9 dimitrios install (VC++) | **Fixé en code** (CRT static) | Sera plus jamais nécessaire d'installer VC++ Redistributable |
+| #16 Babacar Docker startup | **Réponse postée** | Hypothèse stale Python image, instruction `docker pull` envoyée |
+| #18 Bilou Windows freeze after scan | **Ouvert** | Investigation en cours, hypothèse WS storm pendant scan |
+| #23 Bilou Windows crash | **Fixé en code** (CRT static) | Attente confirmation testeur sur v0.8.30 |
+| #26 bluevelvet Windows crash | **Fixé en code** (CRT static) | Attente confirmation testeur sur v0.8.30 |
+
+**Score code-side** : 5/7 P0 fermés en code à fin v0.8.30 (#2, #6, #9, #23, #26). Reste #16 (en attente retour testeur, hypothèse user-error stale image) et #18 (investigation Windows freeze in progress).
 
 ---
 

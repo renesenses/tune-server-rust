@@ -69,8 +69,16 @@ impl Default for HealthMonitorConfig {
         Self {
             enabled: true,
             interval_secs: 60,
-            memory_warning_mb: 500,
-            memory_critical_mb: 1024,
+            // Sized for a music server, not a microservice. RSS naturally
+            // grows with library scale (covers cache, metadata parsing,
+            // rayon worker memory during scan). 1 GB hit "critical" for
+            // Bilou's 50K-track scan on Windows (#18) even though the
+            // server was healthy — just running normally on a library
+            // of its size. Bump to 2 GB warning / 4 GB critical to
+            // match reality of audiophile libraries (testers running
+            // 50K-200K tracks routinely).
+            memory_warning_mb: 2048,
+            memory_critical_mb: 4096,
             disk_warning_gb: 5,
             disk_critical_gb: 1,
             db_path: "tune_server.db".into(),
