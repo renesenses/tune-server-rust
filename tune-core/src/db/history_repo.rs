@@ -1,15 +1,17 @@
+use std::sync::Arc;
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for history_repo.
 ///
-/// `full_dashboard` keeps its dynamic SQL (heavy use of `strftime` and
-/// `DATE()` SQLite-specific functions). Phase 4 will introduce dialect
-/// helpers for date arithmetic (PG: `now() - interval '... days'`, day
-/// truncation: `DATE_TRUNC('day', ts)`) and rewrite this method then.
+/// Simple builders are dialect-aware. `full_dashboard` is still
+/// SQLite-only (300 LOC of inline format!() that need a dedicated
+/// rewrite, see docs/PORTING-HISTORY-REPO-PLAN.md).
 pub mod sql {
     use super::SqlDialect;
 
@@ -80,6 +82,18 @@ pub mod sql {
     pub fn dashboard_unique_artists() -> &'static str {
         "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE artist_name IS NOT NULL"
     }
+
+    /// Daily aggregation. Uses the date helpers so both engines emit
+    /// the right SQL (SQLite strftime / PG to_char + interval).
+    pub fn listening_history<D: SqlDialect>(d: &D, days: i64) -> String {
+        let day_col = d.date_trunc_day("listened_at");
+        let since = d.since_days("listened_at", days);
+        format!(
+            "SELECT {day_col} as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms \
+             FROM listen_history WHERE {since} \
+             GROUP BY day ORDER BY day"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,41 +110,63 @@ pub struct ListenRecord {
 }
 
 pub struct HistoryRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
+    /// SQLite-specific handle for the `full_dashboard` method whose
+    /// 300-LOC dynamic SQL hasn't been ported yet (see
+    /// docs/PORTING-HISTORY-REPO-PLAN.md Group C). Populated when the
+    /// repo is constructed via `new(SqliteDb)`; `None` when constructed
+    /// via `with_backend(Arc<dyn DbBackend>)`, in which case
+    /// `full_dashboard` returns an explicit "not implemented" error.
+    /// Removed once `full_dashboard` is ported in a dedicated commit.
+    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl HistoryRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self { db }
+        Self {
+            sqlite_legacy: Some(db.clone()),
+            db: Arc::new(db),
+        }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
+        Self {
+            db,
+            sqlite_legacy: None,
+        }
+    }
+
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
     }
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
-        self.db.execute(
-            &sql::record(&self.db.dialect()),
-            &[
-                &rec.track_id as &dyn rusqlite::types::ToSql,
-                &rec.title,
-                &rec.artist_name,
-                &rec.album_title,
-                &rec.source,
-                &rec.duration_ms,
-                &rec.zone_id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::record, sql::record);
+        let params: [&dyn ToSqlValue; 7] = [
+            &rec.track_id,
+            &rec.title,
+            &rec.artist_name,
+            &rec.album_title,
+            &rec.source,
+            &rec.duration_ms,
+            &rec.zone_id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
     pub fn recent(&self, limit: i64) -> Result<Vec<ListenRecord>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::recent(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit], |row| Ok(row_to_listen(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let sql = self.dialect_sql(sql::recent, sql::recent);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_listen).collect())
     }
 
     pub fn recent_paginated(
@@ -138,121 +174,113 @@ impl HistoryRepo {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ListenRecord>, i64), String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let total: i64 = conn
-            .query_row(sql::count_all(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        let mut stmt = conn
-            .prepare(&sql::recent_paginated(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit, offset], |row| Ok(row_to_listen(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok((items, total))
+        let total = match self.db.query_one(sql::count_all(), &[])? {
+            None => 0,
+            Some(cols) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+        };
+        let sql = self.dialect_sql(sql::recent_paginated, sql::recent_paginated);
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok((rows.iter().map(row_to_listen).collect(), total))
     }
 
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::top_tracks(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, Option<String>>(1).ok().flatten(),
-                    row.get::<_, i64>(2).unwrap_or(0),
-                ))
+        let sql = self.dialect_sql(sql::top_tracks, sql::top_tracks);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_string()),
+                    cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::top_artists(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                ))
+        let sql = self.dialect_sql(sql::top_artists, sql::top_artists);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn top_albums(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::top_albums(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![limit], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, Option<String>>(1).ok().flatten(),
-                    row.get::<_, i64>(2).unwrap_or(0),
-                ))
+        let sql = self.dialect_sql(sql::top_albums, sql::top_albums);
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_string()),
+                    cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn listening_history(&self, days: i64) -> Result<Vec<(String, i64, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT DATE(listened_at) as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms FROM listen_history WHERE listened_at >= strftime('%Y-%m-%dT00:00:00Z', 'now', '-' || ? || ' days') GROUP BY day ORDER BY day")
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![days], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                    row.get::<_, i64>(2).unwrap_or(0),
-                ))
+        let sql = self.dialect_sql(
+            |d| sql::listening_history(d, days),
+            |d| sql::listening_history(d, days),
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count_all(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count_all(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 
     pub fn dashboard(&self) -> Result<DashboardStats, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-
-        let total_listens: i64 = conn
-            .query_row(sql::count_all(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-
-        let total_duration_ms: i64 = conn
-            .query_row(sql::dashboard_total_duration(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-
-        let unique_tracks: i64 = conn
-            .query_row(sql::dashboard_unique_tracks(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-
-        let unique_artists: i64 = conn
-            .query_row(sql::dashboard_unique_artists(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-
+        let total_listens = self
+            .db
+            .query_one(sql::count_all(), &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        let total_duration_ms = self
+            .db
+            .query_one(sql::dashboard_total_duration(), &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        let unique_tracks = self
+            .db
+            .query_one(sql::dashboard_unique_tracks(), &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        let unique_artists = self
+            .db
+            .query_one(sql::dashboard_unique_artists(), &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
         Ok(DashboardStats {
             total_listens,
             total_duration_ms,
@@ -261,12 +289,10 @@ impl HistoryRepo {
         })
     }
 
-    /// Rich dashboard matching the web client DashboardData type.
-    ///
-    /// `period`: "7d", "30d", "all" (default "30d").
-    /// `zone_id`: optional filter.
-    /// `profile_id`: reserved for future use (ignored).
-    /// `top_n`: how many items in top_* lists (default 10).
+    /// Rich dashboard. **Not yet ported to `Arc<dyn DbBackend>`** —
+    /// uses the SQLite legacy handle (300 LOC of dynamic SQL with 10
+    /// sub-queries to abstract). Returns an error when constructed via
+    /// `with_backend`. Plan: docs/PORTING-HISTORY-REPO-PLAN.md Group C.
     pub fn full_dashboard(
         &self,
         period: &str,
@@ -274,9 +300,13 @@ impl HistoryRepo {
         _profile_id: Option<i64>,
         top_n: i64,
     ) -> Result<DashboardData, String> {
-        let conn = self.db.read_connection().lock().unwrap();
+        let db = self.sqlite_legacy.as_ref().ok_or_else(|| {
+            "full_dashboard: not yet implemented for non-SQLite backends \
+             (docs/PORTING-HISTORY-REPO-PLAN.md Group C)"
+                .to_string()
+        })?;
+        let conn = db.read_connection().lock().unwrap();
 
-        // Build WHERE clause from period + zone_id
         let mut conditions: Vec<String> = Vec::new();
         let days: Option<i64> = match period {
             "7d" => Some(7),
@@ -285,7 +315,6 @@ impl HistoryRepo {
             "all" => None,
             other => other.trim_end_matches('d').parse::<i64>().ok(),
         };
-
         if let Some(d) = days {
             conditions.push(format!(
                 "listened_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{d} days')"
@@ -294,14 +323,12 @@ impl HistoryRepo {
         if let Some(zid) = zone_id {
             conditions.push(format!("h.zone_id = {zid}"));
         }
-
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        // Same conditions but with plain column names (no h. prefix) for simple queries
         let mut simple_conditions: Vec<String> = Vec::new();
         if let Some(d) = days {
             simple_conditions.push(format!(
@@ -317,7 +344,6 @@ impl HistoryRepo {
             format!("WHERE {}", simple_conditions.join(" AND "))
         };
 
-        // ── Range ──
         let from: Option<String> = if days.is_some() {
             conn.query_row(
                 &format!("SELECT MIN(listened_at) FROM listen_history {simple_where}"),
@@ -339,7 +365,6 @@ impl HistoryRepo {
             })
             .map_err(|e| e.to_string())?;
 
-        // ── Totals ──
         let (plays, listening_ms, u_tracks, u_artists): (i64, i64, i64, i64) = conn
             .query_row(
                 &format!(
@@ -354,7 +379,6 @@ impl HistoryRepo {
             )
             .map_err(|e| e.to_string())?;
 
-        // ── Top artists ──
         let top_artists = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -381,7 +405,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── Top albums (join albums table for cover_path) ──
         let top_albums = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -411,7 +434,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── Top tracks ──
         let top_tracks = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -435,7 +457,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── Trend (daily) ──
         let trend = {
             let trend_days = days.unwrap_or(365);
             let mut stmt = conn
@@ -464,7 +485,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── Hourly distribution ──
         let hourly = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -485,7 +505,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── By zone (LEFT JOIN zones for name) ──
         let by_zone = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -509,7 +528,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── By source ──
         let by_source = {
             let mut stmt = conn
                 .prepare(&format!(
@@ -531,9 +549,6 @@ impl HistoryRepo {
             .map_err(|e| e.to_string())?
         };
 
-        // ── Completion stats ──
-        // Heuristic: a track is "completed" if duration_ms > 0 (we recorded it).
-        // "Skipped" = track with duration_ms < 30000 (less than 30s).
         let completion = conn
             .query_row(
                 &format!(
@@ -604,8 +619,6 @@ pub struct DashboardStats {
     pub unique_tracks: i64,
     pub unique_artists: i64,
 }
-
-// ── Rich dashboard types matching web client DashboardData ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardRange {
@@ -696,17 +709,20 @@ pub struct DashboardData {
     pub completion: CompletionStats,
 }
 
-fn row_to_listen(row: &rusqlite::Row) -> ListenRecord {
+fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
     ListenRecord {
-        id: row.get(0).ok(),
-        track_id: row.get(1).ok().flatten(),
-        title: row.get(2).unwrap_or_default(),
-        artist_name: row.get(3).ok().flatten(),
-        album_title: row.get(4).ok().flatten(),
-        source: row.get(5).unwrap_or_else(|_| "local".into()),
-        duration_ms: row.get(6).unwrap_or(0),
-        listened_at: row.get(7).ok().flatten(),
-        zone_id: row.get(8).ok().flatten(),
+        id: cols.first().and_then(|v| v.as_i64()),
+        track_id: cols.get(1).and_then(|v| v.as_i64()),
+        title: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        artist_name: cols.get(3).and_then(|v| v.as_string()),
+        album_title: cols.get(4).and_then(|v| v.as_string()),
+        source: cols
+            .get(5)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "local".into()),
+        duration_ms: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+        listened_at: cols.get(7).and_then(|v| v.as_string()),
+        zone_id: cols.get(8).and_then(|v| v.as_i64()),
     }
 }
 
@@ -715,13 +731,16 @@ mod tests {
     use super::*;
     use crate::db::migrations;
 
-    #[test]
-    fn record_and_query_history() {
+    fn fresh_repo() -> HistoryRepo {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
+        HistoryRepo::new(db)
+    }
 
-        let repo = HistoryRepo::new(db);
+    #[test]
+    fn record_and_query_history() {
+        let repo = fresh_repo();
         let rec = ListenRecord {
             id: None,
             track_id: None,
@@ -751,12 +770,7 @@ mod tests {
 
     #[test]
     fn history_top_artists() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        migrations::run_migrations(&db).unwrap();
-
-        let repo = HistoryRepo::new(db);
-
+        let repo = fresh_repo();
         for _ in 0..5 {
             repo.record(&ListenRecord {
                 id: None,
@@ -796,12 +810,7 @@ mod tests {
 
     #[test]
     fn history_top_albums() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        migrations::run_migrations(&db).unwrap();
-
-        let repo = HistoryRepo::new(db);
-
+        let repo = fresh_repo();
         for _ in 0..3 {
             repo.record(&ListenRecord {
                 id: None,
@@ -825,11 +834,7 @@ mod tests {
 
     #[test]
     fn history_count() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        migrations::run_migrations(&db).unwrap();
-
-        let repo = HistoryRepo::new(db);
+        let repo = fresh_repo();
         assert_eq!(repo.count().unwrap(), 0);
 
         repo.record(&ListenRecord {
@@ -849,11 +854,7 @@ mod tests {
 
     #[test]
     fn history_dashboard_total_duration() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        migrations::run_migrations(&db).unwrap();
-
-        let repo = HistoryRepo::new(db);
+        let repo = fresh_repo();
         repo.record(&ListenRecord {
             id: None,
             track_id: None,
@@ -887,11 +888,7 @@ mod tests {
 
     #[test]
     fn history_recent_order() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        migrations::run_migrations(&db).unwrap();
-
-        let repo = HistoryRepo::new(db);
+        let repo = fresh_repo();
         for title in ["First", "Second", "Third"] {
             repo.record(&ListenRecord {
                 id: None,
@@ -909,18 +906,18 @@ mod tests {
 
         let recent = repo.recent(10).unwrap();
         assert_eq!(recent.len(), 3);
-        // Most recent first
         assert_eq!(recent[0].title, "Third");
     }
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?)"));
         assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7)"));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
+        assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
+        assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
     }
 
     #[test]
@@ -928,7 +925,6 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
-        // Create a zone for the foreign key
         db.execute("INSERT INTO zones (name) VALUES ('Main')", &[])
             .unwrap();
 
@@ -948,5 +944,28 @@ mod tests {
 
         let recent = repo.recent(1).unwrap();
         assert_eq!(recent[0].zone_id, Some(1));
+    }
+
+    #[test]
+    fn with_backend_constructor_rejects_full_dashboard() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = HistoryRepo::with_backend(backend);
+        repo.record(&ListenRecord {
+            id: None,
+            track_id: None,
+            title: "via-backend".into(),
+            artist_name: None,
+            album_title: None,
+            source: "local".into(),
+            duration_ms: 0,
+            listened_at: None,
+            zone_id: None,
+        })
+        .unwrap();
+        assert_eq!(repo.count().unwrap(), 1);
+        assert!(repo.full_dashboard("7d", None, None, 10).is_err());
     }
 }

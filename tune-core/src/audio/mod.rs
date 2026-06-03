@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod decode;
 pub mod encoder;
 pub mod formats;
 pub mod iso_sacd;
