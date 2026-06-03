@@ -24,7 +24,7 @@ pub fn can_decode_native(file_path: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "aiff" | "aif"
+        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg"
     )
 }
 
@@ -143,4 +143,129 @@ pub fn decode_to_pcm(
         channels: out_channels,
         duration_s,
     })
+}
+
+#[cfg(test)]
+mod decode_integration_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path(name: &str) -> String {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures");
+        p.push(name);
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn can_decode_native_formats() {
+        assert!(can_decode_native("song.flac"));
+        assert!(can_decode_native("song.mp3"));
+        assert!(can_decode_native("song.wav"));
+        assert!(can_decode_native("song.m4a"));
+        assert!(can_decode_native("song.ogg"));
+        assert!(!can_decode_native("song.aiff"));
+        assert!(!can_decode_native("song.dsf"));
+        assert!(!can_decode_native("song.dff"));
+        assert!(!can_decode_native("song.ape"));
+        assert!(!can_decode_native("song.wv"));
+    }
+
+    #[test]
+    fn decode_wav() {
+        let path = fixture_path("test.wav");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "WAV should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+        assert!(
+            result.duration_s > 0.9 && result.duration_s < 1.1,
+            "duration should be ~1s, got {}",
+            result.duration_s
+        );
+    }
+
+    #[test]
+    fn decode_flac() {
+        let path = fixture_path("test.flac");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "FLAC should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+        assert!(result.duration_s > 0.9, "duration should be ~1s");
+    }
+
+    #[test]
+    fn decode_mp3() {
+        let path = fixture_path("test.mp3");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "MP3 should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
+    }
+
+    #[test]
+    fn decode_ogg() {
+        let path = fixture_path("test.ogg");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "OGG should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+    }
+
+    #[test]
+    fn decode_m4a() {
+        let path = fixture_path("test.m4a");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "M4A should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+    }
+
+    #[test]
+    fn decode_aiff_falls_back() {
+        let path = fixture_path("test.aiff");
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0);
+        // AIFF not fully supported by symphonia — expected to fail (ffmpeg fallback needed)
+        assert!(
+            result.is_err(),
+            "AIFF should fail in symphonia (needs ffmpeg fallback)"
+        );
+    }
+
+    #[test]
+    fn decode_with_duration_limit() {
+        let path = fixture_path("test.wav");
+        let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        let half = decode_to_pcm(&path, None, None, 0.0, 0.5).unwrap();
+        assert!(
+            half.samples.len() < full.samples.len(),
+            "limited decode should have fewer samples"
+        );
+        assert!(
+            half.samples.len() > 0,
+            "limited decode should still have samples"
+        );
+    }
+
+    #[test]
+    fn decode_with_seek() {
+        let path = fixture_path("test.wav");
+        let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        let seeked = decode_to_pcm(&path, None, None, 0.5, 0.0).unwrap();
+        assert!(
+            seeked.samples.len() < full.samples.len(),
+            "seeked decode should have fewer samples"
+        );
+    }
+
+    #[test]
+    fn decode_nonexistent_file() {
+        let result = decode_to_pcm("/nonexistent/file.flac", None, None, 0.0, 0.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dsf_not_native() {
+        assert!(!can_decode_native("test.dsf"));
+        assert!(!can_decode_native("test.dff"));
+    }
 }
