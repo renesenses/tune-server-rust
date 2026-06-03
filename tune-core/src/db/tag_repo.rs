@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for tag_repo.
@@ -99,141 +101,124 @@ pub struct Tag {
 }
 
 pub struct TagRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl TagRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
     pub fn list(&self) -> Result<Vec<Tag>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(sql::list_all()).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map([], |row| {
-                Ok(Tag {
-                    id: row.get(0).ok(),
-                    name: row.get(1).unwrap_or_default(),
-                    color: row.get(2).unwrap_or_else(|_| "#808080".into()),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let rows = self.db.query_many(sql::list_all(), &[])?;
+        Ok(rows.iter().map(row_to_tag).collect())
     }
 
     pub fn create(&self, name: &str, color: Option<&str>) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create_tag(&self.db.dialect()),
-            &[
-                &name as &dyn rusqlite::types::ToSql,
-                &color.unwrap_or("#808080"),
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::create_tag, sql::create_tag);
+        let color_val = color.unwrap_or("#808080");
+        let params: [&dyn ToSqlValue; 2] = [&name, &color_val];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Tag>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(&sql::get_by_id(&self.db.dialect()), params![id], |row| {
-            Ok(Tag {
-                id: row.get(0).ok(),
-                name: row.get(1).unwrap_or_default(),
-                color: row.get(2).unwrap_or_else(|_| "#808080".into()),
-            })
-        })
-        .optional()
-        .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_tag))
     }
 
     pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
         if let Some(name) = name {
-            self.db.execute(
-                &sql::update_name(&self.db.dialect()),
-                &[&name as &dyn rusqlite::types::ToSql, &id],
-            )?;
+            let sql = self.dialect_sql(sql::update_name, sql::update_name);
+            let params: [&dyn ToSqlValue; 2] = [&name, &id];
+            self.db.execute(&sql, &params)?;
         }
         if let Some(color) = color {
-            self.db.execute(
-                &sql::update_color(&self.db.dialect()),
-                &[&color as &dyn rusqlite::types::ToSql, &id],
-            )?;
+            let sql = self.dialect_sql(sql::update_color, sql::update_color);
+            let params: [&dyn ToSqlValue; 2] = [&color, &id];
+            self.db.execute(&sql, &params)?;
         }
         Ok(())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute(&sql::delete_by_id(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn all_items_by_tag(&self, tag_id: i64) -> Result<Vec<(String, i64)>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::all_items_by_tag(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![tag_id], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                ))
+        let sql = self.dialect_sql(sql::all_items_by_tag, sql::all_items_by_tag);
+        let params: [&dyn ToSqlValue; 1] = [&tag_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+            .collect())
     }
 
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
-        self.db.execute(
-            &sql::tag_item(&self.db.dialect()),
-            &[&tag_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
-        )?;
+        let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
+        let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn untag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
-        self.db.execute(
-            &sql::untag_item(&self.db.dialect()),
-            &[&tag_id as &dyn rusqlite::types::ToSql, &item_type, &item_id],
-        )?;
+        let sql = self.dialect_sql(sql::untag_item, sql::untag_item);
+        let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn items_by_tag(&self, tag_id: i64, item_type: &str) -> Result<Vec<i64>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::items_by_tag(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let ids = stmt
-            .query_map(params![tag_id, item_type], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(ids)
+        let sql = self.dialect_sql(sql::items_by_tag, sql::items_by_tag);
+        let params: [&dyn ToSqlValue; 2] = [&tag_id, &item_type];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
     }
 
     pub fn tags_for_item(&self, item_type: &str, item_id: i64) -> Result<Vec<Tag>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::tags_for_item(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![item_type, item_id], |row| {
-                Ok(Tag {
-                    id: row.get(0).ok(),
-                    name: row.get(1).unwrap_or_default(),
-                    color: row.get(2).unwrap_or_else(|_| "#808080".into()),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let sql = self.dialect_sql(sql::tags_for_item, sql::tags_for_item);
+        let params: [&dyn ToSqlValue; 2] = [&item_type, &item_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_tag).collect())
+    }
+}
+
+fn row_to_tag(cols: &Vec<SqlValue>) -> Tag {
+    Tag {
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        color: cols
+            .get(2)
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "#808080".into()),
     }
 }
 
@@ -325,7 +310,6 @@ mod tests {
 
         let all_items = repo.all_items_by_tag(tag_id).unwrap();
         assert_eq!(all_items.len(), 4);
-        // Should be sorted by item_type, item_id
         assert_eq!(all_items[0].0, "album");
         assert_eq!(all_items[0].1, 1);
     }
@@ -340,7 +324,7 @@ mod tests {
         let tag_id = repo.create("Test", None).unwrap();
 
         repo.tag_item(tag_id, "album", 1).unwrap();
-        repo.tag_item(tag_id, "album", 1).unwrap(); // Should not error
+        repo.tag_item(tag_id, "album", 1).unwrap();
 
         let items = repo.items_by_tag(tag_id, "album").unwrap();
         assert_eq!(items.len(), 1);
@@ -375,13 +359,11 @@ mod tests {
         repo.tag_item(tag_id, "album", 2).unwrap();
 
         repo.delete(tag_id).unwrap();
-        // After deleting the tag, item_tags should be cascade-deleted
         assert!(repo.get(tag_id).unwrap().is_none());
     }
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::create_tag(&s).contains("VALUES (?, ?)"));
@@ -404,5 +386,16 @@ mod tests {
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0].name, "Alpha");
         assert_eq!(tags[2].name, "Zebra");
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = TagRepo::with_backend(backend);
+        let id = repo.create("X", None).unwrap();
+        assert!(repo.get(id).unwrap().is_some());
     }
 }

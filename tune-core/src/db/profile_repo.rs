@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for profile_repo.
@@ -110,39 +112,48 @@ pub struct Favorite {
 }
 
 pub struct ProfileRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl ProfileRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<Profile>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(&sql::get_by_id(&self.db.dialect()), params![id], |row| {
-            Ok(row_to_profile(row))
-        })
-        .optional()
-        .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_profile))
     }
 
     pub fn list(&self) -> Result<Vec<Profile>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(sql::list_all()).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map([], |row| Ok(row_to_profile(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let rows = self.db.query_many(sql::list_all(), &[])?;
+        Ok(rows.iter().map(row_to_profile).collect())
     }
 
     pub fn create(&self, username: &str, display_name: Option<&str>) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create(&self.db.dialect()),
-            &[&username as &dyn rusqlite::types::ToSql, &display_name],
-        )?;
+        let sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 2] = [&username, &display_name];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
@@ -152,14 +163,9 @@ impl ProfileRepo {
         display_name: Option<&str>,
         avatar_path: Option<&str>,
     ) -> Result<(), String> {
-        self.db.execute(
-            &sql::update(&self.db.dialect()),
-            &[
-                &display_name as &dyn rusqlite::types::ToSql,
-                &avatar_path,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::update, sql::update);
+        let params: [&dyn ToSqlValue; 3] = [&display_name, &avatar_path, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -167,7 +173,9 @@ impl ProfileRepo {
         if id == 1 {
             return Err("cannot delete default profile".into());
         }
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -177,14 +185,9 @@ impl ProfileRepo {
         item_type: &str,
         item_id: i64,
     ) -> Result<(), String> {
-        self.db.execute(
-            &sql::add_favorite(&self.db.dialect()),
-            &[
-                &profile_id as &dyn rusqlite::types::ToSql,
-                &item_type,
-                &item_id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::add_favorite, sql::add_favorite);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -194,14 +197,9 @@ impl ProfileRepo {
         item_type: &str,
         item_id: i64,
     ) -> Result<(), String> {
-        self.db.execute(
-            &sql::remove_favorite(&self.db.dialect()),
-            &[
-                &profile_id as &dyn rusqlite::types::ToSql,
-                &item_type,
-                &item_id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::remove_favorite, sql::remove_favorite);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
@@ -211,15 +209,12 @@ impl ProfileRepo {
         item_type: &str,
         item_id: i64,
     ) -> Result<bool, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let count: i32 = conn
-            .query_row(
-                &sql::count_favorite(&self.db.dialect()),
-                params![profile_id, item_type, item_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(count > 0)
+        let sql = self.dialect_sql(sql::count_favorite, sql::count_favorite);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        match self.db.query_one(&sql, &params)? {
+            None => Ok(false),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0) > 0),
+        }
     }
 
     pub fn list_favorites(
@@ -227,45 +222,37 @@ impl ProfileRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<Favorite>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let d = self.db.dialect();
-        let (query, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(t) = item_type {
-                (
-                    sql::list_favorites_by_type(&d),
-                    vec![Box::new(profile_id), Box::new(t.to_string())],
-                )
-            } else {
-                (sql::list_favorites_all(&d), vec![Box::new(profile_id)])
-            };
-        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|b| b.as_ref()).collect();
-        let items = stmt
-            .query_map(params.as_slice(), |row| {
-                Ok(Favorite {
-                    id: row.get(0).ok(),
-                    profile_id: row.get(1).unwrap_or(1),
-                    item_type: row.get(2).unwrap_or_default(),
-                    item_id: row.get(3).unwrap_or(0),
-                    created_at: row.get(4).ok().flatten(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let rows = if let Some(t) = item_type {
+            let sql = self.dialect_sql(sql::list_favorites_by_type, sql::list_favorites_by_type);
+            let params: [&dyn ToSqlValue; 2] = [&profile_id, &t];
+            self.db.query_many(&sql, &params)?
+        } else {
+            let sql = self.dialect_sql(sql::list_favorites_all, sql::list_favorites_all);
+            let params: [&dyn ToSqlValue; 1] = [&profile_id];
+            self.db.query_many(&sql, &params)?
+        };
+        Ok(rows.iter().map(row_to_favorite).collect())
     }
 }
 
-fn row_to_profile(row: &rusqlite::Row) -> Profile {
+fn row_to_profile(cols: &Vec<SqlValue>) -> Profile {
     Profile {
-        id: row.get(0).ok(),
-        name: row.get(1).unwrap_or_default(),
-        display_name: row.get(2).ok().flatten(),
-        avatar_path: row.get(3).ok().flatten(),
-        is_admin: row.get::<_, i32>(4).unwrap_or(0) != 0,
-        created_at: row.get(5).ok().flatten(),
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        display_name: cols.get(2).and_then(|v| v.as_string()),
+        avatar_path: cols.get(3).and_then(|v| v.as_string()),
+        is_admin: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        created_at: cols.get(5).and_then(|v| v.as_string()),
+    }
+}
+
+fn row_to_favorite(cols: &Vec<SqlValue>) -> Favorite {
+    Favorite {
+        id: cols.first().and_then(|v| v.as_i64()),
+        profile_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(1),
+        item_type: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        item_id: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+        created_at: cols.get(4).and_then(|v| v.as_string()),
     }
 }
 
@@ -363,7 +350,6 @@ mod tests {
 
         let repo = ProfileRepo::new(db);
         repo.add_favorite(1, "track", 42).unwrap();
-        // Inserting same favorite again should be idempotent (INSERT OR IGNORE)
         repo.add_favorite(1, "track", 42).unwrap();
 
         let favs = repo.list_favorites(1, Some("track")).unwrap();
@@ -409,20 +395,17 @@ mod tests {
         repo.create("bob", None).unwrap();
 
         let all = repo.list().unwrap();
-        assert_eq!(all.len(), 3); // default + alice + bob
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
     fn sql_builders_emit_dialect_specific_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
 
-        // Single-placeholder query.
         assert!(sql::get_by_id(&s).ends_with("WHERE id = ?"));
         assert!(sql::get_by_id(&p).ends_with("WHERE id = $1"));
 
-        // Three-placeholder query: numbered $1/$2/$3 on Postgres.
         let pg_add = sql::add_favorite(&p);
         assert!(pg_add.contains("VALUES ($1, $2, $3)"));
         assert!(pg_add.ends_with("ON CONFLICT (profile_id, item_type, item_id) DO NOTHING"));
@@ -430,5 +413,16 @@ mod tests {
         let sqlite_add = sql::add_favorite(&s);
         assert!(sqlite_add.contains("VALUES (?, ?, ?)"));
         assert!(sqlite_add.ends_with("ON CONFLICT (profile_id, item_type, item_id) DO NOTHING"));
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ProfileRepo::with_backend(backend);
+        let id = repo.create("xx", None).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "xx");
     }
 }
