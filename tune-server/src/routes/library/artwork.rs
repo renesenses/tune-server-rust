@@ -246,7 +246,7 @@ pub(super) async fn rescan_album_artwork(
         }
     }
     if let Some(ref hash) = found_hash {
-        album_repo.update_cover_path(id, hash).ok();
+        album_repo.force_update_cover_path(id, hash).ok();
     }
     Json(json!({
         "album_id": id,
@@ -283,7 +283,7 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
                         std::path::Path::new(file_path),
                         &cache_dir,
                     ) {
-                        album_repo.update_cover_path(*album_id, &hash).ok();
+                        album_repo.force_update_cover_path(*album_id, &hash).ok();
                         updated += 1;
                         break;
                     }

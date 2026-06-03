@@ -141,6 +141,14 @@ pub mod sql {
         )
     }
 
+    pub fn force_update_cover_path<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET cover_path = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     pub fn update_track_count<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET track_count = (SELECT COUNT(*) FROM tracks WHERE album_id = {}) WHERE id = {}",
@@ -444,6 +452,15 @@ impl AlbumRepo {
 
     pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
         let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
+        let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Like `update_cover_path` but always overwrites the existing value.
+    /// Used by rescan endpoints where the user explicitly wants to refresh artwork.
+    pub fn force_update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::force_update_cover_path, sql::force_update_cover_path);
         let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -896,9 +913,27 @@ mod tests {
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
 
+        // COALESCE: does NOT overwrite existing cover_path
         repo.update_cover_path(id, "new_hash").unwrap();
         let fetched2 = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched2.cover_path.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn force_update_cover_path() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        let id = repo.create(&Album::new("Test Album".into())).unwrap();
+        repo.update_cover_path(id, "abc123").unwrap();
+
+        let fetched = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched.cover_path.as_deref(), Some("abc123"));
+
+        // force: DOES overwrite existing cover_path (used by rescan endpoints)
+        repo.force_update_cover_path(id, "new_hash").unwrap();
+        let fetched2 = repo.get(id).unwrap().unwrap();
+        assert_eq!(fetched2.cover_path.as_deref(), Some("new_hash"));
     }
 
     #[test]
