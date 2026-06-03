@@ -856,6 +856,32 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Persist the play_queue table for a zone with the given local track IDs.
+    /// Called after queue mutations to keep the DB in sync with in-memory state.
+    pub fn persist_local_queue(&self, zone_id: i64, track_ids: &[i64], current_position: i64) {
+        let repo = PlayQueueRepo::new(self.db.clone());
+        if let Err(e) = repo.set_queue(zone_id, track_ids) {
+            warn!(zone_id, error = %e, "persist_local_queue_failed");
+            return;
+        }
+        if current_position > 0 {
+            repo.set_current(zone_id, current_position).ok();
+        }
+    }
+
+    /// Persist the streaming_queue table for a zone.
+    #[allow(clippy::type_complexity)]
+    pub fn persist_streaming_queue(
+        &self,
+        zone_id: i64,
+        tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
+    ) {
+        let repo = PlayQueueRepo::new(self.db.clone());
+        if let Err(e) = repo.set_streaming_queue(zone_id, tracks) {
+            warn!(zone_id, error = %e, "persist_streaming_queue_failed");
+        }
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::new(self.db.clone());
 
