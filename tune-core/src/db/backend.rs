@@ -174,41 +174,39 @@ impl SqlValue {
         )
     }
 
-    /// Decode as `i64`. Returns `None` for `Null`; coerces `Bool` to 0/1.
+    /// Decode as `i64`. Returns `None` for any NULL variant; coerces
+    /// `Bool` to 0/1, `Real` to truncated int, `Text` via parse.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            SqlValue::Null => None,
             SqlValue::Int(i) => Some(*i),
             SqlValue::Bool(b) => Some(if *b { 1 } else { 0 }),
             SqlValue::Real(f) => Some(*f as i64),
             SqlValue::Text(s) => s.parse().ok(),
-            SqlValue::Blob(_) => None,
+            _ => None,
         }
     }
 
-    /// Decode as `f64`. Returns `None` for `Null`.
+    /// Decode as `f64`. Returns `None` for NULL variants.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            SqlValue::Null => None,
             SqlValue::Real(f) => Some(*f),
             SqlValue::Int(i) => Some(*i as f64),
             SqlValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             SqlValue::Text(s) => s.parse().ok(),
-            SqlValue::Blob(_) => None,
+            _ => None,
         }
     }
 
     /// Decode as `bool`. SQLite stores bools as INT; we accept either.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
-            SqlValue::Null => None,
             SqlValue::Bool(b) => Some(*b),
             SqlValue::Int(i) => Some(*i != 0),
             _ => None,
         }
     }
 
-    /// Decode as `&str`. Returns `None` for `Null`.
+    /// Decode as `&str`. Returns `None` for NULL variants.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             SqlValue::Text(s) => Some(s.as_str()),
@@ -216,7 +214,7 @@ impl SqlValue {
         }
     }
 
-    /// Decode as owned `String`. Returns `None` for `Null`.
+    /// Decode as owned `String`. Returns `None` for NULL variants.
     pub fn as_string(&self) -> Option<String> {
         match self {
             SqlValue::Text(s) => Some(s.clone()),
@@ -224,7 +222,7 @@ impl SqlValue {
         }
     }
 
-    /// Decode as `&[u8]`. Returns `None` for `Null`.
+    /// Decode as `&[u8]`. Returns `None` for NULL variants.
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             SqlValue::Blob(b) => Some(b.as_slice()),
@@ -273,11 +271,69 @@ impl ToSqlValue for String {
         SqlValue::Text(self.clone())
     }
 }
-impl<T: ToSqlValue> ToSqlValue for Option<T> {
+// Specific Option<T> impls so `None` carries a type hint to PG via
+// the typed `SqlValue::Null*` variants. SQLite ignores the variant.
+macro_rules! impl_option_int {
+    ($($t:ty),*) => {
+        $(
+            impl ToSqlValue for Option<$t> {
+                fn to_sql_value(&self) -> SqlValue {
+                    match self {
+                        Some(v) => SqlValue::Int(*v as i64),
+                        None => SqlValue::NullInt,
+                    }
+                }
+            }
+        )*
+    };
+}
+impl_option_int!(i8, i16, i32, i64, u8, u16, u32);
+
+impl ToSqlValue for Option<f32> {
     fn to_sql_value(&self) -> SqlValue {
         match self {
-            Some(v) => v.to_sql_value(),
-            None => SqlValue::Null,
+            Some(v) => SqlValue::Real(*v as f64),
+            None => SqlValue::NullReal,
+        }
+    }
+}
+impl ToSqlValue for Option<f64> {
+    fn to_sql_value(&self) -> SqlValue {
+        match self {
+            Some(v) => SqlValue::Real(*v),
+            None => SqlValue::NullReal,
+        }
+    }
+}
+impl ToSqlValue for Option<bool> {
+    fn to_sql_value(&self) -> SqlValue {
+        match self {
+            Some(v) => SqlValue::Bool(*v),
+            None => SqlValue::NullBool,
+        }
+    }
+}
+impl ToSqlValue for Option<String> {
+    fn to_sql_value(&self) -> SqlValue {
+        match self {
+            Some(v) => SqlValue::Text(v.clone()),
+            None => SqlValue::NullText,
+        }
+    }
+}
+impl ToSqlValue for Option<&str> {
+    fn to_sql_value(&self) -> SqlValue {
+        match self {
+            Some(v) => SqlValue::Text((*v).to_string()),
+            None => SqlValue::NullText,
+        }
+    }
+}
+impl ToSqlValue for Option<Vec<u8>> {
+    fn to_sql_value(&self) -> SqlValue {
+        match self {
+            Some(v) => SqlValue::Blob(v.clone()),
+            None => SqlValue::NullBlob,
         }
     }
 }
@@ -295,12 +351,18 @@ impl ToSqlValue for SqlValue {
 // ─── SQLite bridging ──────────────────────────────────────────────────
 
 /// SqlValue → rusqlite::types::Value translation, so SqliteBackend can
-/// hand the parameters to rusqlite::Connection::execute().
+/// hand the parameters to rusqlite::Connection::execute(). SQLite is
+/// dynamically typed so all `Null*` variants collapse to `Value::Null`.
 impl rusqlite::types::ToSql for SqlValue {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         use rusqlite::types::{ToSqlOutput, Value};
         let v = match self {
-            SqlValue::Null => Value::Null,
+            SqlValue::Null
+            | SqlValue::NullInt
+            | SqlValue::NullText
+            | SqlValue::NullReal
+            | SqlValue::NullBool
+            | SqlValue::NullBlob => Value::Null,
             SqlValue::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
             SqlValue::Int(i) => Value::Integer(*i),
             SqlValue::Real(f) => Value::Real(*f),
@@ -582,7 +644,14 @@ fn bind_sqlvalue<'q>(
     v: &SqlValue,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match v {
-        SqlValue::Null => q.bind::<Option<String>>(None),
+        // Unspecified NULL defaults to BIGINT (the most common FK
+        // shape in our schema). The typed variants below pin the
+        // PG-side parameter type to match the column.
+        SqlValue::Null | SqlValue::NullInt => q.bind::<Option<i64>>(None),
+        SqlValue::NullText => q.bind::<Option<String>>(None),
+        SqlValue::NullReal => q.bind::<Option<f64>>(None),
+        SqlValue::NullBool => q.bind::<Option<bool>>(None),
+        SqlValue::NullBlob => q.bind::<Option<Vec<u8>>>(None),
         SqlValue::Bool(b) => q.bind(*b),
         SqlValue::Int(i) => q.bind(*i),
         SqlValue::Real(f) => q.bind(*f),
@@ -597,7 +666,11 @@ fn bind_sqlvalue_scalar<'q>(
     v: &SqlValue,
 ) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments> {
     match v {
-        SqlValue::Null => q.bind::<Option<String>>(None),
+        SqlValue::Null | SqlValue::NullInt => q.bind::<Option<i64>>(None),
+        SqlValue::NullText => q.bind::<Option<String>>(None),
+        SqlValue::NullReal => q.bind::<Option<f64>>(None),
+        SqlValue::NullBool => q.bind::<Option<bool>>(None),
+        SqlValue::NullBlob => q.bind::<Option<Vec<u8>>>(None),
         SqlValue::Bool(b) => q.bind(*b),
         SqlValue::Int(i) => q.bind(*i),
         SqlValue::Real(f) => q.bind(*f),
@@ -808,9 +881,15 @@ mod tests {
     }
 
     #[test]
-    fn option_none_maps_to_null() {
+    fn option_none_maps_to_typed_null() {
         let v: Option<i64> = None;
-        assert!(matches!(v.to_sql_value(), SqlValue::Null));
+        assert!(matches!(v.to_sql_value(), SqlValue::NullInt));
+        let v: Option<String> = None;
+        assert!(matches!(v.to_sql_value(), SqlValue::NullText));
+        let v: Option<f64> = None;
+        assert!(matches!(v.to_sql_value(), SqlValue::NullReal));
+        let v: Option<bool> = None;
+        assert!(matches!(v.to_sql_value(), SqlValue::NullBool));
     }
 
     #[test]
