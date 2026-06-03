@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for radio_repo.
@@ -58,14 +60,14 @@ pub mod sql {
         )
     }
 
-    /// `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` is SQLite. The portable
-    /// equivalent for PG is `to_char(now() AT TIME ZONE 'UTC',
-    /// 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`. The phase 4 PG impl will swap
-    /// the function via a dialect helper; for now this stays SQLite.
+    /// `last_played` is now an ISO-8601 string parameter so the SQL no
+    /// longer needs SQLite-specific `strftime('%Y-%m-%dT%H:%M:%SZ',
+    /// 'now')`. The caller computes the current timestamp.
     pub fn record_play<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE radio_stations SET play_count = play_count + 1, last_played = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = {}",
-            d.placeholder(1)
+            "UPDATE radio_stations SET play_count = play_count + 1, last_played = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
         )
     }
 
@@ -117,142 +119,137 @@ pub struct RadioStation {
 }
 
 pub struct RadioRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl RadioRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<RadioStation>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_by_id(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![id], |row| Ok(row_to_radio(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_radio))
     }
 
     pub fn list(&self) -> Result<Vec<RadioStation>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql::list_all()).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map([], |row| Ok(row_to_radio(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let rows = self.db.query_many(&sql::list_all(), &[])?;
+        Ok(rows.iter().map(row_to_radio).collect())
     }
 
     pub fn favorites(&self) -> Result<Vec<RadioStation>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql::favorites()).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map([], |row| Ok(row_to_radio(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let rows = self.db.query_many(&sql::favorites(), &[])?;
+        Ok(rows.iter().map(row_to_radio).collect())
     }
 
     pub fn create(&self, station: &RadioStation) -> Result<i64, String> {
-        self.db.execute(
-            &sql::create(&self.db.dialect()),
-            &[
-                &station.name as &dyn rusqlite::types::ToSql,
-                &station.url,
-                &station.homepage,
-                &station.logo_url,
-                &station.country,
-                &station.language,
-                &station.genre,
-                &station.codec,
-                &station.bitrate,
-                &station.is_favorite,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::create, sql::create);
+        let params: [&dyn ToSqlValue; 10] = [
+            &station.name,
+            &station.url,
+            &station.homepage,
+            &station.logo_url,
+            &station.country,
+            &station.language,
+            &station.genre,
+            &station.codec,
+            &station.bitrate,
+            &station.is_favorite,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db.execute(&sql::delete(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::delete, sql::delete);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<(), String> {
-        self.db.execute(
-            &sql::set_favorite(&self.db.dialect()),
-            &[&favorite as &dyn rusqlite::types::ToSql, &id],
-        )?;
+        let sql = self.dialect_sql(sql::set_favorite, sql::set_favorite);
+        let params: [&dyn ToSqlValue; 2] = [&favorite, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn record_play(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute(&sql::record_play(&self.db.dialect()), &[&id])?;
+        let sql = self.dialect_sql(sql::record_play, sql::record_play);
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let params: [&dyn ToSqlValue; 2] = [&now, &id];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<RadioStation>, String> {
         let like = format!("%{query}%");
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::search(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![like, like, like], |row| Ok(row_to_radio(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+        let sql = self.dialect_sql(sql::search, sql::search);
+        let params: [&dyn ToSqlValue; 3] = [&like, &like, &like];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_radio).collect())
     }
 
     pub fn update(&self, station: &RadioStation) -> Result<(), String> {
         let Some(id) = station.id else {
             return Err("station has no id".into());
         };
-        self.db.execute(
-            &sql::update(&self.db.dialect()),
-            &[
-                &station.name as &dyn rusqlite::types::ToSql,
-                &station.url,
-                &station.homepage,
-                &station.logo_url,
-                &station.country,
-                &station.language,
-                &station.genre,
-                &station.codec,
-                &station.bitrate,
-                &id,
-            ],
-        )?;
+        let sql = self.dialect_sql(sql::update, sql::update);
+        let params: [&dyn ToSqlValue; 10] = [
+            &station.name,
+            &station.url,
+            &station.homepage,
+            &station.logo_url,
+            &station.country,
+            &station.language,
+            &station.genre,
+            &station.codec,
+            &station.bitrate,
+            &id,
+        ];
+        self.db.execute(&sql, &params)?;
         Ok(())
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        conn.query_row(sql::count(), [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
     }
 }
 
-fn row_to_radio(row: &rusqlite::Row) -> RadioStation {
+fn row_to_radio(cols: &Vec<SqlValue>) -> RadioStation {
     RadioStation {
-        id: row.get(0).ok(),
-        name: row.get(1).unwrap_or_default(),
-        url: row.get(2).unwrap_or_default(),
-        homepage: row.get(3).ok().flatten(),
-        logo_url: row.get(4).ok().flatten(),
-        country: row.get(5).ok().flatten(),
-        language: row.get(6).ok().flatten(),
-        genre: row.get(7).ok().flatten(),
-        codec: row.get(8).ok().flatten(),
-        bitrate: row.get(9).ok().flatten(),
-        is_favorite: row.get::<_, i32>(10).unwrap_or(0) != 0,
-        last_played: row.get(11).ok().flatten(),
-        play_count: row.get(12).unwrap_or(0),
+        id: cols.first().and_then(|v| v.as_i64()),
+        name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+        url: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+        homepage: cols.get(3).and_then(|v| v.as_string()),
+        logo_url: cols.get(4).and_then(|v| v.as_string()),
+        country: cols.get(5).and_then(|v| v.as_string()),
+        language: cols.get(6).and_then(|v| v.as_string()),
+        genre: cols.get(7).and_then(|v| v.as_string()),
+        codec: cols.get(8).and_then(|v| v.as_string()),
+        bitrate: cols.get(9).and_then(|v| v.as_i64()).map(|n| n as i32),
+        is_favorite: cols.get(10).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        last_played: cols.get(11).and_then(|v| v.as_string()),
+        play_count: cols.get(12).and_then(|v| v.as_i64()).unwrap_or(0),
     }
 }
 
@@ -350,7 +347,6 @@ mod tests {
 
         let all = repo.list().unwrap();
         assert_eq!(all.len(), 2);
-        // Favorites first in list
         assert_eq!(all[0].name, "BBC Radio 3");
     }
 
@@ -467,14 +463,11 @@ mod tests {
 
     #[test]
     fn sql_builders_replace_collate_with_lower() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
-        // No more COLLATE NOCASE anywhere.
         assert!(!sql::list_all().contains("COLLATE"));
         assert!(!sql::favorites().contains("COLLATE"));
         assert!(!sql::search(&s).contains("COLLATE"));
-        // Search uses LOWER for case-insensitive matching, portable.
         let pg_search = sql::search(&p);
         assert!(pg_search.contains("LOWER(name) LIKE LOWER($1)"));
         assert!(pg_search.ends_with("LIMIT 50"));
@@ -510,5 +503,31 @@ mod tests {
 
         let fetched = repo.get(id).unwrap().unwrap();
         assert_eq!(fetched.play_count, 5);
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = RadioRepo::with_backend(backend);
+        let station = RadioStation {
+            id: None,
+            name: "X".into(),
+            url: "http://x.com".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        };
+        let id = repo.create(&station).unwrap();
+        assert_eq!(repo.get(id).unwrap().unwrap().name, "X");
     }
 }

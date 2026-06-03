@@ -173,16 +173,69 @@ minimal and any regression bisects cleanly to a single repo.
 
 Suggested order — easiest first, build confidence, hardest last:
 
-1. ~~`settings_repo`~~ ✅ (POC, this commit)
-2. `source_link_repo` — same shape as settings, validates the pattern
-3. `rating_repo` — small, 2 writes
-4. `tag_repo`, `profile_repo`, `playlist_repo`, `radio_repo` — medium
-5. `zone_repo` — has the WAL fallback (commit `8af95ec`), translate it
-6. `artist_repo`, `play_queue_repo` — medium
-7. `history_repo` — heavy aggregation, plan more time
-8. `album_repo`, `track_repo` — the big ones, do last when the pattern
-   is fully proven
+1. ~~`settings_repo`~~ ✅ (POC, fe66002)
+2. ~~`source_link_repo`~~ ✅ (145ceb3)
+3. ~~`rating_repo`~~ ✅ (145ceb3)
+4. ~~`tag_repo`~~ ✅ (ea1f1aa)
+5. ~~`profile_repo`~~ ✅ (ea1f1aa)
+6. ~~`radio_repo`~~ ✅ (this commit)
+7. `history_repo` — heavy aggregation, no transactions — port next
+8. **Transactions blocker**: `playlist_repo`, `zone_repo`, `artist_repo`,
+   `play_queue_repo`, `album_repo`, `track_repo` all use rusqlite
+   `conn.transaction()`. The `DbBackend` trait doesn't yet expose
+   transactions. **Land a `write_tx(closure)` extension first** — see
+   the "Transaction abstraction" section below.
+9. After tx extension: port the 6 transactional repos in the order
+   above, smallest first.
 
 Each step is independent. Stop after any step and the workspace still
 compiles + runs on SQLite. Postgres production rollout waits for the
 last repo.
+
+---
+
+## Transaction abstraction (next infra commit)
+
+Six of the remaining repos use `self.db.connection().lock()` then
+`conn.transaction()` for atomic multi-statement writes (e.g.
+`playlist_repo::add_tracks` does max_pos query + N inserts inside a
+single tx). The current trait can't express that.
+
+Proposed trait extension:
+
+```rust
+pub trait DbBackend: Send + Sync {
+    // ... existing methods ...
+
+    /// Run a closure inside a write transaction. Commits on Ok return,
+    /// rolls back on Err or panic. The handle exposes the same trait
+    /// surface as DbBackend for write/read operations.
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String>;
+}
+
+pub trait DbTxHandle: Send + Sync {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String>;
+    fn query_one(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String>;
+    fn query_many(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
+    fn last_insert_rowid(&self) -> i64;
+}
+```
+
+Implementation notes:
+- SQLite: lock the write conn, `conn.transaction()`, wrap in a
+  `SqliteTxHandle { tx: &rusqlite::Transaction }` that forwards
+  `execute` / `query_*` to `tx.execute` / `tx.prepare`.
+- Postgres: `pool.begin().await` returns a `sqlx::Transaction<'_, Postgres>`,
+  wrap in a `PostgresTxHandle` that runs through `block_in_place`
+  similarly to `PostgresBackend::execute`.
+- Repos that need a tx swap from `self.db.connection().lock().unwrap()`
+  to `self.db.write_tx(&mut |tx| { ... })`. The methods inside use
+  the tx handle's trait surface, which has the same SQL signatures as
+  DbBackend.
+
+Estimated effort for the trait + 2 impls: ~3-4h. Then porting each of
+the 6 remaining transactional repos becomes mechanical (same pattern
+as the first 6, just via tx instead of self.db).
