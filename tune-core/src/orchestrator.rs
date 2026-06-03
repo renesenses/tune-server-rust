@@ -195,12 +195,12 @@ impl PlaybackOrchestrator {
         let _is_dsd = source_format
             .as_ref()
             .is_some_and(|f| *f == AudioFormat::Dsd);
-        // OAAT endpoints: transcode non-WAV/non-FLAC to WAV. FLAC passes through
-        // natively (endpoint decodes via ffmpeg). DSD transcodes to WAV.
+        // OAAT endpoints: transcode everything to WAV for reliable playback.
+        // FLAC passthrough is not yet stable (ffmpeg streaming decode issues).
         let oaat_needs_wav = is_oaat_output
             && source_format
                 .as_ref()
-                .is_some_and(|f| *f != AudioFormat::Wav && *f != AudioFormat::Flac);
+                .is_some_and(|f| *f != AudioFormat::Wav);
         let needs_transcode = source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna())
