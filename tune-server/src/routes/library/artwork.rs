@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
+use tune_core::db::backend::DbBackend;
 use tune_core::db::track_repo::TrackRepo;
 
 use super::artwork_cache_dir;
