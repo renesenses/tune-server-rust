@@ -1,0 +1,205 @@
+name: Rollback
+
+# Phase 5 of release autonomy (docs/RELEASE-AUTONOMY-v0.9.50.md).
+#
+# Opt-in workflow that walks back a published release when something
+# broke after the fact. Reversibility-by-default: by default each step
+# is a dry-run that prints what it WOULD do. Pass `apply: true` to
+# actually execute.
+#
+# What gets rolled back:
+# - GitHub Release  → marked as draft (not deleted; assets stay
+#                     downloadable for forensic purposes)
+# - Git tag         → deleted from the remote (force, opt-in via
+#                     `delete_tag: true`)
+# - Homebrew tap    → reverted to the previous formula via git revert
+#                     of the bump commit
+# - Docker Hub      → only the specific tag is removed; :latest is
+#                     re-pointed to the previous version
+# - Forum thread    → an erratum reply is posted on the original
+#                     announcement thread (NOT deleted, the audit
+#                     trail stays public)
+#
+# IMPORTANT: never auto-runs. Always requires workflow_dispatch with
+# explicit `apply: true`. The dry-run mode is the default safety net.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to roll back (e.g. v0.8.30)"
+        required: true
+        type: string
+      previous_version:
+        description: "Previous good version (e.g. v0.8.29) — Homebrew + Docker :latest will be re-pointed there"
+        required: true
+        type: string
+      apply:
+        description: "Actually execute (default: dry-run that prints what would happen)"
+        required: false
+        default: false
+        type: boolean
+      delete_tag:
+        description: "Also delete the git tag (force-push). Default: keep the tag for traceability."
+        required: false
+        default: false
+        type: boolean
+      forum_thread_id:
+        description: "Forum thread ID where the original announcement was posted (leave blank to skip the erratum reply)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.version }} → ${{ inputs.previous_version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print plan
+        run: |
+          echo "── Rollback plan ──"
+          echo "Version to roll back  : ${{ inputs.version }}"
+          echo "Previous good version : ${{ inputs.previous_version }}"
+          echo "Apply                 : ${{ inputs.apply }}"
+          echo "Delete git tag        : ${{ inputs.delete_tag }}"
+          echo "Forum thread id       : ${{ inputs.forum_thread_id }}"
+          if [ "${{ inputs.apply }}" != "true" ]; then
+            echo
+            echo "DRY-RUN — no remote state will be changed."
+            echo "Re-run with 'apply: true' to execute."
+          fi
+
+      # ─── 1. GitHub Release → draft ──────────────────────────────
+      - name: GitHub Release → draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          if [ "$APPLY" = "true" ]; then
+            gh release edit "$VERSION" --draft --repo "$GITHUB_REPOSITORY"
+            echo "[ok] release $VERSION marked as draft"
+          else
+            echo "[dry] would mark release $VERSION as draft"
+          fi
+
+      # ─── 2. Git tag → optionally deleted on remote ───────────────
+      - name: Git tag → delete on remote (opt-in)
+        if: ${{ inputs.delete_tag }}
+        env:
+          VERSION: ${{ inputs.version }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          if [ "$APPLY" = "true" ]; then
+            git push origin --delete "refs/tags/$VERSION"
+            echo "[ok] tag $VERSION deleted from remote"
+          else
+            echo "[dry] would delete tag $VERSION from remote"
+          fi
+
+      # ─── 3. Homebrew tap → git revert ────────────────────────────
+      - name: Homebrew tap → revert bump commit
+        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/renesenses/homebrew-tap.git" tap
+          cd tap
+          BUMP_SHA=$(git log --grep="tune-server ${VERSION#v}" --pretty=%H -n 1 || true)
+          if [ -z "$BUMP_SHA" ]; then
+            echo "[warn] no bump commit found for $VERSION in homebrew-tap; nothing to revert"
+            exit 0
+          fi
+          if [ "$APPLY" = "true" ]; then
+            git config user.email "renesenses-bot@users.noreply.github.com"
+            git config user.name  "renesenses-bot"
+            git revert --no-edit "$BUMP_SHA"
+            git push origin HEAD
+            echo "[ok] reverted $BUMP_SHA on homebrew-tap"
+          else
+            echo "[dry] would revert $BUMP_SHA on homebrew-tap"
+          fi
+
+      # ─── 4. Docker Hub → repoint :latest, drop the bad tag ───────
+      - name: Docker Hub → repoint :latest, drop bad tag
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          PREVIOUS: ${{ inputs.previous_version }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "[skip] Docker Hub creds missing"
+            exit 0
+          fi
+          TOKEN=$(curl -s -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}" \
+            https://hub.docker.com/v2/users/login/ | python3 -c "import sys, json; print(json.load(sys.stdin)['token'])")
+          if [ "$APPLY" = "true" ]; then
+            # Drop the bad version tag
+            curl -s -X DELETE \
+              -H "Authorization: JWT $TOKEN" \
+              "https://hub.docker.com/v2/repositories/renesenses/tune/tags/$VERSION/" \
+              -o /dev/null -w "%{http_code}\n"
+            echo "[ok] dropped renesenses/tune:$VERSION on Docker Hub"
+
+            # Re-point :latest by re-tagging the previous version locally
+            # (we cannot mutate the manifest list pointer via API; need a
+            # docker buildx imagetools create call).
+            docker buildx imagetools create \
+              -t renesenses/tune:latest \
+              renesenses/tune:$PREVIOUS
+            echo "[ok] renesenses/tune:latest → $PREVIOUS"
+          else
+            echo "[dry] would drop renesenses/tune:$VERSION and re-point :latest to $PREVIOUS"
+          fi
+
+      # ─── 5. Forum erratum reply ──────────────────────────────────
+      - name: Forum erratum
+        if: ${{ inputs.forum_thread_id != '' && secrets.FORUM_TOKEN != '' }}
+        env:
+          FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
+          THREAD_ID: ${{ inputs.forum_thread_id }}
+          VERSION: ${{ inputs.version }}
+          PREVIOUS: ${{ inputs.previous_version }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          BODY=$(printf 'ERRATUM : la version %s a été retirée à cause d'\''une régression critique. Revenez à %s en attendant la prochaine release patchée.\n\nDocker : `docker pull renesenses/tune:%s`\nHomebrew : `brew upgrade tune-server` (la formula a été revertée).\n\nDésolé du dérangement.' "$VERSION" "$PREVIOUS" "$PREVIOUS")
+          PAYLOAD=$(python3 -c "import json, os; print(json.dumps({'body': os.environ['BODY']}))" )
+          if [ "$APPLY" = "true" ]; then
+            STATUS=$(curl -s -o response.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $FORUM_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "https://mozaiklabs.fr/api/v1/forum/threads/$THREAD_ID/replies")
+            echo "HTTP $STATUS"
+            cat response.json
+            if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ]; then
+              echo "::warning::forum erratum POST returned HTTP $STATUS"
+            fi
+          else
+            echo "[dry] would post erratum on forum thread $THREAD_ID"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## Rollback summary"
+            echo
+            echo "| Step | State |"
+            echo "|---|---|"
+            echo "| Release marked as draft | ${{ inputs.apply == 'true' && 'applied' || 'dry-run' }} |"
+            echo "| Git tag deleted | ${{ inputs.delete_tag == true && (inputs.apply == 'true' && 'applied' || 'dry-run') || 'skipped' }} |"
+            echo "| Homebrew formula reverted | ${{ inputs.apply == 'true' && 'applied' || 'dry-run' }} |"
+            echo "| Docker Hub :latest repointed | ${{ inputs.apply == 'true' && 'applied' || 'dry-run' }} |"
+            echo "| Forum erratum posted | ${{ inputs.forum_thread_id != '' && (inputs.apply == 'true' && 'applied' || 'dry-run') || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
