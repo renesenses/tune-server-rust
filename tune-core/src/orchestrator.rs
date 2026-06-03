@@ -1089,3 +1089,321 @@ impl PlaybackOrchestrator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Mutex;
+
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::zone_repo::ZoneRepo;
+    use crate::http::streamer::AudioStreamer;
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::{NowPlaying, PlayState, PlaybackManager};
+    use crate::streaming::registry::ServiceRegistry;
+
+    use super::PlaybackOrchestrator;
+
+    fn test_orchestrator() -> PlaybackOrchestrator {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        PlaybackOrchestrator {
+            db,
+            playback: Arc::new(PlaybackManager::new()),
+            streamer: Arc::new(AudioStreamer::new(0)),
+            services: Arc::new(Mutex::new(ServiceRegistry::new())),
+            outputs: Arc::new(Mutex::new(OutputRegistry::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pause_resume_stop() {
+        let orch = test_orchestrator();
+        let zone_id = 1;
+
+        // Set up a NowPlaying so pause/stop have state to work with
+        let np = NowPlaying {
+            track_id: Some(42),
+            title: "Test Track".into(),
+            artist_name: Some("Test Artist".into()),
+            album_title: Some("Test Album".into()),
+            cover_path: None,
+            duration_ms: 180_000,
+            source: "local".into(),
+            source_id: None,
+            stream_id: None,
+        };
+        orch.playback.play(zone_id, np).await;
+
+        // Pause
+        orch.pause(zone_id, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Paused);
+
+        // Resume
+        orch.resume(zone_id, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Playing);
+
+        // Stop
+        orch.stop(zone_id, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.state, PlayState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn test_seek_persists() {
+        let orch = test_orchestrator();
+
+        // Create a zone in the DB so save_playback_position has a row to UPDATE
+        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_id = zone_repo.create("Test Zone", None, None).unwrap();
+
+        // Set up NowPlaying (seek persists position only when now_playing exists)
+        let np = NowPlaying {
+            track_id: Some(99),
+            title: "Seek Test".into(),
+            artist_name: None,
+            album_title: None,
+            cover_path: None,
+            duration_ms: 300_000,
+            source: "local".into(),
+            source_id: None,
+            stream_id: None,
+        };
+        orch.playback.play(zone_id, np).await;
+
+        // Seek to 42 seconds
+        orch.seek(zone_id, 42_000, None).await;
+
+        // Verify in-memory state updated
+        let state = orch.playback.get_state(zone_id).await;
+        assert_eq!(state.position_ms, 42_000);
+
+        // Verify DB position saved
+        let zone = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(zone.last_position_ms, 42_000);
+        assert_eq!(zone.last_track_id, Some(99));
+        assert_eq!(zone.last_track_source.as_deref(), Some("local"));
+    }
+
+    #[tokio::test]
+    async fn test_set_volume() {
+        let orch = test_orchestrator();
+        let zone_id = 1;
+
+        // Initialize zone state with a NowPlaying
+        let np = NowPlaying {
+            track_id: None,
+            title: "Volume Test".into(),
+            artist_name: None,
+            album_title: None,
+            cover_path: None,
+            duration_ms: 60_000,
+            source: "local".into(),
+            source_id: None,
+            stream_id: None,
+        };
+        orch.playback.play(zone_id, np).await;
+
+        // Set volume to 80%
+        orch.set_volume(zone_id, 0.8, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert!((state.volume - 0.8).abs() < f64::EPSILON);
+
+        // Set volume to 0 (mute level)
+        orch.set_volume(zone_id, 0.0, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert!((state.volume - 0.0).abs() < f64::EPSILON);
+
+        // Set volume to 1.0 (max)
+        orch.set_volume(zone_id, 1.0, None).await;
+        let state = orch.playback.get_state(zone_id).await;
+        assert!((state.volume - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_never_upsamples() {
+        // The Resampler enforces "never upsample": when target > source,
+        // the actual target is clamped to source rate/depth.
+        use crate::audio::resampler::Resampler;
+
+        // 44.1kHz source, 96kHz target requested -> should stay at 44.1kHz
+        let r = Resampler::new(44100, 96000, 16, 24, 2);
+        assert_eq!(r.output_rate(), 44100, "must not upsample rate");
+        assert_eq!(r.output_depth(), 16, "must not upsample bit depth");
+        assert!(
+            !r.needs_resample(),
+            "no resample needed when target > source"
+        );
+
+        // 96kHz source, 48kHz target -> should downsample to 48kHz
+        let r = Resampler::new(96000, 48000, 24, 16, 2);
+        assert_eq!(r.output_rate(), 48000);
+        assert_eq!(r.output_depth(), 16);
+        assert!(r.needs_resample(), "downsample should be flagged");
+
+        // Same rate -> no resample
+        let r = Resampler::new(48000, 48000, 24, 24, 2);
+        assert!(!r.needs_resample());
+
+        // Mixed: rate up but depth down -> rate clamped, depth reduced
+        let r = Resampler::new(44100, 96000, 24, 16, 2);
+        assert_eq!(r.output_rate(), 44100, "rate must not increase");
+        assert_eq!(r.output_depth(), 16, "depth correctly reduced");
+        assert!(r.needs_resample(), "bit depth change requires resample");
+    }
+
+    #[tokio::test]
+    async fn test_persist_position_on_pause() {
+        let orch = test_orchestrator();
+
+        // Create a zone in DB
+        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_id = zone_repo.create("Pause Zone", None, None).unwrap();
+
+        // Set up playback at a known position
+        let np = NowPlaying {
+            track_id: Some(7),
+            title: "Pause Persist".into(),
+            artist_name: None,
+            album_title: None,
+            cover_path: None,
+            duration_ms: 200_000,
+            source: "local".into(),
+            source_id: Some("src-7".into()),
+            stream_id: None,
+        };
+        orch.playback.play(zone_id, np).await;
+        orch.playback.update_position(zone_id, 55_000).await;
+
+        // Pause triggers persist_position
+        orch.pause(zone_id, None).await;
+
+        let zone = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(zone.last_position_ms, 55_000);
+        assert_eq!(zone.last_track_id, Some(7));
+        assert_eq!(zone.last_track_source_id.as_deref(), Some("src-7"));
+    }
+
+    #[tokio::test]
+    async fn test_persist_position_on_stop() {
+        let orch = test_orchestrator();
+
+        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_id = zone_repo.create("Stop Zone", None, None).unwrap();
+
+        let np = NowPlaying {
+            track_id: Some(10),
+            title: "Stop Persist".into(),
+            artist_name: Some("Artist".into()),
+            album_title: None,
+            cover_path: None,
+            duration_ms: 120_000,
+            source: "tidal".into(),
+            source_id: Some("tidal-10".into()),
+            stream_id: None,
+        };
+        orch.playback.play(zone_id, np).await;
+        orch.playback.update_position(zone_id, 90_000).await;
+
+        // Stop also persists position
+        orch.stop(zone_id, None).await;
+
+        let zone = zone_repo.get(zone_id).unwrap().unwrap();
+        assert_eq!(zone.last_position_ms, 90_000);
+        assert_eq!(zone.last_track_source.as_deref(), Some("tidal"));
+    }
+
+    #[tokio::test]
+    async fn test_record_listen() {
+        use crate::db::history_repo::HistoryRepo;
+
+        let orch = test_orchestrator();
+
+        // Create a zone so the FK constraint on zone_id is satisfied
+        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_id = zone_repo.create("Listen Zone", None, None).unwrap();
+
+        orch.record_listen(
+            "Test Song",
+            Some("Artist"),
+            Some("Album"),
+            "local",
+            180_000,
+            zone_id,
+        );
+
+        let repo = HistoryRepo::new(orch.db.clone());
+        let history = repo.recent(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].title, "Test Song");
+        assert_eq!(history[0].artist_name.as_deref(), Some("Artist"));
+        assert_eq!(history[0].source, "local");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_cover_url_passthrough() {
+        // Full URLs pass through unchanged
+        let result =
+            PlaybackOrchestrator::resolve_cover_url(Some("https://img.tidal.com/cover.jpg"));
+        assert_eq!(result.as_deref(), Some("https://img.tidal.com/cover.jpg"));
+
+        let result = PlaybackOrchestrator::resolve_cover_url(Some("http://local/art.png"));
+        assert_eq!(result.as_deref(), Some("http://local/art.png"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_cover_url_hash() {
+        // Hash values get wrapped in a local artwork URL
+        let result = PlaybackOrchestrator::resolve_cover_url(Some("abc123def"));
+        let url = result.unwrap();
+        assert!(
+            url.contains("/api/v1/library/artwork/abc123def"),
+            "got: {url}"
+        );
+        assert!(url.starts_with("http://"), "got: {url}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_cover_url_none() {
+        assert!(PlaybackOrchestrator::resolve_cover_url(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_persist_local_queue() {
+        use crate::db::play_queue_repo::PlayQueueRepo;
+
+        let orch = test_orchestrator();
+        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_id = zone_repo.create("Queue Zone", None, None).unwrap();
+
+        // Insert some tracks so FK constraints are satisfied
+        orch.db
+            .execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", &[])
+            .unwrap();
+        orch.db
+            .execute(
+                "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+                &[],
+            )
+            .unwrap();
+        for i in 1..=3i64 {
+            orch.db
+                .execute(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) VALUES (?, ?, 1, 1, 180000)",
+                    &[&i, &format!("Track {i}") as &dyn rusqlite::types::ToSql],
+                )
+                .unwrap();
+        }
+
+        orch.persist_local_queue(zone_id, &[1, 2, 3], 0);
+
+        let queue_repo = PlayQueueRepo::new(orch.db.clone());
+        let queue = queue_repo.get_queue(zone_id).unwrap();
+        assert_eq!(queue.len(), 3);
+    }
+}
