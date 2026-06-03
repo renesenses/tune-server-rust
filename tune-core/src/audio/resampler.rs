@@ -1,6 +1,7 @@
 use rubato::{FftFixedIn, Resampler as RubatoResampler};
 use tracing::debug;
 
+#[allow(dead_code)]
 fn pcm_format(depth: u32) -> &'static str {
     match depth {
         0..=16 => "s16le",
