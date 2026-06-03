@@ -114,14 +114,22 @@ async fn main() {
     let app = routes::router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => break l,
-            Err(e) => {
-                tracing::warn!(addr = %addr, error = %e, "port_busy_retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
+    let listener = {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("failed to create socket");
+        socket.set_reuse_address(true).ok();
+        socket
+            .bind(&addr.into())
+            .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+        socket.listen(128).expect("failed to listen");
+        socket
+            .set_nonblocking(true)
+            .expect("failed to set nonblocking");
+        tokio::net::TcpListener::from_std(socket.into()).expect("failed to create listener")
     };
 
     info!(%addr, "listening");
