@@ -33,14 +33,17 @@ jobs:
         with:
           fetch-depth: 0  # full history so git-cliff sees every commit
 
-      - name: Install git-cliff
-        uses: orhun/git-cliff-action@v3
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          version: "latest"
-          args: --help
-          # We'll run git-cliff ourselves below so we control the
-          # arguments (the action above just installs the binary
-          # via its setup step).
+          shared-key: changelog-tools
+
+      - name: Install git-cliff
+        # The third-party orhun/git-cliff-action@v3 uses a Debian buster
+        # base image which is EOL — its apt repos return 404. Install
+        # the binary ourselves from cargo to avoid the dependency.
+        run: cargo install git-cliff --locked
 
       - name: Resolve tag
         id: resolve
