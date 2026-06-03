@@ -1,7 +1,9 @@
-use rusqlite::{OptionalExtension, params};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use super::engine::SqlDialect;
+use super::backend::{DbBackend, SqlValue, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
 /// Engine-agnostic SQL builders for play_queue_repo.
@@ -131,6 +133,19 @@ pub mod sql {
             d.placeholder(1)
         )
     }
+
+    pub const CREATE_STREAMING_QUEUE_SQLITE: &str = "CREATE TABLE IF NOT EXISTS streaming_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        zone_id INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        source TEXT,
+        source_id TEXT,
+        title TEXT,
+        artist TEXT,
+        album TEXT,
+        cover_url TEXT,
+        duration_ms INTEGER DEFAULT 0
+    )";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,70 +164,65 @@ pub struct QueueItem {
 }
 
 pub struct PlayQueueRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl PlayQueueRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
-    pub fn get_queue(&self, zone_id: i64) -> Result<Vec<QueueItem>, String> {
-        let query = sql::get_queue(&self.db.dialect());
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        if !items.is_empty() {
-            return Ok(items);
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
         }
-        drop(stmt);
-        drop(conn);
+    }
 
-        // WAL visibility: the read-only connection may not yet see recently
-        // committed rows.  Fall back to the write connection which always has
-        // an up-to-date view of its own commits.
-        let wconn = self.db.connection().lock().unwrap();
-        let mut wstmt = wconn.prepare(&query).map_err(|e| e.to_string())?;
-        let items = wstmt
-            .query_map(params![zone_id], |row| Ok(row_to_queue_item(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(items)
+    pub fn get_queue(&self, zone_id: i64) -> Result<Vec<QueueItem>, String> {
+        // WAL fallback pattern: read first, fall back to strong if 0.
+        let sql = self.dialect_sql(sql::get_queue, sql::get_queue);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        if !rows.is_empty() {
+            return Ok(rows.iter().map(row_to_queue_item).collect());
+        }
+        let strong = self.db.query_many_strong(&sql, &params)?;
+        Ok(strong.iter().map(row_to_queue_item).collect())
     }
 
     pub fn get_current(&self, zone_id: i64) -> Result<Option<QueueItem>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(&sql::get_current(&self.db.dialect()))
-            .map_err(|e| e.to_string())?;
-        stmt.query_row(params![zone_id], |row| Ok(row_to_queue_item(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let sql = self.dialect_sql(sql::get_current, sql::get_current);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_queue_item))
     }
 
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
-        let d = self.db.dialect();
-        let delete_sql = sql::delete_for_zone(&d);
-        let insert_sql = sql::insert_queue_row(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(&delete_sql, params![zone_id])
-            .map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
+        let delete_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        let insert_sql = self.dialect_sql(sql::insert_queue_row, sql::insert_queue_row);
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 1] = [&zone_id];
+            tx.execute(&delete_sql, &p)?;
             for (i, tid) in track_ids.iter().enumerate() {
+                let pos = i as i64;
                 let is_current = if i == 0 { 1i64 } else { 0i64 };
-                stmt.execute(params![zone_id, tid, i as i64, is_current])
-                    .map_err(|e| e.to_string())?;
+                let p: [&dyn ToSqlValue; 4] = [&zone_id, tid, &pos, &is_current];
+                tx.execute(&insert_sql, &p)?;
             }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn add_tracks(
@@ -221,63 +231,68 @@ impl PlayQueueRepo {
         track_ids: &[i64],
         position: Option<i64>,
     ) -> Result<(), String> {
-        let d = self.db.dialect();
-        let max_pos_sql = sql::max_position(&d);
-        let insert_sql = sql::insert_queue_row_no_current(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let max_pos: i64 = tx
-            .query_row(&max_pos_sql, params![zone_id], |row| row.get(0))
-            .unwrap_or(-1);
-        let start = position.unwrap_or(max_pos + 1);
-        {
-            let mut stmt = tx.prepare_cached(&insert_sql).map_err(|e| e.to_string())?;
+        let max_pos_sql = self.dialect_sql(sql::max_position, sql::max_position);
+        let insert_sql = self.dialect_sql(
+            sql::insert_queue_row_no_current,
+            sql::insert_queue_row_no_current,
+        );
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 1] = [&zone_id];
+            let max_pos: i64 = tx
+                .query_one(&max_pos_sql, &p)?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(-1);
+            let start = position.unwrap_or(max_pos + 1);
             for (i, tid) in track_ids.iter().enumerate() {
-                stmt.execute(params![zone_id, tid, start + i as i64])
-                    .map_err(|e| e.to_string())?;
+                let pos = start + i as i64;
+                let p: [&dyn ToSqlValue; 3] = [&zone_id, tid, &pos];
+                tx.execute(&insert_sql, &p)?;
             }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn set_current(&self, zone_id: i64, position: i64) -> Result<(), String> {
-        let d = self.db.dialect();
-        let unset_sql = sql::unset_current(&d);
-        let set_sql = sql::set_current_at(&d);
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute(&unset_sql, params![zone_id])
-            .map_err(|e| e.to_string())?;
-        conn.execute(&set_sql, params![zone_id, position])
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        // unset-all-then-set-one needs to be atomic — between the two
+        // UPDATEs, the zone would have zero "current" entries, which a
+        // concurrent read could mistake for an empty queue. write_tx
+        // serializes the pair.
+        let unset_sql = self.dialect_sql(sql::unset_current, sql::unset_current);
+        let set_sql = self.dialect_sql(sql::set_current_at, sql::set_current_at);
+        self.db.write_tx(&mut |tx| {
+            let p1: [&dyn ToSqlValue; 1] = [&zone_id];
+            tx.execute(&unset_sql, &p1)?;
+            let p2: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+            tx.execute(&set_sql, &p2)?;
+            Ok(())
+        })
     }
 
     pub fn remove_at(&self, zone_id: i64, position: i64) -> Result<bool, String> {
-        let d = self.db.dialect();
-        let delete_sql = sql::delete_at(&d);
-        let reindex_sql = sql::reindex_after_delete(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let deleted = tx
-            .execute(&delete_sql, params![zone_id, position])
-            .map_err(|e| e.to_string())?;
-        if deleted > 0 {
-            // Reindex positions so they stay contiguous
-            tx.execute(&reindex_sql, params![zone_id, position])
-                .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
+        let delete_sql = self.dialect_sql(sql::delete_at, sql::delete_at);
+        let reindex_sql = self.dialect_sql(sql::reindex_after_delete, sql::reindex_after_delete);
+        let mut deleted = 0usize;
+        let deleted_ref = &mut deleted;
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+            *deleted_ref = tx.execute(&delete_sql, &p)?;
+            if *deleted_ref > 0 {
+                tx.execute(&reindex_sql, &p)?;
+            }
+            Ok(())
+        })?;
         Ok(deleted > 0)
     }
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
-        self.db
-            .execute(&sql::delete_for_zone(&self.db.dialect()), &[&zone_id])?;
-        // Also clear streaming_queue so GET /queue returns empty for both types
-        self.db
-            .execute(&sql::delete_streaming(&self.db.dialect()), &[&zone_id])
-            .ok();
+        let delete_queue = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        let delete_streaming = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        self.db.execute(&delete_queue, &params)?;
+        // streaming_queue may not exist yet — tolerate the error like
+        // the original did.
+        let _ = self.db.execute(&delete_streaming, &params);
         Ok(())
     }
 
@@ -287,126 +302,100 @@ impl PlayQueueRepo {
         zone_id: i64,
         tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
     ) -> Result<(), String> {
-        let d = self.db.dialect();
-        let delete_queue_sql = sql::delete_for_zone(&d);
-        let delete_streaming_sql = sql::delete_streaming(&d);
-        let insert_streaming_sql = sql::insert_streaming(&d);
-        let mut conn = self.db.connection().lock().unwrap();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(&delete_queue_sql, params![zone_id])
-            .map_err(|e| e.to_string())?;
-        // SQLite-specific CREATE TABLE (INTEGER PRIMARY KEY AUTOINCREMENT).
-        // Phase 3 of the PG roadmap will move this to migrations.
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS streaming_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                zone_id INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                source TEXT,
-                source_id TEXT,
-                title TEXT,
-                artist TEXT,
-                album TEXT,
-                cover_url TEXT,
-                duration_ms INTEGER DEFAULT 0
-            )",
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute(&delete_streaming_sql, params![zone_id])
-            .map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare_cached(&insert_streaming_sql)
-                .map_err(|e| e.to_string())?;
+        let delete_queue_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
+        let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
+        // Ensure the streaming_queue table exists before the tx — DDL
+        // inside a tx that wraps DML is fine on SQLite but the lazy-
+        // create has always lived outside the durable schema, so keep
+        // it out of the tx for clarity.
+        if self.db.engine() == Engine::Sqlite {
+            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
+        }
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 1] = [&zone_id];
+            tx.execute(&delete_queue_sql, &p)?;
+            tx.execute(&delete_streaming_sql, &p)?;
             for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
                 tracks.iter().enumerate()
             {
-                stmt.execute(params![
-                    zone_id,
-                    i as i64,
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 8] = [
+                    &zone_id,
+                    &pos,
                     source_id,
                     title,
                     artist,
                     album,
                     cover_url,
-                    duration_ms
-                ])
-                .map_err(|e| e.to_string())?;
+                    duration_ms,
+                ];
+                tx.execute(&insert_streaming_sql, &p)?;
             }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn get_streaming_queue(&self, zone_id: i64) -> Result<Vec<serde_json::Value>, String> {
-        let select_sql = sql::select_streaming(&self.db.dialect());
-        let conn = self.db.connection().lock().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS streaming_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                zone_id INTEGER NOT NULL,
-                position INTEGER NOT NULL,
-                source TEXT,
-                source_id TEXT,
-                title TEXT,
-                artist TEXT,
-                album TEXT,
-                cover_url TEXT,
-                duration_ms INTEGER DEFAULT 0
-            )",
-        )
-        .map_err(|e| e.to_string())?;
-        let mut stmt = conn.prepare(&select_sql).map_err(|e| e.to_string())?;
-        let items = stmt
-            .query_map(params![zone_id], |row| {
-                Ok(serde_json::json!({
-                    "source_id": row.get::<_, Option<String>>(0).ok().flatten(),
-                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "cover_path": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "duration_ms": row.get::<_, i64>(5).unwrap_or(0),
-                    "position": row.get::<_, i64>(6).unwrap_or(0),
-                }))
+        let select_sql = self.dialect_sql(sql::select_streaming, sql::select_streaming);
+        // Ensure the streaming_queue table exists (SQLite-only lazy-
+        // create — the table will be added to migrations in phase 3).
+        if self.db.engine() == Engine::Sqlite {
+            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
+        }
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let rows = self.db.query_many(&select_sql, &params)?;
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|cols| {
+                serde_json::json!({
+                    "source_id": cols.first().and_then(|v| v.as_string()),
+                    "title": cols.get(1).and_then(|v| v.as_string()),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "album_title": cols.get(3).and_then(|v| v.as_string()),
+                    "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                    "duration_ms": cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "position": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                })
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            .collect();
         Ok(items)
     }
 
     pub fn count(&self, zone_id: i64) -> Result<i64, String> {
-        let count_sql = sql::count_queue(&self.db.dialect());
-        let conn = self.db.read_connection().lock().unwrap();
-        let n: i64 = conn
-            .query_row(&count_sql, params![zone_id], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
+        let count_sql = self.dialect_sql(sql::count_queue, sql::count_queue);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let n = self
+            .db
+            .query_one(&count_sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
         if n > 0 {
             return Ok(n);
         }
-        drop(conn);
-
-        // WAL fallback: read connection may lag behind the write connection
-        let wconn = self.db.connection().lock().unwrap();
-        wconn
-            .query_row(&count_sql, params![zone_id], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        // WAL fallback: read connection may lag behind the writer.
+        let strong = self.db.query_many_strong(&count_sql, &params)?;
+        Ok(strong
+            .first()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0))
     }
 }
 
-fn row_to_queue_item(row: &rusqlite::Row) -> QueueItem {
+fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
     QueueItem {
-        id: row.get(0).unwrap_or(0),
-        zone_id: row.get(1).unwrap_or(0),
-        track_id: row.get(2).unwrap_or(0),
-        position: row.get(3).unwrap_or(0),
-        is_current: row.get::<_, i64>(4).unwrap_or(0) != 0,
-        title: row.get(5).ok(),
-        artist_name: row.get(6).ok(),
-        album_title: row.get(7).ok(),
-        duration_ms: row.get(8).ok(),
-        file_path: row.get(9).ok(),
-        cover_path: row.get(10).ok(),
+        id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+        zone_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+        track_id: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+        position: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+        is_current: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        title: cols.get(5).and_then(|v| v.as_string()),
+        artist_name: cols.get(6).and_then(|v| v.as_string()),
+        album_title: cols.get(7).and_then(|v| v.as_string()),
+        duration_ms: cols.get(8).and_then(|v| v.as_i64()),
+        file_path: cols.get(9).and_then(|v| v.as_string()),
+        cover_path: cols.get(10).and_then(|v| v.as_string()),
     }
 }
 
@@ -621,7 +610,6 @@ mod tests {
 
     #[test]
     fn sql_builders_dialect_placeholders() {
-        use crate::db::engine::{PostgresDialect, SqliteDialect};
         let s = SqliteDialect;
         let p = PostgresDialect;
         assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?)"));
@@ -658,5 +646,19 @@ mod tests {
 
         let q2 = repo.get_queue(2).unwrap();
         assert_eq!(q2[0].track_id, tid2);
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let mut t = Track::new("X".into());
+        t.file_path = Some("/x.flac".into());
+        let tid = track_repo.create(&t).unwrap();
+
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = PlayQueueRepo::with_backend(backend);
+        repo.set_queue(1, &[tid]).unwrap();
+        assert_eq!(repo.count(1).unwrap(), 1);
     }
 }
