@@ -1,7 +1,7 @@
 # Path to v0.8.50 — Plan de stabilisation v0.8.x
 
-**Statut** : Draft (2026-06-03)
-**Point de départ** : v0.8.27 (main au moment de la rédaction)
+**Statut** : v0.8.28 publiée (2026-06-03)
+**Point de départ** : v0.8.27 → **v0.8.28 livrée** (validation release pipeline)
 **Cible** : v0.8.50 = trigger d'ouverture de `release/v0.9` et de la roadmap v0.9.0
 **Stratégie** : 3 paliers (v0.8.30, v0.8.40, v0.8.50), chacun avec un thème dominant et des critères de sortie fermes
 
@@ -11,10 +11,12 @@
 
 À ce stade :
 - v0.8.x = série de patches post-migration Rust complète
-- ~26 issues forum ouvertes (importées via le bot forum-watch le 2026-06-03)
+- ~26 issues forum ouvertes (importées via le bot forum-watch le 2026-06-03), triées **6 P0 / 16 P1 / 4 P2** (cf. epic GitHub #28)
 - Multiples branches `fix/*` en parallèle (sessions agents bug-treatment)
 - Roadmap v0.9.0 publiée (`docs/ROADMAP-v0.9.md`) avec 6 axes prêts à démarrer dès v0.8.50
-- Axe 6 (PG abstraction) déjà mergé en avance de phase (PR #1, 2026-06-03)
+- **Axe 6 (PG) très en avance** : abstraction + pool wiring + 001 schema + 002 FTS tsvector + migrate-to-postgres tool **tous mergés** (cf. mémoire `project_v090_trigger` qui acte l'exception). Reste seulement le refacto `Arc<dyn DbBackend>` pour basculer le runtime.
+- **Release autonomy livrée 5/5** : preflight, bump CLI, auto-changelog, Homebrew+forum, rollback — validée end-to-end sur v0.8.28
+- Forum-watch bot actif (poll cron 30 min, issues GitHub auto)
 - v0.8.50 = **trigger absolu** : tant qu'on n'y est pas, refus des features v0.9.0 (cf. mémoire `project_v090_trigger`)
 
 ---
@@ -156,10 +158,22 @@ sur le week-end 2-3 juin). Dates ajustables selon flux de bugs forum.
 ## Références
 
 - [ROADMAP-v0.9.md](ROADMAP-v0.9.md) — la cible après v0.8.50
-- [POSTGRES-PLAN.md](POSTGRES-PLAN.md) — axe 6 partiellement livré (abstraction)
+- [POSTGRES-PLAN.md](POSTGRES-PLAN.md) — axe 6 **largement avancé** (abstraction + pool + 001+002 schemas + migrate-to-postgres tool + FTS runtime) ; reste seulement le runtime DbBackend
+- [POSTGRES-DEPLOY.md](POSTGRES-DEPLOY.md) — runbook pour déployer Tune sur PG
+- [RELEASE-OPERATIONS.md](RELEASE-OPERATIONS.md) — runbook pour les releases (preflight/bump/changelog/rollback)
+- [RELEASE-AUTONOMY-v0.9.50.md](RELEASE-AUTONOMY-v0.9.50.md) — plan release autonomy (**5/5 livré**)
 - `docs/cahier-recette-v0.8.20.md` — test plan à re-valider à chaque palier
 - `docs/perf-baseline-2026-06-02.md` — point de départ perf (22884 tracks .15, P95 ≤ 3ms)
 - Memory `project_v090_trigger` — règle de gel v0.8.50
+
+---
+
+## Suivi des releases livrées
+
+| Tag | Date | Notes |
+|---|---|---|
+| v0.8.27 | 2026-06-03 | Bump avant lancement de la nouvelle release autonomy |
+| **v0.8.28** | **2026-06-03** | **Validation end-to-end du release pipeline** (preflight + bump CLI + auto-changelog + Homebrew tap + forum announce + Docker Hub). Premier tag avec l'infra autonomy complète. Aucune feature visible utilisateur. |
 
 ---
 
