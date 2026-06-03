@@ -262,20 +262,17 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
     let db = state.db.clone();
 
     tokio::spawn(async move {
-        let albums: Vec<(i64,)> = {
-            let conn = db.connection().lock().unwrap();
-            conn.prepare("SELECT id FROM albums")
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| Ok((row.get(0)?,)))
-                        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                })
-                .unwrap_or_default()
-        };
+        let albums: Vec<i64> = db
+            .query_many("SELECT id FROM albums", &[])
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.first().and_then(|v| v.as_i64()))
+            .collect();
 
         let track_repo = TrackRepo::new(db.clone());
         let album_repo = AlbumRepo::new(db);
         let mut updated = 0i32;
-        for (album_id,) in &albums {
+        for album_id in &albums {
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
             for track in &tracks {
                 if let Some(ref file_path) = track.file_path {
