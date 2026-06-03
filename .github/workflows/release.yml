@@ -272,3 +272,123 @@ jobs:
             artifacts/**/*.exe
             SHA256SUMS
           generate_release_notes: true
+
+  # ─── Release autonomy phase 4 — Homebrew + forum auto-publish ──────
+  # Docker Hub publication is handled separately by docker.yml on the
+  # same tag, so no docker job here.
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute new formula values
+        id: vals
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          # Source tarball published automatically by GitHub from the tag.
+          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          # Fetch the tarball and hash it; retry a few times since the
+          # archive can take a few seconds to appear after the release
+          # job completes.
+          for i in 1 2 3 4 5; do
+            if curl -fL --retry 0 -o source.tar.gz "$URL"; then break; fi
+            echo "fetch attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "url=$URL"         >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256"   >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: renesenses/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Patch Formula/tune-server.rb
+        working-directory: homebrew-tap
+        run: |
+          F=Formula/tune-server.rb
+          if [ ! -f "$F" ]; then
+            echo "::error::$F not found in tap repo"
+            exit 1
+          fi
+          # Rewrite url + sha256 + version. The formula uses
+          # `url "..."`, `sha256 "..."`, `version "..."` lines.
+          sed -i -E "s|^  url \".*\"|  url \"${{ steps.vals.outputs.url }}\"|" "$F"
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${{ steps.vals.outputs.sha256 }}\"|" "$F"
+          sed -i -E "s|^  version \".*\"|  version \"${{ steps.vals.outputs.version }}\"|" "$F"
+          echo "── New formula ──"
+          cat "$F"
+
+      - name: Commit and push to tap
+        working-directory: homebrew-tap
+        run: |
+          git config user.email "renesenses-bot@users.noreply.github.com"
+          git config user.name  "renesenses-bot"
+          git add Formula/tune-server.rb
+          git commit -m "tune-server v${{ steps.vals.outputs.version }}"
+          git push origin HEAD
+
+  forum:
+    name: Announce on mozaiklabs forum
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: cargo install git-cliff --locked
+
+      - name: Build release notes
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          git-cliff --tag "$VERSION" --latest --output FORUM_BODY.md
+          {
+            echo "Version $VERSION disponible — résumé :"
+            echo
+            cat FORUM_BODY.md
+            echo
+            echo "Téléchargements : https://github.com/${GITHUB_REPOSITORY}/releases/tag/$VERSION"
+            echo "Image Docker : \`renesenses/tune:$VERSION\` (multi-arch amd64/arm64)"
+            echo "Homebrew : \`brew tap renesenses/tap && brew install tune-server\`"
+          } > FORUM_BODY.md
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Post forum thread
+        env:
+          FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
+          VERSION: ${{ steps.notes.outputs.version }}
+        run: |
+          # Trim the body to a reasonable size (forum max ~10k).
+          BODY=$(head -c 8000 FORUM_BODY.md | python3 -c "import sys, json; print(json.dumps(sys.stdin.read()))")
+          TITLE="[Release] tune-server $VERSION disponible"
+          PAYLOAD=$(cat <<EOF
+          {
+            "title": "$TITLE",
+            "body": $BODY,
+            "category": "releases",
+            "pinned": true
+          }
+          EOF
+          )
+          STATUS=$(curl -s -o response.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $FORUM_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://mozaiklabs.fr/api/v1/forum/threads")
+          echo "HTTP $STATUS"
+          cat response.json
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ]; then
+            echo "::error::forum POST failed with HTTP $STATUS"
+            exit 1
+          fi
