@@ -10,6 +10,42 @@ pub async fn ffmpeg_pcm(
     seek_s: f64,
     duration_s: f64,
 ) -> Result<Vec<u8>, String> {
+    // Try symphonia first (pure Rust, no subprocess)
+    if super::decode::can_decode_native(file_path) {
+        let path = file_path.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            super::decode::decode_to_pcm(
+                &path,
+                Some(sample_rate),
+                Some(channels),
+                seek_s,
+                duration_s,
+            )
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))?;
+
+        match result {
+            Ok(decoded) => {
+                debug!(
+                    file = file_path,
+                    samples = decoded.samples.len(),
+                    "decoded_symphonia"
+                );
+                let bytes: Vec<u8> = decoded
+                    .samples
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect();
+                return Ok(bytes);
+            }
+            Err(e) => {
+                warn!(file = file_path, error = %e, "symphonia_fallback_to_ffmpeg");
+            }
+        }
+    }
+
+    // Fallback: ffmpeg subprocess (DSD, WavPack, APE, or symphonia failure)
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
