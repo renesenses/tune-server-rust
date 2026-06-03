@@ -920,6 +920,30 @@ impl OutputTarget for OaatOutput {
     }
 
     #[cfg(feature = "oaat")]
+    async fn set_next_url(
+        &self,
+        url: &str,
+        _mime_type: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(tx) = self.command_tx.lock().await.as_ref() {
+            tx.send(OaatCommand::PrepareNext {
+                url: url.to_owned(),
+                title: title.unwrap_or("Unknown").to_owned(),
+                artist: artist.unwrap_or("Unknown").to_owned(),
+                album: String::new(),
+                cover_url: None,
+                duration_ms: 0,
+            })
+            .await
+            .map_err(|e| format!("channel closed: {e}"))?;
+            info!(device = %self.name, title = ?title, "oaat: next track queued");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oaat")]
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         if let Some(tx) = self.command_tx.lock().await.as_ref() {
             tx.send(OaatCommand::PrepareNext {
