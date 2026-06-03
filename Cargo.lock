@@ -3631,7 +3631,9 @@ dependencies = [
  "clap",
  "clap_complete",
  "reqwest",
+ "rusqlite",
  "serde_json",
+ "sqlx",
  "tokio",
  "urlencoding",
 ]

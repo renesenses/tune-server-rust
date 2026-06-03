@@ -2,6 +2,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use serde_json::json;
 
+mod migrate;
+
 const DEFAULT_SERVER: &str = "http://localhost:8888";
 
 #[derive(Parser)]
@@ -80,6 +82,36 @@ enum Commands {
     Release {
         #[command(subcommand)]
         action: ReleaseAction,
+    },
+    /// Database tooling (offline — operates directly on the DB files)
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Copy a SQLite database into a PostgreSQL one (one-way).
+    /// The target DB must already be bootstrapped via
+    /// tune-core/migrations/postgres/001_initial_schema.sql.
+    /// Idempotent — re-runs use ON CONFLICT DO NOTHING.
+    MigrateToPostgres {
+        /// Source SQLite database file
+        #[arg(long, default_value = "tune.db")]
+        from: std::path::PathBuf,
+        /// Target PostgreSQL DSN (postgresql://user:pass@host/db)
+        #[arg(long)]
+        to: String,
+        /// Rows per INSERT batch (1..=10000)
+        #[arg(long, default_value = "500")]
+        batch_size: usize,
+        /// Restrict to a single table (debug). Default: migrate all.
+        #[arg(long)]
+        only_table: Option<String>,
+        /// Skip the row-count verification at the end (faster, less safe)
+        #[arg(long)]
+        skip_verify: bool,
     },
 }
 
@@ -310,6 +342,25 @@ async fn main() {
         }
     }
 
+    if let Commands::Db { action } = &cli.command {
+        let res = match action {
+            DbAction::MigrateToPostgres {
+                from,
+                to,
+                batch_size,
+                only_table,
+                skip_verify,
+            } => migrate::migrate(from, to, *batch_size, only_table.as_deref(), *skip_verify).await,
+        };
+        match res {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let client = Client::new(&cli.server, cli.json);
 
     let result = match &cli.command {
@@ -353,6 +404,7 @@ async fn main() {
         Commands::Oaat => client.get("/system/diagnostics/oaat").await,
         Commands::Completions { .. } => unreachable!(),
         Commands::Release { .. } => unreachable!(),
+        Commands::Db { .. } => unreachable!(),
     };
 
     match result {

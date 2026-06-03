@@ -8,6 +8,14 @@ license.workspace = true
 name = "tune"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the `tune db migrate-to-postgres` subcommand. Pulls in rusqlite
+# (read side) and sqlx-postgres (write side). Without this feature the
+# subcommand is still present in --help but returns an explicit
+# "rebuild with --features postgres" error.
+postgres = ["dep:rusqlite", "dep:sqlx"]
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
@@ -15,3 +23,5 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 urlencoding = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
