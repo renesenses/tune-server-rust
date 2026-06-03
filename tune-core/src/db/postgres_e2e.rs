@@ -27,11 +27,25 @@ async fn pg_backend() -> Option<Arc<dyn DbBackend>> {
     Some(Arc::new(PostgresBackend::new(pool)))
 }
 
-fn require_pg() -> Arc<dyn DbBackend> {
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(pg_backend())
-        .expect("TUNE_TEST_PG_URL must be set (see scripts/pg-e2e.sh)")
+/// Returns `Some(db)` when PG is available, `None` to skip the test.
+/// Uses a fresh single-thread runtime so the test function stays sync.
+fn try_pg() -> Option<Arc<dyn DbBackend>> {
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    rt.block_on(pg_backend())
+}
+
+/// Test-time guard that bails out cleanly when no PG is wired up.
+/// Use as `let db = pg_or_skip!();` at the top of every test.
+macro_rules! pg_or_skip {
+    () => {
+        match try_pg() {
+            Some(db) => db,
+            None => {
+                eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+                return;
+            }
+        }
+    };
 }
 
 /// Truncate every table the tests touch so each test starts clean.
@@ -60,7 +74,7 @@ fn pg_artists_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let repo = ArtistRepo::with_backend(db);
 
@@ -80,7 +94,7 @@ fn pg_albums_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::{Album, Artist};
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let aid = artist_repo.create(&Artist::new("Coltrane".into())).unwrap();
@@ -108,7 +122,7 @@ fn pg_tracks_round_trip() {
     use crate::db::models::{Artist, Track};
     use crate::db::track_repo::TrackRepo;
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let aid = artist_repo
@@ -135,7 +149,7 @@ fn pg_tracks_round_trip() {
 fn pg_zones_round_trip() {
     use crate::db::zone_repo::ZoneRepo;
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let repo = ZoneRepo::with_backend(db);
 
@@ -162,7 +176,7 @@ fn pg_playlists_round_trip() {
     use crate::db::playlist_repo::PlaylistRepo;
     use crate::db::track_repo::TrackRepo;
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let aid = artist_repo.create(&Artist::new("Test".into())).unwrap();
@@ -187,7 +201,7 @@ fn pg_playlists_round_trip() {
 fn pg_history_round_trip() {
     use crate::db::history_repo::{HistoryRepo, ListenRecord};
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     reset_schema(&db);
     let repo = HistoryRepo::with_backend(db);
 
@@ -224,7 +238,7 @@ fn pg_history_round_trip() {
 fn pg_settings_round_trip() {
     use crate::db::settings_repo::SettingsRepo;
 
-    let db = require_pg();
+    let db = pg_or_skip!();
     // settings table not in 001 — but settings_repo handles its own
     // schema bootstrap via the migration runner? No, the schema is
     // expected to be present. Skip if not.
