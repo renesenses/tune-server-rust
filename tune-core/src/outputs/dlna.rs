@@ -148,14 +148,15 @@ impl DlnaOutput {
             .unwrap_or_default();
 
         let art_tag = cover_url
+            .filter(|c| Self::is_valid_meta(Some(c)))
             .map(|c| {
                 let c = quick_xml::escape::escape(c);
-                format!("&lt;upnp:albumArtURI&gt;{c}&lt;/upnp:albumArtURI&gt;")
+                format!("&lt;upnp:albumArtURI dlna:profileID=&quot;JPEG_TN&quot;&gt;{c}&lt;/upnp:albumArtURI&gt;")
             })
             .unwrap_or_default();
 
         format!(
-            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
+            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
         )
     }
 
@@ -463,6 +464,20 @@ mod tests {
         assert!(didl.contains("Test Album"));
         assert!(didl.contains("albumArtURI"));
         assert!(didl.contains("cover.jpg"));
+        // Must include dlna:profileID for DLNA renderers (Denon DMP-A6 etc.)
+        assert!(
+            didl.contains("dlna:profileID"),
+            "albumArtURI must include dlna:profileID"
+        );
+        assert!(
+            didl.contains("JPEG_TN"),
+            "albumArtURI must use JPEG_TN profile"
+        );
+        // Must declare the dlna namespace
+        assert!(
+            didl.contains("xmlns:dlna"),
+            "DIDL-Lite must declare xmlns:dlna namespace"
+        );
     }
 
     #[test]

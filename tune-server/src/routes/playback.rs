@@ -117,7 +117,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", post(set_volume))
         .route("/{id}/shuffle", post(toggle_shuffle))
         .route("/{id}/repeat", post(set_repeat))
-        .route("/{id}/queue", get(get_queue))
+        .route("/{id}/queue", get(get_queue).delete(queue_clear))
         .route("/{id}/queue/add", post(queue_add))
         .route("/{id}/queue/move", post(queue_move))
         .route("/{id}/queue/jump", post(queue_jump))
@@ -730,6 +730,8 @@ async fn queue_remove(
     Path((zone_id, position)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::new(state.db);
+
+    // Try the local play_queue first.
     match queue_repo.remove_at(zone_id, position) {
         Ok(true) => {
             let new_length = queue_repo.count(zone_id).unwrap_or(0);
@@ -747,7 +749,31 @@ async fn queue_remove(
                 "playback.queue.track_removed",
                 json!({ "zone_id": zone_id, "position": position }),
             );
-            StatusCode::NO_CONTENT.into_response()
+            return Json(json!({ "queue_length": new_length })).into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Ok(false) => { /* fall through to streaming_queue */ }
+    }
+
+    // Fall back to the streaming_queue (Tidal, Qobuz, Deezer, etc.).
+    match queue_repo.remove_streaming_at(zone_id, position) {
+        Ok(true) => {
+            let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
+            let current_pos = state.playback.get_state(zone_id).await.queue_position;
+            let adjusted_pos = if position < current_pos {
+                current_pos - 1
+            } else {
+                current_pos
+            };
+            state
+                .playback
+                .update_queue_info(zone_id, adjusted_pos, new_length)
+                .await;
+            state.event_bus.emit(
+                "playback.queue.track_removed",
+                json!({ "zone_id": zone_id, "position": position }),
+            );
+            Json(json!({ "queue_length": new_length })).into_response()
         }
         Ok(false) => (
             StatusCode::NOT_FOUND,

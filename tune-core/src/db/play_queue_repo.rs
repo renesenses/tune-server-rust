@@ -134,6 +134,29 @@ pub mod sql {
         )
     }
 
+    pub fn delete_streaming_at<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM streaming_queue WHERE zone_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn reindex_streaming_after_delete<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_queue SET position = position - 1 WHERE zone_id = {} AND position > {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn count_streaming<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM streaming_queue WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
     pub const CREATE_STREAMING_QUEUE_SQLITE: &str = "CREATE TABLE IF NOT EXISTS streaming_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         zone_id INTEGER NOT NULL,
@@ -283,6 +306,47 @@ impl PlayQueueRepo {
             Ok(())
         })?;
         Ok(deleted > 0)
+    }
+
+    /// Remove a track from the streaming_queue at the given position.
+    /// Returns true if a row was actually deleted.
+    pub fn remove_streaming_at(&self, zone_id: i64, position: i64) -> Result<bool, String> {
+        // Ensure the streaming_queue table exists (SQLite-only lazy-create).
+        if self.db.engine() == Engine::Sqlite {
+            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
+        }
+        let delete_sql = self.dialect_sql(sql::delete_streaming_at, sql::delete_streaming_at);
+        let reindex_sql = self.dialect_sql(
+            sql::reindex_streaming_after_delete,
+            sql::reindex_streaming_after_delete,
+        );
+        let mut deleted = 0usize;
+        let deleted_ref = &mut deleted;
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+            *deleted_ref = tx.execute(&delete_sql, &p)?;
+            if *deleted_ref > 0 {
+                tx.execute(&reindex_sql, &p)?;
+            }
+            Ok(())
+        })?;
+        Ok(deleted > 0)
+    }
+
+    /// Count tracks in the streaming_queue for a zone.
+    pub fn count_streaming(&self, zone_id: i64) -> Result<i64, String> {
+        if self.db.engine() == Engine::Sqlite {
+            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
+        }
+        let count_sql = self.dialect_sql(sql::count_streaming, sql::count_streaming);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let n = self
+            .db
+            .query_one(&count_sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        Ok(n)
     }
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
