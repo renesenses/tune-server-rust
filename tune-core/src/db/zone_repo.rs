@@ -124,14 +124,35 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        let conn = self.db.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql::list_all()).map_err(|e| e.to_string())?;
-        let zones = stmt
+        // First try the read connection (cheap, no contention with writes).
+        let query = sql::list_all();
+        let read_zones: Vec<Zone> = {
+            let conn = self.db.read_connection().lock().unwrap();
+            let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| Ok(row_to_zone(row)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+
+        // WAL visibility: the read-only connection takes a snapshot at
+        // open time and may not see commits from the write connection
+        // until the snapshot is released. For a 0-result list — which
+        // is the symptom users saw on the "zone disappears after
+        // create" P0 (#2, #6) — re-query through the write connection
+        // which always sees its own commits.
+        // Same pattern as 8af95ec on play_queue/queue.
+        if !read_zones.is_empty() {
+            return Ok(read_zones);
+        }
+        let wconn = self.db.connection().lock().unwrap();
+        let mut wstmt = wconn.prepare(&query).map_err(|e| e.to_string())?;
+        let write_zones = wstmt
             .query_map([], |row| Ok(row_to_zone(row)))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        Ok(zones)
+        Ok(write_zones)
     }
 
     pub fn create(
@@ -480,10 +501,17 @@ mod tests {
 
     #[test]
     fn create_zone_during_open_transaction() {
-        // Verify that zone creation works even when a scan transaction is open.
-        // The zone is created via the write connection (within the scan's transaction).
-        // list() uses the read connection, so it won't see the zone until the
-        // scan commits — this is correct WAL behavior.
+        // Verify that zone creation is visible to list() even while a
+        // scan transaction is still open on the write connection.
+        //
+        // This is the regression fix for forum bugs #2 (Dimitri,
+        // macOS) and #6 (Dominique COMET, Windows): "zone créée"
+        // flashed green then disappeared because list() used the
+        // read-only connection whose snapshot pre-dated the commit.
+        //
+        // The fix: when the read connection returns 0 zones, fall
+        // back to the write connection, which always sees its own
+        // pending writes.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = SqliteDb::open(path.to_str().unwrap()).unwrap();
@@ -499,15 +527,17 @@ mod tests {
             .unwrap();
         assert!(id > 0);
 
-        // In WAL mode, the read connection sees the pre-transaction state.
-        // The zone will be visible after the scan commits.
+        // With the fix in place, list() now sees the zone even though
+        // the scan hasn't committed yet — the write-connection
+        // fallback exposes the pending insert.
         let zones_before_commit = repo.list().unwrap();
-        assert_eq!(zones_before_commit.len(), 0);
+        assert_eq!(zones_before_commit.len(), 1);
+        assert_eq!(zones_before_commit[0].name, "Living Room");
 
         // Commit the scan transaction
         db.execute_batch("COMMIT").unwrap();
 
-        // Now the zone is visible via the read connection
+        // Still visible after commit (now via the read connection).
         let zones_after_commit = repo.list().unwrap();
         assert_eq!(zones_after_commit.len(), 1);
         assert_eq!(zones_after_commit[0].name, "Living Room");
