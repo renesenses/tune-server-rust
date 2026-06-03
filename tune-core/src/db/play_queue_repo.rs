@@ -274,6 +274,10 @@ impl PlayQueueRepo {
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
         self.db
             .execute(&sql::delete_for_zone(&self.db.dialect()), &[&zone_id])?;
+        // Also clear streaming_queue so GET /queue returns empty for both types
+        self.db
+            .execute(&sql::delete_streaming(&self.db.dialect()), &[&zone_id])
+            .ok();
         Ok(())
     }
 

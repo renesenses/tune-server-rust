@@ -253,7 +253,9 @@ async fn play(
                         )
                     })
                     .collect();
-                queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
+                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                }
                 state
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
@@ -329,7 +331,9 @@ async fn play(
                         )
                     })
                     .collect();
-                queue_repo.set_streaming_queue(zone_id, &queue_items).ok();
+                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                }
                 state
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
@@ -346,6 +350,13 @@ async fn play(
         && body.track_id.is_none()
         && body.track_ids.is_none()
     {
+        let source_id_val = body.source_id.clone().unwrap_or_default();
+        let title_val = body.title.clone().unwrap_or_default();
+        let artist_val = body.artist_name.clone().unwrap_or_default();
+        let album_val = body.album_title.clone();
+        let cover_val = body.cover_path.clone();
+        let duration_val = body.duration_ms.unwrap_or(0);
+
         let output_device_id = body.output_device_id.or_else(|| {
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
             zone_repo
@@ -367,7 +378,22 @@ async fn play(
             duration_ms: body.duration_ms,
         };
         return match state.orchestrator.play(orch_req).await {
-            Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
+            Ok(_) => {
+                // Persist single streaming track to DB so GET /queue returns it
+                let queue_item = vec![(
+                    source_id_val,
+                    title_val,
+                    artist_val,
+                    album_val,
+                    cover_val,
+                    duration_val,
+                )];
+                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
+                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                }
+                state.playback.update_queue_info(zone_id, 0, 1).await;
+                Json(build_zone_json(&state, zone_id).await).into_response()
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
     }

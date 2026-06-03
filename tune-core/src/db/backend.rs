@@ -171,6 +171,118 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
     }
 }
 
+// ─── Postgres bridging ────────────────────────────────────────────────
+
+/// PostgresBackend: sqlx::PgPool wrapped to fit the DbBackend trait.
+///
+/// The trait is synchronous but sqlx is async; the impl bridges via
+/// `tokio::task::block_in_place` + `Handle::current().block_on(...)`.
+/// That requires a multi-threaded tokio runtime — Tune uses
+/// `#[tokio::main]` which provides one by default.
+///
+/// `last_insert_rowid`: Postgres has no equivalent of SQLite's
+/// last_insert_rowid(), but every Tune INSERT that needs the new PK
+/// goes through `RETURNING id` (added by `dialect.returning_id_clause`).
+/// The impl detects `RETURNING id` in the SQL and routes through
+/// `fetch_one` to capture the id into an internal mutex, exposed via
+/// `last_insert_rowid()`.
+#[cfg(feature = "postgres")]
+pub struct PostgresBackend {
+    pool: sqlx::PgPool,
+    last_id: std::sync::Arc<std::sync::Mutex<i64>>,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresBackend {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            pool,
+            last_id: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn bind_sqlvalue<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    v: &SqlValue,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match v {
+        SqlValue::Null => q.bind::<Option<String>>(None),
+        SqlValue::Bool(b) => q.bind(*b),
+        SqlValue::Int(i) => q.bind(*i),
+        SqlValue::Real(f) => q.bind(*f),
+        SqlValue::Text(s) => q.bind(s.clone()),
+        SqlValue::Blob(b) => q.bind(b.clone()),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn bind_sqlvalue_scalar<'q>(
+    q: sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments>,
+    v: &SqlValue,
+) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments> {
+    match v {
+        SqlValue::Null => q.bind::<Option<String>>(None),
+        SqlValue::Bool(b) => q.bind(*b),
+        SqlValue::Int(i) => q.bind(*i),
+        SqlValue::Real(f) => q.bind(*f),
+        SqlValue::Text(s) => q.bind(s.clone()),
+        SqlValue::Blob(b) => q.bind(b.clone()),
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl DbBackend for PostgresBackend {
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
+
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let pool = self.pool.clone();
+        let last_id_handle = self.last_id.clone();
+        let sql_owned = sql.to_string();
+        // Case-insensitive check for the conventional `RETURNING id` tail.
+        let returning = sql_owned
+            .to_ascii_uppercase()
+            .trim_end_matches(';')
+            .trim_end()
+            .ends_with("RETURNING ID");
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                if returning {
+                    let mut q = sqlx::query_scalar::<_, i64>(&sql_owned);
+                    for v in &owned {
+                        q = bind_sqlvalue_scalar(q, v);
+                    }
+                    let id = q
+                        .fetch_one(&pool)
+                        .await
+                        .map_err(|e| format!("pg execute (returning): {e}"))?;
+                    *last_id_handle.lock().unwrap() = id;
+                    Ok(1)
+                } else {
+                    let mut q = sqlx::query(&sql_owned);
+                    for v in &owned {
+                        q = bind_sqlvalue(q, v);
+                    }
+                    let result = q
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| format!("pg execute: {e}"))?;
+                    Ok(result.rows_affected() as usize)
+                }
+            })
+        })
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        *self.last_id.lock().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
