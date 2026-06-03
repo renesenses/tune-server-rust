@@ -19,7 +19,7 @@
 
 ---
 
-## v0.8.30 — Stabilisation immédiate des bugs forum (~3 semaines)
+## v0.8.30 — Stabilisation immédiate des bugs forum (~3 jours)
 
 **Thème** : absorber les remontées des testeurs on-mag arrivés en mai-juin. Aucune nouvelle feature.
 
@@ -47,7 +47,7 @@
 
 ---
 
-## v0.8.40 — Performance + self-service Windows (~4 semaines)
+## v0.8.40 — Performance + self-service Windows (~1 semaine)
 
 **Thème** : préparer l'afflux post-article on-mag et baseliner la perf avant la roadmap 500K+ (axe 4 v0.9.0).
 
@@ -81,7 +81,7 @@
 
 ---
 
-## v0.8.50 — Gel features + ouverture release/v0.9 (~2 semaines)
+## v0.8.50 — Gel features + ouverture release/v0.9 (~4-5 jours)
 
 **Thème** : verrouillage. Aucune feature, uniquement consolidation.
 
@@ -132,9 +132,9 @@ Si une opportunité commerciale (article presse, démo) demande une de ces featu
 
 ## Cadence et rituels
 
-- **Patch releases hebdo** (v0.8.28, v0.8.29, ... v0.8.49) au rythme des fixes
-- **Bilan tous les 5 patches** (v0.8.30, v0.8.35, v0.8.40, v0.8.45) — point sur les critères de sortie restants
-- **Réponse forum** : 48h SLA tant que < v0.8.40, 24h après
+- **Patch releases plusieurs fois par jour** au rythme des fixes (cadence actuelle 5-7 patches/jour)
+- **Bilan à chaque palier dizaine** (v0.8.30, v0.8.40, v0.8.50) — point sur les critères de sortie restants
+- **Réponse forum** : 24h SLA dès maintenant (la cadence quotidienne le permet déjà)
 - **Test plan** (cahier de recette) re-validé à chaque palier majeur (v0.8.30, v0.8.40, v0.8.50)
 
 ---
@@ -143,11 +143,13 @@ Si une opportunité commerciale (article presse, démo) demande une de ces featu
 
 | Palier | Cible date | Nom interne |
 |--------|------------|-------------|
-| v0.8.30 | 2026-06-24 | "Stabilisation forum" |
-| v0.8.40 | 2026-07-22 | "Self-service Windows + perf baseline" |
-| v0.8.50 | 2026-08-05 | "Gel + ouverture v0.9" |
+| v0.8.30 | 2026-06-06 | "Stabilisation forum" |
+| v0.8.40 | 2026-06-13 | "Self-service Windows + perf baseline" |
+| v0.8.50 | 2026-06-18 | "Gel + ouverture v0.9" |
 
-(Dates indicatives, ajustables selon flux de bugs.)
+Cadence calibrée sur le rythme observé : 5-7 patches/jour (cf. sessions mai-juin :
+v0.7.96→v0.7.100 le 17 mai, v0.8.14→v0.8.19 le 1er juin, v0.8.22→v0.8.27
+sur le week-end 2-3 juin). Dates ajustables selon flux de bugs forum.
 
 ---
 
