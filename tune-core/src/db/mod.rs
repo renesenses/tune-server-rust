@@ -9,6 +9,8 @@ pub mod play_queue_repo;
 pub mod playlist_repo;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
