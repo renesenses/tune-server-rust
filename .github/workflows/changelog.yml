@@ -84,6 +84,11 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Required because tag-push checks out a detached HEAD on the
+          # tagged commit, not on a branch. Without `base`, the action
+          # fails with: "When the repository is checked out on a commit
+          # instead of a branch, the 'base' input must be supplied."
+          base: main
           commit-message: "docs(changelog): refresh for ${{ steps.resolve.outputs.tag }}"
           branch: "changelog/${{ steps.resolve.outputs.tag }}"
           title: "docs(changelog): refresh for ${{ steps.resolve.outputs.tag }}"
