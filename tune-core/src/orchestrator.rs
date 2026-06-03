@@ -454,11 +454,9 @@ impl PlaybackOrchestrator {
                 32 => "pcm_s32le",
                 _ => "pcm_s16le",
             };
-            let ffmpeg_fmt = match bd {
-                24 => "s24le",
-                32 => "s32le",
-                _ => "s16le",
-            };
+            // Use WAV muxer instead of raw PCM — more widely supported by
+            // minimal FFmpeg builds (e.g., --enable-muxer='flac,wav' only).
+            let ffmpeg_fmt = "wav";
             let upstream = stream_data.url.clone();
             let sr = stream_data.quality.sample_rate;
             tokio::spawn(async move {
@@ -485,21 +483,33 @@ impl PlaybackOrchestrator {
                     .stdin(std::process::Stdio::null())
                     .kill_on_drop(true)
                     .spawn();
-                if let Ok(mut child) = child {
-                    if let Some(stdout) = child.stdout.take() {
-                        let mut reader = tokio::io::BufReader::with_capacity(65536, stdout);
-                        let mut buf = vec![0u8; 32768];
-                        loop {
-                            match reader.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if tx.send(buf[..n].to_vec()).await.is_err() {
-                                        break;
+                match child {
+                    Ok(mut child) => {
+                        if let Some(stdout) = child.stdout.take() {
+                            let mut reader = tokio::io::BufReader::with_capacity(65536, stdout);
+                            let mut buf = vec![0u8; 32768];
+                            loop {
+                                match reader.read(&mut buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                                            break;
+                                        }
                                     }
+                                    Err(_) => break,
                                 }
-                                Err(_) => break,
                             }
                         }
+                        if let Some(mut stderr) = child.stderr.take() {
+                            let mut err_buf = String::new();
+                            let _ = stderr.read_to_string(&mut err_buf).await;
+                            if !err_buf.trim().is_empty() {
+                                tracing::warn!(stderr = %err_buf.trim(), "oaat_ffmpeg_stderr");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "oaat_ffmpeg_spawn_failed");
                     }
                 }
             });
