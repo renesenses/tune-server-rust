@@ -185,6 +185,14 @@ pub trait SqlDialect {
     /// SQLite: `EXISTS (SELECT 1 FROM json_each(<column>) WHERE LOWER(value) = LOWER(<placeholder>))`
     /// Postgres: `EXISTS (SELECT 1 FROM jsonb_array_elements_text(<column>::jsonb) AS x(v) WHERE LOWER(v) = LOWER(<placeholder>))`
     fn json_array_contains_lower(&self, column: &str, placeholder: &str) -> String;
+
+    /// Extract the hour (0-23) from a timestamp column as an integer.
+    /// Used by `history_repo::full_dashboard` for hourly listening
+    /// distribution.
+    ///
+    /// SQLite: `CAST(strftime('%H', <column>) AS INTEGER)`
+    /// Postgres: `EXTRACT(HOUR FROM <column>::timestamp)::int`
+    fn extract_hour(&self, column: &str) -> String;
 }
 
 /// Zero-cost dialect for SQLite. Repos hold one of these.
@@ -238,6 +246,10 @@ impl SqlDialect for SqliteDialect {
         format!(
             "EXISTS (SELECT 1 FROM json_each({column}) WHERE LOWER(value) = LOWER({placeholder}))"
         )
+    }
+
+    fn extract_hour(&self, column: &str) -> String {
+        format!("CAST(strftime('%H', {column}) AS INTEGER)")
     }
 }
 
@@ -305,6 +317,10 @@ impl SqlDialect for PostgresDialect {
         format!(
             "EXISTS (SELECT 1 FROM jsonb_array_elements_text({column}::jsonb) AS x(v) WHERE LOWER(v) = LOWER({placeholder}))"
         )
+    }
+
+    fn extract_hour(&self, column: &str) -> String {
+        format!("EXTRACT(HOUR FROM {column}::timestamp)::int")
     }
 }
 

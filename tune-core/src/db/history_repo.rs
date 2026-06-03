@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
@@ -111,29 +110,15 @@ pub struct ListenRecord {
 
 pub struct HistoryRepo {
     db: Arc<dyn DbBackend>,
-    /// SQLite-specific handle for the `full_dashboard` method whose
-    /// 300-LOC dynamic SQL hasn't been ported yet (see
-    /// docs/PORTING-HISTORY-REPO-PLAN.md Group C). Populated when the
-    /// repo is constructed via `new(SqliteDb)`; `None` when constructed
-    /// via `with_backend(Arc<dyn DbBackend>)`, in which case
-    /// `full_dashboard` returns an explicit "not implemented" error.
-    /// Removed once `full_dashboard` is ported in a dedicated commit.
-    sqlite_legacy: Option<SqliteDb>,
 }
 
 impl HistoryRepo {
     pub fn new(db: SqliteDb) -> Self {
-        Self {
-            sqlite_legacy: Some(db.clone()),
-            db: Arc::new(db),
-        }
+        Self { db: Arc::new(db) }
     }
 
     pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
-        Self {
-            db,
-            sqlite_legacy: None,
-        }
+        Self { db }
     }
 
     fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
@@ -289,10 +274,15 @@ impl HistoryRepo {
         })
     }
 
-    /// Rich dashboard. **Not yet ported to `Arc<dyn DbBackend>`** —
-    /// uses the SQLite legacy handle (300 LOC of dynamic SQL with 10
-    /// sub-queries to abstract). Returns an error when constructed via
-    /// `with_backend`. Plan: docs/PORTING-HISTORY-REPO-PLAN.md Group C.
+    /// Rich dashboard matching the web client `DashboardData` type.
+    /// Now fully ported through `Arc<dyn DbBackend>` — uses the date
+    /// dialect helpers (`since_days`, `date_trunc_day`, `extract_hour`,
+    /// `now_iso8601`) so the same SQL emission paths work on both
+    /// SQLite and Postgres.
+    ///
+    /// `period`: "7d", "30d", "90d", "all" (default 30d).
+    /// `zone_id`: optional filter.
+    /// `top_n`: how many items per top list.
     pub fn full_dashboard(
         &self,
         period: &str,
@@ -300,14 +290,6 @@ impl HistoryRepo {
         _profile_id: Option<i64>,
         top_n: i64,
     ) -> Result<DashboardData, String> {
-        let db = self.sqlite_legacy.as_ref().ok_or_else(|| {
-            "full_dashboard: not yet implemented for non-SQLite backends \
-             (docs/PORTING-HISTORY-REPO-PLAN.md Group C)"
-                .to_string()
-        })?;
-        let conn = db.read_connection().lock().unwrap();
-
-        let mut conditions: Vec<String> = Vec::new();
         let days: Option<i64> = match period {
             "7d" => Some(7),
             "30d" => Some(30),
@@ -315,25 +297,30 @@ impl HistoryRepo {
             "all" => None,
             other => other.trim_end_matches('d').parse::<i64>().ok(),
         };
-        if let Some(d) = days {
-            conditions.push(format!(
-                "listened_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{d} days')"
-            ));
-        }
-        if let Some(zid) = zone_id {
-            conditions.push(format!("h.zone_id = {zid}"));
-        }
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
+
+        // Build WHERE clauses using the date dialect helpers. We need
+        // two flavors: `simple_where` for queries without table alias,
+        // `aliased_where` for queries that use `h.` aliasing.
+        let dialect_since = |col: &str, n: i64| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.since_days(col, n),
+            Engine::Postgres => PostgresDialect.since_days(col, n),
+        };
+        let dialect_now = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.now_iso8601().to_string(),
+            Engine::Postgres => PostgresDialect.now_iso8601().to_string(),
+        };
+        let dialect_day = |col: &str| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.date_trunc_day(col),
+            Engine::Postgres => PostgresDialect.date_trunc_day(col),
+        };
+        let dialect_hour = |col: &str| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.extract_hour(col),
+            Engine::Postgres => PostgresDialect.extract_hour(col),
         };
 
         let mut simple_conditions: Vec<String> = Vec::new();
         if let Some(d) = days {
-            simple_conditions.push(format!(
-                "listened_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{d} days')"
-            ));
+            simple_conditions.push(dialect_since("listened_at", d));
         }
         if let Some(zid) = zone_id {
             simple_conditions.push(format!("zone_id = {zid}"));
@@ -344,252 +331,250 @@ impl HistoryRepo {
             format!("WHERE {}", simple_conditions.join(" AND "))
         };
 
-        let from: Option<String> = if days.is_some() {
-            conn.query_row(
-                &format!("SELECT MIN(listened_at) FROM listen_history {simple_where}"),
-                [],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten()
+        let mut aliased_conditions: Vec<String> = Vec::new();
+        if let Some(d) = days {
+            aliased_conditions.push(dialect_since("listened_at", d));
+        }
+        if let Some(zid) = zone_id {
+            aliased_conditions.push(format!("h.zone_id = {zid}"));
+        }
+        let where_clause = if aliased_conditions.is_empty() {
+            String::new()
         } else {
-            conn.query_row("SELECT MIN(listened_at) FROM listen_history", [], |row| {
-                row.get(0)
-            })
+            format!("WHERE {}", aliased_conditions.join(" AND "))
+        };
+
+        // ── Range ──
+        let from_sql = if days.is_some() {
+            format!("SELECT MIN(listened_at) FROM listen_history {simple_where}")
+        } else {
+            "SELECT MIN(listened_at) FROM listen_history".to_string()
+        };
+        let from: Option<String> = self
+            .db
+            .query_one(&from_sql, &[])
             .ok()
             .flatten()
-        };
-        let to: String = conn
-            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
-                row.get(0)
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()));
+        let to: String = self
+            .db
+            .query_one(&format!("SELECT {dialect_now}"), &[])?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .unwrap_or_default();
+
+        // ── Totals ──
+        let totals_sql = format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(duration_ms), 0),
+                    COUNT(DISTINCT title || COALESCE(artist_name, '')),
+                    COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL THEN artist_name END)
+             FROM listen_history {simple_where}"
+        );
+        let totals_row = self
+            .db
+            .query_one(&totals_sql, &[])?
+            .ok_or("totals query returned no row")?;
+        let plays = totals_row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+        let listening_ms = totals_row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        let u_tracks = totals_row.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+        let u_artists = totals_row.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
+
+        // ── Top artists ──
+        let artists_sql = format!(
+            "SELECT artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+             FROM listen_history
+             {simple_where} {and_or} artist_name IS NOT NULL
+             GROUP BY artist_name ORDER BY plays DESC LIMIT {top_n}",
+            and_or = if simple_where.is_empty() {
+                "WHERE"
+            } else {
+                "AND"
+            },
+        );
+        let top_artists: Vec<TopArtistEntry> = self
+            .db
+            .query_many(&artists_sql, &[])?
+            .into_iter()
+            .map(|cols| TopArtistEntry {
+                artist_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?;
+            .collect();
 
-        let (plays, listening_ms, u_tracks, u_artists): (i64, i64, i64, i64) = conn
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*),
-                            COALESCE(SUM(duration_ms), 0),
-                            COUNT(DISTINCT title || COALESCE(artist_name, '')),
-                            COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL THEN artist_name END)
-                     FROM listen_history {simple_where}"
-                ),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|e| e.to_string())?;
-
-        let top_artists = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-                     FROM listen_history
-                     {simple_where} {and_or} artist_name IS NOT NULL
-                     GROUP BY artist_name ORDER BY plays DESC LIMIT ?",
-                    and_or = if simple_where.is_empty() {
-                        "WHERE"
-                    } else {
-                        "AND"
-                    },
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map(params![top_n], |row| {
-                Ok(TopArtistEntry {
-                    artist_name: row.get(0)?,
-                    plays: row.get(1)?,
-                    listening_ms: row.get(2)?,
-                })
+        // ── Top albums ──
+        let albums_sql = format!(
+            "SELECT h.album_title, h.artist_name, a.cover_path, COUNT(*) as plays
+             FROM listen_history h
+             LEFT JOIN albums a ON a.title = h.album_title
+             {where_clause} {and_or} h.album_title IS NOT NULL
+             GROUP BY h.album_title, h.artist_name, a.cover_path
+             ORDER BY plays DESC LIMIT {top_n}",
+            and_or = if where_clause.is_empty() {
+                "WHERE"
+            } else {
+                "AND"
+            },
+        );
+        let top_albums: Vec<TopAlbumEntry> = self
+            .db
+            .query_many(&albums_sql, &[])?
+            .into_iter()
+            .map(|cols| TopAlbumEntry {
+                album_title: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                artist_name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                cover_path: cols.get(2).and_then(|v| v.as_string()),
+                plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let top_albums = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT h.album_title, h.artist_name, a.cover_path, COUNT(*) as plays
-                     FROM listen_history h
-                     LEFT JOIN albums a ON a.title = h.album_title
-                     {where_clause} {and_or} h.album_title IS NOT NULL
-                     GROUP BY h.album_title, h.artist_name
-                     ORDER BY plays DESC LIMIT ?",
-                    and_or = if where_clause.is_empty() {
-                        "WHERE"
-                    } else {
-                        "AND"
-                    },
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map(params![top_n], |row| {
-                Ok(TopAlbumEntry {
-                    album_title: row.get(0)?,
-                    artist_name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    cover_path: row.get(2)?,
-                    plays: row.get(3)?,
-                })
+        // ── Top tracks ──
+        let tracks_sql = format!(
+            "SELECT MAX(track_id), title, artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+             FROM listen_history
+             {simple_where}
+             GROUP BY title, artist_name ORDER BY plays DESC LIMIT {top_n}"
+        );
+        let top_tracks: Vec<TopTrackEntry> = self
+            .db
+            .query_many(&tracks_sql, &[])?
+            .into_iter()
+            .map(|cols| TopTrackEntry {
+                track_id: cols.first().and_then(|v| v.as_i64()),
+                title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                artist_name: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let top_tracks = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT track_id, title, artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-                     FROM listen_history
-                     {simple_where}
-                     GROUP BY title, artist_name ORDER BY plays DESC LIMIT ?"
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map(params![top_n], |row| {
-                Ok(TopTrackEntry {
-                    track_id: row.get(0)?,
-                    title: row.get(1)?,
-                    artist_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    plays: row.get(3)?,
-                    listening_ms: row.get(4)?,
-                })
+        // ── Trend (daily) ──
+        let trend_days = days.unwrap_or(365);
+        let trend_zone_and = match zone_id {
+            Some(zid) => format!("AND zone_id = {zid}"),
+            None => String::new(),
+        };
+        let trend_sql = format!(
+            "SELECT {} as day, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+             FROM listen_history
+             WHERE {} {trend_zone_and}
+             GROUP BY day ORDER BY day",
+            dialect_day("listened_at"),
+            dialect_since("listened_at", trend_days)
+        );
+        let trend: Vec<TrendEntry> = self
+            .db
+            .query_many(&trend_sql, &[])?
+            .into_iter()
+            .map(|cols| TrendEntry {
+                day: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let trend = {
-            let trend_days = days.unwrap_or(365);
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT DATE(listened_at) as day, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-                     FROM listen_history
-                     WHERE listened_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{trend_days} days')
-                     {zone_and}
-                     GROUP BY day ORDER BY day",
-                    zone_and = if let Some(zid) = zone_id {
-                        format!("AND zone_id = {zid}")
-                    } else {
-                        String::new()
-                    },
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok(TrendEntry {
-                    day: row.get(0)?,
-                    plays: row.get(1)?,
-                    listening_ms: row.get(2)?,
-                })
+        // ── Hourly distribution ──
+        let hourly_sql = format!(
+            "SELECT {} as hour, COUNT(*) as plays
+             FROM listen_history
+             {simple_where}
+             GROUP BY hour ORDER BY hour",
+            dialect_hour("listened_at")
+        );
+        let hourly: Vec<HourlyEntry> = self
+            .db
+            .query_many(&hourly_sql, &[])?
+            .into_iter()
+            .map(|cols| HourlyEntry {
+                hour: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let hourly = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT CAST(strftime('%H', listened_at) AS INTEGER) as hour, COUNT(*) as plays
-                     FROM listen_history
-                     {simple_where}
-                     GROUP BY hour ORDER BY hour"
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok(HourlyEntry {
-                    hour: row.get(0)?,
-                    plays: row.get(1)?,
-                })
+        // ── By zone ──
+        let by_zone_sql = format!(
+            "SELECT h.zone_id, z.name, COUNT(*) as plays, COALESCE(SUM(h.duration_ms), 0) as ms
+             FROM listen_history h
+             LEFT JOIN zones z ON z.id = h.zone_id
+             {where_clause}
+             GROUP BY h.zone_id, z.name ORDER BY plays DESC"
+        );
+        let by_zone: Vec<ByZoneEntry> = self
+            .db
+            .query_many(&by_zone_sql, &[])?
+            .into_iter()
+            .map(|cols| ByZoneEntry {
+                zone_id: cols.first().and_then(|v| v.as_i64()),
+                zone_name: cols.get(1).and_then(|v| v.as_string()),
+                plays: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let by_zone = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT h.zone_id, z.name, COUNT(*) as plays, COALESCE(SUM(h.duration_ms), 0) as ms
-                     FROM listen_history h
-                     LEFT JOIN zones z ON z.id = h.zone_id
-                     {where_clause}
-                     GROUP BY h.zone_id ORDER BY plays DESC"
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok(ByZoneEntry {
-                    zone_id: row.get(0)?,
-                    zone_name: row.get(1)?,
-                    plays: row.get(2)?,
-                    listening_ms: row.get(3)?,
-                })
+        // ── By source ──
+        let by_source_sql = format!(
+            "SELECT source, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+             FROM listen_history
+             {simple_where}
+             GROUP BY source ORDER BY plays DESC"
+        );
+        let by_source: Vec<BySourceEntry> = self
+            .db
+            .query_many(&by_source_sql, &[])?
+            .into_iter()
+            .map(|cols| BySourceEntry {
+                source: cols.first().and_then(|v| v.as_string()),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
+            .collect();
 
-        let by_source = {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT source, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-                     FROM listen_history
-                     {simple_where}
-                     GROUP BY source ORDER BY plays DESC"
-                ))
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok(BySourceEntry {
-                    source: row.get(0)?,
-                    plays: row.get(1)?,
-                    listening_ms: row.get(2)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        // ── Completion stats ──
+        let inner_where = if simple_conditions.is_empty() {
+            String::new()
+        } else {
+            // Re-build the WHERE with `lh.` prefix on column names.
+            // simple_conditions hold either a `since_days(listened_at,
+            // N)` clause (which already references `listened_at` —
+            // need `lh.listened_at`) or `zone_id = N` (need
+            // `lh.zone_id`). Easier: just emit the lh-prefixed form
+            // directly here rather than try to mangle the strings.
+            let mut lh: Vec<String> = Vec::new();
+            if let Some(d) = days {
+                lh.push(dialect_since("lh.listened_at", d));
+            }
+            if let Some(zid) = zone_id {
+                lh.push(format!("lh.zone_id = {zid}"));
+            }
+            format!("WHERE {}", lh.join(" AND "))
         };
-
-        let completion = conn
-            .query_row(
-                &format!(
-                    "SELECT
-                        COUNT(CASE WHEN duration_ms >= 30000 THEN 1 END),
-                        COUNT(CASE WHEN duration_ms < 30000 THEN 1 END),
-                        COALESCE(AVG(duration_ms), 0),
-                        COALESCE((SELECT AVG(t.duration_ms) FROM listen_history lh
-                                  LEFT JOIN tracks t ON t.id = lh.track_id
-                                  {simple_where_inner} {and_or_inner} t.duration_ms IS NOT NULL), 0)
-                     FROM listen_history
-                     {simple_where}",
-                    simple_where_inner = if simple_conditions.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "WHERE {}",
-                            simple_conditions
-                                .iter()
-                                .map(|c| format!("lh.{c}"))
-                                .collect::<Vec<_>>()
-                                .join(" AND ")
-                        )
-                    },
-                    and_or_inner = if simple_conditions.is_empty() {
-                        "WHERE"
-                    } else {
-                        "AND"
-                    },
-                ),
-                [],
-                |row| {
-                    Ok(CompletionStats {
-                        completed: row.get(0)?,
-                        skipped: row.get(1)?,
-                        avg_listened_ms: row.get::<_, f64>(2).unwrap_or(0.0) as i64,
-                        avg_track_duration_ms: row.get::<_, f64>(3).unwrap_or(0.0) as i64,
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())?;
+        let inner_and_or = if simple_conditions.is_empty() {
+            "WHERE"
+        } else {
+            "AND"
+        };
+        let completion_sql = format!(
+            "SELECT
+                COUNT(CASE WHEN duration_ms >= 30000 THEN 1 END),
+                COUNT(CASE WHEN duration_ms < 30000 THEN 1 END),
+                COALESCE(AVG(duration_ms), 0),
+                COALESCE((SELECT AVG(t.duration_ms) FROM listen_history lh
+                          LEFT JOIN tracks t ON t.id = lh.track_id
+                          {inner_where} {inner_and_or} t.duration_ms IS NOT NULL), 0)
+             FROM listen_history
+             {simple_where}"
+        );
+        let comp_row = self
+            .db
+            .query_one(&completion_sql, &[])?
+            .ok_or("completion query returned no row")?;
+        let completion = CompletionStats {
+            completed: comp_row.first().and_then(|v| v.as_i64()).unwrap_or(0),
+            skipped: comp_row.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            avg_listened_ms: comp_row.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
+            avg_track_duration_ms: comp_row.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
+        };
 
         Ok(DashboardData {
             period: period.to_string(),
@@ -947,7 +932,10 @@ mod tests {
     }
 
     #[test]
-    fn with_backend_constructor_rejects_full_dashboard() {
+    fn with_backend_constructor_full_dashboard() {
+        // full_dashboard now works through DbBackend — no more
+        // sqlite_legacy. Smoke test that it returns a valid struct on
+        // a fresh DB (empty results, but no panic / SQL error).
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
@@ -957,7 +945,7 @@ mod tests {
             id: None,
             track_id: None,
             title: "via-backend".into(),
-            artist_name: None,
+            artist_name: Some("X".into()),
             album_title: None,
             source: "local".into(),
             duration_ms: 0,
@@ -966,6 +954,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
-        assert!(repo.full_dashboard("7d", None, None, 10).is_err());
+        let dash = repo.full_dashboard("7d", None, None, 10).unwrap();
+        assert_eq!(dash.totals.plays, 1);
+        assert_eq!(dash.totals.unique_artists, 1);
     }
 }

@@ -27,18 +27,14 @@ async fn pg_backend() -> Option<Arc<dyn DbBackend>> {
     Some(Arc::new(PostgresBackend::new(pool)))
 }
 
-/// Returns `Some(db)` when PG is available, `None` to skip the test.
-/// Uses a fresh single-thread runtime so the test function stays sync.
-fn try_pg() -> Option<Arc<dyn DbBackend>> {
-    let rt = tokio::runtime::Runtime::new().ok()?;
-    rt.block_on(pg_backend())
-}
-
 /// Test-time guard that bails out cleanly when no PG is wired up.
-/// Use as `let db = pg_or_skip!();` at the top of every test.
+/// Use as `let db = pg_or_skip!();` at the top of every #[tokio::test]
+/// test function. Must be called inside a Tokio runtime because the
+/// PostgresBackend methods use `block_in_place` + `block_on` and
+/// expect to be reached from one.
 macro_rules! pg_or_skip {
     () => {
-        match try_pg() {
+        match pg_backend().await {
             Some(db) => db,
             None => {
                 eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
@@ -69,8 +65,8 @@ fn reset_schema(db: &Arc<dyn DbBackend>) {
     }
 }
 
-#[test]
-fn pg_artists_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_artists_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::Artist;
 
@@ -88,8 +84,8 @@ fn pg_artists_round_trip() {
     assert_eq!(by_name.and_then(|a| a.id), Some(id));
 }
 
-#[test]
-fn pg_albums_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_albums_round_trip() {
     use crate::db::album_repo::AlbumRepo;
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::{Album, Artist};
@@ -116,8 +112,8 @@ fn pg_albums_round_trip() {
     assert_eq!(again.id, Some(id));
 }
 
-#[test]
-fn pg_tracks_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_tracks_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::{Artist, Track};
     use crate::db::track_repo::TrackRepo;
@@ -145,8 +141,8 @@ fn pg_tracks_round_trip() {
     assert!(paths.contains("/music/time.flac"));
 }
 
-#[test]
-fn pg_zones_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_zones_round_trip() {
     use crate::db::zone_repo::ZoneRepo;
 
     let db = pg_or_skip!();
@@ -169,8 +165,8 @@ fn pg_zones_round_trip() {
     assert_eq!(all.len(), 1);
 }
 
-#[test]
-fn pg_playlists_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_playlists_round_trip() {
     use crate::db::artist_repo::ArtistRepo;
     use crate::db::models::{Artist, Track};
     use crate::db::playlist_repo::PlaylistRepo;
@@ -197,8 +193,8 @@ fn pg_playlists_round_trip() {
     assert_eq!(ids, vec![tid]);
 }
 
-#[test]
-fn pg_history_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_history_round_trip() {
     use crate::db::history_repo::{HistoryRepo, ListenRecord};
 
     let db = pg_or_skip!();
@@ -234,8 +230,8 @@ fn pg_history_round_trip() {
     );
 }
 
-#[test]
-fn pg_settings_round_trip() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_settings_round_trip() {
     use crate::db::settings_repo::SettingsRepo;
 
     let db = pg_or_skip!();

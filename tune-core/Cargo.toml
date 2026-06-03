@@ -38,6 +38,7 @@ regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
 rubato = { workspace = true }
+hound = { workspace = true }
 oaat-core = { workspace = true, optional = true }
 oaat-controller = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
