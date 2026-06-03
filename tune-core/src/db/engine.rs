@@ -53,6 +53,53 @@ impl fmt::Display for Engine {
     }
 }
 
+/// Format a user-supplied search query for the engine's FTS dialect.
+///
+/// Splits on whitespace, strips non-alphanumeric chars (defensive), and
+/// joins per engine:
+/// - SQLite FTS5: `term1 term2*` (space-separated, prefix on last)
+/// - Postgres tsquery: `term1 & term2:*` (AND, prefix on last)
+///
+/// Returns an empty string if the input has no usable tokens, so the
+/// caller can short-circuit to a LIKE-only path.
+pub fn format_fts_query(engine: Engine, raw: &str) -> String {
+    let tokens: Vec<String> = raw
+        .split_whitespace()
+        .map(|t| {
+            t.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let mut owned = tokens;
+    let last = owned.pop().expect("non-empty");
+    match engine {
+        Engine::Sqlite => {
+            // FTS5 accepts space-separated tokens with implicit AND.
+            let prefix = if owned.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", owned.join(" "))
+            };
+            format!("{prefix}{last}*")
+        }
+        Engine::Postgres => {
+            // tsquery requires explicit operators between tokens; the
+            // prefix marker `:*` only goes on the last token.
+            let prefix = if owned.is_empty() {
+                String::new()
+            } else {
+                format!("{} & ", owned.join(" & "))
+            };
+            format!("{prefix}{last}:*")
+        }
+    }
+}
+
 /// SQL dialect helpers: the small fragments that diverge between SQLite
 /// and PostgreSQL. Repos that want to be engine-agnostic build their
 /// queries via these helpers.
@@ -254,6 +301,50 @@ mod tests {
             p.fts_where("artists", "a", &p.placeholder(1)),
             "a.search_tsv @@ to_tsquery('simple', unaccent($1))"
         );
+    }
+
+    #[test]
+    fn format_fts_query_single_word() {
+        assert_eq!(format_fts_query(Engine::Sqlite, "miles"), "miles*");
+        assert_eq!(format_fts_query(Engine::Postgres, "miles"), "miles:*");
+    }
+
+    #[test]
+    fn format_fts_query_multi_word() {
+        // Multi-word inputs are AND-joined per engine syntax. This is
+        // the bug that crashed tsquery in the v0.8.28 PG smoke test.
+        assert_eq!(
+            format_fts_query(Engine::Sqlite, "miles davis"),
+            "miles davis*"
+        );
+        assert_eq!(
+            format_fts_query(Engine::Postgres, "miles davis"),
+            "miles & davis:*"
+        );
+    }
+
+    #[test]
+    fn format_fts_query_strips_punctuation() {
+        assert_eq!(
+            format_fts_query(Engine::Postgres, "rock & roll!"),
+            "rock & roll:*"
+        );
+        // The user's `&` is stripped along with other non-alphanumerics
+        // before we re-introduce it as the tsquery AND operator.
+    }
+
+    #[test]
+    fn format_fts_query_empty_returns_empty() {
+        assert_eq!(format_fts_query(Engine::Sqlite, ""), "");
+        assert_eq!(format_fts_query(Engine::Postgres, "   !!!"), "");
+    }
+
+    #[test]
+    fn format_fts_query_handles_unicode_letters() {
+        // is_alphanumeric() accepts the Stromaé é; that's fine — we
+        // rely on PG's unaccent() to handle the diacritics downstream
+        // at query time.
+        assert_eq!(format_fts_query(Engine::Postgres, "stromaé"), "stromaé:*");
     }
 
     #[test]

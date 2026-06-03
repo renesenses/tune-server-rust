@@ -694,10 +694,7 @@ impl AlbumRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
-        let fts_query = match self.db.engine() {
-            crate::db::engine::Engine::Sqlite => format!("{query}*"),
-            crate::db::engine::Engine::Postgres => format!("{query}:*"),
-        };
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn

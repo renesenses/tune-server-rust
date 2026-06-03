@@ -276,12 +276,8 @@ impl ArtistRepo {
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
-        // FTS5 uses bare `term*` for prefix; tsquery uses `term:*`.
-        // The repo formats per engine so callers don't have to.
-        let fts_query = match self.db.engine() {
-            crate::db::engine::Engine::Sqlite => format!("{query}*"),
-            crate::db::engine::Engine::Postgres => format!("{query}:*"),
-        };
+        // Engine-specific tokenization + prefix wrapping.
+        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let conn = self.db.read_connection().lock().unwrap();
         let mut stmt = conn
