@@ -163,6 +163,26 @@ async fn set_player_volume(
     }
 }
 
+async fn power_player(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PowerBody>,
+) -> impl IntoResponse {
+    let host = lms_host(&state);
+    let label = if body.state == 1 { "on" } else { "off" };
+    match lms_request(
+        &state.http_client,
+        &host,
+        &id,
+        vec![json!("power"), json!(body.state)],
+    )
+    .await
+    {
+        Ok(result) => Json(json!({"power": label, "result": result})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 async fn discover_players(State(state): State<AppState>) -> impl IntoResponse {
     match discover_and_register(&state).await {
         Ok(registered) => Json(json!({
