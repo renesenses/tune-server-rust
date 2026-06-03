@@ -114,6 +114,37 @@ pub fn can_passthrough(
 }
 
 impl AudioFormat {
+    /// Returns true if this format is lossless (preserves all audio data).
+    pub fn is_lossless(&self) -> bool {
+        matches!(
+            self,
+            Self::Flac
+                | Self::Wav
+                | Self::Dsd
+                | Self::Alac
+                | Self::Aiff
+                | Self::WavPack
+                | Self::Ape
+        )
+    }
+
+    /// Human-readable format name in uppercase (e.g. "FLAC", "WAV", "DSD").
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Flac => "FLAC",
+            Self::Wav => "WAV",
+            Self::Mp3 => "MP3",
+            Self::Aac => "AAC",
+            Self::Alac => "ALAC",
+            Self::Ogg => "OGG",
+            Self::Opus => "OPUS",
+            Self::Aiff => "AIFF",
+            Self::Dsd => "DSD",
+            Self::WavPack => "WavPack",
+            Self::Ape => "APE",
+        }
+    }
+
     /// Returns true if this format needs FFmpeg transcoding before DLNA streaming.
     /// FLAC, WAV, MP3, AAC can be served as raw files; everything else must be transcoded.
     pub fn needs_transcode_for_dlna(&self) -> bool {

@@ -7,9 +7,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use tune_core::db::zone_repo::ZoneRepo;
+use tune_core::audio::formats::AudioFormat;
+use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::zone_repo::{Zone, ZoneRepo};
 use tune_core::discovery::xml_parser::fetch_device_description;
 use tune_core::outputs::dlna::DlnaOutput;
+use tune_core::playback::{PlayState, ZoneState};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -210,6 +213,170 @@ pub async fn create_zone_handler(
     create_zone(state, body).await
 }
 
+/// Build the `signal_path` object for a zone's current playback.
+/// Returns `None` when the zone is not playing.
+fn build_signal_path(
+    ps: &ZoneState,
+    zone: &Zone,
+    db: &tune_core::db::sqlite::SqliteDb,
+) -> Option<Value> {
+    if ps.state == PlayState::Stopped {
+        return None;
+    }
+
+    let np = ps.now_playing.as_ref()?;
+
+    // Look up track details for format/sample_rate/bit_depth
+    let track = np
+        .track_id
+        .and_then(|tid| TrackRepo::new(db.clone()).get(tid).ok().flatten());
+
+    let fmt_str = track
+        .as_ref()
+        .and_then(|t| t.format.clone())
+        .unwrap_or_else(|| "flac".into());
+    let source_format = AudioFormat::from_extension(&fmt_str);
+    let sample_rate = track.as_ref().and_then(|t| t.sample_rate).unwrap_or(44100);
+    let bit_depth = track.as_ref().and_then(|t| t.bit_depth).unwrap_or(16);
+
+    let format_name = source_format
+        .as_ref()
+        .map(|f| f.display_name())
+        .unwrap_or("Unknown");
+    let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
+
+    let output_type = zone.output_type.as_deref().unwrap_or("local");
+
+    // Determine if DSP is active
+    let dsp_enabled = ZoneRepo::new(db.clone())
+        .get_dsp_config(zone.id.unwrap_or(0))
+        .map(|(preset_id, enabled)| enabled && preset_id.is_some())
+        .unwrap_or(false);
+
+    // Volume at 100% means no software volume adjustment
+    let volume_full = ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
+
+    // Check transcoding per output type
+    let is_oaat = output_type == "oaat";
+    let needs_transcode_dlna = source_format
+        .as_ref()
+        .is_some_and(|f| f.needs_transcode_for_dlna());
+    // OAAT transcodes everything to WAV except WAV itself
+    let oaat_transcodes = is_oaat
+        && source_format
+            .as_ref()
+            .is_some_and(|f| *f != AudioFormat::Wav);
+
+    let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
+        "dlna" | "openhome" => {
+            if needs_transcode_dlna {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "DLNA/UPnP", target.display_name())
+            } else {
+                (true, "DLNA/UPnP", format_name)
+            }
+        }
+        "oaat" => {
+            if oaat_transcodes {
+                (false, "OAAT", "WAV")
+            } else {
+                (true, "OAAT", "WAV")
+            }
+        }
+        "airplay" => (false, "AirPlay", "ALAC"),
+        "chromecast" => (false, "Chromecast", "Transcoded"),
+        "local" => (true, "Local", format_name),
+        other => (false, other, format_name),
+    };
+
+    // Overall bit-perfect: lossless source + no transcoding + full volume + no DSP
+    let bit_perfect = is_lossless && transport_bit_perfect && volume_full && !dsp_enabled;
+
+    // Build steps
+    let source_desc = if sample_rate >= 1000 {
+        format!(
+            "{format_name} {sr}kHz/{bit_depth}bit",
+            sr = sample_rate / 1000
+        )
+    } else {
+        format!("{format_name} {sample_rate}Hz/{bit_depth}bit")
+    };
+
+    let mut steps = vec![json!({
+        "name": "Source",
+        "description": source_desc,
+        "bit_perfect": true,
+    })];
+
+    // Decoder step
+    steps.push(json!({
+        "name": "Decoder",
+        "description": format_name,
+        "bit_perfect": is_lossless,
+    }));
+
+    // Transcoding step (only if transcoding occurs)
+    let transcode_active = needs_transcode_dlna
+        || oaat_transcodes
+        || output_type == "airplay"
+        || output_type == "chromecast";
+    if transcode_active {
+        steps.push(json!({
+            "name": "Transcoder",
+            "description": format!("{format_name} \u{2192} {output_format_name}"),
+            "bit_perfect": false,
+        }));
+    }
+
+    // Volume step
+    if !volume_full {
+        steps.push(json!({
+            "name": "Volume",
+            "description": format!("{}%", (ps.volume * 100.0).round() as i32),
+            "bit_perfect": false,
+        }));
+    }
+
+    // DSP step
+    if dsp_enabled {
+        steps.push(json!({
+            "name": "DSP",
+            "description": "EQ/DSP active",
+            "bit_perfect": false,
+        }));
+    }
+
+    // Transport step
+    let renderer_name = zone.output_device_id.as_deref().unwrap_or(output_type);
+    steps.push(json!({
+        "name": "Transport",
+        "description": transport_desc,
+        "bit_perfect": transport_bit_perfect,
+    }));
+
+    steps.push(json!({
+        "name": "Renderer",
+        "description": renderer_name,
+        "bit_perfect": transport_bit_perfect,
+    }));
+
+    // Build summary
+    let bp_label = if bit_perfect { " (bit-perfect)" } else { "" };
+    let summary = if transcode_active {
+        format!(
+            "{format_name} \u{2192} {output_format_name} transcode \u{2192} {transport_desc}{bp_label}"
+        )
+    } else {
+        format!("{format_name} \u{2192} {transport_desc}{bp_label}")
+    };
+
+    Some(json!({
+        "bit_perfect": bit_perfect,
+        "summary": summary,
+        "steps": steps,
+    }))
+}
+
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::new(state.db.clone());
     let zones = repo.list().unwrap_or_default();
@@ -238,6 +405,8 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     z.volume as f64 / 100.0
                 }),
             );
+            let signal_path = build_signal_path(&ps, z, &state.db);
+            obj.insert("signal_path".into(), json!(signal_path));
         }
         result.push(v);
     }
@@ -245,7 +414,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::new(state.db.clone());
     match repo.get(id) {
         Ok(Some(zone)) => {
             let ps = state.playback.get_state(id).await;
@@ -263,6 +432,8 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
+                let signal_path = build_signal_path(&ps, &zone, &state.db);
+                obj.insert("signal_path".into(), json!(signal_path));
             }
             Json(v).into_response()
         }
