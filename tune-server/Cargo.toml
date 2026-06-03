@@ -33,6 +33,9 @@ futures-util = { workspace = true }
 socket2 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 time = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

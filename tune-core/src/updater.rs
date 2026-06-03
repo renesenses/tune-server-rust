@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/mozaiklabs/tune-server/releases/latest";
+    "https://api.github.com/repos/renesenses/tune-server-rust/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
