@@ -10,6 +10,8 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tracing::debug;
 
+use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
+
 pub struct DecodedAudio {
     pub samples: Vec<i16>,
     pub sample_rate: u32,
@@ -25,7 +27,7 @@ pub fn can_decode_native(file_path: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg"
+        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "dsf" | "dff"
     )
 }
 
@@ -36,6 +38,24 @@ pub fn decode_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    // Check for DSD formats — use native parser instead of symphonia
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if ext == "dsf" || ext == "dff" {
+        return decode_dsd_to_pcm(
+            file_path,
+            &ext,
+            target_sample_rate,
+            target_channels,
+            seek_s,
+            max_duration_s,
+        );
+    }
+
     let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -150,6 +170,72 @@ pub fn decode_to_pcm(
     })
 }
 
+/// Decode a DSD file (DSF or DFF) to PCM using native parsers.
+fn decode_dsd_to_pcm(
+    file_path: &str,
+    ext: &str,
+    target_sample_rate: Option<u32>,
+    _target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    let (dsd_rate, channels, dsd_data) = if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        let data = super::dsf::read_dsf_blocks(file_path, &info)?;
+        (info.sample_rate, info.channels as usize, data)
+    } else {
+        let info = super::dff::parse_dff(file_path)?;
+        let data = super::dff::read_dff_data(file_path, &info)?;
+        (info.sample_rate, info.channels as usize, data)
+    };
+
+    let lsb_first = ext == "dsf";
+    let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+
+    let converter = DsdToPcmConverter::new(dsd_rate, output_rate, channels, lsb_first);
+    let all_samples = converter.process_to_i16(&dsd_data);
+
+    // Apply seek and duration limits on the output PCM
+    let skip_frames = if seek_s > 0.0 {
+        (seek_s * output_rate as f64) as usize
+    } else {
+        0
+    };
+    let skip_samples = skip_frames * channels;
+
+    let max_frames = if max_duration_s > 0.0 {
+        (max_duration_s * output_rate as f64) as usize
+    } else {
+        usize::MAX
+    };
+    let max_samples = max_frames.saturating_mul(channels);
+
+    let start = skip_samples.min(all_samples.len());
+    let end = (start + max_samples).min(all_samples.len());
+    let trimmed = &all_samples[start..end];
+
+    let actual_frames = trimmed.len() / channels;
+    let actual_duration = actual_frames as f64 / output_rate as f64;
+
+    debug!(
+        file = file_path,
+        ext,
+        dsd_rate,
+        output_rate,
+        channels,
+        samples = trimmed.len(),
+        duration_s = actual_duration,
+        "decoded_dsd_native"
+    );
+
+    Ok(DecodedAudio {
+        samples: trimmed.to_vec(),
+        sample_rate: output_rate,
+        channels: channels as u32,
+        duration_s: actual_duration,
+    })
+}
+
 #[cfg(test)]
 mod decode_integration_tests {
     use super::*;
@@ -169,9 +255,9 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.wav"));
         assert!(can_decode_native("song.m4a"));
         assert!(can_decode_native("song.ogg"));
+        assert!(can_decode_native("song.dsf"));
+        assert!(can_decode_native("song.dff"));
         assert!(!can_decode_native("song.aiff"));
-        assert!(!can_decode_native("song.dsf"));
-        assert!(!can_decode_native("song.dff"));
         assert!(!can_decode_native("song.ape"));
         assert!(!can_decode_native("song.wv"));
     }
@@ -269,8 +355,8 @@ mod decode_integration_tests {
     }
 
     #[test]
-    fn dsf_not_native() {
-        assert!(!can_decode_native("test.dsf"));
-        assert!(!can_decode_native("test.dff"));
+    fn dsf_is_native() {
+        assert!(can_decode_native("test.dsf"));
+        assert!(can_decode_native("test.dff"));
     }
 }
