@@ -1,3 +1,4 @@
+pub mod aiff;
 pub mod analyzer;
 pub mod decode;
 pub mod encoder;

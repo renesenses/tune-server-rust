@@ -25,7 +25,7 @@ pub fn can_decode_native(file_path: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg"
+        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "aiff" | "aif"
     )
 }
 
@@ -36,6 +36,16 @@ pub fn decode_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    // AIFF/AIF: use native parser instead of symphonia
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "aiff" || ext == "aif" {
+        return super::aiff::decode_aiff_to_pcm(file_path, seek_s, max_duration_s);
+    }
+
     let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -169,7 +179,8 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.wav"));
         assert!(can_decode_native("song.m4a"));
         assert!(can_decode_native("song.ogg"));
-        assert!(!can_decode_native("song.aiff"));
+        assert!(can_decode_native("song.aiff"));
+        assert!(can_decode_native("song.aif"));
         assert!(!can_decode_native("song.dsf"));
         assert!(!can_decode_native("song.dff"));
         assert!(!can_decode_native("song.ape"));
@@ -226,13 +237,16 @@ mod decode_integration_tests {
     }
 
     #[test]
-    fn decode_aiff_falls_back() {
+    fn decode_aiff_native() {
         let path = fixture_path("test.aiff");
-        let result = decode_to_pcm(&path, None, None, 0.0, 0.0);
-        // AIFF not fully supported by symphonia — expected to fail (ffmpeg fallback needed)
+        let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
+        assert!(!result.samples.is_empty(), "AIFF should produce samples");
+        assert_eq!(result.sample_rate, 44100);
+        assert_eq!(result.channels, 2);
         assert!(
-            result.is_err(),
-            "AIFF should fail in symphonia (needs ffmpeg fallback)"
+            result.duration_s > 0.9 && result.duration_s < 1.1,
+            "duration should be ~1s, got {}",
+            result.duration_s
         );
     }
 
