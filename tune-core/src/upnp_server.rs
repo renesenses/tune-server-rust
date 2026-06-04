@@ -12,6 +12,7 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use tracing::{debug, warn};
 
@@ -240,7 +241,11 @@ fn parse_browse_request(soap_xml: &str) -> (String, String, u64, u64) {
                 current_tag.clear();
             }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default().to_string();
+                let decoded = e.decode().unwrap_or_default();
+                let text = match unescape(&decoded) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => decoded.to_string(),
+                };
                 if text.trim().is_empty() {
                     continue;
                 }

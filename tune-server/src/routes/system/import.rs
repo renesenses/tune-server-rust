@@ -543,7 +543,12 @@ fn parse_jriver_xml(
                         if let Ok(quick_xml::events::Event::Text(t)) =
                             reader.read_event_into(&mut buf)
                         {
-                            fields.insert(field_name, t.unescape().unwrap_or_default().to_string());
+                            let decoded = t.decode().unwrap_or_default();
+                            let val = match quick_xml::escape::unescape(&decoded) {
+                                Ok(s) => s.to_string(),
+                                Err(_) => decoded.to_string(),
+                            };
+                            fields.insert(field_name, val);
                         }
                     }
                 }

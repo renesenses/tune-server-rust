@@ -1,4 +1,5 @@
 use quick_xml::Reader;
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use std::collections::HashMap;
 use tracing::debug;
@@ -126,7 +127,11 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
                 current_tag.clear();
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or_default().trim().to_string();
+                let decoded = e.decode().unwrap_or_default();
+                let text = match unescape(&decoded) {
+                    Ok(s) => s.trim().to_string(),
+                    Err(_) => decoded.trim().to_string(),
+                };
                 if text.is_empty() {
                     continue;
                 }
