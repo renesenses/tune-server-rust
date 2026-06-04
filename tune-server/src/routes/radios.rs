@@ -151,9 +151,12 @@ async fn play_radio(
     state.playback.play(zone_id, np).await;
 
     let (output_sent, output_error) = if let Some(ref did) = device_id {
-        let outputs = state.outputs.lock().await;
-        if let Some(output) = outputs.get(did) {
-            let output = output.lock().await;
+        let output_arc = {
+            let outputs = state.outputs.lock().await;
+            outputs.get(did)
+        };
+        if let Some(output_arc) = output_arc {
+            let output = output_arc.lock().await;
             let media = tune_core::outputs::PlayMedia {
                 url: &radio.url,
                 mime_type: "audio/aac",

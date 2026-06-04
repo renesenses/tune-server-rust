@@ -166,12 +166,14 @@ impl PositionPoller {
             } // already handled below
 
             let status = {
-                let outputs = self.outputs.lock().await;
-                let output = match outputs.get(&device_id) {
-                    Some(o) => o,
-                    None => continue,
+                let output_arc = {
+                    let outputs = self.outputs.lock().await;
+                    match outputs.get(&device_id) {
+                        Some(o) => o,
+                        None => continue,
+                    }
                 };
-                let output = output.lock().await;
+                let output = output_arc.lock().await;
                 match output.get_status().await {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -245,12 +247,14 @@ impl PositionPoller {
             ps.total_polls += 1;
             let poll_start = Instant::now();
             let status = {
-                let outputs = self.outputs.lock().await;
-                let output = match outputs.get(&device_id) {
-                    Some(o) => o,
-                    None => continue,
+                let output_arc = {
+                    let outputs = self.outputs.lock().await;
+                    match outputs.get(&device_id) {
+                        Some(o) => o,
+                        None => continue,
+                    }
                 };
-                let output = output.lock().await;
+                let output = output_arc.lock().await;
                 match output.get_status().await {
                     Ok(s) => {
                         ps.consecutive_errors = 0;
@@ -676,9 +680,12 @@ impl PositionPoller {
             .await
         {
             Ok(resolved) => {
-                let outputs = self.outputs.lock().await;
-                if let Some(output) = outputs.get(device_id) {
-                    let output = output.lock().await;
+                let output_arc = {
+                    let outputs = self.outputs.lock().await;
+                    outputs.get(device_id)
+                };
+                if let Some(output_arc) = output_arc {
+                    let output = output_arc.lock().await;
                     let media = crate::outputs::PlayMedia {
                         url: &resolved.url,
                         mime_type: &resolved.mime_type,

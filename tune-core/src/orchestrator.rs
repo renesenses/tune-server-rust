@@ -557,15 +557,20 @@ impl PlaybackOrchestrator {
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
     ) -> (bool, Option<String>) {
-        let outputs = self.outputs.lock().await;
-        if let Some(output) = outputs.get(device_id) {
-            let output = output.lock().await;
+        let output_arc = {
+            let outputs = self.outputs.lock().await;
+            outputs.get(device_id)
+        };
+        if let Some(output_arc) = output_arc {
+            let output = output_arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
+                    drop(output);
                     info!(device_id, "output_play_sent");
                     (true, None)
                 }
                 Err(e) => {
+                    drop(output);
                     warn!(device_id, error = %e, "output_play_failed");
                     (false, Some(format!("Output device error: {e}")))
                 }
