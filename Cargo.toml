@@ -48,7 +48,7 @@ cbc = "0.1"
 regex = "1"
 csv = "1"
 symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg"] }
-rubato = "0.14"
+rubato = "3"
 hound = "3.5"
 unicode-normalization = "0.1"
 oaat-core = { version = "0.2.0", default-features = false }
