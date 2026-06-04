@@ -79,6 +79,7 @@ impl AppState {
             streamer: streamer.clone(),
             services: services.clone(),
             outputs: outputs.clone(),
+            advertised_ip: tune_config.advertised_ip.clone(),
         });
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);

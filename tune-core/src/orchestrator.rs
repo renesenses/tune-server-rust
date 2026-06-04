@@ -24,6 +24,7 @@ pub struct PlaybackOrchestrator {
     pub streamer: Arc<AudioStreamer>,
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
+    pub advertised_ip: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,14 @@ pub struct ResolvedQueueItem {
 }
 
 impl PlaybackOrchestrator {
+    fn server_ip(&self) -> String {
+        self.advertised_ip.clone().unwrap_or_else(|| {
+            crate::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into())
+        })
+    }
+
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
         // Clean up previous stream session for this zone
         let prev_state = self.playback.get_state(req.zone_id).await;
@@ -92,7 +101,7 @@ impl PlaybackOrchestrator {
         self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
 
         let output_sent = if let Some(ref device_id) = req.output_device_id {
-            let resolved_cover_url = Self::resolve_cover_url(cover_path.as_deref());
+            let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
             let media = crate::outputs::traits::PlayMedia {
                 url: &stream_url,
                 mime_type: &mime_type,
@@ -370,9 +379,7 @@ impl PlaybackOrchestrator {
             (session_id, mime, fmt.clone())
         };
 
-        let server_ip = crate::discovery::ssdp::get_local_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".into());
+        let server_ip = self.server_ip();
         let stream_url = self
             .streamer
             .get_stream_url(&session_id, &server_ip, &out_ext);
@@ -503,15 +510,13 @@ impl PlaybackOrchestrator {
     /// absolute HTTP URL accessible by network renderers (DLNA/OpenHome).
     /// Hash-only values like `"abc123def"` become `http://IP:PORT/api/v1/artwork/abc123def`.
     /// Full URLs (starting with `http://` or `https://`) are passed through unchanged.
-    fn resolve_cover_url(cover: Option<&str>) -> Option<String> {
+    fn resolve_cover_url(&self, cover: Option<&str>) -> Option<String> {
         let c = cover?;
         if c.starts_with("http://") || c.starts_with("https://") {
             return Some(c.to_string());
         }
         // It's a local artwork hash — build an absolute URL
-        let server_ip = crate::discovery::ssdp::get_local_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".into());
+        let server_ip = self.server_ip();
         // Use the streamer port (same as API server port)
         let port = std::env::var("TUNE_PORT")
             .ok()
@@ -921,7 +926,7 @@ impl PlaybackOrchestrator {
                 title: item.title.clone().unwrap_or_default(),
                 artist_name: item.artist_name.clone(),
                 album_title: item.album_title.clone(),
-                cover_path: Self::resolve_cover_url(cover_path.as_deref()),
+                cover_path: self.resolve_cover_url(cover_path.as_deref()),
                 duration_ms: item.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
@@ -947,7 +952,7 @@ impl PlaybackOrchestrator {
                 title,
                 artist_name: artist,
                 album_title: album,
-                cover_path: Self::resolve_cover_url(cover.as_deref()),
+                cover_path: self.resolve_cover_url(cover.as_deref()),
                 duration_ms: duration,
                 source,
                 source_id: item["source_id"].as_str().map(String::from),
@@ -1000,7 +1005,7 @@ impl PlaybackOrchestrator {
             title,
             artist,
             album,
-            cover_url: Self::resolve_cover_url(raw_cover.as_deref()),
+            cover_url: self.resolve_cover_url(raw_cover.as_deref()),
             duration_ms: None,
         })
     }
@@ -1048,6 +1053,7 @@ mod tests {
             streamer: Arc::new(AudioStreamer::new(0)),
             services: Arc::new(Mutex::new(ServiceRegistry::new())),
             outputs: Arc::new(Mutex::new(OutputRegistry::new())),
+            advertised_ip: None,
         }
     }
 
@@ -1279,19 +1285,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_cover_url_passthrough() {
-        // Full URLs pass through unchanged
-        let result =
-            PlaybackOrchestrator::resolve_cover_url(Some("https://img.tidal.com/cover.jpg"));
+        let orch = test_orchestrator();
+        let result = orch.resolve_cover_url(Some("https://img.tidal.com/cover.jpg"));
         assert_eq!(result.as_deref(), Some("https://img.tidal.com/cover.jpg"));
 
-        let result = PlaybackOrchestrator::resolve_cover_url(Some("http://local/art.png"));
+        let result = orch.resolve_cover_url(Some("http://local/art.png"));
         assert_eq!(result.as_deref(), Some("http://local/art.png"));
     }
 
     #[tokio::test]
     async fn test_resolve_cover_url_hash() {
-        // Hash values get wrapped in a local artwork URL
-        let result = PlaybackOrchestrator::resolve_cover_url(Some("abc123def"));
+        let orch = test_orchestrator();
+        let result = orch.resolve_cover_url(Some("abc123def"));
         let url = result.unwrap();
         assert!(
             url.contains("/api/v1/library/artwork/abc123def"),
@@ -1302,7 +1307,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_cover_url_none() {
-        assert!(PlaybackOrchestrator::resolve_cover_url(None).is_none());
+        let orch = test_orchestrator();
+        assert!(orch.resolve_cover_url(None).is_none());
     }
 
     #[tokio::test]

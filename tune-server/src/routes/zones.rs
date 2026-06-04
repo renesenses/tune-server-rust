@@ -540,17 +540,8 @@ async fn create_zone(
     match repo.create(&body.name, output_type, output_device_id) {
         Ok(id) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
-            state.event_bus.emit(
-                "zone.created",
-                json!({
-                    "id": id,
-                    "name": &body.name,
-                    "output_type": output_type,
-                    "output_device_id": output_device_id,
-                }),
-            );
 
-            // Return the full zone object so the web client can use it directly
+            // Build the full zone object for both HTTP response and WS event
             let zone = repo.get(id).ok().flatten();
             let mut v = zone
                 .as_ref()
@@ -564,6 +555,15 @@ async fn create_zone(
                 let vol = zone.as_ref().map(|z| z.volume).unwrap_or(50);
                 obj.insert("volume".into(), json!(vol as f64 / 100.0));
             }
+
+            // Emit with full zone data so clients can merge without re-fetching
+            state.event_bus.emit(
+                "zone.created",
+                json!({
+                    "id": id,
+                    "zone": &v,
+                }),
+            );
 
             (StatusCode::CREATED, Json(v)).into_response()
         }

@@ -12,6 +12,10 @@ use tune_core::db::track_repo::TrackRepo;
 
 use super::artwork_cache_dir;
 
+fn is_hex_hash(s: &str) -> bool {
+    (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Deserialize)]
 pub(super) struct ProxyQuery {
     url: String,
@@ -60,7 +64,11 @@ pub(super) async fn album_artwork(
         if cover_path.starts_with("http") {
             return axum::response::Redirect::temporary(cover_path).into_response();
         }
-        let hash = tune_core::artwork::artwork_hash(cover_path);
+        let hash = if is_hex_hash(cover_path) {
+            cover_path.to_string()
+        } else {
+            tune_core::artwork::artwork_hash(cover_path)
+        };
         return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
             .into_response();
     }

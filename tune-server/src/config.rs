@@ -27,6 +27,8 @@ pub struct TuneConfig {
     pub acoustid_api_key: Option<String>,
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub advertised_ip: Option<String>,
 }
 
 impl TuneConfig {
@@ -58,7 +60,19 @@ impl Default for TuneConfig {
             discogs_token: None,
             acoustid_api_key: None,
             openai_api_key: None,
+            advertised_ip: None,
         }
+    }
+}
+
+impl TuneConfig {
+    pub fn server_ip(&self) -> String {
+        if let Some(ref ip) = self.advertised_ip {
+            return ip.clone();
+        }
+        tune_core::discovery::ssdp::get_local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into())
     }
 }
 
@@ -155,6 +169,11 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.openai_api_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_ADVERTISED_IP")
+            && !v.is_empty()
+        {
+            config.advertised_ip = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
