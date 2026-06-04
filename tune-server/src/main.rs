@@ -122,8 +122,6 @@ async fn main() {
         )
         .expect("failed to create socket");
         socket.set_reuse_address(true).ok();
-        #[cfg(not(windows))]
-        socket.set_reuse_port(true).ok();
         for attempt in 1..=10u32 {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,

@@ -23,12 +23,17 @@ pub(super) async fn version() -> Json<Value> {
 }
 
 pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
+    let tracks_result = TrackRepo::new(state.db.clone()).count();
+    let albums_result = AlbumRepo::new(state.db.clone()).count();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
-    // Quick DB connectivity check — if count succeeded, we're connected
-    let db_status = if tracks >= 0 { "connected" } else { "error" };
+    let db_status = if tracks_result.is_ok() {
+        "connected"
+    } else {
+        "error"
+    };
+    let tracks = tracks_result.unwrap_or(0);
+    let albums = albums_result.unwrap_or(0);
 
     Json(json!({
         "status": "ok",

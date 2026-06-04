@@ -286,6 +286,7 @@ fn build_signal_path(
         }
         "airplay" => (false, "AirPlay", "ALAC"),
         "chromecast" => (false, "Chromecast", "Transcoded"),
+        "browser" => (true, "Browser", format_name),
         "local" => (true, "Local", format_name),
         other => (false, other, format_name),
     };

@@ -32,7 +32,7 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
-    json!({
+    let mut v = json!({
         "id": zone_id,
         "name": zone_db.as_ref().map(|z| &z.name),
         "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
@@ -53,7 +53,27 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
-    })
+    });
+    // Include stream_url for browser playback zones so the web client
+    // can feed it to an HTML5 <audio> element.
+    if let Some(ref np) = zone_state.now_playing {
+        if let Some(ref stream_id) = np.stream_id {
+            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                tune_core::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into())
+            });
+            let ext = "flac";
+            let stream_url = format!(
+                "http://{}:{}/stream/{}.{}",
+                server_ip, state.port, stream_id, ext
+            );
+            v.as_object_mut()
+                .unwrap()
+                .insert("stream_url".into(), json!(stream_url));
+        }
+    }
+    v
 }
 
 async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
@@ -745,7 +765,7 @@ async fn queue_move(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueMoveRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
     let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
     let from = body.from_position as usize;
     let to = body.to_position as usize;
@@ -1089,14 +1109,14 @@ async fn do_transfer(
         .update_queue_info(target_zone, current.queue_position, queue_length)
         .await;
 
-    // Optionally start playback on the target device via the orchestrator
-    let target_device = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    // Start playback on the target device via the orchestrator if a device is assigned
+    let has_output = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
         .get(target_zone)
         .ok()
         .flatten()
-        .and_then(|z| z.output_device_id);
-    if let Some(ref device_id) = target_device {
-        // Play the current track on the target output
+        .and_then(|z| z.output_device_id)
+        .is_some();
+    if has_output {
         if let Err(e) = state
             .orchestrator
             .play_from_queue(target_zone, current.queue_position)
