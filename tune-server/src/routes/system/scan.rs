@@ -23,7 +23,8 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
     let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
         let db_for_panic = db.clone();
-        let result = tokio::task::spawn(async move {
+        let handle = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
         let raw_dirs = super::get_music_dirs_list(&db);
         if raw_dirs.is_empty() {
             tracing::warn!("scan_aborted_no_dirs — no music directories configured");
@@ -530,6 +531,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     "updated": updated,
                     "skipped": skipped,
                     "artwork_extracted": artwork_extracted,
+                    "failed_paths": scan_stats.failed_paths,
                 })
                 .to_string(),
             )
@@ -546,15 +548,43 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 "updated": updated,
                 "skipped": skipped,
                 "artwork_extracted": artwork_extracted,
+                "failed_paths": scan_stats.failed_paths,
             }),
         );
 
         // Launch batch artwork enrichment as a background task
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
+        // Write scan report JSON for the /scan/report endpoint
+        let report = serde_json::json!({
+            "total_files": total_discovered,
+            "parsed": scan_stats.total_files,
+            "metadata_ok": scan_stats.metadata_ok,
+            "metadata_failed": scan_stats.metadata_failed,
+            "metadata_timeout": scan_stats.metadata_timeout,
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "artwork_extracted": artwork_extracted,
+            "failed_paths": scan_stats.failed_paths,
+        });
+        let report_path = std::env::var("TUNE_DB_PATH")
+            .unwrap_or_else(|_| "tune.db".into())
+            .replace(".db", "-scan-report.json");
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            std::fs::write(&report_path, json).ok();
+        }
+
         let enrich_db = db.clone();
-        tokio::spawn(async move {
+        let artist_cache_dir = cache_dir.clone();
+        let artist_enrich_db = db.clone();
+        handle.spawn(async move {
             tune_core::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
+        });
+
+        handle.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tune_core::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
         });
         }).await;
         if let Err(e) = result {
@@ -680,5 +710,18 @@ fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
         }
     } else {
         None
+    }
+}
+
+pub(super) async fn scan_report() -> impl IntoResponse {
+    let report_path = std::env::var("TUNE_DB_PATH")
+        .unwrap_or_else(|_| "tune.db".into())
+        .replace(".db", "-scan-report.json");
+    match std::fs::read_to_string(&report_path) {
+        Ok(json) => match serde_json::from_str::<Value>(&json) {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => Json(json!({"error": "invalid report file"})).into_response(),
+        },
+        Err(_) => Json(json!({"error": "no scan report available yet"})).into_response(),
     }
 }

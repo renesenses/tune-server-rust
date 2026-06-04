@@ -102,7 +102,7 @@ pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Va
             .ok();
         if let Some(ref mut s) = fallback {
             results = s
-                .query_map(rusqlite::params![seed_track_id, count], |row| {
+                .query_map(rusqlite::params![seed_track_id, count as i64], |row| {
                     Ok(json!({
                         "track_id": row.get::<_, i64>(0)?,
                         "title": row.get::<_, String>(1)?,
@@ -291,7 +291,7 @@ pub fn generate_mood_queue(db: &SqliteDb, mood: Mood, count: usize) -> Vec<Value
             .ok();
         if let Some(ref mut s) = fallback {
             results = s
-                .query_map(rusqlite::params![count], |row| {
+                .query_map(rusqlite::params![count as i64], |row| {
                     Ok(json!({
                         "track_id": row.get::<_, i64>(0)?,
                         "title": row.get::<_, String>(1)?,

@@ -162,6 +162,7 @@ async fn podcast_episodes(
 }
 
 fn parse_rss_episodes(xml: &str) -> Vec<Value> {
+    use quick_xml::escape::unescape;
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
@@ -214,7 +215,11 @@ fn parse_rss_episodes(xml: &str) -> Vec<Value> {
                 }
             }
             Ok(Event::Text(ref e)) if in_item => {
-                let text = e.unescape().unwrap_or_default().to_string();
+                let decoded = e.decode().unwrap_or_default();
+                let text = match unescape(&decoded) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => decoded.to_string(),
+                };
                 match current_tag.as_str() {
                     "title" => title = text,
                     "description" | "summary" => {

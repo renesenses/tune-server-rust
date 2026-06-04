@@ -14,8 +14,15 @@ use crate::state::AppState;
 pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.clone();
     let cache_dir = crate::routes::library::artwork_cache_dir();
+    let artist_db = state.db.clone();
+    let artist_cache_dir = cache_dir.clone();
     tokio::spawn(async move {
         tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
+    });
+    tokio::spawn(async move {
+        // Small delay to let album enrichment start first
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tune_core::artwork::batch_enrich_artist_artwork(artist_db, artist_cache_dir).await;
     });
     (
         StatusCode::ACCEPTED,

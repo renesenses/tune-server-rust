@@ -316,7 +316,7 @@ mod inner {
         let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
         let mut total: u64 = 0;
         for row in batch {
-            let mut q = sqlx::query(sql);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for v in row {
                 q = bind_json_value(q, &v.0);
             }
@@ -381,11 +381,12 @@ mod inner {
             let sqlite_count: i64 = src
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .map_err(|e| format!("sqlite count {table}: {e}"))?;
-            let pg_count: i64 =
-                sqlx::query_scalar(&format!("SELECT COUNT(*)::bigint FROM {table}"))
-                    .fetch_one(pool)
-                    .await
-                    .map_err(|e| format!("pg count {table}: {e}"))?;
+            let pg_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*)::bigint FROM {table}"
+            )))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("pg count {table}: {e}"))?;
             let ok = sqlite_count == pg_count;
             let marker = if ok { "[ok]   " } else { "[diff] " };
             println!("  {marker}{table:20} sqlite={sqlite_count:>8}  pg={pg_count:>8}");

@@ -23,13 +23,17 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     let host = cpal::default_host();
     let default_name = host
         .default_output_device()
-        .and_then(|d| d.name().ok())
+        .and_then(|d| d.description().ok())
+        .map(|desc| desc.name().to_string())
         .unwrap_or_default();
 
     let mut devices = Vec::new();
     if let Ok(output_devices) = host.output_devices() {
         for device in output_devices {
-            let name = device.name().unwrap_or_else(|_| "Unknown".into());
+            let name = device
+                .description()
+                .map(|desc| desc.name().to_string())
+                .unwrap_or_else(|_| "Unknown".into());
             let is_default = name == default_name;
 
             let (max_channels, sample_rates) =
@@ -38,8 +42,8 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
                     let mut rates = Vec::new();
                     for config in configs {
                         max_ch = max_ch.max(config.channels());
-                        let min = config.min_sample_rate().0;
-                        let max = config.max_sample_rate().0;
+                        let min = config.min_sample_rate();
+                        let max = config.max_sample_rate();
                         for &rate in &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
                             if rate >= min && rate <= max && !rates.contains(&rate) {
                                 rates.push(rate);
@@ -359,8 +363,11 @@ impl OutputTarget for LocalOutput {
             } else {
                 host.output_devices().ok().and_then(|mut devs| {
                     devs.find(|d| {
-                        d.name()
-                            .map(|n| n == device_name || n.contains(&device_name))
+                        d.description()
+                            .map(|desc| {
+                                let n = desc.name().to_string();
+                                n == device_name || n.contains(&device_name)
+                            })
                             .unwrap_or(false)
                     })
                 })
@@ -377,7 +384,7 @@ impl OutputTarget for LocalOutput {
                 .unwrap_or_else(|| {
                     let default = device.default_output_config().unwrap();
                     info!(
-                        default_sr = default.sample_rate().0,
+                        default_sr = default.sample_rate(),
                         wanted_sr = sample_rate,
                         "local_audio_using_default_config"
                     );
@@ -388,7 +395,7 @@ impl OutputTarget for LocalOutput {
                     }
                 });
 
-            let output_sr = stream_config.sample_rate.0;
+            let output_sr = stream_config.sample_rate;
             let output_ch = stream_config.channels;
 
             info!(
@@ -642,8 +649,11 @@ impl OutputTarget for LocalOutput {
             host.output_devices()
                 .map(|devs| {
                     devs.into_iter().any(|d| {
-                        d.name()
-                            .map(|n| n == name || n.contains(&name))
+                        d.description()
+                            .map(|desc| {
+                                let n = desc.name().to_string();
+                                n == name || n.contains(&name)
+                            })
                             .unwrap_or(false)
                     })
                 })
@@ -696,12 +706,12 @@ fn find_matching_config(
     let configs = device.supported_output_configs().ok()?;
     for config in configs {
         if config.channels() >= channels
-            && config.min_sample_rate().0 <= sample_rate
-            && config.max_sample_rate().0 >= sample_rate
+            && config.min_sample_rate() <= sample_rate
+            && config.max_sample_rate() >= sample_rate
         {
             return Some(cpal::StreamConfig {
                 channels: channels.min(config.channels()),
-                sample_rate: cpal::SampleRate(sample_rate),
+                sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             });
         }
