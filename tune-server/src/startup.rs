@@ -11,9 +11,15 @@ use crate::state::AppState;
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
+    restore_queues(state, config);
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(&state.db);
+}
+
+/// Restore persisted queue snapshots from JSON files on disk.
+fn restore_queues(state: &AppState, config: &TuneConfig) {
+    tune_core::queue_persistence::restore_all_queues(&state.db, &config.db_path);
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.

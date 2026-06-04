@@ -34,6 +34,7 @@ pub mod playlist_transfer;
 pub mod plugin_sdk;
 pub mod plugins;
 pub mod poller;
+pub mod queue_persistence;
 pub mod radio_favorites;
 pub mod radio_metadata;
 pub mod remote_discovery;
@@ -78,7 +79,21 @@ pub use metadata::suggestions as metadata_suggestions;
 pub use metadata::tag_writer;
 
 pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    option_env!("TUNE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+pub fn rustc_version() -> &'static str {
+    env!("TUNE_RUSTC_VERSION")
+}
+
+/// List of cargo features enabled at compile time.
+pub fn enabled_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    #[cfg(feature = "local-audio")]
+    features.push("local-audio");
+    #[cfg(feature = "oaat")]
+    features.push("oaat");
+    features
 }
 
 #[cfg(test)]
