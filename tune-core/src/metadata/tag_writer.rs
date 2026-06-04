@@ -103,7 +103,10 @@ fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, 
         count += 1;
     }
     if let Some(v) = update.year {
-        tag.set_year(v as u32);
+        tag.set_date(lofty::tag::items::Timestamp {
+            year: v as u16,
+            ..Default::default()
+        });
         count += 1;
     }
     if let Some(ref v) = update.comment {
@@ -160,7 +163,7 @@ fn read_tags_lofty(file_path: &str) -> Result<HashMap<String, String>, String> {
     if let Some(v) = tag.genre() {
         tags.insert("genre".into(), v.to_string());
     }
-    if let Some(v) = tag.year() {
+    if let Some(v) = tag.date() {
         tags.insert("date".into(), v.to_string());
     }
     if let Some(v) = tag.track() {

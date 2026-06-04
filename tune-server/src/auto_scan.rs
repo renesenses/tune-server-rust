@@ -118,7 +118,7 @@ pub fn build_track_from_metadata(
 
 /// Spawn the auto-scan task that indexes all music directories at startup.
 pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
         let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
         let raw_dirs: Vec<String> = settings
@@ -293,19 +293,26 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
             "auto_scan_complete"
         );
 
-        event_bus.emit(
-            "library.scan.completed",
-            serde_json::json!({
-                "total_files": stats.total_files,
-                "metadata_ok": stats.metadata_ok,
-                "metadata_failed": stats.metadata_failed,
-                "metadata_timeout": stats.metadata_timeout,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "artwork_extracted": albums_with_cover.len(),
-            }),
-        );
+        let report = serde_json::json!({
+            "total_files": stats.total_files,
+            "metadata_ok": stats.metadata_ok,
+            "metadata_failed": stats.metadata_failed,
+            "metadata_timeout": stats.metadata_timeout,
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "artwork_extracted": albums_with_cover.len(),
+            "failed_paths": stats.failed_paths,
+        });
+
+        let report_path = std::env::var("TUNE_DB_PATH")
+            .unwrap_or_else(|_| "tune.db".into())
+            .replace(".db", "-scan-report.json");
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            std::fs::write(&report_path, json).ok();
+        }
+
+        event_bus.emit("library.scan.completed", report);
     });
 }
 

@@ -193,6 +193,34 @@ pub(super) async fn artist_timeline(
     .into_response()
 }
 
+pub(super) async fn artist_image(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::new(state.db);
+    let artist = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let Some(ref image_path) = artist.image_path else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if image_path.starts_with("http") {
+        return axum::response::Redirect::temporary(image_path).into_response();
+    }
+
+    // If it's already a hex hash, use it directly; otherwise hash it
+    let hash = if super::artwork_is_hex_hash(image_path) {
+        image_path.to_string()
+    } else {
+        tune_core::artwork::artwork_hash(image_path)
+    };
+
+    axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response()
+}
+
 pub(super) async fn artist_image_upload(
     State(state): State<AppState>,
     Path(id): Path<i64>,

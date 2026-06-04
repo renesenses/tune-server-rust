@@ -96,8 +96,11 @@ fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, S
         changes.push(format!("genre -> {genre}"));
     }
     if let Some(year) = &fields.year {
-        if let Ok(y) = year.parse::<u32>() {
-            tag.set_year(y);
+        if let Ok(y) = year.parse::<u16>() {
+            tag.set_date(lofty::tag::items::Timestamp {
+                year: y,
+                ..Default::default()
+            });
             changes.push(format!("year -> {year}"));
         }
     }
@@ -400,7 +403,7 @@ async fn set_album_year(
     .ok();
     drop(conn);
 
-    let year_num: Option<u32> = body.year.parse().ok();
+    let year_num: Option<u16> = body.year.parse().ok();
     let mut file_errors: Vec<Value> = Vec::new();
     for (track_id, path) in &paths {
         let result = (|| -> Result<(), String> {
@@ -410,7 +413,10 @@ async fn set_album_year(
             let mut tagged = lofty::read_from_path(path).map_err(|e| format!("Read error: {e}"))?;
             let tag = tagged.primary_tag_mut().ok_or("No tag")?;
             if let Some(y) = year_num {
-                tag.set_year(y);
+                tag.set_date(lofty::tag::items::Timestamp {
+                    year: y,
+                    ..Default::default()
+                });
             }
             tag.save_to_path(path, lofty::config::WriteOptions::default())
                 .map_err(|e| format!("Write error: {e}"))?;
@@ -712,12 +718,12 @@ async fn strip_extra_tags(
                     let key_str = format!("{:?}", item.key());
                     !keep_set.contains(&key_str.to_uppercase())
                 })
-                .map(|item| item.key().clone())
+                .map(|item| item.key())
                 .collect();
 
             let removed: Vec<String> = to_remove.iter().map(|k| format!("{:?}", k)).collect();
 
-            for key in &to_remove {
+            for key in to_remove {
                 tag.remove_key(key);
             }
 

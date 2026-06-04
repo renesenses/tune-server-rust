@@ -87,6 +87,7 @@ pub struct ScanStats {
     pub metadata_failed: usize,
     pub metadata_timeout: usize,
     pub hash_ok: usize,
+    pub failed_paths: Vec<String>,
 }
 
 /// Read metadata (and optionally compute hash) for a single file, with a
@@ -305,15 +306,19 @@ pub fn scan_files_parallel(
         .collect();
 
     let timed_out = timeout_counter.load(Ordering::Relaxed);
+    let failed = failed_files.lock().unwrap();
+    let failed_paths: Vec<String> = failed
+        .iter()
+        .map(|(p, e)| format!("{} ({})", p, e))
+        .collect();
     let stats = ScanStats {
         total_files: results.len(),
         metadata_ok: results.iter().filter(|f| f.metadata.is_some()).count(),
         metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
         metadata_timeout: timed_out,
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
+        failed_paths,
     };
-
-    let failed = failed_files.lock().unwrap();
     if !failed.is_empty() {
         let listing: Vec<String> = failed
             .iter()
@@ -437,6 +442,9 @@ pub fn scan_files_batched(
 
         let failed = failed_files.lock().unwrap();
         if !failed.is_empty() {
+            for (p, e) in failed.iter() {
+                aggregate.failed_paths.push(format!("{} ({})", p, e));
+            }
             let listing: Vec<String> = failed
                 .iter()
                 .take(10)

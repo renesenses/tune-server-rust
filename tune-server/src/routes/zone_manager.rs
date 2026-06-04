@@ -43,7 +43,20 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/oaat-groups/{id}",
-            axum::routing::delete(delete_oaat_group),
+            get(oaat_group_status).delete(delete_oaat_group),
+        )
+        .route("/oaat-groups/{id}/endpoints", post(oaat_group_add_endpoint))
+        .route(
+            "/oaat-groups/{id}/endpoints/{ep_id}",
+            axum::routing::delete(oaat_group_remove_endpoint),
+        )
+        .route(
+            "/oaat-groups/{id}/volume",
+            axum::routing::put(oaat_group_set_volume),
+        )
+        .route(
+            "/oaat-groups/{id}/endpoints/{ep_id}/volume",
+            axum::routing::put(oaat_group_set_endpoint_volume),
         )
 }
 
@@ -925,4 +938,173 @@ async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>
     info!(group_id = %id, "oaat_multiroom_group_deleted");
 
     Json(json!({ "deleted": id }))
+}
+
+// -- Dynamic OAAT group management --
+
+async fn oaat_group_status(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let device_id = format!("oaat-group:{id}");
+    let outputs = state.outputs.lock().await;
+
+    #[cfg(feature = "oaat")]
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            return Json(mr.zone_snapshot().await);
+        }
+    }
+
+    Json(json!({ "error": "group not found", "id": id }))
+}
+
+#[cfg(feature = "oaat")]
+async fn oaat_group_add_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let device_id = format!("oaat-group:{id}");
+    let host = body["host"].as_str().unwrap_or("");
+    let port = body["port"].as_u64().unwrap_or(9740) as u16;
+
+    if host.is_empty() {
+        return Json(json!({ "error": "host is required" }));
+    }
+
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            match mr.add_endpoint(host, port).await {
+                Ok(ep_id) => {
+                    info!(group = %id, endpoint_id = %ep_id, "oaat_group_endpoint_added");
+                    return Json(json!({ "endpoint_id": ep_id, "host": host, "port": port }));
+                }
+                Err(e) => return Json(json!({ "error": e })),
+            }
+        }
+    }
+
+    Json(json!({ "error": "group not found" }))
+}
+
+#[cfg(not(feature = "oaat"))]
+async fn oaat_group_add_endpoint(
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    Json(json!({ "error": "OAAT not compiled" }))
+}
+
+#[cfg(feature = "oaat")]
+async fn oaat_group_remove_endpoint(
+    State(state): State<AppState>,
+    Path((id, ep_id)): Path<(String, String)>,
+) -> Json<Value> {
+    let device_id = format!("oaat-group:{id}");
+    let outputs = state.outputs.lock().await;
+
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            let removed = mr.remove_endpoint(&ep_id).await;
+            info!(group = %id, endpoint_id = %ep_id, removed, "oaat_group_endpoint_removed");
+            return Json(json!({ "removed": removed, "endpoint_id": ep_id }));
+        }
+    }
+
+    Json(json!({ "error": "group not found" }))
+}
+
+#[cfg(not(feature = "oaat"))]
+async fn oaat_group_remove_endpoint(
+    State(_state): State<AppState>,
+    Path((_id, _ep_id)): Path<(String, String)>,
+) -> Json<Value> {
+    Json(json!({ "error": "OAAT not compiled" }))
+}
+
+#[cfg(feature = "oaat")]
+async fn oaat_group_set_volume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let device_id = format!("oaat-group:{id}");
+    let level = body["level"].as_u64().unwrap_or(100).min(100) as u8;
+
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            match mr.set_zone_volume(level).await {
+                Ok(()) => return Json(json!({ "volume": level })),
+                Err(e) => return Json(json!({ "error": e })),
+            }
+        }
+    }
+
+    Json(json!({ "error": "group not found" }))
+}
+
+#[cfg(not(feature = "oaat"))]
+async fn oaat_group_set_volume(
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    Json(json!({ "error": "OAAT not compiled" }))
+}
+
+#[cfg(feature = "oaat")]
+async fn oaat_group_set_endpoint_volume(
+    State(state): State<AppState>,
+    Path((id, ep_id)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let device_id = format!("oaat-group:{id}");
+
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            // Support both absolute level and relative offset
+            if let Some(level) = body["level"].as_u64() {
+                let level = level.min(100) as u8;
+                match mr.set_endpoint_volume(&ep_id, level).await {
+                    Ok(()) => return Json(json!({ "endpoint_id": ep_id, "volume": level })),
+                    Err(e) => return Json(json!({ "error": e })),
+                }
+            } else if let Some(offset) = body["offset"].as_i64() {
+                let offset = offset.clamp(-100, 100) as i8;
+                match mr.set_endpoint_volume_offset(&ep_id, offset).await {
+                    Ok(()) => return Json(json!({ "endpoint_id": ep_id, "offset": offset })),
+                    Err(e) => return Json(json!({ "error": e })),
+                }
+            }
+            return Json(json!({ "error": "provide 'level' (0-100) or 'offset' (-100..100)" }));
+        }
+    }
+
+    Json(json!({ "error": "group not found" }))
+}
+
+#[cfg(not(feature = "oaat"))]
+async fn oaat_group_set_endpoint_volume(
+    State(_state): State<AppState>,
+    Path((_id, _ep_id)): Path<(String, String)>,
+    Json(_body): Json<Value>,
+) -> Json<Value> {
+    Json(json!({ "error": "OAAT not compiled" }))
+}
+
+/// Downcast an OutputTarget to OaatMultiroomOutput.
+#[cfg(feature = "oaat")]
+fn downcast_oaat_multiroom(
+    output: &dyn tune_core::outputs::traits::OutputTarget,
+) -> Option<&tune_core::outputs::oaat::OaatMultiroomOutput> {
+    output
+        .as_any()
+        .downcast_ref::<tune_core::outputs::oaat::OaatMultiroomOutput>()
 }

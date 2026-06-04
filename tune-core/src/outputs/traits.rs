@@ -70,6 +70,11 @@ pub trait OutputTarget: Send + Sync {
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: not dowcastable. Implementations that need downcast override this.
+        &()
+    }
+
     async fn play_url(
         &self,
         url: &str,
