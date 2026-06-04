@@ -1,6 +1,5 @@
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -28,7 +27,7 @@ pub struct StreamInfo {
 }
 
 pub struct AudioPipeline {
-    child: Option<Child>,
+    started: bool,
     tx: mpsc::Sender<Vec<u8>>,
     config: PipelineConfig,
 }
@@ -38,7 +37,7 @@ impl AudioPipeline {
         let (tx, rx) = mpsc::channel(buffer_size);
         (
             Self {
-                child: None,
+                started: false,
                 tx,
                 config,
             },
@@ -57,114 +56,93 @@ impl AudioPipeline {
     }
 
     pub async fn start(&mut self) -> Result<(), String> {
-        let ffmpeg = find_ffmpeg().ok_or("FFmpeg not found")?;
-        let cfg = &self.config;
-
-        let mut args = vec![
-            "-hide_banner".to_string(),
-            "-loglevel".into(),
-            "warning".into(),
-        ];
-
-        if let Some(seek) = cfg.seek_ms {
-            let secs = seek as f64 / 1000.0;
-            args.extend(["-ss".into(), format!("{secs:.3}")]);
-        }
-
-        // DSD requires explicit input format for FFmpeg
-        let ext = std::path::Path::new(&cfg.file_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        match ext.as_str() {
-            "dsf" => args.extend(["-f".into(), "dsf".into()]),
-            "dff" => args.extend(["-f".into(), "dff".into()]),
-            _ => {}
-        }
-
-        let codec = if cfg.output_format == AudioFormat::Wav {
-            match cfg.bit_depth {
-                24 => "pcm_s24le",
-                32 => "pcm_s32le",
-                _ => "pcm_s16le",
-            }
-        } else {
-            cfg.output_format.ffmpeg_codec_arg()
-        };
-
-        args.extend([
-            "-i".into(),
-            cfg.file_path.clone(),
-            "-vn".into(),
-            "-f".into(),
-            cfg.output_format.ffmpeg_format_arg().into(),
-            "-acodec".into(),
-            codec.into(),
-            "-ar".into(),
-            cfg.sample_rate.to_string(),
-            "-ac".into(),
-            cfg.channels.to_string(),
-            "pipe:1".into(),
-        ]);
-
-        info!(file = %cfg.file_path, format = ?cfg.output_format, "pipeline_start");
-
-        let mut child = Command::new(&ffmpeg)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("FFmpeg spawn failed: {e}"))?;
-
-        let stdout = child.stdout.take().ok_or("No stdout")?;
+        let cfg = self.config.clone();
         let tx = self.tx.clone();
 
+        info!(file = %cfg.file_path, format = ?cfg.output_format, "pipeline_start_native");
+
         tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::with_capacity(CHUNK_SIZE * 2, stdout);
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).await.is_err() {
-                            debug!("pipeline_consumer_dropped");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "pipeline_read_error");
-                        break;
-                    }
-                }
+            if let Err(e) = run_native_pipeline(&cfg, &tx).await {
+                warn!(error = %e, file = %cfg.file_path, "pipeline_native_error");
             }
             debug!("pipeline_stream_complete");
         });
 
-        self.child = Some(child);
+        self.started = true;
         Ok(())
     }
 
     pub async fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
-            debug!("pipeline_stopped");
-        }
+        self.started = false;
+        debug!("pipeline_stopped");
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some()
+        self.started
     }
 }
 
-impl Drop for AudioPipeline {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
+/// Decode the file natively, optionally encode to the target format, and send
+/// chunks through the channel.
+async fn run_native_pipeline(
+    cfg: &PipelineConfig,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), String> {
+    let seek_s = cfg.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+
+    // Decode to PCM (i16 samples, interleaved)
+    let decoded = super::decode::decode_to_pcm(
+        &cfg.file_path,
+        Some(cfg.sample_rate),
+        Some(cfg.channels as u32),
+        seek_s,
+        0.0, // no duration limit
+    )
+    .map_err(|e| format!("native decode failed: {e}"))?;
+
+    // Convert i16 samples to raw PCM bytes (16-bit LE)
+    let pcm_bytes: Vec<u8> = decoded
+        .samples
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect();
+
+    // Encode to the target format
+    let output_data = match cfg.output_format {
+        AudioFormat::Wav | AudioFormat::Flac => {
+            let mut encoder = super::encoder::AudioEncoder::new(
+                cfg.output_format.ffmpeg_format_arg(),
+                decoded.sample_rate,
+                16, // decode_to_pcm produces i16
+                decoded.channels,
+            );
+            encoder.start().await?;
+            encoder.write(&pcm_bytes).await?;
+            encoder.finish().await?
+        }
+        _ => {
+            // For other formats, encode as FLAC (the encoder handles fallback)
+            let mut encoder = super::encoder::AudioEncoder::new(
+                cfg.output_format.ffmpeg_format_arg(),
+                decoded.sample_rate,
+                16,
+                decoded.channels,
+            );
+            encoder.start().await?;
+            encoder.write(&pcm_bytes).await?;
+            encoder.finish().await?
+        }
+    };
+
+    // Send in chunks
+    for chunk in output_data.chunks(CHUNK_SIZE) {
+        if tx.send(chunk.to_vec()).await.is_err() {
+            debug!("pipeline_consumer_dropped");
+            return Ok(());
         }
     }
+
+    Ok(())
 }
 
 pub fn find_ffmpeg() -> Option<String> {
@@ -203,5 +181,57 @@ mod tests {
         if let Some(path) = result {
             println!("Found FFmpeg: {}", path);
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_stream_info() {
+        let config = PipelineConfig {
+            file_path: "test.flac".into(),
+            output_format: AudioFormat::Wav,
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            seek_ms: None,
+        };
+        let (pipeline, _rx) = AudioPipeline::new(config, 16);
+        let info = pipeline.stream_info();
+        assert_eq!(info.format, AudioFormat::Wav);
+        assert_eq!(info.sample_rate, 44100);
+        assert_eq!(info.bit_depth, 16);
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.mime_type, "audio/wav");
+    }
+
+    #[tokio::test]
+    async fn native_pipeline_wav_fixture() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/test.wav");
+        if !path.exists() {
+            return; // skip if fixture missing
+        }
+
+        let config = PipelineConfig {
+            file_path: path.to_string_lossy().to_string(),
+            output_format: AudioFormat::Wav,
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            seek_ms: None,
+        };
+        let (mut pipeline, mut rx) = AudioPipeline::new(config, 64);
+        pipeline.start().await.unwrap();
+
+        // Drop the pipeline so self.tx is released and the channel closes
+        // after the spawned decode task completes.
+        drop(pipeline);
+
+        let mut total_bytes = 0;
+        while let Some(chunk) = rx.recv().await {
+            total_bytes += chunk.len();
+        }
+        assert!(
+            total_bytes > 44,
+            "should produce WAV output with header + data"
+        );
     }
 }
