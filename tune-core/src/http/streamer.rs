@@ -221,10 +221,22 @@ pub async fn handle_head(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    // For file sessions, read actual size from filesystem (consistent with GET)
+    let file_size = if session.info.file_size.is_some() {
+        session.info.file_size
+    } else {
+        let fp = session.file_path.lock().await;
+        if let Some(ref path) = *fp {
+            tokio::fs::metadata(path).await.ok().map(|m| m.len())
+        } else {
+            session.info.wav_content_length()
+        }
+    };
+
     info!(
         stream_id,
         format = %session.info.format,
-        file_size = ?session.info.file_size,
+        file_size = ?file_size,
         "stream_head_request"
     );
 
@@ -240,7 +252,7 @@ pub async fn handle_head(
         HeaderValue::from_static("Streaming"),
     );
 
-    if let Some(size) = session.info.file_size {
+    if let Some(size) = file_size {
         headers.insert("Content-Length", HeaderValue::from(size));
     }
 

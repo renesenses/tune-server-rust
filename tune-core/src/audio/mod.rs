@@ -1,6 +1,9 @@
 pub mod aiff;
 pub mod analyzer;
 pub mod decode;
+pub mod dff;
+pub mod dsd_to_pcm;
+pub mod dsf;
 pub mod encoder;
 pub mod formats;
 pub mod iso_sacd;

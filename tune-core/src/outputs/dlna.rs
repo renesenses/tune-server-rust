@@ -117,6 +117,36 @@ impl DlnaOutput {
         matches!(v, Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("null"))
     }
 
+    fn dlna_flags_for_mime(mime: &str) -> &'static str {
+        // DLNA.ORG_OP=01 : byte-range seek supported
+        // DLNA.ORG_CI=0  : no transcoding
+        // DLNA.ORG_FLAGS : streaming + interactive + background + v1.5
+        match mime {
+            "audio/L16" | "audio/wav" | "audio/x-wav" => {
+                "DLNA.ORG_PN=LPCM;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            }
+            "audio/flac" | "audio/x-flac" => {
+                "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            }
+            "audio/mpeg" => {
+                "DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            }
+            "audio/mp4" | "audio/aac" => {
+                "DLNA.ORG_PN=AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            }
+            _ => "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+        }
+    }
+
+    fn format_duration_didl(ms: u64) -> String {
+        let total_secs = ms / 1000;
+        let h = total_secs / 3600;
+        let m = (total_secs % 3600) / 60;
+        let s = total_secs % 60;
+        let frac = ms % 1000;
+        format!("{h}:{m:02}:{s:02}.{frac:03}")
+    }
+
     fn didl_metadata(
         title: Option<&str>,
         artist: Option<&str>,
@@ -124,6 +154,8 @@ impl DlnaOutput {
         mime_type: &str,
         url: &str,
         cover_url: Option<&str>,
+        duration_ms: Option<u64>,
+        file_size: Option<u64>,
     ) -> String {
         let title = quick_xml::escape::escape(if Self::is_valid_meta(title) {
             title.unwrap()
@@ -155,8 +187,21 @@ impl DlnaOutput {
             })
             .unwrap_or_default();
 
+        let dlna_flags = Self::dlna_flags_for_mime(mime_type);
+
+        let size_attr = file_size
+            .map(|s| format!(r#" size=&quot;{s}&quot;"#))
+            .unwrap_or_default();
+        let dur_attr = duration_ms
+            .filter(|d| *d > 0)
+            .map(|d| {
+                let dur = Self::format_duration_didl(d);
+                format!(r#" duration=&quot;{dur}&quot;"#)
+            })
+            .unwrap_or_default();
+
         format!(
-            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:*"&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
+            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:{dlna_flags}"{size_attr}{dur_attr}&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
         )
     }
 
@@ -228,6 +273,8 @@ impl OutputTarget for DlnaOutput {
             media.mime_type,
             media.url,
             media.cover_url,
+            media.duration_ms,
+            media.file_size,
         );
         let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
@@ -380,6 +427,8 @@ impl OutputTarget for DlnaOutput {
             media.mime_type,
             media.url,
             media.cover_url,
+            media.duration_ms,
+            media.file_size,
         );
         self.av_action("SetNextAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
@@ -462,13 +511,14 @@ mod tests {
             "audio/flac",
             "http://example.com/stream",
             Some("http://example.com/cover.jpg"),
+            Some(256_000),
+            Some(50_000_000),
         );
         assert!(didl.contains("Test Track"));
         assert!(didl.contains("Test Artist"));
         assert!(didl.contains("Test Album"));
         assert!(didl.contains("albumArtURI"));
         assert!(didl.contains("cover.jpg"));
-        // Must include dlna:profileID for DLNA renderers (Denon DMP-A6 etc.)
         assert!(
             didl.contains("dlna:profileID"),
             "albumArtURI must include dlna:profileID"
@@ -477,10 +527,22 @@ mod tests {
             didl.contains("JPEG_TN"),
             "albumArtURI must use JPEG_TN profile"
         );
-        // Must declare the dlna namespace
         assert!(
             didl.contains("xmlns:dlna"),
             "DIDL-Lite must declare xmlns:dlna namespace"
+        );
+        assert!(
+            didl.contains("DLNA.ORG_OP=01"),
+            "protocolInfo must include DLNA.ORG_OP"
+        );
+        assert!(
+            didl.contains("DLNA.ORG_FLAGS="),
+            "protocolInfo must include DLNA.ORG_FLAGS"
+        );
+        assert!(didl.contains("size="), "res must include size attribute");
+        assert!(
+            didl.contains("duration="),
+            "res must include duration attribute"
         );
     }
 
@@ -493,23 +555,27 @@ mod tests {
             "audio/flac",
             "http://example.com/stream",
             None,
+            None,
+            None,
         );
         assert!(didl.contains("Title"));
         assert!(!didl.contains("albumArtURI"));
         assert!(!didl.contains("upnp:album"));
-        // artist tag must be omitted when None
         assert!(!didl.contains("dc:creator"));
+        assert!(!didl.contains("size="));
+        assert!(!didl.contains("duration="));
     }
 
     #[test]
     fn didl_metadata_null_artist_string() {
-        // JavaScript clients may send the literal string "null"
         let didl = DlnaOutput::didl_metadata(
             Some("Title"),
             Some("null"),
             None,
             "audio/flac",
             "http://example.com/stream",
+            None,
+            None,
             None,
         );
         assert!(
@@ -527,6 +593,8 @@ mod tests {
             "audio/flac",
             "http://example.com/stream",
             None,
+            None,
+            None,
         );
         assert!(!didl.contains("dc:creator"), "empty artist must be omitted");
     }
@@ -540,10 +608,48 @@ mod tests {
             "audio/flac",
             "http://example.com/stream?a=1&b=2",
             None,
+            None,
+            None,
         );
         assert!(didl.contains("Rock &amp; Roll"));
         assert!(didl.contains("AC/DC"));
         assert!(didl.contains("a=1&amp;b=2"));
+    }
+
+    #[test]
+    fn didl_dlna_flags_wav() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("T"),
+            None,
+            None,
+            "audio/wav",
+            "http://x/s",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            didl.contains("DLNA.ORG_PN=LPCM"),
+            "WAV must have LPCM profile"
+        );
+    }
+
+    #[test]
+    fn didl_dlna_flags_mp3() {
+        let didl = DlnaOutput::didl_metadata(
+            Some("T"),
+            None,
+            None,
+            "audio/mpeg",
+            "http://x/s",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            didl.contains("DLNA.ORG_PN=MP3"),
+            "MP3 must have MP3 profile"
+        );
     }
 
     #[test]
