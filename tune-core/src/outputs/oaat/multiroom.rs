@@ -24,7 +24,6 @@ pub struct OaatMultiroomOutput {
     name: String,
     device_id: String,
     endpoints: Vec<(String, u16)>,
-    controller_id: String,
     stream_counter: Arc<AtomicU32>,
     playing: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -37,36 +36,32 @@ pub struct OaatMultiroomOutput {
     stop_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(feature = "oaat")]
     zone: SharedZone,
-    #[cfg(feature = "oaat")]
-    zone_config: oaat_controller::ControllerConfig,
 }
 
 impl OaatMultiroomOutput {
     pub fn new(name: String, group_id: String, endpoints: Vec<(String, u16)>) -> Self {
         let device_id = format!("oaat-group:{group_id}");
-        let controller_id = uuid::Uuid::new_v4().to_string();
 
         #[cfg(feature = "oaat")]
-        let zone_config = oaat_controller::ControllerConfig {
-            controller_id: controller_id.clone(),
-            controller_name: "Tune Server".into(),
-            features: vec![],
-            clock_port: oaat_core::DEFAULT_CLOCK_PORT,
-            tls: false,
+        let zone = {
+            let config = oaat_controller::ControllerConfig {
+                controller_id: uuid::Uuid::new_v4().to_string(),
+                controller_name: "Tune Server".into(),
+                features: vec![],
+                clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+                tls: false,
+            };
+            Arc::new(Mutex::new(oaat_controller::Zone::new(
+                group_id.clone(),
+                name.clone(),
+                config,
+            )))
         };
-
-        #[cfg(feature = "oaat")]
-        let zone = Arc::new(Mutex::new(oaat_controller::Zone::new(
-            group_id.clone(),
-            name.clone(),
-            zone_config.clone(),
-        )));
 
         Self {
             name,
             device_id,
             endpoints,
-            controller_id,
             stream_counter: Arc::new(AtomicU32::new(1)),
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -79,8 +74,6 @@ impl OaatMultiroomOutput {
             stop_tx: Mutex::new(None),
             #[cfg(feature = "oaat")]
             zone,
-            #[cfg(feature = "oaat")]
-            zone_config,
         }
     }
 
