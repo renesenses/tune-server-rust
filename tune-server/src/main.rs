@@ -122,9 +122,16 @@ async fn main() {
         )
         .expect("failed to create socket");
         socket.set_reuse_address(true).ok();
-        socket
-            .bind(&addr.into())
-            .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
+        for attempt in 1..=10u32 {
+            match socket.bind(&addr.into()) {
+                Ok(()) => break,
+                Err(e) if attempt < 10 => {
+                    eprintln!("bind {addr} failed (attempt {attempt}/10): {e} — retrying in 2s");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                Err(e) => panic!("failed to bind {addr} after 10 attempts: {e}"),
+            }
+        }
         socket.listen(128).expect("failed to listen");
         socket
             .set_nonblocking(true)

@@ -440,8 +440,12 @@ async fn api_fallback(
         };
         return axum::response::Redirect::permanent(&redirect_to).into_response();
     }
-    tracing::debug!(path = %path, "api_not_found");
-    (StatusCode::OK, axum::Json(serde_json::json!([]))).into_response()
+    tracing::warn!(path = %path, "api_not_found");
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({"error": "not found", "path": path})),
+    )
+        .into_response()
 }
 
 pub fn router(state: AppState) -> Router {

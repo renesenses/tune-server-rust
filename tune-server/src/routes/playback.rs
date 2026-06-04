@@ -15,11 +15,24 @@ use tune_core::orchestrator::PlayResult;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Persist the queue state for a zone to disk (non-blocking).
+fn persist_queue_async(state: &AppState, zone_id: i64) {
+    let db = state.db.clone();
+    let db_path = state.config.db_path.clone();
+    let playback = state.playback.clone();
+    tokio::spawn(async move {
+        let zone_state = playback.get_state(zone_id).await;
+        tokio::task::spawn_blocking(move || {
+            tune_core::queue_persistence::save_queue(&db, &db_path, zone_id, &zone_state);
+        });
+    });
+}
+
 async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
-    json!({
+    let mut v = json!({
         "id": zone_id,
         "name": zone_db.as_ref().map(|z| &z.name),
         "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
@@ -40,7 +53,27 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_length": zone_state.queue_length,
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
-    })
+    });
+    // Include stream_url for browser playback zones so the web client
+    // can feed it to an HTML5 <audio> element.
+    if let Some(ref np) = zone_state.now_playing {
+        if let Some(ref stream_id) = np.stream_id {
+            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                tune_core::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into())
+            });
+            let ext = "flac";
+            let stream_url = format!(
+                "http://{}:{}/stream/{}.{}",
+                server_ip, state.port, stream_id, ext
+            );
+            v.as_object_mut()
+                .unwrap()
+                .insert("stream_url".into(), json!(stream_url));
+        }
+    }
+    v
 }
 
 async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
@@ -53,6 +86,12 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     zone.as_object_mut()
         .unwrap()
         .insert("output_sent".into(), json!(result.output_sent));
+    // Expose stream_url for browser playback zones
+    if let Some(ref url) = result.stream_url {
+        zone.as_object_mut()
+            .unwrap()
+            .insert("stream_url".into(), json!(url));
+    }
     zone
 }
 
@@ -113,6 +152,17 @@ struct QueueMoveRequest {
 }
 
 #[derive(Deserialize)]
+struct TransferRequest {
+    target_zone_id: i64,
+    #[serde(default = "default_true")]
+    stop_source: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
 struct QueueJumpRequest {
     position: i64,
 }
@@ -147,6 +197,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/crossfade", post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
+        .route("/{id}/transfer", post(transfer_queue))
         .route("/{id}/alarm", get(get_alarms).post(create_alarm))
         .route(
             "/{id}/alarm/{alarm_id}",
@@ -189,6 +240,24 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
                     serde_json::to_value(&credits).unwrap_or_default(),
                 );
             }
+        }
+    }
+    // Expose stream_url for browser playback zones
+    if let Some(ref np) = zone_state.now_playing {
+        if let Some(ref stream_id) = np.stream_id {
+            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                tune_core::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into())
+            });
+            let ext = "flac"; // default extension
+            let stream_url = format!(
+                "http://{}:{}/stream/{}.{}",
+                server_ip, state.port, stream_id, ext
+            );
+            v.as_object_mut()
+                .unwrap()
+                .insert("stream_url".into(), json!(stream_url));
         }
     }
     Json(v)
@@ -274,6 +343,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
+                persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -352,6 +422,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
+                persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -406,6 +477,7 @@ async fn play(
                     warn!(zone_id, error = %e, "set_streaming_queue_failed");
                 }
                 state.playback.update_queue_info(zone_id, 0, 1).await;
+                persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -497,6 +569,7 @@ async fn play(
                 .playback
                 .update_queue_info(zone_id, start, track_ids.len() as i64)
                 .await;
+            persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -676,6 +749,7 @@ async fn queue_add(
                 .playback
                 .update_queue_info(zone_id, current_pos, new_length)
                 .await;
+            persist_queue_async(&state, zone_id);
             (
                 StatusCode::CREATED,
                 Json(json!({ "added": body.track_ids.len(), "queue_length": new_length })),
@@ -691,7 +765,7 @@ async fn queue_move(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueMoveRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
     let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
     let from = body.from_position as usize;
     let to = body.to_position as usize;
@@ -701,6 +775,7 @@ async fn queue_move(
         items.insert(to, item);
         let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
         queue_repo.set_queue(zone_id, &track_ids).ok();
+        persist_queue_async(&state, zone_id);
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::BAD_REQUEST, "position out of range").into_response()
@@ -718,6 +793,7 @@ async fn queue_jump(
         .await
     {
         Ok(result) => {
+            persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -725,10 +801,15 @@ async fn queue_jump(
 }
 
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
     queue_repo.clear(zone_id).ok();
     state.playback.stop(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
+    // Delete the persisted queue file
+    let db_path = state.config.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        tune_core::queue_persistence::delete_queue_file(&db_path, zone_id);
+    });
     state.event_bus.emit(
         "playback.queue.cleared",
         serde_json::json!({ "zone_id": zone_id }),
@@ -740,7 +821,7 @@ async fn queue_remove(
     State(state): State<AppState>,
     Path((zone_id, position)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
 
     // Try the local play_queue first.
     match queue_repo.remove_at(zone_id, position) {
@@ -756,6 +837,7 @@ async fn queue_remove(
                 .playback
                 .update_queue_info(zone_id, adjusted_pos, new_length)
                 .await;
+            persist_queue_async(&state, zone_id);
             state.event_bus.emit(
                 "playback.queue.track_removed",
                 json!({ "zone_id": zone_id, "position": position }),
@@ -780,6 +862,7 @@ async fn queue_remove(
                 .playback
                 .update_queue_info(zone_id, adjusted_pos, new_length)
                 .await;
+            persist_queue_async(&state, zone_id);
             state.event_bus.emit(
                 "playback.queue.track_removed",
                 json!({ "zone_id": zone_id, "position": position }),
@@ -938,24 +1021,141 @@ async fn set_normalization(
     }))
 }
 
+/// Transfer current track from one zone to another (path-based, backward compat).
+/// Copies the full queue + position and optionally stops the source zone.
 async fn transfer_playback(
     State(state): State<AppState>,
     Path((from_zone, target_zone)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
+    do_transfer(&state, from_zone, target_zone, true).await
+}
+
+/// Transfer queue between zones via JSON body (Sergio #464).
+/// POST /zones/{id}/transfer  { "target_zone_id": 2, "stop_source": true }
+async fn transfer_queue(
+    State(state): State<AppState>,
+    Path(from_zone): Path<i64>,
+    Json(body): Json<TransferRequest>,
+) -> impl IntoResponse {
+    do_transfer(&state, from_zone, body.target_zone_id, body.stop_source).await
+}
+
+/// Shared implementation: copy queue + now playing from source to target zone.
+async fn do_transfer(
+    state: &AppState,
+    from_zone: i64,
+    target_zone: i64,
+    stop_source: bool,
+) -> axum::response::Response {
     let current = state.playback.get_state(from_zone).await;
-    if let Some(np) = current.now_playing {
-        state.playback.stop(from_zone).await;
-        state.playback.play(target_zone, np).await;
-        state.playback.set_volume(target_zone, current.volume).await;
-        Json(json!({
+    if current.now_playing.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "nothing playing to transfer"})),
+        )
+            .into_response();
+    }
+
+    let queue_repo = PlayQueueRepo::new(state.db.clone());
+
+    // Copy local queue (play_queue table)
+    let local_items = queue_repo.get_queue(from_zone).unwrap_or_default();
+    if !local_items.is_empty() {
+        let track_ids: Vec<i64> = local_items.iter().map(|i| i.track_id).collect();
+        let current_pos = local_items.iter().position(|i| i.is_current).unwrap_or(0) as i64;
+        if let Err(e) = queue_repo.set_queue(target_zone, &track_ids) {
+            warn!(from_zone, target_zone, error = %e, "transfer_set_queue_failed");
+        } else if current_pos > 0 {
+            queue_repo.set_current(target_zone, current_pos).ok();
+        }
+    }
+
+    // Copy streaming queue
+    let streaming_items = queue_repo
+        .get_streaming_queue(from_zone)
+        .unwrap_or_default();
+    if !streaming_items.is_empty() {
+        let tracks: Vec<(String, String, String, Option<String>, Option<String>, i64)> =
+            streaming_items
+                .iter()
+                .map(|item| {
+                    (
+                        item["source_id"].as_str().unwrap_or("").to_string(),
+                        item["title"].as_str().unwrap_or("").to_string(),
+                        item["artist_name"].as_str().unwrap_or("").to_string(),
+                        item["album_title"].as_str().map(String::from),
+                        item["cover_path"].as_str().map(String::from),
+                        item["duration_ms"].as_i64().unwrap_or(0),
+                    )
+                })
+                .collect();
+        if let Err(e) = queue_repo.set_streaming_queue(target_zone, &tracks) {
+            warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
+        }
+    }
+
+    let queue_length = if !local_items.is_empty() {
+        local_items.len() as i64
+    } else {
+        streaming_items.len() as i64
+    };
+
+    // Transfer now-playing and playback state
+    let np = current.now_playing.unwrap();
+    state.playback.play(target_zone, np).await;
+    state.playback.set_volume(target_zone, current.volume).await;
+    state
+        .playback
+        .update_queue_info(target_zone, current.queue_position, queue_length)
+        .await;
+
+    // Start playback on the target device via the orchestrator if a device is assigned
+    let has_output = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+        .get(target_zone)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .is_some();
+    if has_output {
+        if let Err(e) = state
+            .orchestrator
+            .play_from_queue(target_zone, current.queue_position)
+            .await
+        {
+            warn!(target_zone, error = %e, "transfer_play_on_target_failed");
+        }
+    }
+
+    if stop_source {
+        state.orchestrator.stop(from_zone, None).await;
+    }
+
+    // Persist queue state for the target zone
+    let target_state = state.playback.get_state(target_zone).await;
+    let db_path = state.config.db_path.clone();
+    let db_clone = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        tune_core::queue_persistence::save_queue(&db_clone, &db_path, target_zone, &target_state);
+    });
+
+    state.event_bus.emit(
+        "playback.transferred",
+        json!({
             "from_zone": from_zone,
             "target_zone": target_zone,
-            "status": "transferred",
-        }))
-        .into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "nothing playing to transfer").into_response()
-    }
+            "stop_source": stop_source,
+            "queue_length": queue_length,
+        }),
+    );
+
+    Json(json!({
+        "from_zone": from_zone,
+        "target_zone": target_zone,
+        "status": "transferred",
+        "queue_length": queue_length,
+        "stop_source": stop_source,
+    }))
+    .into_response()
 }
 
 async fn get_alarms(

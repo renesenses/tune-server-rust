@@ -22,15 +22,26 @@ pub(super) async fn version() -> Json<Value> {
     }))
 }
 
-pub(super) async fn health() -> Json<Value> {
+pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
+    let tracks_result = TrackRepo::new(state.db.clone()).count();
+    let albums_result = AlbumRepo::new(state.db.clone()).count();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
+    let db_status = if tracks_result.is_ok() {
+        "connected"
+    } else {
+        "error"
+    };
+    let tracks = tracks_result.unwrap_or(0);
+    let albums = albums_result.unwrap_or(0);
+
     Json(json!({
         "status": "ok",
-        "components": {
-            "database": true,
-            "scanner": true,
-            "streamer": true,
-            "discovery": true
-        }
+        "version": tune_core::version(),
+        "uptime_seconds": uptime_secs,
+        "db": db_status,
+        "tracks": tracks,
+        "albums": albums,
     }))
 }
 

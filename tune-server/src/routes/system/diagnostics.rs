@@ -20,16 +20,93 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
+    // Zone count
+    let zone_count = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+        .count()
+        .unwrap_or(0);
+
+    // Discovered devices grouped by type
+    let scanner = state.scanner.lock().await;
+    let devices = scanner.devices().await;
+    drop(scanner);
+    let mut devices_by_type: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for d in &devices {
+        devices_by_type
+            .entry(d.device_type.to_string())
+            .or_default()
+            .push(d.name.clone());
+    }
+
+    // Connectors (streaming services)
+    let registry = state.services.lock().await;
+    let connectors: Vec<String> = registry.list();
+    drop(registry);
+
+    // Audio outputs
+    let audio_outputs: Vec<String> = {
+        #[cfg(feature = "local-audio")]
+        {
+            tune_core::outputs::local::list_audio_devices()
+                .iter()
+                .map(|d| d.name.clone())
+                .collect()
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            Vec::new()
+        }
+    };
+
+    // Scan status
+    let settings = SettingsRepo::new(state.db.clone());
+    let scan_status = settings
+        .get("scan_status")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "idle".into());
+    let scan_result: Option<serde_json::Value> = settings
+        .get("scan_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    // Memory RSS
+    let rss_mb = get_rss_mb();
+
+    // DB backend
+    let db_backend = settings
+        .get("db_engine")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "sqlite".into());
+
     Json(json!({
-        "version": tune_core::version(),
+        "server_version": tune_core::version(),
+        "rust_version": tune_core::rustc_version(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "uptime_seconds": uptime_secs,
+        "memory_rss_mb": rss_mb,
+        "db_backend": db_backend,
+        "active_zones": zone_count,
+        "discovered_devices": devices_by_type,
+        "connectors": connectors,
+        "audio_outputs_available": audio_outputs,
+        "scan_status": {
+            "status": scan_status,
+            "tracks": tracks,
+            "albums": albums,
+            "last_result": scan_result,
+        },
+        "features": tune_core::enabled_features(),
+        // Legacy fields kept for backward compatibility
         "engine": "rust",
         "platform": std::env::consts::OS,
-        "arch": std::env::consts::ARCH,
         "pid": std::process::id(),
-        "uptime_seconds": uptime_secs,
         "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         "db": {
-            "engine": "sqlite",
+            "engine": db_backend,
             "migration_version": db_version,
         },
         "music_dirs": music_dirs,
@@ -47,6 +124,37 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
             "db_engine": "rusqlite",
         },
     }))
+}
+
+/// Read process RSS in megabytes. Returns None on unsupported platforms.
+fn get_rss_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|pages| pages * 4096 / 1024 / 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id();
+        std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8(o.stdout)
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(|kb| kb / 1024)
+            })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None::<u64>
+    }
 }
 
 pub(super) async fn diagnostics_bundle(State(state): State<AppState>) -> Json<Value> {

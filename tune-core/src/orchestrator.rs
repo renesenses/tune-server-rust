@@ -1,12 +1,9 @@
-use std::process::Stdio;
 use std::sync::Arc;
 
-use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::audio::formats::AudioFormat;
-use crate::audio::pipeline::find_ffmpeg;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
 use crate::db::play_queue_repo::PlayQueueRepo;
 use crate::db::settings_repo::SettingsRepo;
@@ -283,95 +280,64 @@ impl PlaybackOrchestrator {
 
             let (session_id, tx) = self.streamer.create_session(info, false, 256).await;
 
-            // Spawn FFmpeg transcoding pipeline
-            let ffmpeg_path = find_ffmpeg().ok_or("FFmpeg not found for transcoding")?;
-
-            let codec = if target_fmt == AudioFormat::Wav {
-                match out_bd {
-                    24 => "pcm_s24le",
-                    32 => "pcm_s32le",
-                    _ => "pcm_s16le",
-                }
-            } else {
-                target_fmt.ffmpeg_codec_arg()
-            };
-
-            // When target is WAV, output raw PCM from FFmpeg (no container header).
-            // The streamer prepends its own WAV header based on StreamInfo.format == "wav".
-            let ffmpeg_fmt = if target_fmt == AudioFormat::Wav {
-                match out_bd {
-                    24 => "s24le",
-                    32 => "s32le",
-                    _ => "s16le",
-                }
-            } else {
-                target_fmt.ffmpeg_format_arg()
-            };
-
-            let mut args: Vec<String> =
-                vec!["-hide_banner".into(), "-loglevel".into(), "warning".into()];
-            // DSD/DSF requires explicit input format for FFmpeg to decode correctly
-            if src_fmt == AudioFormat::Dsd {
-                args.extend(["-f".into(), "dsf".into()]);
-            }
-            args.extend([
-                "-i".into(),
-                file_path.clone(),
-                "-vn".into(),
-                "-f".into(),
-                ffmpeg_fmt.into(),
-                "-acodec".into(),
-                codec.into(),
-                "-ar".into(),
-                out_sr.to_string(),
-                "-ac".into(),
-                channels.to_string(),
-                "pipe:1".into(),
-            ]);
-
+            // Native transcoding pipeline: decode with native decoders, encode to target format
             let fp = file_path.clone();
+            let target_format_str = if target_fmt == AudioFormat::Wav {
+                "wav".to_string()
+            } else {
+                target_fmt.ffmpeg_format_arg().to_string()
+            };
             tokio::spawn(async move {
-                let child = tokio::process::Command::new(&ffmpeg_path)
-                    .args(&args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn();
+                let decode_result = crate::audio::decode::decode_to_pcm(
+                    &fp,
+                    Some(out_sr),
+                    Some(channels as u32),
+                    0.0,
+                    0.0,
+                );
 
-                match child {
-                    Ok(mut child) => {
-                        if let Some(stdout) = child.stdout.take() {
-                            let mut reader = tokio::io::BufReader::with_capacity(65536, stdout);
-                            let mut buf = vec![0u8; 32768];
-                            loop {
-                                match reader.read(&mut buf).await {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if tx.send(buf[..n].to_vec()).await.is_err() {
-                                            debug!("transcode_consumer_dropped");
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, file = %fp, "transcode_read_error");
-                                        break;
+                match decode_result {
+                    Ok(decoded) => {
+                        // Convert i16 samples to raw PCM bytes (16-bit LE)
+                        let pcm_bytes: Vec<u8> = decoded
+                            .samples
+                            .iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+
+                        // Encode to target format
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            &target_format_str,
+                            decoded.sample_rate,
+                            16, // decode_to_pcm produces i16 samples
+                            decoded.channels,
+                        );
+                        if let Err(e) = encoder.start().await {
+                            warn!(error = %e, file = %fp, "transcode_encoder_start_failed");
+                            return;
+                        }
+                        if let Err(e) = encoder.write(&pcm_bytes).await {
+                            warn!(error = %e, file = %fp, "transcode_encoder_write_failed");
+                            return;
+                        }
+                        match encoder.finish().await {
+                            Ok(encoded_data) => {
+                                // Send in chunks
+                                for chunk in encoded_data.chunks(32768) {
+                                    if tx.send(chunk.to_vec()).await.is_err() {
+                                        debug!("transcode_consumer_dropped");
+                                        return;
                                     }
                                 }
+                                debug!(file = %fp, "transcode_complete");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, file = %fp, "transcode_encode_failed");
                             }
                         }
-                        // Collect stderr for diagnostics
-                        if let Some(mut stderr) = child.stderr.take() {
-                            let mut err_buf = String::new();
-                            let _ = stderr.read_to_string(&mut err_buf).await;
-                            if !err_buf.trim().is_empty() {
-                                warn!(stderr = %err_buf.trim(), file = %fp, "transcode_ffmpeg_stderr");
-                            }
-                        }
-                        debug!(file = %fp, "transcode_complete");
                     }
                     Err(e) => {
-                        warn!(error = %e, file = %fp, "transcode_spawn_failed");
+                        warn!(error = %e, file = %fp, "transcode_decode_failed");
                     }
                 }
             });
