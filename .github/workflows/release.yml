@@ -283,46 +283,60 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Compute new formula values
-        id: vals
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
-          # Source tarball published automatically by GitHub from the tag.
-          URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
-          # Fetch the tarball and hash it; retry a few times since the
-          # archive can take a few seconds to appear after the release
-          # job completes.
-          for i in 1 2 3 4 5; do
-            if curl -fL --retry 0 -o source.tar.gz "$URL"; then break; fi
-            echo "fetch attempt $i failed, retrying in 5s..."
-            sleep 5
-          done
-          SHA256=$(sha256sum source.tar.gz | cut -d' ' -f1)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "url=$URL"         >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256"   >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
           repository: renesenses/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
-      - name: Patch Formula/tune-server.rb
+      - name: Update formula with new version and SHAs
+        id: vals
         working-directory: homebrew-tap
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
           F=Formula/tune-server.rb
           if [ ! -f "$F" ]; then
             echo "::error::$F not found in tap repo"
             exit 1
           fi
-          # Rewrite url + sha256 + version. The formula uses
-          # `url "..."`, `sha256 "..."`, `version "..."` lines.
-          sed -i -E "s|^  url \".*\"|  url \"${{ steps.vals.outputs.url }}\"|" "$F"
-          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${{ steps.vals.outputs.sha256 }}\"|" "$F"
-          sed -i -E "s|^  version \".*\"|  version \"${{ steps.vals.outputs.version }}\"|" "$F"
-          echo "── New formula ──"
+
+          # Extract old version from formula
+          OLD_VERSION=$(grep -oP '^\s+version "\K[^"]+' "$F")
+          echo "Updating $OLD_VERSION → $VERSION"
+
+          # Update version string and caveats
+          sed -i -E "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
+          sed -i -E "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
+
+          # Update all download URLs (replace old version in paths)
+          sed -i "s|/v${OLD_VERSION}/|/v${VERSION}/|g" "$F"
+          sed -i "s|tune-server-v${OLD_VERSION}-|tune-server-v${VERSION}-|g" "$F"
+
+          # Recompute SHA256 for each platform tarball
+          BASE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+          for PLATFORM in macos-aarch64 macos-x86_64 linux-aarch64 linux-x86_64; do
+            FILE="tune-server-v${VERSION}-${PLATFORM}.tar.gz"
+            URL="${BASE}/${FILE}"
+            echo "Fetching ${PLATFORM}..."
+            for i in 1 2 3 4 5; do
+              if curl -fL --retry 0 -o "/tmp/${FILE}" "$URL"; then break; fi
+              echo "  attempt $i failed, retrying in 10s..."
+              sleep 10
+            done
+            NEW_SHA=$(sha256sum "/tmp/${FILE}" | cut -d' ' -f1)
+            # Find the sha256 line that follows this platform's url line
+            OLD_SHA=$(grep -A1 "${PLATFORM}" "$F" | grep -oP 'sha256 "\K[^"]+')
+            if [ -n "$OLD_SHA" ]; then
+              sed -i "s|${OLD_SHA}|${NEW_SHA}|" "$F"
+              echo "  ${PLATFORM}: ${OLD_SHA} → ${NEW_SHA}"
+            else
+              echo "::warning::Could not find SHA for ${PLATFORM}"
+            fi
+          done
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "── Updated formula ──"
           cat "$F"
 
       - name: Commit and push to tap
@@ -331,6 +345,7 @@ jobs:
           git config user.email "renesenses-bot@users.noreply.github.com"
           git config user.name  "renesenses-bot"
           git add Formula/tune-server.rb
+          git diff --cached --quiet && echo "Formula already up to date" && exit 0
           git commit -m "tune-server v${{ steps.vals.outputs.version }}"
           git push origin HEAD
 
