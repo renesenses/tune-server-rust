@@ -474,6 +474,61 @@ pub(super) async fn changelog() -> Json<Value> {
                     ]},
                 ]
             },
+            {
+                "version": "0.8.28",
+                "date": "2026-06-03",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Zone creation race condition fix",
+                        "PostgreSQL FTS accent search",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Release autonomy pipeline",
+                        "PostgreSQL abstraction layer",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.35",
+                "date": "2026-06-03",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "SSDP non-standard UPnP renderers",
+                        "Artwork rescan coalesce bug",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "DLNA cover art profileID in DIDL-Lite",
+                        "Cargo audit security check in CI",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.37",
+                "date": "2026-06-04",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "OAAT streams FLAC directly (no FFmpeg transcode)",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Mood DJ — ambient mix generation",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.39",
+                "date": "2026-06-04",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Nested transaction fix in artist_repo",
+                        "Signal path shows actual renderer name",
+                        "TCP poll before browser open (no sleep)",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Output errors surfaced to clients",
+                        "Radio favorites: playlist_name + limit params",
+                    ]},
+                ]
+            },
         ]
     }))
 }
