@@ -144,8 +144,11 @@ async fn list_shares() -> Json<Value> {
             match receiver.recv_timeout(Duration::from_millis(500)) {
                 Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
                     let host = info.get_hostname().trim_end_matches('.').to_string();
-                    let addrs: Vec<String> =
-                        info.get_addresses().iter().map(|a| a.to_string()).collect();
+                    let addrs: Vec<String> = info
+                        .get_addresses()
+                        .iter()
+                        .map(|a| a.to_ip_addr().to_string())
+                        .collect();
                     let ip = addrs.first().cloned().unwrap_or_default();
                     let name = info
                         .get_fullname()
@@ -340,7 +343,7 @@ async fn trigger_smb_scan() -> impl IntoResponse {
                         "port": info.get_port(),
                         "addresses": info.get_addresses()
                             .iter()
-                            .map(|a| a.to_string())
+                            .map(|a| a.to_ip_addr().to_string())
                             .collect::<Vec<_>>(),
                         "properties": info.get_properties()
                             .iter()

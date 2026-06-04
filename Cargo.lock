@@ -1781,20 +1781,6 @@ dependencies = [
 
 [[package]]
 name = "mdns-sd"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e36e83ad165be7e0ad2e3ae3be9afffdda0c2c9a7e70c628e5541f11443e3041"
-dependencies = [
- "fastrand",
- "flume",
- "if-addrs 0.13.4",
- "log",
- "polling",
- "socket2 0.5.10",
-]
-
-[[package]]
-name = "mdns-sd"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "892f96f6d2ebe1ea641279f986ac52a2a6bac71e8f743bb258315cfe2bd7e88e"
@@ -2062,7 +2048,7 @@ checksum = "78c12236db588204b49252b18bd568ab302594d1bdbec45ab6bf054514c940e1"
 dependencies = [
  "bytes",
  "hostname",
- "mdns-sd 0.20.0",
+ "mdns-sd",
  "oaat-core",
  "serde",
  "serde_json",
@@ -2225,22 +2211,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "polling"
-version = "2.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b2d323e8ca7996b3e23126511a523f7e62924d93ecd5ae73b333815b0eb3dce"
-dependencies = [
- "autocfg",
- "bitflags 1.3.2",
- "cfg-if",
- "concurrent-queue",
- "libc",
- "log",
- "pin-project-lite",
- "windows-sys 0.48.0",
-]
 
 [[package]]
 name = "potential_utf"
@@ -3967,7 +3937,7 @@ dependencies = [
  "if-addrs 0.13.4",
  "lofty",
  "md-5",
- "mdns-sd 0.12.0",
+ "mdns-sd",
  "notify",
  "oaat-controller",
  "oaat-core",
@@ -4003,7 +3973,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "lofty",
- "mdns-sd 0.12.0",
+ "mdns-sd",
  "quick-xml",
  "reqwest",
  "rusqlite",
