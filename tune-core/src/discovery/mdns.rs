@@ -452,6 +452,9 @@ fn service_to_device(
             caps.insert("firmware".into(), serde_json::Value::String(fw.to_string()));
         }
         caps.insert("oaat".into(), serde_json::Value::Bool(true));
+        if let Some(ip) = info.get_property_val_str("ip") {
+            device.host = ip.to_string();
+        }
     }
 
     device.capabilities = caps;
