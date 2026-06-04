@@ -122,8 +122,6 @@ async fn main() {
         )
         .expect("failed to create socket");
         socket.set_reuse_address(true).ok();
-        #[cfg(not(windows))]
-        socket.set_reuse_port(true).ok();
         socket
             .bind(&addr.into())
             .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
