@@ -51,8 +51,8 @@ symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aac", "alac", 
 rubato = "0.14"
 hound = "3.5"
 unicode-normalization = "0.1"
-oaat-core = { path = "../oaat/crates/oaat-core", default-features = false }
-oaat-controller = { path = "../oaat/crates/oaat-controller", default-features = false }
+oaat-core = { version = "0.2.0", default-features = false }
+oaat-controller = { version = "0.2.0", default-features = false }
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }

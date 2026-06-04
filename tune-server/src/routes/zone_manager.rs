@@ -949,7 +949,7 @@ async fn oaat_group_status(State(state): State<AppState>, Path(id): Path<String>
     #[cfg(feature = "oaat")]
     if let Some(output) = outputs.get(&device_id) {
         let output = output.lock().await;
-        if let Some(mr) = downcast_oaat_multiroom(&*output) {
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
             return Json(mr.zone_snapshot().await);
         }
     }
@@ -974,7 +974,7 @@ async fn oaat_group_add_endpoint(
     let outputs = state.outputs.lock().await;
     if let Some(output) = outputs.get(&device_id) {
         let output = output.lock().await;
-        if let Some(mr) = downcast_oaat_multiroom(&*output) {
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
             match mr.add_endpoint(host, port).await {
                 Ok(ep_id) => {
                     info!(group = %id, endpoint_id = %ep_id, "oaat_group_endpoint_added");
@@ -1007,7 +1007,7 @@ async fn oaat_group_remove_endpoint(
 
     if let Some(output) = outputs.get(&device_id) {
         let output = output.lock().await;
-        if let Some(mr) = downcast_oaat_multiroom(&*output) {
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
             let removed = mr.remove_endpoint(&ep_id).await;
             info!(group = %id, endpoint_id = %ep_id, removed, "oaat_group_endpoint_removed");
             return Json(json!({ "removed": removed, "endpoint_id": ep_id }));
@@ -1037,7 +1037,7 @@ async fn oaat_group_set_volume(
     let outputs = state.outputs.lock().await;
     if let Some(output) = outputs.get(&device_id) {
         let output = output.lock().await;
-        if let Some(mr) = downcast_oaat_multiroom(&*output) {
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
             match mr.set_zone_volume(level).await {
                 Ok(()) => return Json(json!({ "volume": level })),
                 Err(e) => return Json(json!({ "error": e })),
@@ -1068,7 +1068,7 @@ async fn oaat_group_set_endpoint_volume(
     let outputs = state.outputs.lock().await;
     if let Some(output) = outputs.get(&device_id) {
         let output = output.lock().await;
-        if let Some(mr) = downcast_oaat_multiroom(&*output) {
+        if let Some(mr) = downcast_oaat_multiroom(&**output) {
             // Support both absolute level and relative offset
             if let Some(level) = body["level"].as_u64() {
                 let level = level.min(100) as u8;
