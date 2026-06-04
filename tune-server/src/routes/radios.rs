@@ -21,7 +21,9 @@ struct SearchQuery {
 #[derive(Deserialize)]
 struct CreateRadio {
     name: String,
+    #[serde(alias = "stream_url")]
     url: String,
+    #[serde(alias = "homepage_url")]
     homepage: Option<String>,
     logo_url: Option<String>,
     country: Option<String>,
@@ -36,7 +38,10 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
-        .route("/{id}", get(get_radio).delete(delete_radio))
+        .route(
+            "/{id}",
+            get(get_radio).put(update_radio).delete(delete_radio),
+        )
         .route("/{id}/favorite", post(toggle_favorite))
         .route("/{id}/play/{zone_id}", post(play_radio))
         .route("/{id}/artwork", post(set_radio_artwork))
@@ -81,6 +86,30 @@ async fn create_radio(
     };
     match repo.create(&station) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn update_radio(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateRadio>,
+) -> impl IntoResponse {
+    let repo = RadioRepo::new(state.db);
+    let Some(mut station) = repo.get(id).ok().flatten() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    station.name = body.name;
+    station.url = body.url;
+    station.homepage = body.homepage;
+    station.logo_url = body.logo_url;
+    station.country = body.country;
+    station.language = body.language;
+    station.genre = body.genre;
+    station.codec = body.codec;
+    station.bitrate = body.bitrate;
+    match repo.update(&station) {
+        Ok(()) => Json(json!(station)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

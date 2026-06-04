@@ -277,8 +277,14 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
                         } else {
-                            let name_taken = existing.iter().any(|z| z.name == dev.name);
-                            if !name_taken {
+                            let same_name_zone = existing.iter().find(|z| z.name == dev.name);
+                            if let Some(z) = same_name_zone
+                                && let Some(zid) = z.id
+                            {
+                                let _ = zone_repo.update_output_device(zid, &dev.id);
+                                let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+                            } else {
                                 if let Ok(zid) = zone_repo.create(
                                     &dev.name,
                                     Some(output_type_str),
@@ -286,8 +292,6 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 ) {
                                     info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                 }
-                            } else {
-                                info!(name = %dev.name, r#type = output_type_str, "mdns_zone_skipped_name_exists");
                             }
                         }
                     }

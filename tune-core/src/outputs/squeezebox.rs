@@ -8,6 +8,7 @@ use super::traits::*;
 pub struct SqueezeboxOutput {
     name: String,
     device_id: String,
+    player_id: String,
     lms_host: String,
     lms_port: u16,
     client: Client,
@@ -15,6 +16,10 @@ pub struct SqueezeboxOutput {
 
 impl SqueezeboxOutput {
     pub fn new(name: String, device_id: String, lms_host: String, lms_port: u16) -> Self {
+        let player_id = device_id
+            .strip_prefix("squeezebox-")
+            .unwrap_or(&device_id)
+            .to_string();
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -22,6 +27,7 @@ impl SqueezeboxOutput {
         Self {
             name,
             device_id,
+            player_id,
             lms_host,
             lms_port,
             client,
@@ -36,7 +42,7 @@ impl SqueezeboxOutput {
         let body = json!({
             "id": 1,
             "method": "slim.request",
-            "params": [&self.device_id, cmd],
+            "params": [&self.player_id, cmd],
         });
         let resp = self
             .client
