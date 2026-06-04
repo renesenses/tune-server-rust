@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use quick_xml::Reader;
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use reqwest::Client;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -301,9 +302,12 @@ fn parse_propertyset(xml: &str) -> HashMap<String, String> {
             Ok(Event::Text(ref e)) => {
                 if in_property
                     && !current_tag.is_empty()
-                    && let Ok(text) = e.unescape()
+                    && let Ok(decoded) = e.decode()
                 {
-                    let text = text.trim().to_string();
+                    let text = match unescape(&decoded) {
+                        Ok(s) => s.trim().to_string(),
+                        Err(_) => decoded.trim().to_string(),
+                    };
                     if !text.is_empty() {
                         result.insert(current_tag.clone(), text);
                     }

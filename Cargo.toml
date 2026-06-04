@@ -17,15 +17,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 pyo3 = { version = "0.24", features = ["extension-module"] }
-lofty = "0.22"
+lofty = "0.24"
 id3 = "1.17"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "query", "form"] }
 walkdir = "2"
 rayon = "1.10"
 notify = "7"
 md-5 = "0.10"
-quick-xml = "0.37"
-mdns-sd = "0.12"
+quick-xml = "0.40"
+mdns-sd = "0.20"
 socket2 = "0.5"
 if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
@@ -39,7 +39,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "postgres"] }
 rusqlite = { version = "0.39", features = ["bundled", "functions"] }
 urlencoding = "2"
 toml = "0.8"
-cpal = "0.15"
+cpal = "0.17"
 rust_cast = "0.21"
 sha2 = "0.10"
 blowfish = "0.9"
@@ -47,7 +47,7 @@ chrono = "0.4"
 cbc = "0.1"
 regex = "1"
 csv = "1"
-symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg"] }
+symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg"] }
 rubato = "0.14"
 hound = "3.5"
 unicode-normalization = "0.1"

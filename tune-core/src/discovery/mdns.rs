@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info};
 
@@ -319,7 +319,7 @@ async fn handle_event(
 }
 
 fn service_to_device(
-    info: &ServiceInfo,
+    info: &ResolvedService,
     output_type: OutputType,
     default_port: u16,
 ) -> DiscoveredDevice {
@@ -359,12 +359,12 @@ fn service_to_device(
         .get_addresses()
         .iter()
         .find(|a| a.is_ipv4())
-        .map(|a| a.to_string())
+        .map(|a| a.to_ip_addr().to_string())
         .unwrap_or_else(|| {
             info.get_addresses()
                 .iter()
                 .next()
-                .map(|a| a.to_string())
+                .map(|a| a.to_ip_addr().to_string())
                 .unwrap_or_default()
         });
 

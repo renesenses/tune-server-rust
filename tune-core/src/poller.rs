@@ -27,6 +27,9 @@ pub struct ZonePollerMetrics {
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 2;
+/// After this many consecutive Stopped ticks without enough playback,
+/// treat as playback failure and stop the zone (don't advance).
+const STOPPED_FAILURE_THRESHOLD: u8 = 6;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
@@ -436,6 +439,7 @@ impl PositionPoller {
             let in_gapless_guard = ps.gapless_sent_at.is_some();
 
             let mut track_ended = false;
+            let mut force_stop = false;
             match status.state {
                 TransportState::Stopped => {
                     if ps.gapless_cooldown > 0 {
@@ -475,7 +479,36 @@ impl PositionPoller {
                         }
                     } else {
                         ps.stopped_ticks += 1;
-                        track_ended = ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD;
+                        if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
+                            let is_short_track = track_duration_ms > 0
+                                && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
+                            let natural_end = played_enough
+                                || (is_short_track
+                                    && ps.peak_position_ms as f64
+                                        >= track_duration_ms as f64 * 0.5);
+                            if natural_end {
+                                track_ended = true;
+                            } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
+                                warn!(
+                                    zone_id,
+                                    peak_pos = ps.peak_position_ms,
+                                    track_dur = track_duration_ms,
+                                    wall_secs = wall_elapsed,
+                                    "playback_failure_stopping_zone"
+                                );
+                                track_ended = false;
+                                force_stop = true;
+                            } else {
+                                debug!(
+                                    zone_id,
+                                    peak_pos = ps.peak_position_ms,
+                                    track_dur = track_duration_ms,
+                                    wall_secs = wall_elapsed,
+                                    stopped_ticks = ps.stopped_ticks,
+                                    "stopped_early_waiting"
+                                );
+                            }
+                        }
                     }
                 }
                 TransportState::Playing | TransportState::Transitioning => {
@@ -570,7 +603,13 @@ impl PositionPoller {
                 },
             );
 
-            if track_ended {
+            if force_stop {
+                poll_states.remove(&zone_id);
+                let device_id_ref = self.get_zone_device_id(zone_id);
+                self.orchestrator
+                    .stop(zone_id, device_id_ref.as_deref())
+                    .await;
+            } else if track_ended {
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
