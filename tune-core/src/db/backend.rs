@@ -714,7 +714,7 @@ impl DbBackend for PostgresBackend {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 if returning {
-                    let mut q = sqlx::query_scalar::<_, i64>(&sql_owned);
+                    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
                         q = bind_sqlvalue_scalar(q, v);
                     }
@@ -725,7 +725,7 @@ impl DbBackend for PostgresBackend {
                     *last_id_handle.lock().unwrap() = id;
                     Ok(1)
                 } else {
-                    let mut q = sqlx::query(&sql_owned);
+                    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                     for v in &owned {
                         q = bind_sqlvalue(q, v);
                     }
@@ -754,7 +754,7 @@ impl DbBackend for PostgresBackend {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let mut q = sqlx::query(&sql_owned);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);
                 }
@@ -781,7 +781,7 @@ impl DbBackend for PostgresBackend {
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let mut q = sqlx::query(&sql_owned);
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
                 for v in &owned {
                     q = bind_sqlvalue(q, v);
                 }
