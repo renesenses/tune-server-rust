@@ -553,8 +553,19 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         // This fetches covers from MusicBrainz Cover Art Archive for albums
         // that don't have embedded cover art.
         let enrich_db = db.clone();
+        let artist_cache_dir = cache_dir.clone();
+        let artist_enrich_db = db.clone();
         tokio::spawn(async move {
             tune_core::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
+        });
+
+        // Launch batch artist image enrichment after album artwork
+        // This fetches artist images from mozaiklabs API for artists
+        // that have an MBID but no image yet.
+        tokio::spawn(async move {
+            // Small delay to let album enrichment start first
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tune_core::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
         });
         }).await;
         if let Err(e) = result {
@@ -680,5 +691,18 @@ fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
         }
     } else {
         None
+    }
+}
+
+pub(super) async fn scan_report() -> impl IntoResponse {
+    let report_path = std::env::var("TUNE_DB_PATH")
+        .unwrap_or_else(|_| "tune.db".into())
+        .replace(".db", "-scan-report.json");
+    match std::fs::read_to_string(&report_path) {
+        Ok(json) => match serde_json::from_str::<Value>(&json) {
+            Ok(v) => Json(v).into_response(),
+            Err(_) => Json(json!({"error": "invalid report file"})).into_response(),
+        },
+        Err(_) => Json(json!({"error": "no scan report available yet"})).into_response(),
     }
 }
