@@ -44,6 +44,7 @@ pub struct PlayMedia<'a> {
     pub album: Option<&'a str>,
     pub cover_url: Option<&'a str>,
     pub duration_ms: Option<u64>,
+    pub file_size: Option<u64>,
     /// Signalled by the HTTP streamer when the renderer makes its first GET request.
     /// DLNA outputs wait on this before sending Play to avoid buffer underrun clicks.
     pub stream_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -59,6 +60,7 @@ impl Default for PlayMedia<'_> {
             album: None,
             cover_url: None,
             duration_ms: None,
+            file_size: None,
             stream_ready: None,
         }
     }
