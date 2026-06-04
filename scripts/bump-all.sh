@@ -74,7 +74,7 @@ FORMULA="$DEV/tune-server-linux/homebrew/tune-server.rb"
 if [ -f "$FORMULA" ] && command -v gh &>/dev/null; then
     sed -i.bak -E "s/^  version \"[0-9]+\\.[0-9]+\\.[0-9]+\"/  version \"$VERSION\"/" "$FORMULA"
     sed -i.bak -E "s|/v[0-9]+\\.[0-9]+\\.[0-9]+/|/v$VERSION/|g" "$FORMULA"
-    sed -i.bak -E "s/v[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz/v$VERSION.tar.gz/" "$FORMULA"
+    sed -i.bak -E "s/tune-server-v[0-9]+\\.[0-9]+\\.[0-9]+-/tune-server-v$VERSION-/g" "$FORMULA"
     sed -i.bak -E "s/Tune Server v[0-9]+\\.[0-9]+\\.[0-9]+/Tune Server v$VERSION/" "$FORMULA"
     rm -f "$FORMULA.bak"
     echo "  - $FORMULA"
