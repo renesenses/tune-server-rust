@@ -36,12 +36,22 @@ fn parse_lms_host(state: &AppState) -> (String, u16) {
         .flatten()
         .unwrap_or_else(|| "localhost".into());
 
-    if raw.contains(':') {
-        let parts: Vec<&str> = raw.splitn(2, ':').collect();
-        let port = parts[1].parse::<u16>().unwrap_or(LMS_CLI_PORT);
+    // Strip http:// or https:// prefix if user pasted a URL
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+
+    if cleaned.contains(':') {
+        let parts: Vec<&str> = cleaned.splitn(2, ':').collect();
+        let mut port = parts[1].parse::<u16>().unwrap_or(LMS_CLI_PORT);
+        // Auto-correct: port 9000 is LMS HTTP, CLI is 9090
+        if port == 9000 {
+            port = LMS_CLI_PORT;
+        }
         (parts[0].to_string(), port)
     } else {
-        (raw, LMS_CLI_PORT)
+        (cleaned.to_string(), LMS_CLI_PORT)
     }
 }
 
