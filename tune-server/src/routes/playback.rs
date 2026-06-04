@@ -559,13 +559,12 @@ async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<V
 
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let current = state.playback.get_state(zone_id).await;
-    let next_pos = current.queue_position + 1;
 
-    if next_pos >= current.queue_length {
+    let Some(next_pos) = tune_core::poller::PositionPoller::next_position(&current) else {
         let device_id = get_zone_device_id(&state, zone_id);
         state.orchestrator.stop(zone_id, device_id.as_deref()).await;
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
-    }
+    };
 
     match state.orchestrator.play_from_queue(zone_id, next_pos).await {
         Ok(result) => {

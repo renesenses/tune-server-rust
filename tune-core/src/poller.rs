@@ -558,7 +558,7 @@ impl PositionPoller {
         }
     }
 
-    fn next_position(zone_state: &crate::playback::ZoneState) -> Option<i64> {
+    pub fn next_position(zone_state: &crate::playback::ZoneState) -> Option<i64> {
         if zone_state.queue_length == 0 {
             return None;
         }

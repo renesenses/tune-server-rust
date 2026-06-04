@@ -34,6 +34,8 @@ struct MountRequest {
     username: Option<String>,
     password: Option<String>,
     mount_path: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 pub fn router() -> Router<AppState> {
@@ -412,6 +414,20 @@ async fn mount_smb_share(
     let mount_path = body
         .mount_path
         .unwrap_or_else(|| format!("/mnt/{}_{}", body.host, share_safe));
+
+    // Dry run: just test reachability without mounting
+    if body.dry_run {
+        let reachable = tokio::net::TcpStream::connect(format!("{}:445", body.host))
+            .await
+            .is_ok();
+        return Json(json!({
+            "ok": reachable,
+            "host": body.host,
+            "share_name": body.share_name,
+            "message": if reachable { "Host reachable on SMB port 445" } else { "Cannot reach host on port 445" },
+        }))
+        .into_response();
+    }
 
     // Create mount directory
     if let Err(e) = tokio::fs::create_dir_all(&mount_path).await {
