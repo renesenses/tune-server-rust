@@ -6,6 +6,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tune_core::audio::decode::decode_to_pcm;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
@@ -171,20 +172,22 @@ async fn dj_waveform(
         return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
     };
 
-    // Use FFmpeg to extract mono PCM at 8 kHz for waveform visualization
-    let output = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-i", path, "-ac", "1", "-ar", "8000", "-f", "f32le", "-v", "quiet", "-",
-        ])
-        .output()
-        .await;
+    // Decode to mono PCM natively, then downsample to ~8kHz equivalent by striding
+    let path_owned = path.clone();
+    let decoded =
+        tokio::task::spawn_blocking(move || decode_to_pcm(&path_owned, None, Some(1), 0.0, 0.0))
+            .await;
 
-    match output {
-        Ok(out) if out.status.success() && out.stdout.len() >= 4 => {
-            let samples: Vec<f32> = out
-                .stdout
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    match decoded {
+        Ok(Ok(audio)) if !audio.samples.is_empty() => {
+            let source_rate = audio.sample_rate as usize;
+            // Stride factor to approximate 8kHz from native rate
+            let stride = (source_rate / 8000).max(1);
+            let samples: Vec<f32> = audio
+                .samples
+                .iter()
+                .step_by(stride)
+                .map(|&s| s as f32 / 32768.0)
                 .collect();
 
             // Downsample to ~200 points (peak amplitude per chunk)
@@ -205,7 +208,7 @@ async fn dj_waveform(
         _ => Json(json!({
             "track_id": track_id,
             "waveform": null,
-            "error": "FFmpeg not available or failed",
+            "error": "native decode failed",
         }))
         .into_response(),
     }
@@ -225,25 +228,37 @@ async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) ->
         return Json(json!({"track_id": track_id, "error": "no file path"})).into_response();
     };
 
-    // Extract mono PCM at 22050 Hz for energy-based beat detection
-    let output = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-i", path, "-ac", "1", "-ar", "22050", "-f", "f32le", "-v", "quiet", "-",
-        ])
-        .output()
-        .await;
+    // Decode to mono PCM natively for energy-based beat detection
+    let path_owned = path.clone();
+    let decoded =
+        tokio::task::spawn_blocking(move || decode_to_pcm(&path_owned, None, Some(1), 0.0, 0.0))
+            .await;
 
-    match output {
-        Ok(out) if out.status.success() && out.stdout.len() >= 4 => {
-            let samples: Vec<f32> = out
-                .stdout
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+    match decoded {
+        Ok(Ok(audio)) if !audio.samples.is_empty() => {
+            let source_rate = audio.sample_rate as usize;
+            // Stride to approximate 22050 Hz from native rate
+            let stride = (source_rate / 22050).max(1);
+            let effective_rate: usize = source_rate / stride;
+
+            let samples: Vec<f32> = audio
+                .samples
+                .iter()
+                .step_by(stride)
+                .map(|&s| s as f32 / 32768.0)
                 .collect();
 
-            let sample_rate: usize = 22050;
             // 250 ms windows for energy computation
-            let window_size = sample_rate / 4;
+            let window_size = effective_rate / 4;
+            if window_size == 0 {
+                return Json(json!({
+                    "track_id": track_id,
+                    "bpm": null,
+                    "error": "audio too short for analysis",
+                }))
+                .into_response();
+            }
+
             let energies: Vec<f32> = samples
                 .chunks(window_size)
                 .map(|chunk| chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32)
@@ -272,7 +287,7 @@ async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) ->
                 prev_above = above;
             }
 
-            let duration_secs = samples.len() as f64 / sample_rate as f64;
+            let duration_secs = samples.len() as f64 / effective_rate as f64;
             let bpm_raw = if duration_secs > 0.0 {
                 (beats as f64 / duration_secs * 60.0).round()
             } else {
@@ -296,7 +311,7 @@ async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) ->
         _ => Json(json!({
             "track_id": track_id,
             "bpm": null,
-            "error": "FFmpeg not available or analysis failed",
+            "error": "native decode failed",
         }))
         .into_response(),
     }
