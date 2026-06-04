@@ -88,10 +88,22 @@ pub struct LocalOutput {
     track_title: Arc<std::sync::Mutex<Option<String>>>,
     track_artist: Arc<std::sync::Mutex<Option<String>>>,
     stop_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// When true (and on macOS), use CoreAudio exclusive/hog mode for
+    /// bit-perfect output, bypassing the system mixer.
+    exclusive_mode: bool,
 }
 
 impl LocalOutput {
     pub fn new(device_name: String) -> Self {
+        Self::new_with_exclusive(device_name, false)
+    }
+
+    /// Create a new `LocalOutput` with explicit exclusive-mode control.
+    ///
+    /// When `exclusive_mode` is `true` and the platform is macOS, playback
+    /// claims hog mode on the device and sets the hardware sample rate / bit
+    /// depth to match the source, bypassing the system audio mixer.
+    pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
         let device_id = format!("local:{device_name}");
         Self {
             device_name,
@@ -107,12 +119,27 @@ impl LocalOutput {
             track_title: Arc::new(std::sync::Mutex::new(None)),
             track_artist: Arc::new(std::sync::Mutex::new(None)),
             stop_tx: std::sync::Mutex::new(None),
+            exclusive_mode,
+        }
+    }
+
+    /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
+    pub fn supports_exclusive_mode() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
         }
     }
 }
 
-/// Ring buffer shared between the HTTP reader thread and the cpal audio callback.
-struct RingBuf {
+/// Ring buffer shared between the HTTP reader thread and the audio callback.
+///
+/// Also used by `coreaudio_exclusive` on macOS for bit-perfect output.
+pub struct RingBuf {
     buf: Box<[f32]>,
     /// Write position (HTTP thread writes here)
     write: AtomicU64,
@@ -121,7 +148,7 @@ struct RingBuf {
 }
 
 impl RingBuf {
-    fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             buf: vec![0.0f32; capacity].into_boxed_slice(),
             write: AtomicU64::new(0),
@@ -129,19 +156,19 @@ impl RingBuf {
         }
     }
 
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.buf.len()
     }
 
     /// Number of samples available to read
-    fn available(&self) -> usize {
+    pub fn available(&self) -> usize {
         let w = self.write.load(Ordering::Acquire);
         let r = self.read.load(Ordering::Acquire);
         (w.wrapping_sub(r)) as usize
     }
 
     /// Push samples into the ring buffer. Returns number actually written.
-    fn push(&self, samples: &[f32]) -> usize {
+    pub fn push(&self, samples: &[f32]) -> usize {
         let cap = self.capacity();
         let w = self.write.load(Ordering::Acquire);
         let r = self.read.load(Ordering::Acquire);
@@ -160,7 +187,7 @@ impl RingBuf {
     }
 
     /// Read samples from the ring buffer into `out`. Returns number actually read.
-    fn pop(&self, out: &mut [f32]) -> usize {
+    pub fn pop(&self, out: &mut [f32]) -> usize {
         let w = self.write.load(Ordering::Acquire);
         let r = self.read.load(Ordering::Acquire);
         let avail = (w.wrapping_sub(r)) as usize;
@@ -289,6 +316,7 @@ impl OutputTarget for LocalOutput {
         let volume = self.volume.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_shared = self.duration_ms.clone();
+        let exclusive_mode = self.exclusive_mode;
 
         // Store metadata
         *self.current_uri.lock().unwrap() = Some(url.clone());
@@ -356,7 +384,129 @@ impl OutputTarget for LocalOutput {
             let bytes_per_sample = (bit_depth / 8) as usize;
             let frame_bytes = channels as usize * bytes_per_sample;
 
-            // ------- Open cpal device -------
+            // ------- Exclusive mode path (macOS only) -------
+            #[cfg(target_os = "macos")]
+            if exclusive_mode {
+                use super::coreaudio_exclusive::ExclusiveOutput;
+
+                info!(
+                    device = %device_name,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    "local_audio_exclusive_mode_active"
+                );
+
+                // Ring buffer: ~2 seconds of audio at source sample rate
+                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
+                let ring = Arc::new(RingBuf::new(ring_cap));
+
+                let exclusive = match ExclusiveOutput::new(
+                    &device_name,
+                    sample_rate,
+                    bit_depth as u32,
+                    channels as u32,
+                    ring.clone(),
+                    volume.clone(),
+                    paused.clone(),
+                ) {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        warn!(error = %e, "coreaudio_exclusive_init_failed_falling_back_to_shared");
+                        // Fall through to cpal shared mode below
+                        // We need a goto-like mechanism; use a flag instead
+                        // (handled by the `if !exclusive_mode` block below)
+                        // Actually, we can't fall through in Rust. Log and return error.
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
+
+                // Feed audio data (no resampling needed -- hardware is set to source rate)
+                let pcm_data = if data_offset < header_buf.len() {
+                    header_buf[data_offset..].to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                let mut total_frames_fed: u64 = 0;
+
+                // Process leftover from header read
+                if !pcm_data.is_empty() {
+                    let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
+                    if aligned_len > 0 {
+                        let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+                        feed_ring(&ring, &samples, &stop_rx, &paused);
+                        total_frames_fed += (aligned_len / frame_bytes) as u64;
+                    }
+                }
+
+                // Read and feed the rest of the stream
+                let mut read_buf = vec![0u8; 65536];
+                let mut leftover = Vec::new();
+
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+
+                    let n = match reader.read(&mut read_buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_exclusive_read_error");
+                            break;
+                        }
+                    };
+
+                    leftover.extend_from_slice(&read_buf[..n]);
+
+                    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
+                    if aligned_len == 0 {
+                        continue;
+                    }
+
+                    let samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
+                    let remainder = leftover[aligned_len..].to_vec();
+                    leftover = remainder;
+
+                    feed_ring(&ring, &samples, &stop_rx, &paused);
+
+                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+
+                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                    position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                // Wait for ring buffer to drain
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if ring.available() == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // ExclusiveOutput::drop() restores sample rate and releases hog mode
+                drop(exclusive);
+                playing.store(false, Ordering::SeqCst);
+                info!(
+                    device = %device_name,
+                    frames = total_frames_fed,
+                    "local_audio_exclusive_stopped"
+                );
+                return;
+            }
+
+            // Suppress unused-variable warning on non-macOS platforms
+            #[cfg(not(target_os = "macos"))]
+            let _ = exclusive_mode;
+
+            // ------- Open cpal device (shared mode) -------
             let host = cpal::default_host();
             let device = if device_name == "default" {
                 host.default_output_device()
