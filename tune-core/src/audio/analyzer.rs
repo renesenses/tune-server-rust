@@ -45,7 +45,7 @@ pub async fn ffmpeg_pcm(
         }
     }
 
-    // Fallback: ffmpeg subprocess (DSD, WavPack, APE, or symphonia failure)
+    // Fallback: ffmpeg subprocess (DSD, APE, hybrid WavPack, or symphonia failure)
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
