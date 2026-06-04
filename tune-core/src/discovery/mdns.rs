@@ -355,18 +355,7 @@ fn service_to_device(
         .map(|s| s.to_string())
         .unwrap_or_else(|| name.clone());
 
-    let host = info
-        .get_addresses()
-        .iter()
-        .find(|a| a.is_ipv4())
-        .map(|a| a.to_ip_addr().to_string())
-        .unwrap_or_else(|| {
-            info.get_addresses()
-                .iter()
-                .next()
-                .map(|a| a.to_ip_addr().to_string())
-                .unwrap_or_default()
-        });
+    let host = pick_best_address(info.get_addresses());
 
     let port = info.get_port();
     let port = if port > 0 { port } else { default_port };

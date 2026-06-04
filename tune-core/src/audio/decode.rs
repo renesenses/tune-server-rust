@@ -27,8 +27,17 @@ pub fn can_decode_native(file_path: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "aiff" | "aif" | "dsf" | "dff"
+        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "aiff" | "aif" | "dsf" | "dff" | "wv"
     )
+}
+
+fn is_wavpack(file_path: &str) -> bool {
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    ext == "wv"
 }
 
 pub fn decode_to_pcm(
@@ -52,6 +61,16 @@ pub fn decode_to_pcm(
         return decode_dsd_to_pcm(
             file_path,
             &ext,
+            target_sample_rate,
+            target_channels,
+            seek_s,
+            max_duration_s,
+        );
+    }
+
+    if is_wavpack(file_path) {
+        return super::wavpack::decode_wavpack_to_pcm(
+            file_path,
             target_sample_rate,
             target_channels,
             seek_s,
@@ -263,7 +282,7 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.dsf"));
         assert!(can_decode_native("song.dff"));
         assert!(!can_decode_native("song.ape"));
-        assert!(!can_decode_native("song.wv"));
+        assert!(can_decode_native("song.wv"));
     }
 
     #[test]
