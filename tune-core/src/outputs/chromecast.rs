@@ -38,6 +38,11 @@ impl OutputTarget for ChromecastOutput {
         Some(&self.host)
     }
 
+    async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
+        self.play_url(media.url, media.mime_type, media.title, media.artist)
+            .await
+    }
+
     async fn play_url(
         &self,
         url: &str,

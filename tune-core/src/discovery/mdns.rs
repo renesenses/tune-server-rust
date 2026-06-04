@@ -458,6 +458,58 @@ fn service_to_device(
     device
 }
 
+fn pick_best_address(addrs: &std::collections::HashSet<mdns_sd::ScopedIp>) -> String {
+    let local_prefix = detect_local_subnet();
+    let mut ipv4_same_subnet: Option<String> = None;
+    let mut ipv4_private: Option<String> = None;
+    let mut ipv4_any: Option<String> = None;
+
+    for addr in addrs {
+        let ip = addr.to_ip_addr();
+        if let std::net::IpAddr::V4(v4) = ip {
+            let s = v4.to_string();
+            if ipv4_any.is_none() {
+                ipv4_any = Some(s.clone());
+            }
+            let octets = v4.octets();
+            let is_private = octets[0] == 192
+                || octets[0] == 10
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]));
+            if is_private && ipv4_private.is_none() {
+                ipv4_private = Some(s.clone());
+            }
+            if let Some(ref prefix) = local_prefix {
+                if s.starts_with(prefix) && ipv4_same_subnet.is_none() {
+                    ipv4_same_subnet = Some(s);
+                }
+            }
+        }
+    }
+
+    ipv4_same_subnet
+        .or(ipv4_private)
+        .or(ipv4_any)
+        .unwrap_or_else(|| {
+            addrs
+                .iter()
+                .next()
+                .map(|a| a.to_ip_addr().to_string())
+                .unwrap_or_default()
+        })
+}
+
+fn detect_local_subnet() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:53").ok()?;
+    let addr = sock.local_addr().ok()?;
+    if let std::net::IpAddr::V4(v4) = addr.ip() {
+        let o = v4.octets();
+        Some(format!("{}.{}.{}.", o[0], o[1], o[2]))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

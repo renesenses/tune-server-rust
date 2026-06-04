@@ -27,7 +27,18 @@ pub fn can_decode_native(file_path: &str) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "alac" | "ogg" | "aiff" | "aif" | "dsf" | "dff" | "wv"
+        "flac"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "aac"
+            | "alac"
+            | "ogg"
+            | "aiff"
+            | "aif"
+            | "dsf"
+            | "dff"
+            | "wv"
     )
 }
 
