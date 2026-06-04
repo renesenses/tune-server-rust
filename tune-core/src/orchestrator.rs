@@ -77,8 +77,17 @@ impl PlaybackOrchestrator {
             self.streamer.remove_session(old_sid).await;
         }
 
-        let (stream_url, mime_type, title, artist, duration_ms, source, resolved_cover, stream_id) =
-            self.resolve_stream(&req).await?;
+        let (
+            stream_url,
+            mime_type,
+            title,
+            artist,
+            duration_ms,
+            source,
+            resolved_cover,
+            stream_id,
+            file_size,
+        ) = self.resolve_stream(&req).await?;
 
         let cover_path = req.cover_url.clone().or(resolved_cover);
         let np = NowPlaying {
@@ -115,6 +124,7 @@ impl PlaybackOrchestrator {
                 album: req.album_title.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
                 duration_ms: duration_ms.map(|d| d as u64),
+                file_size,
                 stream_ready,
             };
             self.send_to_output(device_id, &media).await
@@ -147,6 +157,7 @@ impl PlaybackOrchestrator {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     async fn resolve_stream(
         &self,
         req: &PlayRequest,
@@ -160,6 +171,7 @@ impl PlaybackOrchestrator {
             String,
             Option<String>,
             Option<String>,
+            Option<u64>,
         ),
         String,
     > {
@@ -172,6 +184,7 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
+    #[allow(clippy::type_complexity)]
     async fn resolve_local_track(
         &self,
         req: &PlayRequest,
@@ -185,6 +198,7 @@ impl PlaybackOrchestrator {
             String,
             Option<String>,
             Option<String>,
+            Option<u64>,
         ),
         String,
     > {
@@ -400,9 +414,11 @@ impl PlaybackOrchestrator {
             "local".into(),
             track.cover_path,
             Some(session_id),
+            track.file_size.map(|s| s as u64),
         ))
     }
 
+    #[allow(clippy::type_complexity)]
     async fn resolve_streaming_url(
         &self,
         service_name: &str,
@@ -417,6 +433,7 @@ impl PlaybackOrchestrator {
             String,
             Option<String>,
             Option<String>,
+            Option<u64>,
         ),
         String,
     > {
@@ -510,6 +527,7 @@ impl PlaybackOrchestrator {
             service_name.into(),
             cover_path,
             sid,
+            None,
         ))
     }
 
@@ -1006,7 +1024,7 @@ impl PlaybackOrchestrator {
             duration_ms: item.duration_ms,
         };
 
-        let (url, mime_type, title, artist, _, _, resolved_cover, _) =
+        let (url, mime_type, title, artist, _, _, resolved_cover, _, _) =
             self.resolve_stream(&req).await?;
         let raw_cover = cover.or(resolved_cover);
         Ok(ResolvedQueueItem {

@@ -686,7 +686,8 @@ impl PositionPoller {
                         artist: resolved.artist.as_deref(),
                         album: resolved.album.as_deref(),
                         cover_url: resolved.cover_url.as_deref(),
-                        duration_ms: None,
+                        duration_ms: resolved.duration_ms,
+                        file_size: None,
                         stream_ready: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
