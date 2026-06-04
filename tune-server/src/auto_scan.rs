@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tracing::info;
+use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -117,7 +118,7 @@ pub fn build_track_from_metadata(
 
 /// Spawn the auto-scan task that indexes all music directories at startup.
 pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
         let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
         let raw_dirs: Vec<String> = settings
@@ -154,9 +155,9 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
         let files_to_scan: Vec<std::path::PathBuf> = files
             .into_iter()
             .filter(|path| {
-                let path_str = path.to_string_lossy();
+                let path_str: String = path.to_string_lossy().nfc().collect();
                 if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_ref())
+                    existing_tracks.get(path_str.as_str())
                     && let Ok(file_meta) = path.metadata()
                 {
                     let mtime = file_meta
@@ -214,6 +215,7 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
                     let Some((mut track, album_id)) =
                         build_track_from_metadata(sf, &artist_repo, &album_repo)
                     else {
+                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         continue;
                     };
 
@@ -291,19 +293,26 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
             "auto_scan_complete"
         );
 
-        event_bus.emit(
-            "library.scan.completed",
-            serde_json::json!({
-                "total_files": stats.total_files,
-                "metadata_ok": stats.metadata_ok,
-                "metadata_failed": stats.metadata_failed,
-                "metadata_timeout": stats.metadata_timeout,
-                "inserted": inserted,
-                "updated": updated,
-                "skipped": skipped,
-                "artwork_extracted": albums_with_cover.len(),
-            }),
-        );
+        let report = serde_json::json!({
+            "total_files": stats.total_files,
+            "metadata_ok": stats.metadata_ok,
+            "metadata_failed": stats.metadata_failed,
+            "metadata_timeout": stats.metadata_timeout,
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "artwork_extracted": albums_with_cover.len(),
+            "failed_paths": stats.failed_paths,
+        });
+
+        let report_path = std::env::var("TUNE_DB_PATH")
+            .unwrap_or_else(|_| "tune.db".into())
+            .replace(".db", "-scan-report.json");
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            std::fs::write(&report_path, json).ok();
+        }
+
+        event_bus.emit("library.scan.completed", report);
     });
 }
 
@@ -357,6 +366,7 @@ pub fn spawn_file_watcher(db: SqliteDb) {
                                     let Some((track, album_id)) =
                                         build_track_from_metadata(sf, &artist_repo, &album_repo)
                                     else {
+                                        tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                         continue;
                                     };
 

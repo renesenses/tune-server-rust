@@ -36,6 +36,10 @@ const GAPLESS_GUARD_SECS: u64 = 5;
 /// renderer (e.g. DMP-A8) reports state changes immediately after
 /// SetNextAVTransportURI.
 const MIN_PLAYED_FRACTION: f64 = 0.80;
+/// Minimum wall-clock seconds a track must have been playing before we accept
+/// a gapless transition. Prevents false skips when a renderer fails to decode
+/// and reports STOPPED after only a few seconds.
+const MIN_TRACK_WALL_SECS: u64 = 15;
 /// How often (in ticks) to persist the playback position to the database.
 const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 
@@ -84,6 +88,9 @@ struct ZonePollState {
     peak_position_ms: u64,
     /// Tick counter for throttling DB position saves.
     ticks_since_db_save: u64,
+    /// When the current track started playing (wall clock).
+    /// Used to reject false gapless transitions that happen too soon.
+    track_started_at: Option<Instant>,
 }
 
 pub struct PositionPoller {
@@ -224,6 +231,7 @@ impl PositionPoller {
                 last_position_ms: 0,
                 peak_position_ms: 0,
                 ticks_since_db_save: 0,
+                track_started_at: None,
             });
 
             if ps.backoff_remaining > 0 {
@@ -367,8 +375,13 @@ impl PositionPoller {
             // Helper: has enough of the track been played?
             // True when peak_position_ms >= 80% of track_duration, or
             // when track_duration is unknown/zero (no guard possible).
-            let played_enough = track_duration_ms == 0
-                || ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION;
+            let wall_elapsed = ps
+                .track_started_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            let played_enough = (track_duration_ms == 0
+                || ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION)
+                && wall_elapsed >= MIN_TRACK_WALL_SECS;
 
             // Detect position reset: position drops from >30s to <5s.
             // This is a strong signal that the renderer performed a gapless
@@ -397,6 +410,7 @@ impl PositionPoller {
                     ps.gapless_sent_at = None;
                     ps.stopped_ticks = 0;
                     ps.peak_position_ms = 0;
+                    ps.track_started_at = None;
                     if let Some(next_pos) = Self::next_position(zone_state) {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
@@ -447,6 +461,7 @@ impl PositionPoller {
                             ps.gapless_sent_at = None;
                             ps.stopped_ticks = 0;
                             ps.peak_position_ms = 0;
+                            ps.track_started_at = None;
                             if let Some(next_pos) = Self::next_position(zone_state) {
                                 if let Err(e) = self
                                     .orchestrator
@@ -466,6 +481,9 @@ impl PositionPoller {
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
+                    if ps.track_started_at.is_none() {
+                        ps.track_started_at = Some(Instant::now());
+                    }
 
                     // Detect gapless transition: renderer reports a different
                     // duration than the current track AND the position confirms
@@ -497,6 +515,7 @@ impl PositionPoller {
                         );
                         ps.gapless_sent = false;
                         ps.peak_position_ms = 0;
+                        ps.track_started_at = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -629,6 +648,7 @@ impl PositionPoller {
                         album: resolved.album.as_deref(),
                         cover_url: resolved.cover_url.as_deref(),
                         duration_ms: None,
+                        stream_ready: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");
@@ -671,6 +691,7 @@ mod tests {
             last_position_ms: 0,
             peak_position_ms: 0,
             ticks_since_db_save: 0,
+            track_started_at: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -706,6 +727,7 @@ mod tests {
             last_position_ms: 0,
             peak_position_ms: 0,
             ticks_since_db_save: 0,
+            track_started_at: None,
         };
 
         // Simulates entering Playing state
@@ -796,6 +818,7 @@ mod tests {
             last_position_ms: 0,
             peak_position_ms: 0,
             ticks_since_db_save: 0,
+            track_started_at: None,
         };
 
         // Simulate consecutive errors with exponential backoff

@@ -253,7 +253,9 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 .flatten()
                                 .unwrap_or_default();
                             if current.is_empty() {
-                                let lms_addr = format!("{}:9000", dev.host);
+                                // Use the CLI port (9090), NOT the JSON-RPC port (9000)
+                                let cli_port = dev.port;
+                                let lms_addr = format!("{}:{}", dev.host, cli_port);
                                 settings.set("squeezebox_host", &lms_addr).ok();
                                 settings.set("squeezebox_enabled", "true").ok();
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");

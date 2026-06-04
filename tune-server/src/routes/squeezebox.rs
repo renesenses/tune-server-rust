@@ -1,3 +1,7 @@
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -7,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::outputs::squeezebox::LMS_CLI_PORT;
 
 use crate::state::AppState;
 
@@ -21,110 +26,144 @@ pub fn router() -> Router<AppState> {
         .route("/players/{id}/power", post(power_player))
 }
 
-fn lms_host(state: &AppState) -> String {
+/// Parse the squeezebox_host setting into (host, port).
+/// Default CLI port is 9090.
+fn parse_lms_host(state: &AppState) -> (String, u16) {
     let settings = SettingsRepo::new(state.db.clone());
-    settings
+    let raw = settings
         .get("squeezebox_host")
         .ok()
         .flatten()
-        .unwrap_or_else(|| "localhost".into())
-}
+        .unwrap_or_else(|| "localhost".into());
 
-fn lms_url(host: &str) -> String {
-    if host.contains(':') {
-        format!("http://{host}/jsonrpc.js")
+    if raw.contains(':') {
+        let parts: Vec<&str> = raw.splitn(2, ':').collect();
+        let port = parts[1].parse::<u16>().unwrap_or(LMS_CLI_PORT);
+        (parts[0].to_string(), port)
     } else {
-        format!("http://{host}:9000/jsonrpc.js")
+        (raw, LMS_CLI_PORT)
     }
 }
 
-/// Send a JSON-RPC request to LMS. LMS uses a "slim" protocol:
-/// `{ "id": 1, "method": "slim.request", "params": [player_id, [command, ...]] }`
-async fn lms_request(
-    client: &reqwest::Client,
-    host: &str,
-    player: &str,
-    cmd: Vec<Value>,
-) -> Result<Value, String> {
-    let url = lms_url(host);
-    let body = json!({
-        "id": 1,
-        "method": "slim.request",
-        "params": [player, cmd],
-    });
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_connect() {
-                format!("Impossible de se connecter au serveur Squeezebox (LMS) sur {host}. Vérifiez que Logitech Media Server est démarré.")
-            } else if e.is_timeout() {
-                format!("Le serveur Squeezebox (LMS) sur {host} ne répond pas (timeout).")
-            } else {
-                format!("LMS request failed: {e}")
-            }
-        })?;
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("LMS read error: {e}"))?;
-    if text.is_empty() {
-        return Err(format!(
-            "Le serveur sur {host} a renvoyé une réponse vide. Vérifiez qu'il s'agit bien d'un serveur Squeezebox/LMS."
-        ));
-    }
-    let json: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Réponse invalide du serveur LMS: {e}"))?;
-    Ok(json.get("result").cloned().unwrap_or(Value::Null))
+/// Send a raw CLI command to LMS via TCP and return the response line.
+fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
+    let addr = format!("{host}:{port}");
+    let stream = TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .map_err(|e| format!("invalid LMS address {addr}: {e}"))?,
+        Duration::from_secs(5),
+    )
+    .map_err(|e| {
+        format!(
+            "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre."
+        )
+    })?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("clone stream: {e}"))?;
+    let line = format!("{cmd}\n");
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("LMS CLI write: {e}"))?;
+    writer.flush().map_err(|e| format!("LMS CLI flush: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("LMS CLI read: {e}"))?;
+
+    let decoded = urlencoding::decode(response.trim())
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| response.trim().to_string());
+
+    Ok(decoded)
+}
+
+/// Send a player-scoped CLI command.
+fn lms_player_command(host: &str, port: u16, player_id: &str, cmd: &str) -> Result<String, String> {
+    let encoded_mac = urlencoding::encode(player_id);
+    lms_cli_command(host, port, &format!("{encoded_mac} {cmd}"))
 }
 
 async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
-    let host = lms_host(&state);
-    match lms_request(
-        &state.http_client,
-        &host,
-        "",
-        vec![json!("serverstatus"), json!(0), json!(100)],
-    )
-    .await
-    {
-        Ok(result) => Json(result).into_response(),
+    let (host, port) = parse_lms_host(&state);
+    match lms_cli_command(&host, port, "serverstatus 0 100") {
+        Ok(resp) => Json(json!({"status": "ok", "response": resp})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
 
 async fn list_players(State(state): State<AppState>) -> impl IntoResponse {
-    let host = lms_host(&state);
-    match lms_request(
-        &state.http_client,
-        &host,
-        "",
-        vec![json!("players"), json!(0), json!(100)],
-    )
-    .await
-    {
-        Ok(result) => {
-            let players = result.get("players_loop").cloned().unwrap_or(json!([]));
-            Json(players).into_response()
-        }
+    let (host, port) = parse_lms_host(&state);
+    match list_players_cli(&host, port) {
+        Ok(players) => Json(json!(players)).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
 
+/// Discover players via CLI commands: `player count ?`, then `player id/name {i} ?`
+fn list_players_cli(host: &str, port: u16) -> Result<Vec<Value>, String> {
+    let count_resp = lms_cli_command(host, port, "player count ?")?;
+    // Response: "player count 3"
+    let count: usize = count_resp
+        .rsplit(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut players = Vec::new();
+    for i in 0..count {
+        let id_resp = lms_cli_command(host, port, &format!("player id {i} ?"))?;
+        let name_resp = lms_cli_command(host, port, &format!("player name {i} ?"))?;
+
+        // Response: "player id 0 00:04:20:ab:cd:ef"
+        let player_id = id_resp.rsplit(' ').next().unwrap_or("").to_string();
+        // Response: "player name 0 Kitchen"
+        let player_name = name_resp
+            .rsplitn(2, &format!("player name {i} "))
+            .next()
+            .unwrap_or("Squeezebox")
+            .to_string();
+        // Better extraction: everything after the last known prefix
+        let player_name = if let Some(pos) = name_resp.find(&format!("player name {i} ")) {
+            let start = pos + format!("player name {i} ").len();
+            name_resp[start..].to_string()
+        } else {
+            player_name
+        };
+
+        if !player_id.is_empty() {
+            players.push(json!({
+                "playerid": player_id,
+                "name": player_name,
+            }));
+        }
+    }
+    Ok(players)
+}
+
 async fn play_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let host = lms_host(&state);
-    match lms_request(&state.http_client, &host, &id, vec![json!("play")]).await {
-        Ok(result) => Json(json!({"status": "playing", "result": result})).into_response(),
+    let (host, port) = parse_lms_host(&state);
+    match lms_player_command(&host, port, &id, "play") {
+        Ok(_) => Json(json!({"status": "playing"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
 
 async fn pause_player(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let host = lms_host(&state);
-    match lms_request(&state.http_client, &host, &id, vec![json!("pause")]).await {
-        Ok(result) => Json(json!({"status": "paused", "result": result})).into_response(),
+    let (host, port) = parse_lms_host(&state);
+    match lms_player_command(&host, port, &id, "pause") {
+        Ok(_) => Json(json!({"status": "paused"})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -149,16 +188,9 @@ async fn set_player_volume(
     Path(id): Path<String>,
     Json(body): Json<VolumeBody>,
 ) -> impl IntoResponse {
-    let host = lms_host(&state);
-    match lms_request(
-        &state.http_client,
-        &host,
-        &id,
-        vec![json!("mixer"), json!("volume"), json!(body.volume)],
-    )
-    .await
-    {
-        Ok(result) => Json(json!({"volume": body.volume, "result": result})).into_response(),
+    let (host, port) = parse_lms_host(&state);
+    match lms_player_command(&host, port, &id, &format!("mixer volume {}", body.volume)) {
+        Ok(_) => Json(json!({"volume": body.volume})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -168,17 +200,10 @@ async fn power_player(
     Path(id): Path<String>,
     Json(body): Json<PowerBody>,
 ) -> impl IntoResponse {
-    let host = lms_host(&state);
+    let (host, port) = parse_lms_host(&state);
     let label = if body.state == 1 { "on" } else { "off" };
-    match lms_request(
-        &state.http_client,
-        &host,
-        &id,
-        vec![json!("power"), json!(body.state)],
-    )
-    .await
-    {
-        Ok(result) => Json(json!({"power": label, "result": result})).into_response(),
+    match lms_player_command(&host, port, &id, &format!("power {}", body.state)) {
+        Ok(_) => Json(json!({"power": label})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
 }
@@ -194,40 +219,15 @@ async fn discover_players(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Query LMS for connected players and register them as Squeezebox outputs + auto-create zones.
+/// Query LMS for connected players via CLI and register them as Squeezebox outputs + auto-create zones.
 /// Called at startup (when squeezebox_enabled=true) and via POST /squeezebox/discover.
 pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, String> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
-    let host = settings
-        .get("squeezebox_host")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "localhost".into());
+    let (lms_host_str, lms_port) = parse_lms_host(state);
 
-    // Parse host:port from the setting
-    let (lms_host_str, lms_port) = if host.contains(':') {
-        let parts: Vec<&str> = host.splitn(2, ':').collect();
-        let port = parts[1].parse::<u16>().unwrap_or(9000);
-        (parts[0].to_string(), port)
-    } else {
-        (host.clone(), 9000u16)
-    };
-
-    let result = lms_request(
-        &state.http_client,
-        &host,
-        "",
-        vec![json!("players"), json!(0), json!(100)],
-    )
-    .await?;
-    let players = result
-        .get("players_loop")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let players = list_players_cli(&lms_host_str, lms_port)?;
 
     if players.is_empty() {
-        tracing::info!(host = %host, "squeezebox_discover: no players found on LMS");
+        tracing::info!(host = %lms_host_str, port = lms_port, "squeezebox_discover: no players found on LMS");
         return Ok(vec![]);
     }
 
@@ -247,7 +247,7 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             .to_string();
         let device_id = format!("squeezebox-{player_id}");
 
-        // Register output
+        // Register output using CLI port
         let output = tune_core::outputs::squeezebox::SqueezeboxOutput::new(
             player_name.clone(),
             device_id.clone(),
@@ -258,7 +258,7 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             let mut reg = state.outputs.lock().await;
             reg.register(Box::new(output));
         }
-        tracing::info!(name = %player_name, id = %device_id, lms = %host, "squeezebox_output_registered");
+        tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
 
         // Auto-create zone if not already present
         let already_by_device = existing_zones
@@ -282,8 +282,6 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
             "id": device_id,
             "name": player_name,
             "playerid": player_id,
-            "model": player.get("modelname"),
-            "connected": player.get("connected"),
         }));
     }
 

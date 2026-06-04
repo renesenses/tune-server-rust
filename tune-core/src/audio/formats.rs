@@ -148,7 +148,10 @@ impl AudioFormat {
     /// Returns true if this format needs FFmpeg transcoding before DLNA streaming.
     /// FLAC, WAV, MP3, AAC can be served as raw files; everything else must be transcoded.
     pub fn needs_transcode_for_dlna(&self) -> bool {
-        matches!(self, Self::Aiff | Self::Dsd | Self::WavPack | Self::Ape)
+        matches!(
+            self,
+            Self::Aiff | Self::Dsd | Self::WavPack | Self::Ape | Self::Alac
+        )
     }
 
     /// Returns the target output format for DLNA transcoding.
@@ -157,7 +160,7 @@ impl AudioFormat {
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
             Self::Aiff => AudioFormat::Flac,
-            Self::Dsd | Self::WavPack | Self::Ape => AudioFormat::Wav,
+            Self::Alac | Self::Dsd | Self::WavPack | Self::Ape => AudioFormat::Wav,
             other => *other,
         }
     }

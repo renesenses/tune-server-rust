@@ -28,7 +28,7 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
 urlencoding = { workspace = true }
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 rust_cast = { workspace = true }
 sha2 = { workspace = true }
 blowfish = { workspace = true }
@@ -39,6 +39,7 @@ csv = { workspace = true }
 symphonia = { workspace = true }
 rubato = { workspace = true }
 hound = { workspace = true }
+unicode-normalization = { workspace = true }
 oaat-core = { workspace = true, optional = true }
 oaat-controller = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

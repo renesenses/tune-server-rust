@@ -54,6 +54,7 @@ pub struct StreamSession {
     pub is_radio: bool,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    pub first_request: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl StreamSession {
@@ -74,6 +75,7 @@ impl StreamSession {
             is_radio: false,
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -158,6 +160,30 @@ impl AudioStreamer {
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
+    }
+
+    pub async fn get_stream_ready_notify(
+        &self,
+        stream_id: &str,
+    ) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(stream_id).map(|s| s.first_request.clone())
+    }
+
+    pub async fn wait_first_request(&self, stream_id: &str, timeout_ms: u64) -> bool {
+        let session = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(stream_id).cloned()
+        };
+        let Some(session) = session else {
+            return false;
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            session.first_request.notified(),
+        )
+        .await
+        .is_ok()
     }
 
     pub async fn cleanup_stale_sessions(&self) -> usize {
@@ -251,6 +277,7 @@ pub async fn handle_stream(
         format = %session.info.format,
         "stream_request"
     );
+    session.first_request.notify_waiters();
 
     // File serving with Range support
     let file_path = session.file_path.lock().await.clone();

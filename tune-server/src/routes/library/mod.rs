@@ -100,6 +100,10 @@ pub(super) fn now_iso_utc() -> String {
     format!("{y:04}-{:02}-{:02}T{h:02}:{m:02}:{s:02}Z", mo + 1, d + 1)
 }
 
+pub(super) fn artwork_is_hex_hash(s: &str) -> bool {
+    (s.len() == 32 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
     if let Ok(v) = std::env::var("TUNE_ARTWORK_DIR") {
         return std::path::PathBuf::from(v);
@@ -190,6 +194,14 @@ pub fn router() -> Router<AppState> {
             "/artwork/enrich/status",
             get(artwork::batch_enrich_artwork_status),
         )
+        .route(
+            "/artwork/enrich-artists",
+            post(artwork::batch_enrich_artist_artwork),
+        )
+        .route(
+            "/artwork/enrich-artists/status",
+            get(artwork::batch_enrich_artist_artwork_status),
+        )
         .route("/duplicates", get(duplicates::list_duplicates))
         .route("/duplicates/resolve", post(duplicates::resolve_duplicate))
         .route("/activity", get(stats::library_activity))
@@ -203,6 +215,7 @@ pub fn router() -> Router<AppState> {
             "/albums/merge-duplicates",
             post(albums::merge_duplicate_albums_route),
         )
+        .route("/artists/{id}/image", get(artists::artist_image))
         .route("/artists/{id}/timeline", get(artists::artist_timeline))
         .route(
             "/artists/{id}/image/upload",

@@ -726,22 +726,22 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         None => return dsf_dff_fallback(path).ok_or_else(|| "no tags found".to_string()),
     };
 
-    let get = |key: &ItemKey| tag.get_string(key).map(|s| s.to_string());
+    let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
 
-    let compilation_str = get(&ItemKey::FlagCompilation).unwrap_or_default();
+    let compilation_str = get(ItemKey::FlagCompilation).unwrap_or_default();
     let compilation = matches!(compilation_str.as_str(), "1" | "true" | "True");
 
-    let bpm = get(&ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
+    let bpm = get(ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
     let original_year =
-        get(&ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok());
+        get(ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok());
 
     let total_tracks = tag
         .track_total()
-        .or_else(|| get(&ItemKey::TrackTotal).and_then(|s| s.parse::<u32>().ok()));
+        .or_else(|| get(ItemKey::TrackTotal).and_then(|s| s.parse::<u32>().ok()));
     let total_discs = tag
         .disk_total()
-        .or_else(|| get(&ItemKey::DiscTotal).and_then(|s| s.parse::<u32>().ok()));
+        .or_else(|| get(ItemKey::DiscTotal).and_then(|s| s.parse::<u32>().ok()));
 
     let credits = parse_credits(tag);
 
@@ -756,17 +756,17 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
         album: tag.album().map(|s| s.to_string()),
-        album_artist: get(&ItemKey::AlbumArtist),
-        album_artist_sort: get(&ItemKey::AlbumArtistSortOrder),
+        album_artist: get(ItemKey::AlbumArtist),
+        album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
         track_number: tag.track(),
         disc_number: tag.disk(),
         total_tracks,
         total_discs,
-        disc_subtitle: get(&ItemKey::SetSubtitle),
-        year: tag.year(),
+        disc_subtitle: get(ItemKey::SetSubtitle),
+        year: tag.date().map(|d| d.year as u32),
         original_year,
-        release_date: get(&ItemKey::ReleaseDate),
-        original_date: get(&ItemKey::OriginalReleaseDate),
+        release_date: get(ItemKey::ReleaseDate),
+        original_date: get(ItemKey::OriginalReleaseDate),
         genre,
         genres,
         duration_ms: Some(props.duration().as_millis() as u64),
@@ -780,14 +780,14 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         file_size: std::fs::metadata(path).ok().map(|m| m.len()),
         bpm,
         compilation,
-        label: get(&ItemKey::Label),
-        catalog_number: get(&ItemKey::CatalogNumber),
-        musicbrainz_recording_id: get(&ItemKey::MusicBrainzRecordingId),
-        musicbrainz_release_id: get(&ItemKey::MusicBrainzReleaseId),
-        musicbrainz_artist_id: get(&ItemKey::MusicBrainzArtistId),
-        musicbrainz_album_artist_id: get(&ItemKey::MusicBrainzReleaseArtistId),
-        musicbrainz_release_group_id: get(&ItemKey::MusicBrainzReleaseGroupId),
-        isrc: get(&ItemKey::Isrc),
+        label: get(ItemKey::Label),
+        catalog_number: get(ItemKey::CatalogNumber),
+        musicbrainz_recording_id: get(ItemKey::MusicBrainzRecordingId),
+        musicbrainz_release_id: get(ItemKey::MusicBrainzReleaseId),
+        musicbrainz_artist_id: get(ItemKey::MusicBrainzArtistId),
+        musicbrainz_album_artist_id: get(ItemKey::MusicBrainzReleaseArtistId),
+        musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
+        isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         credits,
     })
@@ -813,6 +813,7 @@ pub struct MetadataUpdate {
 pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String> {
     use lofty::config::WriteOptions;
     use lofty::file::TaggedFileExt;
+    use lofty::tag::items::Timestamp;
     use lofty::tag::{Accessor, ItemKey, ItemValue, TagExt, TagItem};
 
     let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
@@ -837,7 +838,10 @@ pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String
         tag.set_disk(v);
     }
     if let Some(v) = update.year {
-        tag.set_year(v);
+        tag.set_date(Timestamp {
+            year: v as u16,
+            ..Default::default()
+        });
     }
 
     if let Some(ref v) = update.album_artist {
@@ -863,7 +867,7 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
 
     let mut credits = Vec::new();
 
-    if let Some(composer) = tag.get_string(&ItemKey::Composer) {
+    if let Some(composer) = tag.get_string(ItemKey::Composer) {
         credits.push(TrackCredit {
             name: composer.to_string(),
             role: "composer".into(),
@@ -871,7 +875,7 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
         });
     }
 
-    if let Some(conductor) = tag.get_string(&ItemKey::Conductor) {
+    if let Some(conductor) = tag.get_string(ItemKey::Conductor) {
         credits.push(TrackCredit {
             name: conductor.to_string(),
             role: "conductor".into(),
@@ -879,7 +883,7 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
         });
     }
 
-    if let Some(lyricist) = tag.get_string(&ItemKey::Lyricist) {
+    if let Some(lyricist) = tag.get_string(ItemKey::Lyricist) {
         credits.push(TrackCredit {
             name: lyricist.to_string(),
             role: "lyricist".into(),
@@ -888,7 +892,7 @@ fn parse_credits(tag: &lofty::tag::Tag) -> Vec<TrackCredit> {
     }
 
     for item in tag.items() {
-        if item.key() == &ItemKey::Performer
+        if item.key() == ItemKey::Performer
             && let Some(val) = item.value().text()
         {
             let (name, instrument) = if let Some((n, i)) = val.split_once('(') {

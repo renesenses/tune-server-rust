@@ -1,12 +1,13 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 use tracing::debug;
 
 pub struct DecodedAudio {
@@ -43,37 +44,44 @@ pub fn decode_to_pcm(
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| format!("probe: {e}"))?;
 
-    let mut format = probed.format;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("no default audio track")?;
 
-    let track = format.default_track().ok_or("no default track")?;
-
-    let codec_params = track.codec_params.clone();
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("track has no audio codec parameters".into()),
+    };
     let track_id = track.id;
-    let source_rate = codec_params.sample_rate.unwrap_or(44100);
-    let source_channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
+    let source_rate = audio_params.sample_rate.unwrap_or(44100);
+    let source_channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u32)
+        .unwrap_or(2);
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
     // Seek if requested
     if seek_s > 0.0 {
-        use symphonia::core::formats::SeekMode;
-        use symphonia::core::formats::SeekTo;
-        use symphonia::core::units::Time;
+        let seconds = seek_s as i64;
+        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+        let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
         let _ = format.seek(
             SeekMode::Coarse,
             SeekTo::Time {
-                time: Time::from(seek_s),
+                time,
                 track_id: Some(track_id),
             },
         );
@@ -92,7 +100,8 @@ pub fn decode_to_pcm(
         }
 
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(symphonia::core::errors::Error::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -101,7 +110,7 @@ pub fn decode_to_pcm(
             Err(_) => break,
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -110,13 +119,9 @@ pub fn decode_to_pcm(
             Err(_) => continue,
         };
 
-        let spec = *decoded.spec();
-        let num_frames = decoded.frames();
-
-        let mut sample_buf = SampleBuffer::<i16>::new(num_frames as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        all_samples.extend_from_slice(sample_buf.samples());
+        let mut packet_samples: Vec<i16> = Vec::new();
+        decoded.copy_to_vec_interleaved::<i16>(&mut packet_samples);
+        all_samples.extend_from_slice(&packet_samples);
     }
 
     if all_samples.len() > max_samples {

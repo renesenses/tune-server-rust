@@ -228,6 +228,69 @@ pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -
     }))
 }
 
+pub(super) async fn batch_enrich_artist_artwork(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.db.clone();
+
+    // Check how many artists are missing images
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(state.db.clone());
+    let missing = artist_repo.list_without_image().unwrap_or_default();
+
+    if missing.is_empty() {
+        return Json(json!({
+            "status": "skipped",
+            "message": "all artists with MBID already have images",
+            "missing": 0,
+        }))
+        .into_response();
+    }
+
+    // Store initial status
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    settings.set("artist_artwork_enrich_status", "running").ok();
+    settings
+        .set(
+            "artist_artwork_enrich_result",
+            &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string(),
+        )
+        .ok();
+
+    tokio::spawn(async move {
+        tune_core::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "message": "batch artist artwork enrichment started",
+            "artists_to_process": missing.len(),
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn batch_enrich_artist_artwork_status(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let result = settings
+        .get("artist_artwork_enrich_result")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(state.db);
+    let still_missing = artist_repo.list_without_image().unwrap_or_default().len();
+
+    Json(json!({
+        "result": result,
+        "artists_without_image": still_missing,
+    }))
+}
+
 pub(super) async fn rescan_album_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 use tracing::{info, warn};
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
@@ -15,7 +16,7 @@ use crate::metadata::{TrackMetadata, try_read_metadata};
 /// Maximum time allowed for reading metadata + computing hash for a single file.
 /// Files on NAS over a flaky network can hang indefinitely; this prevents the
 /// entire scan from stalling on a single corrupt or unreachable file.
-const FILE_TIMEOUT: Duration = Duration::from_secs(10);
+const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
@@ -86,6 +87,7 @@ pub struct ScanStats {
     pub metadata_failed: usize,
     pub metadata_timeout: usize,
     pub hash_ok: usize,
+    pub failed_paths: Vec<String>,
 }
 
 /// Read metadata (and optionally compute hash) for a single file, with a
@@ -246,7 +248,11 @@ pub fn scan_files_parallel(
                 cb(idx, total);
             }
 
-            let path_str = path.to_string_lossy().to_string();
+            // NFC-normalize the path string: macOS HFS+/APFS stores filenames
+            // in NFD (decomposed Unicode, e.g. "è" = "e" + combining accent).
+            // Without NFC normalization, metadata readers and DB lookups can
+            // fail on paths containing accented characters.
+            let path_str: String = path.to_string_lossy().nfc().collect();
 
             let file_meta = path.metadata().ok();
             let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -259,8 +265,10 @@ pub fn scan_files_parallel(
             let (metadata, audio_hash) = match read_file_with_timeout(path, with_hash) {
                 Ok((meta, hash)) => {
                     if meta.is_none() {
-                        // try_read_metadata returned an error (already logged
-                        // inside read_file_with_timeout via the Err branch)
+                        warn!(
+                            path = %path_str,
+                            "scan_file_no_metadata — metadata reader returned None"
+                        );
                     }
                     (meta, hash)
                 }
@@ -273,13 +281,16 @@ pub fn scan_files_parallel(
                     timeout_counter.fetch_add(1, Ordering::Relaxed);
                     (None, None)
                 }
-                Err(err) => {
+                Err(ref err) => {
                     warn!(
                         path = %path_str,
                         error = %err,
-                        "scan_file_failed"
+                        "scan_file_metadata_failed — could not read metadata"
                     );
-                    failed_files.lock().unwrap().push((path_str.clone(), err));
+                    failed_files
+                        .lock()
+                        .unwrap()
+                        .push((path_str.clone(), err.clone()));
                     (None, None)
                 }
             };
@@ -295,15 +306,19 @@ pub fn scan_files_parallel(
         .collect();
 
     let timed_out = timeout_counter.load(Ordering::Relaxed);
+    let failed = failed_files.lock().unwrap();
+    let failed_paths: Vec<String> = failed
+        .iter()
+        .map(|(p, e)| format!("{} ({})", p, e))
+        .collect();
     let stats = ScanStats {
         total_files: results.len(),
         metadata_ok: results.iter().filter(|f| f.metadata.is_some()).count(),
         metadata_failed: results.iter().filter(|f| f.metadata.is_none()).count(),
         metadata_timeout: timed_out,
         hash_ok: results.iter().filter(|f| f.audio_hash.is_some()).count(),
+        failed_paths,
     };
-
-    let failed = failed_files.lock().unwrap();
     if !failed.is_empty() {
         let listing: Vec<String> = failed
             .iter()
@@ -374,7 +389,8 @@ pub fn scan_files_batched(
         let batch: Vec<ScannedFile> = chunk
             .par_iter()
             .map(|path| {
-                let path_str = path.to_string_lossy().to_string();
+                // NFC-normalize: see comment in scan_files_parallel
+                let path_str: String = path.to_string_lossy().nfc().collect();
 
                 let file_meta = path.metadata().ok();
                 let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -426,6 +442,9 @@ pub fn scan_files_batched(
 
         let failed = failed_files.lock().unwrap();
         if !failed.is_empty() {
+            for (p, e) in failed.iter() {
+                aggregate.failed_paths.push(format!("{} ({})", p, e));
+            }
             let listing: Vec<String> = failed
                 .iter()
                 .take(10)

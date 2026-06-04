@@ -36,7 +36,6 @@ impl Default for OutputStatus {
     }
 }
 
-#[derive(Debug, Clone, Default)]
 pub struct PlayMedia<'a> {
     pub url: &'a str,
     pub mime_type: &'a str,
@@ -45,6 +44,24 @@ pub struct PlayMedia<'a> {
     pub album: Option<&'a str>,
     pub cover_url: Option<&'a str>,
     pub duration_ms: Option<u64>,
+    /// Signalled by the HTTP streamer when the renderer makes its first GET request.
+    /// DLNA outputs wait on this before sending Play to avoid buffer underrun clicks.
+    pub stream_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl Default for PlayMedia<'_> {
+    fn default() -> Self {
+        Self {
+            url: "",
+            mime_type: "",
+            title: None,
+            artist: None,
+            album: None,
+            cover_url: None,
+            duration_ms: None,
+            stream_ready: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -52,6 +69,11 @@ pub trait OutputTarget: Send + Sync {
     fn name(&self) -> &str;
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Default: not dowcastable. Implementations that need downcast override this.
+        &()
+    }
 
     async fn play_url(
         &self,

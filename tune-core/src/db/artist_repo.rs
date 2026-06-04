@@ -95,6 +95,10 @@ pub mod sql {
         "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
     }
 
+    pub fn list_without_image() -> &'static str {
+        "SELECT id, name, musicbrainz_id FROM artists WHERE (image_path IS NULL OR image_path = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
     /// Engine-agnostic full-text search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -264,6 +268,35 @@ impl ArtistRepo {
             Ok(())
         })?;
         Ok(count)
+    }
+
+    /// Return all artists that have a MusicBrainz ID but no image set.
+    /// Each entry is (artist_id, name, musicbrainz_id).
+    pub fn list_without_image(&self) -> Result<Vec<(i64, String, String)>, String> {
+        let rows = self.db.query_many(sql::list_without_image(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Update only the image_path and image_source for an artist.
+    pub fn update_image(&self, id: i64, hash: &str, source: &str) -> Result<(), String> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => "UPDATE artists SET image_path = ?, image_source = ? WHERE id = ?",
+            Engine::Postgres => {
+                "UPDATE artists SET image_path = $1, image_source = $2 WHERE id = $3"
+            }
+        };
+        let params: [&dyn ToSqlValue; 3] = [&hash, &source, &id];
+        self.db.execute(sql, &params)?;
+        Ok(())
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
