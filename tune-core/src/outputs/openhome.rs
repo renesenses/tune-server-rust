@@ -61,7 +61,7 @@ impl OpenHomeOutput {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
-                .unwrap(),
+                .unwrap_or_default(),
             current_oh_id: tokio::sync::Mutex::new(None),
         }
     }

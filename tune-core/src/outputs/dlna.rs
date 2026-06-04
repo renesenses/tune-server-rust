@@ -34,7 +34,7 @@ impl DlnaOutput {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap(),
+                .unwrap_or_default(),
             play_delay_ms: 0,
         }
     }
@@ -158,14 +158,14 @@ impl DlnaOutput {
         file_size: Option<u64>,
     ) -> String {
         let title = quick_xml::escape::escape(if Self::is_valid_meta(title) {
-            title.unwrap()
+            title.unwrap_or("Unknown")
         } else {
             "Unknown"
         });
         let escaped_url = quick_xml::escape::escape(url);
 
         let artist_tag = if Self::is_valid_meta(artist) {
-            let a = quick_xml::escape::escape(artist.unwrap());
+            let a = quick_xml::escape::escape(artist.unwrap_or("Unknown"));
             format!("&lt;dc:creator&gt;{a}&lt;/dc:creator&gt;")
         } else {
             String::new()
