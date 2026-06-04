@@ -10,6 +10,7 @@ use tracing::warn;
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::orchestrator::PlayResult;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -40,6 +41,19 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
     })
+}
+
+async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
+    let mut zone = build_zone_json(state, zone_id).await;
+    if let Some(ref err) = result.error {
+        zone.as_object_mut()
+            .unwrap()
+            .insert("error".into(), json!(err));
+    }
+    zone.as_object_mut()
+        .unwrap()
+        .insert("output_sent".into(), json!(result.output_sent));
+    zone
 }
 
 #[derive(Deserialize)]
@@ -239,7 +253,7 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
         };
         return match state.orchestrator.play(orch_req).await {
-            Ok(_) => {
+            Ok(result) => {
                 let queue_items: Vec<_> = tracks
                     .iter()
                     .map(|t| {
@@ -260,7 +274,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                Json(build_zone_json(&state, zone_id).await).into_response()
+                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -317,7 +331,7 @@ async fn play(
             duration_ms: Some(first.duration_ms as i64),
         };
         return match state.orchestrator.play(orch_req).await {
-            Ok(_) => {
+            Ok(result) => {
                 let queue_items: Vec<_> = tracks
                     .iter()
                     .map(|t| {
@@ -338,7 +352,7 @@ async fn play(
                     .playback
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
-                Json(build_zone_json(&state, zone_id).await).into_response()
+                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -378,7 +392,7 @@ async fn play(
             duration_ms: body.duration_ms,
         };
         return match state.orchestrator.play(orch_req).await {
-            Ok(_) => {
+            Ok(result) => {
                 // Persist single streaming track to DB so GET /queue returns it
                 let queue_item = vec![(
                     source_id_val,
@@ -392,7 +406,7 @@ async fn play(
                     warn!(zone_id, error = %e, "set_streaming_queue_failed");
                 }
                 state.playback.update_queue_info(zone_id, 0, 1).await;
-                Json(build_zone_json(&state, zone_id).await).into_response()
+                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
@@ -478,12 +492,12 @@ async fn play(
     };
 
     match state.orchestrator.play(orch_req).await {
-        Ok(_result) => {
+        Ok(result) => {
             state
                 .playback
                 .update_queue_info(zone_id, start, track_ids.len() as i64)
                 .await;
-            Json(build_zone_json(&state, zone_id).await).into_response()
+            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -522,7 +536,8 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 duration_ms: Some(np.duration_ms),
             };
             return match state.orchestrator.play(orch_req).await {
-                Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
+                Ok(result) => Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                    .into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             };
         }
@@ -553,9 +568,8 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     }
 
     match state.orchestrator.play_from_queue(zone_id, next_pos).await {
-        Ok(_) => {
-            let zone_state = state.playback.get_state(zone_id).await;
-            Json(json!(zone_state)).into_response()
+        Ok(result) => {
+            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -576,9 +590,8 @@ async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> im
     let prev_pos = (current.queue_position - 1).max(0);
 
     match state.orchestrator.play_from_queue(zone_id, prev_pos).await {
-        Ok(_) => {
-            let zone_state = state.playback.get_state(zone_id).await;
-            Json(json!(zone_state)).into_response()
+        Ok(result) => {
+            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -705,9 +718,8 @@ async fn queue_jump(
         .play_from_queue(zone_id, body.position)
         .await
     {
-        Ok(_) => {
-            let zone_state = state.playback.get_state(zone_id).await;
-            Json(json!(zone_state)).into_response()
+        Ok(result) => {
+            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1127,7 +1139,9 @@ async fn invoke_zone_pin(
         duration_ms: None,
     };
     match state.orchestrator.play(orch_req).await {
-        Ok(_) => Json(build_zone_json(&state, zone_id).await).into_response(),
+        Ok(result) => {
+            Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1296,12 +1310,18 @@ pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
         duration_ms: track.as_ref().map(|t| t.duration_ms),
     };
     match state.orchestrator.play(orch_req).await {
-        Ok(_) => {
+        Ok(result) => {
             state
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
-            Json(json!({ "zone_id": zone_id, "tracks_queued": all_ids.len() })).into_response()
+            let mut resp = json!({ "zone_id": zone_id, "tracks_queued": all_ids.len(), "output_sent": result.output_sent });
+            if let Some(ref err) = result.error {
+                resp.as_object_mut()
+                    .unwrap()
+                    .insert("error".into(), json!(err));
+            }
+            Json(resp).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }

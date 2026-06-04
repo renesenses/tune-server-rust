@@ -121,7 +121,7 @@ async fn play_radio(
     };
     state.playback.play(zone_id, np).await;
 
-    let output_sent = if let Some(ref did) = device_id {
+    let (output_sent, output_error) = if let Some(ref did) = device_id {
         let outputs = state.outputs.lock().await;
         if let Some(output) = outputs.get(did) {
             let output = output.lock().await;
@@ -132,12 +132,18 @@ async fn play_radio(
                 cover_url: radio.logo_url.as_deref(),
                 ..Default::default()
             };
-            output.play_media(&media).await.is_ok()
+            match output.play_media(&media).await {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(format!("Output device error: {e}"))),
+            }
         } else {
-            false
+            (
+                false,
+                Some("Device not yet discovered. Please retry in a few seconds.".into()),
+            )
         }
     } else {
-        false
+        (false, None)
     };
 
     repo.record_play(id).ok();
@@ -147,6 +153,7 @@ async fn play_radio(
         "zone_id": zone_id,
         "radio": radio.name,
         "output_sent": output_sent,
+        "error": output_error,
         "state": zone_state,
     }))
     .into_response()
@@ -452,6 +459,10 @@ async fn save_current_as_favorite(
 #[derive(Deserialize)]
 struct CreatePlaylistFromFavBody {
     name: Option<String>,
+    playlist_name: Option<String>,
+    #[allow(dead_code)]
+    service: Option<String>, // accepted for forward-compat; not used yet
+    limit: Option<usize>,
 }
 
 async fn create_playlist_from_favorites(
@@ -485,9 +496,24 @@ async fn create_playlist_from_favorites(
             .into_response());
     }
 
-    let name = body
-        .and_then(|b| b.name.clone())
-        .unwrap_or_else(|| "Radio Favorites".into());
+    let (name, limit) = match body {
+        Some(Json(ref b)) => {
+            let n = b
+                .playlist_name
+                .clone()
+                .or(b.name.clone())
+                .unwrap_or_else(|| "Radio Favorites".into());
+            let l = b.limit.unwrap_or(200);
+            (n, l)
+        }
+        None => ("Radio Favorites".into(), 200),
+    };
+
+    let favorites: Vec<(String, String)> = if limit < favorites.len() {
+        favorites.into_iter().take(limit).collect()
+    } else {
+        favorites
+    };
 
     let repo = tune_core::db::playlist_repo::PlaylistRepo::new(state.db.clone());
     let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db);

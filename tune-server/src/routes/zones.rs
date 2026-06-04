@@ -219,6 +219,7 @@ fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
     db: &tune_core::db::sqlite::SqliteDb,
+    renderer_label: Option<&str>,
 ) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
@@ -347,13 +348,15 @@ fn build_signal_path(
     }
 
     // Transport step
-    let renderer_name = zone.output_device_id.as_deref().unwrap_or(output_type);
     steps.push(json!({
         "name": "Transport",
         "description": transport_desc,
         "bit_perfect": transport_bit_perfect,
     }));
 
+    let renderer_name = renderer_label
+        .or(zone.output_device_id.as_deref())
+        .unwrap_or(output_type);
     steps.push(json!({
         "name": "Renderer",
         "description": renderer_name,
@@ -380,6 +383,7 @@ fn build_signal_path(
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::new(state.db.clone());
     let zones = repo.list().unwrap_or_default();
+    let devices = state.scanner.lock().await.devices().await;
     let mut result = Vec::new();
     for z in &zones {
         let zone_id = z.id.unwrap_or(0);
@@ -405,7 +409,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     z.volume as f64 / 100.0
                 }),
             );
-            let signal_path = build_signal_path(&ps, z, &state.db);
+            let renderer_label = z
+                .output_device_id
+                .as_deref()
+                .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+            let signal_path = build_signal_path(&ps, z, &state.db, renderer_label);
             obj.insert("signal_path".into(), json!(signal_path));
         }
         result.push(v);
@@ -432,7 +440,12 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
-                let signal_path = build_signal_path(&ps, &zone, &state.db);
+                let devices = state.scanner.lock().await.devices().await;
+                let renderer_label = zone
+                    .output_device_id
+                    .as_deref()
+                    .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+                let signal_path = build_signal_path(&ps, &zone, &state.db, renderer_label);
                 obj.insert("signal_path".into(), json!(signal_path));
             }
             Json(v).into_response()

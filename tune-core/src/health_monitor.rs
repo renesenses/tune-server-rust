@@ -140,18 +140,18 @@ impl AdvancedHealthMonitor {
     }
 
     pub fn check_memory(&self) -> CheckResult {
-        let rss_mb = get_rss_mb().unwrap_or(0.0);
-        let status = if rss_mb >= self.config.memory_critical_mb as f64 {
-            AlertLevel::Critical
-        } else if rss_mb >= self.config.memory_warning_mb as f64 {
-            AlertLevel::Warning
-        } else {
-            AlertLevel::Ok
+        let rss_mb = get_rss_mb();
+        let status = match rss_mb {
+            Some(mb) if mb >= self.config.memory_critical_mb as f64 => AlertLevel::Critical,
+            Some(mb) if mb >= self.config.memory_warning_mb as f64 => AlertLevel::Warning,
+            _ => AlertLevel::Ok, // None (unavailable on this OS) or below thresholds
         };
 
         if status != AlertLevel::Ok {
-            let msg = format!("Mémoire: {rss_mb:.0}MB");
-            let _ = self.add_alert_sync(status, "memory", &msg);
+            if let Some(mb) = rss_mb {
+                let msg = format!("Mémoire: {mb:.0}MB");
+                let _ = self.add_alert_sync(status, "memory", &msg);
+            }
         }
 
         CheckResult {
@@ -164,18 +164,18 @@ impl AdvancedHealthMonitor {
     }
 
     pub fn check_disk(&self) -> CheckResult {
-        let free_gb = disk_free_gb(&self.config.db_path).unwrap_or(0.0);
-        let status = if free_gb < self.config.disk_critical_gb as f64 {
-            AlertLevel::Critical
-        } else if free_gb < self.config.disk_warning_gb as f64 {
-            AlertLevel::Warning
-        } else {
-            AlertLevel::Ok
+        let free_gb = disk_free_gb(&self.config.db_path);
+        let status = match free_gb {
+            Some(gb) if gb < self.config.disk_critical_gb as f64 => AlertLevel::Critical,
+            Some(gb) if gb < self.config.disk_warning_gb as f64 => AlertLevel::Warning,
+            _ => AlertLevel::Ok, // None (df unavailable on Windows) or plenty of space
         };
 
         if status != AlertLevel::Ok {
-            let msg = format!("Disque: {free_gb:.1}Go restants");
-            let _ = self.add_alert_sync(status, "disk", &msg);
+            if let Some(gb) = free_gb {
+                let msg = format!("Disque: {gb:.1}Go restants");
+                let _ = self.add_alert_sync(status, "disk", &msg);
+            }
         }
 
         CheckResult {

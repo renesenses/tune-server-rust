@@ -139,8 +139,18 @@ async fn main() {
     if std::env::var("TUNE_OPEN_BROWSER").ok().as_deref() == Some("1") {
         let port = config.port;
         tokio::spawn(async move {
-            // Small grace period so axum::serve is fully running before the browser connects
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Wait until the server is actually accepting connections before opening the browser.
+            // Poll via TCP connect every 500ms, up to 10 attempts (5s max).
+            for attempt in 1..=10 {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_ok()
+                {
+                    info!(attempt, "server_ready_for_browser");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
             let url = format!("http://localhost:{port}");
             info!(url = %url, "opening_browser");
             #[cfg(target_os = "macos")]

@@ -175,53 +175,38 @@ impl ArtistRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Look up or create an artist, atomically read-then-write inside
-    /// a single transaction. During a scan, this guarantees the lookup
-    /// sees artists created earlier in the same batch — preventing
-    /// duplicates — and that the conditional INSERT can't race with
-    /// another scanner adding the same artist.
+    /// Sequential `query_one` + `execute` + `last_insert_rowid` (not
+    /// `write_tx`) because the scanner holds `BEGIN IMMEDIATE` while
+    /// calling this, and `write_tx` would try to start a nested
+    /// `BEGIN DEFERRED` — same constraint as `album_repo::get_or_create`.
     pub fn get_or_create(
         &self,
         name: &str,
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
     ) -> Result<Artist, String> {
-        let by_mbid_sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
-        let by_name_sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
+        if let Some(mbid) = musicbrainz_id {
+            if let Some(found) = self.get_by_musicbrainz_id(mbid)? {
+                return Ok(found);
+            }
+        }
+        if let Some(found) = self.get_by_name(name)? {
+            return Ok(found);
+        }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
-
-        // Output slot for the result. The closure writes to it.
-        let mut out: Option<Artist> = None;
-        let out_ref = &mut out;
-        self.db.write_tx(&mut |tx| {
-            if let Some(mbid) = musicbrainz_id {
-                let p: [&dyn ToSqlValue; 1] = [&mbid];
-                if let Some(row) = tx.query_one(&by_mbid_sql, &p)? {
-                    *out_ref = Some(row_to_artist(&row));
-                    return Ok(());
-                }
-            }
-            let p: [&dyn ToSqlValue; 1] = [&name];
-            if let Some(row) = tx.query_one(&by_name_sql, &p)? {
-                *out_ref = Some(row_to_artist(&row));
-                return Ok(());
-            }
-            let p: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
-            tx.execute(&create_sql, &p)?;
-            let id = tx.last_insert_rowid();
-            *out_ref = Some(Artist {
-                id: Some(id),
-                name: name.to_string(),
-                sort_name: sort_name.map(|s| s.to_string()),
-                musicbrainz_id: musicbrainz_id.map(|s| s.to_string()),
-                discogs_id: None,
-                bio: None,
-                image_path: None,
-                image_source: None,
-            });
-            Ok(())
-        })?;
-        out.ok_or_else(|| "get_or_create: closure left no result".into())
+        let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];
+        self.db.execute(&create_sql, &params)?;
+        let id = self.db.last_insert_rowid();
+        Ok(Artist {
+            id: Some(id),
+            name: name.to_string(),
+            sort_name: sort_name.map(|s| s.to_string()),
+            musicbrainz_id: musicbrainz_id.map(|s| s.to_string()),
+            discogs_id: None,
+            bio: None,
+            image_path: None,
+            image_source: None,
+        })
     }
 
     pub fn update(&self, artist: &Artist) -> Result<(), String> {

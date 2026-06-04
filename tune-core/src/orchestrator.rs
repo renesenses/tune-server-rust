@@ -46,6 +46,7 @@ pub struct PlayResult {
     pub stream_url: Option<String>,
     pub output_sent: bool,
     pub source: String,
+    pub error: Option<String>,
 }
 
 pub struct ResolvedQueueItem {
@@ -100,7 +101,7 @@ impl PlaybackOrchestrator {
         // ListenBrainz Now Playing
         self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
 
-        let output_sent = if let Some(ref device_id) = req.output_device_id {
+        let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
             let media = crate::outputs::traits::PlayMedia {
                 url: &stream_url,
@@ -113,7 +114,7 @@ impl PlaybackOrchestrator {
             };
             self.send_to_output(device_id, &media).await
         } else {
-            false
+            (false, None)
         };
 
         self.record_listen(
@@ -137,6 +138,7 @@ impl PlaybackOrchestrator {
             stream_url: Some(stream_url),
             output_sent,
             source,
+            error: output_error,
         })
     }
 
@@ -531,23 +533,26 @@ impl PlaybackOrchestrator {
         &self,
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
-    ) -> bool {
+    ) -> (bool, Option<String>) {
         let outputs = self.outputs.lock().await;
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
                     info!(device_id, "output_play_sent");
-                    true
+                    (true, None)
                 }
                 Err(e) => {
                     warn!(device_id, error = %e, "output_play_failed");
-                    false
+                    (false, Some(format!("Output device error: {e}")))
                 }
             }
         } else {
             warn!(device_id, "output_not_found");
-            false
+            (
+                false,
+                Some("Device not yet discovered. Please retry in a few seconds.".into()),
+            )
         }
     }
 
