@@ -1,5 +1,4 @@
 use std::net::UdpSocket;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -297,8 +296,47 @@ fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8]) -> Vec<u8
     pkt
 }
 
-fn find_ffmpeg() -> Option<String> {
-    crate::audio::pipeline::find_ffmpeg()
+/// Temporary file guard that deletes the file on drop.
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Convert a URL to a local file path for native decoding.
+/// - Bare paths (`/path/to/file`) are returned as-is.
+/// - `file:///path/to/file` URLs have the scheme stripped.
+/// - HTTP(S) URLs are downloaded to a temporary file (cleaned up on drop).
+async fn url_to_local_path(url: &str) -> Result<(String, Option<TempFileGuard>), String> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return Ok((path.to_string(), None));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let resp = reqwest::get(url)
+            .await
+            .map_err(|e| format!("download {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("download {url}: HTTP {}", resp.status()));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("download body: {e}"))?;
+
+        let tmp_dir = std::env::temp_dir();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = tmp_dir.join(format!("tune_airplay_{id}.pcm"));
+        std::fs::write(&tmp_path, &bytes).map_err(|e| format!("write tmp: {e}"))?;
+        let path_str = tmp_path.to_string_lossy().to_string();
+        return Ok((path_str, Some(TempFileGuard(tmp_path))));
+    }
+    // Assume bare file path
+    Ok((url.to_string(), None))
 }
 
 #[async_trait::async_trait]
@@ -321,8 +359,6 @@ impl OutputTarget for AirplayOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.stop().await.ok();
-
-        let ffmpeg = find_ffmpeg().ok_or("FFmpeg not found for AirPlay streaming")?;
 
         // Establish RTSP session
         let mut session = RtspSession::connect(&self.host, self.port).await?;
@@ -363,16 +399,8 @@ impl OutputTarget for AirplayOutput {
         let name = self.name.clone();
 
         tokio::spawn(async move {
-            let result = stream_to_airplay(
-                &ffmpeg,
-                &url,
-                udp,
-                &playing,
-                &paused,
-                &position_ms,
-                &mut stop_rx,
-            )
-            .await;
+            let result =
+                stream_to_airplay(&url, udp, &playing, &paused, &position_ms, &mut stop_rx).await;
 
             if let Err(e) = result {
                 warn!(device = %name, error = %e, "airplay_stream_error");
@@ -464,7 +492,6 @@ impl OutputTarget for AirplayOutput {
 }
 
 async fn stream_to_airplay(
-    ffmpeg: &str,
     url: &str,
     udp: UdpSocket,
     playing: &AtomicBool,
@@ -472,49 +499,50 @@ async fn stream_to_airplay(
     position_ms: &AtomicU64,
     stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let mut child = tokio::process::Command::new(ffmpeg)
-        .args([
-            "-i",
-            url,
-            "-f",
-            "s16be",
-            "-ar",
-            &SAMPLE_RATE.to_string(),
-            "-ac",
-            &CHANNELS.to_string(),
-            "-acodec",
-            "pcm_s16be",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ffmpeg spawn: {e}"))?;
+    // Resolve URL to a local file path (downloading HTTP URLs if needed)
+    let (local_path, _tmp_guard) = url_to_local_path(url).await?;
 
-    let stdout = child.stdout.take().ok_or("no ffmpeg stdout")?;
-    let mut reader = tokio::io::BufReader::new(stdout);
+    // Decode the entire file natively to PCM i16 at AirPlay sample rate, stereo
+    let decoded = tokio::task::spawn_blocking({
+        let path = local_path.clone();
+        move || {
+            crate::audio::decode::decode_to_pcm(
+                &path,
+                Some(SAMPLE_RATE),
+                Some(CHANNELS as u32),
+                0.0,
+                0.0,
+            )
+        }
+    })
+    .await
+    .map_err(|e| format!("decode join: {e}"))?
+    .map_err(|e| format!("native decode: {e}"))?;
+
+    if decoded.samples.is_empty() {
+        return Err("decoded audio is empty".into());
+    }
+
+    // Convert i16 LE samples to s16 BE bytes (swap byte order)
+    let pcm_be: Vec<u8> = decoded
+        .samples
+        .iter()
+        .flat_map(|&s| s.to_be_bytes())
+        .collect();
 
     let ssrc: u32 = rand_random();
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
-    let mut audio_buf = vec![0u8; BYTES_PER_PACKET];
     let mut total_frames: u64 = 0;
+    let mut offset: usize = 0;
 
     let udp = tokio::net::UdpSocket::from_std(udp).map_err(|e| format!("tokio udp: {e}"))?;
     let start_time = tokio::time::Instant::now();
 
-    loop {
-        tokio::select! {
-            _ = &mut *stop_rx => {
-                break;
-            }
-            result = reader.read_exact(&mut audio_buf) => {
-                match result {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(format!("ffmpeg read: {e}")),
-                }
-            }
+    while offset + BYTES_PER_PACKET <= pcm_be.len() {
+        // Check for stop signal (non-blocking)
+        if stop_rx.try_recv().is_ok() {
+            break;
         }
 
         if !playing.load(Ordering::Relaxed) {
@@ -528,7 +556,8 @@ async fn stream_to_airplay(
             }
         }
 
-        let pkt = build_rtp_packet(seq, timestamp, ssrc, &audio_buf);
+        let audio_buf = &pcm_be[offset..offset + BYTES_PER_PACKET];
+        let pkt = build_rtp_packet(seq, timestamp, ssrc, audio_buf);
         if let Err(e) = udp.send(&pkt).await {
             debug!(error = %e, "airplay_rtp_send_error");
         }
@@ -536,6 +565,7 @@ async fn stream_to_airplay(
         seq = seq.wrapping_add(1);
         timestamp = timestamp.wrapping_add(FRAMES_PER_PACKET as u32);
         total_frames += FRAMES_PER_PACKET as u64;
+        offset += BYTES_PER_PACKET;
         position_ms.store(total_frames * 1000 / SAMPLE_RATE as u64, Ordering::Relaxed);
 
         // Pace to real-time: sleep until the next packet is due
@@ -544,7 +574,6 @@ async fn stream_to_airplay(
         tokio::time::sleep_until(target).await;
     }
 
-    child.kill().await.ok();
     Ok(())
 }
 
