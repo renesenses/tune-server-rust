@@ -39,6 +39,7 @@ pub fn can_decode_native(file_path: &str) -> bool {
             | "dsf"
             | "dff"
             | "wv"
+            | "ape"
     )
 }
 
@@ -81,6 +82,16 @@ pub fn decode_to_pcm(
 
     if is_wavpack(file_path) {
         return super::wavpack::decode_wavpack_to_pcm(
+            file_path,
+            target_sample_rate,
+            target_channels,
+            seek_s,
+            max_duration_s,
+        );
+    }
+
+    if ext == "ape" {
+        return super::ape::decode_ape_to_pcm(
             file_path,
             target_sample_rate,
             target_channels,
@@ -292,7 +303,7 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.aif"));
         assert!(can_decode_native("song.dsf"));
         assert!(can_decode_native("song.dff"));
-        assert!(!can_decode_native("song.ape"));
+        assert!(can_decode_native("song.ape"));
         assert!(can_decode_native("song.wv"));
     }
 
