@@ -50,6 +50,7 @@ csv = "1"
 symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg"] }
 rubato = "0.14"
 hound = "3.5"
+unicode-normalization = "0.1"
 oaat-core = { version = "0.1.3", default-features = false }
 oaat-controller = { version = "0.1.3", default-features = false }
 flate2 = "1"

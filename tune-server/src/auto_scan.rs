@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tracing::info;
+use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
@@ -154,9 +155,9 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
         let files_to_scan: Vec<std::path::PathBuf> = files
             .into_iter()
             .filter(|path| {
-                let path_str = path.to_string_lossy();
+                let path_str: String = path.to_string_lossy().nfc().collect();
                 if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_ref())
+                    existing_tracks.get(path_str.as_str())
                     && let Ok(file_meta) = path.metadata()
                 {
                     let mtime = file_meta
@@ -214,6 +215,7 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
                     let Some((mut track, album_id)) =
                         build_track_from_metadata(sf, &artist_repo, &album_repo)
                     else {
+                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         continue;
                     };
 
@@ -357,6 +359,7 @@ pub fn spawn_file_watcher(db: SqliteDb) {
                                     let Some((track, album_id)) =
                                         build_track_from_metadata(sf, &artist_repo, &album_repo)
                                     else {
+                                        tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                         continue;
                                     };
 

@@ -90,7 +90,7 @@ impl PlaybackOrchestrator {
             duration_ms: duration_ms.unwrap_or(0),
             source: source.clone(),
             source_id: req.source_id.clone(),
-            stream_id,
+            stream_id: stream_id.clone(),
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -103,6 +103,10 @@ impl PlaybackOrchestrator {
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
+            let stream_ready = match stream_id {
+                Some(ref sid) => self.streamer.get_stream_ready_notify(sid).await,
+                None => None,
+            };
             let media = crate::outputs::traits::PlayMedia {
                 url: &stream_url,
                 mime_type: &mime_type,
@@ -111,6 +115,7 @@ impl PlaybackOrchestrator {
                 album: req.album_title.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
                 duration_ms: duration_ms.map(|d| d as u64),
+                stream_ready,
             };
             self.send_to_output(device_id, &media).await
         } else {
