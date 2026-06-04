@@ -1,4 +1,7 @@
-use rubato::{FftFixedIn, Resampler as RubatoResampler};
+use rubato::{
+    Fft, FixedSync, Resampler as RubatoResampler, audioadapter::Adapter,
+    audioadapter_buffers::direct::SequentialSliceOfVecs,
+};
 use tracing::debug;
 
 #[allow(dead_code)]
@@ -17,7 +20,7 @@ pub struct Resampler {
     target_depth: u32,
     channels: u32,
     needs_resample: bool,
-    resampler: Option<FftFixedIn<f64>>,
+    resampler: Option<Fft<f64>>,
 }
 
 impl Resampler {
@@ -67,12 +70,13 @@ impl Resampler {
         );
 
         let chunk_size = 1024;
-        let resampler = FftFixedIn::<f64>::new(
+        let resampler = Fft::<f64>::new(
             self.source_rate as usize,
             self.target_rate as usize,
             chunk_size,
             2,
             self.channels as usize,
+            FixedSync::Input,
         )
         .map_err(|e| format!("rubato init: {e}"))?;
 
@@ -95,7 +99,7 @@ impl Resampler {
         }
 
         // Deinterleave PCM bytes → Vec<Vec<f64>> per channel
-        let mut channel_data: Vec<Vec<f64>> = vec![Vec::with_capacity(frames); channels];
+        let mut channel_data: Vec<Vec<f64>> = vec![vec![0.0; frames]; channels];
         for frame in 0..frames {
             for ch in 0..channels {
                 let offset = (frame * channels + ch) * bytes_per_sample;
@@ -128,42 +132,45 @@ impl Resampler {
                     }
                     _ => 0.0,
                 };
-                channel_data[ch].push(sample);
+                channel_data[ch][frame] = sample;
             }
         }
 
-        // Resample
+        // Resample using rubato 3.0 API
+        let input_adapter = SequentialSliceOfVecs::new(&channel_data, channels, frames)
+            .map_err(|e| format!("rubato input adapter: {e}"))?;
+
         let resampled = resampler
-            .process(&channel_data, None)
+            .process(&input_adapter, 0, None)
             .map_err(|e| format!("rubato process: {e}"))?;
 
-        // Interleave back to PCM bytes
+        // Extract interleaved f64 samples from the output
+        let out_frames = resampled.frames();
+        let interleaved_data = resampled.take_data();
+
+        // Convert interleaved f64 samples to PCM bytes
         let out_bytes_per_sample = (self.target_depth as usize + 7) / 8;
-        let out_frames = resampled[0].len();
         let mut output = Vec::with_capacity(out_frames * channels * out_bytes_per_sample);
 
-        for frame in 0..out_frames {
-            for ch in 0..channels {
-                let sample = resampled[ch][frame];
-                match out_bytes_per_sample {
-                    2 => {
-                        let s = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
-                        output.extend_from_slice(&s.to_le_bytes());
-                    }
-                    3 => {
-                        let s = (sample * 8388607.0).round().clamp(-8388608.0, 8388607.0) as i32;
-                        let bytes = s.to_le_bytes();
-                        output.extend_from_slice(&bytes[..3]);
-                    }
-                    4 => {
-                        let s = (sample * 2147483647.0)
-                            .round()
-                            .clamp(-2147483648.0, 2147483647.0)
-                            as i32;
-                        output.extend_from_slice(&s.to_le_bytes());
-                    }
-                    _ => {}
+        for i in 0..out_frames * channels {
+            let sample = interleaved_data[i];
+            match out_bytes_per_sample {
+                2 => {
+                    let s = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
+                    output.extend_from_slice(&s.to_le_bytes());
                 }
+                3 => {
+                    let s = (sample * 8388607.0).round().clamp(-8388608.0, 8388607.0) as i32;
+                    let bytes = s.to_le_bytes();
+                    output.extend_from_slice(&bytes[..3]);
+                }
+                4 => {
+                    let s = (sample * 2147483647.0)
+                        .round()
+                        .clamp(-2147483648.0, 2147483647.0) as i32;
+                    output.extend_from_slice(&s.to_le_bytes());
+                }
+                _ => {}
             }
         }
 
