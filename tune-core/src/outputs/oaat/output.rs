@@ -386,34 +386,36 @@ impl OutputTarget for OaatOutput {
                 );
 
                 let is_flac = si.format == AudioFormat::Flac;
-                let cur_format = if is_flac {
-                    AudioFormat::PcmS16le
-                } else {
-                    si.format
-                };
-                let cur_sample_rate = si.sample_rate;
-                let cur_bits = si.bits_per_sample;
-                let ch = si.channels.min(8) as u8;
-                let layout = ChannelLayout::Stereo;
-                let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
 
-                // For FLAC files, convert to WAV via ffmpeg then re-parse
-                let pcm_data = if is_flac {
+                // For FLAC files, convert to WAV via ffmpeg then use WAV info
+                let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = if is_flac {
                     eprintln!("OAAT-DEBUG: converting FLAC to WAV via ffmpeg...");
                     match super::helpers::decode_flac_to_pcm(fp) {
                         Some(wav_data) => {
                             let mut wav_buf = wav_data;
-                            if let Some(wav_si) = detect_and_parse(&mut wav_buf) {
-                                eprintln!(
-                                    "OAAT-DEBUG: WAV decoded: {} bytes, {}Hz {}bit",
-                                    wav_buf.len(),
-                                    wav_si.sample_rate,
-                                    wav_si.bits_per_sample
-                                );
-                                // Update format info from WAV
-                                // cur_format, cur_bits etc already set but we use wav_buf as PCM
-                            }
-                            wav_buf
+                            let wav_si = match detect_and_parse(&mut wav_buf) {
+                                Some(info) => info,
+                                None => {
+                                    eprintln!("OAAT-DEBUG: WAV parse failed after ffmpeg");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            eprintln!(
+                                "OAAT-DEBUG: WAV: {} bytes, {:?} {}Hz {}bit {}ch",
+                                wav_buf.len(),
+                                wav_si.format,
+                                wav_si.sample_rate,
+                                wav_si.bits_per_sample,
+                                wav_si.channels
+                            );
+                            (
+                                wav_buf,
+                                wav_si.format,
+                                wav_si.sample_rate,
+                                wav_si.bits_per_sample,
+                                wav_si.channels.min(8) as u8,
+                            )
                         }
                         None => {
                             eprintln!("OAAT-DEBUG: ffmpeg FLAC->WAV failed");
@@ -422,8 +424,16 @@ impl OutputTarget for OaatOutput {
                         }
                     }
                 } else {
-                    buf
+                    (
+                        buf,
+                        si.format,
+                        si.sample_rate,
+                        si.bits_per_sample,
+                        si.channels.min(8) as u8,
+                    )
                 };
+                let layout = ChannelLayout::Stereo;
+                let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
 
                 let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
                 if let Err(e) = endpoint
@@ -595,6 +605,22 @@ impl OutputTarget for OaatOutput {
             };
 
             let is_flac = si.format == AudioFormat::Flac;
+
+            if is_flac {
+                while buf.len() < 65536 {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                        Some(Err(e)) => {
+                            error!(device = %device_name, error = %e, "oaat: FLAC pre-buffer failed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                        None => break,
+                    }
+                }
+                debug!(device = %device_name, buffered = buf.len(), "oaat: FLAC pre-buffered");
+            }
+
             let is_dsd = si.format.is_dsd();
             let uses_byte_offset = is_flac || is_dsd;
             let mut cur_format = si.format;

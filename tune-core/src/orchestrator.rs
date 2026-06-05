@@ -66,13 +66,11 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
-        // Clean up previous stream session for this zone
+        // Remember old session for cleanup AFTER output has been stopped
         let prev_state = self.playback.get_state(req.zone_id).await;
-        if let Some(ref np) = prev_state.now_playing
-            && let Some(ref old_sid) = np.stream_id
-        {
-            self.streamer.remove_session(old_sid).await;
-        }
+        let old_stream_id = prev_state.now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.clone());
 
         let (
             stream_url,
