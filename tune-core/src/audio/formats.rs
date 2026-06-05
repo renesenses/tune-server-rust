@@ -34,7 +34,8 @@ impl AudioFormat {
         }
     }
 
-    pub fn ffmpeg_format_arg(&self) -> &'static str {
+    /// Container format identifier (e.g. "flac", "wav", "mp3").
+    pub fn container_format(&self) -> &'static str {
         match self {
             Self::Flac => "flac",
             Self::Wav => "wav",
@@ -48,7 +49,8 @@ impl AudioFormat {
         }
     }
 
-    pub fn ffmpeg_codec_arg(&self) -> &'static str {
+    /// Codec identifier (e.g. "flac", "pcm_s16le", "alac").
+    pub fn codec_name(&self) -> &'static str {
         match self {
             Self::Flac => "flac",
             Self::Wav => "pcm_s16le",
@@ -145,7 +147,7 @@ impl AudioFormat {
         }
     }
 
-    /// Returns true if this format needs FFmpeg transcoding before DLNA streaming.
+    /// Returns true if this format needs transcoding before DLNA streaming.
     /// FLAC, WAV, MP3, AAC can be served as raw files; everything else must be transcoded.
     pub fn needs_transcode_for_dlna(&self) -> bool {
         matches!(
@@ -308,7 +310,7 @@ mod tests {
 
     #[test]
     fn dsd_codec_is_24bit() {
-        assert_eq!(AudioFormat::Dsd.ffmpeg_codec_arg(), "pcm_s24le");
+        assert_eq!(AudioFormat::Dsd.codec_name(), "pcm_s24le");
     }
 
     #[test]
@@ -441,32 +443,32 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_format_args() {
-        assert_eq!(AudioFormat::Flac.ffmpeg_format_arg(), "flac");
-        assert_eq!(AudioFormat::Wav.ffmpeg_format_arg(), "wav");
-        assert_eq!(AudioFormat::Mp3.ffmpeg_format_arg(), "mp3");
-        assert_eq!(AudioFormat::Aac.ffmpeg_format_arg(), "adts");
-        assert_eq!(AudioFormat::Alac.ffmpeg_format_arg(), "ipod");
-        assert_eq!(AudioFormat::Ogg.ffmpeg_format_arg(), "ogg");
-        assert_eq!(AudioFormat::Opus.ffmpeg_format_arg(), "opus");
-        assert_eq!(AudioFormat::Aiff.ffmpeg_format_arg(), "aiff");
-        assert_eq!(AudioFormat::Dsd.ffmpeg_format_arg(), "wav");
-        assert_eq!(AudioFormat::WavPack.ffmpeg_format_arg(), "wav");
-        assert_eq!(AudioFormat::Ape.ffmpeg_format_arg(), "wav");
+    fn container_formats() {
+        assert_eq!(AudioFormat::Flac.container_format(), "flac");
+        assert_eq!(AudioFormat::Wav.container_format(), "wav");
+        assert_eq!(AudioFormat::Mp3.container_format(), "mp3");
+        assert_eq!(AudioFormat::Aac.container_format(), "adts");
+        assert_eq!(AudioFormat::Alac.container_format(), "ipod");
+        assert_eq!(AudioFormat::Ogg.container_format(), "ogg");
+        assert_eq!(AudioFormat::Opus.container_format(), "opus");
+        assert_eq!(AudioFormat::Aiff.container_format(), "aiff");
+        assert_eq!(AudioFormat::Dsd.container_format(), "wav");
+        assert_eq!(AudioFormat::WavPack.container_format(), "wav");
+        assert_eq!(AudioFormat::Ape.container_format(), "wav");
     }
 
     #[test]
-    fn ffmpeg_codec_args() {
-        assert_eq!(AudioFormat::Flac.ffmpeg_codec_arg(), "flac");
-        assert_eq!(AudioFormat::Wav.ffmpeg_codec_arg(), "pcm_s16le");
-        assert_eq!(AudioFormat::Mp3.ffmpeg_codec_arg(), "libmp3lame");
-        assert_eq!(AudioFormat::Aac.ffmpeg_codec_arg(), "aac");
-        assert_eq!(AudioFormat::Alac.ffmpeg_codec_arg(), "alac");
-        assert_eq!(AudioFormat::Ogg.ffmpeg_codec_arg(), "libvorbis");
-        assert_eq!(AudioFormat::Opus.ffmpeg_codec_arg(), "libopus");
-        assert_eq!(AudioFormat::Aiff.ffmpeg_codec_arg(), "pcm_s16be");
-        assert_eq!(AudioFormat::WavPack.ffmpeg_codec_arg(), "pcm_s24le");
-        assert_eq!(AudioFormat::Ape.ffmpeg_codec_arg(), "pcm_s24le");
+    fn codec_names() {
+        assert_eq!(AudioFormat::Flac.codec_name(), "flac");
+        assert_eq!(AudioFormat::Wav.codec_name(), "pcm_s16le");
+        assert_eq!(AudioFormat::Mp3.codec_name(), "libmp3lame");
+        assert_eq!(AudioFormat::Aac.codec_name(), "aac");
+        assert_eq!(AudioFormat::Alac.codec_name(), "alac");
+        assert_eq!(AudioFormat::Ogg.codec_name(), "libvorbis");
+        assert_eq!(AudioFormat::Opus.codec_name(), "libopus");
+        assert_eq!(AudioFormat::Aiff.codec_name(), "pcm_s16be");
+        assert_eq!(AudioFormat::WavPack.codec_name(), "pcm_s24le");
+        assert_eq!(AudioFormat::Ape.codec_name(), "pcm_s24le");
     }
 
     #[test]

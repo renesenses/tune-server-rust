@@ -507,7 +507,7 @@ pub(super) async fn changelog() -> Json<Value> {
                 "date": "2026-06-04",
                 "sections": [
                     { "title": "Corrections", "items": [
-                        "OAAT streams FLAC directly (no FFmpeg transcode)",
+                        "OAAT streams FLAC directly (native pipeline)",
                     ]},
                     { "title": "Nouveautes", "items": [
                         "Mood DJ — ambient mix generation",

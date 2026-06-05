@@ -1,7 +1,7 @@
 //! Native AIFF/AIFC parser and PCM decoder.
 //!
 //! Parses the IFF container (FORM + COMM + SSND chunks) and extracts
-//! interleaved PCM samples as i16, avoiding the FFmpeg subprocess fallback.
+//! interleaved PCM samples as i16.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

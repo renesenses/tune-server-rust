@@ -396,7 +396,7 @@ pub(super) async fn track_waveform(
 
     let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
     if points.is_empty() {
-        return Json(json!({ "track_id": id, "waveform": null, "error": "ffmpeg unavailable or file unreadable" })).into_response();
+        return Json(json!({ "track_id": id, "waveform": null, "error": "file unreadable or unsupported format" })).into_response();
     }
 
     let json_str = serde_json::to_string(&points).unwrap_or_default();

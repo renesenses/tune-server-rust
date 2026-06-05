@@ -1,5 +1,3 @@
-use std::process::Stdio;
-
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -111,7 +109,7 @@ async fn run_native_pipeline(
     let output_data = match cfg.output_format {
         AudioFormat::Wav | AudioFormat::Flac => {
             let mut encoder = super::encoder::AudioEncoder::new(
-                cfg.output_format.ffmpeg_format_arg(),
+                cfg.output_format.container_format(),
                 decoded.sample_rate,
                 16, // decode_to_pcm produces i16
                 decoded.channels,
@@ -123,7 +121,7 @@ async fn run_native_pipeline(
         _ => {
             // For other formats, encode as FLAC (the encoder handles fallback)
             let mut encoder = super::encoder::AudioEncoder::new(
-                cfg.output_format.ffmpeg_format_arg(),
+                cfg.output_format.container_format(),
                 decoded.sample_rate,
                 16,
                 decoded.channels,
@@ -145,55 +143,9 @@ async fn run_native_pipeline(
     Ok(())
 }
 
-pub fn find_ffmpeg() -> Option<String> {
-    // 1. Check bundled / well-known absolute paths first
-    let bundled: Vec<&str> = if cfg!(target_os = "windows") {
-        vec![".\\ffmpeg.exe"]
-    } else {
-        vec!["/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]
-    };
-
-    for candidate in &bundled {
-        if std::process::Command::new(candidate)
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-        {
-            info!(path = %candidate, "ffmpeg_found_bundled");
-            return Some(candidate.to_string());
-        }
-    }
-
-    // 2. Fall back to PATH lookup (bare "ffmpeg" — the OS resolves via PATH)
-    if std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-    {
-        info!("ffmpeg_found_in_path");
-        return Some("ffmpeg".to_string());
-    }
-
-    warn!("ffmpeg_not_found");
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ffmpeg_detection() {
-        // Should find ffmpeg on dev machines
-        let result = find_ffmpeg();
-        if let Some(path) = result {
-            println!("Found FFmpeg: {}", path);
-        }
-    }
 
     #[tokio::test]
     async fn pipeline_stream_info() {

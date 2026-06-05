@@ -86,11 +86,6 @@ fn build_wav_header(py: Python<'_>, channels: u16, sample_rate: u32, bit_depth: 
 }
 
 #[pyfunction]
-fn find_ffmpeg() -> Option<String> {
-    tune_core::audio::pipeline::find_ffmpeg()
-}
-
-#[pyfunction]
 fn format_from_extension(ext: &str) -> Option<String> {
     tune_core::audio::formats::AudioFormat::from_extension(ext)
         .map(|f| format!("{:?}", f).to_lowercase())
@@ -120,7 +115,6 @@ fn tune_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(read_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(build_wav_header, m)?)?;
-    m.add_function(wrap_pyfunction!(find_ffmpeg, m)?)?;
     m.add_function(wrap_pyfunction!(format_from_extension, m)?)?;
     m.add_function(wrap_pyfunction!(mime_type_for_format, m)?)?;
     m.add_class::<pipeline_wrapper::RustPipeline>()?;

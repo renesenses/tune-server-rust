@@ -77,7 +77,7 @@ impl AudioEncoder {
                 warn!(
                     requested = "mp3",
                     actual = "flac",
-                    "encoder_format_substitution: MP3 not available without FFmpeg, encoding as FLAC"
+                    "encoder_format_substitution: MP3 not natively supported, encoding as FLAC"
                 );
                 self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
@@ -85,7 +85,7 @@ impl AudioEncoder {
                 warn!(
                     requested = "ogg",
                     actual = "flac",
-                    "encoder_format_substitution: OGG not available without FFmpeg, encoding as FLAC"
+                    "encoder_format_substitution: OGG not natively supported, encoding as FLAC"
                 );
                 self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
@@ -146,9 +146,6 @@ impl AudioEncoder {
         self.flac_state = None;
     }
 }
-
-// Keep the old name as a type alias for backward compatibility
-pub type FFmpegEncoder = AudioEncoder;
 
 // ---------------------------------------------------------------------------
 // WAV encoder (hound)
@@ -1140,13 +1137,6 @@ mod tests {
         assert_eq!(enc.format, "flac");
         assert_eq!(enc.sample_rate, 44100);
         assert!(enc.pcm_buffer.is_none());
-    }
-
-    #[test]
-    fn encoder_new_alias() {
-        // FFmpegEncoder alias still works
-        let enc = FFmpegEncoder::new("flac", 44100, 16, 2);
-        assert_eq!(enc.format, "flac");
     }
 
     #[tokio::test]

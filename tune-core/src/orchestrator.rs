@@ -214,7 +214,7 @@ impl PlaybackOrchestrator {
         let channels = track.channels as u16;
 
         // Check if this format needs transcoding for DLNA (AIFF, DSD, WavPack, APE)
-        // OAAT outputs handle DSD natively — skip FFmpeg transcode
+        // OAAT outputs handle DSD natively — skip transcode
         let is_oaat_output = req
             .output_device_id
             .as_deref()
@@ -256,7 +256,7 @@ impl PlaybackOrchestrator {
             let out_ext = if oaat_needs_wav {
                 "wav".to_string()
             } else {
-                target_fmt.ffmpeg_format_arg().to_string()
+                target_fmt.container_format().to_string()
             };
 
             info!(
@@ -285,7 +285,7 @@ impl PlaybackOrchestrator {
             let target_format_str = if target_fmt == AudioFormat::Wav {
                 "wav".to_string()
             } else {
-                target_fmt.ffmpeg_format_arg().to_string()
+                target_fmt.container_format().to_string()
             };
             tokio::spawn(async move {
                 let decode_result = crate::audio::decode::decode_to_pcm(
@@ -434,9 +434,7 @@ impl PlaybackOrchestrator {
 
         let (stream_url, sid) = if is_https && is_oaat_stream {
             // OAAT endpoint handles FLAC natively — proxy the upstream FLAC
-            // stream directly instead of transcoding via FFmpeg. This avoids
-            // requiring PCM encoders (pcm_s16le/s24le) that may be missing
-            // on minimal FFmpeg builds.
+            // stream directly instead of transcoding.
             let session_id = self
                 .streamer
                 .create_proxy_session(info.clone(), stream_data.url.clone(), false)
