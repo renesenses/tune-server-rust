@@ -305,17 +305,27 @@ jobs:
             exit 1
           fi
 
-          # Extract old version from formula
-          OLD_VERSION=$(grep -oP '^\s+version "\K[^"]+' "$F")
+          # Extract old version from formula (POSIX-compatible, no grep -P)
+          OLD_VERSION=$(sed -n 's/^[[:space:]]*version "\([^"]*\)".*/\1/p' "$F")
+          if [ -z "$OLD_VERSION" ]; then
+            echo "::error::Could not extract version from $F"
+            exit 1
+          fi
           echo "Updating $OLD_VERSION → $VERSION"
 
           # Update version string and caveats
-          sed -i -E "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
-          sed -i -E "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
+          sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
+          sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
 
-          # Update all download URLs (replace old version in paths)
+          # Update all download URLs — both path (/vX.Y.Z/) AND tarball name (tune-server-vX.Y.Z-)
           sed -i "s|/v${OLD_VERSION}/|/v${VERSION}/|g" "$F"
           sed -i "s|tune-server-v${OLD_VERSION}-|tune-server-v${VERSION}-|g" "$F"
+
+          # Safety: catch any remaining old version references
+          if grep -q "${OLD_VERSION}" "$F"; then
+            echo "::warning::Formula still contains old version ${OLD_VERSION} after sed"
+            grep -n "${OLD_VERSION}" "$F"
+          fi
 
           # Recompute SHA256 for each platform tarball
           BASE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
@@ -330,7 +340,7 @@ jobs:
             done
             NEW_SHA=$(sha256sum "/tmp/${FILE}" | cut -d' ' -f1)
             # Find the sha256 line that follows this platform's url line
-            OLD_SHA=$(grep -A1 "${PLATFORM}" "$F" | grep -oP 'sha256 "\K[^"]+')
+            OLD_SHA=$(grep -A1 "${PLATFORM}" "$F" | sed -n 's/^[[:space:]]*sha256 "\([0-9a-f]*\)".*/\1/p')
             if [ -n "$OLD_SHA" ]; then
               sed -i "s|${OLD_SHA}|${NEW_SHA}|" "$F"
               echo "  ${PLATFORM}: ${OLD_SHA} → ${NEW_SHA}"
