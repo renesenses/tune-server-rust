@@ -166,6 +166,29 @@ async fn demo_library(
     .into_response()
 }
 
+async fn cache_control_middleware(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    if path.starts_with("/assets/") {
+        // Hashed assets (index-Bmb2F8zZ.js) — immutable, cache forever
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if path == "/" || path.ends_with(".html") || !path.contains('.') {
+        // HTML pages and SPA routes — always revalidate
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache, must-revalidate"),
+        );
+    }
+    response
+}
+
 async fn api_fallback(
     axum::extract::OriginalUri(original): axum::extract::OriginalUri,
 ) -> impl IntoResponse {
@@ -363,6 +386,7 @@ pub fn router(state: AppState) -> Router {
     .fallback_service(
         ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
     )
+    .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(CompressionLayer::new())
     .layer(CorsLayer::permissive())
 }
