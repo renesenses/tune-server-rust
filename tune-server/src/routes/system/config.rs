@@ -51,8 +51,17 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let listens = HistoryRepo::new(state.db.clone()).count().unwrap_or(0);
     let zones = ZoneRepo::new(state.db).count().unwrap_or(0);
-    let devices = state.scanner.lock().await.devices().await.len();
-    let outputs = state.outputs.lock().await.list().len();
+    // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
+    let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        state.scanner.lock().await.devices().await.len()
+    })
+    .await
+    .unwrap_or(0);
+    let outputs = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        state.outputs.lock().await.list().len()
+    })
+    .await
+    .unwrap_or(0);
 
     Json(json!({
         "artists": artists,

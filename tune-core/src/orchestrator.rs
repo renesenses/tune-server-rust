@@ -201,24 +201,39 @@ impl PlaybackOrchestrator {
         let bit_depth = track.bit_depth.unwrap_or(16) as u16;
         let channels = track.channels as u16;
 
-        // Check if this format needs transcoding for DLNA (AIFF, DSD, WavPack, APE)
-        // OAAT outputs handle DSD natively — skip transcode
+        // Determine the output type for this zone to scope transcode decisions correctly.
+        let zone_output_type = ZoneRepo::new(self.db.clone())
+            .get(req.zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_type);
+
         let is_oaat_output = req
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
-        let _is_dsd = source_format
-            .as_ref()
-            .is_some_and(|f| *f == AudioFormat::Dsd);
         // OAAT endpoints: transcode to WAV for reliable bit-perfect playback.
         let oaat_needs_wav = is_oaat_output
             && source_format
                 .as_ref()
                 .is_some_and(|f| *f != AudioFormat::Wav);
-        let needs_transcode = source_format
-            .as_ref()
-            .is_some_and(|f| f.needs_transcode_for_dlna())
-            || oaat_needs_wav;
+
+        // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs
+        // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
+        // Local and AirPlay outputs do their own decoding and don't need orchestrator transcoding.
+        let is_network_output = matches!(
+            zone_output_type.as_deref(),
+            Some("dlna")
+                | Some("openhome")
+                | Some("chromecast")
+                | Some("bluos")
+                | Some("squeezebox")
+        );
+        let needs_transcode_for_output = is_network_output
+            && source_format
+                .as_ref()
+                .is_some_and(|f| f.needs_transcode_for_dlna());
+        let needs_transcode = needs_transcode_for_output || oaat_needs_wav;
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
             let src_fmt = source_format.expect("guarded by needs_transcode check"); // safe: needs_transcode is true
@@ -252,7 +267,7 @@ impl PlaybackOrchestrator {
                 target = ?target_fmt,
                 sample_rate = out_sr,
                 bit_depth = out_bd,
-                "dlna_transcode_required"
+                "transcode_required"
             );
 
             let info = StreamInfo {

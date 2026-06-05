@@ -2,6 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rubato::{
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction, calculate_cutoff,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -539,7 +543,7 @@ impl OutputTarget for LocalOutput {
             // anyway — WASAPI shared mode will resample in the driver (better
             // quality than our linear interpolation). Only fall back to default
             // config if cpal rejects the stream config at build time.
-            let stream_config = find_matching_config(&device, channels, sample_rate)
+            let preferred_config = find_matching_config(&device, channels, sample_rate)
                 .unwrap_or_else(|| {
                     // Attempt source rate even if not in reported range
                     cpal::StreamConfig {
@@ -549,8 +553,99 @@ impl OutputTarget for LocalOutput {
                     }
                 });
 
-            let output_sr = stream_config.sample_rate;
-            let output_ch = stream_config.channels;
+            // Build output stream — try preferred config first, fall back to
+            // device default if the device rejects the source sample rate
+            // (common on Windows where WASAPI shared mode locks to 48 kHz).
+            let build_stream = |cfg: &cpal::StreamConfig,
+                                ring_cb: Arc<RingBuf>,
+                                vol_cb: Arc<AtomicU32>,
+                                paused_cb: Arc<AtomicBool>,
+                                _finished_cb: Arc<AtomicBool>| {
+                device.build_output_stream(
+                    cfg,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        if paused_cb.load(Ordering::Relaxed) {
+                            data.fill(0.0);
+                            return;
+                        }
+                        let read = ring_cb.pop(data);
+                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        for sample in &mut data[..read] {
+                            *sample *= v;
+                        }
+                        if read < data.len() {
+                            data[read..].fill(0.0);
+                        }
+                    },
+                    |e| warn!(error = %e, "audio_stream_error"),
+                    None,
+                )
+            };
+
+            let finished_flag = Arc::new(AtomicBool::new(false));
+
+            // First attempt: preferred config (source sample rate)
+            let ring_cap_preferred =
+                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) * 2;
+            let ring_preferred = Arc::new(RingBuf::new(ring_cap_preferred));
+            let stream_result = build_stream(
+                &preferred_config,
+                ring_preferred.clone(),
+                volume.clone(),
+                paused.clone(),
+                finished_flag.clone(),
+            );
+
+            let (stream, actual_config, ring) = match stream_result {
+                Ok(s) => (s, preferred_config, ring_preferred),
+                Err(first_err) => {
+                    // Fall back to device default config + rubato resampling
+                    let fallback_config = device.default_output_config().map(|c| c.config());
+                    match fallback_config {
+                        Ok(default_cfg) => {
+                            info!(
+                                default_sr = default_cfg.sample_rate,
+                                default_ch = default_cfg.channels,
+                                "local_audio_fallback_to_device_default"
+                            );
+                            let ring_cap_fb = (default_cfg.sample_rate as usize)
+                                * (default_cfg.channels as usize)
+                                * 2;
+                            let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                            match build_stream(
+                                &default_cfg,
+                                ring_fb.clone(),
+                                volume.clone(),
+                                paused.clone(),
+                                finished_flag.clone(),
+                            ) {
+                                Ok(s) => (s, default_cfg, ring_fb),
+                                Err(second_err) => {
+                                    warn!(
+                                        first_error = %first_err,
+                                        second_error = %second_err,
+                                        "audio_stream_build_failed_both_configs"
+                                    );
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(cfg_err) => {
+                            warn!(
+                                first_error = %first_err,
+                                config_error = %cfg_err,
+                                "audio_stream_build_failed"
+                            );
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let output_sr = actual_config.sample_rate;
+            let output_ch = actual_config.channels;
 
             info!(
                 device = %device_name,
@@ -561,49 +656,6 @@ impl OutputTarget for LocalOutput {
                 output_ch,
                 "local_audio_stream_config"
             );
-
-            // Ring buffer: ~2 seconds of audio at output sample rate
-            let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-            let ring = Arc::new(RingBuf::new(ring_cap));
-            let ring_for_callback = ring.clone();
-            let vol_for_callback = volume.clone();
-            let paused_for_callback = paused.clone();
-            let finished_flag = Arc::new(AtomicBool::new(false));
-            let finished_for_callback = finished_flag.clone();
-
-            let stream = device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if paused_for_callback.load(Ordering::Relaxed) {
-                        data.fill(0.0);
-                        return;
-                    }
-                    let read = ring_for_callback.pop(data);
-                    // Apply volume
-                    let v = vol_for_callback.load(Ordering::Relaxed) as f32 / 1000.0;
-                    for sample in &mut data[..read] {
-                        *sample *= v;
-                    }
-                    // Fill remainder with silence
-                    if read < data.len() {
-                        data[read..].fill(0.0);
-                        // If the HTTP reader is done and buffer is empty, signal end
-                        if finished_for_callback.load(Ordering::Relaxed)
-                            && ring_for_callback.available() == 0
-                        {
-                            // Nothing more to play — callback will produce silence
-                        }
-                    }
-                },
-                |e| warn!(error = %e, "audio_stream_error"),
-                None,
-            );
-
-            let Ok(stream) = stream else {
-                warn!("audio_stream_build_failed");
-                playing.store(false, Ordering::SeqCst);
-                return;
-            };
 
             if let Err(e) = stream.play() {
                 warn!(error = %e, "audio_stream_play_failed");
@@ -624,6 +676,45 @@ impl OutputTarget for LocalOutput {
             let needs_resample = output_sr != sample_rate;
             let needs_channel_adapt = output_ch != channels;
 
+            // Create rubato sinc resampler once for the entire track.
+            // Using FixedAsync::Input so we feed fixed-size input chunks.
+            let mut resampler: Option<Async<f32>> = if needs_resample {
+                let ratio = output_sr as f64 / sample_rate as f64;
+                let sinc_len = 256;
+                let window = WindowFunction::BlackmanHarris2;
+                let f_cutoff = calculate_cutoff(sinc_len, window);
+                let params = SincInterpolationParameters {
+                    sinc_len,
+                    f_cutoff,
+                    interpolation: SincInterpolationType::Cubic,
+                    oversampling_factor: 256,
+                    window,
+                };
+                match Async::<f32>::new_sinc(
+                    ratio,
+                    1.1,
+                    &params,
+                    1024,
+                    output_ch as usize,
+                    FixedAsync::Input,
+                ) {
+                    Ok(r) => {
+                        info!(
+                            from_sr = sample_rate,
+                            to_sr = output_sr,
+                            "rubato_resampler_created"
+                        );
+                        Some(r)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "rubato_resampler_creation_failed");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Process leftover from header read
             if !pcm_data.is_empty() {
                 let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
@@ -633,7 +724,7 @@ impl OutputTarget for LocalOutput {
                         samples = adapt_channels(&samples, channels, output_ch);
                     }
                     if needs_resample {
-                        samples = simple_resample(&samples, sample_rate, output_sr, output_ch);
+                        samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
                     }
                     feed_ring(&ring, &samples, &stop_rx, &paused);
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
@@ -674,7 +765,7 @@ impl OutputTarget for LocalOutput {
                     samples = adapt_channels(&samples, channels, output_ch);
                 }
                 if needs_resample {
-                    samples = simple_resample(&samples, sample_rate, output_sr, output_ch);
+                    samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
                 }
 
                 feed_ring(&ring, &samples, &stop_rx, &paused);
@@ -684,6 +775,14 @@ impl OutputTarget for LocalOutput {
                 // Update position
                 let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
                 position_ms.store(pos, Ordering::Relaxed);
+            }
+
+            // Flush the resampler: feed silence to get remaining buffered samples
+            if needs_resample {
+                let flushed = rubato_resample_chunk(&mut resampler, &[], output_ch, true);
+                if !flushed.is_empty() {
+                    feed_ring(&ring, &flushed, &stop_rx, &paused);
+                }
             }
 
             // Signal that HTTP reading is done
@@ -923,6 +1022,8 @@ fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f32> {
 }
 
 /// Simple linear-interpolation resampler for rate conversion.
+/// Kept as a fallback — the main path now uses rubato sinc resampling.
+#[allow(dead_code)]
 fn simple_resample(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
     if from_sr == to_sr {
         return samples.to_vec();
@@ -949,6 +1050,122 @@ fn simple_resample(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> 
         }
     }
     out
+}
+
+/// Resample a chunk of interleaved f32 samples using rubato's sinc resampler.
+///
+/// The resampler is created once per track and reused across chunks.
+/// `samples` is interleaved f32, `channels` is the channel count *after*
+/// any channel adaptation (i.e. the output channel count).
+///
+/// When `flush` is true, feeds silence into the resampler to drain its
+/// internal buffers at end-of-stream. `samples` should be empty in that case.
+fn rubato_resample_chunk(
+    resampler: &mut Option<Async<f32>>,
+    samples: &[f32],
+    channels: u16,
+    flush: bool,
+) -> Vec<f32> {
+    use rubato::audioadapter_buffers::direct::InterleavedSlice;
+    use rubato::audioadapter_buffers::owned::InterleavedOwned;
+
+    let Some(resampler) = resampler.as_mut() else {
+        // No resampler available — pass through unchanged
+        return samples.to_vec();
+    };
+
+    let ch = channels as usize;
+    let in_frames = if flush {
+        // Feed enough silence to flush the resampler's internal delay
+        resampler.input_frames_next()
+    } else {
+        if samples.is_empty() || ch == 0 {
+            return Vec::new();
+        }
+        samples.len() / ch
+    };
+
+    if in_frames == 0 && !flush {
+        return Vec::new();
+    }
+
+    // Build the input buffer — either from real samples or silence for flush
+    let input_data: Vec<f32>;
+    let input_ref: &[f32] = if flush {
+        input_data = vec![0.0f32; in_frames * ch];
+        &input_data
+    } else {
+        // Ensure we have a whole number of frames
+        let usable = (samples.len() / ch) * ch;
+        &samples[..usable]
+    };
+    let actual_in_frames = input_ref.len() / ch;
+
+    if actual_in_frames == 0 {
+        return Vec::new();
+    }
+
+    // Process the input in chunks of input_frames_next() size
+    let mut all_output = Vec::new();
+    let mut offset = 0;
+
+    while offset < actual_in_frames || (flush && offset == 0) {
+        let chunk_needed = resampler.input_frames_next();
+        let chunk_available = actual_in_frames.saturating_sub(offset);
+
+        let chunk_frames = chunk_available.min(chunk_needed);
+        let is_partial = chunk_frames < chunk_needed;
+
+        if chunk_frames == 0 && !is_partial {
+            break;
+        }
+
+        let chunk_slice = &input_ref[offset * ch..(offset + chunk_frames) * ch];
+
+        let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_frames) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "rubato_input_adapter_error");
+                break;
+            }
+        };
+
+        let out_frames = resampler.output_frames_next();
+        let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
+
+        let partial_len = if is_partial { Some(chunk_frames) } else { None };
+        let indexing = rubato::Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len,
+            active_channels_mask: None,
+        };
+
+        match resampler.process_into_buffer(&input_adapter, &mut output_buf, Some(&indexing)) {
+            Ok((_nbr_in, nbr_out)) => {
+                // Extract interleaved output
+                let out_data = output_buf.take_data();
+                all_output.extend_from_slice(&out_data[..nbr_out * ch]);
+            }
+            Err(e) => {
+                warn!(error = %e, "rubato_process_error");
+                break;
+            }
+        }
+
+        offset += chunk_frames;
+
+        // If this was a flush with a partial chunk, we're done
+        if flush && is_partial {
+            break;
+        }
+        // If we've exhausted input and it was partial, stop
+        if is_partial {
+            break;
+        }
+    }
+
+    all_output
 }
 
 #[cfg(test)]

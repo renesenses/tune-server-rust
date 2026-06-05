@@ -102,14 +102,20 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
-    let registry = state.services.lock().await;
-    let services = registry.status_all().await;
-    let mut map = serde_json::Map::new();
-    for svc in services {
-        if let Some(name) = svc.get("name").and_then(|n| n.as_str()) {
-            map.insert(name.to_string(), svc);
+    // Timeout to avoid blocking the Settings page if a streaming service auth check hangs
+    let map = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let registry = state.services.lock().await;
+        let services = registry.status_all().await;
+        let mut map = serde_json::Map::new();
+        for svc in services {
+            if let Some(name) = svc.get("name").and_then(|n| n.as_str()) {
+                map.insert(name.to_string(), svc);
+            }
         }
-    }
+        map
+    })
+    .await
+    .unwrap_or_default();
     Json(Value::Object(map))
 }
 

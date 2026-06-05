@@ -257,12 +257,18 @@ fn build_signal_path(
     // Volume at 100% means no software volume adjustment
     let volume_full = ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
 
-    // Check transcoding per output type
-    let is_oaat = output_type == "oaat";
-    let needs_transcode_dlna = source_format
-        .as_ref()
-        .is_some_and(|f| f.needs_transcode_for_dlna());
+    // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
+    // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
+    let is_network_output = matches!(
+        output_type,
+        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
+    );
+    let needs_transcode_for_output = is_network_output
+        && source_format
+            .as_ref()
+            .is_some_and(|f| f.needs_transcode_for_dlna());
     // OAAT transcodes everything to WAV except WAV itself
+    let is_oaat = output_type == "oaat";
     let oaat_transcodes = is_oaat
         && source_format
             .as_ref()
@@ -270,10 +276,11 @@ fn build_signal_path(
 
     let (transport_bit_perfect, transport_desc, output_format_name) = match output_type {
         "dlna" | "openhome" => {
-            if needs_transcode_dlna {
+            if needs_transcode_for_output {
                 let target = source_format.unwrap().dlna_transcode_target();
                 (false, "DLNA/UPnP", target.display_name())
             } else {
+                // FLAC, WAV, MP3, AAC → passthrough (bit-perfect for lossless)
                 (true, "DLNA/UPnP", format_name)
             }
         }
@@ -285,7 +292,30 @@ fn build_signal_path(
             }
         }
         "airplay" => (false, "AirPlay", "ALAC"),
-        "chromecast" => (false, "Chromecast", "Transcoded"),
+        "chromecast" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "Chromecast", target.display_name())
+            } else {
+                (false, "Chromecast", format_name)
+            }
+        }
+        "bluos" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "BluOS", target.display_name())
+            } else {
+                (true, "BluOS", format_name)
+            }
+        }
+        "squeezebox" => {
+            if needs_transcode_for_output {
+                let target = source_format.unwrap().dlna_transcode_target();
+                (false, "Squeezebox", target.display_name())
+            } else {
+                (true, "Squeezebox", format_name)
+            }
+        }
         "browser" => (true, "Browser", format_name),
         "local" => (true, "Local", format_name),
         other => (false, other, format_name),
@@ -318,10 +348,8 @@ fn build_signal_path(
     }));
 
     // Transcoding step (only if transcoding occurs)
-    let transcode_active = needs_transcode_dlna
-        || oaat_transcodes
-        || output_type == "airplay"
-        || output_type == "chromecast";
+    let transcode_active =
+        needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
     if transcode_active {
         steps.push(json!({
             "name": "Transcoder",
