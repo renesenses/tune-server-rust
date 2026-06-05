@@ -42,7 +42,7 @@ pub async fn lookup_release(
     }
     let query = query_parts.join(" AND ");
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .get(format!("{MB_API}/release"))
         .query(&[

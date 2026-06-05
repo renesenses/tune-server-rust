@@ -12,7 +12,7 @@ pub async fn get_lastfm_tags(title: &str, artist: &str, api_key: &str) -> Lastfm
         return LastfmTags::default();
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
 
     let track_data = client
         .get(LASTFM_API)
@@ -52,7 +52,7 @@ pub async fn get_lastfm_tags(title: &str, artist: &str, api_key: &str) -> Lastfm
 
     let genres = tags.iter().take(3).cloned().collect();
 
-    let bio = get_artist_bio(&client, artist, api_key).await;
+    let bio = get_artist_bio(client, artist, api_key).await;
 
     LastfmTags { genres, tags, bio }
 }
@@ -113,7 +113,7 @@ impl LastfmEnricher {
             return vec![];
         }
 
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .get(LASTFM_API)
             .query(&[

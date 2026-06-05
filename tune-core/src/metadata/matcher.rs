@@ -45,7 +45,7 @@ pub async fn lookup_track(title: &str, artist: &str, album: &str) -> Vec<TrackMa
         return vec![];
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .get(format!("{MB_API}/recording"))
         .query(&[
@@ -154,7 +154,7 @@ pub async fn lookup_album(title: &str, artist: &str) -> Vec<AlbumMatch> {
         return vec![];
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .get(format!("{MB_API}/release"))
         .query(&[

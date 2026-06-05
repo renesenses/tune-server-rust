@@ -46,6 +46,18 @@ pub struct PlayResult {
     pub error: Option<String>,
 }
 
+pub struct ResolvedStream {
+    pub url: String,
+    pub mime_type: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub source: String,
+    pub cover_url: Option<String>,
+    pub stream_id: Option<String>,
+    pub file_size: Option<u64>,
+}
+
 pub struct ResolvedQueueItem {
     pub url: String,
     pub mime_type: String,
@@ -73,46 +85,40 @@ impl PlaybackOrchestrator {
             .as_ref()
             .and_then(|np| np.stream_id.clone());
 
-        let (
-            stream_url,
-            mime_type,
-            title,
-            artist,
-            duration_ms,
-            source,
-            resolved_cover,
-            stream_id,
-            file_size,
-        ) = self.resolve_stream(&req).await?;
+        let resolved = self.resolve_stream(&req).await?;
 
-        let cover_path = req.cover_url.clone().or(resolved_cover);
+        let cover_path = req.cover_url.clone().or(resolved.cover_url);
         let np = NowPlaying {
             track_id: req.track_id,
-            title: title.clone(),
-            artist_name: artist.clone(),
+            title: resolved.title.clone(),
+            artist_name: resolved.artist.clone(),
             album_title: req.album_title.clone(),
             cover_path: cover_path.clone(),
-            duration_ms: duration_ms.unwrap_or(0),
-            source: source.clone(),
+            duration_ms: resolved.duration_ms.unwrap_or(0),
+            source: resolved.source.clone(),
             source_id: req.source_id.clone(),
-            stream_id: stream_id.clone(),
+            stream_id: resolved.stream_id.clone(),
         };
 
         self.playback.play(req.zone_id, np).await;
 
         // Last.fm Now Playing
-        self.lastfm_now_playing(&title, artist.as_deref());
+        self.lastfm_now_playing(&resolved.title, resolved.artist.as_deref());
 
         // ListenBrainz Now Playing
-        self.listenbrainz_now_playing(&title, artist.as_deref(), req.album_title.as_deref());
+        self.listenbrainz_now_playing(
+            &resolved.title,
+            resolved.artist.as_deref(),
+            req.album_title.as_deref(),
+        );
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
-            let stream_ready = match stream_id {
+            let stream_ready = match resolved.stream_id {
                 Some(ref sid) => self.streamer.get_stream_ready_notify(sid).await,
                 None => None,
             };
-            let local_file_path = if source == "local" {
+            let local_file_path = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
                     TrackRepo::new(self.db.clone())
                         .get(tid)
@@ -124,14 +130,14 @@ impl PlaybackOrchestrator {
                 None
             };
             let media = crate::outputs::traits::PlayMedia {
-                url: &stream_url,
-                mime_type: &mime_type,
-                title: Some(&title),
-                artist: artist.as_deref(),
+                url: &resolved.url,
+                mime_type: &resolved.mime_type,
+                title: Some(&resolved.title),
+                artist: resolved.artist.as_deref(),
                 album: req.album_title.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
-                duration_ms: duration_ms.map(|d| d as u64),
-                file_size,
+                duration_ms: resolved.duration_ms.map(|d| d as u64),
+                file_size: resolved.file_size,
                 file_path: local_file_path.as_deref(),
                 stream_ready,
             };
@@ -146,48 +152,31 @@ impl PlaybackOrchestrator {
         }
 
         self.record_listen(
-            &title,
-            artist.as_deref(),
+            &resolved.title,
+            resolved.artist.as_deref(),
             req.album_title.as_deref(),
-            &source,
-            duration_ms.unwrap_or(0),
+            &resolved.source,
+            resolved.duration_ms.unwrap_or(0),
             req.zone_id,
         );
 
         info!(
             zone_id = req.zone_id,
-            title = %title,
-            source = %source,
+            title = %resolved.title,
+            source = %resolved.source,
             output_sent,
             "orchestrator_play"
         );
 
         Ok(PlayResult {
-            stream_url: Some(stream_url),
+            stream_url: Some(resolved.url),
             output_sent,
-            source,
+            source: resolved.source,
             error: output_error,
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    async fn resolve_stream(
-        &self,
-        req: &PlayRequest,
-    ) -> Result<
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<u64>,
-        ),
-        String,
-    > {
+    async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         if let Some(ref source) = req.source
             && source != "local"
         {
@@ -197,24 +186,7 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
-    #[allow(clippy::type_complexity)]
-    async fn resolve_local_track(
-        &self,
-        req: &PlayRequest,
-    ) -> Result<
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<u64>,
-        ),
-        String,
-    > {
+    async fn resolve_local_track(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
         let repo = TrackRepo::new(self.db.clone());
         let track = repo
@@ -303,7 +275,7 @@ impl PlaybackOrchestrator {
                 target_fmt.container_format().to_string()
             };
             tokio::spawn(async move {
-                eprintln!("TRANSCODE-DEBUG: decoding {fp} sr={out_sr} ch={channels}");
+                debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
                 let decode_result = crate::audio::decode::decode_to_pcm(
                     &fp,
                     Some(out_sr),
@@ -314,11 +286,11 @@ impl PlaybackOrchestrator {
 
                 match decode_result {
                     Ok(decoded) => {
-                        eprintln!(
-                            "TRANSCODE-DEBUG: decoded {} samples sr={} ch={}",
-                            decoded.samples.len(),
-                            decoded.sample_rate,
-                            decoded.channels
+                        debug!(
+                            samples = decoded.samples.len(),
+                            sample_rate = decoded.sample_rate,
+                            channels = decoded.channels,
+                            "transcode_decoded"
                         );
                         // Convert i16 samples to raw PCM bytes (16-bit LE)
                         let pcm_bytes: Vec<u8> = decoded
@@ -359,7 +331,6 @@ impl PlaybackOrchestrator {
                         }
                     }
                     Err(e) => {
-                        eprintln!("TRANSCODE-DEBUG: decode FAILED: {e}");
                         warn!(error = %e, file = %fp, "transcode_decode_failed");
                     }
                 }
@@ -394,38 +365,24 @@ impl PlaybackOrchestrator {
             .streamer
             .get_stream_url(&session_id, &server_ip, &out_ext);
 
-        Ok((
-            stream_url,
-            out_mime,
-            track.title,
-            track.artist_name,
-            Some(track.duration_ms),
-            "local".into(),
-            track.cover_path,
-            Some(session_id),
-            track.file_size.map(|s| s as u64),
-        ))
+        Ok(ResolvedStream {
+            url: stream_url,
+            mime_type: out_mime,
+            title: track.title,
+            artist: track.artist_name,
+            duration_ms: Some(track.duration_ms),
+            source: "local".into(),
+            cover_url: track.cover_path,
+            stream_id: Some(session_id),
+            file_size: track.file_size.map(|s| s as u64),
+        })
     }
 
-    #[allow(clippy::type_complexity)]
     async fn resolve_streaming_url(
         &self,
         service_name: &str,
         req: &PlayRequest,
-    ) -> Result<
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<i64>,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<u64>,
-        ),
-        String,
-    > {
+    ) -> Result<ResolvedStream, String> {
         let source_id = req
             .source_id
             .as_deref()
@@ -505,17 +462,17 @@ impl PlaybackOrchestrator {
             }
         };
 
-        Ok((
-            stream_url,
-            stream_data.mime_type,
+        Ok(ResolvedStream {
+            url: stream_url,
+            mime_type: stream_data.mime_type,
             title,
             artist,
             duration_ms,
-            service_name.into(),
-            cover_path,
-            sid,
-            None,
-        ))
+            source: service_name.into(),
+            cover_url: cover_path,
+            stream_id: sid,
+            file_size: None,
+        })
     }
 
     /// Convert a cover_path (which may be a short hash or a full URL) into an
@@ -702,7 +659,7 @@ impl PlaybackOrchestrator {
                 }]
             });
 
-            let client = reqwest::Client::new();
+            let client = crate::http::client::shared();
             if let Err(e) = client
                 .post("https://api.listenbrainz.org/1/submit-listens")
                 .header("Authorization", format!("Token {token}"))
@@ -738,7 +695,7 @@ impl PlaybackOrchestrator {
                 }]
             });
 
-            let client = reqwest::Client::new();
+            let client = crate::http::client::shared();
             if let Err(e) = client
                 .post("https://api.listenbrainz.org/1/submit-listens")
                 .header("Authorization", format!("Token {token}"))
@@ -849,7 +806,6 @@ impl PlaybackOrchestrator {
     }
 
     /// Persist the streaming_queue table for a zone.
-    #[allow(clippy::type_complexity)]
     pub fn persist_streaming_queue(
         &self,
         zone_id: i64,
@@ -1018,14 +974,13 @@ impl PlaybackOrchestrator {
             duration_ms: item.duration_ms,
         };
 
-        let (url, mime_type, title, artist, _, _, resolved_cover, _, _) =
-            self.resolve_stream(&req).await?;
-        let raw_cover = cover.or(resolved_cover);
+        let resolved = self.resolve_stream(&req).await?;
+        let raw_cover = cover.or(resolved.cover_url);
         Ok(ResolvedQueueItem {
-            url,
-            mime_type,
-            title,
-            artist,
+            url: resolved.url,
+            mime_type: resolved.mime_type,
+            title: resolved.title,
+            artist: resolved.artist,
             album,
             cover_url: self.resolve_cover_url(raw_cover.as_deref()),
             duration_ms: None,

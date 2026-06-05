@@ -3,7 +3,6 @@
 pub mod alarms;
 pub mod api_analytics;
 pub mod audio;
-pub mod buffer;
 pub mod bug_report;
 pub mod collaborative;
 pub mod config;
