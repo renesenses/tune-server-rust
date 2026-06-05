@@ -617,77 +617,32 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         _ => "audio/flac",
     };
 
-    let duration_str = if track.duration_ms > 0 {
-        let total_secs = track.duration_ms / 1000;
-        let h = total_secs / 3600;
-        let m = (total_secs % 3600) / 60;
-        let s = total_secs % 60;
-        format!(" duration=\"{h}:{m:02}:{s:02}\"")
-    } else {
-        String::new()
-    };
-
-    let sr_attr = track
-        .sample_rate
-        .map(|sr| format!(" sampleFrequency=\"{sr}\""))
-        .unwrap_or_default();
-    let bd_attr = track
-        .bit_depth
-        .map(|bd| format!(" bitsPerSample=\"{bd}\""))
-        .unwrap_or_default();
-    let ch_attr = format!(" nrAudioChannels=\"{}\"", track.channels);
-    let size_attr = track
-        .file_size
-        .map(|s| format!(" size=\"{s}\""))
-        .unwrap_or_default();
-
     let stream_url = format!("{base_url}/stream/{track_id}.{fmt}");
+    let cover_url = track
+        .cover_path
+        .as_ref()
+        .map(|c| format!("{base_url}/artwork/{c}"));
 
-    let mut extra = String::new();
-    if let Some(ref artist) = track.artist_name {
-        extra.push_str(&format!(
-            "<dc:creator>{}</dc:creator><upnp:artist>{}</upnp:artist>",
-            quick_xml::escape::escape(artist),
-            quick_xml::escape::escape(artist),
-        ));
-    }
-    if let Some(ref album_title) = track.album_title {
-        extra.push_str(&format!(
-            "<upnp:album>{}</upnp:album>",
-            quick_xml::escape::escape(album_title),
-        ));
+    let mut builder = crate::outputs::didl::DidlBuilder::new(&track.title, &stream_url, mime)
+        .item_id(&id)
+        .parent_id(parent_id)
+        .include_upnp_artist(true)
+        .channels(track.channels as u32)
+        .artist_opt(track.artist_name.as_deref())
+        .album_opt(track.album_title.as_deref())
+        .album_art_opt(cover_url.as_deref())
+        .sample_rate_opt(track.sample_rate.map(|sr| sr as u32))
+        .bit_depth_opt(track.bit_depth.map(|bd| bd as u32))
+        .file_size_opt(track.file_size.map(|s| s as u64));
+
+    if track.duration_ms > 0 {
+        builder = builder.duration_ms(track.duration_ms as u64);
     }
     if track.track_number > 0 {
-        extra.push_str(&format!(
-            "<upnp:originalTrackNumber>{}</upnp:originalTrackNumber>",
-            track.track_number
-        ));
-    }
-    if let Some(ref cover) = track.cover_path {
-        extra.push_str(&format!(
-            "<upnp:albumArtURI>{base_url}/artwork/{cover}</upnp:albumArtURI>"
-        ));
+        builder = builder.track_number(track.track_number as u32);
     }
 
-    format!(
-        "<item id=\"{id}\" parentID=\"{pid}\">\
-         <dc:title>{title}</dc:title>\
-         <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
-         {extra}\
-         <res protocolInfo=\"http-get:*:{mime}:*\"{duration}{sr}{bd}{ch}{size}>{url}</res>\
-         </item>",
-        id = quick_xml::escape::escape(&id),
-        pid = quick_xml::escape::escape(parent_id),
-        title = quick_xml::escape::escape(&track.title),
-        extra = extra,
-        mime = mime,
-        duration = duration_str,
-        sr = sr_attr,
-        bd = bd_attr,
-        ch = ch_attr,
-        size = size_attr,
-        url = quick_xml::escape::escape(&stream_url),
-    )
+    builder.build_item()
 }
 
 // ---------------------------------------------------------------------------

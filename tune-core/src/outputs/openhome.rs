@@ -4,6 +4,7 @@ use std::sync::Arc;
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
+use super::didl::DidlBuilder;
 use super::oh_events::{EventState, OpenHomeEventListener};
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
@@ -304,25 +305,12 @@ impl OpenHomeOutput {
         url: &str,
         cover_url: Option<&str>,
     ) -> String {
-        let title = quick_xml::escape::escape(title.unwrap_or("Unknown"));
-        let artist = quick_xml::escape::escape(artist.unwrap_or("Unknown"));
-        let escaped_url = quick_xml::escape::escape(url);
-
-        let album_tag = album
-            .map(|a| format!("<upnp:album>{}</upnp:album>", quick_xml::escape::escape(a)))
-            .unwrap_or_default();
-        let art_tag = cover_url
-            .map(|c| {
-                format!(
-                    "<upnp:albumArtURI>{}</upnp:albumArtURI>",
-                    quick_xml::escape::escape(c)
-                )
-            })
-            .unwrap_or_default();
-
-        format!(
-            r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="0" parentID="0" restricted="1"><dc:title>{title}</dc:title><dc:creator>{artist}</dc:creator><upnp:artist>{artist}</upnp:artist>{album_tag}{art_tag}<upnp:class>object.item.audioItem.musicTrack</upnp:class><res protocolInfo="http-get:*:{mime_type}:*">{escaped_url}</res></item></DIDL-Lite>"#
-        )
+        DidlBuilder::new(title.unwrap_or("Unknown"), url, mime_type)
+            .artist(artist.unwrap_or("Unknown"))
+            .album_opt(album)
+            .album_art_opt(cover_url)
+            .include_upnp_artist(true)
+            .build()
     }
 }
 

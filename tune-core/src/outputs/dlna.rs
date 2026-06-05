@@ -1,6 +1,7 @@
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
+use super::didl::{DidlBuilder, ProtocolStyle};
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -111,42 +112,6 @@ impl DlnaOutput {
         .await
     }
 
-    /// Return true when the value is a usable metadata string (not empty,
-    /// not the literal `"null"` that JavaScript clients sometimes send).
-    fn is_valid_meta(v: Option<&str>) -> bool {
-        matches!(v, Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("null"))
-    }
-
-    fn dlna_flags_for_mime(mime: &str) -> &'static str {
-        // DLNA.ORG_OP=01 : byte-range seek supported
-        // DLNA.ORG_CI=0  : no transcoding
-        // DLNA.ORG_FLAGS : streaming + interactive + background + v1.5
-        match mime {
-            "audio/L16" | "audio/wav" | "audio/x-wav" => {
-                "DLNA.ORG_PN=LPCM;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-            }
-            "audio/flac" | "audio/x-flac" => {
-                "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-            }
-            "audio/mpeg" => {
-                "DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-            }
-            "audio/mp4" | "audio/aac" => {
-                "DLNA.ORG_PN=AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-            }
-            _ => "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
-        }
-    }
-
-    fn format_duration_didl(ms: u64) -> String {
-        let total_secs = ms / 1000;
-        let h = total_secs / 3600;
-        let m = (total_secs % 3600) / 60;
-        let s = total_secs % 60;
-        let frac = ms % 1000;
-        format!("{h}:{m:02}:{s:02}.{frac:03}")
-    }
-
     fn didl_metadata(
         title: Option<&str>,
         artist: Option<&str>,
@@ -157,52 +122,16 @@ impl DlnaOutput {
         duration_ms: Option<u64>,
         file_size: Option<u64>,
     ) -> String {
-        let title = quick_xml::escape::escape(if Self::is_valid_meta(title) {
-            title.unwrap_or("Unknown")
-        } else {
-            "Unknown"
-        });
-        let escaped_url = quick_xml::escape::escape(url);
-
-        let artist_tag = if Self::is_valid_meta(artist) {
-            let a = quick_xml::escape::escape(artist.unwrap_or("Unknown"));
-            format!("&lt;dc:creator&gt;{a}&lt;/dc:creator&gt;")
-        } else {
-            String::new()
-        };
-
-        let album_tag = album
-            .filter(|a| Self::is_valid_meta(Some(a)))
-            .map(|a| {
-                let a = quick_xml::escape::escape(a);
-                format!("&lt;upnp:album&gt;{a}&lt;/upnp:album&gt;")
-            })
-            .unwrap_or_default();
-
-        let art_tag = cover_url
-            .filter(|c| Self::is_valid_meta(Some(c)))
-            .map(|c| {
-                let c = quick_xml::escape::escape(c);
-                format!("&lt;upnp:albumArtURI dlna:profileID=&quot;JPEG_TN&quot;&gt;{c}&lt;/upnp:albumArtURI&gt;")
-            })
-            .unwrap_or_default();
-
-        let dlna_flags = Self::dlna_flags_for_mime(mime_type);
-
-        let size_attr = file_size
-            .map(|s| format!(r#" size=&quot;{s}&quot;"#))
-            .unwrap_or_default();
-        let dur_attr = duration_ms
-            .filter(|d| *d > 0)
-            .map(|d| {
-                let dur = Self::format_duration_didl(d);
-                format!(r#" duration=&quot;{dur}&quot;"#)
-            })
-            .unwrap_or_default();
-
-        format!(
-            r#"&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;&lt;item id="1" parentID="0" restricted="1"&gt;&lt;dc:title&gt;{title}&lt;/dc:title&gt;{artist_tag}&lt;upnp:class&gt;object.item.audioItem.musicTrack&lt;/upnp:class&gt;{album_tag}{art_tag}&lt;res protocolInfo="http-get:*:{mime_type}:{dlna_flags}"{size_attr}{dur_attr}&gt;{escaped_url}&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;"#
-        )
+        DidlBuilder::new(title.unwrap_or("Unknown"), url, mime_type)
+            .protocol_style(ProtocolStyle::Dlna)
+            .dlna_art_profile(true)
+            .item_id("1")
+            .artist_opt(artist)
+            .album_opt(album)
+            .album_art_opt(cover_url)
+            .duration_ms_opt(duration_ms)
+            .file_size_opt(file_size)
+            .build_escaped()
     }
 
     fn parse_time(time_str: &str) -> u64 {
@@ -611,9 +540,12 @@ mod tests {
             None,
             None,
         );
-        assert!(didl.contains("Rock &amp; Roll"));
+        // build_escaped() double-escapes: first XML-escape for DIDL content,
+        // then HTML-entity-encode the whole DIDL for SOAP embedding.
+        // "&" -> "&amp;" (XML) -> "&amp;amp;" (SOAP entity encoding)
+        assert!(didl.contains("Rock &amp;amp; Roll"));
         assert!(didl.contains("AC/DC"));
-        assert!(didl.contains("a=1&amp;b=2"));
+        assert!(didl.contains("a=1&amp;amp;b=2"));
     }
 
     #[test]

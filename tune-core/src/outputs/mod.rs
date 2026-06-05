@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
+pub mod didl;
 pub mod dlna;
 pub mod dlna_buffer_stats;
 #[cfg(test)]
