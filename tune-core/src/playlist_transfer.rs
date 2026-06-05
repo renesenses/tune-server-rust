@@ -2,7 +2,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::track_matcher::{MatchCandidate, MatchResult, find_best_match};
+use crate::library::track_matcher::{MatchCandidate, MatchResult, find_best_match};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferProgress {

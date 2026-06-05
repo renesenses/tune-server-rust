@@ -261,7 +261,7 @@ struct LookupTrackQuery {
 }
 
 async fn lookup_track(Query(q): Query<LookupTrackQuery>) -> Json<serde_json::Value> {
-    let results = tune_core::metadata_matcher::lookup_track(
+    let results = tune_core::metadata::matcher::lookup_track(
         q.title.as_deref().unwrap_or(""),
         q.artist.as_deref().unwrap_or(""),
         q.album.as_deref().unwrap_or(""),
@@ -277,7 +277,7 @@ struct LookupAlbumQuery {
 }
 
 async fn lookup_album(Query(q): Query<LookupAlbumQuery>) -> Json<serde_json::Value> {
-    let results = tune_core::metadata_matcher::lookup_album(
+    let results = tune_core::metadata::matcher::lookup_album(
         q.title.as_deref().unwrap_or(""),
         q.artist.as_deref().unwrap_or(""),
     )
@@ -372,7 +372,8 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
         .flatten()
         .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
 
-    let mut client = tune_core::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
+    let mut client =
+        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
     let data = client.get_artist(&artist.name).await;
     Json(json!(data)).into_response()
 }
@@ -391,7 +392,8 @@ async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> 
         .flatten()
         .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
 
-    let mut client = tune_core::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
+    let mut client =
+        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
     let data = client.get_similar(&artist.name).await;
     Json(json!(data)).into_response()
 }
