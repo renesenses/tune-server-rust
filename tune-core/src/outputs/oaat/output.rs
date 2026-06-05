@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
-use tracing::info;
 #[cfg(feature = "oaat")]
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 

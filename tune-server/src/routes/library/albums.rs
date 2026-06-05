@@ -16,7 +16,6 @@ use tune_core::db::track_repo::TrackRepo;
 use super::Pagination;
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub(super) struct AlbumFilters {
     limit: Option<i64>,
     offset: Option<i64>,

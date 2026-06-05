@@ -96,7 +96,7 @@ impl ArtistEnrichmentClient {
     pub async fn refresh(&mut self, mbid: &str) -> Option<ArtistData> {
         self.cache.remove(mbid);
         let url = format!("{}/{mbid}/refresh", self.base_url);
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .post(&url)
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
@@ -132,7 +132,7 @@ impl ArtistEnrichmentClient {
 
     async fn request(&self, path: &str) -> Option<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .get(&url)
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
@@ -151,7 +151,7 @@ impl ArtistEnrichmentClient {
         params: &[(&str, &str)],
     ) -> Option<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .get(&url)
             .query(params)

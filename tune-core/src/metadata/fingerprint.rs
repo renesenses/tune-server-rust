@@ -54,7 +54,7 @@ pub async fn lookup_acoustid(
     fingerprint: &str,
     duration: f64,
 ) -> Result<Vec<AcoustIdMatch>, String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .post(ACOUSTID_API)
         .form(&[

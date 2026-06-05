@@ -264,7 +264,7 @@ impl ServicesManager {
         if token.is_empty() {
             return (false, "Token vide.".into());
         }
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .get("https://api.discogs.com/oauth/identity")
             .header("Authorization", format!("Discogs token={token}"))
@@ -288,7 +288,7 @@ impl ServicesManager {
         if api_key.is_empty() {
             return (false, "API Key vide.".into());
         }
-        let client = reqwest::Client::new();
+        let client = crate::http::client::shared();
         let resp = client
             .get("https://ws.audioscrobbler.com/2.0/")
             .query(&[

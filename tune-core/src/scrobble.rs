@@ -56,7 +56,7 @@ pub async fn get_auth_token(api_key: &str, api_secret: &str) -> Result<String, S
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
         .query(&params)
@@ -125,7 +125,7 @@ pub async fn scrobble_full(
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .post("https://ws.audioscrobbler.com/2.0/")
         .form(&params)
@@ -182,7 +182,7 @@ pub async fn update_now_playing_full(
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .post("https://ws.audioscrobbler.com/2.0/")
         .form(&params)
@@ -212,7 +212,7 @@ pub async fn get_session(api_key: &str, api_secret: &str, token: &str) -> Result
     params.push(("api_sig", sig));
     params.push(("format", "json".to_string()));
 
-    let client = reqwest::Client::new();
+    let client = crate::http::client::shared();
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
         .query(&params)
