@@ -37,7 +37,7 @@ pub fn batch_edit_tracks(db: &SqliteDb, request: &BatchEditRequest) -> BatchResu
 
         if let Some(ref genre) = request.genre {
             sets.push("genre = ?");
-            values.push(Box::new(genre.clone()));
+            values.push(Box::new(super::normalize_genre(genre)));
         }
         if let Some(year) = request.year {
             sets.push("year = ?");

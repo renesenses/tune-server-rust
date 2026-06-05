@@ -398,6 +398,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_zone_playback_position",
         up: "",
     },
+    Migration {
+        version: 27,
+        name: "add_zone_max_sample_rate",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -648,6 +653,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "zones", "last_track_id", "INTEGER");
             add_column_if_missing(db, "zones", "last_track_source", "TEXT");
             add_column_if_missing(db, "zones", "last_track_source_id", "TEXT");
+        }
+        if migration.version == 27 {
+            add_column_if_missing(db, "zones", "max_sample_rate", "INTEGER");
         }
 
         db.execute(

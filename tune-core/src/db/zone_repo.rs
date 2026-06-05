@@ -10,7 +10,7 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id";
+    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate";
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("SELECT {COLS} FROM zones WHERE id = {}", d.placeholder(1))
@@ -104,6 +104,7 @@ pub struct Zone {
     pub last_track_id: Option<i64>,
     pub last_track_source: Option<String>,
     pub last_track_source_id: Option<String>,
+    pub max_sample_rate: Option<u32>,
 }
 
 pub struct ZoneRepo {
@@ -259,6 +260,14 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_max_sample_rate(&self, id: i64, rate: Option<u32>) -> Result<(), String> {
+        let sql = self.update_field_sql("max_sample_rate");
+        let rate_i64 = rate.map(|r| r as i64);
+        let params: [&dyn ToSqlValue; 2] = [&rate_i64, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn save_playback_position(
         &self,
         id: i64,
@@ -324,6 +333,7 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         last_track_id: cols.get(11).and_then(|v| v.as_i64()),
         last_track_source: cols.get(12).and_then(|v| v.as_string()),
         last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
+        max_sample_rate: cols.get(14).and_then(|v| v.as_i64()).map(|v| v as u32),
     }
 }
 

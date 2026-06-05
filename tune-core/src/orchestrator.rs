@@ -201,12 +201,13 @@ impl PlaybackOrchestrator {
         let bit_depth = track.bit_depth.unwrap_or(16) as u16;
         let channels = track.channels as u16;
 
-        // Determine the output type for this zone to scope transcode decisions correctly.
-        let zone_output_type = ZoneRepo::new(self.db.clone())
+        // Determine the output type and max_sample_rate for this zone.
+        let zone = ZoneRepo::new(self.db.clone())
             .get(req.zone_id)
             .ok()
-            .flatten()
-            .and_then(|z| z.output_type);
+            .flatten();
+        let zone_output_type = zone.as_ref().and_then(|z| z.output_type.clone());
+        let zone_max_sample_rate = zone.as_ref().and_then(|z| z.max_sample_rate);
 
         let is_oaat_output = req
             .output_device_id
@@ -233,16 +234,33 @@ impl PlaybackOrchestrator {
             && source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
-        let needs_transcode = needs_transcode_for_output || oaat_needs_wav;
+        // Downsample if the zone has a max_sample_rate cap and the source exceeds it
+        let needs_downsample = zone_max_sample_rate.is_some_and(|max| sample_rate > max);
+        let needs_transcode = needs_transcode_for_output || oaat_needs_wav || needs_downsample;
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
-            let src_fmt = source_format.expect("guarded by needs_transcode check"); // safe: needs_transcode is true
+            let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
             let target_fmt = if oaat_needs_wav {
                 AudioFormat::Wav
+            } else if needs_downsample && !needs_transcode_for_output {
+                // Only downsampling — keep the same lossless format
+                AudioFormat::Flac
             } else {
                 src_fmt.dlna_transcode_target()
             };
-            let out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
+            let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
+            // Apply zone max_sample_rate cap
+            if let Some(max_sr) = zone_max_sample_rate {
+                if out_sr > max_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = out_sr,
+                        max_rate = max_sr,
+                        "zone_max_sample_rate_cap_applied"
+                    );
+                    out_sr = max_sr;
+                }
+            }
             let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
                 24
             } else if oaat_needs_wav {
@@ -538,7 +556,9 @@ impl PlaybackOrchestrator {
             warn!(device_id, "output_not_found");
             (
                 false,
-                Some("Device not yet discovered. Please retry in a few seconds.".into()),
+                Some(format!(
+                    "Device not yet discovered: {device_id}. Please retry in a few seconds."
+                )),
             )
         }
     }

@@ -48,6 +48,8 @@ struct PatchZone {
     output_type: Option<String>,
     gapless_enabled: Option<bool>,
     sync_delay_ms: Option<i32>,
+    /// Max output sample rate in Hz (e.g. 96000, 88200). null = no limit (passthrough).
+    max_sample_rate: Option<Option<u32>>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -321,8 +323,14 @@ fn build_signal_path(
         other => (false, other, format_name),
     };
 
-    // Overall bit-perfect: lossless source + no transcoding + full volume + no DSP
-    let bit_perfect = is_lossless && transport_bit_perfect && volume_full && !dsp_enabled;
+    // Detect sample rate capping
+    let resampling_active = zone
+        .max_sample_rate
+        .is_some_and(|max| (sample_rate as u32) > max);
+
+    // Overall bit-perfect: lossless source + no transcoding + full volume + no DSP + no resampling
+    let bit_perfect =
+        is_lossless && transport_bit_perfect && volume_full && !dsp_enabled && !resampling_active;
 
     // Build steps
     let source_desc = if sample_rate >= 1000 {
@@ -354,6 +362,18 @@ fn build_signal_path(
         steps.push(json!({
             "name": "Transcoder",
             "description": format!("{format_name} \u{2192} {output_format_name}"),
+            "bit_perfect": false,
+        }));
+    }
+
+    // Resampler step (when zone max_sample_rate caps the output)
+    if resampling_active {
+        let max_sr = zone.max_sample_rate.unwrap();
+        let src_khz = sample_rate / 1000;
+        let dst_khz = max_sr / 1000;
+        steps.push(json!({
+            "name": "Resampler",
+            "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
         }));
     }
@@ -525,6 +545,11 @@ async fn patch_zone(
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    if let Some(rate) = body.max_sample_rate
+        && let Err(e) = repo.update_max_sample_rate(id, rate)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
     get_zone(State(state), Path(id)).await.into_response()
 }
 
@@ -558,6 +583,22 @@ async fn create_zone(
                 } else {
                     warn!(device_id, "create_zone_device_not_discovered");
                 }
+            }
+        }
+
+        // For local audio zones, verify the device exists in the OutputRegistry
+        if matches!(output_type, Some("local")) && device_id.starts_with("local:") {
+            let found = {
+                let outputs = state.outputs.lock().await;
+                outputs.get(device_id).is_some()
+            };
+            if !found {
+                warn!(device_id, "create_zone_local_device_not_found");
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"detail": format!("Local audio device not found: {device_id}. Make sure the device is connected and detected.")})),
+                )
+                    .into_response();
             }
         }
     }

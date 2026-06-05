@@ -71,11 +71,68 @@ pub struct TrackMetadata {
 ///   "Jazz/Fusion/Progressive"   -> ["Jazz", "Fusion", "Progressive"]
 ///   "Rock"                      -> ["Rock"]
 ///   ""                          -> []
+/// Normalize a genre string to Title Case, handling special tokens.
+///
+/// - Splits on whitespace, capitalizes the first letter of each word and
+///   lowercases the rest.
+/// - Preserves well-known uppercase tokens: "R&B", "DJ", "UK", "US", "MC",
+///   "TV", "AC", "DC", "EDM", "RnB", "II", "III", "IV".
+/// - Handles slash-separated sub-genres (e.g. "Folk/Rock") by normalizing
+///   each part independently.
+///
+/// Examples:
+///   "classique"       -> "Classique"
+///   "ROCK"            -> "Rock"
+///   "r&b"             -> "R&B"
+///   "hip hop"         -> "Hip Hop"
+///   "dj mix"          -> "DJ Mix"
+///   "folk/rock"       -> "Folk/Rock"
+pub fn normalize_genre(genre: &str) -> String {
+    // Uppercase tokens that must be preserved verbatim (checked case-insensitively)
+    const UPPERCASE_TOKENS: &[&str] = &[
+        "R&B", "DJ", "UK", "US", "MC", "TV", "AC", "DC", "EDM", "II", "III", "IV",
+    ];
+
+    fn title_case_word(word: &str) -> String {
+        // Check if the whole word matches an uppercase token
+        for &token in UPPERCASE_TOKENS {
+            if word.eq_ignore_ascii_case(token) {
+                return token.to_string();
+            }
+        }
+        // Title-case: first char uppercase, rest lowercase
+        let mut chars = word.chars();
+        match chars.next() {
+            None => String::new(),
+            Some(first) => {
+                let mut s = first.to_uppercase().to_string();
+                for c in chars {
+                    s.extend(c.to_lowercase());
+                }
+                s
+            }
+        }
+    }
+
+    // Handle slash-separated compound genres like "Folk/Rock"
+    genre
+        .split('/')
+        .map(|part| {
+            part.split_whitespace()
+                .map(title_case_word)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn split_genre_tag(raw: &str) -> Vec<String> {
     // Split by semicolon, forward-slash, backslash, or null byte
     raw.split(&[';', '/', '\\', '\0'][..])
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
+        .map(normalize_genre)
         .collect()
 }
 
@@ -1055,7 +1112,7 @@ mod tests {
     #[test]
     fn split_genre_unicode() {
         let genres = split_genre_tag("Musique classique; Musique experimentale");
-        assert_eq!(genres, vec!["Musique classique", "Musique experimentale"]);
+        assert_eq!(genres, vec!["Musique Classique", "Musique Experimentale"]);
     }
 
     #[test]
@@ -1436,6 +1493,50 @@ mod tests {
     fn normalize_format_case_sensitivity() {
         assert_eq!(normalize_format("mpeg", None), "mp3");
         assert_eq!(normalize_format("MPEG", None), "MPEG");
+    }
+
+    #[test]
+    fn normalize_genre_title_case() {
+        assert_eq!(normalize_genre("classique"), "Classique");
+        assert_eq!(normalize_genre("ROCK"), "Rock");
+        assert_eq!(normalize_genre("jazz"), "Jazz");
+        assert_eq!(normalize_genre("Jazz"), "Jazz");
+    }
+
+    #[test]
+    fn normalize_genre_multi_word() {
+        assert_eq!(normalize_genre("hip hop"), "Hip Hop");
+        assert_eq!(normalize_genre("trip hop"), "Trip Hop");
+        assert_eq!(normalize_genre("HARD ROCK"), "Hard Rock");
+    }
+
+    #[test]
+    fn normalize_genre_special_tokens() {
+        assert_eq!(normalize_genre("r&b"), "R&B");
+        assert_eq!(normalize_genre("R&B"), "R&B");
+        assert_eq!(normalize_genre("dj mix"), "DJ Mix");
+        assert_eq!(normalize_genre("DJ"), "DJ");
+        assert_eq!(normalize_genre("edm"), "EDM");
+        assert_eq!(normalize_genre("uk garage"), "UK Garage");
+    }
+
+    #[test]
+    fn normalize_genre_slash_compound() {
+        assert_eq!(normalize_genre("Folk/Rock"), "Folk/Rock");
+        assert_eq!(normalize_genre("folk/rock"), "Folk/Rock");
+        assert_eq!(normalize_genre("FOLK/ROCK"), "Folk/Rock");
+    }
+
+    #[test]
+    fn normalize_genre_already_correct() {
+        assert_eq!(normalize_genre("Progressive Rock"), "Progressive Rock");
+        assert_eq!(normalize_genre("Jazz"), "Jazz");
+    }
+
+    #[test]
+    fn split_genre_normalizes_case() {
+        let genres = split_genre_tag("classique; ROCK; jazz");
+        assert_eq!(genres, vec!["Classique", "Rock", "Jazz"]);
     }
 
     #[test]
