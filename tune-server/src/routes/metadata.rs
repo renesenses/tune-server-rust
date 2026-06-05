@@ -562,7 +562,7 @@ fn clean_album_title(title: &str) -> String {
     let mut result = String::with_capacity(title.len());
     let mut depth = 0i32;
     let mut paren_start = 0;
-    for (i, c) in title.chars().enumerate() {
+    for (i, c) in title.char_indices() {
         if c == '(' {
             if depth == 0 {
                 paren_start = i;
