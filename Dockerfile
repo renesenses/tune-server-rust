@@ -27,7 +27,7 @@ RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -48,6 +48,6 @@ EXPOSE 8888
 VOLUME ["/data", "/music"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8888/system/stats || exit 1
+    CMD curl -f http://localhost:8888/api/v1/library/stats || exit 1
 
 ENTRYPOINT ["/app/tune-server"]
