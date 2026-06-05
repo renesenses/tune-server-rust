@@ -534,18 +534,17 @@ impl OutputTarget for LocalOutput {
                 return;
             };
 
-            // Try to find a config matching the stream's sample rate
+            // Try to find a config matching the stream's sample rate.
+            // If the device doesn't explicitly list the source rate, try it
+            // anyway — WASAPI shared mode will resample in the driver (better
+            // quality than our linear interpolation). Only fall back to default
+            // config if cpal rejects the stream config at build time.
             let stream_config = find_matching_config(&device, channels, sample_rate)
                 .unwrap_or_else(|| {
-                    let default = device.default_output_config().unwrap();
-                    info!(
-                        default_sr = default.sample_rate(),
-                        wanted_sr = sample_rate,
-                        "local_audio_using_default_config"
-                    );
+                    // Attempt source rate even if not in reported range
                     cpal::StreamConfig {
-                        channels: default.channels().min(channels),
-                        sample_rate: default.sample_rate(),
+                        channels,
+                        sample_rate,
                         buffer_size: cpal::BufferSize::Default,
                     }
                 });
