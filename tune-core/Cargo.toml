@@ -22,7 +22,6 @@ rayon = { workspace = true }
 notify = { workspace = true }
 md-5 = { workspace = true }
 rusqlite = { workspace = true }
-axum = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
@@ -50,6 +49,7 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 
 [dev-dependencies]
 tempfile = "3"
+axum = { workspace = true }
 
 [features]
 default = ["local-audio"]

@@ -4,6 +4,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod connect;
 pub mod dashboard;
+pub mod deezer_proxy_handler;
 pub mod devices;
 pub mod discogs;
 pub mod dj;
@@ -49,11 +50,13 @@ pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
 pub mod squeezebox;
+pub mod stream_handler;
 pub mod streaming;
 pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_media_server;
 pub mod visualizer;
 pub mod voice;
 pub mod widget;
@@ -563,12 +566,12 @@ pub fn router(state: AppState) -> Router {
     let upnp_routes = state
         .upnp
         .as_ref()
-        .map(|upnp_state| tune_core::upnp_server::standalone_router(upnp_state.clone()));
+        .map(|upnp_state| upnp_media_server::standalone_router(upnp_state.clone()));
 
     let deezer_proxy = axum::Router::new()
         .route(
             "/deezer-proxy/{filename}",
-            get(tune_core::http::deezer_proxy::handle_deezer_proxy),
+            get(deezer_proxy_handler::handle_deezer_proxy),
         )
         .with_state(state.services.clone());
 
@@ -578,7 +581,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state)
-        .merge(tune_core::http::streamer::router(streamer_sessions))
+        .merge(stream_handler::router(streamer_sessions))
         .merge(deezer_proxy);
 
     if let Some(upnp) = upnp_routes {
