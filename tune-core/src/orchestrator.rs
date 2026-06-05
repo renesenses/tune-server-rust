@@ -303,7 +303,7 @@ impl PlaybackOrchestrator {
                 target_fmt.container_format().to_string()
             };
             tokio::spawn(async move {
-                eprintln!("TRANSCODE-DEBUG: decoding {fp} sr={out_sr} ch={channels}");
+                debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
                 let decode_result = crate::audio::decode::decode_to_pcm(
                     &fp,
                     Some(out_sr),
@@ -314,11 +314,11 @@ impl PlaybackOrchestrator {
 
                 match decode_result {
                     Ok(decoded) => {
-                        eprintln!(
-                            "TRANSCODE-DEBUG: decoded {} samples sr={} ch={}",
-                            decoded.samples.len(),
-                            decoded.sample_rate,
-                            decoded.channels
+                        debug!(
+                            samples = decoded.samples.len(),
+                            sample_rate = decoded.sample_rate,
+                            channels = decoded.channels,
+                            "transcode_decoded"
                         );
                         // Convert i16 samples to raw PCM bytes (16-bit LE)
                         let pcm_bytes: Vec<u8> = decoded
@@ -359,7 +359,6 @@ impl PlaybackOrchestrator {
                         }
                     }
                     Err(e) => {
-                        eprintln!("TRANSCODE-DEBUG: decode FAILED: {e}");
                         warn!(error = %e, file = %fp, "transcode_decode_failed");
                     }
                 }

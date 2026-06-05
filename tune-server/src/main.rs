@@ -126,7 +126,7 @@ async fn main() {
             match socket.bind(&addr.into()) {
                 Ok(()) => break,
                 Err(e) if attempt < 10 => {
-                    eprintln!("bind {addr} failed (attempt {attempt}/10): {e} — retrying in 2s");
+                    tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 Err(e) => panic!("failed to bind {addr} after 10 attempts: {e}"),
@@ -199,7 +199,7 @@ async fn shutdown_signal() {
     // because tokio runtime may itself be stalling
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        eprintln!("shutdown_timeout_forcing_exit");
+        tracing::warn!("shutdown_timeout_forcing_exit");
         std::process::exit(0);
     });
 }
