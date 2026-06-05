@@ -1,5 +1,3 @@
-use std::process::Stdio;
-
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +8,6 @@ pub struct BugReportData {
     pub version: String,
     pub os: String,
     pub architecture: String,
-    pub ffmpeg_version: Option<String>,
     pub tracks: i64,
     pub albums: i64,
     pub artists: i64,
@@ -29,22 +26,6 @@ pub struct ZoneInfo {
 pub fn sanitize_path(text: &str) -> String {
     let re = Regex::new(r"(/(?:home|Users|mnt|media)/)([^/\s]+)").unwrap();
     re.replace_all(text, "${1}<user>").to_string()
-}
-
-pub fn detect_ffmpeg_version() -> Option<String> {
-    let output = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().next().map(String::from)
 }
 
 pub fn collect_system_info(
@@ -75,7 +56,6 @@ pub fn collect_system_info(
         version: version.to_string(),
         os: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         architecture: std::env::consts::ARCH.to_string(),
-        ffmpeg_version: detect_ffmpeg_version(),
         tracks,
         albums,
         artists,
@@ -109,10 +89,6 @@ pub fn format_markdown(data: &BugReportData) -> String {
     lines.push(format!("- **Tune Server**: v{}", data.version));
     lines.push(format!("- **OS**: {}", data.os));
     lines.push(format!("- **Architecture**: {}", data.architecture));
-    lines.push(format!(
-        "- **FFmpeg**: {}",
-        data.ffmpeg_version.as_deref().unwrap_or("non disponible")
-    ));
     lines.push(String::new());
 
     lines.push("### Bibliotheque".to_string());
@@ -184,7 +160,6 @@ mod tests {
             version: "1.0.0".into(),
             os: "Linux x86_64".into(),
             architecture: "x86_64".into(),
-            ffmpeg_version: Some("ffmpeg version 6.0".into()),
             tracks: 1000,
             albums: 100,
             artists: 50,
@@ -211,7 +186,6 @@ mod tests {
             version: "0.1.0".into(),
             os: "macOS".into(),
             architecture: "aarch64".into(),
-            ffmpeg_version: None,
             tracks: 0,
             albums: 0,
             artists: 0,
@@ -222,7 +196,6 @@ mod tests {
         };
 
         let md = format_markdown(&data);
-        assert!(md.contains("non disponible"));
         assert!(!md.contains("Repertoires"));
     }
 }

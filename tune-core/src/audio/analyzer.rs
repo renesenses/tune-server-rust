@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 /// Decode audio file to raw PCM (i16 LE interleaved).
 ///
 /// Uses native Rust decoders for all supported formats (FLAC, MP3, WAV, AAC,
-/// ALAC, OGG, AIFF, DSF, DFF, WavPack, APE). No FFmpeg subprocess is needed.
+/// ALAC, OGG, AIFF, DSF, DFF, WavPack, APE).
 pub async fn decode_pcm(
     file_path: &str,
     sample_rate: u32,
@@ -41,18 +41,6 @@ pub async fn decode_pcm(
     }
 }
 
-/// Backward-compatible alias for callers that still reference `ffmpeg_pcm`.
-#[inline]
-pub async fn ffmpeg_pcm(
-    file_path: &str,
-    sample_rate: u32,
-    channels: u32,
-    seek_s: f64,
-    duration_s: f64,
-) -> Result<Vec<u8>, String> {
-    decode_pcm(file_path, sample_rate, channels, seek_s, duration_s).await
-}
-
 pub async fn get_duration(file_path: &str) -> Result<f64, String> {
     let path = file_path.to_string();
     tokio::task::spawn_blocking(move || {
@@ -65,7 +53,7 @@ pub async fn get_duration(file_path: &str) -> Result<f64, String> {
 }
 
 // ---------------------------------------------------------------------------
-// EBU R128 loudness measurement (pure Rust, no FFmpeg)
+// EBU R128 loudness measurement (pure Rust)
 // ---------------------------------------------------------------------------
 
 /// Transposed direct-form II biquad filter.
@@ -270,12 +258,12 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
     }
 
     let lufs = -0.691 + 10.0 * mean_rel.log10();
-    // Round to 1 decimal like FFmpeg does
+    // Round to 1 decimal
     Some((lufs * 10.0).round() / 10.0)
 }
 
 // ---------------------------------------------------------------------------
-// Trailing silence detection (pure Rust, no FFmpeg)
+// Trailing silence detection (pure Rust)
 // ---------------------------------------------------------------------------
 
 /// Detect trailing silence duration in seconds.
@@ -430,12 +418,6 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
         .iter()
         .map(|v| (*v as f32 * 10000.0).round() / 10000.0)
         .collect()
-}
-
-/// Deprecated: FFmpeg is no longer required. Always returns false.
-#[deprecated(note = "FFmpeg is no longer required for audio analysis")]
-pub fn ffmpeg_available() -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -785,16 +767,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Existing tests (preserved)
     // -----------------------------------------------------------------------
-
-    #[test]
-    #[allow(deprecated)]
-    fn ffmpeg_check() {
-        let available = ffmpeg_available();
-        assert!(
-            !available,
-            "ffmpeg_available should always return false now"
-        );
-    }
 
     #[test]
     fn waveform_normalize() {

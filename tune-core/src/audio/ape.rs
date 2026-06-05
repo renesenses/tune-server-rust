@@ -1,4 +1,4 @@
-//! Native APE (Monkey's Audio) decoder — pure Rust, no FFmpeg.
+//! Native APE (Monkey's Audio) decoder — pure Rust.
 //!
 //! Supports:
 //! - APE version >= 3980 (modern format with descriptor + header)

@@ -53,8 +53,6 @@ pub struct TuneConfig {
     pub crossfade_duration: f64,
 
     // Audio
-    pub ffmpeg_path: String,
-    pub ffprobe_path: String,
     pub default_output_format: String,
     pub max_sample_rate: u32,
     pub max_bit_depth: u32,
@@ -164,8 +162,6 @@ impl Default for TuneConfig {
             dlna_slow_max_retries: 2,
             crossfade_enabled: false,
             crossfade_duration: 3.0,
-            ffmpeg_path: "ffmpeg".into(),
-            ffprobe_path: "ffprobe".into(),
             default_output_format: "flac".into(),
             max_sample_rate: 192_000,
             max_bit_depth: 24,
@@ -236,8 +232,6 @@ impl TuneConfig {
         env_bool("TUNE_WATCH_FILESYSTEM", &mut config.watch_filesystem);
         env_bool("TUNE_CROSSFADE_ENABLED", &mut config.crossfade_enabled);
         env_f64("TUNE_CROSSFADE_DURATION", &mut config.crossfade_duration);
-        env_str("TUNE_FFMPEG_PATH", &mut config.ffmpeg_path);
-        env_str("TUNE_FFPROBE_PATH", &mut config.ffprobe_path);
         env_str(
             "TUNE_DEFAULT_OUTPUT_FORMAT",
             &mut config.default_output_format,

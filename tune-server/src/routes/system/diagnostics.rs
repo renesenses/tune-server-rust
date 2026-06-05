@@ -17,7 +17,6 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
     let music_dirs = super::get_music_dirs_list(&state.db);
-    let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Zone count
@@ -113,8 +112,6 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "tracks_count": tracks,
         "albums_count": albums,
         "artists_count": artists,
-        "ffmpeg_path": ffmpeg,
-        "ffmpeg_available": ffmpeg.is_some(),
         "rust_engines": {
             "available": true,
             "version": tune_core::version(),
@@ -296,7 +293,6 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
     let settings = SettingsRepo::new(state.db.clone());
     let music_dirs = super::get_music_dirs_list(&state.db);
-    let ffmpeg = tune_core::audio::pipeline::find_ffmpeg();
     let scan_status = settings
         .get("scan_status")
         .ok()
@@ -333,19 +329,6 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         (uptime_secs % 3600) / 60,
         uptime_secs % 60,
     );
-
-    // FFmpeg version
-    let ffmpeg_version = ffmpeg.as_ref().and_then(|path| {
-        std::process::Command::new(path)
-            .arg("-version")
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .and_then(|s| s.lines().next().map(|l| l.to_string()))
-            })
-    });
 
     // Memory RSS
     let rss_mb = {
@@ -452,12 +435,6 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str("## Network\n");
     md.push_str(&format!("- Discovered devices: {}\n", devices.len()));
     md.push_str(&format!("- Registered outputs: {output_count}\n"));
-    md.push_str(&format!(
-        "- FFmpeg: {}\n",
-        ffmpeg_version
-            .as_deref()
-            .unwrap_or(ffmpeg.as_deref().unwrap_or("not found"))
-    ));
     md.push('\n');
 
     if !oaat_endpoints.is_empty() {
@@ -507,8 +484,6 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
         },
-        "ffmpeg": ffmpeg,
-        "ffmpeg_version": ffmpeg_version,
         "oaat_endpoints": oaat_endpoints,
         "database": {
             "engine": "sqlite",
@@ -539,40 +514,16 @@ pub(super) async fn bug_report_markdown(
 }
 
 pub(super) async fn audio_check() -> Json<Value> {
-    let ffmpeg_path = tune_core::audio::pipeline::find_ffmpeg();
-    let ffprobe = if ffmpeg_path.is_some() {
-        // If ffmpeg is found, ffprobe is likely available too
-        which_cmd("ffprobe")
-    } else {
-        None
-    };
-
-    let formats = if ffmpeg_path.is_some() {
-        vec![
-            "flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wma",
-        ]
-    } else {
-        vec![]
-    };
+    let formats = vec![
+        "flac", "wav", "aiff", "mp3", "aac", "ogg", "opus", "alac", "dsd", "wavpack", "ape",
+    ];
 
     Json(json!({
-        "ffmpeg_available": ffmpeg_path.is_some(),
-        "ffmpeg_path": ffmpeg_path,
-        "ffprobe_available": ffprobe.is_some(),
-        "ffprobe_path": ffprobe,
+        "native_engine": true,
         "supported_formats": formats,
         "lofty_available": true,
         "engine": "rust",
     }))
-}
-
-fn which_cmd(name: &str) -> Option<String> {
-    std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry

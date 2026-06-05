@@ -1,4 +1,4 @@
-//! Native WavPack (.wv) lossless decoder — pure Rust, no FFmpeg.
+//! Native WavPack (.wv) lossless decoder — pure Rust.
 //!
 //! Supports:
 //! - WavPack version 4.x lossless (no hybrid/lossy)
@@ -1088,11 +1088,11 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
     }
 
     if header.is_dsd() {
-        return Err("DSD WavPack not supported, use FFmpeg fallback".into());
+        return Err("DSD WavPack not supported".into());
     }
 
     if header.is_hybrid() {
-        return Err("hybrid (lossy) WavPack not supported, use FFmpeg fallback".into());
+        return Err("hybrid (lossy) WavPack not supported".into());
     }
 
     let mut sample_rate = header.sample_rate();
@@ -1165,11 +1165,11 @@ pub fn decode_wavpack_to_pcm(
     }
 
     if first_header.is_dsd() {
-        return Err("DSD WavPack not supported, use FFmpeg fallback".into());
+        return Err("DSD WavPack not supported".into());
     }
 
     if first_header.is_hybrid() {
-        return Err("hybrid (lossy) WavPack not supported, use FFmpeg fallback".into());
+        return Err("hybrid (lossy) WavPack not supported".into());
     }
 
     let source_rate = {
