@@ -1,3 +1,8 @@
+//! Axum handler for the Deezer CDN decryption proxy.
+//!
+//! Proxies encrypted Deezer streams, decrypting them on-the-fly via
+//! `tune_core::streaming::deezer_decrypt::DeezerDecryptStream`.
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -7,9 +12,9 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::streaming::ServiceRegistry;
-use crate::streaming::deezer::DeezerService;
-use crate::streaming::deezer_decrypt::DeezerDecryptStream;
+use tune_core::streaming::ServiceRegistry;
+use tune_core::streaming::deezer::DeezerService;
+use tune_core::streaming::deezer_decrypt::DeezerDecryptStream;
 
 pub async fn handle_deezer_proxy(
     Path(filename): Path<String>,

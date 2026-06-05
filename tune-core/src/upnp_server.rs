@@ -1,17 +1,9 @@
-//! UPnP MediaServer (ContentDirectory) implementation.
+//! UPnP MediaServer (ContentDirectory) implementation — business logic.
 //!
-//! Advertises the Tune server as a DLNA MediaServer so DLNA clients (TVs, NAS
-//! apps, network players) can browse and play the music library.
-//!
-//! Routes are intended to be merged into the main Axum app or served on a
-//! separate port (default 8080 for UPnP description + ContentDirectory).
+//! Contains SOAP parsing, DIDL-Lite generation, SSDP advertisement helpers,
+//! and the shared `UpnpState`. The Axum HTTP handlers live in
+//! `tune-server/src/routes/upnp_media_server.rs`.
 
-use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use tracing::{debug, warn};
@@ -46,45 +38,24 @@ impl UpnpState {
         }
     }
 
-    fn server_ip(&self) -> String {
+    pub fn server_ip(&self) -> String {
         ssdp::get_local_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into())
     }
 
-    fn base_url(&self) -> String {
+    pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.server_ip(), self.server_port)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Router
+// Device Description XML builder
 // ---------------------------------------------------------------------------
 
-pub fn router() -> Router<UpnpState> {
-    Router::new()
-        .route("/description.xml", get(device_description))
-        .route("/ContentDirectory/control", post(content_directory_control))
-        .route("/ContentDirectory/event", get(content_directory_event))
-        .route(
-            "/ConnectionManager/control",
-            post(connection_manager_control),
-        )
-}
-
-/// Build a standalone Axum `Router` (with state already applied) suitable for
-/// merging into the main server or serving separately.
-pub fn standalone_router(state: UpnpState) -> Router {
-    router().with_state(state)
-}
-
-// ---------------------------------------------------------------------------
-// Device Description
-// ---------------------------------------------------------------------------
-
-async fn device_description(State(state): State<UpnpState>) -> impl IntoResponse {
+pub fn build_device_description(state: &UpnpState) -> String {
     let base = state.base_url();
-    let xml = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
@@ -127,39 +98,30 @@ async fn device_description(State(state): State<UpnpState>) -> impl IntoResponse
         version = crate::version(),
         uuid = state.uuid,
         base = base,
-    );
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
-        .body(Body::from(xml))
-        .unwrap()
+    )
 }
 
 // ---------------------------------------------------------------------------
-// ContentDirectory control (SOAP)
+// ContentDirectory SOAP response builder
 // ---------------------------------------------------------------------------
 
-async fn content_directory_control(
-    State(state): State<UpnpState>,
-    body: String,
-) -> impl IntoResponse {
-    debug!(body_len = body.len(), "upnp_content_directory_request");
+pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
+    debug!(body_len = soap_body.len(), "upnp_content_directory_request");
 
-    let (object_id, browse_flag, start, count) = parse_browse_request(&body);
+    let (object_id, browse_flag, start, count) = parse_browse_request(soap_body);
 
     let direct_children = browse_flag != "BrowseMetadata";
 
     let didl = if direct_children {
-        browse_direct_children(&state, &object_id, start, count)
+        browse_direct_children(state, &object_id, start, count)
     } else {
-        browse_metadata(&state, &object_id)
+        browse_metadata(state, &object_id)
     };
 
     let total_matches = didl.total;
     let number_returned = didl.returned;
 
-    let soap = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
@@ -174,31 +136,20 @@ async fn content_directory_control(
         result = quick_xml::escape::escape(&didl.xml),
         returned = number_returned,
         total = total_matches,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ConnectionManager SOAP response builder
+// ---------------------------------------------------------------------------
+
+pub fn build_connection_manager_response(soap_body: &str) -> String {
+    debug!(
+        body_len = soap_body.len(),
+        "upnp_connection_manager_request"
     );
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
-        .body(Body::from(soap))
-        .unwrap()
-}
-
-// ---------------------------------------------------------------------------
-// ContentDirectory event (stub — required for DLNA compliance)
-// ---------------------------------------------------------------------------
-
-async fn content_directory_event() -> impl IntoResponse {
-    StatusCode::OK
-}
-
-// ---------------------------------------------------------------------------
-// ConnectionManager (minimal stub)
-// ---------------------------------------------------------------------------
-
-async fn connection_manager_control(body: String) -> impl IntoResponse {
-    debug!(body_len = body.len(), "upnp_connection_manager_request");
-
-    let soap = r#"<?xml version="1.0" encoding="UTF-8"?>
+    r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
     <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
@@ -206,13 +157,8 @@ async fn connection_manager_control(body: String) -> impl IntoResponse {
       <Sink></Sink>
     </u:GetProtocolInfoResponse>
   </s:Body>
-</s:Envelope>"#;
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
-        .body(Body::from(soap))
-        .unwrap()
+</s:Envelope>"#
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
