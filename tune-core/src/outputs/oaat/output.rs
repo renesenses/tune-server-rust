@@ -293,10 +293,7 @@ impl OutputTarget for OaatOutput {
         tokio::spawn(async move {
             use futures_util::StreamExt;
 
-            eprintln!(
-                "OAAT-DEBUG: play_media spawned for {} url={}",
-                device_name, url
-            );
+            debug!(device = %device_name, url = %url, "oaat: play_media spawned");
 
             let config = ControllerConfig {
                 controller_id,
@@ -309,8 +306,7 @@ impl OutputTarget for OaatOutput {
             // Connect with retry
             let mut endpoint: Option<ConnectedEndpoint> = None;
             for attempt in 1..=3u32 {
-                eprintln!("OAAT-DEBUG: connecting attempt {attempt} to {endpoint_addr}");
-                info!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
+                debug!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
                         info!(device = %device_name, endpoint_name = %ep.info.endpoint_name, "oaat: connected");
@@ -353,13 +349,14 @@ impl OutputTarget for OaatOutput {
             // Fetch & detect format
             let stream_id = format!("tune-{stream_num}");
 
+<<<<<<< HEAD
             // If we have a local file path, read directly instead of HTTP self-fetch
             if let Some(ref fp) = file_path {
-                eprintln!("OAAT-DEBUG: reading file directly: {fp}");
+                debug!("reading file directly: {fp}");
                 let file_data = match tokio::fs::read(fp).await {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("OAAT-DEBUG: file read failed: {e}");
+                        debug!("file read failed: {e}");
                         error!(device = %device_name, error = %e, file = %fp, "oaat: file read failed");
                         playing.store(false, Ordering::SeqCst);
                         return;
@@ -370,13 +367,13 @@ impl OutputTarget for OaatOutput {
                 let si = match detect_and_parse(&mut buf) {
                     Some(info) => info,
                     None => {
-                        eprintln!("OAAT-DEBUG: unsupported file format");
+                        debug!("unsupported file format");
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
                 };
 
-                eprintln!(
+                debug!(
                     "OAAT-DEBUG: file format {:?} {}Hz {}bit {}ch, {} bytes PCM",
                     si.format,
                     si.sample_rate,
@@ -389,19 +386,19 @@ impl OutputTarget for OaatOutput {
 
                 // For FLAC files, convert to WAV via ffmpeg then use WAV info
                 let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = if is_flac {
-                    eprintln!("OAAT-DEBUG: converting FLAC to WAV via ffmpeg...");
+                    debug!("converting FLAC to WAV via ffmpeg...");
                     match super::helpers::decode_flac_to_pcm(fp) {
                         Some(wav_data) => {
                             let mut wav_buf = wav_data;
                             let wav_si = match detect_and_parse(&mut wav_buf) {
                                 Some(info) => info,
                                 None => {
-                                    eprintln!("OAAT-DEBUG: WAV parse failed after ffmpeg");
+                                    debug!("WAV parse failed after ffmpeg");
                                     playing.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
-                            eprintln!(
+                            debug!(
                                 "OAAT-DEBUG: WAV: {} bytes, {:?} {}Hz {}bit {}ch",
                                 wav_buf.len(),
                                 wav_si.format,
@@ -418,7 +415,7 @@ impl OutputTarget for OaatOutput {
                             )
                         }
                         None => {
-                            eprintln!("OAAT-DEBUG: ffmpeg FLAC->WAV failed");
+                            debug!("ffmpeg FLAC->WAV failed");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -471,7 +468,7 @@ impl OutputTarget for OaatOutput {
                 }
 
                 diag.connected.store(true, Ordering::SeqCst);
-                eprintln!(
+                debug!(
                     "OAAT-DEBUG: streaming {} bytes PCM directly",
                     pcm_data.len()
                 );
@@ -551,25 +548,22 @@ impl OutputTarget for OaatOutput {
                 endpoint.send_stop(&stream_id).await.ok();
                 playing.store(false, Ordering::SeqCst);
                 diag.connected.store(false, Ordering::SeqCst);
-                eprintln!(
+                debug!(
                     "OAAT-DEBUG: direct file playback complete, {} samples",
                     sample_offset
                 );
                 return;
             }
 
-            eprintln!("OAAT-DEBUG: connected OK, fetching {url}");
-            info!(device = %device_name, url = %url, "oaat: fetching audio stream");
+            debug!(device = %device_name, url = %url, "oaat: fetching audio stream");
             let resp = match http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
-                    eprintln!("OAAT-DEBUG: HTTP error {} for {url}", r.status());
                     error!(device = %device_name, status = %r.status(), url = %url, "oaat: HTTP error");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
                 Err(e) => {
-                    eprintln!("OAAT-DEBUG: fetch failed: {e} for {url}");
                     error!(device = %device_name, error = %e, url = %url, "oaat: fetch failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
