@@ -5,12 +5,40 @@ use tracing::{debug, warn};
 /// Audio encoder that handles WAV (via hound) and FLAC (native pure-Rust).
 /// MP3 and OGG requests are transparently encoded as FLAC with a warning,
 /// since pure-Rust encoders for those formats are not available.
+///
+/// The FLAC encoder works in streaming mode: PCM data is encoded incrementally
+/// as it arrives via `write()`, keeping memory usage bounded regardless of
+/// track length. Only one block's worth of samples (~4096) is buffered at a time.
 pub struct AudioEncoder {
     format: String,
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
+    /// WAV-only: accumulates all PCM data (hound needs it all upfront).
     pcm_buffer: Option<Vec<u8>>,
+    /// FLAC streaming state (None when not started or after finish).
+    flac_state: Option<FlacStreamState>,
+}
+
+/// Mutable state for the streaming FLAC encoder.
+struct FlacStreamState {
+    /// Encoded output accumulated across start/write/finish.
+    output: Vec<u8>,
+    /// Per-channel sample buffers — holds up to FLAC_BLOCK_SIZE samples each.
+    channel_buffers: Vec<Vec<i32>>,
+    /// Number of full FLAC frames encoded so far.
+    frame_count: u32,
+    /// Total number of inter-channel samples encoded so far.
+    total_samples: u64,
+    /// Minimum encoded frame size seen so far (bytes).
+    min_frame_size: u32,
+    /// Maximum encoded frame size seen so far (bytes).
+    max_frame_size: u32,
+    /// Byte offset of the STREAMINFO block within `output`.
+    streaminfo_offset: usize,
+    /// Leftover PCM bytes from a previous `write()` that didn't align to a
+    /// complete inter-channel sample boundary (< bytes_per_frame bytes).
+    pcm_leftover: Vec<u8>,
 }
 
 impl AudioEncoder {
@@ -21,6 +49,7 @@ impl AudioEncoder {
             bit_depth,
             channels,
             pcm_buffer: None,
+            flac_state: None,
         }
     }
 
@@ -33,14 +62,16 @@ impl AudioEncoder {
                     bit_depth = self.bit_depth,
                     "encoder_start_hound"
                 );
+                self.pcm_buffer = Some(Vec::new());
             }
             "flac" => {
                 debug!(
                     format = "flac",
                     sample_rate = self.sample_rate,
                     bit_depth = self.bit_depth,
-                    "encoder_start_native_flac"
+                    "encoder_start_native_flac_streaming"
                 );
+                self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
             "mp3" => {
                 warn!(
@@ -48,6 +79,7 @@ impl AudioEncoder {
                     actual = "flac",
                     "encoder_format_substitution: MP3 not available without FFmpeg, encoding as FLAC"
                 );
+                self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
             "ogg" => {
                 warn!(
@@ -55,6 +87,7 @@ impl AudioEncoder {
                     actual = "flac",
                     "encoder_format_substitution: OGG not available without FFmpeg, encoding as FLAC"
                 );
+                self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
             other => {
                 warn!(
@@ -62,19 +95,37 @@ impl AudioEncoder {
                     actual = "flac",
                     "encoder_format_substitution: format not natively supported, encoding as FLAC"
                 );
+                self.flac_state = Some(flac_start(self.sample_rate, self.bit_depth, self.channels));
             }
         }
-        self.pcm_buffer = Some(Vec::new());
         Ok(())
     }
 
     pub async fn write(&mut self, pcm_data: &[u8]) -> Result<(), String> {
+        if let Some(ref mut state) = self.flac_state {
+            // FLAC streaming path: decode + buffer + encode when full
+            flac_write(
+                state,
+                pcm_data,
+                self.sample_rate,
+                self.bit_depth,
+                self.channels,
+            )?;
+            return Ok(());
+        }
+        // WAV path: accumulate raw PCM
         let buf = self.pcm_buffer.as_mut().ok_or("encoder not started")?;
         buf.extend_from_slice(pcm_data);
         Ok(())
     }
 
     pub async fn finish(&mut self) -> Result<Vec<u8>, String> {
+        // FLAC streaming path
+        if let Some(state) = self.flac_state.take() {
+            return flac_finish(state, self.sample_rate, self.bit_depth, self.channels);
+        }
+
+        // WAV path
         let pcm_data = self.pcm_buffer.take().unwrap_or_default();
         if pcm_data.is_empty() && self.pcm_buffer.is_none() {
             // finish() called without start()
@@ -84,14 +135,15 @@ impl AudioEncoder {
         match self.format.as_str() {
             "wav" => encode_wav_hound(&pcm_data, self.sample_rate, self.bit_depth, self.channels),
             _ => {
-                // FLAC for flac/mp3/ogg/anything else
-                encode_flac(&pcm_data, self.sample_rate, self.bit_depth, self.channels)
+                // Should not reach here (FLAC uses flac_state), but as a fallback:
+                encode_flac_batch(&pcm_data, self.sample_rate, self.bit_depth, self.channels)
             }
         }
     }
 
     pub async fn stop(&mut self) {
         self.pcm_buffer = None;
+        self.flac_state = None;
     }
 }
 
@@ -173,16 +225,255 @@ fn write_pcm_samples(
 }
 
 // ---------------------------------------------------------------------------
-// FLAC encoder (pure Rust)
+// FLAC encoder (pure Rust, streaming)
 // ---------------------------------------------------------------------------
 //
 // Implements a minimal FLAC encoder using FIXED prediction (orders 0-4)
 // with Rice coding for residuals. Produces valid FLAC streams that any
 // standard decoder can read.
+//
+// The encoder works in streaming mode:
+//   start()  -> writes fLaC magic + placeholder STREAMINFO
+//   write()  -> de-interleaves PCM, encodes full blocks immediately
+//   finish() -> encodes remaining samples, patches STREAMINFO, returns output
 
 const FLAC_BLOCK_SIZE: usize = 4096;
 
-fn encode_flac(
+/// Initialize FLAC streaming state: write the fLaC magic and a placeholder
+/// STREAMINFO block. Returns the mutable state to be stored in AudioEncoder.
+fn flac_start(sample_rate: u32, bit_depth: u32, channels: u32) -> FlacStreamState {
+    let mut output = Vec::with_capacity(8192);
+
+    // 1. fLaC magic
+    output.extend_from_slice(b"fLaC");
+
+    // 2. STREAMINFO metadata block header
+    //    1 bit is_last=1, 7 bits type=0, 24 bits length=34
+    let block_header: u32 = (1 << 31) | 34;
+    output.extend_from_slice(&block_header.to_be_bytes());
+
+    let streaminfo_offset = output.len();
+
+    // min block size, max block size (2+2 bytes) — placeholder using FLAC_BLOCK_SIZE
+    let block_size_u16 = FLAC_BLOCK_SIZE as u16;
+    output.extend_from_slice(&block_size_u16.to_be_bytes());
+    output.extend_from_slice(&block_size_u16.to_be_bytes());
+
+    // min frame size, max frame size (3+3 bytes) — placeholder zeros
+    output.extend_from_slice(&[0u8; 6]);
+
+    // sample rate (20 bits) | channels-1 (3 bits) | bps-1 (5 bits) | total samples high 4 bits
+    // Total samples = 0 placeholder (patched in finish)
+    let sr_ch_bps: u32 = ((sample_rate) << 12)
+        | (((channels - 1) as u32) << 9)
+        | (((bit_depth - 1) as u32) << 4)
+        | 0; // total_samples_hi = 0 placeholder
+    output.extend_from_slice(&sr_ch_bps.to_be_bytes());
+
+    // total samples low 32 bits — placeholder 0
+    output.extend_from_slice(&0u32.to_be_bytes());
+
+    // MD5 — 16 bytes of zeros (optional, valid per spec)
+    output.extend_from_slice(&[0u8; 16]);
+
+    FlacStreamState {
+        output,
+        channel_buffers: vec![Vec::with_capacity(FLAC_BLOCK_SIZE); channels as usize],
+        frame_count: 0,
+        total_samples: 0,
+        min_frame_size: u32::MAX,
+        max_frame_size: 0,
+        streaminfo_offset,
+        pcm_leftover: Vec::new(),
+    }
+}
+
+/// Feed PCM data into the streaming FLAC encoder. Encodes complete blocks
+/// immediately, keeping only up to FLAC_BLOCK_SIZE samples buffered.
+fn flac_write(
+    state: &mut FlacStreamState,
+    pcm_data: &[u8],
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+) -> Result<(), String> {
+    let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
+    let bytes_per_frame = bytes_per_sample * channels as usize; // one inter-channel sample
+
+    // Combine any leftover bytes from the previous write with new data.
+    // We take ownership of leftover to avoid borrow conflicts with state.
+    let combined: Vec<u8>;
+    let working_data: &[u8] = if state.pcm_leftover.is_empty() {
+        pcm_data
+    } else {
+        combined = {
+            let mut v = std::mem::take(&mut state.pcm_leftover);
+            v.extend_from_slice(pcm_data);
+            v
+        };
+        &combined
+    };
+
+    // How many complete inter-channel samples can we decode?
+    let usable_bytes = (working_data.len() / bytes_per_frame) * bytes_per_frame;
+    let remainder_bytes = working_data.len() - usable_bytes;
+
+    // Decode usable PCM to interleaved i32 samples
+    let interleaved = pcm_to_i32(&working_data[..usable_bytes], bit_depth)?;
+
+    // De-interleave into per-channel buffers
+    let ch = channels as usize;
+    for (i, &s) in interleaved.iter().enumerate() {
+        state.channel_buffers[i % ch].push(s);
+    }
+
+    // Encode complete blocks as they become available
+    while state.channel_buffers[0].len() >= FLAC_BLOCK_SIZE {
+        encode_block_from_buffers(state, FLAC_BLOCK_SIZE, sample_rate, bit_depth, channels)?;
+    }
+
+    // Save remainder bytes for the next write
+    if remainder_bytes > 0 {
+        state.pcm_leftover = working_data[usable_bytes..].to_vec();
+    }
+    // else: pcm_leftover is already empty (either was empty, or was taken via mem::take)
+
+    Ok(())
+}
+
+/// Encode `block_len` samples from the front of each channel buffer as a single
+/// FLAC frame, then drain those samples from the buffers.
+fn encode_block_from_buffers(
+    state: &mut FlacStreamState,
+    block_len: usize,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+) -> Result<(), String> {
+    let frame_start = state.output.len();
+
+    // Build temporary per-channel slices for the encoder
+    let channel_slices: Vec<&[i32]> = state
+        .channel_buffers
+        .iter()
+        .map(|buf| &buf[..block_len])
+        .collect();
+
+    encode_flac_frame_slices(
+        &mut state.output,
+        &channel_slices,
+        block_len,
+        sample_rate,
+        bit_depth,
+        channels,
+        state.frame_count,
+    )?;
+
+    let frame_bytes = (state.output.len() - frame_start) as u32;
+    state.min_frame_size = state.min_frame_size.min(frame_bytes);
+    state.max_frame_size = state.max_frame_size.max(frame_bytes);
+    state.frame_count += 1;
+    state.total_samples += block_len as u64;
+
+    // Drain the consumed samples from channel buffers
+    for buf in &mut state.channel_buffers {
+        buf.drain(..block_len);
+    }
+
+    Ok(())
+}
+
+/// Finalize the FLAC stream: encode remaining samples, patch STREAMINFO, return output.
+fn flac_finish(
+    mut state: FlacStreamState,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+) -> Result<Vec<u8>, String> {
+    // Handle any leftover PCM bytes (shouldn't happen with well-aligned writes, but be safe)
+    if !state.pcm_leftover.is_empty() {
+        let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
+        let bytes_per_frame = bytes_per_sample * channels as usize;
+        let usable = (state.pcm_leftover.len() / bytes_per_frame) * bytes_per_frame;
+        if usable > 0 {
+            let interleaved = pcm_to_i32(&state.pcm_leftover[..usable], bit_depth)?;
+            let ch = channels as usize;
+            for (i, &s) in interleaved.iter().enumerate() {
+                state.channel_buffers[i % ch].push(s);
+            }
+        }
+        state.pcm_leftover.clear();
+    }
+
+    // Encode any remaining samples as a final (possibly shorter) frame
+    let remaining = state.channel_buffers[0].len();
+    if remaining > 0 {
+        encode_block_from_buffers(&mut state, remaining, sample_rate, bit_depth, channels)?;
+    }
+
+    let total_samples = state.total_samples;
+
+    // Patch STREAMINFO with actual values
+    let si = state.streaminfo_offset;
+    let output = &mut state.output;
+
+    // Patch min/max block size (bytes 0-3 of STREAMINFO)
+    // If only one frame was encoded and it was shorter than FLAC_BLOCK_SIZE,
+    // use the actual block size
+    if total_samples > 0 {
+        let actual_max_block = FLAC_BLOCK_SIZE.min(total_samples as usize) as u16;
+        // For the last frame, min block size might be smaller
+        let actual_min_block = if total_samples <= FLAC_BLOCK_SIZE as u64 {
+            total_samples as u16
+        } else {
+            // With FLAC_BLOCK_SIZE blocks + possibly shorter last block
+            let last_block = (total_samples as usize) % FLAC_BLOCK_SIZE;
+            if last_block == 0 {
+                FLAC_BLOCK_SIZE as u16
+            } else {
+                last_block as u16
+            }
+        };
+        output[si..si + 2].copy_from_slice(&actual_min_block.to_be_bytes());
+        output[si + 2..si + 4].copy_from_slice(&actual_max_block.to_be_bytes());
+    } else {
+        // No samples at all — set both to 0
+        output[si..si + 4].copy_from_slice(&[0u8; 4]);
+    }
+
+    // Patch min/max frame size (bytes 4-9 of STREAMINFO)
+    let mut min_fs = state.min_frame_size;
+    if min_fs == u32::MAX {
+        min_fs = 0;
+    }
+    let fs_offset = si + 4;
+    output[fs_offset] = (min_fs >> 16) as u8;
+    output[fs_offset + 1] = (min_fs >> 8) as u8;
+    output[fs_offset + 2] = min_fs as u8;
+    output[fs_offset + 3] = (state.max_frame_size >> 16) as u8;
+    output[fs_offset + 4] = (state.max_frame_size >> 8) as u8;
+    output[fs_offset + 5] = state.max_frame_size as u8;
+
+    // Patch total samples: high 4 bits at byte 17 of STREAMINFO (nibble in sr_ch_bps word),
+    // low 32 bits at bytes 18-21 of STREAMINFO.
+    // sr_ch_bps is at si+10..si+14, total_lo at si+14..si+18
+    let total_hi_nibble = ((total_samples >> 32) & 0xF) as u8;
+    // Preserve existing sr/ch/bps bits, patch only the low nibble
+    output[si + 13] = (output[si + 13] & 0xF0) | total_hi_nibble;
+    output[si + 14..si + 18].copy_from_slice(&(total_samples as u32).to_be_bytes());
+
+    debug!(
+        flac_bytes = output.len(),
+        total_samples,
+        frames = state.frame_count,
+        "flac_encoded_streaming"
+    );
+
+    Ok(state.output)
+}
+
+/// Batch FLAC encoding (used as internal fallback, keeps original logic).
+fn encode_flac_batch(
     pcm: &[u8],
     sample_rate: u32,
     bit_depth: u32,
@@ -215,7 +506,6 @@ fn encode_flac(
     output.extend_from_slice(b"fLaC");
 
     // 2. STREAMINFO metadata block
-    //    Header: 1 bit is_last=1, 7 bits type=0, 24 bits length=34
     let block_header: u32 = (1 << 31) | 34;
     output.extend_from_slice(&block_header.to_be_bytes());
 
@@ -226,42 +516,42 @@ fn encode_flac(
         block_size as u16
     };
 
-    // Placeholder for STREAMINFO — we'll fill min/max frame sizes after encoding
     let streaminfo_offset = output.len();
 
-    // min block size, max block size (2+2 bytes)
     output.extend_from_slice(&block_size_u16.to_be_bytes());
     output.extend_from_slice(&block_size_u16.to_be_bytes());
-    // min frame size, max frame size (3+3 bytes) — placeholder 0
     output.extend_from_slice(&[0u8; 6]);
-    // sample rate (20 bits) | channels-1 (3 bits) | bps-1 (5 bits) | total samples high 4 bits
     let sr_ch_bps: u64 = ((sample_rate as u64) << 12)
         | (((channels - 1) as u64) << 9)
         | (((bit_depth - 1) as u64) << 4)
         | ((total_samples as u64 >> 32) & 0xF);
     output.extend_from_slice(&(sr_ch_bps as u32).to_be_bytes());
-    // total samples low 32 bits
     output.extend_from_slice(&(total_samples as u32).to_be_bytes());
-    // MD5 — 16 bytes of zeros (optional, valid per spec)
     output.extend_from_slice(&[0u8; 16]);
 
     // 3. Audio frames
     let mut min_frame_size: u32 = u32::MAX;
     let mut max_frame_size: u32 = 0;
     let mut sample_offset: usize = 0;
+    let mut frame_number: u32 = 0;
 
     while sample_offset < total_samples {
         let block_len = FLAC_BLOCK_SIZE.min(total_samples - sample_offset);
         let frame_start = output.len();
 
-        encode_flac_frame(
+        let channel_slices: Vec<&[i32]> = channel_data
+            .iter()
+            .map(|ch_buf| &ch_buf[sample_offset..sample_offset + block_len])
+            .collect();
+
+        encode_flac_frame_slices(
             &mut output,
-            &channel_data,
-            sample_offset,
+            &channel_slices,
             block_len,
             sample_rate,
             bit_depth,
             channels,
+            frame_number,
         )?;
 
         let frame_bytes = (output.len() - frame_start) as u32;
@@ -269,13 +559,14 @@ fn encode_flac(
         max_frame_size = max_frame_size.max(frame_bytes);
 
         sample_offset += block_len;
+        frame_number += 1;
     }
 
-    // Patch min/max frame size in STREAMINFO (offset +4 from streaminfo_offset)
+    // Patch min/max frame size in STREAMINFO
     if min_frame_size == u32::MAX {
         min_frame_size = 0;
     }
-    let fs_offset = streaminfo_offset + 4; // after min/max block size
+    let fs_offset = streaminfo_offset + 4;
     output[fs_offset] = (min_frame_size >> 16) as u8;
     output[fs_offset + 1] = (min_frame_size >> 8) as u8;
     output[fs_offset + 2] = min_frame_size as u8;
@@ -391,15 +682,16 @@ impl BitWriter {
     }
 }
 
-/// Encode a single FLAC frame and append to output.
-fn encode_flac_frame(
+/// Encode a single FLAC frame from per-channel slices and append to output.
+/// `channel_slices[ch]` contains exactly `block_len` samples for channel `ch`.
+fn encode_flac_frame_slices(
     output: &mut Vec<u8>,
-    channel_data: &[Vec<i32>],
-    sample_offset: usize,
+    channel_slices: &[&[i32]],
     block_len: usize,
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
+    frame_number: u32,
 ) -> Result<(), String> {
     let mut bw = BitWriter::new();
 
@@ -472,8 +764,8 @@ fn encode_flac_frame(
         16 => 4,
         20 => 5,
         24 => 6,
-        32 => 7, // 32-bit per sample not officially in the spec table but we use it
-        _ => 0,  // get from STREAMINFO
+        32 => 7,
+        _ => 0,
     };
     bw.write_bits(sample_size_code as u32, 3);
 
@@ -481,7 +773,6 @@ fn encode_flac_frame(
     bw.write_bits(0, 1);
 
     // Frame number (UTF-8 coded, blocking strategy=0 means frame number)
-    let frame_number = (sample_offset / block_len) as u32;
     write_utf8_u32(&mut bw, frame_number);
 
     // Optional block size at end of header
@@ -506,7 +797,7 @@ fn encode_flac_frame(
 
     // --- Subframes (one per channel) ---
     for ch_idx in 0..channels as usize {
-        let samples = &channel_data[ch_idx][sample_offset..sample_offset + block_len];
+        let samples = channel_slices[ch_idx];
         encode_subframe(&mut bw, samples, bit_depth)?;
     }
 
@@ -981,8 +1272,9 @@ mod tests {
 
     #[test]
     fn flac_streaminfo_total_samples() {
+        // Use the batch encoder directly to test STREAMINFO encoding
         let pcm = vec![0u8; 800]; // 200 frames stereo 16-bit
-        let flac = encode_flac(&pcm, 44100, 16, 2).unwrap();
+        let flac = encode_flac_batch(&pcm, 44100, 16, 2).unwrap();
         // Total samples in STREAMINFO: bytes 22-25 (low 32 bits)
         let total_lo = u32::from_be_bytes([flac[22], flac[23], flac[24], flac[25]]);
         // Also check high nibble from byte 21
@@ -1084,5 +1376,162 @@ mod tests {
         enc.write(&pcm).await.unwrap();
         let flac = enc.finish().await.unwrap();
         assert_eq!(&flac[0..4], b"fLaC");
+    }
+
+    /// Verify that streaming encoding (multiple small writes) produces
+    /// the same FLAC output structure as a single large write.
+    #[tokio::test]
+    async fn streaming_matches_batch_encoding() {
+        // Generate a non-trivial signal: stereo 16-bit ramp, 5000 samples
+        // (exceeds one FLAC_BLOCK_SIZE=4096 to test multi-frame)
+        let num_samples = 5000usize;
+        let channels = 2u32;
+        let bit_depth = 16u32;
+        let sample_rate = 44100u32;
+        let bytes_per_sample = 2usize;
+
+        let mut pcm = Vec::with_capacity(num_samples * channels as usize * bytes_per_sample);
+        for i in 0..num_samples {
+            for ch in 0..channels {
+                let val = (((i * channels as usize + ch as usize) % 512) as i16 - 256) * 50;
+                pcm.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        // Batch encoding (single write)
+        let mut enc_batch = AudioEncoder::new("flac", sample_rate, bit_depth, channels);
+        enc_batch.start().await.unwrap();
+        enc_batch.write(&pcm).await.unwrap();
+        let flac_batch = enc_batch.finish().await.unwrap();
+
+        // Streaming encoding (many small writes of ~100 samples each)
+        let mut enc_stream = AudioEncoder::new("flac", sample_rate, bit_depth, channels);
+        enc_stream.start().await.unwrap();
+        let chunk_size = 100 * channels as usize * bytes_per_sample; // 100 samples per write
+        for chunk in pcm.chunks(chunk_size) {
+            enc_stream.write(chunk).await.unwrap();
+        }
+        let flac_stream = enc_stream.finish().await.unwrap();
+
+        // Both should produce valid FLAC
+        assert_eq!(&flac_batch[0..4], b"fLaC");
+        assert_eq!(&flac_stream[0..4], b"fLaC");
+
+        // The output should be byte-identical since the encoding algorithm
+        // is deterministic and processes the same blocks in the same order.
+        assert_eq!(
+            flac_batch.len(),
+            flac_stream.len(),
+            "batch and streaming FLAC should have the same length"
+        );
+        assert_eq!(
+            flac_batch, flac_stream,
+            "batch and streaming FLAC should be byte-identical"
+        );
+    }
+
+    /// Verify that streaming encoding with many blocks keeps memory bounded.
+    /// The encoder should not accumulate all PCM data — only one block at a time.
+    #[tokio::test]
+    async fn streaming_bounded_memory_large_input() {
+        let channels = 2u32;
+        let bit_depth = 16u32;
+        let sample_rate = 44100u32;
+        let bytes_per_sample = 2usize;
+        let frame_bytes = bytes_per_sample * channels as usize;
+
+        // Simulate a long track: 10 * FLAC_BLOCK_SIZE samples = ~40960 samples
+        // This is enough to verify multi-block streaming works without OOM.
+        let total_samples = FLAC_BLOCK_SIZE * 10;
+        let total_pcm_bytes = total_samples * frame_bytes;
+
+        let mut enc = AudioEncoder::new("flac", sample_rate, bit_depth, channels);
+        enc.start().await.unwrap();
+
+        // Write in small chunks (256 samples at a time)
+        let chunk_samples = 256;
+        let chunk_bytes = chunk_samples * frame_bytes;
+        let mut pcm_chunk = vec![0u8; chunk_bytes];
+        let mut written = 0usize;
+        while written < total_pcm_bytes {
+            let this_chunk = chunk_bytes.min(total_pcm_bytes - written);
+            // Fill with a pattern so it's not all zeros (exercises prediction)
+            for j in 0..this_chunk {
+                pcm_chunk[j] = ((written + j) % 251) as u8;
+            }
+            enc.write(&pcm_chunk[..this_chunk]).await.unwrap();
+
+            // Verify the channel buffers never exceed FLAC_BLOCK_SIZE
+            if let Some(ref state) = enc.flac_state {
+                for buf in &state.channel_buffers {
+                    assert!(
+                        buf.len() <= FLAC_BLOCK_SIZE,
+                        "channel buffer grew to {} samples, exceeding FLAC_BLOCK_SIZE={}",
+                        buf.len(),
+                        FLAC_BLOCK_SIZE,
+                    );
+                }
+            }
+
+            written += this_chunk;
+        }
+
+        let flac = enc.finish().await.unwrap();
+        assert_eq!(&flac[0..4], b"fLaC");
+
+        // Verify total samples in STREAMINFO
+        let total_lo = u32::from_be_bytes([flac[22], flac[23], flac[24], flac[25]]);
+        let total_hi = (flac[21] & 0x0F) as u64;
+        let encoded_total = (total_hi << 32) | total_lo as u64;
+        assert_eq!(
+            encoded_total, total_samples as u64,
+            "STREAMINFO total_samples should match"
+        );
+
+        // Verify min/max frame sizes were patched (non-zero)
+        let min_fs = u32::from_be_bytes([0, flac[12], flac[13], flac[14]]);
+        let max_fs = u32::from_be_bytes([0, flac[15], flac[16], flac[17]]);
+        assert!(min_fs > 0, "min_frame_size should be patched");
+        assert!(max_fs > 0, "max_frame_size should be patched");
+        assert!(max_fs >= min_fs, "max_frame_size >= min_frame_size");
+    }
+
+    /// Verify streaming works with unaligned write boundaries (PCM chunks that
+    /// don't align to sample boundaries).
+    #[tokio::test]
+    async fn streaming_unaligned_writes() {
+        let channels = 2u32;
+        let bit_depth = 16u32;
+        let sample_rate = 44100u32;
+
+        // 500 samples, stereo 16-bit = 2000 bytes
+        let mut pcm = Vec::with_capacity(2000);
+        for i in 0..500 {
+            for ch in 0..2 {
+                let val = ((i * 2 + ch) as i16).wrapping_mul(73);
+                pcm.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        // Write in chunks of 137 bytes (not a multiple of 4 = frame size)
+        let mut enc = AudioEncoder::new("flac", sample_rate, bit_depth, channels);
+        enc.start().await.unwrap();
+        for chunk in pcm.chunks(137) {
+            enc.write(chunk).await.unwrap();
+        }
+        let flac = enc.finish().await.unwrap();
+
+        assert_eq!(&flac[0..4], b"fLaC");
+
+        // Cross-check: single write should produce the same output
+        let mut enc2 = AudioEncoder::new("flac", sample_rate, bit_depth, channels);
+        enc2.start().await.unwrap();
+        enc2.write(&pcm).await.unwrap();
+        let flac2 = enc2.finish().await.unwrap();
+
+        assert_eq!(
+            flac, flac2,
+            "unaligned writes should produce same output as single write"
+        );
     }
 }
