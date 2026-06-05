@@ -292,6 +292,11 @@ impl OutputTarget for OaatOutput {
         tokio::spawn(async move {
             use futures_util::StreamExt;
 
+            eprintln!(
+                "OAAT-DEBUG: play_media spawned for {} url={}",
+                device_name, url
+            );
+
             let config = ControllerConfig {
                 controller_id,
                 controller_name: "Tune Server".into(),
@@ -303,6 +308,7 @@ impl OutputTarget for OaatOutput {
             // Connect with retry
             let mut endpoint: Option<ConnectedEndpoint> = None;
             for attempt in 1..=3u32 {
+                eprintln!("OAAT-DEBUG: connecting attempt {attempt} to {endpoint_addr}");
                 info!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
@@ -346,15 +352,18 @@ impl OutputTarget for OaatOutput {
             // Fetch & detect format
             let stream_id = format!("tune-{stream_num}");
 
+            eprintln!("OAAT-DEBUG: connected OK, fetching {url}");
             info!(device = %device_name, url = %url, "oaat: fetching audio stream");
             let resp = match http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
+                    eprintln!("OAAT-DEBUG: HTTP error {} for {url}", r.status());
                     error!(device = %device_name, status = %r.status(), url = %url, "oaat: HTTP error");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
                 Err(e) => {
+                    eprintln!("OAAT-DEBUG: fetch failed: {e} for {url}");
                     error!(device = %device_name, error = %e, url = %url, "oaat: fetch failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
