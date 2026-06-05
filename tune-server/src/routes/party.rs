@@ -1,4 +1,6 @@
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -17,6 +19,54 @@ pub fn router() -> Router<AppState> {
         .route("/queue", get(party_queue))
         .route("/vote", post(party_vote))
         .route("/vote/reset", post(party_vote_reset))
+}
+
+// --- Room handlers (used by mod.rs router at /party/rooms) ---
+
+pub async fn list_rooms(State(state): State<AppState>) -> Json<Value> {
+    let mgr = state.rooms.lock().await;
+    Json(json!({ "rooms": mgr.list_rooms() }))
+}
+
+pub async fn create_room(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let id = body["room_id"].as_str().unwrap_or("").to_string();
+    if id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "room_id required"}).to_string(),
+        )
+            .into_response();
+    }
+    let mut mgr = state.rooms.lock().await;
+    if mgr.create_room(&id) {
+        (StatusCode::CREATED, Json(json!({"room_id": id}))).into_response()
+    } else {
+        (
+            StatusCode::CONFLICT,
+            json!({"error": "room exists"}).to_string(),
+        )
+            .into_response()
+    }
+}
+
+pub async fn room_info(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let mgr = state.rooms.lock().await;
+    match mgr.room_info(&id) {
+        Some(info) => Json(info).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+pub async fn delete_room(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
+    let mut mgr = state.rooms.lock().await;
+    if mgr.delete_room(&id) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 fn load_queue(settings: &SettingsRepo) -> Vec<Value> {

@@ -215,7 +215,7 @@ pub(super) async fn artist_image(
     let hash = if super::artwork_is_hex_hash(image_path) {
         image_path.to_string()
     } else {
-        tune_core::artwork::artwork_hash(image_path)
+        tune_core::library::artwork::artwork_hash(image_path)
     };
 
     axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}")).into_response()
@@ -259,7 +259,7 @@ pub(super) async fn artist_image_upload(
     };
     let cache_dir = artwork_cache_dir();
     std::fs::create_dir_all(&cache_dir).ok();
-    let hash = tune_core::artwork::artwork_hash(&format!("artist-{id}"));
+    let hash = tune_core::library::artwork::artwork_hash(&format!("artist-{id}"));
     let path = cache_dir.join(format!("{hash}.{ext}"));
     if std::fs::write(&path, &data).is_err() {
         return (

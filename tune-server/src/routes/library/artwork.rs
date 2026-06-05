@@ -67,7 +67,7 @@ pub(super) async fn album_artwork(
         let hash = if is_hex_hash(cover_path) {
             cover_path.to_string()
         } else {
-            tune_core::artwork::artwork_hash(cover_path)
+            tune_core::library::artwork::artwork_hash(cover_path)
         };
         return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
             .into_response();
@@ -80,7 +80,7 @@ pub(super) async fn album_artwork(
     {
         let cache_dir = artwork_cache_dir();
         if let Some(hash) =
-            tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
+            tune_core::library::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
         {
             return axum::response::Redirect::temporary(&format!("/api/v1/library/artwork/{hash}"))
                 .into_response();
@@ -150,11 +150,12 @@ pub(super) async fn enrich_album_artwork(
             .into_response();
     };
 
-    match tune_core::artwork::fetch_cover_art(mbid).await {
+    match tune_core::library::artwork::fetch_cover_art(mbid).await {
         Some(data) => {
             let cache_dir = artwork_cache_dir();
-            let hash = tune_core::artwork::artwork_hash(mbid);
-            if tune_core::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+            let hash = tune_core::library::artwork::artwork_hash(mbid);
+            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            {
                 repo.update_cover_path(id, &hash).ok();
                 Json(json!({"enriched": true, "hash": hash, "size": data.len()})).into_response()
             } else {
@@ -197,7 +198,7 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
         .ok();
 
     tokio::spawn(async move {
-        tune_core::artwork::batch_enrich_artwork(db, cache_dir).await;
+        tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
 
     (
@@ -258,7 +259,7 @@ pub(super) async fn batch_enrich_artist_artwork(
         .ok();
 
     tokio::spawn(async move {
-        tune_core::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
+        tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
     });
 
     (
@@ -309,9 +310,10 @@ pub(super) async fn rescan_album_artwork(
     let mut found_hash: Option<String> = None;
     for track in &tracks {
         if let Some(ref file_path) = track.file_path {
-            if let Some(hash) =
-                tune_core::artwork::get_or_extract(std::path::Path::new(file_path), &cache_dir)
-            {
+            if let Some(hash) = tune_core::library::artwork::get_or_extract(
+                std::path::Path::new(file_path),
+                &cache_dir,
+            ) {
                 found_hash = Some(hash);
                 break;
             }
@@ -348,7 +350,7 @@ pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl In
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
             for track in &tracks {
                 if let Some(ref file_path) = track.file_path {
-                    if let Some(hash) = tune_core::artwork::get_or_extract(
+                    if let Some(hash) = tune_core::library::artwork::get_or_extract(
                         std::path::Path::new(file_path),
                         &cache_dir,
                     ) {

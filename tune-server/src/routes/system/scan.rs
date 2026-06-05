@@ -272,7 +272,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
                     if let Some(aid) = album_id
                         && !albums_with_cover.contains(&aid)
-                        && let Some(hash) = tune_core::artwork::get_or_extract(
+                        && let Some(hash) = tune_core::library::artwork::get_or_extract(
                             std::path::Path::new(&sf.path),
                             &cache_dir,
                         )
@@ -293,7 +293,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                                 {
                                     let candidate = parent.join(name);
                                     if candidate.exists() {
-                                        let hash = tune_core::artwork::artwork_hash(
+                                        let hash = tune_core::library::artwork::artwork_hash(
                                             &candidate.to_string_lossy(),
                                         );
                                         let ext = candidate
@@ -301,7 +301,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                                             .and_then(|e| e.to_str())
                                             .unwrap_or("jpg");
                                         if let Ok(data) = std::fs::read(&candidate) {
-                                            tune_core::artwork::save_to_cache(
+                                            tune_core::library::artwork::save_to_cache(
                                                 &data, &cache_dir, &hash, ext,
                                             );
                                         }
@@ -579,12 +579,12 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         let artist_cache_dir = cache_dir.clone();
         let artist_enrich_db = db.clone();
         handle.spawn(async move {
-            tune_core::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
+            tune_core::library::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
         });
 
         handle.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            tune_core::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
+            tune_core::library::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
         });
         }).await;
         if let Err(e) = result {

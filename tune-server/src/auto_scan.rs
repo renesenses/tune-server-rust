@@ -221,7 +221,7 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
 
                     if let Some(aid) = album_id
                         && !albums_with_cover.contains(&aid)
-                        && let Some(hash) = tune_core::artwork::get_or_extract(
+                        && let Some(hash) = tune_core::library::artwork::get_or_extract(
                             std::path::Path::new(&sf.path),
                             &cache_dir,
                         )
@@ -388,10 +388,12 @@ pub fn spawn_file_watcher(db: SqliteDb) {
 
                                     if let Some(aid) = album_id {
                                         let cache_dir = crate::routes::library::artwork_cache_dir();
-                                        if let Some(hash) = tune_core::artwork::get_or_extract(
-                                            std::path::Path::new(&sf.path),
-                                            &cache_dir,
-                                        ) {
+                                        if let Some(hash) =
+                                            tune_core::library::artwork::get_or_extract(
+                                                std::path::Path::new(&sf.path),
+                                                &cache_dir,
+                                            )
+                                        {
                                             album_repo.update_cover_path(aid, &hash).ok();
                                         }
                                         album_repo.update_track_count(aid).ok();

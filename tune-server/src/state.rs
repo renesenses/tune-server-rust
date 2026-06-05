@@ -9,7 +9,7 @@ use tune_core::discovery::ssdp::SsdpScanner;
 use tune_core::event_bus::EventBus;
 use tune_core::health_monitor::{AdvancedHealthMonitor, HealthMonitorConfig};
 use tune_core::http::streamer::AudioStreamer;
-use tune_core::metadata_suggestions::SuggestionStore;
+use tune_core::metadata::suggestions::SuggestionStore;
 use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
