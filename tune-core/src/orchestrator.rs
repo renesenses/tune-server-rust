@@ -222,12 +222,11 @@ impl PlaybackOrchestrator {
         let _is_dsd = source_format
             .as_ref()
             .is_some_and(|f| *f == AudioFormat::Dsd);
-        // OAAT endpoints: pass FLAC/WAV directly (native decode on endpoint).
-        // Only transcode exotic formats (AIFF, DSD, WavPack, APE).
+        // OAAT endpoints: transcode to WAV for reliable bit-perfect playback.
         let oaat_needs_wav = is_oaat_output
-            && source_format.as_ref().is_some_and(|f| {
-                *f != AudioFormat::Wav && *f != AudioFormat::Flac && f.needs_transcode_for_dlna()
-            });
+            && source_format
+                .as_ref()
+                .is_some_and(|f| *f != AudioFormat::Wav);
         let needs_transcode = source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna())
@@ -288,6 +287,7 @@ impl PlaybackOrchestrator {
                 target_fmt.container_format().to_string()
             };
             tokio::spawn(async move {
+                eprintln!("TRANSCODE-DEBUG: decoding {fp} sr={out_sr} ch={channels}");
                 let decode_result = crate::audio::decode::decode_to_pcm(
                     &fp,
                     Some(out_sr),
@@ -298,6 +298,12 @@ impl PlaybackOrchestrator {
 
                 match decode_result {
                     Ok(decoded) => {
+                        eprintln!(
+                            "TRANSCODE-DEBUG: decoded {} samples sr={} ch={}",
+                            decoded.samples.len(),
+                            decoded.sample_rate,
+                            decoded.channels
+                        );
                         // Convert i16 samples to raw PCM bytes (16-bit LE)
                         let pcm_bytes: Vec<u8> = decoded
                             .samples
@@ -337,6 +343,7 @@ impl PlaybackOrchestrator {
                         }
                     }
                     Err(e) => {
+                        eprintln!("TRANSCODE-DEBUG: decode FAILED: {e}");
                         warn!(error = %e, file = %fp, "transcode_decode_failed");
                     }
                 }

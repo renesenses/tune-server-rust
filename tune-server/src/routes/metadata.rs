@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -70,6 +72,14 @@ pub fn router() -> Router<AppState> {
         // Artist enrichment
         .route("/artists/{id}/enrich", get(enrich_artist))
         .route("/artists/{id}/similar", get(similar_artists))
+        // Genre fix tools
+        .route("/fix-genres", post(fix_genres))
+        .route("/fix-genres-by-artist", post(fix_genres_by_artist))
+        .route(
+            "/fix-genres-by-artist-fuzzy",
+            post(fix_genres_by_artist_fuzzy),
+        )
+        .route("/fix-genres-by-family", post(fix_genres_by_family))
 }
 
 async fn edit_track(
@@ -384,4 +394,1036 @@ async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> 
     let mut client = tune_core::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
     let data = client.get_similar(&artist.name).await;
     Json(json!(data)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Genre Fix Tools
+// ---------------------------------------------------------------------------
+
+/// Names to skip for genre propagation (compilations / unknown).
+const SKIP_ARTIST_NAMES: &[&str] = &[
+    "various artists",
+    "various",
+    "va",
+    "v.a.",
+    "unknown artist",
+    "unknown",
+    "?",
+    "compilation",
+    "compilations",
+];
+
+fn is_skip_artist(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SKIP_ARTIST_NAMES.iter().any(|&s| s == lower)
+}
+
+/// Genre synonym map — maps Last.fm/Discogs tags to canonical genre names.
+fn genre_map() -> HashMap<&'static str, &'static str> {
+    let entries: &[(&str, &str)] = &[
+        ("rock", "Rock"),
+        ("alternative rock", "Rock"),
+        ("indie rock", "Rock"),
+        ("classic rock", "Rock"),
+        ("hard rock", "Rock"),
+        ("progressive rock", "Progressive Rock"),
+        ("post-rock", "Rock"),
+        ("psychedelic rock", "Rock"),
+        ("punk rock", "Punk"),
+        ("pop", "Pop"),
+        ("indie pop", "Pop"),
+        ("synthpop", "Pop"),
+        ("electropop", "Pop"),
+        ("dream pop", "Pop"),
+        ("chamber pop", "Pop"),
+        ("art pop", "Pop"),
+        ("jazz", "Jazz"),
+        ("smooth jazz", "Jazz"),
+        ("free jazz", "Jazz"),
+        ("vocal jazz", "Jazz"),
+        ("cool jazz", "Jazz"),
+        ("bebop", "Jazz"),
+        ("hard bop", "Jazz"),
+        ("post-bop", "Jazz"),
+        ("jazz fusion", "Jazz"),
+        ("avant-garde jazz", "Jazz"),
+        ("contemporary jazz", "Jazz"),
+        ("electronic", "Electronic"),
+        ("ambient", "Electronic"),
+        ("downtempo", "Electronic"),
+        ("idm", "Electronic"),
+        ("trip-hop", "Electronic"),
+        ("house", "Electronic"),
+        ("techno", "Electronic"),
+        ("electronica", "Electronic"),
+        ("chillout", "Electronic"),
+        ("classical", "Classical"),
+        ("contemporary classical", "Classical"),
+        ("modern classical", "Classical"),
+        ("baroque", "Classical"),
+        ("romantic", "Classical"),
+        ("orchestral", "Classical"),
+        ("chamber music", "Classical"),
+        ("opera", "Classical"),
+        ("blues", "Blues"),
+        ("electric blues", "Blues"),
+        ("delta blues", "Blues"),
+        ("soul", "Soul"),
+        ("neo-soul", "Soul"),
+        ("r&b", "R&B"),
+        ("rnb", "R&B"),
+        ("funk", "Funk"),
+        ("hip-hop", "Hip-Hop"),
+        ("hip hop", "Hip-Hop"),
+        ("rap", "Hip-Hop"),
+        ("metal", "Metal"),
+        ("heavy metal", "Metal"),
+        ("progressive metal", "Metal"),
+        ("folk", "Folk"),
+        ("indie folk", "Folk"),
+        ("folk rock", "Folk"),
+        ("country", "Country"),
+        ("alt-country", "Country"),
+        ("reggae", "Reggae"),
+        ("dub", "Reggae"),
+        ("world", "World"),
+        ("afrobeat", "World"),
+        ("latin", "World"),
+        ("bossa nova", "World"),
+        ("chanson", "Chanson"),
+        ("chanson francaise", "Chanson"),
+        ("french", "Chanson"),
+        ("singer-songwriter", "Singer-Songwriter"),
+        ("soundtrack", "Soundtrack"),
+        ("film score", "Soundtrack"),
+        ("new wave", "New Wave"),
+        ("post-punk", "New Wave"),
+        ("experimental", "Experimental"),
+        ("avant-garde", "Experimental"),
+    ];
+    entries.iter().copied().collect()
+}
+
+/// Pick a genre from external service tags. When `allowed` is provided,
+/// only return a value already in the user's library vocabulary.
+fn normalize_genre(
+    tags: &[String],
+    allowed: Option<&HashMap<String, String>>,
+    gmap: &HashMap<&str, &str>,
+) -> Option<String> {
+    if let Some(allowed) = allowed {
+        // Direct hit in user's existing genres (case-insensitive).
+        for tag in tags {
+            let t = tag.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(hit) = allowed.get(&t.to_lowercase()) {
+                return Some(hit.clone());
+            }
+        }
+        // Synonym -> canonical bucket, but only if that bucket exists.
+        for tag in tags {
+            if let Some(&bucket) = gmap.get(tag.to_lowercase().trim()) {
+                if let Some(hit) = allowed.get(&bucket.to_lowercase()) {
+                    return Some(hit.clone());
+                }
+            }
+        }
+        return None;
+    }
+
+    // Unconstrained path.
+    for tag in tags {
+        if let Some(&normalized) = gmap.get(tag.to_lowercase().trim()) {
+            return Some(normalized.to_string());
+        }
+    }
+    for tag in tags {
+        let t = tag.trim();
+        if t.len() > 2 && t.len() < 30 && t.parse::<f64>().is_err() {
+            // Title-case the tag.
+            let mut chars = t.chars();
+            let first = chars
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_default();
+            return Some(format!("{first}{}", chars.as_str()));
+        }
+    }
+    None
+}
+
+/// Strip hi-res suffixes like "(96kHz/24bit)" from album titles for API lookups.
+fn clean_album_title(title: &str) -> String {
+    // Remove patterns like (44.1kHz), (96kHz/24bit), (192kHz 24bit) etc.
+    let mut result = String::with_capacity(title.len());
+    let mut depth = 0i32;
+    let mut paren_start = 0;
+    for (i, c) in title.chars().enumerate() {
+        if c == '(' {
+            if depth == 0 {
+                paren_start = i;
+            }
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth <= 0 {
+                depth = 0;
+                // Check if the parenthesized content looks like a hi-res suffix.
+                let inner = &title[paren_start + 1..i];
+                let lower = inner.to_lowercase();
+                if lower.contains("khz") || lower.contains("hz") {
+                    // Skip this parenthesized part (and leading whitespace).
+                    while result.ends_with(' ') {
+                        result.pop();
+                    }
+                } else {
+                    // Keep it.
+                    result.push_str(&title[paren_start..=i]);
+                }
+            }
+        } else if depth == 0 {
+            result.push(c);
+        }
+    }
+    result.trim().to_string()
+}
+
+/// Regex-free artist normalization for fuzzy grouping.
+/// Strips leading "The ", trailing ensemble suffixes (Quartet, Trio, Orchestra, etc.),
+/// and featuring clauses.
+fn normalize_artist_for_grouping(name: &str) -> String {
+    let mut n = name.trim().to_string();
+    if n.is_empty() {
+        return String::new();
+    }
+
+    // Strip leading "The "
+    if n.to_lowercase().starts_with("the ") {
+        n = n[4..].to_string();
+    }
+
+    // Iteratively strip trailing ensemble suffixes.
+    for _ in 0..3 {
+        let trimmed = strip_ensemble_suffix(&n);
+        if trimmed == n {
+            break;
+        }
+        n = trimmed;
+    }
+
+    n.to_lowercase().trim().to_string()
+}
+
+/// Strip trailing ensemble/featuring suffixes from artist name.
+fn strip_ensemble_suffix(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let lower = lower.trim();
+
+    // Ensemble words that can appear at the end.
+    let ensemble_words = &[
+        "quartet",
+        "quintet",
+        "trio",
+        "sextet",
+        "septet",
+        "octet",
+        "nonet",
+        "orchestra",
+        "big band",
+        "bigband",
+        "band",
+        "ensemble",
+        "group",
+        "project",
+        "combo",
+        "collective",
+        "players",
+    ];
+
+    // Check for "all stars" / "all-stars" variants at end.
+    for pat in &["all stars", "all-stars", "allstars", "all star"] {
+        if lower.ends_with(pat) {
+            let cut = name.len() - pat.len();
+            return name[..cut].trim().to_string();
+        }
+        // Also match "all star <word>" or "all-star <word>".
+        if let Some(pos) = lower.rfind(pat) {
+            if pos > 0 {
+                return name[..pos].trim().to_string();
+            }
+        }
+    }
+
+    // Check for ensemble words at the end.
+    for &word in ensemble_words {
+        if lower.ends_with(word) {
+            let cut = name.len() - word.len();
+            let before = name[..cut].trim();
+            if !before.is_empty() {
+                return before.to_string();
+            }
+        }
+    }
+
+    // Check for "feat.", "featuring", "and his/her", "with his/her", "& the/his/her".
+    for pat in &[
+        "feat.",
+        "feat ",
+        "featuring ",
+        "and his ",
+        "and her ",
+        "with his ",
+        "with her ",
+        "& the ",
+        "& his ",
+        "& her ",
+    ] {
+        if let Some(pos) = lower.rfind(pat) {
+            if pos > 0 {
+                return name[..pos].trim().to_string();
+            }
+        }
+    }
+
+    name.trim().to_string()
+}
+
+/// Genre family classification rules. First keyword match wins.
+const GENRE_FAMILY_RULES: &[(&str, &str)] = &[
+    ("soul", "soul-funk"),
+    ("funk", "soul-funk"),
+    ("r&b", "soul-funk"),
+    ("rnb", "soul-funk"),
+    ("jazz", "jazz"),
+    ("classical", "classical"),
+    ("baroque", "classical"),
+    ("opera", "classical"),
+    ("orchestral", "classical"),
+    ("blues", "blues"),
+    ("chanson", "chanson"),
+    ("variét", "chanson"),
+    ("bossa", "world"),
+    ("afro", "world"),
+    ("latin", "world"),
+    ("reggae", "world"),
+    ("tango", "world"),
+    ("world", "world"),
+    ("electro", "electro"),
+    ("electronic", "electro"),
+    ("techno", "electro"),
+    ("ambient", "electro"),
+    ("idm", "electro"),
+    ("house", "electro"),
+    ("folk", "folk"),
+    ("country", "country"),
+    ("soundtrack", "soundtrack"),
+    ("film", "soundtrack"),
+    ("rap", "hip-hop"),
+    ("hip-hop", "hip-hop"),
+    ("hip hop", "hip-hop"),
+    ("metal", "metal"),
+    ("punk", "punk"),
+    ("rock", "rock"),
+    ("pop", "pop"),
+];
+
+fn genre_family(genre: &str) -> &'static str {
+    let g = genre.to_lowercase();
+    for &(kw, fam) in GENRE_FAMILY_RULES {
+        if g.contains(kw) {
+            return fam;
+        }
+    }
+    "other"
+}
+
+#[derive(Deserialize)]
+struct CoherenceParams {
+    min_coherence: Option<f64>,
+}
+
+/// Helper: fetch all albums with artist info for genre propagation.
+fn fetch_albums_with_artists(
+    db: &tune_core::db::sqlite::SqliteDb,
+) -> Result<Vec<(i64, String, Option<String>, Option<i64>, Option<String>)>, String> {
+    let conn = db.read_connection();
+    let conn = conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT al.id, al.title, al.genre, al.artist_id, ar.name as artist_name \
+             FROM albums al \
+             LEFT JOIN artists ar ON al.artist_id = ar.id \
+             WHERE al.artist_id IS NOT NULL",
+        )
+        .map_err(|e| format!("prepare: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|e| format!("query: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect: {e}"))?;
+
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// POST /fix-genres-by-artist
+// ---------------------------------------------------------------------------
+
+async fn fix_genres_by_artist(
+    State(state): State<AppState>,
+    Query(params): Query<CoherenceParams>,
+) -> impl IntoResponse {
+    let min_coherence = params.min_coherence.unwrap_or(0.7);
+
+    let rows = match fetch_albums_with_artists(&state.db) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    // Group by artist_id: collect known genres + ids missing genre.
+    let mut by_artist_genres: HashMap<i64, HashMap<String, usize>> = HashMap::new();
+    let mut by_artist_missing: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
+    let mut artist_names: HashMap<i64, String> = HashMap::new();
+
+    for (album_id, title, genre, artist_id, artist_name) in &rows {
+        let aid = match artist_id {
+            Some(id) => *id,
+            None => continue,
+        };
+        let name = artist_name.as_deref().unwrap_or("").trim().to_string();
+        if name.is_empty() || is_skip_artist(&name) {
+            continue;
+        }
+        artist_names.entry(aid).or_insert_with(|| name.clone());
+        let g = genre.as_deref().unwrap_or("").trim().to_string();
+        if !g.is_empty() {
+            *by_artist_genres
+                .entry(aid)
+                .or_default()
+                .entry(g)
+                .or_insert(0) += 1;
+        } else {
+            by_artist_missing
+                .entry(aid)
+                .or_default()
+                .push((*album_id, title.clone()));
+        }
+    }
+
+    let mut fixed = 0usize;
+    let mut skipped_low_coherence = 0usize;
+    let mut skipped_no_known_genre = 0usize;
+    let mut details: Vec<serde_json::Value> = Vec::new();
+
+    for (aid, missing) in &by_artist_missing {
+        let counter = match by_artist_genres.get(aid) {
+            Some(c) => c,
+            None => {
+                skipped_no_known_genre += missing.len();
+                continue;
+            }
+        };
+        let total_known: usize = counter.values().sum();
+        let (top_genre, top_count) = counter
+            .iter()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(g, c)| (g.clone(), *c))
+            .unwrap();
+        let coherence = if total_known > 0 {
+            top_count as f64 / total_known as f64
+        } else {
+            0.0
+        };
+        if coherence < min_coherence {
+            skipped_low_coherence += missing.len();
+            continue;
+        }
+        for (album_id, title) in missing {
+            state
+                .db
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[
+                        &top_genre as &dyn rusqlite::types::ToSql,
+                        album_id as &dyn rusqlite::types::ToSql,
+                    ],
+                )
+                .ok();
+            fixed += 1;
+            if details.len() < 200 {
+                details.push(json!({
+                    "album": title,
+                    "artist": artist_names.get(aid).unwrap_or(&"?".to_string()),
+                    "genre": top_genre,
+                    "coherence": (coherence * 100.0).round() / 100.0,
+                    "based_on": total_known,
+                }));
+            }
+        }
+    }
+
+    let total_candidates: usize = by_artist_missing.values().map(|m| m.len()).sum();
+
+    Json(json!({
+        "ok": true,
+        "total": total_candidates,
+        "fixed": fixed,
+        "skipped_low_coherence": skipped_low_coherence,
+        "skipped_no_known_genre": skipped_no_known_genre,
+        "min_coherence": min_coherence,
+        "details": details,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /fix-genres-by-artist-fuzzy
+// ---------------------------------------------------------------------------
+
+async fn fix_genres_by_artist_fuzzy(
+    State(state): State<AppState>,
+    Query(params): Query<CoherenceParams>,
+) -> impl IntoResponse {
+    let min_coherence = params.min_coherence.unwrap_or(0.7);
+
+    let rows = match fetch_albums_with_artists(&state.db) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    // Group by normalized artist name (fuzzy).
+    let mut by_group_genres: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let mut by_group_missing: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+    let mut group_display: HashMap<String, String> = HashMap::new();
+
+    for (album_id, title, genre, _artist_id, artist_name) in &rows {
+        let name = artist_name.as_deref().unwrap_or("").trim().to_string();
+        if name.is_empty() || is_skip_artist(&name) {
+            continue;
+        }
+        let key = normalize_artist_for_grouping(&name);
+        if key.is_empty() {
+            continue;
+        }
+        // Display name: shortest variant as canonical label.
+        let current = group_display
+            .get(&key)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if name.len() < current {
+            group_display.insert(key.clone(), name.clone());
+        }
+        let g = genre.as_deref().unwrap_or("").trim().to_string();
+        if !g.is_empty() {
+            *by_group_genres
+                .entry(key.clone())
+                .or_default()
+                .entry(g)
+                .or_insert(0) += 1;
+        } else {
+            by_group_missing
+                .entry(key)
+                .or_default()
+                .push((*album_id, title.clone(), name.clone()));
+        }
+    }
+
+    let mut fixed = 0usize;
+    let mut skipped_low_coherence = 0usize;
+    let mut skipped_no_known_genre = 0usize;
+    let mut details: Vec<serde_json::Value> = Vec::new();
+
+    for (key, missing) in &by_group_missing {
+        let counter = match by_group_genres.get(key) {
+            Some(c) => c,
+            None => {
+                skipped_no_known_genre += missing.len();
+                continue;
+            }
+        };
+        let total_known: usize = counter.values().sum();
+        let (top_genre, top_count) = counter
+            .iter()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(g, c)| (g.clone(), *c))
+            .unwrap();
+        let coherence = if total_known > 0 {
+            top_count as f64 / total_known as f64
+        } else {
+            0.0
+        };
+        if coherence < min_coherence {
+            skipped_low_coherence += missing.len();
+            continue;
+        }
+        for (album_id, title, original_artist) in missing {
+            state
+                .db
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[
+                        &top_genre as &dyn rusqlite::types::ToSql,
+                        album_id as &dyn rusqlite::types::ToSql,
+                    ],
+                )
+                .ok();
+            fixed += 1;
+            if details.len() < 200 {
+                details.push(json!({
+                    "album": title,
+                    "artist": original_artist,
+                    "group": group_display.get(key).unwrap_or(key),
+                    "genre": top_genre,
+                    "coherence": (coherence * 100.0).round() / 100.0,
+                    "based_on": total_known,
+                }));
+            }
+        }
+    }
+
+    let total_candidates: usize = by_group_missing.values().map(|m| m.len()).sum();
+
+    Json(json!({
+        "ok": true,
+        "total": total_candidates,
+        "fixed": fixed,
+        "skipped_low_coherence": skipped_low_coherence,
+        "skipped_no_known_genre": skipped_no_known_genre,
+        "min_coherence": min_coherence,
+        "details": details,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /fix-genres-by-family
+// ---------------------------------------------------------------------------
+
+async fn fix_genres_by_family(
+    State(state): State<AppState>,
+    Query(params): Query<CoherenceParams>,
+) -> impl IntoResponse {
+    let min_coherence = params.min_coherence.unwrap_or(0.7);
+
+    let rows = match fetch_albums_with_artists(&state.db) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    // group_key -> family_name -> count
+    let mut family_counts: HashMap<String, HashMap<&str, usize>> = HashMap::new();
+    // group_key -> family_name -> specific_genre -> count
+    let mut family_specific: HashMap<String, HashMap<&str, HashMap<String, usize>>> =
+        HashMap::new();
+    let mut by_group_missing: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+    let mut group_display: HashMap<String, String> = HashMap::new();
+
+    for (album_id, title, genre, _artist_id, artist_name) in &rows {
+        let name = artist_name.as_deref().unwrap_or("").trim().to_string();
+        if name.is_empty() || is_skip_artist(&name) {
+            continue;
+        }
+        let key = normalize_artist_for_grouping(&name);
+        if key.is_empty() {
+            continue;
+        }
+        let current = group_display
+            .get(&key)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if name.len() < current {
+            group_display.insert(key.clone(), name.clone());
+        }
+        let g = genre.as_deref().unwrap_or("").trim().to_string();
+        if !g.is_empty() {
+            let fam = genre_family(&g);
+            *family_counts
+                .entry(key.clone())
+                .or_default()
+                .entry(fam)
+                .or_insert(0) += 1;
+            *family_specific
+                .entry(key.clone())
+                .or_default()
+                .entry(fam)
+                .or_default()
+                .entry(g)
+                .or_insert(0) += 1;
+        } else {
+            by_group_missing
+                .entry(key)
+                .or_default()
+                .push((*album_id, title.clone(), name.clone()));
+        }
+    }
+
+    let mut fixed = 0usize;
+    let mut skipped_low_coherence = 0usize;
+    let mut skipped_no_known_genre = 0usize;
+    let mut skipped_only_other_family = 0usize;
+    let mut details: Vec<serde_json::Value> = Vec::new();
+
+    for (key, missing) in &by_group_missing {
+        let counter = match family_counts.get(key) {
+            Some(c) => c,
+            None => {
+                skipped_no_known_genre += missing.len();
+                continue;
+            }
+        };
+        let total_known: usize = counter.values().sum();
+
+        // Pick top family (excluding "other").
+        let top_family = counter
+            .iter()
+            .filter(|&(f, _)| *f != "other")
+            .max_by_key(|&(_, c)| *c);
+        let (top_family, top_count) = match top_family {
+            Some((f, c)) => (*f, *c),
+            None => {
+                skipped_only_other_family += missing.len();
+                continue;
+            }
+        };
+        let coherence = if total_known > 0 {
+            top_count as f64 / total_known as f64
+        } else {
+            0.0
+        };
+        if coherence < min_coherence {
+            skipped_low_coherence += missing.len();
+            continue;
+        }
+
+        // Most common specific genre within that family.
+        let target_genre = family_specific
+            .get(key)
+            .and_then(|fam_map| fam_map.get(top_family))
+            .and_then(|specific| {
+                specific
+                    .iter()
+                    .max_by_key(|&(_, c)| *c)
+                    .map(|(g, _)| g.clone())
+            })
+            .unwrap_or_default();
+
+        if target_genre.is_empty() {
+            continue;
+        }
+
+        for (album_id, title, original_artist) in missing {
+            state
+                .db
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[
+                        &target_genre as &dyn rusqlite::types::ToSql,
+                        album_id as &dyn rusqlite::types::ToSql,
+                    ],
+                )
+                .ok();
+            fixed += 1;
+            if details.len() < 200 {
+                details.push(json!({
+                    "album": title,
+                    "artist": original_artist,
+                    "group": group_display.get(key).unwrap_or(key),
+                    "family": top_family,
+                    "genre": target_genre,
+                    "family_coherence": (coherence * 100.0).round() / 100.0,
+                    "based_on": total_known,
+                }));
+            }
+        }
+    }
+
+    let total_candidates: usize = by_group_missing.values().map(|m| m.len()).sum();
+
+    Json(json!({
+        "ok": true,
+        "total": total_candidates,
+        "fixed": fixed,
+        "skipped_low_coherence": skipped_low_coherence,
+        "skipped_no_known_genre": skipped_no_known_genre,
+        "skipped_only_other_family": skipped_only_other_family,
+        "min_coherence": min_coherence,
+        "details": details,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /fix-genres (Last.fm + Discogs)
+// ---------------------------------------------------------------------------
+
+async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
+    let svc_mgr = tune_core::services_manager::ServicesManager::new(state.db.clone());
+
+    // Prefer DB-stored credentials, fall back to config / settings repo.
+    let settings = SettingsRepo::new(state.db.clone());
+    let lastfm_key = svc_mgr
+        .get_credential("lastfm", "api_key")
+        .or_else(|| settings.get("lastfm_api_key").ok().flatten())
+        .filter(|s| !s.is_empty());
+    let discogs_token = svc_mgr
+        .get_credential("discogs", "token")
+        .or_else(|| state.config.discogs_token.clone())
+        .filter(|s| !s.is_empty());
+
+    if lastfm_key.is_none() && discogs_token.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "No Last.fm or Discogs credentials configured"})),
+        )
+            .into_response();
+    }
+
+    // Fetch albums with no genre.
+    let rows = {
+        let conn = state.db.read_connection();
+        let conn = conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT al.id, al.title, ar.name as artist_name \
+             FROM albums al \
+             LEFT JOIN artists ar ON al.artist_id = ar.id \
+             WHERE al.genre IS NULL OR al.genre = '' \
+             ORDER BY al.title",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"ok": false, "error": format!("prepare: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        let result: Result<Vec<(i64, String, Option<String>)>, _> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| format!("query: {e}"))
+            .and_then(|iter| {
+                iter.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("row: {e}"))
+            });
+        match result {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"ok": false, "error": e})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if rows.is_empty() {
+        return Json(json!({"ok": true, "total": 0, "fixed": 0})).into_response();
+    }
+
+    // When respect_vocabulary is on, only assign genres already in library.
+    let respect_vocab = settings
+        .get("metadata_fix_genres_respect_vocabulary")
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let allowed_genres: Option<HashMap<String, String>> = if respect_vocab {
+        let conn = state.db.read_connection();
+        let conn = conn.lock().unwrap();
+        let map = conn
+            .prepare("SELECT DISTINCT genre FROM albums WHERE genre IS NOT NULL AND genre <> ''")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .ok()
+                    .map(|iter| {
+                        iter.filter_map(|r| r.ok())
+                            .map(|g| (g.to_lowercase(), g))
+                            .collect::<HashMap<String, String>>()
+                    })
+            });
+        map
+    } else {
+        None
+    };
+
+    let gmap = genre_map();
+    let total = rows.len();
+    let mut fixed = 0usize;
+    let mut details: Vec<serde_json::Value> = Vec::new();
+
+    let client = &state.http_client;
+
+    for (album_id, album_title, artist_name) in &rows {
+        let artist_name = artist_name.as_deref().unwrap_or("");
+        if album_title.is_empty() || album_title == "Unknown Album" {
+            continue;
+        }
+
+        let clean_title = clean_album_title(album_title);
+        let mut genre: Option<String> = None;
+
+        // 1) Last.fm
+        if let Some(ref api_key) = lastfm_key {
+            let resp = client
+                .get("https://ws.audioscrobbler.com/2.0/")
+                .query(&[
+                    ("method", "album.getinfo"),
+                    ("api_key", api_key.as_str()),
+                    ("artist", artist_name),
+                    ("album", &clean_title),
+                    ("format", "json"),
+                ])
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().is_success() {
+                    if let Ok(data) = resp.json::<serde_json::Value>().await {
+                        let tags: Vec<String> = data
+                            .get("album")
+                            .and_then(|a| a.get("tags"))
+                            .and_then(|t| t.get("tag"))
+                            .and_then(|t| t.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        genre = normalize_genre(&tags, allowed_genres.as_ref(), &gmap);
+                    }
+                }
+            }
+        }
+
+        // 2) Discogs fallback
+        if genre.is_none() {
+            if let Some(ref token) = discogs_token {
+                let mut query_params = vec![
+                    ("release_title".to_string(), clean_title.clone()),
+                    ("type".to_string(), "release".to_string()),
+                    ("per_page".to_string(), "3".to_string()),
+                ];
+                if !artist_name.is_empty() && artist_name != "Unknown Artist" && artist_name != "?"
+                {
+                    query_params.push(("artist".to_string(), artist_name.to_string()));
+                }
+
+                let resp = client
+                    .get("https://api.discogs.com/database/search")
+                    .query(&query_params)
+                    .header("User-Agent", "TuneServer/2.0 +https://mozaiklabs.fr")
+                    .header("Authorization", format!("Discogs token={token}"))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await;
+
+                if let Ok(resp) = resp {
+                    if resp.status().as_u16() == 429 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    } else if resp.status().is_success() {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
+                                for hit in results {
+                                    let mut styles: Vec<String> = Vec::new();
+                                    if let Some(arr) = hit.get("style").and_then(|v| v.as_array()) {
+                                        for v in arr {
+                                            if let Some(s) = v.as_str() {
+                                                styles.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                    if let Some(arr) = hit.get("genre").and_then(|v| v.as_array()) {
+                                        for v in arr {
+                                            if let Some(s) = v.as_str() {
+                                                styles.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                    genre =
+                                        normalize_genre(&styles, allowed_genres.as_ref(), &gmap);
+                                    if genre.is_some() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref g) = genre {
+            state
+                .db
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[
+                        g as &dyn rusqlite::types::ToSql,
+                        album_id as &dyn rusqlite::types::ToSql,
+                    ],
+                )
+                .ok();
+            fixed += 1;
+            if details.len() < 100 {
+                details.push(json!({
+                    "album": album_title,
+                    "artist": artist_name,
+                    "genre": g,
+                }));
+            }
+        }
+
+        // Rate-limit to avoid hammering APIs.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    Json(json!({
+        "ok": true,
+        "total": total,
+        "fixed": fixed,
+        "not_found": total - fixed,
+        "details": details,
+    }))
+    .into_response()
 }
