@@ -68,7 +68,8 @@ impl PlaybackOrchestrator {
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
         // Remember old session for cleanup AFTER output has been stopped
         let prev_state = self.playback.get_state(req.zone_id).await;
-        let old_stream_id = prev_state.now_playing
+        let old_stream_id = prev_state
+            .now_playing
             .as_ref()
             .and_then(|np| np.stream_id.clone());
 
@@ -138,6 +139,11 @@ impl PlaybackOrchestrator {
         } else {
             (false, None)
         };
+
+        // Clean up old session now that the output has been stopped by play_media
+        if let Some(ref old_sid) = old_stream_id {
+            self.streamer.remove_session(old_sid).await;
+        }
 
         self.record_listen(
             &title,
@@ -773,13 +779,11 @@ impl PlaybackOrchestrator {
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
-        // Clean up stream session before stopping
         let state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = state.now_playing
-            && let Some(ref stream_id) = np.stream_id
-        {
-            self.streamer.remove_session(stream_id).await;
-        }
+        let old_stream_id = state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.clone());
         self.playback.stop(zone_id).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
@@ -788,6 +792,10 @@ impl PlaybackOrchestrator {
                     warn!(zone_id, error = %e, "device_stop_failed");
                 }
             }
+        }
+        // Remove session AFTER the output has been stopped
+        if let Some(ref sid) = old_stream_id {
+            self.streamer.remove_session(sid).await;
         }
     }
 

@@ -854,7 +854,32 @@ impl OutputTarget for OaatOutput {
                                 })).await.ok();
 
                                 if is_flac {
-                                    warn!(device = %device_name, "oaat: seek not supported for FLAC");
+                                    match http_client.get(&url).send().await {
+                                        Ok(resp) if resp.status().is_success() => {
+                                            stream = Box::pin(resp.bytes_stream());
+                                            buf.clear();
+                                            let mut header_ok = true;
+                                            while buf.len() < 65536 {
+                                                match stream.next().await {
+                                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                                                    Some(Err(_)) | None => { header_ok = false; break; }
+                                                }
+                                            }
+                                            if header_ok {
+                                                byte_offset = 0;
+                                                sample_offset = 0;
+                                                let elapsed_eq = std::time::Duration::from_millis(seek_pos);
+                                                start = std::time::Instant::now() - elapsed_eq;
+                                                pause_offset = std::time::Duration::ZERO;
+                                                position_ms.store(seek_pos, Ordering::SeqCst);
+                                                info!(device = %device_name, seek_pos, "oaat: FLAC seek — stream restarted");
+                                            } else {
+                                                warn!(device = %device_name, "oaat: FLAC seek re-buffer failed");
+                                            }
+                                        }
+                                        Ok(resp) => warn!(device = %device_name, status = %resp.status(), "oaat: FLAC seek re-fetch failed"),
+                                        Err(e) => warn!(device = %device_name, error = %e, "oaat: FLAC seek re-fetch failed"),
+                                    }
                                 } else {
                                     // Calculate byte offset
                                     let bytes_per_sec = if is_dsd {
