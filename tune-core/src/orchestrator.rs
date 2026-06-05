@@ -113,6 +113,17 @@ impl PlaybackOrchestrator {
                 Some(ref sid) => self.streamer.get_stream_ready_notify(sid).await,
                 None => None,
             };
+            let local_file_path = if source == "local" {
+                req.track_id.and_then(|tid| {
+                    TrackRepo::new(self.db.clone())
+                        .get(tid)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.file_path)
+                })
+            } else {
+                None
+            };
             let media = crate::outputs::traits::PlayMedia {
                 url: &stream_url,
                 mime_type: &mime_type,
@@ -122,6 +133,7 @@ impl PlaybackOrchestrator {
                 cover_url: resolved_cover_url.as_deref(),
                 duration_ms: duration_ms.map(|d| d as u64),
                 file_size,
+                file_path: local_file_path.as_deref(),
                 stream_ready,
             };
             self.send_to_output(device_id, &media).await

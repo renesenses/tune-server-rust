@@ -695,6 +695,7 @@ impl PositionPoller {
                         cover_url: resolved.cover_url.as_deref(),
                         duration_ms: resolved.duration_ms,
                         file_size: None,
+                        file_path: None,
                         stream_ready: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {

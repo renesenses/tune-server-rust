@@ -253,6 +253,7 @@ impl OutputTarget for OaatOutput {
         self.stop().await.ok();
 
         let url = media.url.to_owned();
+        let file_path = media.file_path.map(|s| s.to_owned());
         let title = media.title.unwrap_or("Unknown").to_owned();
         let artist = media.artist.unwrap_or("Unknown").to_owned();
         let album = media.album.unwrap_or("").to_owned();
@@ -351,6 +352,201 @@ impl OutputTarget for OaatOutput {
 
             // Fetch & detect format
             let stream_id = format!("tune-{stream_num}");
+
+            // If we have a local file path, read directly instead of HTTP self-fetch
+            if let Some(ref fp) = file_path {
+                eprintln!("OAAT-DEBUG: reading file directly: {fp}");
+                let file_data = match tokio::fs::read(fp).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("OAAT-DEBUG: file read failed: {e}");
+                        error!(device = %device_name, error = %e, file = %fp, "oaat: file read failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                let mut buf = file_data;
+                let si = match detect_and_parse(&mut buf) {
+                    Some(info) => info,
+                    None => {
+                        eprintln!("OAAT-DEBUG: unsupported file format");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                eprintln!(
+                    "OAAT-DEBUG: file format {:?} {}Hz {}bit {}ch, {} bytes PCM",
+                    si.format,
+                    si.sample_rate,
+                    si.bits_per_sample,
+                    si.channels,
+                    buf.len()
+                );
+
+                let is_flac = si.format == AudioFormat::Flac;
+                let cur_format = if is_flac {
+                    AudioFormat::PcmS16le
+                } else {
+                    si.format
+                };
+                let cur_sample_rate = si.sample_rate;
+                let cur_bits = si.bits_per_sample;
+                let ch = si.channels.min(8) as u8;
+                let layout = ChannelLayout::Stereo;
+                let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
+
+                // For FLAC files, convert to WAV via ffmpeg then re-parse
+                let pcm_data = if is_flac {
+                    eprintln!("OAAT-DEBUG: converting FLAC to WAV via ffmpeg...");
+                    match super::helpers::decode_flac_to_pcm(fp) {
+                        Some(wav_data) => {
+                            let mut wav_buf = wav_data;
+                            if let Some(wav_si) = detect_and_parse(&mut wav_buf) {
+                                eprintln!(
+                                    "OAAT-DEBUG: WAV decoded: {} bytes, {}Hz {}bit",
+                                    wav_buf.len(),
+                                    wav_si.sample_rate,
+                                    wav_si.bits_per_sample
+                                );
+                                // Update format info from WAV
+                                // cur_format, cur_bits etc already set but we use wav_buf as PCM
+                            }
+                            wav_buf
+                        }
+                        None => {
+                            eprintln!("OAAT-DEBUG: ffmpeg FLAC->WAV failed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                } else {
+                    buf
+                };
+
+                let fmt_str = format_rate_display(cur_sample_rate, cur_bits, cur_format);
+                if let Err(e) = endpoint
+                    .propose_format(
+                        &stream_id,
+                        cur_format,
+                        cur_sample_rate,
+                        ch,
+                        layout,
+                        cur_bits as u8,
+                    )
+                    .await
+                {
+                    error!(device = %device_name, error = %e, "oaat: format propose failed");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                endpoint
+                    .send_metadata(oaat_core::message::TrackMetadata {
+                        title: title.clone(),
+                        artist: artist.clone(),
+                        album: album.clone(),
+                        duration_ms: track_duration_ms,
+                        artwork_url: cover_url.clone(),
+                        format: Some(fmt_str),
+                    })
+                    .await
+                    .ok();
+
+                if let Err(e) = endpoint.send_play(&stream_id).await {
+                    error!(device = %device_name, error = %e, "oaat: play failed");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                diag.connected.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "OAAT-DEBUG: streaming {} bytes PCM directly",
+                    pcm_data.len()
+                );
+
+                let packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
+                let mut offset = 0usize;
+                let mut sample_offset: u64 = 0;
+                let start = std::time::Instant::now();
+
+                while offset < pcm_data.len() && playing.load(Ordering::Relaxed) {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    while paused.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if stop_rx.try_recv().is_ok() {
+                            break;
+                        }
+                    }
+
+                    let chunk_bytes = packet_size.min(pcm_data.len() - offset);
+                    let chunk_samples = chunk_bytes / bytes_per_frame;
+                    let payload = &pcm_data[offset..offset + chunk_bytes];
+                    let pts_ns = (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                    let flags = if offset == 0 {
+                        PacketFlags::FIRST_PACKET
+                    } else {
+                        PacketFlags::empty()
+                    };
+
+                    if endpoint
+                        .send_audio(
+                            stream_num,
+                            cur_format,
+                            pts_ns,
+                            sample_offset,
+                            payload,
+                            flags,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    offset += chunk_bytes;
+                    sample_offset += chunk_samples as u64;
+                    diag.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    diag.bytes_sent
+                        .fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+
+                    position_ms.store(
+                        sample_offset * 1000 / cur_sample_rate as u64,
+                        Ordering::Relaxed,
+                    );
+
+                    let expected = std::time::Duration::from_nanos(
+                        (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                    );
+                    let elapsed = start.elapsed();
+                    if expected > elapsed {
+                        tokio::time::sleep(expected - elapsed).await;
+                    }
+                }
+
+                endpoint
+                    .send_audio(
+                        stream_num,
+                        cur_format,
+                        0,
+                        sample_offset,
+                        &[],
+                        PacketFlags::LAST_PACKET,
+                    )
+                    .await
+                    .ok();
+                endpoint.send_stop(&stream_id).await.ok();
+                playing.store(false, Ordering::SeqCst);
+                diag.connected.store(false, Ordering::SeqCst);
+                eprintln!(
+                    "OAAT-DEBUG: direct file playback complete, {} samples",
+                    sample_offset
+                );
+                return;
+            }
 
             eprintln!("OAAT-DEBUG: connected OK, fetching {url}");
             info!(device = %device_name, url = %url, "oaat: fetching audio stream");
