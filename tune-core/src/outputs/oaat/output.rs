@@ -348,7 +348,6 @@ impl OutputTarget for OaatOutput {
             // Fetch & detect format
             let stream_id = format!("tune-{stream_num}");
 
-<<<<<<< HEAD
             // If we have a local file path, read directly instead of HTTP self-fetch
             if let Some(ref fp) = file_path {
                 debug!("reading file directly: {fp}");
