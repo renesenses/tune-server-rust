@@ -92,6 +92,8 @@ pub struct LocalOutput {
     track_title: Arc<std::sync::Mutex<Option<String>>>,
     track_artist: Arc<std::sync::Mutex<Option<String>>>,
     stop_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Handle to the playback thread so `stop()` can wait for it to exit.
+    play_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
     exclusive_mode: bool,
@@ -123,6 +125,7 @@ impl LocalOutput {
             track_title: Arc::new(std::sync::Mutex::new(None)),
             track_artist: Arc::new(std::sync::Mutex::new(None)),
             stop_tx: std::sync::Mutex::new(None),
+            play_thread: std::sync::Mutex::new(None),
             exclusive_mode,
         }
     }
@@ -204,6 +207,86 @@ impl RingBuf {
         self.read.store(r + n as u64, Ordering::Release);
         n
     }
+}
+
+/// Decode a compressed audio stream (FLAC, MP3, AAC, etc.) into f32 samples using symphonia.
+/// Returns (channels, sample_rate, samples) or None if decoding fails.
+fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
+    use std::io::Cursor;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let cursor = Cursor::new(data.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+    let hint = Hint::new();
+
+    let mut format: Box<dyn symphonia::core::formats::FormatReader> =
+        symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .ok()?;
+
+    let track = format.default_track(TrackType::Audio)?;
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return None,
+    };
+    let track_id = track.id;
+    let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .ok()?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // Convert decoded audio to interleaved f32 samples
+        let mut packet_samples: Vec<f32> = Vec::new();
+        decoded.copy_to_vec_interleaved::<f32>(&mut packet_samples);
+        all_samples.extend_from_slice(&packet_samples);
+    }
+
+    if all_samples.is_empty() {
+        return None;
+    }
+
+    info!(
+        channels,
+        sample_rate,
+        samples = all_samples.len(),
+        "local_audio_decoded_compressed_stream"
+    );
+
+    Some((channels, sample_rate, all_samples))
 }
 
 /// Parse a WAV header and return (channels, sample_rate, bit_depth, data_offset).
@@ -337,7 +420,7 @@ impl OutputTarget for LocalOutput {
         position_ms.store(0, Ordering::SeqCst);
         duration_ms_shared.store(0, Ordering::SeqCst);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             // ------- HTTP fetch the audio stream -------
             let response = match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
@@ -383,11 +466,157 @@ impl OutputTarget for LocalOutput {
                     );
                     parsed
                 } else {
-                    // No WAV header — assume raw PCM with server defaults (44100/16/2)
-                    // or try to infer from MIME type. The streamer always sends WAV for
-                    // local files, so this path is a fallback for edge cases.
-                    info!("local_audio_no_wav_header_assuming_raw_pcm");
-                    (2u16, 44100u32, 16u16, 0)
+                    // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
+                    // Read the rest of the stream, decode with symphonia, and play.
+                    info!("local_audio_non_wav_stream_detected_decoding");
+
+                    // Read the entire remaining stream
+                    let mut all_data = header_buf.clone();
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        if stop_rx.try_recv().is_ok() {
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                            Err(e) => {
+                                warn!(error = %e, "local_audio_compressed_read_error");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Decode the compressed audio
+                    let Some((dec_channels, dec_sample_rate, decoded_samples)) =
+                        decode_compressed_stream(&all_data)
+                    else {
+                        warn!("local_audio_decode_compressed_failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    };
+
+                    // Now play the decoded f32 samples using cpal shared mode
+                    let dec_ch = dec_channels;
+                    let dec_sr = dec_sample_rate;
+                    let decoded_len = decoded_samples.len();
+
+                    let host = cpal::default_host();
+                    let device = if device_name == "default" {
+                        host.default_output_device()
+                    } else {
+                        host.output_devices().ok().and_then(|mut devs| {
+                            devs.find(|d| {
+                                d.description()
+                                    .map(|desc| {
+                                        let n = desc.name().to_string();
+                                        n == device_name || n.contains(&device_name)
+                                    })
+                                    .unwrap_or(false)
+                            })
+                        })
+                    };
+
+                    let Some(device) = device else {
+                        warn!(name = %device_name, "audio_device_not_found");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    };
+
+                    // Try source sample rate first, then fall back to device default
+                    let output_config = find_matching_config(&device, dec_ch, dec_sr)
+                        .or_else(|| device.default_output_config().ok().map(|c| c.config()))
+                        .unwrap_or(cpal::StreamConfig {
+                            channels: dec_ch,
+                            sample_rate: dec_sr,
+                            buffer_size: cpal::BufferSize::Default,
+                        });
+
+                    let output_sr = output_config.sample_rate;
+                    let output_ch = output_config.channels;
+
+                    let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
+                    let ring = Arc::new(RingBuf::new(ring_cap));
+                    let ring_cb = ring.clone();
+                    let vol_cb = volume.clone();
+                    let paused_cb = paused.clone();
+
+                    let stream = match device.build_output_stream(
+                        &output_config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            if paused_cb.load(Ordering::Relaxed) {
+                                data.fill(0.0);
+                                return;
+                            }
+                            let read = ring_cb.pop(data);
+                            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                            for sample in &mut data[..read] {
+                                *sample *= v;
+                            }
+                            if read < data.len() {
+                                data[read..].fill(0.0);
+                            }
+                        },
+                        |e| warn!(error = %e, "audio_stream_error"),
+                        None,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "audio_stream_build_failed_compressed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+
+                    info!(
+                        device = %device_name,
+                        dec_sr,
+                        dec_ch,
+                        output_sr,
+                        output_ch,
+                        samples = decoded_len,
+                        "local_audio_compressed_playing"
+                    );
+
+                    if let Err(e) = stream.play() {
+                        warn!(error = %e, "audio_stream_play_failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+
+                    // Adapt channels and resample if needed
+                    let mut samples = decoded_samples;
+                    if dec_ch != output_ch {
+                        samples = adapt_channels(&samples, dec_ch, output_ch);
+                    }
+                    if dec_sr != output_sr {
+                        samples = simple_resample(&samples, dec_sr, output_sr, output_ch);
+                    }
+
+                    // Feed all samples to ring buffer
+                    feed_ring(&ring, &samples, &stop_rx, &paused);
+
+                    // Update position
+                    let total_frames = decoded_len as u64 / dec_ch as u64;
+                    let duration = (total_frames as f64 / dec_sr as f64 * 1000.0) as u64;
+                    position_ms.store(duration, Ordering::Relaxed);
+
+                    // Wait for ring buffer to drain
+                    loop {
+                        if stop_rx.try_recv().is_ok() {
+                            break;
+                        }
+                        if ring.available() == 0 {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+
+                    drop(stream);
+                    playing.store(false, Ordering::SeqCst);
+                    info!(device = %device_name, "local_audio_compressed_stopped");
+                    return;
                 };
 
             let bytes_per_sample = (bit_depth / 8) as usize;
@@ -809,6 +1038,7 @@ impl OutputTarget for LocalOutput {
         });
 
         *self.stop_tx.lock().unwrap() = Some(stop_tx);
+        *self.play_thread.lock().unwrap() = Some(handle);
         Ok(())
     }
 
@@ -823,11 +1053,37 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        // Send the stop signal first
         if let Some(tx) = self.stop_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
-        self.playing.store(false, Ordering::SeqCst);
+        // Unpause so the thread unblocks from pause-wait loops
         self.paused.store(false, Ordering::SeqCst);
+        // Wait for the playback thread to actually exit so the audio
+        // device is fully released before a new track starts.
+        // Use a bounded wait (2 seconds) to avoid blocking indefinitely
+        // if the thread is stuck in a long HTTP read.
+        let old_handle = self.play_thread.lock().unwrap().take();
+        if let Some(handle) = old_handle {
+            let _ = tokio::task::spawn_blocking(move || {
+                // Park in a loop checking if the thread has finished
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if handle.is_finished() {
+                        let _ = handle.join();
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        warn!("local_audio_stop_thread_join_timeout");
+                        // Thread is still running; it will clean up eventually
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .await;
+        }
+        self.playing.store(false, Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;

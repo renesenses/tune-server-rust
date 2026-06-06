@@ -460,18 +460,150 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+        let is_local_stream = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
 
-        let (stream_url, sid) = if is_https && is_oaat_stream {
-            let session_id = self
-                .streamer
-                .create_proxy_session(info.clone(), stream_data.url.clone(), false)
+        // Local and OAAT outputs expect raw PCM in a WAV container.
+        // Streaming services deliver compressed audio (FLAC, AAC, etc.)
+        // which LocalOutput cannot decode — it would interpret compressed
+        // bytes as raw PCM samples, producing white noise.
+        // Fix: download → decode → WAV transcode, same as local files.
+        let (stream_url, sid, out_mime) = if is_local_stream || is_oaat_stream {
+            let upstream_url = stream_data.url.clone();
+            let codec = stream_data.quality.codec.to_lowercase();
+            let sr = stream_data.quality.sample_rate;
+            let bd = stream_data.quality.bit_depth.max(16).min(24);
+
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: sr,
+                bit_depth: bd,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+            };
+
+            let (session_id, tx) = self.streamer.create_session(wav_info, false, 256).await;
+
+            info!(
+                service = service_name,
+                codec = %codec,
+                sample_rate = sr,
+                bit_depth = bd,
+                "streaming_transcode_to_wav_for_local_output"
+            );
+
+            // Background task: download upstream → temp file → decode → WAV → session
+            tokio::spawn(async move {
+                // Download to temp file on a blocking thread
+                let tmp_path = format!("/tmp/tune-stream-{}.{}", uuid::Uuid::new_v4(), codec);
+                let tmp_path_clone = tmp_path.clone();
+                let upstream = upstream_url.clone();
+                let download_result = tokio::task::spawn_blocking(move || {
+                    let resp = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(120))
+                        .build()
+                        .and_then(|c| c.get(&upstream).send());
+                    match resp {
+                        Ok(mut r) if r.status().is_success() => {
+                            let mut file = match std::fs::File::create(&tmp_path_clone) {
+                                Ok(f) => f,
+                                Err(e) => return Err(format!("tmp create: {e}")),
+                            };
+                            match std::io::copy(&mut r, &mut file) {
+                                Ok(bytes) => {
+                                    debug!(bytes, path = %tmp_path_clone, "streaming_download_complete");
+                                    Ok(tmp_path_clone)
+                                }
+                                Err(e) => Err(format!("download copy: {e}")),
+                            }
+                        }
+                        Ok(r) => Err(format!("upstream HTTP {}", r.status())),
+                        Err(e) => Err(format!("upstream fetch: {e}")),
+                    }
+                })
                 .await;
+
+                let tmp_file = match download_result {
+                    Ok(Ok(path)) => path,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "streaming_transcode_download_failed");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "streaming_transcode_task_join_failed");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return;
+                    }
+                };
+
+                // Decode to PCM
+                let decode_result =
+                    crate::audio::decode::decode_to_pcm(&tmp_file, Some(sr), Some(2), 0.0, 0.0);
+
+                // Clean up temp file
+                let _ = std::fs::remove_file(&tmp_file);
+
+                match decode_result {
+                    Ok(decoded) => {
+                        debug!(
+                            samples = decoded.samples.len(),
+                            sample_rate = decoded.sample_rate,
+                            channels = decoded.channels,
+                            "streaming_transcode_decoded"
+                        );
+                        // Convert i16 samples to raw PCM bytes (16-bit LE)
+                        let pcm_bytes: Vec<u8> = decoded
+                            .samples
+                            .iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+
+                        // Encode to WAV
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            "wav",
+                            decoded.sample_rate,
+                            16, // decode_to_pcm produces i16 samples
+                            decoded.channels,
+                        );
+                        if let Err(e) = encoder.start().await {
+                            warn!(error = %e, "streaming_transcode_encoder_start_failed");
+                            return;
+                        }
+                        if let Err(e) = encoder.write(&pcm_bytes).await {
+                            warn!(error = %e, "streaming_transcode_encoder_write_failed");
+                            return;
+                        }
+                        match encoder.finish().await {
+                            Ok(wav_data) => {
+                                for chunk in wav_data.chunks(32768) {
+                                    if tx.send(chunk.to_vec()).await.is_err() {
+                                        debug!("streaming_transcode_consumer_dropped");
+                                        return;
+                                    }
+                                }
+                                debug!("streaming_transcode_complete");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "streaming_transcode_encode_failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "streaming_transcode_decode_failed");
+                    }
+                }
+            });
+
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            let ext = &info.format;
-            let url = self.streamer.get_stream_url(&session_id, &server_ip, ext);
-            (url, Some(session_id))
+            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (url, Some(session_id), "audio/wav".to_string())
         } else if is_https {
             let session_id = self
                 .streamer
@@ -485,9 +617,9 @@ impl PlaybackOrchestrator {
                 &server_ip,
                 &stream_data.quality.codec.to_lowercase(),
             );
-            (url, Some(session_id))
+            (url, Some(session_id), stream_data.mime_type.clone())
         } else {
-            (stream_data.url.clone(), None)
+            (stream_data.url.clone(), None, stream_data.mime_type.clone())
         };
 
         let (title, artist, album, duration_ms, cover_path) = if req.title.is_some() {
@@ -513,7 +645,7 @@ impl PlaybackOrchestrator {
 
         Ok(ResolvedStream {
             url: stream_url,
-            mime_type: stream_data.mime_type,
+            mime_type: out_mime,
             title,
             artist,
             album,
