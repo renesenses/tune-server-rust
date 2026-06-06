@@ -600,29 +600,65 @@ async fn unicast_probe(state: &Arc<Mutex<ScannerState>>, dev_id: &str) -> bool {
 }
 
 pub fn get_local_ip() -> Option<Ipv4Addr> {
-    // Enumerate real interfaces first (works in Docker macvlan, VPN, multi-NIC)
+    // --- Step 1: UDP connect probe (follows the OS default route → real LAN) ---
+    let probe_ip = udp_probe_ip();
+    if let Some(ip) = probe_ip {
+        if !is_virtual_ip(ip) {
+            info!(ip = %ip, method = "udp_probe", "local_ip_detected");
+            return Some(ip);
+        }
+        debug!(ip = %ip, "udp_probe_returned_virtual_ip_skipping");
+    }
+
+    // --- Step 2: enumerate interfaces, skip virtual adapters ---
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        // Prefer private LAN IPs (192.168.x, 172.16-31.x) over VPN (10.x)
-        let mut best: Option<Ipv4Addr> = None;
+        // Score each candidate: higher = more preferred
+        let mut candidates: Vec<(Ipv4Addr, u8)> = Vec::new();
         for iface in &ifaces {
             if iface.is_loopback() {
                 continue;
             }
             if let std::net::IpAddr::V4(ip) = iface.ip() {
+                if is_virtual_interface(&iface.name, ip) {
+                    debug!(name = %iface.name, ip = %ip, "skipping_virtual_interface");
+                    continue;
+                }
                 let o = ip.octets();
-                if o[0] == 192 || (o[0] == 172 && o[1] >= 16 && o[1] <= 31) {
-                    return Some(ip);
-                }
-                if best.is_none() && ip.is_private() {
-                    best = Some(ip);
-                }
+                let score = if o[0] == 192 && o[1] == 168 {
+                    // 192.168.x.x — typical home LAN, highest priority
+                    30
+                } else if o[0] == 10 {
+                    // 10.x.x.x — could be real LAN or VPN, medium priority
+                    20
+                } else if o[0] == 172 && o[1] >= 16 && o[1] <= 31 {
+                    // 172.16-31.x.x — less common for home LANs
+                    10
+                } else {
+                    5
+                };
+                candidates.push((ip, score));
             }
         }
-        if let Some(ip) = best {
-            return Some(ip);
+        // Pick highest-scoring candidate
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some((ip, _)) = candidates.first() {
+            info!(ip = %ip, method = "interface_enum", "local_ip_detected");
+            return Some(*ip);
         }
     }
-    // Fallback: UDP connect probe
+
+    // --- Step 3: fall back to UDP probe even if it's virtual (better than nothing) ---
+    if let Some(ip) = probe_ip {
+        warn!(ip = %ip, "local_ip_fallback_to_virtual");
+        return Some(ip);
+    }
+
+    warn!("local_ip_detection_failed");
+    None
+}
+
+/// UDP connect probe: the OS picks the interface for the default route.
+fn udp_probe_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -630,6 +666,54 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
         SocketAddr::V4(addr) => Some(*addr.ip()),
         _ => None,
     }
+}
+
+/// Returns true if the interface name or IP belongs to a known virtual adapter
+/// (VirtualBox, Docker, VMware, Hyper-V, libvirt, VPN tunnels, WSL).
+fn is_virtual_interface(name: &str, ip: Ipv4Addr) -> bool {
+    // Check by interface name (case-insensitive)
+    let lower = name.to_lowercase();
+    let virtual_name_prefixes = [
+        "vbox",       // VirtualBox
+        "virtualbox", // VirtualBox (alt)
+        "vmnet",      // VMware
+        "docker",     // Docker bridge
+        "br-",        // Docker custom bridges
+        "veth",       // Docker/container veth pairs
+        "virbr",      // libvirt/KVM
+        "vethernet",  // Hyper-V / WSL
+        "tailscale",  // Tailscale VPN
+        "wg",         // WireGuard
+        "tun",        // VPN tunnel
+        "utun",       // macOS VPN tunnel (utun0, utun1, ...)
+        "ham",        // Hamachi VPN
+        "zt",         // ZeroTier
+    ];
+    for prefix in &virtual_name_prefixes {
+        if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    // Check by well-known virtual IP ranges
+    is_virtual_ip(ip)
+}
+
+/// Returns true if the IP falls in a well-known virtual adapter subnet.
+fn is_virtual_ip(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // VirtualBox Host-Only default: 192.168.56.x
+    if o[0] == 192 && o[1] == 168 && o[2] == 56 {
+        return true;
+    }
+    // VMware default ranges: 192.168.{52,137,138,139}.x
+    if o[0] == 192 && o[1] == 168 && (o[2] == 52 || o[2] == 137 || o[2] == 138 || o[2] == 139) {
+        return true;
+    }
+    // Docker default bridge: 172.17.x.x
+    if o[0] == 172 && o[1] == 17 {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -681,5 +765,53 @@ mod tests {
             assert!(!ip.is_loopback());
             println!("Local IP: {ip}");
         }
+    }
+
+    #[test]
+    fn virtual_ip_detection() {
+        // VirtualBox Host-Only default
+        assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 56, 1)));
+        assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 56, 100)));
+        // VMware defaults
+        assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 137, 1)));
+        assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 52, 1)));
+        // Docker bridge
+        assert!(is_virtual_ip(Ipv4Addr::new(172, 17, 0, 1)));
+        // Real LAN IPs must NOT be flagged
+        assert!(!is_virtual_ip(Ipv4Addr::new(192, 168, 1, 100)));
+        assert!(!is_virtual_ip(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(!is_virtual_ip(Ipv4Addr::new(10, 0, 0, 50)));
+        assert!(!is_virtual_ip(Ipv4Addr::new(172, 16, 0, 1)));
+    }
+
+    #[test]
+    fn virtual_interface_detection() {
+        let real_ip = Ipv4Addr::new(192, 168, 1, 100);
+        let vbox_ip = Ipv4Addr::new(192, 168, 56, 1);
+
+        // Virtual adapters by name
+        assert!(is_virtual_interface("vboxnet0", real_ip));
+        assert!(is_virtual_interface("VirtualBox Host-Only", real_ip));
+        assert!(is_virtual_interface("vmnet8", real_ip));
+        assert!(is_virtual_interface("docker0", real_ip));
+        assert!(is_virtual_interface("br-abc123", real_ip));
+        assert!(is_virtual_interface("veth1234", real_ip));
+        assert!(is_virtual_interface("virbr0", real_ip));
+        assert!(is_virtual_interface("tailscale0", real_ip));
+        assert!(is_virtual_interface("wg0", real_ip));
+        assert!(is_virtual_interface("tun0", real_ip));
+        assert!(is_virtual_interface("utun3", real_ip));
+        assert!(is_virtual_interface("zt0", real_ip));
+
+        // Virtual adapter by IP (even with real-looking name)
+        assert!(is_virtual_interface("eth1", vbox_ip));
+
+        // Real adapters must NOT be flagged
+        assert!(!is_virtual_interface("eth0", real_ip));
+        assert!(!is_virtual_interface("en0", real_ip));
+        assert!(!is_virtual_interface("enp3s0", real_ip));
+        assert!(!is_virtual_interface("wlan0", real_ip));
+        assert!(!is_virtual_interface("Wi-Fi", real_ip));
+        assert!(!is_virtual_interface("Ethernet", real_ip));
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -22,6 +23,9 @@ pub struct PlaybackOrchestrator {
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub advertised_ip: Option<String>,
+    /// Stream sessions created by gapless preparation (resolve_queue_item_url).
+    /// Keyed by zone_id. Cleaned up when the zone starts a new track or stops.
+    gapless_sessions: Mutex<HashMap<i64, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +71,40 @@ pub struct ResolvedQueueItem {
     pub album: Option<String>,
     pub cover_url: Option<String>,
     pub duration_ms: Option<u64>,
+    pub stream_id: Option<String>,
 }
 
 impl PlaybackOrchestrator {
+    pub fn new(
+        db: SqliteDb,
+        playback: Arc<PlaybackManager>,
+        streamer: Arc<AudioStreamer>,
+        services: Arc<Mutex<ServiceRegistry>>,
+        outputs: Arc<Mutex<OutputRegistry>>,
+        advertised_ip: Option<String>,
+    ) -> Self {
+        Self {
+            db,
+            playback,
+            streamer,
+            services,
+            outputs,
+            advertised_ip,
+            gapless_sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Remove any gapless-prepared stream session for a zone.
+    /// Called when a zone starts a new track or stops, so the
+    /// previously prepared session doesn't leak.
+    async fn cleanup_gapless_session(&self, zone_id: i64) {
+        let old_sid = self.gapless_sessions.lock().await.remove(&zone_id);
+        if let Some(ref sid) = old_sid {
+            self.streamer.remove_session(sid).await;
+            debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
+        }
+    }
+
     fn server_ip(&self) -> String {
         self.advertised_ip.clone().unwrap_or_else(|| {
             crate::discovery::ssdp::get_local_ip()
@@ -79,6 +114,10 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        // Clean up any gapless-prepared session for this zone before
+        // creating a new stream.
+        self.cleanup_gapless_session(req.zone_id).await;
+
         // Remember old session for cleanup AFTER output has been stopped
         let prev_state = self.playback.get_state(req.zone_id).await;
         let old_stream_id = prev_state
@@ -914,6 +953,7 @@ impl PlaybackOrchestrator {
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
+        self.cleanup_gapless_session(zone_id).await;
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -1135,6 +1175,10 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<ResolvedQueueItem, String> {
+        // Clean up any previously prepared gapless session for this zone
+        // before creating a new one.
+        self.cleanup_gapless_session(zone_id).await;
+
         let queue_repo = PlayQueueRepo::new(self.db.clone());
         let queue = queue_repo.get_queue(zone_id)?;
         let item = queue
@@ -1159,6 +1203,16 @@ impl PlaybackOrchestrator {
         };
 
         let resolved = self.resolve_stream(&req).await?;
+
+        // Track this session so it can be cleaned up when the zone
+        // starts a new track, stops, or prepares a different gapless item.
+        if let Some(ref sid) = resolved.stream_id {
+            self.gapless_sessions
+                .lock()
+                .await
+                .insert(zone_id, sid.clone());
+        }
+
         let raw_cover = cover.or(resolved.cover_url);
         Ok(ResolvedQueueItem {
             url: resolved.url,
@@ -1168,6 +1222,7 @@ impl PlaybackOrchestrator {
             album,
             cover_url: self.resolve_cover_url(raw_cover.as_deref()),
             duration_ms: None,
+            stream_id: resolved.stream_id,
         })
     }
 
@@ -1208,14 +1263,14 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
-        PlaybackOrchestrator {
+        PlaybackOrchestrator::new(
             db,
-            playback: Arc::new(PlaybackManager::new()),
-            streamer: Arc::new(AudioStreamer::new(0)),
-            services: Arc::new(Mutex::new(ServiceRegistry::new())),
-            outputs: Arc::new(Mutex::new(OutputRegistry::new())),
-            advertised_ip: None,
-        }
+            Arc::new(PlaybackManager::new()),
+            Arc::new(AudioStreamer::new(0)),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            Arc::new(Mutex::new(OutputRegistry::new())),
+            None,
+        )
     }
 
     #[tokio::test]

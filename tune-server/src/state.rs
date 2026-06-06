@@ -99,14 +99,14 @@ impl AppState {
         let services = Arc::new(Mutex::new(services));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
 
-        let orchestrator = Arc::new(PlaybackOrchestrator {
-            db: db.clone(),
-            playback: playback.clone(),
-            streamer: streamer.clone(),
-            services: services.clone(),
-            outputs: outputs.clone(),
-            advertised_ip: tune_config.advertised_ip.clone(),
-        });
+        let orchestrator = Arc::new(PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            streamer.clone(),
+            services.clone(),
+            outputs.clone(),
+            tune_config.advertised_ip.clone(),
+        ));
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
         let scanner = Arc::new(Mutex::new(SsdpScanner::new(ssdp_tx)));

@@ -63,7 +63,7 @@ fn spawn_squeezebox_poller(state: &AppState) {
 fn spawn_session_gc(state: &AppState) {
     let streamer = state.streamer.clone();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
             let removed = streamer.cleanup_stale_sessions().await;

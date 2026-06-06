@@ -97,6 +97,10 @@ pub struct LocalOutput {
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
     exclusive_mode: bool,
+    /// Set by stop() to immediately silence the cpal callback, even if
+    /// the playback thread hasn't exited yet.  Prevents overlapping audio
+    /// when switching tracks and the old thread is still draining.
+    force_silent: Arc<AtomicBool>,
 }
 
 impl LocalOutput {
@@ -127,6 +131,7 @@ impl LocalOutput {
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
             exclusive_mode,
+            force_silent: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -400,6 +405,9 @@ impl OutputTarget for LocalOutput {
     ) -> Result<(), String> {
         self.stop().await.ok();
 
+        // Reset force_silent for the new track
+        self.force_silent.store(false, Ordering::SeqCst);
+
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
         let url = url.to_string();
@@ -409,6 +417,7 @@ impl OutputTarget for LocalOutput {
         let position_ms = self.position_ms.clone();
         let duration_ms_shared = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
+        let force_silent = self.force_silent.clone();
 
         // Store metadata
         *self.current_uri.lock().unwrap() = Some(url.clone());
@@ -455,169 +464,171 @@ impl OutputTarget for LocalOutput {
             };
             header_buf.truncate(header_read);
 
-            let (channels, sample_rate, bit_depth, data_offset) =
-                if let Some(parsed) = parse_wav_header(&header_buf) {
-                    info!(
-                        channels = parsed.0,
-                        sample_rate = parsed.1,
-                        bit_depth = parsed.2,
-                        data_offset = parsed.3,
-                        "local_audio_wav_header_parsed"
-                    );
-                    parsed
-                } else {
-                    // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
-                    // Read the rest of the stream, decode with symphonia, and play.
-                    info!("local_audio_non_wav_stream_detected_decoding");
+            let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
+                parse_wav_header(&header_buf)
+            {
+                info!(
+                    channels = parsed.0,
+                    sample_rate = parsed.1,
+                    bit_depth = parsed.2,
+                    data_offset = parsed.3,
+                    "local_audio_wav_header_parsed"
+                );
+                parsed
+            } else {
+                // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
+                // Read the rest of the stream, decode with symphonia, and play.
+                info!("local_audio_non_wav_stream_detected_decoding");
 
-                    // Read the entire remaining stream
-                    let mut all_data = header_buf.clone();
-                    let mut buf = vec![0u8; 65536];
-                    loop {
-                        if stop_rx.try_recv().is_ok() {
-                            playing.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                        match reader.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => all_data.extend_from_slice(&buf[..n]),
-                            Err(e) => {
-                                warn!(error = %e, "local_audio_compressed_read_error");
-                                break;
-                            }
-                        }
+                // Read the entire remaining stream
+                let mut all_data = header_buf.clone();
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        playing.store(false, Ordering::SeqCst);
+                        return;
                     }
-
-                    // Decode the compressed audio
-                    let Some((dec_channels, dec_sample_rate, decoded_samples)) =
-                        decode_compressed_stream(&all_data)
-                    else {
-                        warn!("local_audio_decode_compressed_failed");
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    };
-
-                    // Now play the decoded f32 samples using cpal shared mode
-                    let dec_ch = dec_channels;
-                    let dec_sr = dec_sample_rate;
-                    let decoded_len = decoded_samples.len();
-
-                    let host = cpal::default_host();
-                    let device = if device_name == "default" {
-                        host.default_output_device()
-                    } else {
-                        host.output_devices().ok().and_then(|mut devs| {
-                            devs.find(|d| {
-                                d.description()
-                                    .map(|desc| {
-                                        let n = desc.name().to_string();
-                                        n == device_name || n.contains(&device_name)
-                                    })
-                                    .unwrap_or(false)
-                            })
-                        })
-                    };
-
-                    let Some(device) = device else {
-                        warn!(name = %device_name, "audio_device_not_found");
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    };
-
-                    // Try source sample rate first, then fall back to device default
-                    let output_config = find_matching_config(&device, dec_ch, dec_sr)
-                        .or_else(|| device.default_output_config().ok().map(|c| c.config()))
-                        .unwrap_or(cpal::StreamConfig {
-                            channels: dec_ch,
-                            sample_rate: dec_sr,
-                            buffer_size: cpal::BufferSize::Default,
-                        });
-
-                    let output_sr = output_config.sample_rate;
-                    let output_ch = output_config.channels;
-
-                    let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
-                    let ring = Arc::new(RingBuf::new(ring_cap));
-                    let ring_cb = ring.clone();
-                    let vol_cb = volume.clone();
-                    let paused_cb = paused.clone();
-
-                    let stream = match device.build_output_stream(
-                        &output_config,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            if paused_cb.load(Ordering::Relaxed) {
-                                data.fill(0.0);
-                                return;
-                            }
-                            let read = ring_cb.pop(data);
-                            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                            for sample in &mut data[..read] {
-                                *sample *= v;
-                            }
-                            if read < data.len() {
-                                data[read..].fill(0.0);
-                            }
-                        },
-                        |e| warn!(error = %e, "audio_stream_error"),
-                        None,
-                    ) {
-                        Ok(s) => s,
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => all_data.extend_from_slice(&buf[..n]),
                         Err(e) => {
-                            warn!(error = %e, "audio_stream_build_failed_compressed");
-                            playing.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                    };
-
-                    info!(
-                        device = %device_name,
-                        dec_sr,
-                        dec_ch,
-                        output_sr,
-                        output_ch,
-                        samples = decoded_len,
-                        "local_audio_compressed_playing"
-                    );
-
-                    if let Err(e) = stream.play() {
-                        warn!(error = %e, "audio_stream_play_failed");
-                        playing.store(false, Ordering::SeqCst);
-                        return;
-                    }
-
-                    // Adapt channels and resample if needed
-                    let mut samples = decoded_samples;
-                    if dec_ch != output_ch {
-                        samples = adapt_channels(&samples, dec_ch, output_ch);
-                    }
-                    if dec_sr != output_sr {
-                        samples = simple_resample(&samples, dec_sr, output_sr, output_ch);
-                    }
-
-                    // Feed all samples to ring buffer
-                    feed_ring(&ring, &samples, &stop_rx, &paused);
-
-                    // Update position
-                    let total_frames = decoded_len as u64 / dec_ch as u64;
-                    let duration = (total_frames as f64 / dec_sr as f64 * 1000.0) as u64;
-                    position_ms.store(duration, Ordering::Relaxed);
-
-                    // Wait for ring buffer to drain
-                    loop {
-                        if stop_rx.try_recv().is_ok() {
+                            warn!(error = %e, "local_audio_compressed_read_error");
                             break;
                         }
-                        if ring.available() == 0 {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
+                }
 
-                    drop(stream);
+                // Decode the compressed audio
+                let Some((dec_channels, dec_sample_rate, decoded_samples)) =
+                    decode_compressed_stream(&all_data)
+                else {
+                    warn!("local_audio_decode_compressed_failed");
                     playing.store(false, Ordering::SeqCst);
-                    info!(device = %device_name, "local_audio_compressed_stopped");
                     return;
                 };
+
+                // Now play the decoded f32 samples using cpal shared mode
+                let dec_ch = dec_channels;
+                let dec_sr = dec_sample_rate;
+                let decoded_len = decoded_samples.len();
+
+                let host = cpal::default_host();
+                let device = if device_name == "default" {
+                    host.default_output_device()
+                } else {
+                    host.output_devices().ok().and_then(|mut devs| {
+                        devs.find(|d| {
+                            d.description()
+                                .map(|desc| {
+                                    let n = desc.name().to_string();
+                                    n == device_name || n.contains(&device_name)
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                };
+
+                let Some(device) = device else {
+                    warn!(name = %device_name, "audio_device_not_found");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                };
+
+                // Try source sample rate first, then fall back to device default
+                let output_config = find_matching_config(&device, dec_ch, dec_sr)
+                    .or_else(|| device.default_output_config().ok().map(|c| c.config()))
+                    .unwrap_or(cpal::StreamConfig {
+                        channels: dec_ch,
+                        sample_rate: dec_sr,
+                        buffer_size: cpal::BufferSize::Default,
+                    });
+
+                let output_sr = output_config.sample_rate;
+                let output_ch = output_config.channels;
+
+                let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
+                let ring = Arc::new(RingBuf::new(ring_cap));
+                let ring_cb = ring.clone();
+                let vol_cb = volume.clone();
+                let paused_cb = paused.clone();
+                let silent_cb = force_silent.clone();
+
+                let stream = match device.build_output_stream(
+                    &output_config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
+                            data.fill(0.0);
+                            return;
+                        }
+                        let read = ring_cb.pop(data);
+                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
+                        for sample in &mut data[..read] {
+                            *sample *= v;
+                        }
+                        if read < data.len() {
+                            data[read..].fill(0.0);
+                        }
+                    },
+                    |e| warn!(error = %e, "audio_stream_error"),
+                    None,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "audio_stream_build_failed_compressed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                info!(
+                    device = %device_name,
+                    dec_sr,
+                    dec_ch,
+                    output_sr,
+                    output_ch,
+                    samples = decoded_len,
+                    "local_audio_compressed_playing"
+                );
+
+                if let Err(e) = stream.play() {
+                    warn!(error = %e, "audio_stream_play_failed");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+
+                // Adapt channels and resample if needed
+                let mut samples = decoded_samples;
+                if dec_ch != output_ch {
+                    samples = adapt_channels(&samples, dec_ch, output_ch);
+                }
+                if dec_sr != output_sr {
+                    samples = simple_resample(&samples, dec_sr, output_sr, output_ch);
+                }
+
+                // Feed all samples to ring buffer
+                feed_ring(&ring, &samples, &stop_rx, &paused);
+
+                // Update position
+                let total_frames = decoded_len as u64 / dec_ch as u64;
+                let duration = (total_frames as f64 / dec_sr as f64 * 1000.0) as u64;
+                position_ms.store(duration, Ordering::Relaxed);
+
+                // Wait for ring buffer to drain
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if ring.available() == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                drop(stream);
+                playing.store(false, Ordering::SeqCst);
+                info!(device = %device_name, "local_audio_compressed_stopped");
+                return;
+            };
 
             let bytes_per_sample = (bit_depth / 8) as usize;
             let frame_bytes = channels as usize * bytes_per_sample;
@@ -785,15 +796,17 @@ impl OutputTarget for LocalOutput {
             // Build output stream — try preferred config first, fall back to
             // device default if the device rejects the source sample rate
             // (common on Windows where WASAPI shared mode locks to 48 kHz).
+            let silent_cb_outer = force_silent.clone();
             let build_stream = |cfg: &cpal::StreamConfig,
                                 ring_cb: Arc<RingBuf>,
                                 vol_cb: Arc<AtomicU32>,
                                 paused_cb: Arc<AtomicBool>,
-                                _finished_cb: Arc<AtomicBool>| {
+                                _finished_cb: Arc<AtomicBool>,
+                                silent_cb: Arc<AtomicBool>| {
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        if paused_cb.load(Ordering::Relaxed) {
+                        if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
                             data.fill(0.0);
                             return;
                         }
@@ -823,6 +836,7 @@ impl OutputTarget for LocalOutput {
                 volume.clone(),
                 paused.clone(),
                 finished_flag.clone(),
+                silent_cb_outer.clone(),
             );
 
             let (stream, actual_config, ring) = match stream_result {
@@ -847,6 +861,7 @@ impl OutputTarget for LocalOutput {
                                 volume.clone(),
                                 paused.clone(),
                                 finished_flag.clone(),
+                                silent_cb_outer.clone(),
                             ) {
                                 Ok(s) => (s, default_cfg, ring_fb),
                                 Err(second_err) => {
@@ -1053,6 +1068,10 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        // Immediately silence the cpal callback so no audio leaks while
+        // we wait for the playback thread to exit.  This prevents
+        // overlapping audio when the old thread is slow to terminate.
+        self.force_silent.store(true, Ordering::SeqCst);
         // Send the stop signal first
         if let Some(tx) = self.stop_tx.lock().unwrap().take() {
             let _ = tx.send(());
