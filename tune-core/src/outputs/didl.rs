@@ -4,7 +4,7 @@
 //! DLNA/UPnP to describe media items. This module provides a single reusable
 //! builder so that all output modules produce consistent, valid DIDL-Lite.
 
-use quick_xml::escape::escape;
+use quick_xml::escape::{escape, partial_escape};
 
 /// DLNA flags string for a given MIME type.
 ///
@@ -70,7 +70,9 @@ pub enum ProtocolStyle {
 /// Builder for a single DIDL-Lite `<item>` element.
 ///
 /// Produces raw XML (not HTML-escaped). Callers that embed the result inside
-/// SOAP body text must escape it themselves (e.g. via `quick_xml::escape::escape`).
+/// SOAP body text must escape it themselves (use `build_escaped()` or
+/// `quick_xml::escape::partial_escape` — NOT `escape`, which also escapes
+/// `"` and breaks some DLNA renderers).
 pub struct DidlBuilder {
     title: String,
     artist: Option<String>,
@@ -361,12 +363,18 @@ impl DidlBuilder {
         )
     }
 
-    /// Build the DIDL-Lite XML and then HTML-escape it for embedding in SOAP body text.
+    /// Build the DIDL-Lite XML and then XML-escape it for embedding in SOAP body text.
     ///
     /// This is the format expected by DLNA renderers when DIDL is passed as the
     /// value of `CurrentURIMetaData` in a `SetAVTransportURI` SOAP call.
+    ///
+    /// Uses `partial_escape` (only `<`, `>`, `&`) instead of full `escape`
+    /// (which also escapes `"` and `'`).  Double-quotes do NOT require escaping
+    /// in XML text content — only in attribute values — and some DLNA renderers
+    /// (Denon, Marantz) have buggy XML parsers that fail to unescape `&quot;`
+    /// in text content, causing them to reject the metadata entirely.
     pub fn build_escaped(&self) -> String {
-        escape(&self.build()).to_string()
+        partial_escape(&self.build()).to_string()
     }
 }
 
@@ -510,6 +518,24 @@ mod tests {
         let xml = DidlBuilder::new("Test", "http://x/s", "audio/flac").build_escaped();
         assert!(xml.contains("&lt;DIDL-Lite"));
         assert!(xml.contains("&lt;/DIDL-Lite&gt;"));
+    }
+
+    #[test]
+    fn build_escaped_does_not_escape_quotes() {
+        // DLNA renderers (Denon, Marantz) have buggy XML parsers that fail
+        // to unescape &quot; in SOAP text content.  Quotes must remain as
+        // raw " in the escaped DIDL, not &quot;.
+        let xml = DidlBuilder::new("Test", "http://x/s", "audio/flac")
+            .protocol_style(ProtocolStyle::Dlna)
+            .item_id("1")
+            .build_escaped();
+        assert!(
+            !xml.contains("&quot;"),
+            "escaped DIDL must not contain &quot; — breaks Denon/Marantz"
+        );
+        // Namespace declarations and attribute values should use raw quotes
+        assert!(xml.contains("xmlns=\""));
+        assert!(xml.contains("id=\"1\""));
     }
 
     #[test]

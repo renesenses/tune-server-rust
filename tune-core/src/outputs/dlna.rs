@@ -540,9 +540,11 @@ mod tests {
             None,
             None,
         );
-        // build_escaped() double-escapes: first XML-escape for DIDL content,
-        // then HTML-entity-encode the whole DIDL for SOAP embedding.
-        // "&" -> "&amp;" (XML) -> "&amp;amp;" (SOAP entity encoding)
+        // build_escaped() double-escapes ampersands: first XML-escape for
+        // DIDL content, then partial_escape for SOAP embedding.
+        // "&" -> "&amp;" (XML) -> "&amp;amp;" (SOAP partial escape)
+        // Note: quotes are NOT escaped (partial_escape), matching what
+        // Denon/Marantz renderers expect in SOAP text content.
         assert!(didl.contains("Rock &amp;amp; Roll"));
         assert!(didl.contains("AC/DC"));
         assert!(didl.contains("a=1&amp;amp;b=2"));

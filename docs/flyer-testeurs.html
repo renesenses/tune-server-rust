@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tune — Recherche de testeurs</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #0a0f0a;
+    color: #f0f0f0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  .flyer {
+    width: 800px;
+    min-height: 1100px;
+    background: linear-gradient(170deg, #0a0f0a 0%, #0d1a0d 40%, #0a1520 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 24px;
+    padding: 60px 50px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .flyer::before {
+    content: '';
+    position: absolute;
+    top: -200px;
+    right: -200px;
+    width: 500px;
+    height: 500px;
+    background: radial-gradient(circle, rgba(0,200,150,0.08) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    margin-bottom: 40px;
+  }
+
+  .logo {
+    width: 90px;
+    height: 90px;
+    border-radius: 18px;
+    object-fit: cover;
+  }
+
+  .header-text h1 {
+    font-size: 28px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.5px;
+  }
+
+  .header-text p {
+    font-size: 14px;
+    color: rgba(255,255,255,0.5);
+    margin-top: 4px;
+  }
+
+  .hero {
+    text-align: center;
+    margin: 40px 0;
+  }
+
+  .hero h2 {
+    font-size: 48px;
+    font-weight: 900;
+    background: linear-gradient(135deg, #4ade80, #22d3ee, #818cf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    line-height: 1.1;
+    margin-bottom: 16px;
+  }
+
+  .hero p {
+    font-size: 20px;
+    color: rgba(255,255,255,0.7);
+    max-width: 550px;
+    margin: 0 auto;
+    line-height: 1.5;
+  }
+
+  .badge {
+    display: inline-block;
+    background: rgba(74, 222, 128, 0.15);
+    color: #4ade80;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    border: 1px solid rgba(74, 222, 128, 0.2);
+  }
+
+  .features {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 40px 0;
+  }
+
+  .feature {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 14px;
+    padding: 20px;
+  }
+
+  .feature-icon {
+    font-size: 24px;
+    margin-bottom: 8px;
+  }
+
+  .feature h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    margin-bottom: 6px;
+  }
+
+  .feature p {
+    font-size: 13px;
+    color: rgba(255,255,255,0.5);
+    line-height: 1.4;
+  }
+
+  .platforms {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    margin: 30px 0;
+    flex-wrap: wrap;
+  }
+
+  .platform {
+    text-align: center;
+    color: rgba(255,255,255,0.6);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .platform .icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+  }
+
+  .cta {
+    text-align: center;
+    margin: 40px 0 20px;
+  }
+
+  .cta-button {
+    display: inline-block;
+    background: linear-gradient(135deg, #4ade80, #22d3ee);
+    color: #0a0f0a;
+    padding: 16px 40px;
+    border-radius: 12px;
+    font-size: 18px;
+    font-weight: 700;
+    text-decoration: none;
+    letter-spacing: -0.3px;
+  }
+
+  .cta-sub {
+    margin-top: 12px;
+    font-size: 14px;
+    color: rgba(255,255,255,0.4);
+  }
+
+  .stats {
+    display: flex;
+    justify-content: center;
+    gap: 48px;
+    margin: 30px 0;
+  }
+
+  .stat {
+    text-align: center;
+  }
+
+  .stat .number {
+    font-size: 36px;
+    font-weight: 900;
+    color: #4ade80;
+  }
+
+  .stat .label {
+    font-size: 12px;
+    color: rgba(255,255,255,0.4);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-top: 4px;
+  }
+
+  .footer {
+    text-align: center;
+    margin-top: 40px;
+    padding-top: 24px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .footer p {
+    font-size: 13px;
+    color: rgba(255,255,255,0.3);
+  }
+
+  .footer a {
+    color: #4ade80;
+    text-decoration: none;
+  }
+
+  .comparison {
+    margin: 30px 0;
+    text-align: center;
+  }
+
+  .comparison table {
+    margin: 0 auto;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  .comparison th {
+    padding: 8px 16px;
+    color: rgba(255,255,255,0.4);
+    font-weight: 500;
+    text-align: center;
+  }
+
+  .comparison td {
+    padding: 6px 16px;
+    color: rgba(255,255,255,0.6);
+    text-align: center;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .comparison td:first-child {
+    text-align: left;
+    color: rgba(255,255,255,0.8);
+    font-weight: 500;
+  }
+
+  .check { color: #4ade80; }
+  .cross { color: rgba(255,255,255,0.2); }
+</style>
+</head>
+<body>
+
+<div class="flyer">
+
+  <div class="header">
+    <img src="https://mozaiklabs.fr/logo_mozaiclabs.png" alt="MozAIk Labs" class="logo">
+    <div class="header-text">
+      <h1>MozAIk Labs</h1>
+      <p>Open-source audio innovation</p>
+    </div>
+  </div>
+
+  <div class="hero">
+    <span class="badge">BETA OUVERTE - GRATUIT</span>
+    <h2>Devenez testeur<br>de Tune</h2>
+    <p>Le serveur audio multi-room open-source qui rivalise avec Roon. Gratuit, pour toujours.</p>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="number">10 MB</div>
+      <div class="label">Binaire unique</div>
+    </div>
+    <div class="stat">
+      <div class="number">100%</div>
+      <div class="label">Rust natif</div>
+    </div>
+    <div class="stat">
+      <div class="number">6</div>
+      <div class="label">Services streaming</div>
+    </div>
+    <div class="stat">
+      <div class="number">0 &euro;</div>
+      <div class="label">Pour toujours</div>
+    </div>
+  </div>
+
+  <div class="features">
+    <div class="feature">
+      <div class="feature-icon">&#127925;</div>
+      <h3>Multi-room synchronise</h3>
+      <p>Protocole OAAT open-source. Bit-perfect, &lt; 1ms de sync entre pieces.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#127911;</div>
+      <h3>Hi-Res &amp; DSD natif</h3>
+      <p>PCM jusqu'a 768 kHz / 32 bits. DSD512 natif. Decodage Rust sans FFmpeg.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128225;</div>
+      <h3>DLNA / AirPlay / Chromecast</h3>
+      <p>Pilotez vos appareils existants. Squeezebox, Sonos, OpenHome, BluOS.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#127912;</div>
+      <h3>Qobuz, Tidal, Deezer, Spotify...</h3>
+      <p>6 services de streaming integres. Recherche federee locale + cloud.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128187;</div>
+      <h3>Web, iOS, Android</h3>
+      <p>Interface web responsive + apps natives iOS (TestFlight) et Android (Flutter).</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128640;</div>
+      <h3>v0.9 en preparation</h3>
+      <p>Plugin SDK, multi-utilisateur, assistant IA, acces distant, Docker officiel.</p>
+    </div>
+  </div>
+
+  <div class="comparison">
+    <table>
+      <tr>
+        <th></th>
+        <th>Tune</th>
+        <th>Roon</th>
+        <th>Audirvana</th>
+      </tr>
+      <tr>
+        <td>Open source</td>
+        <td class="check">&#10003;</td>
+        <td class="cross">&#10007;</td>
+        <td class="cross">&#10007;</td>
+      </tr>
+      <tr>
+        <td>Multi-room</td>
+        <td class="check">&#10003;</td>
+        <td class="check">&#10003;</td>
+        <td class="cross">&#10007;</td>
+      </tr>
+      <tr>
+        <td>Plugin SDK</td>
+        <td class="check">&#10003;</td>
+        <td class="cross">&#10007;</td>
+        <td class="cross">&#10007;</td>
+      </tr>
+      <tr>
+        <td>Prix</td>
+        <td class="check">Gratuit</td>
+        <td>10 &euro;/mois</td>
+        <td>100 &euro;</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="platforms">
+    <div class="platform"><div class="icon">&#128421;</div>Windows</div>
+    <div class="platform"><div class="icon">&#63743;</div>macOS</div>
+    <div class="platform"><div class="icon">&#128039;</div>Linux</div>
+    <div class="platform"><div class="icon">&#128225;</div>Raspberry Pi</div>
+    <div class="platform"><div class="icon">&#128230;</div>Docker</div>
+    <div class="platform"><div class="icon">&#128241;</div>iOS / Android</div>
+  </div>
+
+  <div class="cta">
+    <a href="https://mozaiklabs.fr/download" class="cta-button">Telecharger Tune</a>
+    <p class="cta-sub">mozaiklabs.fr/download &mdash; Installation en 2 minutes</p>
+  </div>
+
+  <div class="footer">
+    <p>Forum : <a href="https://mozaiklabs.fr/forum">mozaiklabs.fr/forum</a> &mdash; Contact : <a href="mailto:renesenses@gmail.com">renesenses@gmail.com</a></p>
+    <p style="margin-top: 8px;">Projet francais &mdash; Developpe a Dijon &mdash; MIT License</p>
+  </div>
+
+</div>
+
+</body>
+</html>

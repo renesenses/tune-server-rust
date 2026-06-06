@@ -962,7 +962,11 @@ impl PlaybackOrchestrator {
                 source_id: None,
                 stream_id: None,
             };
-            self.playback.play(zone_id, np).await;
+            // Use update_now_playing (not play) to avoid bumping
+            // track_generation — the poller must keep its gapless_cooldown
+            // intact so it doesn't falsely detect track-end on renderers
+            // that briefly report Stopped during gapless transitions.
+            self.playback.update_now_playing(zone_id, np).await;
             self.playback
                 .update_queue_info(zone_id, position, queue.len() as i64)
                 .await;
@@ -988,7 +992,9 @@ impl PlaybackOrchestrator {
                 source_id: item["source_id"].as_str().map(String::from),
                 stream_id: None,
             };
-            self.playback.play(zone_id, np).await;
+            // Same rationale: gapless metadata-only advance must not
+            // bump track_generation and must not reset position to 0.
+            self.playback.update_now_playing(zone_id, np).await;
             self.playback
                 .update_queue_info(zone_id, position, streaming.len() as i64)
                 .await;
