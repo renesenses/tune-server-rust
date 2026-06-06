@@ -179,10 +179,15 @@ impl ArtistRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    /// Sequential `query_one` + `execute` + `last_insert_rowid` (not
-    /// `write_tx`) because the scanner holds `BEGIN IMMEDIATE` while
-    /// calling this, and `write_tx` would try to start a nested
+    /// Sequential `query_one_strong` + `execute` + `last_insert_rowid`
+    /// (not `write_tx`) because the scanner holds `BEGIN IMMEDIATE`
+    /// while calling this, and `write_tx` would try to start a nested
     /// `BEGIN DEFERRED` — same constraint as `album_repo::get_or_create`.
+    ///
+    /// Uses `query_one_strong` (write connection) so the SELECT sees
+    /// artists created earlier in the same `BEGIN IMMEDIATE` transaction.
+    /// Without this, the read-only connection's WAL snapshot misses
+    /// uncommitted writes and duplicate artists are created.
     pub fn get_or_create(
         &self,
         name: &str,
@@ -190,12 +195,18 @@ impl ArtistRepo {
         sort_name: Option<&str>,
     ) -> Result<Artist, String> {
         if let Some(mbid) = musicbrainz_id {
-            if let Some(found) = self.get_by_musicbrainz_id(mbid)? {
-                return Ok(found);
+            let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
+            let params: [&dyn ToSqlValue; 1] = [&mbid];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                return Ok(row_to_artist(&row));
             }
         }
-        if let Some(found) = self.get_by_name(name)? {
-            return Ok(found);
+        {
+            let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
+            let params: [&dyn ToSqlValue; 1] = [&name];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                return Ok(row_to_artist(&row));
+            }
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&name, &sort_name, &musicbrainz_id];

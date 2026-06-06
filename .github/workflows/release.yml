@@ -317,14 +317,17 @@ jobs:
           sed -i "s|version \"${OLD_VERSION}\"|version \"${VERSION}\"|g" "$F"
           sed -i "s|Tune Server v${OLD_VERSION}|Tune Server v${VERSION}|g" "$F"
 
-          # Update all download URLs — both path (/vX.Y.Z/) AND tarball name (tune-server-vX.Y.Z-)
-          sed -i "s|/v${OLD_VERSION}/|/v${VERSION}/|g" "$F"
-          sed -i "s|tune-server-v${OLD_VERSION}-|tune-server-v${VERSION}-|g" "$F"
+          # Update all download URLs — use regex to catch ANY old version, not just OLD_VERSION
+          # This handles cases where the formula has stale versions from failed previous updates
+          sed -i -E "s|/v[0-9]+\.[0-9]+\.[0-9]+/|/v${VERSION}/|g" "$F"
+          sed -i -E "s|tune-server-v[0-9]+\.[0-9]+\.[0-9]+-|tune-server-v${VERSION}-|g" "$F"
 
-          # Safety: catch any remaining old version references
-          if grep -q "${OLD_VERSION}" "$F"; then
-            echo "::warning::Formula still contains old version ${OLD_VERSION} after sed"
-            grep -n "${OLD_VERSION}" "$F"
+          # Safety: verify all URLs now point to the correct version
+          BAD_URLS=$(grep -n "tune-server-v" "$F" | grep -v "tune-server-v${VERSION}" || true)
+          if [ -n "$BAD_URLS" ]; then
+            echo "::error::Formula still has wrong version in URLs after sed:"
+            echo "$BAD_URLS"
+            exit 1
           fi
 
           # Recompute SHA256 for each platform tarball

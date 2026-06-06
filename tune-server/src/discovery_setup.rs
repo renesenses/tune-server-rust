@@ -248,14 +248,18 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             let settings =
                                 tune_core::db::settings_repo::SettingsRepo::new(db.clone());
                             let current = settings
-                                .get("squeezebox_host")
+                                .get("lms_host")
                                 .ok()
                                 .flatten()
+                                .or_else(|| settings.get("squeezebox_host").ok().flatten())
                                 .unwrap_or_default();
                             if current.is_empty() {
                                 // Use the CLI port (9090), NOT the JSON-RPC port (9000)
                                 let cli_port = dev.port;
                                 let lms_addr = format!("{}:{}", dev.host, cli_port);
+                                // Write to both keys: "lms_host" is what the web client reads,
+                                // "squeezebox_host" is legacy
+                                settings.set("lms_host", &lms_addr).ok();
                                 settings.set("squeezebox_host", &lms_addr).ok();
                                 settings.set("squeezebox_enabled", "true").ok();
                                 info!(host = %lms_addr, "mdns_lms_discovered_auto_configured");

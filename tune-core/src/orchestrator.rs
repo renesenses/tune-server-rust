@@ -51,6 +51,7 @@ pub struct ResolvedStream {
     pub mime_type: String,
     pub title: String,
     pub artist: Option<String>,
+    pub album: Option<String>,
     pub duration_ms: Option<i64>,
     pub source: String,
     pub cover_url: Option<String>,
@@ -87,12 +88,13 @@ impl PlaybackOrchestrator {
 
         let resolved = self.resolve_stream(&req).await?;
 
-        let cover_path = req.cover_url.clone().or(resolved.cover_url);
+        let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
+        let album = req.album_title.clone().or(resolved.album.clone());
         let np = NowPlaying {
             track_id: req.track_id,
             title: resolved.title.clone(),
             artist_name: resolved.artist.clone(),
-            album_title: req.album_title.clone(),
+            album_title: album.clone(),
             cover_path: cover_path.clone(),
             duration_ms: resolved.duration_ms.unwrap_or(0),
             source: resolved.source.clone(),
@@ -109,7 +111,7 @@ impl PlaybackOrchestrator {
         self.listenbrainz_now_playing(
             &resolved.title,
             resolved.artist.as_deref(),
-            req.album_title.as_deref(),
+            album.as_deref(),
         );
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
@@ -134,7 +136,7 @@ impl PlaybackOrchestrator {
                 mime_type: &resolved.mime_type,
                 title: Some(&resolved.title),
                 artist: resolved.artist.as_deref(),
-                album: req.album_title.as_deref(),
+                album: album.as_deref(),
                 cover_url: resolved_cover_url.as_deref(),
                 duration_ms: resolved.duration_ms.map(|d| d as u64),
                 file_size: resolved.file_size,
@@ -154,7 +156,7 @@ impl PlaybackOrchestrator {
         self.record_listen(
             &resolved.title,
             resolved.artist.as_deref(),
-            req.album_title.as_deref(),
+            album.as_deref(),
             &resolved.source,
             resolved.duration_ms.unwrap_or(0),
             req.zone_id,
@@ -416,6 +418,7 @@ impl PlaybackOrchestrator {
             mime_type: out_mime,
             title: track.title,
             artist: track.artist_name,
+            album: track.album_title,
             duration_ms: Some(track.duration_ms),
             source: "local".into(),
             cover_url: track.cover_path,
@@ -487,22 +490,24 @@ impl PlaybackOrchestrator {
             (stream_data.url.clone(), None)
         };
 
-        let (title, artist, duration_ms, cover_path) = if req.title.is_some() {
+        let (title, artist, album, duration_ms, cover_path) = if req.title.is_some() {
             (
                 req.title.clone().unwrap_or_default(),
                 req.artist_name.clone(),
+                req.album_title.clone(),
                 req.duration_ms,
-                None,
+                req.cover_url.clone(),
             )
         } else {
             match svc.get_track(source_id).await {
                 Ok(track) => (
                     track.title,
                     Some(track.artist),
+                    track.album,
                     Some(track.duration_ms as i64),
                     track.cover_path,
                 ),
-                Err(_) => ("Unknown".into(), None, req.duration_ms, None),
+                Err(_) => ("Unknown".into(), None, None, req.duration_ms, None),
             }
         };
 
@@ -511,6 +516,7 @@ impl PlaybackOrchestrator {
             mime_type: stream_data.mime_type,
             title,
             artist,
+            album,
             duration_ms,
             source: service_name.into(),
             cover_url: cover_path,

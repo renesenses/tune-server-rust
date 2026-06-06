@@ -578,88 +578,93 @@ impl TrackRepo {
 
     // ─── Group B/C: write_tx + simple inline ──────────────────────
 
+    /// Insert multiple tracks using individual execute calls.
+    ///
+    /// **Important**: this method does NOT start its own transaction.
+    /// The caller is responsible for wrapping the call in a transaction
+    /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
+    /// Using `write_tx` here would fail with "cannot start a transaction
+    /// within a transaction" when the caller already holds one.
     pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
-        let count_ref = &mut count;
-        self.db.write_tx(&mut |tx| {
-            for track in tracks {
-                let params: [&dyn ToSqlValue; 26] = [
-                    &track.title,
-                    &track.album_id,
-                    &track.artist_id,
-                    &track.album_artist,
-                    &track.disc_number,
-                    &track.disc_subtitle,
-                    &track.track_number,
-                    &track.duration_ms,
-                    &track.file_path,
-                    &track.format,
-                    &track.sample_rate,
-                    &track.bit_depth,
-                    &track.channels,
-                    &track.file_mtime,
-                    &track.file_size,
-                    &track.audio_hash,
-                    &track.source,
-                    &track.source_id,
-                    &track.isrc,
-                    &track.genre,
-                    &track.genres,
-                    &track.composer,
-                    &track.year,
-                    &track.bpm,
-                    &track.label,
-                    &track.musicbrainz_recording_id,
-                ];
-                if tx.execute(&insert_sql, &params).is_ok() {
-                    *count_ref += 1;
-                }
+        for track in tracks {
+            let params: [&dyn ToSqlValue; 26] = [
+                &track.title,
+                &track.album_id,
+                &track.artist_id,
+                &track.album_artist,
+                &track.disc_number,
+                &track.disc_subtitle,
+                &track.track_number,
+                &track.duration_ms,
+                &track.file_path,
+                &track.format,
+                &track.sample_rate,
+                &track.bit_depth,
+                &track.channels,
+                &track.file_mtime,
+                &track.file_size,
+                &track.audio_hash,
+                &track.source,
+                &track.source_id,
+                &track.isrc,
+                &track.genre,
+                &track.genres,
+                &track.composer,
+                &track.year,
+                &track.bpm,
+                &track.label,
+                &track.musicbrainz_recording_id,
+            ];
+            if self.db.execute(&insert_sql, &params).is_ok() {
+                count += 1;
             }
-            Ok(())
-        })?;
+        }
         Ok(count)
     }
 
+    /// Update multiple tracks using individual execute calls.
+    ///
+    /// **Important**: this method does NOT start its own transaction.
+    /// The caller is responsible for wrapping the call in a transaction
+    /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
+    /// See `create_batch` for rationale.
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
         let update_sql = self.dialect_sql(sql::update, sql::update);
         let mut count = 0usize;
-        let count_ref = &mut count;
-        self.db.write_tx(&mut |tx| {
-            for track in tracks {
-                let Some(id) = track.id else { continue };
-                let params: [&dyn ToSqlValue; 24] = [
-                    &track.title,
-                    &track.album_id,
-                    &track.artist_id,
-                    &track.album_artist,
-                    &track.disc_number,
-                    &track.disc_subtitle,
-                    &track.track_number,
-                    &track.duration_ms,
-                    &track.file_path,
-                    &track.format,
-                    &track.sample_rate,
-                    &track.bit_depth,
-                    &track.channels,
-                    &track.file_mtime,
-                    &track.file_size,
-                    &track.audio_hash,
-                    &track.genre,
-                    &track.genres,
-                    &track.composer,
-                    &track.year,
-                    &track.bpm,
-                    &track.label,
-                    &track.musicbrainz_recording_id,
-                    &id,
-                ];
-                if tx.execute(&update_sql, &params).is_ok() {
-                    *count_ref += 1;
-                }
+        for track in tracks {
+            let Some(id) = track.id else { continue };
+            let params: [&dyn ToSqlValue; 24] = [
+                &track.title,
+                &track.album_id,
+                &track.artist_id,
+                &track.album_artist,
+                &track.disc_number,
+                &track.disc_subtitle,
+                &track.track_number,
+                &track.duration_ms,
+                &track.file_path,
+                &track.format,
+                &track.sample_rate,
+                &track.bit_depth,
+                &track.channels,
+                &track.file_mtime,
+                &track.file_size,
+                &track.audio_hash,
+                &track.genre,
+                &track.genres,
+                &track.composer,
+                &track.year,
+                &track.bpm,
+                &track.label,
+                &track.musicbrainz_recording_id,
+                &id,
+            ];
+            if self.db.execute(&update_sql, &params).is_ok() {
+                count += 1;
             }
-            Ok(())
-        })?;
+        }
         Ok(count)
     }
 

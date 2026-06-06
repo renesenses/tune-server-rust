@@ -36,9 +36,10 @@ fn spawn_squeezebox_poller(state: &AppState) {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
             let host = settings
-                .get("squeezebox_host")
+                .get("lms_host")
                 .ok()
                 .flatten()
+                .or_else(|| settings.get("squeezebox_host").ok().flatten())
                 .unwrap_or_default();
 
             if enabled && !host.is_empty() {

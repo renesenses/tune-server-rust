@@ -44,6 +44,12 @@ pub struct ZoneState {
     pub repeat: RepeatMode,
     pub queue_position: i64,
     pub queue_length: i64,
+    /// Monotonically increasing counter bumped on each `play()` call.
+    /// The poller uses this to detect track changes and reset its state
+    /// (peak_position, gapless flags, etc.) so stale data from the
+    /// previous track cannot trigger false advances.
+    #[serde(default)]
+    pub track_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +73,7 @@ impl Default for ZoneState {
             repeat: RepeatMode::Off,
             queue_position: 0,
             queue_length: 0,
+            track_generation: 0,
         }
     }
 }
@@ -137,6 +144,7 @@ impl PlaybackManager {
         state.state = PlayState::Playing;
         state.position_ms = 0;
         state.now_playing = Some(np.clone());
+        state.track_generation = state.track_generation.wrapping_add(1);
 
         self.emit(PlaybackEvent {
             event: "started".into(),

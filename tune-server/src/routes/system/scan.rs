@@ -170,7 +170,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     let existing_album_artist: Option<String> = if meta.album_artist.is_none() {
                         meta.album.as_ref().and_then(|title| {
                             album_repo
-                                .get_by_title(title)
+                                .get_by_title_strong(title)
                                 .ok()
                                 .flatten()
                                 .and_then(|a| a.artist_name)

@@ -73,7 +73,7 @@ pub fn build_track_from_metadata(
         // existing album with this title first to avoid creating duplicates when
         // tracks in the same album have different track artists.
         if !has_explicit_album_artist {
-            if let Ok(Some(existing)) = album_repo.get_by_title_only(title) {
+            if let Ok(Some(existing)) = album_repo.get_by_title_only_strong(title) {
                 return Some(existing);
             }
         }

@@ -257,6 +257,19 @@ impl AlbumRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
+    /// Like `get_by_title` but reads through the write connection.
+    /// Used by the scanner when running inside a `BEGIN IMMEDIATE` to
+    /// see albums created earlier in the same transaction.
+    pub fn get_by_title_strong(&self, title: &str) -> Result<Option<Album>, String> {
+        let sql = self.dialect_sql(sql::get_by_title, sql::get_by_title);
+        let params: [&dyn ToSqlValue; 1] = [&title];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .as_ref()
+            .map(row_to_album))
+    }
+
     pub fn get_by_title_and_artist(
         &self,
         title: &str,
@@ -280,6 +293,19 @@ impl AlbumRepo {
         let sql = self.dialect_sql(sql::get_by_title_only, sql::get_by_title_only);
         let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
+    }
+
+    /// Like `get_by_title_only` but reads through the write connection.
+    /// Used by the scanner when running inside a `BEGIN IMMEDIATE` to
+    /// see albums created earlier in the same transaction.
+    pub fn get_by_title_only_strong(&self, title: &str) -> Result<Option<Album>, String> {
+        let sql = self.dialect_sql(sql::get_by_title_only, sql::get_by_title_only);
+        let params: [&dyn ToSqlValue; 1] = [&title];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .as_ref()
+            .map(row_to_album))
     }
 
     pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
@@ -322,20 +348,28 @@ impl AlbumRepo {
     }
 
     /// Look up an album by (title, artist, year), or create it.
-    /// Sequential `query_one` + `execute` + `last_insert_rowid` (not
-    /// `write_tx`) because the scanner holds `BEGIN IMMEDIATE` while
-    /// calling this, and `write_tx` would try to start a nested
+    /// Sequential `query_one_strong` + `execute` + `last_insert_rowid`
+    /// (not `write_tx`) because the scanner holds `BEGIN IMMEDIATE`
+    /// while calling this, and `write_tx` would try to start a nested
     /// `BEGIN DEFERRED` — same constraint as `zone_repo::create` (cf.
     /// commit `9f502c0`). On SQLite the write mutex serializes the
     /// three calls, so a concurrent `get_or_create` on another thread
     /// can't shift the rowid we read.
+    ///
+    /// Uses `query_one_strong` (write connection) instead of
+    /// `query_one` (read pool) so that the SELECT sees albums created
+    /// earlier in the same `BEGIN IMMEDIATE` transaction. Without this,
+    /// the read-only connection's WAL snapshot does not include
+    /// uncommitted writes, causing each track in a batch to create a
+    /// separate album instead of reusing the one created by the first
+    /// track.
     pub fn get_or_create(
         &self,
         title: &str,
         artist_id: i64,
         year: Option<i32>,
     ) -> Result<Album, String> {
-        if let Some(found) = self.get_by_title_and_artist(title, artist_id, year)? {
+        if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
             return Ok(found);
         }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
@@ -359,11 +393,16 @@ impl AlbumRepo {
         mbid: Option<&str>,
     ) -> Result<Album, String> {
         if let Some(release_id) = mbid {
-            if let Some(found) = self.get_by_musicbrainz_release_id(release_id)? {
-                return Ok(found);
+            let sql = self.dialect_sql(
+                sql::get_by_musicbrainz_release_id,
+                sql::get_by_musicbrainz_release_id,
+            );
+            let params: [&dyn ToSqlValue; 1] = [&release_id];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                return Ok(row_to_album(&row));
             }
         }
-        if let Some(found) = self.get_by_title_and_artist(title, artist_id, year)? {
+        if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
             return Ok(found);
         }
         let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
@@ -376,6 +415,33 @@ impl AlbumRepo {
         album.year = year;
         album.musicbrainz_release_id = mbid.map(String::from);
         Ok(album)
+    }
+
+    /// Like `get_by_title_and_artist` but uses `query_one_strong` to
+    /// read through the write connection. Called by `get_or_create` /
+    /// `get_or_create_with_mbid` which run inside a scanner
+    /// `BEGIN IMMEDIATE` transaction.
+    fn find_by_title_and_artist_strong(
+        &self,
+        title: &str,
+        artist_id: i64,
+        year: Option<i32>,
+    ) -> Result<Option<Album>, String> {
+        if let Some(y) = year {
+            let sql =
+                self.dialect_sql(sql::get_by_title_artist_year, sql::get_by_title_artist_year);
+            let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &y];
+            if let Some(row) = self.db.query_one_strong(&sql, &params)? {
+                return Ok(Some(row_to_album(&row)));
+            }
+        }
+        let sql = self.dialect_sql(sql::get_by_title_artist, sql::get_by_title_artist);
+        let params: [&dyn ToSqlValue; 2] = [&title, &artist_id];
+        Ok(self
+            .db
+            .query_one_strong(&sql, &params)?
+            .as_ref()
+            .map(row_to_album))
     }
 
     pub fn update(&self, album: &Album) -> Result<(), String> {

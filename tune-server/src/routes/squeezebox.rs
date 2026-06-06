@@ -26,23 +26,28 @@ pub fn router() -> Router<AppState> {
         .route("/players/{id}/power", post(power_player))
 }
 
-/// Parse the squeezebox_host setting into (host, port).
+/// Parse the LMS host setting into (host, port).
 /// Default CLI port is 9090.
+/// The web client saves this as "lms_host"; legacy key is "squeezebox_host".
 fn parse_lms_host(state: &AppState) -> (String, u16) {
     let settings = SettingsRepo::new(state.db.clone());
+    // Try "lms_host" first (what the web client actually saves), then fall back to legacy "squeezebox_host"
     let raw = settings
-        .get("squeezebox_host")
+        .get("lms_host")
         .ok()
         .flatten()
+        .or_else(|| settings.get("squeezebox_host").ok().flatten())
         .unwrap_or_else(|| "localhost".into());
 
     // Strip http:// or https:// prefix if user pasted a URL
     let cleaned = raw
         .trim()
         .trim_start_matches("http://")
-        .trim_start_matches("https://");
+        .trim_start_matches("https://")
+        // Strip trailing path segments (e.g. "192.168.1.7:9000/")
+        .trim_end_matches('/');
 
-    if cleaned.contains(':') {
+    let (host, port) = if cleaned.contains(':') {
         let parts: Vec<&str> = cleaned.splitn(2, ':').collect();
         let mut port = parts[1].parse::<u16>().unwrap_or(LMS_CLI_PORT);
         // Auto-correct: port 9000 is LMS HTTP, CLI is 9090
@@ -52,19 +57,27 @@ fn parse_lms_host(state: &AppState) -> (String, u16) {
         (parts[0].to_string(), port)
     } else {
         (cleaned.to_string(), LMS_CLI_PORT)
-    }
+    };
+
+    tracing::debug!(raw = %raw, host = %host, port, "parse_lms_host resolved");
+    (host, port)
 }
 
 /// Send a raw CLI command to LMS via TCP and return the response line.
 fn lms_cli_command(host: &str, port: u16, cmd: &str) -> Result<String, String> {
     let addr = format!("{host}:{port}");
+    tracing::debug!(addr = %addr, cmd = %cmd, "lms_cli_command connecting");
     let stream = TcpStream::connect_timeout(
         &addr
             .parse()
-            .map_err(|e| format!("invalid LMS address {addr}: {e}"))?,
+            .map_err(|e| {
+                tracing::error!(addr = %addr, error = %e, "lms_cli_command: invalid address");
+                format!("invalid LMS address {addr}: {e}")
+            })?,
         Duration::from_secs(5),
     )
     .map_err(|e| {
+        tracing::error!(addr = %addr, error = %e, "lms_cli_command: TCP connect failed");
         format!(
             "Impossible de se connecter au serveur Squeezebox (LMS) sur {addr}: {e}. Verifiez que Logitech Media Server est demarre."
         )
@@ -107,9 +120,23 @@ fn lms_player_command(host: &str, port: u16, player_id: &str, cmd: &str) -> Resu
 
 async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
     let (host, port) = parse_lms_host(&state);
+    let lms_host_display = if port == LMS_CLI_PORT {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     match lms_cli_command(&host, port, "serverstatus 0 100") {
-        Ok(resp) => Json(json!({"status": "ok", "response": resp})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+        Ok(resp) => Json(json!({
+            "status": "ok",
+            "response": resp,
+            "lms_host": lms_host_display,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e, "lms_host": lms_host_display})),
+        )
+            .into_response(),
     }
 }
 

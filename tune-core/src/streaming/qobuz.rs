@@ -489,9 +489,41 @@ impl StreamingService for QobuzService {
         let data = self
             .api_get("/album/get", &[("album_id", album_id)])
             .await?;
+        // Qobuz album/get returns album metadata at the top level while
+        // individual track items inside tracks.items do NOT carry an
+        // "album" sub-object.  Extract the album-level title, image and
+        // id so we can inject them into each mapped track.
+        let album_title = data["title"].as_str().map(String::from);
+        let album_cover = data["image"]["large"]
+            .as_str()
+            .or_else(|| data["image"]["small"].as_str())
+            .map(String::from);
+        let album_id_val = data["id"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| data["id"].as_u64().map(|id| id.to_string()));
+
         let tracks = data["tracks"]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let mut t = Self::map_track(item);
+                        // Inject album-level metadata when the track lacks it
+                        if t.album.is_none() {
+                            t.album = album_title.clone();
+                        }
+                        if t.cover_path.is_none() {
+                            t.cover_path = album_cover.clone();
+                        }
+                        if t.album_id.is_none() {
+                            t.album_id = album_id_val.clone();
+                        }
+                        t
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(tracks)
     }

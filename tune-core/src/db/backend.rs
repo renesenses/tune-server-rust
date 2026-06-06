@@ -102,6 +102,26 @@ pub trait DbBackend: Send + Sync {
     ) -> Result<Vec<Vec<SqlValue>>, String> {
         self.query_many(sql, params)
     }
+
+    /// Like `query_one`, but reads through the write connection so the
+    /// query sees rows inserted in the current write transaction.
+    ///
+    /// Same WAL snapshot rationale as `query_many_strong`: the read-only
+    /// connection pool may not see rows that the write connection
+    /// inserted inside a `BEGIN IMMEDIATE` that has not yet been
+    /// committed. This is the root cause of the album-splitting bug
+    /// where each track in a batch scan created its own album — the
+    /// `SELECT` to check for an existing album ran on a read connection
+    /// that couldn't see the album just created by the write connection.
+    ///
+    /// Default impl delegates to `query_one`; SQLite overrides.
+    fn query_one_strong(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.query_one(sql, params)
+    }
 }
 
 /// Transaction handle. Mirror of `DbBackend`'s execution surface, but
@@ -517,6 +537,39 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             out.push(cols);
         }
         Ok(out)
+    }
+
+    fn query_one_strong(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        // Same body as query_one but uses the *write* connection so the
+        // query sees rows inserted in the current write transaction.
+        // See query_many_strong and the album-splitting bug.
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let conn = self.connection().lock().unwrap();
+        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(refs.iter()))
+            .map_err(|e| format!("query: {e}"))?;
+        if let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
+            let cols = (0..col_count)
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(rusqlite_value_to_sqlvalue)
+                        .map_err(|e| format!("col {i}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(cols))
+        } else {
+            Ok(None)
+        }
     }
 }
 

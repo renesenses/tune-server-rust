@@ -94,6 +94,11 @@ struct ZonePollState {
     /// When the current track started playing (wall clock).
     /// Used to reject false gapless transitions that happen too soon.
     track_started_at: Option<Instant>,
+    /// Tracks the `ZoneState::track_generation` we last observed.
+    /// When the generation changes (new track started via `play()`),
+    /// we reset all per-track state so stale values from the previous
+    /// track cannot trigger false gapless advances or premature track ends.
+    track_generation: u64,
 }
 
 pub struct PositionPoller {
@@ -237,7 +242,30 @@ impl PositionPoller {
                 peak_position_ms: 0,
                 ticks_since_db_save: 0,
                 track_started_at: None,
+                track_generation: zone_state.track_generation,
             });
+
+            // Detect track change: if the generation changed, the orchestrator
+            // started a new track (via play() / play_from_queue / next / previous).
+            // Reset all per-track poller state so stale values from the previous
+            // track (peak_position, gapless flags, etc.) cannot cause false
+            // gapless advances or premature track-end detection.
+            if ps.track_generation != zone_state.track_generation {
+                info!(
+                    zone_id,
+                    old_gen = ps.track_generation,
+                    new_gen = zone_state.track_generation,
+                    "poller_track_generation_changed_resetting_state"
+                );
+                ps.gapless_sent = false;
+                ps.gapless_sent_at = None;
+                ps.gapless_cooldown = 0;
+                ps.stopped_ticks = 0;
+                ps.last_position_ms = 0;
+                ps.peak_position_ms = 0;
+                ps.track_started_at = None;
+                ps.track_generation = zone_state.track_generation;
+            }
 
             if ps.backoff_remaining > 0 {
                 ps.backoff_remaining -= 1;
@@ -740,6 +768,7 @@ mod tests {
             peak_position_ms: 0,
             ticks_since_db_save: 0,
             track_started_at: None,
+            track_generation: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -776,6 +805,7 @@ mod tests {
             peak_position_ms: 0,
             ticks_since_db_save: 0,
             track_started_at: None,
+            track_generation: 0,
         };
 
         // Simulates entering Playing state
@@ -867,6 +897,7 @@ mod tests {
             peak_position_ms: 0,
             ticks_since_db_save: 0,
             track_started_at: None,
+            track_generation: 0,
         };
 
         // Simulate consecutive errors with exponential backoff
