@@ -1119,20 +1119,27 @@ impl OutputTarget for OaatOutput {
                                 Ordering::Relaxed,
                             );
 
-                            // Real-time pacing
-                            let expected = if uses_byte_offset {
-                                let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
-                                std::time::Duration::from_nanos(
-                                    (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
-                                )
+                            // Real-time pacing — skip for first 50 packets to pre-fill endpoint buffer
+                            let packet_num = if uses_byte_offset {
+                                byte_offset / packet_size as u64
                             } else {
-                                std::time::Duration::from_nanos(
-                                    (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                                )
+                                sample_offset / PCM_SAMPLES_PER_PACKET as u64
                             };
-                            let elapsed = start.elapsed();
-                            if expected > elapsed {
-                                tokio::time::sleep(expected - elapsed).await;
+                            if packet_num > 50 {
+                                let expected = if uses_byte_offset {
+                                    let audio_bytes_per_sec = cur_sample_rate as f64 * bytes_per_frame as f64;
+                                    std::time::Duration::from_nanos(
+                                        (byte_offset as f64 / audio_bytes_per_sec * 1e9) as u64,
+                                    )
+                                } else {
+                                    std::time::Duration::from_nanos(
+                                        (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                                    )
+                                };
+                                let elapsed = start.elapsed();
+                                if expected > elapsed {
+                                    tokio::time::sleep(expected - elapsed).await;
+                                }
                             }
                         }
                     }
