@@ -1200,7 +1200,7 @@ pub fn decode_wavpack_to_pcm(
         usize::MAX
     };
 
-    let mut all_samples: Vec<i16> = Vec::new();
+    let mut all_samples: Vec<i32> = Vec::new();
     let mut samples_processed: u64 = 0;
 
     loop {
@@ -1250,7 +1250,7 @@ pub fn decode_wavpack_to_pcm(
         let is_mono = header.is_mono() && !header.is_false_stereo();
         let out_channels = if is_mono { 1 } else { 2 };
 
-        // Convert i32 samples to i16, interleaved
+        // Collect i32 samples interleaved
         let start_in_block = if samples_processed < skip_samples {
             (skip_samples - samples_processed) as usize
         } else {
@@ -1262,15 +1262,10 @@ pub fn decode_wavpack_to_pcm(
                 break;
             }
 
-            let l = clamp_to_i16(left[i], bits);
-            all_samples.push(l);
+            all_samples.push(left[i]);
 
             if out_channels == 2 {
-                let r = if i < right.len() {
-                    clamp_to_i16(right[i], bits)
-                } else {
-                    l
-                };
+                let r = if i < right.len() { right[i] } else { left[i] };
                 all_samples.push(r);
             }
         }
@@ -1298,31 +1293,12 @@ pub fn decode_wavpack_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples: all_samples,
+        samples_i32: all_samples,
+        bit_depth: bits as u16,
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,
     })
-}
-
-/// Clamp an i32 sample to i16 range, considering the source bit depth.
-fn clamp_to_i16(sample: i32, bits: u32) -> i16 {
-    match bits {
-        8 => {
-            // 8-bit samples are 0-255, center at 128
-            ((sample.clamp(0, 255) - 128) as i16) << 8
-        }
-        16 => sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        24 => {
-            // Shift right by 8 to fit into 16 bits
-            (sample >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-        }
-        32 => {
-            // Shift right by 16 to fit into 16 bits
-            (sample >> 16).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-        }
-        _ => sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1541,22 +1517,6 @@ mod tests {
         assert_eq!(restore_weight(1), 8 + 0); // (1<<3) + ((1+7)>>4) = 8 + 0 = 8
         assert_eq!(restore_weight(10), 80 + 1); // (10<<3) + ((10+7)>>4) = 80 + 1 = 81
         assert_eq!(restore_weight(-1), -8 + 0); // (-1<<3) - ((1+7)>>4) = -8 - 0 = -8
-    }
-
-    #[test]
-    fn clamp_to_i16_values() {
-        // 16-bit passthrough
-        assert_eq!(clamp_to_i16(0, 16), 0);
-        assert_eq!(clamp_to_i16(32767, 16), 32767);
-        assert_eq!(clamp_to_i16(-32768, 16), -32768);
-        assert_eq!(clamp_to_i16(40000, 16), 32767); // clamped
-
-        // 24-bit -> 16-bit (shift right by 8)
-        assert_eq!(clamp_to_i16(256, 24), 1); // 256 >> 8 = 1
-        assert_eq!(clamp_to_i16(-256, 24), -1);
-
-        // 32-bit -> 16-bit (shift right by 16)
-        assert_eq!(clamp_to_i16(65536, 32), 1);
     }
 
     #[test]

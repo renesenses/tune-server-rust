@@ -335,23 +335,20 @@ impl PlaybackOrchestrator {
                 match decode_result {
                     Ok(decoded) => {
                         debug!(
-                            samples = decoded.samples.len(),
+                            samples = decoded.samples_i32.len(),
                             sample_rate = decoded.sample_rate,
                             channels = decoded.channels,
+                            bit_depth = decoded.bit_depth,
                             "transcode_decoded"
                         );
-                        // Convert i16 samples to raw PCM bytes (16-bit LE)
-                        let pcm_bytes: Vec<u8> = decoded
-                            .samples
-                            .iter()
-                            .flat_map(|s| s.to_le_bytes())
-                            .collect();
+                        let actual_bd = decoded.bit_depth;
+                        let pcm_bytes = decoded.pcm_bytes();
 
-                        // Encode to target format
+                        // Encode to target format using native bit depth
                         let mut encoder = crate::audio::encoder::AudioEncoder::new(
                             &target_format_str,
                             decoded.sample_rate,
-                            16, // decode_to_pcm produces i16 samples
+                            actual_bd as u32,
                             decoded.channels,
                         );
                         if let Err(e) = encoder.start().await {
@@ -551,23 +548,20 @@ impl PlaybackOrchestrator {
                 match decode_result {
                     Ok(decoded) => {
                         debug!(
-                            samples = decoded.samples.len(),
+                            samples = decoded.samples_i32.len(),
                             sample_rate = decoded.sample_rate,
                             channels = decoded.channels,
+                            bit_depth = decoded.bit_depth,
                             "streaming_transcode_decoded"
                         );
-                        // Convert i16 samples to raw PCM bytes (16-bit LE)
-                        let pcm_bytes: Vec<u8> = decoded
-                            .samples
-                            .iter()
-                            .flat_map(|s| s.to_le_bytes())
-                            .collect();
+                        let actual_bd = decoded.bit_depth;
+                        let pcm_bytes = decoded.pcm_bytes();
 
-                        // Encode to WAV
+                        // Encode to WAV using native bit depth
                         let mut encoder = crate::audio::encoder::AudioEncoder::new(
                             "wav",
                             decoded.sample_rate,
-                            16, // decode_to_pcm produces i16 samples
+                            actual_bd as u32,
                             decoded.channels,
                         );
                         if let Err(e) = encoder.start().await {

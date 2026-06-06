@@ -13,10 +13,36 @@ use tracing::debug;
 use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
 
 pub struct DecodedAudio {
-    pub samples: Vec<i16>,
+    pub samples_i32: Vec<i32>,
+    pub bit_depth: u16,
     pub sample_rate: u32,
     pub channels: u32,
     pub duration_s: f64,
+}
+
+impl DecodedAudio {
+    pub fn pcm_bytes(&self) -> Vec<u8> {
+        match self.bit_depth {
+            24 => self
+                .samples_i32
+                .iter()
+                .flat_map(|s| {
+                    let b = s.to_le_bytes();
+                    [b[0], b[1], b[2]].into_iter()
+                })
+                .collect(),
+            32 => self
+                .samples_i32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect(),
+            _ => self
+                .samples_i32
+                .iter()
+                .flat_map(|s| (*s as i16).to_le_bytes())
+                .collect(),
+        }
+    }
 }
 
 pub fn can_decode_native(file_path: &str) -> bool {
@@ -151,7 +177,9 @@ pub fn decode_to_pcm(
         );
     }
 
-    let mut all_samples: Vec<i16> = Vec::new();
+    let source_bd = audio_params.bits_per_sample.unwrap_or(16) as u16;
+
+    let mut all_samples: Vec<i32> = Vec::new();
     let max_samples = if max_duration_s > 0.0 {
         (max_duration_s * source_rate as f64 * source_channels as f64) as usize
     } else {
@@ -183,8 +211,8 @@ pub fn decode_to_pcm(
             Err(_) => continue,
         };
 
-        let mut packet_samples: Vec<i16> = Vec::new();
-        decoded.copy_to_vec_interleaved::<i16>(&mut packet_samples);
+        let mut packet_samples: Vec<i32> = Vec::new();
+        decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
         all_samples.extend_from_slice(&packet_samples);
     }
 
@@ -207,7 +235,8 @@ pub fn decode_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples: all_samples,
+        samples_i32: all_samples,
+        bit_depth: source_bd,
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,
@@ -273,7 +302,8 @@ fn decode_dsd_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples: trimmed.to_vec(),
+        samples_i32: trimmed.iter().map(|&s| s as i32).collect(),
+        bit_depth: 16,
         sample_rate: output_rate,
         channels: channels as u32,
         duration_s: actual_duration,
@@ -311,7 +341,7 @@ mod decode_integration_tests {
     fn decode_wav() {
         let path = fixture_path("test.wav");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "WAV should produce samples");
+        assert!(!result.samples_i32.is_empty(), "WAV should produce samples");
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
         assert!(
@@ -325,7 +355,10 @@ mod decode_integration_tests {
     fn decode_flac() {
         let path = fixture_path("test.flac");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "FLAC should produce samples");
+        assert!(
+            !result.samples_i32.is_empty(),
+            "FLAC should produce samples"
+        );
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
         assert!(result.duration_s > 0.9, "duration should be ~1s");
@@ -335,7 +368,7 @@ mod decode_integration_tests {
     fn decode_mp3() {
         let path = fixture_path("test.mp3");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "MP3 should produce samples");
+        assert!(!result.samples_i32.is_empty(), "MP3 should produce samples");
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
     }
@@ -344,7 +377,7 @@ mod decode_integration_tests {
     fn decode_ogg() {
         let path = fixture_path("test.ogg");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "OGG should produce samples");
+        assert!(!result.samples_i32.is_empty(), "OGG should produce samples");
         assert_eq!(result.sample_rate, 44100);
     }
 
@@ -352,7 +385,7 @@ mod decode_integration_tests {
     fn decode_m4a() {
         let path = fixture_path("test.m4a");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "M4A should produce samples");
+        assert!(!result.samples_i32.is_empty(), "M4A should produce samples");
         assert_eq!(result.sample_rate, 44100);
     }
 
@@ -360,7 +393,10 @@ mod decode_integration_tests {
     fn decode_aiff_native() {
         let path = fixture_path("test.aiff");
         let result = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "AIFF should produce samples");
+        assert!(
+            !result.samples_i32.is_empty(),
+            "AIFF should produce samples"
+        );
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
         assert!(
@@ -376,11 +412,11 @@ mod decode_integration_tests {
         let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
         let half = decode_to_pcm(&path, None, None, 0.0, 0.5).unwrap();
         assert!(
-            half.samples.len() < full.samples.len(),
+            half.samples_i32.len() < full.samples_i32.len(),
             "limited decode should have fewer samples"
         );
         assert!(
-            half.samples.len() > 0,
+            half.samples_i32.len() > 0,
             "limited decode should still have samples"
         );
     }
@@ -391,7 +427,7 @@ mod decode_integration_tests {
         let full = decode_to_pcm(&path, None, None, 0.0, 0.0).unwrap();
         let seeked = decode_to_pcm(&path, None, None, 0.5, 0.0).unwrap();
         assert!(
-            seeked.samples.len() < full.samples.len(),
+            seeked.samples_i32.len() < full.samples_i32.len(),
             "seeked decode should have fewer samples"
         );
     }

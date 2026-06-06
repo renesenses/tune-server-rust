@@ -98,20 +98,17 @@ async fn run_native_pipeline(
     )
     .map_err(|e| format!("native decode failed: {e}"))?;
 
-    // Convert i16 samples to raw PCM bytes (16-bit LE)
-    let pcm_bytes: Vec<u8> = decoded
-        .samples
-        .iter()
-        .flat_map(|s| s.to_le_bytes())
-        .collect();
+    // Convert samples to raw PCM bytes using bit-depth-aware encoding
+    let pcm_bytes: Vec<u8> = decoded.pcm_bytes();
 
     // Encode to the target format
+    let actual_bd = decoded.bit_depth as u32;
     let output_data = match cfg.output_format {
         AudioFormat::Wav | AudioFormat::Flac => {
             let mut encoder = super::encoder::AudioEncoder::new(
                 cfg.output_format.container_format(),
                 decoded.sample_rate,
-                16, // decode_to_pcm produces i16
+                actual_bd,
                 decoded.channels,
             );
             encoder.start().await?;
@@ -123,7 +120,7 @@ async fn run_native_pipeline(
             let mut encoder = super::encoder::AudioEncoder::new(
                 cfg.output_format.container_format(),
                 decoded.sample_rate,
-                16,
+                actual_bd,
                 decoded.channels,
             );
             encoder.start().await?;

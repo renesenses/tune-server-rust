@@ -152,7 +152,7 @@ pub fn parse_aiff(path: &str) -> Result<AiffInfo, String> {
     })
 }
 
-/// Decode an AIFF/AIFC file to interleaved i16 PCM samples.
+/// Decode an AIFF/AIFC file to interleaved i32 PCM samples.
 ///
 /// Supports seek (in seconds) and duration limiting.
 pub fn decode_aiff_to_pcm(
@@ -198,7 +198,8 @@ pub fn decode_aiff_to_pcm(
 
     if max_frames == 0 {
         return Ok(DecodedAudio {
-            samples: Vec::new(),
+            samples_i32: Vec::new(),
+            bit_depth: info.bits_per_sample,
             sample_rate: info.sample_rate.round() as u32,
             channels: info.channels as u32,
             duration_s: 0.0,
@@ -217,12 +218,12 @@ pub fn decode_aiff_to_pcm(
     f.read_exact(&mut raw)
         .map_err(|e| format!("read PCM data: {e}"))?;
 
-    // Convert to interleaved i16
+    // Convert to interleaved i32 (preserving native bit depth)
     let total_samples = (max_frames * info.channels as u64) as usize;
-    let mut samples = Vec::with_capacity(total_samples);
+    let mut samples: Vec<i32> = Vec::with_capacity(total_samples);
 
     if is_float {
-        // Float formats
+        // Float formats — scale to 16-bit range as i32
         match info.bits_per_sample {
             32 => {
                 for chunk in raw.chunks_exact(4) {
@@ -232,7 +233,7 @@ pub fn decode_aiff_to_pcm(
                         f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                     };
                     let clamped = f_val.max(-1.0).min(1.0);
-                    samples.push((clamped * i16::MAX as f32) as i16);
+                    samples.push((clamped * i16::MAX as f32) as i32);
                 }
             }
             64 => {
@@ -249,7 +250,7 @@ pub fn decode_aiff_to_pcm(
                         ])
                     };
                     let clamped = f_val.max(-1.0).min(1.0);
-                    samples.push((clamped * i16::MAX as f64) as i16);
+                    samples.push((clamped * i16::MAX as f64) as i32);
                 }
             }
             _ => {
@@ -266,12 +267,12 @@ pub fn decode_aiff_to_pcm(
                 for &b in &raw {
                     // 8-bit AIFF is unsigned
                     let signed = b as i16 - 128;
-                    samples.push(signed << 8);
+                    samples.push((signed << 8) as i32);
                 }
             }
             16 => {
                 for chunk in raw.chunks_exact(2) {
-                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    samples.push(i16::from_le_bytes([chunk[0], chunk[1]]) as i32);
                 }
             }
             24 => {
@@ -279,13 +280,13 @@ pub fn decode_aiff_to_pcm(
                     let val = i32::from_le_bytes([0, chunk[0], chunk[1], chunk[2]]);
                     // Sign-extend from 24 bits
                     let val = (val << 8) >> 8;
-                    samples.push((val >> 8) as i16);
+                    samples.push(val);
                 }
             }
             32 => {
                 for chunk in raw.chunks_exact(4) {
                     let val = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    samples.push((val >> 16) as i16);
+                    samples.push(val);
                 }
             }
             _ => return Err(format!("unsupported bit depth: {}", info.bits_per_sample)),
@@ -296,25 +297,26 @@ pub fn decode_aiff_to_pcm(
             8 => {
                 // 8-bit AIFF PCM is signed (unlike WAV which is unsigned)
                 for &b in &raw {
-                    samples.push((b as i8 as i16) << 8);
+                    samples.push(((b as i8 as i16) << 8) as i32);
                 }
             }
             16 => {
                 for chunk in raw.chunks_exact(2) {
-                    samples.push(i16::from_be_bytes([chunk[0], chunk[1]]));
+                    samples.push(i16::from_be_bytes([chunk[0], chunk[1]]) as i32);
                 }
             }
             24 => {
                 for chunk in raw.chunks_exact(3) {
                     // Build a 32-bit value from 3 big-endian bytes, sign-extend
                     let val = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], 0]);
-                    samples.push((val >> 16) as i16);
+                    // Shift right by 8 to get 24-bit signed value
+                    samples.push(val >> 8);
                 }
             }
             32 => {
                 for chunk in raw.chunks_exact(4) {
                     let val = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    samples.push((val >> 16) as i16);
+                    samples.push(val);
                 }
             }
             _ => return Err(format!("unsupported bit depth: {}", info.bits_per_sample)),
@@ -335,7 +337,8 @@ pub fn decode_aiff_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples,
+        samples_i32: samples,
+        bit_depth: info.bits_per_sample,
         sample_rate: info.sample_rate.round() as u32,
         channels: info.channels as u32,
         duration_s,
@@ -455,7 +458,7 @@ mod tests {
     fn decode_aiff_fixture() {
         let path = fixture_path("test.aiff");
         let result = decode_aiff_to_pcm(&path, 0.0, 0.0).unwrap();
-        assert!(!result.samples.is_empty(), "should produce samples");
+        assert!(!result.samples_i32.is_empty(), "should produce samples");
         assert_eq!(result.sample_rate, 44100);
         assert_eq!(result.channels, 2);
         assert!(
@@ -471,10 +474,10 @@ mod tests {
         let full = decode_aiff_to_pcm(&path, 0.0, 0.0).unwrap();
         let seeked = decode_aiff_to_pcm(&path, 0.5, 0.0).unwrap();
         assert!(
-            seeked.samples.len() < full.samples.len(),
+            seeked.samples_i32.len() < full.samples_i32.len(),
             "seeked should have fewer samples ({} vs {})",
-            seeked.samples.len(),
-            full.samples.len()
+            seeked.samples_i32.len(),
+            full.samples_i32.len()
         );
     }
 
@@ -484,11 +487,11 @@ mod tests {
         let full = decode_aiff_to_pcm(&path, 0.0, 0.0).unwrap();
         let half = decode_aiff_to_pcm(&path, 0.0, 0.5).unwrap();
         assert!(
-            half.samples.len() < full.samples.len(),
+            half.samples_i32.len() < full.samples_i32.len(),
             "limited decode should have fewer samples"
         );
         assert!(
-            !half.samples.is_empty(),
+            !half.samples_i32.is_empty(),
             "limited decode should still have samples"
         );
     }
@@ -498,7 +501,7 @@ mod tests {
         let path = fixture_path("test.aiff");
         let result = decode_aiff_to_pcm(&path, 999.0, 0.0).unwrap();
         assert!(
-            result.samples.is_empty(),
+            result.samples_i32.is_empty(),
             "seeking past end should produce empty samples"
         );
     }
@@ -564,11 +567,11 @@ mod tests {
         assert!(!info.is_aifc);
 
         let decoded = decode_aiff_to_pcm(tmp.to_str().unwrap(), 0.0, 0.0).unwrap();
-        assert_eq!(decoded.samples.len(), 4);
-        assert_eq!(decoded.samples[0], 1000);
-        assert_eq!(decoded.samples[1], -1000);
-        assert_eq!(decoded.samples[2], 2000);
-        assert_eq!(decoded.samples[3], -2000);
+        assert_eq!(decoded.samples_i32.len(), 4);
+        assert_eq!(decoded.samples_i32[0], 1000);
+        assert_eq!(decoded.samples_i32[1], -1000);
+        assert_eq!(decoded.samples_i32[2], 2000);
+        assert_eq!(decoded.samples_i32[3], -2000);
 
         std::fs::remove_file(&tmp).ok();
     }
@@ -622,9 +625,9 @@ mod tests {
         assert_eq!(info.compression.as_deref(), Some("sowt"));
 
         let decoded = decode_aiff_to_pcm(tmp.to_str().unwrap(), 0.0, 0.0).unwrap();
-        assert_eq!(decoded.samples.len(), 2);
-        assert_eq!(decoded.samples[0], 500);
-        assert_eq!(decoded.samples[1], -500);
+        assert_eq!(decoded.samples_i32.len(), 2);
+        assert_eq!(decoded.samples_i32[0], 500);
+        assert_eq!(decoded.samples_i32[1], -500);
 
         std::fs::remove_file(&tmp).ok();
     }

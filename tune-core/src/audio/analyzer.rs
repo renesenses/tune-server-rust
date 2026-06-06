@@ -24,14 +24,10 @@ pub async fn decode_pcm(
         Ok(decoded) => {
             debug!(
                 file = file_path,
-                samples = decoded.samples.len(),
+                samples = decoded.samples_i32.len(),
                 "decoded_native"
             );
-            let bytes: Vec<u8> = decoded
-                .samples
-                .iter()
-                .flat_map(|s| s.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = decoded.pcm_bytes();
             Ok(bytes)
         }
         Err(e) => {
@@ -159,15 +155,20 @@ pub async fn measure_loudness(file_path: &str) -> Option<f64> {
 
     let sample_rate = decoded.sample_rate as usize;
     let channels = decoded.channels as usize;
-    if sample_rate == 0 || channels == 0 || decoded.samples.is_empty() {
+    if sample_rate == 0 || channels == 0 || decoded.samples_i32.is_empty() {
         return None;
     }
 
-    // Convert i16 → f64 normalized to [-1, 1]
+    // Convert i32 → f64 normalized to [-1, 1] based on bit depth
+    let scale = match decoded.bit_depth {
+        24 => (1i64 << 23) as f64,
+        32 => (1i64 << 31) as f64,
+        _ => 32768.0,
+    };
     let samples: Vec<f64> = decoded
-        .samples
+        .samples_i32
         .iter()
-        .map(|&s| s as f64 / 32768.0)
+        .map(|&s| s as f64 / scale)
         .collect();
 
     let num_frames = samples.len() / channels;
@@ -283,21 +284,28 @@ pub async fn detect_trailing_silence(file_path: &str, threshold_db: f64) -> f64 
     };
 
     let sample_rate = decoded.sample_rate as f64;
-    if sample_rate <= 0.0 || decoded.samples.is_empty() {
+    if sample_rate <= 0.0 || decoded.samples_i32.is_empty() {
         return 0.0;
     }
 
     let threshold_linear = 10.0_f64.powf(threshold_db / 20.0);
 
+    // Normalize based on bit depth
+    let scale = match decoded.bit_depth {
+        24 => (1i64 << 23) as f64,
+        32 => (1i64 << 31) as f64,
+        _ => 32768.0,
+    };
+
     // Find the last sample above threshold, scanning backwards
     let last_loud = decoded
-        .samples
+        .samples_i32
         .iter()
-        .rposition(|&s| (s as f64 / 32768.0).abs() > threshold_linear);
+        .rposition(|&s| (s as f64 / scale).abs() > threshold_linear);
 
     match last_loud {
-        Some(pos) => (decoded.samples.len() - 1 - pos) as f64 / sample_rate,
-        None => decoded.samples.len() as f64 / sample_rate, // entire file is silent
+        Some(pos) => (decoded.samples_i32.len() - 1 - pos) as f64 / sample_rate,
+        None => decoded.samples_i32.len() as f64 / sample_rate, // entire file is silent
     }
 }
 

@@ -664,7 +664,7 @@ pub fn decode_ape_to_pcm(
         0
     };
 
-    let mut all_samples: Vec<i16> = Vec::new();
+    let mut all_samples: Vec<i32> = Vec::new();
 
     for frame_idx in start_frame..(info.total_frames as usize) {
         if all_samples.len() >= max_interleaved_samples {
@@ -725,7 +725,7 @@ pub fn decode_ape_to_pcm(
             }
         };
 
-        // Convert i32 samples to i16 and apply seek skip
+        // Apply seek skip and collect i32 samples
         let skip_interleaved = if frame_idx == start_frame {
             skip_in_first_frame * source_channels as usize
         } else {
@@ -739,7 +739,7 @@ pub fn decode_ape_to_pcm(
             if all_samples.len() >= max_interleaved_samples {
                 break;
             }
-            all_samples.push(clamp_to_i16(sample, bits));
+            all_samples.push(sample);
         }
     }
 
@@ -764,27 +764,12 @@ pub fn decode_ape_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples: all_samples,
+        samples_i32: all_samples,
+        bit_depth: bits as u16,
         sample_rate: out_rate,
         channels: out_channels,
         duration_s,
     })
-}
-
-/// Clamp an i32 sample to i16 range, considering the source bit depth.
-fn clamp_to_i16(sample: i32, bits: u16) -> i16 {
-    match bits {
-        8 => {
-            // 8-bit samples are 0-255, center at 128
-            ((sample.clamp(0, 255) - 128) as i16) << 8
-        }
-        16 => sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-        24 => {
-            // Shift right by 8 to fit into 16 bits
-            (sample >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-        }
-        _ => sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -998,25 +983,6 @@ mod tests {
         assert_eq!(decode_sign(4), 2);
         assert_eq!(decode_sign(5), -3);
         assert_eq!(decode_sign(6), 3);
-    }
-
-    #[test]
-    fn clamp_to_i16_various_bits() {
-        // 16-bit passthrough
-        assert_eq!(clamp_to_i16(0, 16), 0);
-        assert_eq!(clamp_to_i16(1000, 16), 1000);
-        assert_eq!(clamp_to_i16(-1000, 16), -1000);
-        assert_eq!(clamp_to_i16(40000, 16), 32767); // clamped
-
-        // 24-bit right-shift by 8
-        assert_eq!(clamp_to_i16(256, 24), 1);
-        assert_eq!(clamp_to_i16(-256, 24), -1);
-        assert_eq!(clamp_to_i16(0, 24), 0);
-
-        // 8-bit centered
-        assert_eq!(clamp_to_i16(128, 8), 0); // center
-        assert_eq!(clamp_to_i16(255, 8), 127 << 8);
-        assert_eq!(clamp_to_i16(0, 8), -128 << 8);
     }
 
     #[test]

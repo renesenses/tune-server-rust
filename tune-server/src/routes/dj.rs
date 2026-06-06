@@ -179,15 +179,20 @@ async fn dj_waveform(
             .await;
 
     match decoded {
-        Ok(Ok(audio)) if !audio.samples.is_empty() => {
+        Ok(Ok(audio)) if !audio.samples_i32.is_empty() => {
             let source_rate = audio.sample_rate as usize;
+            let scale = match audio.bit_depth {
+                24 => (1i64 << 23) as f32,
+                32 => (1i64 << 31) as f32,
+                _ => 32768.0,
+            };
             // Stride factor to approximate 8kHz from native rate
             let stride = (source_rate / 8000).max(1);
             let samples: Vec<f32> = audio
-                .samples
+                .samples_i32
                 .iter()
                 .step_by(stride)
-                .map(|&s| s as f32 / 32768.0)
+                .map(|&s| s as f32 / scale)
                 .collect();
 
             // Downsample to ~200 points (peak amplitude per chunk)
@@ -235,17 +240,22 @@ async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) ->
             .await;
 
     match decoded {
-        Ok(Ok(audio)) if !audio.samples.is_empty() => {
+        Ok(Ok(audio)) if !audio.samples_i32.is_empty() => {
             let source_rate = audio.sample_rate as usize;
+            let scale = match audio.bit_depth {
+                24 => (1i64 << 23) as f32,
+                32 => (1i64 << 31) as f32,
+                _ => 32768.0,
+            };
             // Stride to approximate 22050 Hz from native rate
             let stride = (source_rate / 22050).max(1);
             let effective_rate: usize = source_rate / stride;
 
             let samples: Vec<f32> = audio
-                .samples
+                .samples_i32
                 .iter()
                 .step_by(stride)
-                .map(|&s| s as f32 / 32768.0)
+                .map(|&s| s as f32 / scale)
                 .collect();
 
             // 250 ms windows for energy computation

@@ -519,15 +519,22 @@ async fn stream_to_airplay(
     .map_err(|e| format!("decode join: {e}"))?
     .map_err(|e| format!("native decode: {e}"))?;
 
-    if decoded.samples.is_empty() {
+    if decoded.samples_i32.is_empty() {
         return Err("decoded audio is empty".into());
     }
 
-    // Convert i16 LE samples to s16 BE bytes (swap byte order)
+    // Convert i32 samples to i16, then to big-endian bytes for AirPlay RTP
     let pcm_be: Vec<u8> = decoded
-        .samples
+        .samples_i32
         .iter()
-        .flat_map(|&s| s.to_be_bytes())
+        .flat_map(|&s| {
+            let s16 = match decoded.bit_depth {
+                24 => (s >> 8) as i16,
+                32 => (s >> 16) as i16,
+                _ => s as i16,
+            };
+            s16.to_be_bytes()
+        })
         .collect();
 
     let ssrc: u32 = rand_random();
