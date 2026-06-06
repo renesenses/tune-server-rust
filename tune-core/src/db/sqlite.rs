@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OpenFlags};
@@ -5,19 +6,32 @@ use tracing::info;
 
 use crate::db::engine::{Engine, SqliteDialect};
 
+/// Number of read connections in the pool.
+const READ_POOL_SIZE: usize = 3;
+
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
-    read_conn: Arc<Mutex<Connection>>,
+    read_pool: Vec<Arc<Mutex<Connection>>>,
+    read_counter: Arc<AtomicUsize>,
 }
 
-const PRAGMAS: &str = "PRAGMA journal_mode=WAL;
+const PRAGMAS_BASE: &str = "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
              PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;
-             PRAGMA cache_size=-64000;
              PRAGMA temp_store=MEMORY;
              PRAGMA mmap_size=268435456;
              PRAGMA analysis_limit=400;";
+
+/// Build the full PRAGMA batch, including adaptive cache_size.
+/// Respects `TUNE_CACHE_SIZE` env override (value in negative KB, e.g. `-128000`).
+fn build_pragmas() -> String {
+    let cache_size = std::env::var("TUNE_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(-64000); // default 64 MB
+    format!("{PRAGMAS_BASE}\nPRAGMA cache_size={cache_size};")
+}
 
 impl SqliteDb {
     pub fn open(path: &str) -> Result<Self, String> {
@@ -25,27 +39,36 @@ impl SqliteDb {
             return Self::open_in_memory();
         }
 
+        let pragmas = build_pragmas();
+
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
         let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| format!("sqlite open {path}: {e}"))?;
-        conn.execute_batch(PRAGMAS)
+        conn.execute_batch(&pragmas)
             .map_err(|e| format!("pragma: {e}"))?;
 
+        // Open a pool of read-only connections for concurrent read access
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let read_conn = Connection::open_with_flags(path, read_flags)
-            .map_err(|e| format!("sqlite open read {path}: {e}"))?;
-        read_conn
-            .execute_batch(PRAGMAS)
-            .map_err(|e| format!("pragma read: {e}"))?;
+        let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
+        for i in 0..READ_POOL_SIZE {
+            let rc = Connection::open_with_flags(path, read_flags)
+                .map_err(|e| format!("sqlite open read[{i}] {path}: {e}"))?;
+            rc.execute_batch(&pragmas)
+                .map_err(|e| format!("pragma read[{i}]: {e}"))?;
+            rc.execute_batch("PRAGMA query_only = ON;")
+                .map_err(|e| format!("pragma query_only read[{i}]: {e}"))?;
+            read_pool.push(Arc::new(Mutex::new(rc)));
+        }
 
-        info!(path, "sqlite_opened");
+        info!(path, readers = READ_POOL_SIZE, "sqlite_opened");
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            read_conn: Arc::new(Mutex::new(read_conn)),
+            read_pool,
+            read_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -58,9 +81,11 @@ impl SqliteDb {
         // In-memory DBs: share the same connection for reads and writes
         // (separate in-memory connections don't share data)
         let conn = Arc::new(Mutex::new(conn));
+        let read_pool = vec![conn.clone(); READ_POOL_SIZE];
         Ok(Self {
-            read_conn: conn.clone(),
             conn,
+            read_pool,
+            read_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -68,8 +93,10 @@ impl SqliteDb {
         &self.conn
     }
 
+    /// Returns the next read connection from the round-robin pool.
     pub fn read_connection(&self) -> &Arc<Mutex<Connection>> {
-        &self.read_conn
+        let idx = self.read_counter.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
+        &self.read_pool[idx]
     }
 
     pub fn execute(
@@ -96,12 +123,12 @@ impl SqliteDb {
         conn.last_insert_rowid()
     }
 
-    /// Execute a read-only closure on the read connection.
+    /// Execute a read-only closure on the next available read connection.
     pub fn read<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     ) -> Result<T, String> {
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.read_connection().lock().unwrap();
         f(&conn).map_err(|e| format!("db read: {e}"))
     }
 
@@ -115,7 +142,7 @@ impl SqliteDb {
     }
 
     pub fn query_timed<T>(&self, label: &str, f: impl FnOnce(&Connection) -> T) -> T {
-        let conn = self.read_conn.lock().unwrap();
+        let conn = self.read_connection().lock().unwrap();
         let start = std::time::Instant::now();
         let result = f(&conn);
         let elapsed = start.elapsed();
@@ -142,7 +169,8 @@ impl Clone for SqliteDb {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
-            read_conn: self.read_conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_counter: self.read_counter.clone(),
         }
     }
 }

@@ -116,6 +116,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         let total_to_scan = files_to_scan.len() as i64;
         let total = total_to_scan + pre_skipped;
         let mut last_progress_emit = std::time::Instant::now();
+        let scan_timer_start = std::time::Instant::now();
 
         // In-memory caches to avoid repeated DB lookups (persist across batches)
         let mut artist_cache: std::collections::HashMap<
@@ -456,6 +457,17 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     && (batch_idx % 2 == 0 || elapsed >= std::time::Duration::from_secs(2))
                 {
                     last_progress_emit = std::time::Instant::now();
+
+                    // Compute scan rate and ETA
+                    let elapsed_secs = scan_timer_start.elapsed().as_secs_f64().max(0.001);
+                    let tracks_per_second = processed as f64 / elapsed_secs;
+                    let remaining = (total - processed).max(0);
+                    let eta_seconds = if tracks_per_second > 0.0 {
+                        (remaining as f64 / tracks_per_second) as u64
+                    } else {
+                        0
+                    };
+
                     event_bus.emit(
                         "library.scan.progress",
                         json!({
@@ -466,6 +478,8 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             "inserted": inserted,
                             "updated": updated,
                             "skipped": skipped,
+                            "tracks_per_second": (tracks_per_second * 10.0).round() / 10.0,
+                            "eta_seconds": eta_seconds,
                         }),
                     );
                 }

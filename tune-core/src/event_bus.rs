@@ -27,6 +27,14 @@ pub struct EventBus {
     tx: broadcast::Sender<TuneEvent>,
 }
 
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
