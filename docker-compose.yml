@@ -1,20 +1,25 @@
+## Tune Server — Docker Compose
+##
+## Quick start:
+##   1. Replace /path/to/music with your music library path
+##   2. docker compose up -d
+##   3. Open http://localhost:8888
+##
+## For DLNA/SSDP/mDNS discovery, add: network_mode: host
+## (not supported on macOS/Windows Docker Desktop)
+
 services:
   tune:
-    build: .
     image: renesenses/tune:latest
     container_name: tune-server
-    restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8888:8888"
     volumes:
       - tune-data:/data
       - /path/to/music:/music:ro
-      # - ./web:/app/web:ro
     environment:
-      - TUNE_PORT=8085
-      - TUNE_DB_PATH=/data/tune.db
-      - TUNE_ARTWORK_DIR=/data/artwork_cache
-      - TUNE_AUTO_SCAN=true
-      - TUNE_MUSIC_DIRS=/music
+      - TUNE_MUSIC_DIRS=["/music"]
+    restart: unless-stopped
 
 volumes:
   tune-data:
