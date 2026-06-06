@@ -108,6 +108,40 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  test-postgres:
+    name: Test (PostgreSQL)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tune
+          POSTGRES_PASSWORD: tune
+          POSTGRES_DB: tune_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tune -d tune_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://tune:tune@localhost:5432/tune_test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tune-core-postgres
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run tests with postgres feature
+        run: cargo test -p tune-core --no-default-features --features postgres,oaat
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

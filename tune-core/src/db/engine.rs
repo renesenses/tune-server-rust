@@ -193,6 +193,25 @@ pub trait SqlDialect {
     /// SQLite: `CAST(strftime('%H', <column>) AS INTEGER)`
     /// Postgres: `EXTRACT(HOUR FROM <column>::timestamp)::int`
     fn extract_hour(&self, column: &str) -> String;
+
+    /// Current UTC timestamp expression, suitable for use as a DEFAULT
+    /// or in INSERT VALUES.
+    ///
+    /// SQLite: `datetime('now')`
+    /// Postgres: `NOW()`
+    fn current_timestamp_expr(&self) -> &'static str;
+
+    /// Boolean literal (for engines that don't support native booleans).
+    ///
+    /// SQLite: `1` / `0`
+    /// Postgres: `TRUE` / `FALSE`
+    fn bool_literal(&self, val: bool) -> &'static str;
+
+    /// GROUP_CONCAT or STRING_AGG for aggregating text values.
+    ///
+    /// SQLite: `GROUP_CONCAT(<column>, <separator>)`
+    /// Postgres: `STRING_AGG(<column>, <separator>)`
+    fn group_concat(&self, column: &str, separator: &str) -> String;
 }
 
 /// Zero-cost dialect for SQLite. Repos hold one of these.
@@ -250,6 +269,18 @@ impl SqlDialect for SqliteDialect {
 
     fn extract_hour(&self, column: &str) -> String {
         format!("CAST(strftime('%H', {column}) AS INTEGER)")
+    }
+
+    fn current_timestamp_expr(&self) -> &'static str {
+        "datetime('now')"
+    }
+
+    fn bool_literal(&self, val: bool) -> &'static str {
+        if val { "1" } else { "0" }
+    }
+
+    fn group_concat(&self, column: &str, separator: &str) -> String {
+        format!("GROUP_CONCAT({column}, '{separator}')")
     }
 }
 
@@ -321,6 +352,18 @@ impl SqlDialect for PostgresDialect {
 
     fn extract_hour(&self, column: &str) -> String {
         format!("EXTRACT(HOUR FROM {column}::timestamp)::int")
+    }
+
+    fn current_timestamp_expr(&self) -> &'static str {
+        "NOW()"
+    }
+
+    fn bool_literal(&self, val: bool) -> &'static str {
+        if val { "TRUE" } else { "FALSE" }
+    }
+
+    fn group_concat(&self, column: &str, separator: &str) -> String {
+        format!("STRING_AGG({column}, '{separator}')")
     }
 }
 
@@ -453,6 +496,32 @@ mod tests {
     fn engine_display_matches_as_str() {
         assert_eq!(format!("{}", Engine::Sqlite), "sqlite");
         assert_eq!(format!("{}", Engine::Postgres), "postgres");
+    }
+
+    #[test]
+    fn current_timestamp_expr_dialect() {
+        let s = SqliteDialect;
+        assert_eq!(s.current_timestamp_expr(), "datetime('now')");
+        let p = PostgresDialect;
+        assert_eq!(p.current_timestamp_expr(), "NOW()");
+    }
+
+    #[test]
+    fn bool_literal_dialect() {
+        let s = SqliteDialect;
+        assert_eq!(s.bool_literal(true), "1");
+        assert_eq!(s.bool_literal(false), "0");
+        let p = PostgresDialect;
+        assert_eq!(p.bool_literal(true), "TRUE");
+        assert_eq!(p.bool_literal(false), "FALSE");
+    }
+
+    #[test]
+    fn group_concat_dialect() {
+        let s = SqliteDialect;
+        assert_eq!(s.group_concat("name", ", "), "GROUP_CONCAT(name, ', ')");
+        let p = PostgresDialect;
+        assert_eq!(p.group_concat("name", ", "), "STRING_AGG(name, ', ')");
     }
 
     #[test]

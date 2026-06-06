@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{Mutex, oneshot};
+use tracing::info;
 
+use tune_core::db::engine::Engine;
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::discovery::ssdp::SsdpScanner;
 use tune_core::event_bus::EventBus;
@@ -46,6 +48,30 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
+        // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
+        // default to SQLite. When PG is configured, we log the intent and
+        // fall through to the SQLite path for now — full PG wiring
+        // (Arc<dyn DbBackend> in AppState) is Phase 6. The config
+        // plumbing is landed here so `tune-cli db migrate-to-postgres`
+        // and future PG-only deployments can detect the env.
+        let selected_engine = tune_config
+            .database_url
+            .as_deref()
+            .map(Engine::from_connection_string)
+            .unwrap_or(Engine::Sqlite);
+
+        if selected_engine == Engine::Postgres {
+            let pg_url = tune_config.database_url.as_deref().unwrap_or("(none)");
+            info!(
+                engine = "postgres",
+                url = %pg_url.split('@').last().unwrap_or(pg_url),
+                "database_engine_selected (PG support is compile-time gated; \
+                 falling back to SQLite for this boot)"
+            );
+        } else {
+            info!(engine = "sqlite", path = %db_path, "database_engine_selected");
+        }
+
         let db = SqliteDb::open(db_path)?;
         db.init_schema()?;
         tune_core::db::migrations::run_migrations(&db)?;

@@ -29,6 +29,11 @@ pub struct TuneConfig {
     pub openai_api_key: Option<String>,
     #[serde(default)]
     pub advertised_ip: Option<String>,
+    /// PostgreSQL connection string. When set (or via `TUNE_DATABASE_URL`
+    /// env), the server boots with PostgreSQL instead of SQLite.
+    /// Format: `postgres://user:pass@host:5432/dbname`
+    #[serde(default)]
+    pub database_url: Option<String>,
 }
 
 impl TuneConfig {
@@ -61,6 +66,7 @@ impl Default for TuneConfig {
             acoustid_api_key: None,
             openai_api_key: None,
             advertised_ip: None,
+            database_url: None,
         }
     }
 }
@@ -174,6 +180,11 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.advertised_ip = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_DATABASE_URL")
+            && !v.is_empty()
+        {
+            config.database_url = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();

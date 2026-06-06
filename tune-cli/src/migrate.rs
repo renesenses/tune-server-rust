@@ -153,6 +153,110 @@ mod inner {
             "play_queue",
             &["id", "zone_id", "track_id", "position", "is_current"],
         ),
+        // ── Tables added in Phase 5 (migrations 2-22) ──
+        (
+            "radio_stations",
+            &[
+                "id",
+                "name",
+                "url",
+                "homepage",
+                "logo_url",
+                "country",
+                "language",
+                "genre",
+                "codec",
+                "bitrate",
+                "is_favorite",
+                "last_played",
+                "play_count",
+            ],
+        ),
+        (
+            "listen_history",
+            &[
+                "id",
+                "track_id",
+                "title",
+                "artist_name",
+                "album_title",
+                "source",
+                "duration_ms",
+                "listened_at",
+                "zone_id",
+            ],
+        ),
+        ("settings", &["key", "value", "updated_at"]),
+        (
+            "bookmarks",
+            &["id", "track_id", "position_ms", "label", "created_at"],
+        ),
+        (
+            "profiles",
+            &[
+                "id",
+                "username",
+                "display_name",
+                "avatar_path",
+                "password_hash",
+                "is_admin",
+                "created_at",
+            ],
+        ),
+        (
+            "favorites",
+            &["id", "profile_id", "item_type", "item_id", "created_at"],
+        ),
+        ("tags", &["id", "name", "color"]),
+        ("item_tags", &["id", "tag_id", "item_type", "item_id"]),
+        (
+            "album_ratings",
+            &[
+                "id",
+                "album_id",
+                "profile_id",
+                "rating",
+                "note",
+                "created_at",
+            ],
+        ),
+        (
+            "smart_playlists",
+            &[
+                "id",
+                "name",
+                "rules",
+                "sort_by",
+                "sort_order",
+                "max_tracks",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+        (
+            "radio_favorites",
+            &[
+                "id",
+                "title",
+                "artist",
+                "station_name",
+                "cover_url",
+                "stream_url",
+                "saved_at",
+            ],
+        ),
+        (
+            "track_source_links",
+            &[
+                "id",
+                "track_id",
+                "service",
+                "service_track_id",
+                "confidence",
+                "match_method",
+                "linked_at",
+            ],
+        ),
     ];
 
     pub async fn migrate(
@@ -228,6 +332,22 @@ mod inner {
         cols: &[&str],
         batch_size: usize,
     ) -> Result<u64, String> {
+        // Check if the source table exists (not all tables are present
+        // in every SQLite DB — some are created at runtime by specific
+        // features, e.g. radio_favorites, or only exist in older DBs).
+        let table_exists: bool = src
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !table_exists {
+            println!("  [skip] {table:20} (not in source)");
+            return Ok(0);
+        }
+
         // Source row count for progress reporting.
         let total: i64 = src
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -376,6 +496,18 @@ mod inner {
             if let Some(t) = only_table
                 && t != *table
             {
+                continue;
+            }
+            // Skip tables that don't exist on the source side.
+            let table_exists: bool = src
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+            if !table_exists {
                 continue;
             }
             let sqlite_count: i64 = src
