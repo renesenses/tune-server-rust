@@ -42,6 +42,8 @@ toml = "0.8"
 cpal = "0.17"
 rust_cast = "0.21"
 sha2 = "0.10"
+jsonwebtoken = "9"
+argon2 = { version = "0.5", features = ["std"] }
 blowfish = "0.9"
 chrono = "0.4"
 cbc = "0.1"

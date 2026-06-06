@@ -29,6 +29,8 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
 unicode-normalization = { workspace = true }
 futures-util = { workspace = true }
 socket2 = { workspace = true }

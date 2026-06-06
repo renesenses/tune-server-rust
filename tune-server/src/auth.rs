@@ -1,194 +1,172 @@
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
-// HMAC-SHA256 helpers (no external crate needed)
+// JWT Claims & AuthUser
 // ---------------------------------------------------------------------------
 
-fn hmac_sha256(data: &[u8], key: &[u8]) -> [u8; 32] {
-    const BLOCK_SIZE: usize = 64;
-    let mut key_block = [0u8; BLOCK_SIZE];
-    if key.len() > BLOCK_SIZE {
-        let hash = Sha256::digest(key);
-        key_block[..32].copy_from_slice(&hash);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; BLOCK_SIZE];
-    let mut opad = [0x5cu8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(data);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(&inner_hash);
-    let result = outer.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    out
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtClaims {
+    /// Subject: user_id (profile id) as string
+    pub sub: String,
+    /// Issued at (unix timestamp)
+    pub iat: u64,
+    /// Expiration (unix timestamp)
+    pub exp: u64,
+    /// Role: "admin" or "user"
+    pub role: String,
 }
 
-fn base64url_encode(data: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    let lut = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-    let mut i = 0;
-    while i + 2 < data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
-        let _ = write!(
-            out,
-            "{}{}{}{}",
-            lut[((n >> 18) & 63) as usize] as char,
-            lut[((n >> 12) & 63) as usize] as char,
-            lut[((n >> 6) & 63) as usize] as char,
-            lut[(n & 63) as usize] as char,
-        );
-        i += 3;
-    }
-
-    let rem = data.len() - i;
-    if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        let _ = write!(
-            out,
-            "{}{}{}",
-            lut[((n >> 18) & 63) as usize] as char,
-            lut[((n >> 12) & 63) as usize] as char,
-            lut[((n >> 6) & 63) as usize] as char,
-        );
-    } else if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        let _ = write!(
-            out,
-            "{}{}",
-            lut[((n >> 18) & 63) as usize] as char,
-            lut[((n >> 12) & 63) as usize] as char,
-        );
-    }
-
-    out
+/// Injected into request extensions by the auth middleware / extractor.
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub user_id: i64,
+    pub role: String,
 }
 
-fn base64url_decode(s: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let lut: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".to_vec();
+// ---------------------------------------------------------------------------
+// JWT helpers
+// ---------------------------------------------------------------------------
 
-    let bytes: Vec<u8> = s.bytes().collect();
-    let mut buf = 0u32;
-    let mut bits = 0u8;
+pub fn sign_jwt(user_id: i64, role: &str, secret: &str) -> Result<String, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    for &b in &bytes {
-        let val = lut
-            .iter()
-            .position(|&c| c == b)
-            .ok_or("invalid base64url char")? as u32;
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
+    let claims = JwtClaims {
+        sub: user_id.to_string(),
+        iat: now,
+        exp: now + 86400, // 24h
+        role: role.to_string(),
+    };
+
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| format!("jwt encode error: {e}"))
+}
+
+fn sign_jwt_long_lived(name: &str, secret: &str) -> Result<String, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let claims = JwtClaims {
+        sub: name.to_string(),
+        iat: now,
+        exp: now + 365 * 86400,
+        role: "api-token".to_string(),
+    };
+
+    jsonwebtoken::encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| format!("jwt encode error: {e}"))
+}
+
+pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtClaims, String> {
+    jsonwebtoken::decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map(|data| data.claims)
+    .map_err(|e| format!("jwt verify error: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Argon2 password hashing
+// ---------------------------------------------------------------------------
+
+/// Generate a random salt string using system randomness.
+fn generate_salt() -> SaltString {
+    // Build 16 random bytes from multiple sources of entropy
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        let s = RandomState::new();
+        let mut h = s.build_hasher();
+        h.write_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        );
+        let val = h.finish().to_le_bytes();
+        let len = chunk.len().min(8);
+        chunk[..len].copy_from_slice(&val[..len]);
+    }
+
+    // SaltString requires base64ct-encoded data; use b64 encoding of our random bytes
+    SaltString::encode_b64(&bytes).expect("salt encoding")
+}
+
+pub fn hash_password(password: &str) -> Result<String, String> {
+    let salt = generate_salt();
+    let argon2 = Argon2::default();
+    argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| format!("argon2 hash error: {e}"))
+}
+
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// JWT secret management
+// ---------------------------------------------------------------------------
+
+fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
+    match settings.get("jwt_secret").ok().flatten() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            let new_secret = uuid::Uuid::new_v4().to_string();
+            settings.set("jwt_secret", &new_secret).ok();
+            new_secret
         }
     }
-
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
-// JWT creation and verification
-// ---------------------------------------------------------------------------
-
-fn create_jwt(username: &str, secret: &str) -> String {
-    let header = base64url_encode(r#"{"alg":"HS256","typ":"JWT"}"#.as_bytes());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let payload_str = format!(
-        r#"{{"sub":"{}","iat":{},"exp":{}}}"#,
-        username,
-        now,
-        now + 86400
-    );
-    let payload = base64url_encode(payload_str.as_bytes());
-    let signing_input = format!("{header}.{payload}");
-    let sig = hmac_sha256(signing_input.as_bytes(), secret.as_bytes());
-    let sig_b64 = base64url_encode(&sig);
-    format!("{signing_input}.{sig_b64}")
-}
-
-fn verify_jwt(token: &str, settings: &SettingsRepo) -> Result<String, String> {
-    let secret = settings
-        .get("jwt_secret")
-        .ok()
-        .flatten()
-        .ok_or_else(|| "no jwt secret configured".to_string())?;
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return Err("invalid jwt format".into());
-    }
-
-    // Verify signature
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
-    let expected_sig = hmac_sha256(signing_input.as_bytes(), secret.as_bytes());
-    let actual_sig = base64url_decode(parts[2])?;
-    if actual_sig != expected_sig {
-        return Err("invalid signature".into());
-    }
-
-    // Decode payload and check expiry
-    let payload_bytes = base64url_decode(parts[1])?;
-    let payload_str =
-        String::from_utf8(payload_bytes).map_err(|_| "invalid payload encoding".to_string())?;
-    let payload: Value =
-        serde_json::from_str(&payload_str).map_err(|_| "invalid payload json".to_string())?;
-
-    let exp = payload["exp"].as_u64().unwrap_or(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    if now > exp {
-        return Err("token expired".into());
-    }
-
-    payload["sub"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "missing sub claim".to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Middleware
+// Middleware — auth layer applied to the API router
 // ---------------------------------------------------------------------------
 
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    // Check if auth is enabled
     let settings = SettingsRepo::new(state.db.clone());
     let auth_enabled = settings
         .get("auth_enabled")
@@ -211,24 +189,13 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Check for Authorization header
-    let auth_header = request
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    // Extract token from Authorization header or tune_session cookie
+    let token = extract_token_from_request(&request);
 
-    match auth_header {
-        Some(header) if header.starts_with("Bearer ") => {
-            let token = &header[7..];
-            if verify_jwt(token, &settings).is_ok() {
-                next.run(request).await
-            } else {
-                (StatusCode::UNAUTHORIZED, "invalid token").into_response()
-            }
-        }
-        Some(header) if header.starts_with("ApiKey ") => {
-            let key = &header[7..];
+    match token {
+        Some(tok) if tok.starts_with("ApiKey:") => {
+            // API key auth
+            let key = &tok[7..];
             let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
             if !stored.is_empty() && key == stored {
                 next.run(request).await
@@ -236,7 +203,117 @@ pub async fn auth_middleware(
                 (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
             }
         }
-        _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        Some(tok) => {
+            let secret = match settings.get("jwt_secret").ok().flatten() {
+                Some(s) if !s.is_empty() => s,
+                _ => return (StatusCode::UNAUTHORIZED, "no jwt secret configured").into_response(),
+            };
+            match verify_jwt(&tok, &secret) {
+                Ok(claims) => {
+                    let user_id = claims.sub.parse::<i64>().unwrap_or(0);
+                    request.extensions_mut().insert(AuthUser {
+                        user_id,
+                        role: claims.role,
+                    });
+                    next.run(request).await
+                }
+                Err(_) => (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+            }
+        }
+        None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    }
+}
+
+/// Extract JWT token from Authorization header (Bearer) or tune_session cookie.
+/// Returns "ApiKey:<key>" for API key auth.
+fn extract_token_from_request(request: &Request) -> Option<String> {
+    extract_token_from_headers(request.headers())
+}
+
+fn extract_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    // 1. Check Authorization header
+    if let Some(auth_header) = headers.get("Authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth_header.strip_prefix("Bearer ") {
+            return Some(token.to_string());
+        }
+        if let Some(key) = auth_header.strip_prefix("ApiKey ") {
+            return Some(format!("ApiKey:{key}"));
+        }
+    }
+
+    // 2. Check tune_session cookie
+    if let Some(cookie_header) = headers.get("Cookie").and_then(|v| v.to_str().ok()) {
+        for part in cookie_header.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("tune_session=") {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// AuthUser — axum extractor for route-level auth
+// ---------------------------------------------------------------------------
+
+impl FromRequestParts<AppState> for AuthUser {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // First check if auth_middleware already injected AuthUser
+        if let Some(user) = parts.extensions.get::<AuthUser>() {
+            return Ok(user.clone());
+        }
+
+        // Otherwise, try to extract directly (for routes outside the middleware layer)
+        let settings = SettingsRepo::new(state.db.clone());
+
+        let secret = settings
+            .get("jwt_secret")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "authentication not configured"})),
+                )
+            })?;
+
+        let token = extract_token_from_headers(&parts.headers).ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "authentication required"})),
+            )
+        })?;
+
+        // Skip ApiKey tokens for the extractor
+        if token.starts_with("ApiKey:") {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "API key auth not supported for this endpoint, use JWT"})),
+            ));
+        }
+
+        let claims = verify_jwt(&token, &secret).map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "invalid or expired token"})),
+            )
+        })?;
+
+        let user_id = claims.sub.parse::<i64>().unwrap_or(0);
+        Ok(AuthUser {
+            user_id,
+            role: claims.role,
+        })
     }
 }
 
@@ -246,11 +323,132 @@ pub async fn auth_middleware(
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/register", post(register))
         .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/me", get(me))
         .route("/token", post(create_token))
         .route("/api-key", get(get_api_key).post(generate_api_key))
         .route("/config", get(auth_config).post(set_auth_config))
 }
+
+// ---------------------------------------------------------------------------
+// POST /auth/register
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username: String,
+    password: String,
+    email: Option<String>,
+}
+
+async fn register(
+    State(state): State<AppState>,
+    Json(body): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    let username = body.username.trim().to_string();
+    if username.is_empty() || body.password.len() < 4 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "username required and password must be at least 4 characters"})),
+        )
+            .into_response();
+    }
+
+    // Check if username already exists
+    let conn = state.db.connection().lock().unwrap();
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM profiles WHERE username = ?",
+            rusqlite::params![username],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if exists {
+        drop(conn);
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "username already exists"})),
+        )
+            .into_response();
+    }
+    drop(conn);
+
+    // Hash password with argon2
+    let password_hash = match hash_password(&body.password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("password hashing failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Create profile
+    let conn = state.db.connection().lock().unwrap();
+    let result = conn.execute(
+        "INSERT INTO profiles (username, display_name, password_hash_v2, email) VALUES (?, ?, ?, ?)",
+        rusqlite::params![username, username, password_hash, body.email],
+    );
+    let profile_id = conn.last_insert_rowid();
+    drop(conn);
+
+    if let Err(e) = result {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to create profile: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Determine role
+    let is_admin = profile_id == 1; // first user is admin
+    let role = if is_admin { "admin" } else { "user" };
+
+    // Generate JWT
+    let settings = SettingsRepo::new(state.db.clone());
+    let secret = get_or_create_jwt_secret(&settings);
+    let token = match sign_jwt(profile_id, role, &secret) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("token generation failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let cookie = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+
+    let mut response = Json(json!({
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "user": {
+            "id": profile_id,
+            "username": username,
+            "role": role,
+            "email": body.email,
+        }
+    }))
+    .into_response();
+
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+
+    (StatusCode::CREATED, response).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth/login
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct LoginRequest {
@@ -261,25 +459,60 @@ struct LoginRequest {
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db.clone());
 
-    // Verify against profile password_hash
+    // Look up profile
     let conn = state.db.connection().lock().unwrap();
-    let stored_hash: Option<String> = conn
+    let row: Option<(i64, Option<String>, Option<String>, bool)> = conn
         .query_row(
-            "SELECT password_hash FROM profiles WHERE username = ?",
+            "SELECT id, password_hash, password_hash_v2, is_admin FROM profiles WHERE username = ?",
             rusqlite::params![body.username],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
         )
-        .ok()
-        .flatten();
+        .ok();
     drop(conn);
 
-    // Hash the provided password with SHA-256 for comparison
-    let provided_hash = format!("{:x}", Sha256::digest(body.password.as_bytes()));
+    let (profile_id, old_hash, new_hash, is_admin) = match row {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "invalid credentials"})),
+            )
+                .into_response();
+        }
+    };
 
-    let valid = match stored_hash {
-        Some(ref h) if !h.is_empty() => *h == provided_hash,
-        // If no password set, allow login for the default profile
-        None | Some(_) => body.username == "default",
+    // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
+    let valid_v2 = if let Some(ref h) = new_hash {
+        if !h.is_empty() {
+            verify_password(&body.password, h)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let valid = if valid_v2 {
+        true
+    } else if let Some(ref h) = old_hash {
+        if !h.is_empty() {
+            // Legacy SHA-256 check
+            let provided_hash = format!("{:x}", Sha256::digest(body.password.as_bytes()));
+            provided_hash == *h
+        } else {
+            // No password set — allow login for the default profile
+            body.username == "default"
+        }
+    } else {
+        // No password set — allow login for the default profile
+        body.username == "default"
     };
 
     if !valid {
@@ -290,25 +523,114 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
             .into_response();
     }
 
-    // Ensure JWT secret exists
-    let secret = match settings.get("jwt_secret").ok().flatten() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            let new_secret = uuid::Uuid::new_v4().to_string();
-            settings.set("jwt_secret", &new_secret).ok();
-            new_secret
+    // If logged in with old SHA-256 hash, upgrade to argon2
+    if !valid_v2 && valid {
+        if let Ok(upgraded) = hash_password(&body.password) {
+            let conn = state.db.connection().lock().unwrap();
+            conn.execute(
+                "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
+                rusqlite::params![upgraded, profile_id],
+            )
+            .ok();
+            drop(conn);
+        }
+    }
+
+    let role = if is_admin { "admin" } else { "user" };
+    let secret = get_or_create_jwt_secret(&settings);
+    let token = match sign_jwt(profile_id, role, &secret) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("token generation failed: {e}")})),
+            )
+                .into_response();
         }
     };
 
-    let token = create_jwt(&body.username, &secret);
-    Json(json!({
+    let cookie = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+
+    let mut response = Json(json!({
         "token": token,
         "token_type": "Bearer",
         "expires_in": 86400,
         "username": body.username,
+        "user_id": profile_id,
+        "role": role,
     }))
-    .into_response()
+    .into_response();
+
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+
+    response
 }
+
+// ---------------------------------------------------------------------------
+// POST /auth/logout
+// ---------------------------------------------------------------------------
+
+async fn logout() -> impl IntoResponse {
+    let cookie = "tune_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+    let mut response = Json(json!({"ok": true})).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    response
+}
+
+// ---------------------------------------------------------------------------
+// GET /auth/me — requires auth
+// ---------------------------------------------------------------------------
+
+async fn me(State(state): State<AppState>, auth: AuthUser) -> impl IntoResponse {
+    let conn = state.db.connection().lock().unwrap();
+    let row: Option<(i64, String, Option<String>, Option<String>, bool, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT id, username, display_name, avatar_path, is_admin, email, created_at FROM profiles WHERE id = ?",
+            rusqlite::params![auth.user_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .ok();
+    drop(conn);
+
+    match row {
+        Some((id, username, display_name, avatar_path, is_admin, email, created_at)) => {
+            Json(json!({
+                "id": id,
+                "username": username,
+                "display_name": display_name,
+                "avatar_path": avatar_path,
+                "is_admin": is_admin,
+                "email": email,
+                "created_at": created_at,
+                "role": auth.role,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "profile not found"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth/token — create long-lived API token
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct CreateTokenRequest {
@@ -321,40 +643,22 @@ async fn create_token(
 ) -> impl IntoResponse {
     let settings = SettingsRepo::new(state.db);
     let name = body.name.as_deref().unwrap_or("api-token");
+    let secret = get_or_create_jwt_secret(&settings);
 
-    let secret = match settings.get("jwt_secret").ok().flatten() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            let new_secret = uuid::Uuid::new_v4().to_string();
-            settings.set("jwt_secret", &new_secret).ok();
-            new_secret
-        }
-    };
-
-    // Create a long-lived token (365 days)
-    let header = base64url_encode(r#"{"alg":"HS256","typ":"JWT"}"#.as_bytes());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let payload_str = format!(
-        r#"{{"sub":"{}","iat":{},"exp":{}}}"#,
-        name,
-        now,
-        now + 365 * 86400
-    );
-    let payload = base64url_encode(payload_str.as_bytes());
-    let signing_input = format!("{header}.{payload}");
-    let sig = hmac_sha256(signing_input.as_bytes(), secret.as_bytes());
-    let sig_b64 = base64url_encode(&sig);
-    let token = format!("{signing_input}.{sig_b64}");
-
-    Json(json!({
-        "token": token,
-        "name": name,
-        "expires_in": 365 * 86400,
-    }))
+    match sign_jwt_long_lived(name, &secret) {
+        Ok(token) => Json(json!({
+            "token": token,
+            "name": name,
+            "expires_in": 365 * 86400,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
 }
+
+// ---------------------------------------------------------------------------
+// API key endpoints
+// ---------------------------------------------------------------------------
 
 async fn get_api_key(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
@@ -374,6 +678,10 @@ async fn generate_api_key(State(state): State<AppState>) -> Json<Value> {
     settings.set("api_key", &key).ok();
     Json(json!({ "key": key }))
 }
+
+// ---------------------------------------------------------------------------
+// Auth config endpoints
+// ---------------------------------------------------------------------------
 
 async fn auth_config(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::new(state.db);
@@ -420,16 +728,7 @@ async fn set_auth_config(
 
         // Auto-generate JWT secret when enabling auth
         if enabled {
-            if settings
-                .get("jwt_secret")
-                .ok()
-                .flatten()
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
-            {
-                let secret = uuid::Uuid::new_v4().to_string();
-                settings.set("jwt_secret", &secret).ok();
-            }
+            get_or_create_jwt_secret(&settings);
         }
     }
     if let Some(ref secret) = body.jwt_secret {

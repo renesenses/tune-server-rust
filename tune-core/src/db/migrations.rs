@@ -403,6 +403,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_zone_max_sample_rate",
         up: "",
     },
+    Migration {
+        version: 28,
+        name: "add_profile_email_and_argon2_password",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -656,6 +661,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 27 {
             add_column_if_missing(db, "zones", "max_sample_rate", "INTEGER");
+        }
+        if migration.version == 28 {
+            add_column_if_missing(db, "profiles", "email", "TEXT");
+            add_column_if_missing(db, "profiles", "password_hash_v2", "TEXT");
         }
 
         db.execute(
