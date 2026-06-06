@@ -763,6 +763,73 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
     })
 }
 
+fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext != "m4a" && ext != "mp4" && ext != "alac" {
+        return None;
+    }
+    let file_name = path.file_stem()?.to_str()?;
+    let parent = path.parent()?;
+    let album = parent.file_name()?.to_str().map(|s| s.to_string());
+    let artist = parent
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(|s| s.to_string());
+
+    let (track_number, title) =
+        if let Some(rest) = file_name.strip_prefix(|c: char| c.is_ascii_digit()) {
+            let num_str: String = std::iter::once(file_name.chars().next().unwrap())
+                .chain(rest.chars().take_while(|c| c.is_ascii_digit()))
+                .collect();
+            let after = file_name[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
+            (num_str.parse::<u32>().ok(), Some(after.to_string()))
+        } else {
+            (None, Some(file_name.to_string()))
+        };
+
+    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+    tracing::debug!(path = %path.display(), title = ?title, artist = ?artist, album = ?album, "m4a_fallback_metadata");
+
+    Some(TrackMetadata {
+        title,
+        album,
+        artist: artist.clone(),
+        album_artist: artist,
+        album_artist_sort: None,
+        track_number,
+        disc_number: None,
+        total_tracks: None,
+        total_discs: None,
+        disc_subtitle: None,
+        year: None,
+        original_year: None,
+        release_date: None,
+        original_date: None,
+        genre: None,
+        genres: vec![],
+        format: Some("alac".to_string()),
+        file_size,
+        sample_rate: None,
+        channels: Some(2),
+        duration_ms: None,
+        bit_depth: None,
+        bpm: None,
+        compilation: false,
+        label: None,
+        catalog_number: None,
+        musicbrainz_recording_id: None,
+        musicbrainz_release_id: None,
+        musicbrainz_artist_id: None,
+        musicbrainz_album_artist_id: None,
+        musicbrainz_release_group_id: None,
+        isrc: None,
+        has_cover: false,
+        credits: vec![],
+    })
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -770,12 +837,27 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::tag::{Accessor, ItemKey};
 
     let tagged = match Probe::open(path).and_then(|p| {
-        p.options(ParseOptions::new().parsing_mode(ParsingMode::Relaxed))
-            .guess_file_type()?
-            .read()
+        p.options(
+            ParseOptions::new()
+                .parsing_mode(ParsingMode::Relaxed)
+                .max_junk_bytes(1024 * 1024),
+        )
+        .guess_file_type()?
+        .read()
     }) {
         Ok(t) => t,
-        Err(e) => return dsf_dff_fallback(path).ok_or_else(|| format!("{e}")),
+        Err(e) => {
+            // Try DSF/DFF fallback first
+            if let Some(meta) = dsf_dff_fallback(path) {
+                return Ok(meta);
+            }
+            // For M4A/ALAC files that lofty can't parse (large atoms),
+            // fall back to directory/filename-based metadata extraction
+            if let Some(meta) = m4a_fallback(path) {
+                return Ok(meta);
+            }
+            return Err(format!("{e}"));
+        }
     };
     let props = tagged.properties();
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
