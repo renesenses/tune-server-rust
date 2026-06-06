@@ -413,7 +413,38 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 inserted += batch_inserted;
                 updated += batch_updated;
 
-                // COMMIT this batch -- tracks are now queryable
+                // Update track_count + album stats for albums touched in this batch
+                // so albums are never visible with 0 tracks between batches.
+                {
+                    let touched_album_ids: std::collections::HashSet<i64> = to_insert
+                        .iter()
+                        .chain(to_update.iter())
+                        .filter_map(|t| t.album_id)
+                        .collect();
+                    if !touched_album_ids.is_empty() {
+                        let ids_csv: String = touched_album_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        if let Ok(conn) = db.connection().lock() {
+                            conn.execute_batch(&format!(
+                                "UPDATE albums SET track_count = \
+                                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) \
+                                 WHERE id IN ({ids_csv});\
+                                 UPDATE albums SET \
+                                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
+                                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
+                                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                                 genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1)), \
+                                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)) \
+                                 WHERE id IN ({ids_csv})"
+                            )).ok();
+                        }
+                    }
+                }
+
+                // COMMIT this batch -- tracks + album stats are now queryable
                 if let Err(e) = db.execute_batch("COMMIT") {
                     tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
                 }
@@ -490,6 +521,17 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 [],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
+            }
+            // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
+            let orphan_albums = conn.execute(
+                "DELETE FROM albums WHERE id IN (\
+                 SELECT a.id FROM albums a \
+                 LEFT JOIN tracks t ON t.album_id = a.id \
+                 WHERE t.id IS NULL AND a.source = 'local')",
+                [],
+            ).unwrap_or(0);
+            if orphan_albums > 0 {
+                tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
             }
         }
         if let Err(e) = db.execute_batch("COMMIT") {
