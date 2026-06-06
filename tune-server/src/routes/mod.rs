@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod archive;
 pub mod bandcamp;
 pub mod bridge;
@@ -298,6 +299,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/auth", crate::auth::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
+        .nest("/ai", ai::router())
         .route(
             "/services/tokens",
             get(service_tokens::list).post(service_tokens::list),

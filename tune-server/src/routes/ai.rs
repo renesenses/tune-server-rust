@@ -96,7 +96,12 @@ async fn ai_query(
         if tool_uses.is_empty() {
             // No tool calls — extract the text response and return
             let reply = extract_text(&response.content);
-            info!(round, reply_len = reply.len(), actions = actions.len(), "ai_done");
+            info!(
+                round,
+                reply_len = reply.len(),
+                actions = actions.len(),
+                "ai_done"
+            );
             return Ok(Json(json!({
                 "reply": reply,
                 "actions": actions,
