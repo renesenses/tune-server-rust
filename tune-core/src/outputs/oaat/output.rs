@@ -685,9 +685,87 @@ impl OutputTarget for OaatOutput {
                 }
             }
 
+            // Convert S24LE (3-byte packed) → S32LE (4-byte) server-side via ffmpeg
+            // to avoid padding complexity on the endpoint.
+            let mut needs_s24_upconvert = !is_flac && si.format == AudioFormat::PcmS24le;
+            if needs_s24_upconvert {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let ffmpeg = tokio::process::Command::new("ffmpeg")
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "s24le",
+                        "-ar",
+                        &si.sample_rate.to_string(),
+                        "-ac",
+                        &si.channels.to_string(),
+                        "-i",
+                        "pipe:0",
+                        "-f",
+                        "s32le",
+                        "pipe:1",
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+
+                match ffmpeg {
+                    Ok(mut child) => {
+                        let mut stdin = child.stdin.take().unwrap();
+                        let stdout = child.stdout.take().unwrap();
+                        let pcm_buf = std::mem::take(&mut buf);
+
+                        tokio::spawn(async move {
+                            let _ = stdin.write_all(&pcm_buf).await;
+                            while let Some(Ok(chunk)) = stream.next().await {
+                                if stdin.write_all(&chunk).await.is_err() {
+                                    break;
+                                }
+                            }
+                            drop(stdin);
+                        });
+
+                        let (tx, rx) =
+                            tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(32);
+                        tokio::spawn(async move {
+                            let mut stdout = stdout;
+                            let mut read_buf = vec![0u8; 8192];
+                            loop {
+                                match stdout.read(&mut read_buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if tx
+                                            .send(Ok(bytes::Bytes::copy_from_slice(&read_buf[..n])))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+
+                        stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+                        buf = Vec::new();
+                        info!(device = %device_name, "oaat: S24LE→S32LE conversion server-side");
+                    }
+                    Err(e) => {
+                        warn!(device = %device_name, error = %e, "oaat: ffmpeg S24→S32 failed, sending raw S24");
+                        needs_s24_upconvert = false;
+                    }
+                }
+            }
+
             let is_dsd = si.format.is_dsd();
             let uses_byte_offset = is_flac || is_dsd;
-            let mut cur_format = if !is_flac && si.format == AudioFormat::Flac {
+            let was_flac = si.format == AudioFormat::Flac;
+            let mut cur_format = if (was_flac && !is_flac) || needs_s24_upconvert {
                 if si.bits_per_sample >= 24 {
                     AudioFormat::PcmS32le
                 } else {
@@ -697,7 +775,7 @@ impl OutputTarget for OaatOutput {
                 si.format
             };
             let mut cur_sample_rate = si.sample_rate;
-            let mut cur_bits = if !is_flac && si.format == AudioFormat::Flac {
+            let mut cur_bits = if (was_flac && !is_flac) || needs_s24_upconvert {
                 if si.bits_per_sample >= 24 { 32 } else { 16 }
             } else {
                 si.bits_per_sample
