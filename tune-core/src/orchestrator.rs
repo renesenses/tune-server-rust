@@ -219,9 +219,21 @@ impl PlaybackOrchestrator {
                 .as_ref()
                 .is_some_and(|f| *f != AudioFormat::Wav);
 
+        // Local output (cpal) expects raw PCM in a WAV container — it does NOT
+        // decode compressed formats (FLAC, MP3, etc.) itself.  Non-WAV files
+        // must be transcoded to WAV so the LocalOutput receives a valid WAV
+        // stream with a parseable header followed by raw PCM samples.
+        let is_local_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
+        let local_needs_wav = is_local_output
+            && source_format
+                .as_ref()
+                .is_some_and(|f| *f != AudioFormat::Wav);
+
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
-        // Local and AirPlay outputs do their own decoding and don't need orchestrator transcoding.
         let is_network_output = matches!(
             zone_output_type.as_deref(),
             Some("dlna")
@@ -236,11 +248,12 @@ impl PlaybackOrchestrator {
                 .is_some_and(|f| f.needs_transcode_for_dlna());
         // Downsample if the zone has a max_sample_rate cap and the source exceeds it
         let needs_downsample = zone_max_sample_rate.is_some_and(|max| sample_rate > max);
-        let needs_transcode = needs_transcode_for_output || oaat_needs_wav || needs_downsample;
+        let needs_transcode =
+            needs_transcode_for_output || oaat_needs_wav || local_needs_wav || needs_downsample;
 
         let (session_id, out_mime, out_ext) = if needs_transcode {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
-            let target_fmt = if oaat_needs_wav {
+            let target_fmt = if oaat_needs_wav || local_needs_wav {
                 AudioFormat::Wav
             } else if needs_downsample && !needs_transcode_for_output {
                 // Only downsampling — keep the same lossless format
@@ -263,17 +276,17 @@ impl PlaybackOrchestrator {
             }
             let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
                 24
-            } else if oaat_needs_wav {
+            } else if oaat_needs_wav || local_needs_wav {
                 bit_depth.max(16).min(24)
             } else {
                 bit_depth.max(16)
             };
-            let out_mime = if oaat_needs_wav {
+            let out_mime = if oaat_needs_wav || local_needs_wav {
                 "audio/wav".to_string()
             } else {
                 target_fmt.mime_type().to_string()
             };
-            let out_ext = if oaat_needs_wav {
+            let out_ext = if oaat_needs_wav || local_needs_wav {
                 "wav".to_string()
             } else {
                 target_fmt.container_format().to_string()
