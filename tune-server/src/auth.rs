@@ -184,6 +184,7 @@ pub async fn auth_middleware(
     if path.contains("/system/health")
         || path.contains("/system/version")
         || path.contains("/auth/")
+        || path.contains("/cloud/sso/")
         || path == "/ws"
     {
         return next.run(request).await;

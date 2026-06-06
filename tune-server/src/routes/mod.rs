@@ -3,6 +3,7 @@ pub mod archive;
 pub mod bandcamp;
 pub mod bridge;
 pub mod cd_rip;
+pub mod cloud;
 pub mod connect;
 pub mod dashboard;
 pub mod deezer_proxy_handler;
@@ -297,6 +298,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/i18n", i18n::router())
         .nest("/upnp", upnp::router())
         .nest("/auth", crate::auth::router())
+        .nest("/cloud", cloud::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())

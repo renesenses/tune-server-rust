@@ -20,6 +20,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
     spawn_memory_diagnostics(state.outputs.clone());
+    spawn_telemetry_reporter(state);
 }
 
 fn spawn_squeezebox_poller(state: &AppState) {
@@ -168,6 +169,10 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
             server_base,
         );
     }
+}
+
+fn spawn_telemetry_reporter(state: &AppState) {
+    tune_core::cloud::telemetry::TelemetryReporter::spawn(state.db.clone());
 }
 
 fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
