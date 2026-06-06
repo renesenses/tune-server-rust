@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
@@ -36,11 +36,11 @@ impl PluginMarketplace {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
             Ok(resp) => {
-                warn!(status = %resp.status(), "marketplace_list_failed");
+                debug!(status = %resp.status(), "marketplace_list_failed");
                 vec![]
             }
             Err(e) => {
-                warn!(error = %e, "marketplace_list_request_failed");
+                debug!(error = %e, "marketplace_list_request_failed");
                 vec![]
             }
         }

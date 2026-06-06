@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
@@ -71,7 +71,7 @@ impl MozaikAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body, "oauth_token_exchange_failed");
+            debug!(status = %status, body = %body, "oauth_token_exchange_failed");
             return Err(format!("oauth token exchange failed: {status}"));
         }
 

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
@@ -83,10 +83,10 @@ impl TelemetryReporter {
             }
             Ok(resp) => {
                 let status = resp.status();
-                warn!(status = %status, "telemetry_report_rejected");
+                debug!(status = %status, "telemetry_report_rejected");
             }
             Err(e) => {
-                warn!(error = %e, "telemetry_report_failed");
+                debug!(error = %e, "telemetry_report_failed");
             }
         }
     }

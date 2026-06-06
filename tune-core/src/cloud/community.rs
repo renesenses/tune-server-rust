@@ -1,4 +1,4 @@
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
@@ -21,7 +21,7 @@ pub async fn report_artist_image(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        warn!(mbid, status = %status, "artist_image_report_rejected");
+        debug!(mbid, status = %status, "artist_image_report_rejected");
         return Err(format!("artist image report failed: {status}"));
     }
 
@@ -51,7 +51,7 @@ pub async fn submit_genre_correction(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        warn!(album_id, status = %status, "genre_correction_rejected");
+        debug!(album_id, status = %status, "genre_correction_rejected");
         return Err(format!("genre correction failed: {status}"));
     }
 
