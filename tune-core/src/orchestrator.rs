@@ -459,8 +459,6 @@ impl PlaybackOrchestrator {
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
 
         let (stream_url, sid) = if is_https && is_oaat_stream {
-            // OAAT endpoint handles FLAC natively — proxy the upstream FLAC
-            // stream directly instead of transcoding.
             let session_id = self
                 .streamer
                 .create_proxy_session(info.clone(), stream_data.url.clone(), false)
@@ -468,7 +466,7 @@ impl PlaybackOrchestrator {
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            let ext = if info.format == "flac" { "flac" } else { "wav" };
+            let ext = &info.format;
             let url = self.streamer.get_stream_url(&session_id, &server_ip, ext);
             (url, Some(session_id))
         } else if is_https {

@@ -596,28 +596,112 @@ impl OutputTarget for OaatOutput {
                 }
             };
 
-            let is_flac = si.format == AudioFormat::Flac;
+            let mut is_flac = si.format == AudioFormat::Flac;
 
+            // FLAC via UDP causes frame-boundary corruption — decode to PCM on
+            // the server and stream clean PCM to the endpoint instead.
             if is_flac {
-                while buf.len() < 65536 {
-                    match stream.next().await {
-                        Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                        Some(Err(e)) => {
-                            error!(device = %device_name, error = %e, "oaat: FLAC pre-buffer failed");
-                            playing.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                        None => break,
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let pcm_fmt = if si.bits_per_sample >= 24 {
+                    "s32le"
+                } else {
+                    "s16le"
+                };
+                let ffmpeg = tokio::process::Command::new("ffmpeg")
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "flac",
+                        "-i",
+                        "pipe:0",
+                        "-f",
+                        pcm_fmt,
+                        "-ar",
+                        &si.sample_rate.to_string(),
+                        "-ac",
+                        &si.channels.to_string(),
+                        "pipe:1",
+                    ])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+
+                match ffmpeg {
+                    Ok(mut child) => {
+                        let mut stdin = child.stdin.take().unwrap();
+                        let stdout = child.stdout.take().unwrap();
+                        let flac_buf = std::mem::take(&mut buf);
+
+                        // Pipe HTTP FLAC stream → ffmpeg stdin in background
+                        tokio::spawn(async move {
+                            let _ = stdin.write_all(&flac_buf).await;
+                            while let Some(Ok(chunk)) = stream.next().await {
+                                if stdin.write_all(&chunk).await.is_err() {
+                                    break;
+                                }
+                            }
+                            drop(stdin);
+                        });
+
+                        // Read PCM from ffmpeg stdout as new stream
+                        let (tx, rx) =
+                            tokio::sync::mpsc::channel::<Result<bytes::Bytes, reqwest::Error>>(32);
+                        tokio::spawn(async move {
+                            let mut stdout = stdout;
+                            let mut read_buf = vec![0u8; 8192];
+                            loop {
+                                match stdout.read(&mut read_buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if tx
+                                            .send(Ok(bytes::Bytes::copy_from_slice(&read_buf[..n])))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+
+                        stream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+                        buf = Vec::new();
+                        is_flac = false;
+
+                        let decoded_bits: u16 = if si.bits_per_sample >= 24 { 32 } else { 16 };
+                        info!(device = %device_name, original_bits = si.bits_per_sample, decoded_bits, "oaat: FLAC decoded to PCM server-side");
+                    }
+                    Err(e) => {
+                        error!(device = %device_name, error = %e, "oaat: ffmpeg spawn failed for FLAC decode");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
                     }
                 }
-                debug!(device = %device_name, buffered = buf.len(), "oaat: FLAC pre-buffered");
             }
 
             let is_dsd = si.format.is_dsd();
             let uses_byte_offset = is_flac || is_dsd;
-            let mut cur_format = si.format;
+            let mut cur_format = if !is_flac && si.format == AudioFormat::Flac {
+                if si.bits_per_sample >= 24 {
+                    AudioFormat::PcmS32le
+                } else {
+                    AudioFormat::PcmS16le
+                }
+            } else {
+                si.format
+            };
             let mut cur_sample_rate = si.sample_rate;
-            let mut cur_bits = si.bits_per_sample;
+            let mut cur_bits = if !is_flac && si.format == AudioFormat::Flac {
+                if si.bits_per_sample >= 24 { 32 } else { 16 }
+            } else {
+                si.bits_per_sample
+            };
             let cur_channels = si.channels;
             let ch = cur_channels.min(8) as u8;
             let layout = ChannelLayout::Stereo;
@@ -845,34 +929,7 @@ impl OutputTarget for OaatOutput {
                                     position_ms: seek_pos,
                                 })).await.ok();
 
-                                if is_flac {
-                                    match http_client.get(&url).send().await {
-                                        Ok(resp) if resp.status().is_success() => {
-                                            stream = Box::pin(resp.bytes_stream());
-                                            buf.clear();
-                                            let mut header_ok = true;
-                                            while buf.len() < 65536 {
-                                                match stream.next().await {
-                                                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
-                                                    Some(Err(_)) | None => { header_ok = false; break; }
-                                                }
-                                            }
-                                            if header_ok {
-                                                byte_offset = 0;
-                                                sample_offset = 0;
-                                                let elapsed_eq = std::time::Duration::from_millis(seek_pos);
-                                                start = std::time::Instant::now() - elapsed_eq;
-                                                pause_offset = std::time::Duration::ZERO;
-                                                position_ms.store(seek_pos, Ordering::SeqCst);
-                                                info!(device = %device_name, seek_pos, "oaat: FLAC seek — stream restarted");
-                                            } else {
-                                                warn!(device = %device_name, "oaat: FLAC seek re-buffer failed");
-                                            }
-                                        }
-                                        Ok(resp) => warn!(device = %device_name, status = %resp.status(), "oaat: FLAC seek re-fetch failed"),
-                                        Err(e) => warn!(device = %device_name, error = %e, "oaat: FLAC seek re-fetch failed"),
-                                    }
-                                } else {
+                                {
                                     // Calculate byte offset
                                     let bytes_per_sec = if is_dsd {
                                         cur_sample_rate as u64 * cur_channels as u64 / 8

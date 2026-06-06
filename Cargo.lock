@@ -4017,6 +4017,7 @@ dependencies = [
  "symphonia",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "unicode-normalization",
  "urlencoding",
