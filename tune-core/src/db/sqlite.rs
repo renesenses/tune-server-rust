@@ -50,6 +50,11 @@ impl SqliteDb {
         conn.execute_batch(&pragmas)
             .map_err(|e| format!("pragma: {e}"))?;
 
+        // Checkpoint WAL before opening read connections so readers
+        // see the latest committed data (prevents stale reads after
+        // git reset, crash recovery, or external DB modifications).
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
         // Open a pool of read-only connections for concurrent read access
         let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let mut read_pool = Vec::with_capacity(READ_POOL_SIZE);
