@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use symphonia::core::codecs::CodecParameters;
@@ -8,7 +9,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Tr
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
 
@@ -117,15 +118,70 @@ pub fn decode_to_pcm(
     }
 
     if ext == "ape" {
-        return super::ape::decode_ape_to_pcm(
-            file_path,
+        // Wrap in catch_unwind: the native APE decoder may panic on malformed
+        // or unsupported APE files (e.g. very old versions, Insane compression).
+        // A panic must NOT crash the server.
+        let fp = file_path.to_string();
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            super::ape::decode_ape_to_pcm(
+                &fp,
+                target_sample_rate,
+                target_channels,
+                seek_s,
+                max_duration_s,
+            )
+        }));
+        return match result {
+            Ok(inner) => inner,
+            Err(panic_info) => {
+                let msg = panic_payload_to_string(&panic_info);
+                error!(file = file_path, panic = %msg, "ape_decoder_panic");
+                Err(format!("APE decode panic: {msg}"))
+            }
+        };
+    }
+
+    // Wrap symphonia decode in catch_unwind — an unsupported codec or
+    // malformed file must never panic-crash the server.
+    let fp = file_path.to_string();
+    let result = catch_unwind(AssertUnwindSafe(move || {
+        decode_symphonia(
+            &fp,
             target_sample_rate,
             target_channels,
             seek_s,
             max_duration_s,
-        );
+        )
+    }));
+    match result {
+        Ok(inner) => inner,
+        Err(panic_info) => {
+            let msg = panic_payload_to_string(&panic_info);
+            error!(file = file_path, panic = %msg, "symphonia_decoder_panic");
+            Err(format!("decode panic ({ext}): {msg}"))
+        }
     }
+}
 
+/// Extract a human-readable message from a panic payload.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
+fn decode_symphonia(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
     let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 

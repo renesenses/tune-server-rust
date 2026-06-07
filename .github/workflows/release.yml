@@ -155,6 +155,7 @@ jobs:
             FileWrite `$0 'set "TUNE_WEB_DIR=%~dp0web"$\r$\n'
             FileWrite `$0 'set "TUNE_PORT=8888"$\r$\n'
             FileWrite `$0 'set "TUNE_OPEN_BROWSER=1"$\r$\n'
+            FileWrite `$0 'set "TUNE_LOG_LEVEL=DEBUG"$\r$\n'
             FileWrite `$0 'tune-server.exe$\r$\n'
             FileClose `$0
 

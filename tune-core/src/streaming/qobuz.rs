@@ -294,6 +294,78 @@ impl QobuzService {
             .or_else(|_| Ok(serde_json::json!({"ok": true})))
     }
 
+    /// Determine the best format_id given the user's subscription level.
+    /// "Studio" / "HiFi" subscriptions max out at CD quality (format_id 6).
+    /// "Sublime" / "Sublime+" can access Hi-Res (format_id 27).
+    fn best_format_id_for_subscription(&self) -> &str {
+        match self.subscription.as_deref() {
+            Some(sub) => {
+                let lower = sub.to_lowercase();
+                if lower.contains("sublime") {
+                    "27"
+                } else {
+                    // Studio, HiFi, Premium, or unknown → safe default to CD quality
+                    "6"
+                }
+            }
+            // No subscription info available → try Hi-Res, fallback handled by caller
+            None => "27",
+        }
+    }
+
+    /// Low-level fetch of a track streaming URL with a specific format_id.
+    async fn fetch_track_url(&self, track_id: &str, format_id: &str) -> Result<StreamUrl, String> {
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let timestamp = format!("{}.{}", dur.as_secs(), dur.subsec_millis());
+
+        let sig_input = format!(
+            "trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{timestamp}{}",
+            self.app_secret
+        );
+        let sig = md5_hex(&sig_input);
+
+        info!(track_id, format_id, timestamp = %timestamp, sig = %sig, "qobuz_get_file_url");
+
+        let data = self
+            .api_get(
+                "/track/getFileUrl",
+                &[
+                    ("track_id", track_id),
+                    ("format_id", format_id),
+                    ("intent", "stream"),
+                    ("request_ts", &timestamp),
+                    ("request_sig", &sig),
+                ],
+            )
+            .await?;
+
+        let url = data["url"].as_str().ok_or("no url")?.to_string();
+        let mime = data["mime_type"]
+            .as_str()
+            .unwrap_or("audio/flac")
+            .to_string();
+        let sample_rate = data["sampling_rate"]
+            .as_f64()
+            .map(|r| (r * 1000.0) as u32)
+            .unwrap_or(44100);
+        let bit_depth = data["bit_depth"].as_u64().map(|b| b as u16).unwrap_or(16);
+
+        Ok(StreamUrl {
+            url,
+            mime_type: mime,
+            quality: StreamQuality {
+                codec: "FLAC".into(),
+                sample_rate,
+                bit_depth,
+                bitrate: None,
+                channels: 2,
+            },
+            expires_at: None,
+        })
+    }
+
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         // Qobuz returns subgenresCount (integer) rather than a subgenres array
         // at the /genre/list level. Fall back to checking the subgenres array
@@ -421,61 +493,36 @@ impl StreamingService for QobuzService {
         track_id: &str,
         quality: Option<&str>,
     ) -> Result<StreamUrl, String> {
+        // Determine the best format_id based on quality request and subscription level.
+        // Qobuz format_id values: 5=MP3, 6=FLAC 16/44, 7=FLAC 24/96, 27=FLAC 24/192.
+        // "Studio" (formerly "HiFi") subscribers max out at format_id 6.
+        // "Sublime"/"Sublime+" subscribers can access 7 and 27.
         let format_id = match quality {
             Some("hires") => "27",
             Some("cd") => "6",
-            _ => "27",
+            Some("mp3") => "5",
+            _ => self.best_format_id_for_subscription(),
         };
 
-        let dur = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let timestamp = format!("{}.{}", dur.as_secs(), dur.subsec_millis());
-
-        let sig_input = format!(
-            "trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{timestamp}{}",
-            self.app_secret
-        );
-        let sig = md5_hex(&sig_input);
-
-        info!(track_id, format_id, timestamp = %timestamp, sig = %sig, "qobuz_get_file_url");
-
-        let data = self
-            .api_get(
-                "/track/getFileUrl",
-                &[
-                    ("track_id", track_id),
-                    ("format_id", format_id),
-                    ("intent", "stream"),
-                    ("request_ts", &timestamp),
-                    ("request_sig", &sig),
-                ],
-            )
-            .await?;
-
-        let url = data["url"].as_str().ok_or("no url")?.to_string();
-        let mime = data["mime_type"]
-            .as_str()
-            .unwrap_or("audio/flac")
-            .to_string();
-        let sample_rate = data["sampling_rate"]
-            .as_f64()
-            .map(|r| (r * 1000.0) as u32)
-            .unwrap_or(44100);
-        let bit_depth = data["bit_depth"].as_u64().map(|b| b as u16).unwrap_or(16);
-
-        Ok(StreamUrl {
-            url,
-            mime_type: mime,
-            quality: StreamQuality {
-                codec: "FLAC".into(),
-                sample_rate,
-                bit_depth,
-                bitrate: None,
-                channels: 2,
-            },
-            expires_at: None,
-        })
+        match self.fetch_track_url(track_id, format_id).await {
+            Ok(stream_url) => Ok(stream_url),
+            Err(e) => {
+                // If Hi-Res failed (likely subscription-level mismatch), retry with CD quality.
+                // Qobuz returns 401/403 or specific error when the format is not
+                // available for the user's subscription.
+                if format_id != "6" {
+                    info!(
+                        track_id,
+                        format_id,
+                        error = %e,
+                        "qobuz_format_id_failed_retrying_cd_quality"
+                    );
+                    self.fetch_track_url(track_id, "6").await
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {

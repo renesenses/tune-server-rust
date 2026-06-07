@@ -32,13 +32,14 @@ impl SqueezeboxOutput {
         }
     }
 
-    /// Send a raw CLI command to LMS and return the response line.
+    /// Send a raw CLI command to LMS and return the raw (URL-encoded) response line.
     ///
     /// The LMS CLI protocol is telnet-style on port 9090:
     /// - Commands are newline-terminated
     /// - The server echoes the command back with results appended
     /// - Each connection is stateless (open, send, read, close)
-    fn lms_cli_command(&self, cmd: &str) -> Result<String, String> {
+    /// - The response is URL-encoded; callers must decode as needed.
+    fn lms_cli_command_raw(&self, cmd: &str) -> Result<String, String> {
         let addr = format!("{}:{}", self.lms_host, self.lms_port);
         let stream = TcpStream::connect_timeout(
             &addr.parse().map_err(|e| format!("invalid LMS address {addr}: {e}"))?,
@@ -72,10 +73,16 @@ impl SqueezeboxOutput {
             .read_line(&mut response)
             .map_err(|e| format!("LMS CLI read failed: {e}"))?;
 
-        let decoded = urlencoding::decode(response.trim())
-            .map(|s| s.into_owned())
-            .unwrap_or_else(|_| response.trim().to_string());
+        Ok(response.trim().to_string())
+    }
 
+    /// Send a raw CLI command and return the URL-decoded response.
+    /// Use for simple commands where the response structure doesn't matter.
+    fn lms_cli_command(&self, cmd: &str) -> Result<String, String> {
+        let raw = self.lms_cli_command_raw(cmd)?;
+        let decoded = urlencoding::decode(&raw)
+            .map(|s| s.into_owned())
+            .unwrap_or(raw);
         Ok(decoded)
     }
 
@@ -88,20 +95,34 @@ impl SqueezeboxOutput {
     }
 
     /// Query player status via CLI (returns key-value pairs).
+    ///
+    /// The LMS CLI response is space-separated tokens, each URL-encoded.
+    /// Within each token, keys and values are separated by `%3A` (encoded colon).
+    /// We must split on literal spaces first (token boundaries), then decode
+    /// each token individually to preserve multi-word keys like "mixer volume".
     fn player_status_cli(&self) -> Result<Vec<(String, String)>, String> {
         let encoded_mac = urlencoding::encode(&self.player_id);
-        let resp = self.lms_cli_command(&format!("{encoded_mac} status 0 100 tags:adlNJ"))?;
+        let raw_resp =
+            self.lms_cli_command_raw(&format!("{encoded_mac} status 0 100 tags:adlNJ"))?;
 
-        // The response is space-separated key:value pairs (URL-encoded)
+        // The raw response is space-separated tokens (URL-encoded).
+        // Strip the player id prefix (encoded MAC) from the response.
+        let encoded_prefix = format!("{encoded_mac} ");
+        let body = raw_resp.strip_prefix(&*encoded_prefix).unwrap_or(&raw_resp);
+
         let mut pairs = Vec::new();
-        // Strip the player id prefix from the response
-        let body = resp
-            .strip_prefix(&format!("{} ", self.player_id))
-            .unwrap_or(&resp);
-
         for token in body.split(' ') {
-            if let Some((k, v)) = token.split_once(':') {
-                pairs.push((k.to_string(), v.to_string()));
+            // Each token is "key%3Avalue" where %3A is the encoded colon separator.
+            // We split on the FIRST %3A to get key and value, then decode each.
+            if let Some((raw_k, raw_v)) = token.split_once("%3A").or_else(|| token.split_once(':'))
+            {
+                let key = urlencoding::decode(raw_k)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| raw_k.to_string());
+                let value = urlencoding::decode(raw_v)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| raw_v.to_string());
+                pairs.push((key, value));
             }
         }
         Ok(pairs)
@@ -282,5 +303,75 @@ mod tests {
         let mac = "00:04:20:ab:cd:ef";
         let encoded = urlencoding::encode(mac);
         assert_eq!(encoded, "00%3A04%3A20%3Aab%3Acd%3Aef");
+    }
+
+    /// Simulates parsing a raw LMS CLI status response to verify that
+    /// multi-word keys (like "mixer volume") and values with spaces
+    /// (like track titles) are correctly decoded.
+    #[test]
+    fn parse_lms_status_tokens() {
+        // Simulated raw LMS CLI response (URL-encoded, space-separated tokens):
+        // mixer%20volume%3A75 mode%3Aplay time%3A42.5 duration%3A180.0
+        // title%3AMy%20Great%20Song artist%3AThe%20Artist
+        let raw_tokens = "mixer%20volume%3A75 mode%3Aplay time%3A42.5 duration%3A180.0 title%3AMy%20Great%20Song artist%3AThe%20Artist";
+
+        let mut pairs = Vec::new();
+        for token in raw_tokens.split(' ') {
+            if let Some((raw_k, raw_v)) = token.split_once("%3A").or_else(|| token.split_once(':'))
+            {
+                let key = urlencoding::decode(raw_k)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| raw_k.to_string());
+                let value = urlencoding::decode(raw_v)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| raw_v.to_string());
+                pairs.push((key, value));
+            }
+        }
+
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "mixer volume")
+                .map(|(_, v)| v.as_str()),
+            Some("75"),
+            "multi-word key 'mixer volume' must be parsed correctly"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "mode")
+                .map(|(_, v)| v.as_str()),
+            Some("play")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "time")
+                .map(|(_, v)| v.as_str()),
+            Some("42.5")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "duration")
+                .map(|(_, v)| v.as_str()),
+            Some("180.0")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "title")
+                .map(|(_, v)| v.as_str()),
+            Some("My Great Song"),
+            "values with spaces must be fully preserved"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(k, _)| k == "artist")
+                .map(|(_, v)| v.as_str()),
+            Some("The Artist")
+        );
     }
 }

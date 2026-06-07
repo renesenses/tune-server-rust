@@ -292,7 +292,7 @@ impl PlaybackOrchestrator {
         let needs_transcode =
             needs_transcode_for_output || oaat_needs_wav || local_needs_wav || needs_downsample;
 
-        let (session_id, out_mime, out_ext) = if needs_transcode {
+        let (session_id, out_mime, out_ext, resolved_file_size) = if needs_transcode {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
             let target_fmt = if oaat_needs_wav || local_needs_wav {
                 AudioFormat::Wav
@@ -351,6 +351,9 @@ impl PlaybackOrchestrator {
                 file_size: None,
                 duration_ms: Some(track.duration_ms as u64),
             };
+            // Use the computed WAV/FLAC content length for the DIDL size
+            // attribute so DLNA renderers know the correct stream size.
+            let transcode_file_size = info.wav_content_length();
 
             let (session_id, tx) = self.streamer.create_session(info, false, 256).await;
 
@@ -380,37 +383,53 @@ impl PlaybackOrchestrator {
                             bit_depth = decoded.bit_depth,
                             "transcode_decoded"
                         );
-                        let actual_bd = decoded.bit_depth;
                         let pcm_bytes = decoded.pcm_bytes();
 
-                        // Encode to target format using native bit depth
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            &target_format_str,
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        if let Err(e) = encoder.start().await {
-                            warn!(error = %e, file = %fp, "transcode_encoder_start_failed");
-                            return;
-                        }
-                        if let Err(e) = encoder.write(&pcm_bytes).await {
-                            warn!(error = %e, file = %fp, "transcode_encoder_write_failed");
-                            return;
-                        }
-                        match encoder.finish().await {
-                            Ok(encoded_data) => {
-                                // Send in chunks
-                                for chunk in encoded_data.chunks(32768) {
-                                    if tx.send(chunk.to_vec()).await.is_err() {
-                                        debug!("transcode_consumer_dropped");
-                                        return;
-                                    }
+                        if target_format_str == "wav" {
+                            // WAV target: send raw PCM only. The HTTP stream
+                            // handler already prepends a WAV header with the
+                            // correct data size (from duration_ms). Sending a
+                            // complete WAV (header + PCM) here would produce a
+                            // double header, causing silence on strict DLNA
+                            // renderers (e.g. Denon RCD-N12).
+                            for chunk in pcm_bytes.chunks(32768) {
+                                if tx.send(chunk.to_vec()).await.is_err() {
+                                    debug!("transcode_consumer_dropped");
+                                    return;
                                 }
-                                debug!(file = %fp, "transcode_complete");
                             }
-                            Err(e) => {
-                                warn!(error = %e, file = %fp, "transcode_encode_failed");
+                            debug!(file = %fp, pcm_bytes = pcm_bytes.len(), "transcode_complete_raw_pcm");
+                        } else {
+                            let actual_bd = decoded.bit_depth;
+                            // Encode to target format using native bit depth
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                &target_format_str,
+                                decoded.sample_rate,
+                                actual_bd as u32,
+                                decoded.channels,
+                            );
+                            if let Err(e) = encoder.start().await {
+                                warn!(error = %e, file = %fp, "transcode_encoder_start_failed");
+                                return;
+                            }
+                            if let Err(e) = encoder.write(&pcm_bytes).await {
+                                warn!(error = %e, file = %fp, "transcode_encoder_write_failed");
+                                return;
+                            }
+                            match encoder.finish().await {
+                                Ok(encoded_data) => {
+                                    // Send in chunks
+                                    for chunk in encoded_data.chunks(32768) {
+                                        if tx.send(chunk.to_vec()).await.is_err() {
+                                            debug!("transcode_consumer_dropped");
+                                            return;
+                                        }
+                                    }
+                                    debug!(file = %fp, "transcode_complete");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, file = %fp, "transcode_encode_failed");
+                                }
                             }
                         }
                     }
@@ -420,7 +439,7 @@ impl PlaybackOrchestrator {
                 }
             });
 
-            (session_id, out_mime, out_ext)
+            (session_id, out_mime, out_ext, transcode_file_size)
         } else {
             // Standard passthrough: serve the raw file
             let mime = source_format
@@ -437,11 +456,13 @@ impl PlaybackOrchestrator {
                 duration_ms: Some(track.duration_ms as u64),
             };
 
+            let passthrough_file_size = track.file_size.map(|s| s as u64);
+
             let session_id = self
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
-            (session_id, mime, fmt.clone())
+            (session_id, mime, fmt.clone(), passthrough_file_size)
         };
 
         let server_ip = self.server_ip();
@@ -459,7 +480,7 @@ impl PlaybackOrchestrator {
             source: "local".into(),
             cover_url: track.cover_path,
             stream_id: Some(session_id),
-            file_size: track.file_size.map(|s| s as u64),
+            file_size: resolved_file_size,
         })
     }
 
@@ -477,9 +498,27 @@ impl PlaybackOrchestrator {
         let svc = registry
             .get(service_name)
             .ok_or_else(|| format!("unknown service: {service_name}"))?;
-        let svc = svc.lock().await;
+        let mut svc = svc.lock().await;
 
-        let stream_data = svc.get_track_url(source_id, None).await?;
+        // Try to get the track URL; if it fails with an auth error, attempt
+        // a token refresh and retry once. This handles Qobuz tokens expiring
+        // mid-session (search still works without auth, but playback doesn't).
+        let stream_data = match svc.get_track_url(source_id, None).await {
+            Ok(data) => data,
+            Err(ref e) if e.contains("401") || e.contains("403") => {
+                info!(
+                    service = service_name,
+                    error = %e,
+                    "streaming_auth_error_attempting_refresh"
+                );
+                if svc.refresh_if_needed().await.unwrap_or(false) {
+                    svc.get_track_url(source_id, None).await?
+                } else {
+                    return Err(e.clone());
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let info = StreamInfo {
             format: stream_data.quality.codec.to_lowercase(),
@@ -593,38 +632,18 @@ impl PlaybackOrchestrator {
                             bit_depth = decoded.bit_depth,
                             "streaming_transcode_decoded"
                         );
-                        let actual_bd = decoded.bit_depth;
                         let pcm_bytes = decoded.pcm_bytes();
 
-                        // Encode to WAV using native bit depth
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            "wav",
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        if let Err(e) = encoder.start().await {
-                            warn!(error = %e, "streaming_transcode_encoder_start_failed");
-                            return;
-                        }
-                        if let Err(e) = encoder.write(&pcm_bytes).await {
-                            warn!(error = %e, "streaming_transcode_encoder_write_failed");
-                            return;
-                        }
-                        match encoder.finish().await {
-                            Ok(wav_data) => {
-                                for chunk in wav_data.chunks(32768) {
-                                    if tx.send(chunk.to_vec()).await.is_err() {
-                                        debug!("streaming_transcode_consumer_dropped");
-                                        return;
-                                    }
-                                }
-                                debug!("streaming_transcode_complete");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "streaming_transcode_encode_failed");
+                        // Send raw PCM only — the HTTP stream handler
+                        // prepends the WAV header. Sending a complete WAV
+                        // (header + PCM) would produce a double header.
+                        for chunk in pcm_bytes.chunks(32768) {
+                            if tx.send(chunk.to_vec()).await.is_err() {
+                                debug!("streaming_transcode_consumer_dropped");
+                                return;
                             }
                         }
+                        debug!(pcm_bytes = pcm_bytes.len(), "streaming_transcode_complete");
                     }
                     Err(e) => {
                         warn!(error = %e, "streaming_transcode_decode_failed");
