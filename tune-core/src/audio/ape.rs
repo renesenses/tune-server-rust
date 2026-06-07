@@ -238,7 +238,13 @@ impl<'a> RangeDecoder<'a> {
     /// Decode a value with a given frequency total.
     fn decode_frequency(&mut self, total: u32) -> u32 {
         self.normalize();
+        if total == 0 {
+            return 0;
+        }
         self.range /= total;
+        if self.range == 0 {
+            return 0;
+        }
         (self.low / self.range).min(total - 1)
     }
 
