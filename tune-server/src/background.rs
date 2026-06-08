@@ -271,7 +271,10 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         let device_id = format!("local:{}", dev.name);
         new_device_ids.insert(device_id.clone());
 
-        if existing_ids.contains(&device_id) {
+        // Skip if already registered — check both the pre-loop snapshot and
+        // the live registry (guards against cpal returning the same device
+        // name twice in a single enumeration).
+        if existing_ids.contains(&device_id) || outputs.contains(&device_id) {
             continue; // already registered
         }
 

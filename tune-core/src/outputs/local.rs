@@ -38,6 +38,7 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     );
 
     let mut devices = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
@@ -45,6 +46,15 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
+
+                // Skip duplicate device names — cpal/CoreAudio can report the
+                // same physical device multiple times (e.g. with different
+                // stream configurations).  We keep the first occurrence.
+                if !seen_names.insert(name.clone()) {
+                    debug!(device = %name, "local_audio_device_skipped_duplicate");
+                    continue;
+                }
+
                 let is_default = name == default_name;
 
                 let (max_channels, sample_rates) = if let Ok(configs) =

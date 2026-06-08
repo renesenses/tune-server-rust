@@ -830,6 +830,186 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
     })
 }
 
+/// Check if a file has a known audio extension (used to decide whether to
+/// attempt a filesystem-based metadata fallback when lofty fails).
+fn is_known_audio_ext(path: &Path) -> bool {
+    const AUDIO_EXTS: &[&str] = &[
+        "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff",
+        "dst", "alac", "ape",
+    ];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| AUDIO_EXTS.contains(&ext.to_lowercase().as_str()))
+}
+
+/// Extract basic metadata from the directory structure when lofty successfully
+/// parsed the audio properties but the file has no tags.
+///
+/// Directory convention: `.../Artist/Album/01 - Title.wav`
+fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> TrackMetadata {
+    let (track_number, title) = extract_title_from_filename(path);
+    let parent = path.parent();
+    let album = parent
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    let artist = parent
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_lowercase();
+    let format = Some(normalize_format(&ext, props.bit_depth()));
+
+    tracing::debug!(
+        path = %path.display(),
+        title = ?title,
+        artist = ?artist,
+        album = ?album,
+        "tagless_fallback_metadata"
+    );
+
+    TrackMetadata {
+        title,
+        album,
+        artist: artist.clone(),
+        album_artist: artist,
+        album_artist_sort: None,
+        track_number,
+        disc_number: None,
+        total_tracks: None,
+        total_discs: None,
+        disc_subtitle: None,
+        year: None,
+        original_year: None,
+        release_date: None,
+        original_date: None,
+        genre: None,
+        genres: vec![],
+        format,
+        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        sample_rate: props.sample_rate(),
+        channels: props.channels().map(|c| c as u16),
+        duration_ms: Some(props.duration().as_millis() as u64),
+        bit_depth: props.bit_depth().map(|b| b as u16),
+        bpm: None,
+        compilation: false,
+        label: None,
+        catalog_number: None,
+        musicbrainz_recording_id: None,
+        musicbrainz_release_id: None,
+        musicbrainz_artist_id: None,
+        musicbrainz_album_artist_id: None,
+        musicbrainz_release_group_id: None,
+        isrc: None,
+        has_cover: false,
+        credits: vec![],
+    }
+}
+
+/// Fallback when lofty cannot parse the file at all (no audio properties).
+/// Extracts everything from the filesystem.
+fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
+    let (track_number, title) = extract_title_from_filename(path);
+    let parent = path.parent();
+    let album = parent
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    let artist = parent
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_lowercase();
+
+    tracing::debug!(
+        path = %path.display(),
+        title = ?title,
+        artist = ?artist,
+        album = ?album,
+        "tagless_fallback_no_props_metadata"
+    );
+
+    TrackMetadata {
+        title,
+        album,
+        artist: artist.clone(),
+        album_artist: artist,
+        album_artist_sort: None,
+        track_number,
+        disc_number: None,
+        total_tracks: None,
+        total_discs: None,
+        disc_subtitle: None,
+        year: None,
+        original_year: None,
+        release_date: None,
+        original_date: None,
+        genre: None,
+        genres: vec![],
+        format: Some(ext),
+        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        sample_rate: None,
+        channels: Some(2),
+        duration_ms: None,
+        bit_depth: None,
+        bpm: None,
+        compilation: false,
+        label: None,
+        catalog_number: None,
+        musicbrainz_recording_id: None,
+        musicbrainz_release_id: None,
+        musicbrainz_artist_id: None,
+        musicbrainz_album_artist_id: None,
+        musicbrainz_release_group_id: None,
+        isrc: None,
+        has_cover: false,
+        credits: vec![],
+    }
+}
+
+/// Parse track number and title from a filename.
+///
+/// Handles patterns like:
+///   "01 - Title.wav" -> (Some(1), Some("Title"))
+///   "01. Title.wav"  -> (Some(1), Some("Title"))
+///   "01_Title.wav"   -> (Some(1), Some("Title"))
+///   "Title.wav"      -> (None, Some("Title"))
+fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
+    let file_name = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => return (None, None),
+    };
+    if let Some(first_char) = file_name.chars().next()
+        && first_char.is_ascii_digit()
+    {
+        let num_str: String = file_name
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let after = file_name[num_str.len()..].trim_start_matches([' ', '-', '.', '_']);
+        let title = if after.is_empty() {
+            Some(file_name.to_string())
+        } else {
+            Some(after.to_string())
+        };
+        (num_str.parse::<u32>().ok(), title)
+    } else {
+        (None, Some(file_name.to_string()))
+    }
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -856,13 +1036,35 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
             if let Some(meta) = m4a_fallback(path) {
                 return Ok(meta);
             }
+            // For any other audio file (WAV, AIFF, etc.) that lofty cannot
+            // parse, extract basic metadata from the filesystem so the file
+            // still appears in the library rather than being silently skipped.
+            // Only apply the fallback if the file actually exists (a missing
+            // file should still return Err).
+            if is_known_audio_ext(path) && path.exists() {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "lofty_parse_failed_using_filesystem_fallback"
+                );
+                return Ok(tagless_fallback_no_props(path));
+            }
             return Err(format!("{e}"));
         }
     };
     let props = tagged.properties();
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
         Some(t) => t,
-        None => return dsf_dff_fallback(path).ok_or_else(|| "no tags found".to_string()),
+        None => {
+            if let Some(meta) = dsf_dff_fallback(path) {
+                return Ok(meta);
+            }
+            // For audio files that lofty can parse (valid audio properties)
+            // but have no tags (e.g. WAV without RIFF INFO or ID3v2),
+            // extract metadata from the file/directory structure so they
+            // still appear in the library instead of being silently skipped.
+            return Ok(tagless_fallback(path, props));
+        }
     };
 
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());

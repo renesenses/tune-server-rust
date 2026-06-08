@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::info;
 use unicode_normalization::UnicodeNormalization;
@@ -117,7 +118,15 @@ pub fn build_track_from_metadata(
 }
 
 /// Spawn the auto-scan task that indexes all music directories at startup.
-pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
+///
+/// Returns an `Arc<AtomicBool>` that is set to `true` once the scan finishes.
+/// The file watcher should wait for this flag before monitoring directories,
+/// otherwise it may pick up filesystem events triggered by the scan itself
+/// (macOS FSEvents can replay recent events on watcher startup) and race
+/// with the scanner — deleting freshly inserted tracks.
+pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool> {
+    let scan_done = Arc::new(AtomicBool::new(false));
+    let scan_done_clone = scan_done.clone();
     tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
         let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
@@ -313,11 +322,18 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) {
         }
 
         event_bus.emit("library.scan.completed", report);
+        scan_done_clone.store(true, Ordering::Release);
     });
+    scan_done
 }
 
 /// Spawn the file watcher that monitors music directories for live changes.
-pub fn spawn_file_watcher(db: SqliteDb) {
+///
+/// If `wait_for_scan` is provided, the watcher will wait until the initial scan
+/// completes before starting to monitor directories. This prevents the watcher
+/// from picking up stale FSEvents replayed on subscription and racing with the
+/// scanner (deleting tracks that the scanner just inserted).
+pub fn spawn_file_watcher(db: SqliteDb, wait_for_scan: Option<Arc<AtomicBool>>) {
     let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
@@ -334,6 +350,19 @@ pub fn spawn_file_watcher(db: SqliteDb) {
         Ok(watcher) => {
             info!("file_watcher_started");
             tokio::task::spawn_blocking(move || {
+                // Wait for the initial auto-scan to complete before processing
+                // watcher events. On macOS, FSEvents replays recent events when
+                // a new watcher subscribes, which can cause the watcher to
+                // delete+reinsert tracks that the scanner just added.
+                if let Some(ref flag) = wait_for_scan {
+                    info!("file_watcher_waiting_for_scan");
+                    while !flag.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    // Drain any stale events that accumulated during the scan
+                    let _ = watcher.poll_changes(std::time::Duration::from_millis(100));
+                    info!("file_watcher_scan_complete_starting_watch");
+                }
                 loop {
                     let changes = watcher.poll_debounced(
                         std::time::Duration::from_secs(2),

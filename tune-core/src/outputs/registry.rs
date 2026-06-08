@@ -31,6 +31,11 @@ impl OutputRegistry {
         self.outputs.get(device_id).cloned()
     }
 
+    /// Returns `true` if a device with the given ID is already registered.
+    pub fn contains(&self, device_id: &str) -> bool {
+        self.outputs.contains_key(device_id)
+    }
+
     pub fn remove(&mut self, device_id: &str) {
         self.outputs.remove(device_id);
     }
