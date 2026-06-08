@@ -803,7 +803,7 @@ async fn queue_jump(
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::new(state.db.clone());
     queue_repo.clear(zone_id).ok();
-    state.playback.stop(zone_id).await;
+    state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
     // Delete the persisted queue file
     let db_path = state.config.db_path.clone();

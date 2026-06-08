@@ -29,13 +29,13 @@ pub fn build_track_from_metadata(
             .map(|s| s == "various artists" || s == "various" || s == "va" || s == "compilations")
             .unwrap_or(false);
 
-    let album_artist_name = meta.album_artist.as_deref().unwrap_or_else(|| {
-        if is_compilation {
-            "Various Artists"
-        } else {
-            meta.artist.as_deref().unwrap_or("Unknown Artist")
-        }
-    });
+    let album_artist_name = if is_compilation {
+        "Various Artists"
+    } else {
+        meta.album_artist
+            .as_deref()
+            .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"))
+    };
 
     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
 
@@ -68,11 +68,11 @@ pub fn build_track_from_metadata(
     let has_explicit_album_artist = meta.album_artist.is_some();
     let album = meta.album.as_ref().and_then(|title| {
         let aid = album_artist_id.unwrap_or(0);
-        // When album_artist tag is explicit, use strict matching (title + artist + year).
-        // When album_artist is missing (fallback to track artist), try to find any
-        // existing album with this title first to avoid creating duplicates when
-        // tracks in the same album have different track artists.
-        if !has_explicit_album_artist {
+        // Compilations: group by title only (ignore per-track artist) to prevent
+        // splitting a VA album into N albums for N different track artists.
+        // Non-compilations without explicit album_artist: also try title-only first
+        // to avoid duplicates when tracks share an album but have different artists.
+        if is_compilation || !has_explicit_album_artist {
             if let Ok(Some(existing)) = album_repo.get_by_title_only_strong(title) {
                 return Some(existing);
             }

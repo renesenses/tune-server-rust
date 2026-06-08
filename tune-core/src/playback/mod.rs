@@ -213,6 +213,22 @@ impl PlaybackManager {
         });
     }
 
+    /// Stop playback and clear the now_playing metadata entirely.
+    /// Used when the queue is cleared — there is nothing to resume.
+    pub async fn stop_and_clear(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.state = PlayState::Stopped;
+            state.now_playing = None;
+            state.position_ms = 0;
+        }
+        self.emit(PlaybackEvent {
+            event: "stopped".into(),
+            zone_id,
+            data: serde_json::json!({}),
+        });
+    }
+
     pub async fn seek(&self, zone_id: i64, position_ms: i64) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
