@@ -3,6 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::json;
+use tracing::error;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -122,7 +123,13 @@ pub async fn save(
             let skey = format!("{}_{}", id, key);
             let sval = value.as_str().unwrap_or("");
             if !sval.is_empty() {
-                settings.set(&skey, sval).ok();
+                if let Err(e) = settings.set(&skey, sval) {
+                    error!(key = %skey, error = %e, "service_token_save_failed");
+                    return Json(json!({
+                        "valid": false,
+                        "validation_message": format!("Erreur sauvegarde: {e}")
+                    }));
+                }
             }
         }
     }

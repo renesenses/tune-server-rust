@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_devices))
         .route("/list", get(list_devices))
         .route("/scan", post(scan_devices))
+        .route("/rescan", post(rescan_local_devices))
         .route("/audio", get(list_audio_devices))
         // buffer-stats/all must be registered before /{device_id} to avoid capture
         .route("/buffer-stats/all", get(all_buffer_stats))
@@ -183,6 +184,33 @@ async fn list_audio_devices() -> Json<Value> {
     }
     #[cfg(not(feature = "local-audio"))]
     Json(json!([]))
+}
+
+/// Trigger immediate re-enumeration of local audio devices (USB DAC hot-plug).
+async fn rescan_local_devices(State(state): State<AppState>) -> Json<Value> {
+    #[cfg(feature = "local-audio")]
+    {
+        crate::background::rescan_local_audio_devices(&state).await;
+        let outputs = state.outputs.lock().await;
+        let local_devices: Vec<String> = outputs
+            .list()
+            .into_iter()
+            .filter(|id| id.starts_with("local:"))
+            .collect();
+        Json(json!({
+            "status": "ok",
+            "local_devices": local_devices.len(),
+            "devices": local_devices,
+        }))
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = state;
+        Json(json!({
+            "status": "unsupported",
+            "message": "local-audio feature not enabled",
+        }))
+    }
 }
 
 async fn device_status(

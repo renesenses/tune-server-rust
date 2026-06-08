@@ -282,14 +282,14 @@ fn decode_wav_integration() {
 
     assert_eq!(result.sample_rate, 44100);
     assert_eq!(result.channels, 2);
-    assert!(!result.samples.is_empty(), "WAV should produce samples");
+    assert!(!result.samples_i32.is_empty(), "WAV should produce samples");
     assert!(
         result.duration_s > 0.9 && result.duration_s < 1.1,
         "duration should be ~1s, got {}",
         result.duration_s
     );
     // Verify sample count: 44100 frames * 2 channels = 88200
-    assert_eq!(result.samples.len(), 88200);
+    assert_eq!(result.samples_i32.len(), 88200);
 }
 
 #[test]
@@ -304,13 +304,16 @@ fn decode_aiff_integration() {
 
     assert_eq!(result.sample_rate, 44100);
     assert_eq!(result.channels, 2);
-    assert!(!result.samples.is_empty(), "AIFF should produce samples");
+    assert!(
+        !result.samples_i32.is_empty(),
+        "AIFF should produce samples"
+    );
     assert!(
         result.duration_s > 0.9 && result.duration_s < 1.1,
         "duration should be ~1s, got {}",
         result.duration_s
     );
-    assert_eq!(result.samples.len(), 88200);
+    assert_eq!(result.samples_i32.len(), 88200);
 }
 
 #[test]
@@ -324,12 +327,15 @@ fn decode_aiff_sample_values() {
             .unwrap();
 
     // First frame: i=0, val = (0 % 100) * 100 = 0
-    assert_eq!(result.samples[0], 0, "first L sample should be 0");
-    assert_eq!(result.samples[1], 0, "first R sample should be 0");
+    assert_eq!(result.samples_i32[0], 0, "first L sample should be 0");
+    assert_eq!(result.samples_i32[1], 0, "first R sample should be 0");
 
     // Second frame: i=1, val = (1 % 100) * 100 = 100
-    assert_eq!(result.samples[2], 100, "second L sample should be 100");
-    assert_eq!(result.samples[3], -100, "second R sample should be -100");
+    assert_eq!(result.samples_i32[2], 100, "second L sample should be 100");
+    assert_eq!(
+        result.samples_i32[3], -100,
+        "second R sample should be -100"
+    );
 }
 
 #[test]
@@ -346,7 +352,7 @@ fn decode_dsf_integration() {
     assert_eq!(result.sample_rate, 176400);
     assert_eq!(result.channels, 2);
     assert!(
-        !result.samples.is_empty(),
+        !result.samples_i32.is_empty(),
         "DSF decode should produce PCM samples"
     );
     assert!(
@@ -370,7 +376,7 @@ fn decode_dff_integration() {
     assert_eq!(result.sample_rate, 176400);
     assert_eq!(result.channels, 2);
     assert!(
-        !result.samples.is_empty(),
+        !result.samples_i32.is_empty(),
         "DFF decode should produce PCM samples"
     );
     assert!(
@@ -395,13 +401,13 @@ fn decode_wav_with_seek() {
             .unwrap();
 
     assert!(
-        seeked.samples.len() < full.samples.len(),
+        seeked.samples_i32.len() < full.samples_i32.len(),
         "seeked decode should have fewer samples ({} vs {})",
-        seeked.samples.len(),
-        full.samples.len()
+        seeked.samples_i32.len(),
+        full.samples_i32.len()
     );
     assert!(
-        !seeked.samples.is_empty(),
+        !seeked.samples_i32.is_empty(),
         "seeked decode should still have samples"
     );
 }
@@ -421,20 +427,20 @@ fn decode_wav_with_duration_limit() {
             .unwrap();
 
     assert!(
-        half.samples.len() < full.samples.len(),
+        half.samples_i32.len() < full.samples_i32.len(),
         "limited decode should have fewer samples ({} vs {})",
-        half.samples.len(),
-        full.samples.len()
+        half.samples_i32.len(),
+        full.samples_i32.len()
     );
     assert!(
-        !half.samples.is_empty(),
+        !half.samples_i32.is_empty(),
         "limited decode should still have samples"
     );
     // Half-second at 44100 Hz stereo = ~44100 samples
     assert!(
-        half.samples.len() <= 44200,
+        half.samples_i32.len() <= 44200,
         "0.5s limit should produce ~44100 samples, got {}",
-        half.samples.len()
+        half.samples_i32.len()
     );
 }
 
@@ -453,7 +459,7 @@ fn decode_aiff_with_seek() {
             .unwrap();
 
     assert!(
-        seeked.samples.len() < full.samples.len(),
+        seeked.samples_i32.len() < full.samples_i32.len(),
         "seeked AIFF should have fewer samples"
     );
 }
@@ -473,7 +479,7 @@ fn decode_aiff_with_duration_limit() {
             .unwrap();
 
     assert!(
-        half.samples.len() < full.samples.len(),
+        half.samples_i32.len() < full.samples_i32.len(),
         "limited AIFF decode should have fewer samples"
     );
 }
@@ -489,7 +495,7 @@ fn decode_aiff_seek_past_end() {
             .unwrap();
 
     assert!(
-        result.samples.is_empty(),
+        result.samples_i32.is_empty(),
         "seeking past end should produce empty samples"
     );
 }
@@ -750,5 +756,5 @@ fn decode_dsf_with_target_sample_rate() {
 
     assert_eq!(result.sample_rate, 88200);
     assert_eq!(result.channels, 2);
-    assert!(!result.samples.is_empty());
+    assert!(!result.samples_i32.is_empty());
 }

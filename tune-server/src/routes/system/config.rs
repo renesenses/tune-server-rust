@@ -125,6 +125,12 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     config
         .entry("onboarding_completed".to_string())
         .or_insert(json!(onboarding_complete));
+    // Derived boolean: web client checks discogs_token_set to display badge
+    let discogs_token_set = config
+        .get("discogs_token")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
     Json(Value::Object(config))
 }
 
