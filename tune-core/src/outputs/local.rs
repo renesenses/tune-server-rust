@@ -141,7 +141,12 @@ pub struct LocalOutput {
     /// Set by stop() to immediately silence the cpal callback, even if
     /// the playback thread hasn't exited yet.  Prevents overlapping audio
     /// when switching tracks and the old thread is still draining.
-    force_silent: Arc<AtomicBool>,
+    ///
+    /// IMPORTANT: This is replaced with a fresh Arc on each new play_url()
+    /// call, so that resetting it to `false` for the new stream does NOT
+    /// accidentally un-silence the old stream's callback (which keeps its
+    /// own clone of the previous Arc).
+    force_silent: std::sync::Mutex<Arc<AtomicBool>>,
 }
 
 impl LocalOutput {
@@ -172,7 +177,7 @@ impl LocalOutput {
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
             exclusive_mode,
-            force_silent: Arc::new(AtomicBool::new(false)),
+            force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
 
@@ -446,8 +451,14 @@ impl OutputTarget for LocalOutput {
     ) -> Result<(), String> {
         self.stop().await.ok();
 
-        // Reset force_silent for the new track
-        self.force_silent.store(false, Ordering::SeqCst);
+        // Create a FRESH force_silent flag for the new stream.
+        // The old stream's callback keeps its clone of the previous Arc
+        // (which was set to true by stop()), so it stays silent.
+        // This prevents the race where resetting force_silent would
+        // accidentally un-silence the old cpal callback.
+        let new_force_silent = Arc::new(AtomicBool::new(false));
+        *self.force_silent.lock().unwrap() = new_force_silent.clone();
+        let force_silent = new_force_silent;
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
@@ -458,7 +469,6 @@ impl OutputTarget for LocalOutput {
         let position_ms = self.position_ms.clone();
         let duration_ms_shared = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
-        let force_silent = self.force_silent.clone();
 
         // Store metadata
         *self.current_uri.lock().unwrap() = Some(url.clone());
@@ -473,9 +483,11 @@ impl OutputTarget for LocalOutput {
         let handle = std::thread::spawn(move || {
             // ------- HTTP fetch the audio stream -------
             // No total timeout — long tracks can stream for 30+ minutes.
-            // The stop signal + force_silent flag handle cancellation.
+            // The force_silent flag is checked at every loop iteration and
+            // in feed_ring to abort promptly on stop().
             let response = match reqwest::blocking::Client::builder()
                 .timeout(None)
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .and_then(|client| client.get(&url).send())
             {
@@ -498,12 +510,26 @@ impl OutputTarget for LocalOutput {
             let mut reader = response;
             let mut header_buf = vec![0u8; 4096];
             let read_start = std::time::Instant::now();
-            let header_read = match reader.read(&mut header_buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(error = %e, "local_audio_header_read_failed");
+            let header_read = loop {
+                if force_silent.load(Ordering::Relaxed) {
+                    debug!("local_audio_header_read_aborted");
                     playing.store(false, Ordering::SeqCst);
                     return;
+                }
+                match reader.read(&mut header_buf) {
+                    Ok(n) => break n,
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        // Retry header read (stream not ready yet)
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "local_audio_header_read_failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
                 }
             };
             let read_elapsed = read_start.elapsed();
@@ -538,9 +564,21 @@ impl OutputTarget for LocalOutput {
                         playing.store(false, Ordering::SeqCst);
                         return;
                     }
+                    if force_silent.load(Ordering::Relaxed) {
+                        debug!("local_audio_compressed_read_aborted_by_stop");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            // Read timeout — check abort flag and retry
+                            continue;
+                        }
                         Err(e) => {
                             warn!(error = %e, "local_audio_compressed_read_error");
                             break;
@@ -656,7 +694,7 @@ impl OutputTarget for LocalOutput {
                 }
 
                 // Feed all samples to ring buffer
-                feed_ring(&ring, &samples, &stop_rx, &paused);
+                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
                 // Update position
                 let total_frames = decoded_len as u64 / dec_ch as u64;
@@ -666,6 +704,9 @@ impl OutputTarget for LocalOutput {
                 // Wait for ring buffer to drain
                 loop {
                     if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if force_silent.load(Ordering::Relaxed) {
                         break;
                     }
                     if ring.available() == 0 {
@@ -737,7 +778,13 @@ impl OutputTarget for LocalOutput {
                     let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
                     if aligned_len > 0 {
                         let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
-                        feed_ring(&ring, &samples, &stop_rx, &paused);
+                        feed_ring_abortable(
+                            &ring,
+                            &samples,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
                         total_frames_fed += (aligned_len / frame_bytes) as u64;
                     }
                 }
@@ -750,10 +797,21 @@ impl OutputTarget for LocalOutput {
                     if stop_rx.try_recv().is_ok() {
                         break;
                     }
+                    if force_silent.load(Ordering::Relaxed) {
+                        debug!("local_audio_exclusive_aborted_by_stop");
+                        break;
+                    }
 
                     let n = match reader.read(&mut read_buf) {
                         Ok(0) => break,
                         Ok(n) => n,
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            // Read timeout — check abort flag and retry
+                            continue;
+                        }
                         Err(e) => {
                             warn!(error = %e, "local_audio_exclusive_read_error");
                             break;
@@ -771,7 +829,7 @@ impl OutputTarget for LocalOutput {
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
 
-                    feed_ring(&ring, &samples, &stop_rx, &paused);
+                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
 
@@ -782,6 +840,9 @@ impl OutputTarget for LocalOutput {
                 // Wait for ring buffer to drain
                 loop {
                     if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if force_silent.load(Ordering::Relaxed) {
                         break;
                     }
                     if ring.available() == 0 {
@@ -1041,7 +1102,7 @@ impl OutputTarget for LocalOutput {
                     if needs_resample {
                         samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
                     }
-                    feed_ring(&ring, &samples, &stop_rx, &paused);
+                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
                 }
             }
@@ -1062,6 +1123,14 @@ impl OutputTarget for LocalOutput {
                     );
                     break;
                 }
+                // Check abort flag (set by stop() to force immediate exit)
+                if force_silent.load(Ordering::Relaxed) {
+                    debug!(
+                        total_bytes_read,
+                        total_frames_fed, "local_audio_stopped_by_abort_flag"
+                    );
+                    break;
+                }
 
                 let read_start = std::time::Instant::now();
                 let n = match reader.read(&mut read_buf) {
@@ -1075,6 +1144,13 @@ impl OutputTarget for LocalOutput {
                         break; // EOF
                     }
                     Ok(n) => n,
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        // Read timeout — loop back to check abort flag
+                        continue;
+                    }
                     Err(e) => {
                         warn!(error = %e, total_bytes_read, "local_audio_read_error");
                         break;
@@ -1129,7 +1205,7 @@ impl OutputTarget for LocalOutput {
                     samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
                 }
 
-                feed_ring(&ring, &samples, &stop_rx, &paused);
+                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
                 total_frames_fed += (aligned_len / frame_bytes) as u64;
 
@@ -1142,7 +1218,7 @@ impl OutputTarget for LocalOutput {
             if needs_resample {
                 let flushed = rubato_resample_chunk(&mut resampler, &[], output_ch, true);
                 if !flushed.is_empty() {
-                    feed_ring(&ring, &flushed, &stop_rx, &paused);
+                    feed_ring_abortable(&ring, &flushed, &stop_rx, &paused, Some(&force_silent));
                 }
             }
 
@@ -1152,6 +1228,9 @@ impl OutputTarget for LocalOutput {
             // Wait for ring buffer to drain or stop signal
             loop {
                 if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                if force_silent.load(Ordering::Relaxed) {
                     break;
                 }
                 if ring.available() == 0 {
@@ -1188,38 +1267,43 @@ impl OutputTarget for LocalOutput {
 
     async fn stop(&self) -> Result<(), String> {
         // Immediately silence the cpal callback so no audio leaks while
-        // we wait for the playback thread to exit.  This prevents
-        // overlapping audio when the old thread is slow to terminate.
-        self.force_silent.store(true, Ordering::SeqCst);
-        // Send the stop signal first
+        // we wait for the playback thread to exit.  This flag is also
+        // checked by the I/O read loop and feed_ring, causing the thread
+        // to exit promptly.
+        self.force_silent
+            .lock()
+            .unwrap()
+            .store(true, Ordering::SeqCst);
+        // Send the stop signal via channel (belt-and-suspenders with force_silent)
         if let Some(tx) = self.stop_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
         // Unpause so the thread unblocks from pause-wait loops
         self.paused.store(false, Ordering::SeqCst);
-        // Wait for the playback thread to actually exit so the audio
-        // device is fully released before a new track starts.
-        // Use a bounded wait (5 seconds) which is long enough for the
-        // read_timeout (30s) to fire and the loop to check stop_rx,
-        // but short enough to not block the UI. With the read_timeout
-        // on the HTTP client, the thread should exit within ~30s even
-        // in the worst case.
+        // Wait for the playback thread to exit so the cpal stream is
+        // dropped (releasing the audio device) before a new track starts.
+        // Even if the thread is slow to exit (blocked on HTTP I/O), the
+        // force_silent flag ensures silence, and play_url() creates a
+        // FRESH force_silent Arc so the old callback stays permanently muted.
         let old_handle = self.play_thread.lock().unwrap().take();
         if let Some(handle) = old_handle {
             let _ = tokio::task::spawn_blocking(move || {
-                // Park in a loop checking if the thread has finished
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
                 loop {
                     if handle.is_finished() {
                         let _ = handle.join();
-                        break;
+                        return;
                     }
                     if std::time::Instant::now() >= deadline {
-                        warn!("local_audio_stop_thread_join_timeout");
-                        // Thread is still running; it will clean up eventually
-                        break;
+                        warn!(
+                            "local_audio_stop_thread_join_timeout — old stream may overlap briefly"
+                        );
+                        // Thread is still running but force_silent ensures
+                        // the cpal callback outputs silence, so no audible
+                        // overlap. The thread will clean up on its own.
+                        return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(25));
                 }
             })
             .await;
@@ -1319,21 +1403,29 @@ impl OutputTarget for LocalOutput {
 // ---------------------------------------------------------------------------
 
 /// Feed samples into the ring buffer, blocking (with sleep) when full.
-/// Checks the stop signal periodically.
-fn feed_ring(
+/// Checks the stop signal, abort flag, and pause state periodically.
+/// Returns immediately when abort is signaled or stop is received.
+fn feed_ring_abortable(
     ring: &RingBuf,
     samples: &[f32],
     stop_rx: &std::sync::mpsc::Receiver<()>,
     paused: &AtomicBool,
+    abort: Option<&AtomicBool>,
 ) {
     let mut offset = 0;
     while offset < samples.len() {
         if stop_rx.try_recv().is_ok() {
             return;
         }
+        if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
+            return;
+        }
         // If paused, wait without feeding
         while paused.load(Ordering::Relaxed) {
             if stop_rx.try_recv().is_ok() {
+                return;
+            }
+            if abort.map_or(false, |a| a.load(Ordering::Relaxed)) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
