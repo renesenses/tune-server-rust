@@ -157,6 +157,98 @@ pub async fn fetch_approved_covers(
     Ok(wrapper.covers)
 }
 
+/// A community-approved artist image returned by mozaiklabs.fr.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommunityArtistImage {
+    pub mbid: String,
+    pub artist_name: String,
+    pub image_url: String,
+    pub approved_at: String,
+}
+
+/// Submit a community artist image to mozaiklabs.fr for approval.
+pub async fn submit_artist_image(
+    base_url: &str,
+    mbid: &str,
+    artist_name: &str,
+    instance_id: &str,
+    image_data: &[u8],
+) -> Result<(), String> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/api/v1/community/artist-images");
+    let client = crate::http::client::shared();
+
+    let image_part = reqwest::multipart::Part::bytes(image_data.to_vec())
+        .file_name(format!("{mbid}.jpg"))
+        .mime_str("image/jpeg")
+        .map_err(|e| format!("mime error: {e}"))?;
+
+    let form = reqwest::multipart::Form::new()
+        .text("mbid", mbid.to_string())
+        .text("artist_name", artist_name.to_string())
+        .text("instance_id", instance_id.to_string())
+        .part("image", image_part);
+
+    let resp = client
+        .post(&url)
+        .multipart(form)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("submit artist image failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        debug!(mbid, status = %status, "artist_image_submit_rejected");
+        return Err(format!("artist image submit failed: {status}"));
+    }
+
+    info!(mbid, artist_name, "community_artist_image_submitted");
+    Ok(())
+}
+
+/// Fetch approved community artist images from mozaiklabs.fr.
+pub async fn fetch_approved_artist_images(
+    base_url: &str,
+    since: Option<&str>,
+) -> Result<Vec<CommunityArtistImage>, String> {
+    let base = base_url.trim_end_matches('/');
+    let mut url = format!("{base}/api/v1/community/artist-images/approved");
+    if let Some(s) = since {
+        url.push_str(&format!("?since={}", urlencoding::encode(s)));
+    }
+    let client = crate::http::client::shared();
+
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("fetch approved artist images failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        debug!(status = %status, "fetch_approved_artist_images_failed");
+        return Err(format!("fetch approved artist images failed: {status}"));
+    }
+
+    #[derive(Deserialize)]
+    struct Wrapper {
+        images: Vec<CommunityArtistImage>,
+    }
+
+    let wrapper: Wrapper = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse approved artist images: {e}"))?;
+
+    info!(
+        count = wrapper.images.len(),
+        "community_artist_images_fetched"
+    );
+    Ok(wrapper.images)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
