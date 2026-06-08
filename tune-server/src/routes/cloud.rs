@@ -27,6 +27,8 @@ pub fn router() -> Router<AppState> {
         .route("/plugins/{name}/vote", post(marketplace_vote))
         .route("/community/artist-image", post(report_artist_image))
         .route("/community/genre-correction", post(submit_genre_correction))
+        .route("/community/covers", post(submit_community_cover))
+        .route("/community/covers/sync", post(sync_community_covers))
 }
 
 // ---------------------------------------------------------------------------
@@ -396,4 +398,186 @@ async fn submit_genre_correction(
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Community covers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CoverSubmitRequest {
+    mbid_release: String,
+    album_title: String,
+    artist_name: Option<String>,
+    image_base64: String,
+}
+
+async fn submit_community_cover(
+    State(state): State<AppState>,
+    Json(body): Json<CoverSubmitRequest>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db);
+    let base_url = settings
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
+    let instance_id = settings
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Decode base64 image data
+    let image_data = match base64_decode(&body.image_base64) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid base64: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match tune_core::cloud::community::submit_cover(
+        &base_url,
+        &body.mbid_release,
+        &body.album_title,
+        body.artist_name.as_deref(),
+        &instance_id,
+        &image_data,
+    )
+    .await
+    {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => {
+            warn!(error = %e, "community_cover_submit_failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CoverSyncRequest {
+    since: Option<String>,
+}
+
+async fn sync_community_covers(
+    State(state): State<AppState>,
+    Json(body): Json<CoverSyncRequest>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::new(state.db.clone());
+    let base_url = settings
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "https://mozaiklabs.fr".to_string());
+
+    let covers =
+        match tune_core::cloud::community::fetch_approved_covers(&base_url, body.since.as_deref())
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "community_covers_sync_failed");
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
+            }
+        };
+
+    let client = tune_core::http::client::shared();
+    let artwork_dir = &state.config.artwork_dir;
+    if let Err(e) = std::fs::create_dir_all(artwork_dir) {
+        warn!(error = %e, "artwork_cache_dir_create_failed");
+    }
+
+    let mut synced = 0u32;
+    for cover in &covers {
+        // Build the full image URL (relative paths need the base)
+        let image_url = if cover.image_url.starts_with("http") {
+            cover.image_url.clone()
+        } else {
+            format!("{}{}", base_url.trim_end_matches('/'), cover.image_url)
+        };
+
+        // Download the image
+        let image_data = match client
+            .get(&image_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(b) => b,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+
+        // Save to artwork_cache/{mbid}.jpg
+        let dest = std::path::Path::new(artwork_dir).join(format!("{}.jpg", cover.mbid_release));
+        if std::fs::write(&dest, &image_data).is_err() {
+            continue;
+        }
+
+        // Update album cover_path in DB for matching mbid
+        let dest_str = dest.to_string_lossy().to_string();
+        let db = state.db.clone();
+        let mbid = cover.mbid_release.clone();
+        let conn = db.connection();
+        if let Ok(lock) = conn.lock() {
+            lock.execute(
+                "UPDATE albums SET cover_path = ? WHERE mbid = ? AND (cover_path IS NULL OR cover_path = '')",
+                rusqlite::params![dest_str, mbid],
+            )
+            .ok();
+        }
+        synced += 1;
+    }
+
+    info!(total = covers.len(), synced, "community_covers_synced");
+    Json(json!({
+        "total": covers.len(),
+        "synced": synced,
+    }))
+    .into_response()
+}
+
+/// Minimal base64 decoder (standard alphabet, with padding).
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut lookup = [255u8; 256];
+    for (i, &c) in TABLE.iter().enumerate() {
+        lookup[c as usize] = i as u8;
+    }
+
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| *b != b'\n' && *b != b'\r' && *b != b' ')
+        .collect();
+    let stripped: &[u8] = if cleaned.ends_with(b"==") {
+        &cleaned[..cleaned.len() - 2]
+    } else if cleaned.ends_with(b"=") {
+        &cleaned[..cleaned.len() - 1]
+    } else {
+        &cleaned
+    };
+
+    let mut out = Vec::with_capacity(stripped.len() * 3 / 4);
+    let chunks = stripped.chunks(4);
+    for chunk in chunks {
+        let mut buf = 0u32;
+        for (i, &byte) in chunk.iter().enumerate() {
+            let val = lookup[byte as usize];
+            if val == 255 {
+                return Err(format!("invalid base64 character: {}", byte as char));
+            }
+            buf |= (val as u32) << (18 - 6 * i);
+        }
+        let bytes_to_write = chunk.len() - 1;
+        for i in 0..bytes_to_write {
+            out.push((buf >> (16 - 8 * i)) as u8);
+        }
+    }
+    Ok(out)
 }
