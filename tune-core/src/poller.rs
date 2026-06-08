@@ -26,7 +26,7 @@ pub struct ZonePollerMetrics {
 
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
-const STOPPED_TICKS_THRESHOLD: u8 = 2;
+const STOPPED_TICKS_THRESHOLD: u8 = 3;
 /// After this many consecutive Stopped ticks without enough playback,
 /// treat as playback failure and stop the zone (don't advance).
 const STOPPED_FAILURE_THRESHOLD: u8 = 6;
@@ -43,6 +43,12 @@ const MIN_PLAYED_FRACTION: f64 = 0.80;
 /// a gapless transition. Prevents false skips when a renderer fails to decode
 /// and reports STOPPED after only a few seconds.
 const MIN_TRACK_WALL_SECS: u64 = 15;
+/// Minimum peak position (ms) required before accepting track-end when the
+/// track duration is unknown (0).  Prevents false skips on slow renderers
+/// (e.g. Shanling SCD1.3) that report duration=0 and briefly show Stopped
+/// state while buffering.  60 seconds is long enough to avoid false positives
+/// while still handling actual short tracks via the `is_short_track` path.
+const MIN_PEAK_UNKNOWN_DURATION_MS: u64 = 60_000;
 /// How often (in ticks) to persist the playback position to the database.
 const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 
@@ -408,15 +414,22 @@ impl PositionPoller {
                 .unwrap_or(0);
 
             // Helper: has enough of the track been played?
-            // True when peak_position_ms >= 80% of track_duration, or
-            // when track_duration is unknown/zero (no guard possible).
+            // When track_duration is known: peak_position_ms >= 80% of duration.
+            // When track_duration is unknown (0): require peak_position_ms >= 60s
+            // to avoid false skips on slow renderers (Shanling SCD1.3 etc.)
+            // that report duration=0 and briefly show Stopped while buffering.
             let wall_elapsed = ps
                 .track_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            let played_enough = (track_duration_ms == 0
-                || ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION)
-                && wall_elapsed >= MIN_TRACK_WALL_SECS;
+            let played_enough = if track_duration_ms == 0 {
+                // Unknown duration: rely on peak position as the only guard.
+                ps.peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
+                    && wall_elapsed >= MIN_TRACK_WALL_SECS
+            } else {
+                ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
+                    && wall_elapsed >= MIN_TRACK_WALL_SECS
+            };
 
             // Detect position reset: position drops from >30s to <5s.
             // This is a strong signal that the renderer performed a gapless
@@ -537,6 +550,11 @@ impl PositionPoller {
                                     track_dur = track_duration_ms,
                                     wall_secs = wall_elapsed,
                                     stopped_ticks = ps.stopped_ticks,
+                                    unknown_dur_min_peak = if track_duration_ms == 0 {
+                                        MIN_PEAK_UNKNOWN_DURATION_MS
+                                    } else {
+                                        0
+                                    },
                                     "stopped_early_waiting"
                                 );
                             }
@@ -784,6 +802,8 @@ mod tests {
         ps.stopped_ticks = 1;
         assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
         ps.stopped_ticks = 2;
+        assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
+        ps.stopped_ticks = 3;
         assert!(ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD);
     }
 
@@ -943,12 +963,34 @@ mod tests {
     }
 
     #[test]
-    fn played_enough_unknown_duration() {
-        // When duration is unknown (0), we cannot guard — allow transition.
+    fn played_enough_unknown_duration_low_peak() {
+        // When duration is unknown (0) and peak position is below the
+        // threshold, played_enough should be false to prevent false skips
+        // on slow renderers like Shanling SCD1.3.
         let peak_ms: u64 = 5_000;
         let duration_ms: u64 = 0;
-        let played_enough =
-            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
-        assert!(played_enough, "unknown duration should always pass");
+        let played_enough = if duration_ms == 0 {
+            peak_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
+        } else {
+            peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION
+        };
+        assert!(
+            !played_enough,
+            "5s peak with unknown duration should NOT pass"
+        );
+    }
+
+    #[test]
+    fn played_enough_unknown_duration_high_peak() {
+        // When duration is unknown (0) but enough position has been reported,
+        // allow the transition.
+        let peak_ms: u64 = 120_000;
+        let duration_ms: u64 = 0;
+        let played_enough = if duration_ms == 0 {
+            peak_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
+        } else {
+            peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION
+        };
+        assert!(played_enough, "120s peak with unknown duration should pass");
     }
 }
