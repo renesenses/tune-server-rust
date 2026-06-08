@@ -1155,6 +1155,8 @@ impl OutputTarget for LocalOutput {
             info!(
                 device = %device_name,
                 frames = total_frames_fed,
+                total_bytes_read,
+                elapsed_ms = stream_start.elapsed().as_millis() as u64,
                 "local_audio_stopped"
             );
         });
