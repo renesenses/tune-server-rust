@@ -7,7 +7,7 @@ use rubato::{
     WindowFunction, calculate_cutoff,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 
@@ -31,17 +31,25 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
         .map(|desc| desc.name().to_string())
         .unwrap_or_default();
 
-    let mut devices = Vec::new();
-    if let Ok(output_devices) = host.output_devices() {
-        for device in output_devices {
-            let name = device
-                .description()
-                .map(|desc| desc.name().to_string())
-                .unwrap_or_else(|_| "Unknown".into());
-            let is_default = name == default_name;
+    info!(
+        host = %host.id().name(),
+        default_device = %default_name,
+        "local_audio_enumerating_devices"
+    );
 
-            let (max_channels, sample_rates) =
-                if let Ok(configs) = device.supported_output_configs() {
+    let mut devices = Vec::new();
+    match host.output_devices() {
+        Ok(output_devices) => {
+            for device in output_devices {
+                let name = device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".into());
+                let is_default = name == default_name;
+
+                let (max_channels, sample_rates) = if let Ok(configs) =
+                    device.supported_output_configs()
+                {
                     let mut max_ch = 0u16;
                     let mut rates = Vec::new();
                     for config in configs {
@@ -57,17 +65,40 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
                     rates.sort();
                     (max_ch, rates)
                 } else {
+                    warn!(
+                        device = %name,
+                        "local_audio_device_no_supported_configs"
+                    );
                     (2, vec![44100, 48000])
                 };
 
-            devices.push(AudioDevice {
-                name,
-                is_default,
-                max_channels,
-                sample_rates,
-            });
+                info!(
+                    device = %name,
+                    is_default,
+                    max_channels,
+                    sample_rates = ?sample_rates,
+                    "local_audio_device_found"
+                );
+
+                devices.push(AudioDevice {
+                    name,
+                    is_default,
+                    max_channels,
+                    sample_rates,
+                });
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "local_audio_output_devices_enumeration_failed");
         }
     }
+
+    if devices.is_empty() {
+        warn!("local_audio_no_output_devices_found");
+    } else {
+        info!(count = devices.len(), "local_audio_devices_enumerated");
+    }
+
     devices
 }
 
@@ -431,8 +462,10 @@ impl OutputTarget for LocalOutput {
 
         let handle = std::thread::spawn(move || {
             // ------- HTTP fetch the audio stream -------
+            // No total timeout — long tracks can stream for 30+ minutes.
+            // The stop signal + force_silent flag handle cancellation.
             let response = match reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(None)
                 .build()
                 .and_then(|client| client.get(&url).send())
             {
@@ -454,6 +487,7 @@ impl OutputTarget for LocalOutput {
             use std::io::Read;
             let mut reader = response;
             let mut header_buf = vec![0u8; 4096];
+            let read_start = std::time::Instant::now();
             let header_read = match reader.read(&mut header_buf) {
                 Ok(n) => n,
                 Err(e) => {
@@ -462,6 +496,12 @@ impl OutputTarget for LocalOutput {
                     return;
                 }
             };
+            let read_elapsed = read_start.elapsed();
+            debug!(
+                header_bytes = header_read,
+                elapsed_ms = read_elapsed.as_millis() as u64,
+                "local_audio_first_read"
+            );
             header_buf.truncate(header_read);
 
             let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
@@ -773,7 +813,21 @@ impl OutputTarget for LocalOutput {
             };
 
             let Some(device) = device else {
-                warn!(name = %device_name, "audio_device_not_found");
+                // Log all available devices for diagnosis (e.g. USB DAC not found)
+                let available: Vec<String> = host
+                    .output_devices()
+                    .map(|devs| {
+                        devs.filter_map(|d| {
+                            d.description().ok().map(|desc| desc.name().to_string())
+                        })
+                        .collect()
+                    })
+                    .unwrap_or_default();
+                warn!(
+                    requested = %device_name,
+                    available = ?available,
+                    "audio_device_not_found"
+                );
                 playing.store(false, Ordering::SeqCst);
                 return;
             };
@@ -916,6 +970,13 @@ impl OutputTarget for LocalOutput {
                 Vec::new()
             };
 
+            debug!(
+                pcm_data_from_header = pcm_data.len(),
+                header_buf_len = header_buf.len(),
+                data_offset,
+                "local_audio_initial_pcm_data"
+            );
+
             let mut total_frames_fed: u64 = 0;
             let needs_resample = output_sr != sample_rate;
             let needs_channel_adapt = output_ch != channels;
@@ -978,22 +1039,57 @@ impl OutputTarget for LocalOutput {
             // Read and feed the rest of the stream
             let mut read_buf = vec![0u8; 65536];
             let mut leftover = Vec::new();
+            let mut total_bytes_read: u64 = 0;
+            let mut first_data_logged = false;
+            let stream_start = std::time::Instant::now();
 
             loop {
                 // Check for stop signal (non-blocking)
                 if stop_rx.try_recv().is_ok() {
+                    debug!(
+                        total_bytes_read,
+                        total_frames_fed, "local_audio_stopped_by_signal"
+                    );
                     break;
                 }
 
+                let read_start = std::time::Instant::now();
                 let n = match reader.read(&mut read_buf) {
-                    Ok(0) => break, // EOF
+                    Ok(0) => {
+                        debug!(
+                            total_bytes_read,
+                            total_frames_fed,
+                            elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                            "local_audio_stream_eof"
+                        );
+                        break; // EOF
+                    }
                     Ok(n) => n,
                     Err(e) => {
-                        warn!(error = %e, "local_audio_read_error");
+                        warn!(error = %e, total_bytes_read, "local_audio_read_error");
                         break;
                     }
                 };
+                let read_elapsed = read_start.elapsed();
 
+                // Log first data arrival and any suspiciously slow reads
+                if !first_data_logged {
+                    info!(
+                        bytes = n,
+                        wait_ms = stream_start.elapsed().as_millis() as u64,
+                        "local_audio_first_pcm_data_received"
+                    );
+                    first_data_logged = true;
+                } else if read_elapsed.as_millis() > 5000 {
+                    warn!(
+                        bytes = n,
+                        wait_ms = read_elapsed.as_millis() as u64,
+                        total_bytes_read,
+                        "local_audio_slow_read"
+                    );
+                }
+
+                total_bytes_read += n as u64;
                 leftover.extend_from_slice(&read_buf[..n]);
 
                 let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
@@ -1004,6 +1100,17 @@ impl OutputTarget for LocalOutput {
                 let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                 let remainder = leftover[aligned_len..].to_vec();
                 leftover = remainder;
+
+                // Detect all-zero samples (silence from decode failure)
+                if !first_data_logged || total_frames_fed == 0 {
+                    let non_zero = samples.iter().any(|&s| s != 0.0);
+                    if !non_zero && !samples.is_empty() {
+                        warn!(
+                            sample_count = samples.len(),
+                            "local_audio_first_samples_all_zero"
+                        );
+                    }
+                }
 
                 if needs_channel_adapt {
                     samples = adapt_channels(&samples, channels, output_ch);
@@ -1080,13 +1187,16 @@ impl OutputTarget for LocalOutput {
         self.paused.store(false, Ordering::SeqCst);
         // Wait for the playback thread to actually exit so the audio
         // device is fully released before a new track starts.
-        // Use a bounded wait (2 seconds) to avoid blocking indefinitely
-        // if the thread is stuck in a long HTTP read.
+        // Use a bounded wait (5 seconds) which is long enough for the
+        // read_timeout (30s) to fire and the loop to check stop_rx,
+        // but short enough to not block the UI. With the read_timeout
+        // on the HTTP client, the thread should exit within ~30s even
+        // in the worst case.
         let old_handle = self.play_thread.lock().unwrap().take();
         if let Some(handle) = old_handle {
             let _ = tokio::task::spawn_blocking(move || {
                 // Park in a loop checking if the thread has finished
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 loop {
                     if handle.is_finished() {
                         let _ = handle.join();

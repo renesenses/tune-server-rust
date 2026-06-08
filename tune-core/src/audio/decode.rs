@@ -276,6 +276,17 @@ fn decode_symphonia(
         all_samples.truncate(max_samples);
     }
 
+    // Symphonia's copy_to_vec_interleaved::<i32>() returns samples
+    // left-justified in the 32-bit range (e.g. a 16-bit sample is shifted
+    // left by 16). Normalize to right-justified so that pcm_bytes() can
+    // directly extract the correct byte width without further shifting.
+    let shift = 32u16.saturating_sub(source_bd);
+    if shift > 0 && shift < 32 {
+        for s in all_samples.iter_mut() {
+            *s >>= shift;
+        }
+    }
+
     let out_rate = target_sample_rate.unwrap_or(source_rate);
     let out_channels = target_channels.unwrap_or(source_channels);
     let total_frames = all_samples.len() as f64 / source_channels as f64;

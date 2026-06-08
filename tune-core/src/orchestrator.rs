@@ -366,13 +366,28 @@ impl PlaybackOrchestrator {
             };
             tokio::spawn(async move {
                 debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
-                let decode_result = crate::audio::decode::decode_to_pcm(
-                    &fp,
-                    Some(out_sr),
-                    Some(channels as u32),
-                    0.0,
-                    0.0,
-                );
+                // Use spawn_blocking for the synchronous decode — reading from
+                // NAS/SMB paths can block for seconds and must not starve the
+                // tokio runtime (which also serves the HTTP stream to LocalOutput).
+                let fp_clone = fp.clone();
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm(
+                        &fp_clone,
+                        Some(out_sr),
+                        Some(channels as u32),
+                        0.0,
+                        0.0,
+                    )
+                })
+                .await;
+
+                let decode_result = match decode_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, file = %fp, "transcode_decode_task_panic");
+                        return;
+                    }
+                };
 
                 match decode_result {
                     Ok(decoded) => {
@@ -616,12 +631,29 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // Decode to PCM
-                let decode_result =
-                    crate::audio::decode::decode_to_pcm(&tmp_file, Some(sr), Some(2), 0.0, 0.0);
+                // Decode to PCM — use spawn_blocking since decode does sync I/O
+                let tmp_file_clone = tmp_file.clone();
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm(
+                        &tmp_file_clone,
+                        Some(sr),
+                        Some(2),
+                        0.0,
+                        0.0,
+                    )
+                })
+                .await;
 
                 // Clean up temp file
                 let _ = std::fs::remove_file(&tmp_file);
+
+                let decode_result = match decode_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "streaming_transcode_decode_task_panic");
+                        return;
+                    }
+                };
 
                 match decode_result {
                     Ok(decoded) => {

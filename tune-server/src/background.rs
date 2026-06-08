@@ -12,6 +12,7 @@ use crate::state::AppState;
 /// and RSS memory diagnostics.
 pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_squeezebox_poller(state);
+    spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_position_poller(state);
     spawn_token_refresher(state);
@@ -51,6 +52,40 @@ fn spawn_squeezebox_poller(state: &AppState) {
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, lms = %host, "squeezebox_poll_failed");
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+fn spawn_hqplayer_poller(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        loop {
+            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+            let enabled = settings
+                .get("hqplayer_enabled")
+                .ok()
+                .flatten()
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false);
+            let host = settings
+                .get("hqplayer_host")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+
+            if enabled && !host.is_empty() {
+                match crate::routes::hqplayer::discover_and_register(&state).await {
+                    Ok(_) => {
+                        info!(host = %host, "hqplayer_poll_registered");
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, host = %host, "hqplayer_poll_failed");
                     }
                 }
             }
