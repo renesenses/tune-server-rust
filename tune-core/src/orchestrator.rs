@@ -589,7 +589,10 @@ impl PlaybackOrchestrator {
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
                 // Download to temp file on a blocking thread
-                let tmp_path = format!("/tmp/tune-stream-{}.{}", uuid::Uuid::new_v4(), codec);
+                let tmp_path = std::env::temp_dir()
+                    .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                    .to_string_lossy()
+                    .to_string();
                 let tmp_path_clone = tmp_path.clone();
                 let upstream = upstream_url.clone();
                 let download_result = tokio::task::spawn_blocking(move || {

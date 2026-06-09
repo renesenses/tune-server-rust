@@ -79,7 +79,12 @@ async fn start_sacd_rip(
     let output_dir = body
         .output_dir
         .or_else(|| settings.get("sacd_rip_output_dir").ok().flatten())
-        .unwrap_or_else(|| "/tmp/tune-sacd-rip".into());
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tune-sacd-rip")
+                .to_string_lossy()
+                .to_string()
+        });
     let format = body.format.unwrap_or_else(|| "dsf".into());
     let layer = body.layer.unwrap_or_else(|| "stereo".into());
 

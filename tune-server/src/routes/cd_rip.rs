@@ -176,7 +176,12 @@ async fn start_rip(
     let output_dir = body
         .output_dir
         .or_else(|| settings.get("cd_rip_output_dir").ok().flatten())
-        .unwrap_or_else(|| "/tmp/tune-rip".into());
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tune-rip")
+                .to_string_lossy()
+                .to_string()
+        });
     let format = body.format.unwrap_or_else(|| "wav".into());
 
     // Store rip state
