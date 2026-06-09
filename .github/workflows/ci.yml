@@ -78,8 +78,16 @@ jobs:
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
-      - name: Build (native, no local-audio on Linux/Windows)
-        if: "!matrix.cross && runner.os != 'macOS'"
+      - name: Install ALSA dev (Linux)
+        if: runner.os == 'Linux' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build (native, Linux with local-audio)
+        if: "!matrix.cross && runner.os == 'Linux'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
+
+      - name: Build (native, Windows)
+        if: "!matrix.cross && runner.os == 'Windows'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
       - name: Build (native, macOS with local-audio)

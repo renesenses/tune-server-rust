@@ -25,6 +25,7 @@ pub struct AudioDevice {
 
 pub fn list_audio_devices() -> Vec<AudioDevice> {
     let host = cpal::default_host();
+    let host_name = host.id().name();
     let default_name = host
         .default_output_device()
         .and_then(|d| d.description().ok())
@@ -32,7 +33,7 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
         .unwrap_or_default();
 
     info!(
-        host = %host.id().name(),
+        host = %host_name,
         default_device = %default_name,
         "local_audio_enumerating_devices"
     );
@@ -99,17 +100,103 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
             }
         }
         Err(e) => {
-            warn!(error = %e, "local_audio_output_devices_enumeration_failed");
+            warn!(error = %e, host = %host_name, "local_audio_output_devices_enumeration_failed");
         }
     }
 
     if devices.is_empty() {
-        warn!("local_audio_no_output_devices_found");
+        log_no_devices_diagnostics(&host_name);
     } else {
         info!(count = devices.len(), "local_audio_devices_enumerated");
     }
 
     devices
+}
+
+/// Log detailed diagnostics when zero audio devices are found.
+///
+/// On Linux, checks for PipeWire and provides actionable guidance.
+/// On other platforms, logs a simple warning.
+fn log_no_devices_diagnostics(host_name: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        // Check if PipeWire is running (it provides ALSA compat layer)
+        let pipewire_active = std::fs::read_to_string("/run/user/1000/pipewire-0").is_ok()
+            || std::process::Command::new("pgrep")
+                .args(["-x", "pipewire"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+        // Check if PulseAudio compat is running
+        let pulseaudio_active = std::process::Command::new("pgrep")
+            .args(["-x", "pipewire-pulse"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+            || std::process::Command::new("pgrep")
+                .args(["-x", "pulseaudio"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+        // Check if ALSA devices are visible at kernel level
+        let proc_asound_cards = std::fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+        let kernel_cards: Vec<&str> = proc_asound_cards
+            .lines()
+            .filter(|l| l.contains('['))
+            .collect();
+
+        // Check if libasound is available
+        let libasound_ok = std::path::Path::new("/usr/lib/x86_64-linux-gnu/libasound.so.2")
+            .exists()
+            || std::path::Path::new("/usr/lib/aarch64-linux-gnu/libasound.so.2").exists()
+            || std::path::Path::new("/usr/lib/libasound.so.2").exists();
+
+        // Check ALSA config for PipeWire PCM plugin
+        let alsa_conf_has_pipewire =
+            std::fs::read_to_string("/etc/alsa/conf.d/99-pipewire-default.conf")
+                .or_else(|_| {
+                    std::fs::read_to_string("/usr/share/alsa/alsa.conf.d/99-pipewire-default.conf")
+                })
+                .or_else(|_| {
+                    std::fs::read_to_string("/usr/share/alsa/alsa.conf.d/50-pipewire.conf")
+                })
+                .map(|c| c.contains("pipewire"))
+                .unwrap_or(false);
+
+        warn!(
+            host = %host_name,
+            pipewire_active,
+            pulseaudio_compat_active = pulseaudio_active,
+            kernel_sound_cards = kernel_cards.len(),
+            libasound_available = libasound_ok,
+            alsa_pipewire_plugin = alsa_conf_has_pipewire,
+            "local_audio_no_output_devices_found — \
+             if PipeWire is active, ensure pipewire-alsa is installed \
+             (provides the ALSA PCM plugin so cpal can see devices). \
+             Install: sudo apt install pipewire-alsa (Debian/Ubuntu) \
+             or pipewire-alsa (Fedora/Arch). \
+             Also verify: aplay -l shows devices, \
+             /proc/asound/cards lists sound cards."
+        );
+
+        if !kernel_cards.is_empty() {
+            info!(
+                cards = ?kernel_cards,
+                "local_audio_kernel_sound_cards_detected — \
+                 kernel sees sound hardware but cpal ({host_name}) returned zero devices"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!(
+            host = %host_name,
+            "local_audio_no_output_devices_found"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

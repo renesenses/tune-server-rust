@@ -90,9 +90,13 @@ jobs:
         if: matrix.cross
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
 
-      - name: Build (native, Linux headless - no local-audio)
+      - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build (native, Linux with local-audio)
+        if: "!matrix.cross && runner.os == 'Linux'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
 
       - name: Build (native, Windows with local-audio)
         if: "!matrix.cross && runner.os == 'Windows'"

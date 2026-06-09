@@ -57,8 +57,8 @@ jobs:
           shared-key: tune-core-postgres
 
       # `--no-default-features` drops `local-audio` (which pulls
-      # alsa-sys via cpal). The CI runner doesn't have libasound2-dev
-      # and we don't need it to exercise the engine + postgres modules.
+      # alsa-sys via cpal). We don't need it to exercise the engine +
+      # postgres modules, so skip it here to keep this job fast.
       - name: Engine module tests (no DB needed)
         run: cargo test -p tune-core --no-default-features --features postgres db::engine
 
