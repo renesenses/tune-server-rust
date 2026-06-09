@@ -3,7 +3,7 @@ members = ["tune-core", "tune-server", "tune-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.68"
+version = "0.8.69"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
