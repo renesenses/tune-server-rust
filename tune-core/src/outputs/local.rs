@@ -427,7 +427,22 @@ fn decode_compressed_stream(data: &[u8]) -> Option<(u16, u32, Vec<f32>)> {
     Some((channels, sample_rate, all_samples))
 }
 
+/// WAV format tag constants.
+const WAVE_FORMAT_PCM: u16 = 1;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
 /// Parse a WAV header and return (channels, sample_rate, bit_depth, data_offset).
+///
+/// Handles PCM (format tag 1), IEEE Float (3), and WAVE_FORMAT_EXTENSIBLE
+/// (0xFFFE).  For EXTENSIBLE, the actual sub-format is checked and
+/// `wValidBitsPerSample` is used instead of the container size.
+///
+/// The `bit_depth` returned is the *effective* bit depth for PCM
+/// interpretation:
+///   - PCM integer: `wBitsPerSample` (or `wValidBitsPerSample` for EXTENSIBLE)
+///   - IEEE Float 32-bit: returns 0 as a sentinel so `pcm_bytes_to_f32`
+///     uses the float path.
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     if header.len() < 44 {
         return None;
@@ -454,9 +469,84 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
 
         if chunk_id == b"fmt " && offset + 8 + chunk_size <= header.len() {
             let fmt = &header[offset + 8..];
+            let format_tag = u16::from_le_bytes([fmt[0], fmt[1]]);
             channels = u16::from_le_bytes([fmt[2], fmt[3]]);
             sample_rate = u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]);
-            bit_depth = u16::from_le_bytes([fmt[14], fmt[15]]);
+            let block_align = u16::from_le_bytes([fmt[12], fmt[13]]);
+            let w_bits_per_sample = u16::from_le_bytes([fmt[14], fmt[15]]);
+
+            match format_tag {
+                WAVE_FORMAT_PCM => {
+                    // Use nBlockAlign to determine the actual byte width per
+                    // sample, which may differ from wBitsPerSample / 8 in
+                    // edge cases (e.g. 20-bit in 24-bit container).
+                    if channels > 0 {
+                        let container_bytes = block_align / channels;
+                        bit_depth = (container_bytes * 8).min(32);
+                    } else {
+                        bit_depth = w_bits_per_sample;
+                    }
+                }
+                WAVE_FORMAT_IEEE_FLOAT => {
+                    // Signal to pcm_bytes_to_f32 that the data is already
+                    // IEEE float.  We use 0 as a sentinel value.
+                    if channels > 0 {
+                        let container_bytes = block_align / channels;
+                        // 32-bit float -> sentinel 0; 64-bit float -> unsupported
+                        if container_bytes == 4 {
+                            bit_depth = 0; // sentinel: IEEE float 32-bit
+                        } else {
+                            // 64-bit float — cannot handle, fall through to
+                            // compressed decode path
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                WAVE_FORMAT_EXTENSIBLE => {
+                    // EXTENSIBLE: wBitsPerSample is the container size.
+                    // wValidBitsPerSample at fmt[18..19] is the actual depth.
+                    // The sub-format GUID at fmt[24..40] tells us PCM vs Float.
+                    if chunk_size >= 40 {
+                        let valid_bits = u16::from_le_bytes([fmt[18], fmt[19]]);
+                        // Sub-format GUID first two bytes indicate the format
+                        // (same as format_tag for standard formats).
+                        let sub_format = u16::from_le_bytes([fmt[24], fmt[25]]);
+                        if sub_format == WAVE_FORMAT_IEEE_FLOAT {
+                            if channels > 0 && block_align / channels == 4 {
+                                bit_depth = 0; // sentinel: IEEE float 32-bit
+                            } else {
+                                return None; // 64-bit float unsupported
+                            }
+                        } else {
+                            // PCM sub-format — use valid_bits for the actual
+                            // bit depth, but the byte stride comes from
+                            // nBlockAlign.
+                            if channels > 0 {
+                                let container_bytes = block_align / channels;
+                                // Use the smaller of container size and valid
+                                // bits, rounded to a standard byte width.
+                                let effective = valid_bits.min(container_bytes * 8);
+                                bit_depth = match effective {
+                                    0..=16 => 16,
+                                    17..=24 => 24,
+                                    _ => 32,
+                                };
+                            } else {
+                                bit_depth = w_bits_per_sample;
+                            }
+                        }
+                    } else {
+                        // Truncated EXTENSIBLE — fall back to container size
+                        bit_depth = w_bits_per_sample;
+                    }
+                }
+                _ => {
+                    // Unknown format tag — let compressed decode handle it
+                    return None;
+                }
+            }
         } else if chunk_id == b"data" {
             data_offset = Some(offset + 8);
             break;
@@ -472,9 +562,22 @@ fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
     data_offset.map(|d| (channels, sample_rate, bit_depth, d))
 }
 
-/// Convert raw PCM bytes (16-bit or 24-bit little-endian) to f32 samples.
+/// Convert raw PCM bytes to f32 samples.
+///
+/// `bit_depth` semantics:
+///   - 16: signed 16-bit little-endian integer
+///   - 24: signed 24-bit little-endian integer (3 bytes per sample)
+///   - 32: signed 32-bit little-endian integer
+///   -  0: IEEE 754 32-bit float (already in [-1, 1] range)
 fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
     match bit_depth {
+        0 => {
+            // IEEE Float 32-bit — reinterpret bytes as f32 directly
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
         16 => bytes
             .chunks_exact(2)
             .map(|c| {
@@ -525,6 +628,11 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
+        // Store the known track duration so get_status() can report it
+        // and the poller can detect near-end-of-track for gapless/advance.
+        if let Some(dur) = media.duration_ms {
+            self.duration_ms.store(dur, Ordering::SeqCst);
+        }
         self.play_url(media.url, media.mime_type, media.title, media.artist)
             .await
     }
@@ -554,7 +662,6 @@ impl OutputTarget for LocalOutput {
         let paused = self.paused.clone();
         let volume = self.volume.clone();
         let position_ms = self.position_ms.clone();
-        let duration_ms_shared = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
 
         // Store metadata
@@ -565,7 +672,9 @@ impl OutputTarget for LocalOutput {
         playing.store(true, Ordering::SeqCst);
         paused.store(false, Ordering::SeqCst);
         position_ms.store(0, Ordering::SeqCst);
-        duration_ms_shared.store(0, Ordering::SeqCst);
+        // NOTE: duration_ms is NOT reset here — play_media() sets it before
+        // calling play_url(), and resetting would wipe the known duration.
+        // It is cleared in stop() instead.
 
         let handle = std::thread::spawn(move || {
             // ------- HTTP fetch the audio stream -------
@@ -808,7 +917,12 @@ impl OutputTarget for LocalOutput {
                 return;
             };
 
-            let bytes_per_sample = (bit_depth / 8) as usize;
+            // bit_depth == 0 is the sentinel for IEEE float 32-bit (4 bytes)
+            let bytes_per_sample = if bit_depth == 0 {
+                4
+            } else {
+                (bit_depth / 8) as usize
+            };
             let frame_bytes = channels as usize * bytes_per_sample;
 
             // ------- Exclusive mode path (macOS only) -------
@@ -1397,6 +1511,7 @@ impl OutputTarget for LocalOutput {
         }
         self.playing.store(false, Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
+        self.duration_ms.store(0, Ordering::SeqCst);
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
         *self.track_artist.lock().unwrap() = None;
@@ -1777,6 +1892,92 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert!((samples[0] - 1.0).abs() < 0.001);
         assert!((samples[1]).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_wav_header_24bit() {
+        let header = crate::audio::wav::build_wav_header(2, 96000, 24);
+        let parsed = parse_wav_header(&header);
+        assert!(parsed.is_some());
+        let (ch, sr, bd, offset) = parsed.unwrap();
+        assert_eq!(ch, 2);
+        assert_eq!(sr, 96000);
+        assert_eq!(bd, 24);
+        assert_eq!(offset, 44);
+    }
+
+    #[test]
+    fn test_parse_wav_header_ieee_float() {
+        // Build a 32-bit IEEE Float WAV header (format tag 3)
+        let mut header = [0u8; 44];
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&16u32.to_le_bytes());
+        header[20..22].copy_from_slice(&3u16.to_le_bytes()); // IEEE_FLOAT
+        header[22..24].copy_from_slice(&2u16.to_le_bytes()); // channels
+        header[24..28].copy_from_slice(&44100u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(44100u32 * 2 * 4).to_le_bytes()); // byte_rate
+        header[32..34].copy_from_slice(&8u16.to_le_bytes()); // block_align
+        header[34..36].copy_from_slice(&32u16.to_le_bytes()); // bits_per_sample
+        header[36..40].copy_from_slice(b"data");
+        header[40..44].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+
+        let parsed = parse_wav_header(&header);
+        assert!(parsed.is_some());
+        let (ch, sr, bd, offset) = parsed.unwrap();
+        assert_eq!(ch, 2);
+        assert_eq!(sr, 44100);
+        assert_eq!(bd, 0); // sentinel for IEEE float
+        assert_eq!(offset, 44);
+    }
+
+    #[test]
+    fn test_parse_wav_header_extensible_24bit() {
+        // Build a WAVE_FORMAT_EXTENSIBLE 24-bit WAV header
+        let mut header = [0u8; 68]; // 12 (RIFF) + 8 (fmt hdr) + 40 (fmt data) + 8 (data hdr)
+        header[0..4].copy_from_slice(b"RIFF");
+        header[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        header[8..12].copy_from_slice(b"WAVE");
+        header[12..16].copy_from_slice(b"fmt ");
+        header[16..20].copy_from_slice(&40u32.to_le_bytes()); // extensible fmt size
+        header[20..22].copy_from_slice(&0xFFFEu16.to_le_bytes()); // EXTENSIBLE
+        header[22..24].copy_from_slice(&2u16.to_le_bytes()); // channels
+        header[24..28].copy_from_slice(&96000u32.to_le_bytes());
+        header[28..32].copy_from_slice(&(96000u32 * 2 * 3).to_le_bytes());
+        header[32..34].copy_from_slice(&6u16.to_le_bytes()); // block_align = 2*3
+        header[34..36].copy_from_slice(&24u16.to_le_bytes()); // wBitsPerSample
+        header[36..38].copy_from_slice(&22u16.to_le_bytes()); // cbSize
+        header[38..40].copy_from_slice(&24u16.to_le_bytes()); // wValidBitsPerSample
+        header[40..44].copy_from_slice(&0u32.to_le_bytes()); // channel mask
+        // Sub-format GUID: PCM = {00000001-0000-0010-8000-00aa00389b71}
+        header[44..46].copy_from_slice(&1u16.to_le_bytes());
+        header[46..60].copy_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+        ]);
+        header[60..64].copy_from_slice(b"data");
+        header[64..68].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+
+        let parsed = parse_wav_header(&header);
+        assert!(parsed.is_some());
+        let (ch, sr, bd, offset) = parsed.unwrap();
+        assert_eq!(ch, 2);
+        assert_eq!(sr, 96000);
+        assert_eq!(bd, 24);
+        assert_eq!(offset, 68);
+    }
+
+    #[test]
+    fn test_pcm_bytes_to_f32_float() {
+        // IEEE Float 32-bit: 0.5 and -0.5
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&(-0.5f32).to_le_bytes());
+        let samples = pcm_bytes_to_f32(&bytes, 0);
+        assert_eq!(samples.len(), 2);
+        assert!((samples[0] - 0.5).abs() < 0.0001);
+        assert!((samples[1] + 0.5).abs() < 0.0001);
     }
 
     #[test]

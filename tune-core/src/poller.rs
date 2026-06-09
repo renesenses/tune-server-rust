@@ -51,6 +51,11 @@ const MIN_TRACK_WALL_SECS: u64 = 15;
 const MIN_PEAK_UNKNOWN_DURATION_MS: u64 = 60_000;
 /// How often (in ticks) to persist the playback position to the database.
 const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
+/// When the output reports Playing but position >= track duration (track
+/// effectively ended), wait this many ticks before advancing. This gives
+/// the output time to drain its buffer and report Stopped naturally.
+/// If it doesn't, this threshold forces the advance.
+const POSITION_PAST_END_TICKS: u8 = 3;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -105,6 +110,13 @@ struct ZonePollState {
     /// we reset all per-track state so stale values from the previous
     /// track cannot trigger false gapless advances or premature track ends.
     track_generation: u64,
+    /// Counts ticks where the output reports Playing but position_ms has
+    /// reached or exceeded the known track duration.  After
+    /// POSITION_PAST_END_TICKS consecutive ticks in this state, the poller
+    /// treats the track as ended even though the output hasn't reported
+    /// Stopped.  This handles local/cpal outputs where the playback thread
+    /// may be slow to set `playing = false`.
+    past_end_ticks: u8,
 }
 
 pub struct PositionPoller {
@@ -249,6 +261,7 @@ impl PositionPoller {
                 ticks_since_db_save: 0,
                 track_started_at: None,
                 track_generation: zone_state.track_generation,
+                past_end_ticks: 0,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -271,6 +284,7 @@ impl PositionPoller {
                 ps.peak_position_ms = 0;
                 ps.track_started_at = None;
                 ps.track_generation = zone_state.track_generation;
+                ps.past_end_ticks = 0;
             }
 
             if ps.backoff_remaining > 0 {
@@ -635,6 +649,31 @@ impl PositionPoller {
                         }
                         ps.gapless_sent = true;
                     }
+
+                    // Position-based end-of-track detection: when the output
+                    // still reports Playing but position has reached or exceeded
+                    // the known track duration, the audio has effectively ended
+                    // (e.g. local/cpal output draining its ring buffer).
+                    // Wait POSITION_PAST_END_TICKS consecutive ticks to avoid
+                    // cutting off the last fraction of a second of audio.
+                    if track_duration_ms > 0
+                        && played_enough
+                        && status.position_ms >= track_duration_ms
+                    {
+                        ps.past_end_ticks += 1;
+                        if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
+                            info!(
+                                zone_id,
+                                position_ms = status.position_ms,
+                                track_dur = track_duration_ms,
+                                past_end_ticks = ps.past_end_ticks,
+                                "position_past_end_advancing"
+                            );
+                            track_ended = true;
+                        }
+                    } else {
+                        ps.past_end_ticks = 0;
+                    }
                 }
                 TransportState::Paused => {
                     ps.stopped_ticks = 0;
@@ -787,6 +826,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            past_end_ticks: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -826,6 +866,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            past_end_ticks: 0,
         };
 
         // Simulates entering Playing state
@@ -918,6 +959,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            past_end_ticks: 0,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -992,5 +1034,45 @@ mod tests {
             peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION
         };
         assert!(played_enough, "120s peak with unknown duration should pass");
+    }
+
+    #[test]
+    fn past_end_ticks_triggers_after_threshold() {
+        // Simulate: output reports Playing but position >= track duration.
+        // After POSITION_PAST_END_TICKS ticks, track should be treated as ended.
+        let mut past_end: u8 = 0;
+        let track_duration_ms: u64 = 240_000;
+        let position_ms: u64 = 240_500; // slightly past end
+        let played_enough = true;
+
+        for _ in 0..POSITION_PAST_END_TICKS {
+            if track_duration_ms > 0 && played_enough && position_ms >= track_duration_ms {
+                past_end += 1;
+            } else {
+                past_end = 0;
+            }
+        }
+        assert!(
+            past_end >= POSITION_PAST_END_TICKS,
+            "should trigger after {} ticks past end",
+            POSITION_PAST_END_TICKS
+        );
+    }
+
+    #[test]
+    fn past_end_ticks_resets_when_position_below_duration() {
+        // If position drops below duration (e.g. seek or correction),
+        // the past_end counter should reset.
+        let mut past_end: u8 = 2; // already accumulated some ticks
+        let track_duration_ms: u64 = 240_000;
+        let position_ms: u64 = 200_000; // below duration
+        let played_enough = true;
+
+        if track_duration_ms > 0 && played_enough && position_ms >= track_duration_ms {
+            past_end += 1;
+        } else {
+            past_end = 0;
+        }
+        assert_eq!(past_end, 0, "counter should reset when position < duration");
     }
 }

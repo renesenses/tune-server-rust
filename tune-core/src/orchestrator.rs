@@ -255,23 +255,28 @@ impl PlaybackOrchestrator {
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
         // OAAT endpoints: transcode to WAV for reliable bit-perfect playback.
-        let oaat_needs_wav = is_oaat_output
-            && source_format
-                .as_ref()
-                .is_some_and(|f| *f != AudioFormat::Wav);
+        // Always transcode, even WAV sources, to normalise EXTENSIBLE/FLOAT
+        // variants into simple PCM that the endpoint can reliably parse.
+        let oaat_needs_wav = is_oaat_output && source_format.is_some();
 
-        // Local output (cpal) expects raw PCM in a WAV container — it does NOT
-        // decode compressed formats (FLAC, MP3, etc.) itself.  Non-WAV files
-        // must be transcoded to WAV so the LocalOutput receives a valid WAV
-        // stream with a parseable header followed by raw PCM samples.
+        // Local output (cpal) has a simple WAV parser that only understands
+        // standard PCM (format tag 1).  Real-world WAV files can use
+        // WAVE_FORMAT_EXTENSIBLE (0xFFFE), IEEE_FLOAT (3), or have extra
+        // metadata chunks that shift the data offset beyond the parser's
+        // 4096-byte header buffer.  Feeding such files as passthrough causes
+        // white noise because the byte layout doesn't match what the parser
+        // expects (wrong bit depth, wrong data offset, or float-as-integer).
+        //
+        // Fix: ALWAYS transcode through symphonia for local output, even when
+        // the source is already WAV.  Symphonia handles all WAV variants and
+        // produces normalised integer PCM.  The HTTP stream handler then
+        // prepends a simple 44-byte PCM header that the local parser handles
+        // correctly.  The overhead is negligible (memcpy, no re-encoding).
         let is_local_output = req
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
-        let local_needs_wav = is_local_output
-            && source_format
-                .as_ref()
-                .is_some_and(|f| *f != AudioFormat::Wav);
+        let local_needs_wav = is_local_output && source_format.is_some();
 
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
