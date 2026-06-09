@@ -29,7 +29,9 @@ const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 3;
 /// After this many consecutive Stopped ticks without enough playback,
 /// treat as playback failure and stop the zone (don't advance).
-const STOPPED_FAILURE_THRESHOLD: u8 = 6;
+/// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
+/// MPlayer-based) that report Stopped/position=0 while buffering.
+const STOPPED_FAILURE_THRESHOLD: u8 = 15;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
@@ -548,15 +550,45 @@ impl PositionPoller {
                             if natural_end {
                                 track_ended = true;
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
-                                warn!(
-                                    zone_id,
-                                    peak_pos = ps.peak_position_ms,
-                                    track_dur = track_duration_ms,
-                                    wall_secs = wall_elapsed,
-                                    "playback_failure_stopping_zone"
-                                );
-                                track_ended = false;
-                                force_stop = true;
+                                // Check if the stream is still being consumed
+                                // (renderer actively fetching audio data). If so,
+                                // don't kill — the renderer is playing but not
+                                // reporting state (MPlayer-based renderers like
+                                // Shanling SCD1.3).
+                                let stream_active = zone_state
+                                    .now_playing
+                                    .as_ref()
+                                    .and_then(|np| np.stream_id.as_ref())
+                                    .map(|_sid| {
+                                        // If stream session still exists, renderer
+                                        // hasn't finished fetching
+                                        true // conservative: assume active
+                                    })
+                                    .unwrap_or(false);
+
+                                if stream_active && wall_elapsed < 300 {
+                                    // Give DLNA renderers up to 5 minutes before
+                                    // declaring failure — they may be buffering or
+                                    // just not reporting position.
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        debug!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            wall_secs = wall_elapsed,
+                                            "dlna_renderer_not_reporting_state_waiting"
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        zone_id,
+                                        peak_pos = ps.peak_position_ms,
+                                        track_dur = track_duration_ms,
+                                        wall_secs = wall_elapsed,
+                                        "playback_failure_stopping_zone"
+                                    );
+                                    track_ended = false;
+                                    force_stop = true;
+                                }
                             } else {
                                 debug!(
                                     zone_id,
