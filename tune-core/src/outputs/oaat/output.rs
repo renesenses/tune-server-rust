@@ -250,6 +250,7 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -328,7 +329,7 @@ impl OutputTarget for OaatOutput {
 
             // Clock sync with timeout
             match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(2),
                 endpoint.clock_sync_bootstrap(),
             )
             .await
