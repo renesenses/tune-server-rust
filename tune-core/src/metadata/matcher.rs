@@ -235,6 +235,70 @@ pub async fn lookup_album(title: &str, artist: &str) -> Vec<AlbumMatch> {
         .collect()
 }
 
+/// Search MusicBrainz for an artist by name and return the best match MBID.
+pub async fn lookup_artist(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let client = crate::http::client::shared();
+    let query = format!("artist:\"{name}\"");
+    let resp = client
+        .get(format!("{MB_API}/artist"))
+        .query(&[
+            ("query", &query),
+            ("limit", &"1".to_string()),
+            ("fmt", &"json".to_string()),
+        ])
+        .header("User-Agent", MB_UA)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    let data: serde_json::Value = match resp {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        _ => return None,
+    };
+
+    let artists = data.get("artists")?.as_array()?;
+    let best = artists.first()?;
+    let score = best.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+    if score < 90 {
+        return None;
+    }
+    best.get("id").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// Batch-match artists without MBID by searching MusicBrainz.
+/// Returns the number of artists matched.
+pub async fn batch_match_artist_mbids(db: crate::db::sqlite::SqliteDb) -> usize {
+    let repo = crate::db::artist_repo::ArtistRepo::new(db);
+    let artists = repo.list_without_mbid().unwrap_or_default();
+
+    if artists.is_empty() {
+        tracing::info!("batch_artist_mbid_match_skip_all_have_mbid");
+        return 0;
+    }
+
+    tracing::info!(count = artists.len(), "batch_artist_mbid_match_started");
+    let mut matched = 0usize;
+
+    for (artist_id, name) in &artists {
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        if let Some(mbid) = lookup_artist(name).await {
+            repo.update_mbid(*artist_id, &mbid).ok();
+            matched += 1;
+            tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
+        }
+    }
+
+    tracing::info!(
+        matched,
+        total = artists.len(),
+        "batch_artist_mbid_match_complete"
+    );
+    matched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,10 +19,16 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
     tokio::spawn(async move {
         tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
+    let mbid_db = state.db.clone();
+    let art_db = artist_db.clone();
+    let art_cache = artist_cache_dir.clone();
     tokio::spawn(async move {
-        // Small delay to let album enrichment start first
+        // 1. Match MusicBrainz IDs for artists without one
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        tune_core::library::artwork::batch_enrich_artist_artwork(artist_db, artist_cache_dir).await;
+        tune_core::metadata::matcher::batch_match_artist_mbids(mbid_db).await;
+        // 2. Fetch images for artists with MBID
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tune_core::library::artwork::batch_enrich_artist_artwork(art_db, art_cache).await;
     });
     (
         StatusCode::ACCEPTED,
