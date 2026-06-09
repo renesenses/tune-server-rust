@@ -333,7 +333,34 @@ fn decode_dsd_to_pcm(
     let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
 
     let converter = DsdToPcmConverter::new(dsd_rate, output_rate, channels, lsb_first);
-    let all_samples = converter.process_to_i16(&dsd_data);
+
+    // Use native 24-bit output from the DSD converter.  The converter
+    // produces 3 bytes per sample (24-bit LE); we reconstruct i32 values
+    // from those triplets so the rest of the pipeline (pcm_bytes, WAV
+    // header, DLNA streaming) all agree on 24-bit depth.
+    //
+    // Previously this used process_to_i16() which truncated to 16-bit,
+    // but the orchestrator declared bit_depth=24 for DSD in the WAV
+    // header.  The mismatch (header says 24-bit / data is 16-bit)
+    // caused malformed WAV streams that DLNA renderers such as the
+    // Marantz SR7009 could not play.
+    let pcm_24 = converter.process(&dsd_data);
+    let num_samples = pcm_24.len() / 3;
+    let mut all_samples: Vec<i32> = Vec::with_capacity(num_samples);
+    for i in 0..num_samples {
+        let offset = i * 3;
+        let lo = pcm_24[offset] as u32;
+        let mid = pcm_24[offset + 1] as u32;
+        let hi = pcm_24[offset + 2] as u32;
+        let val24 = lo | (mid << 8) | (hi << 16);
+        // Sign-extend from 24-bit to 32-bit
+        let val32 = if val24 & 0x80_0000 != 0 {
+            (val24 | 0xFF00_0000) as i32
+        } else {
+            val24 as i32
+        };
+        all_samples.push(val32);
+    }
 
     // Apply seek and duration limits on the output PCM
     let skip_frames = if seek_s > 0.0 {
@@ -369,8 +396,8 @@ fn decode_dsd_to_pcm(
     );
 
     Ok(DecodedAudio {
-        samples_i32: trimmed.iter().map(|&s| s as i32).collect(),
-        bit_depth: 16,
+        samples_i32: trimmed.to_vec(),
+        bit_depth: 24,
         sample_rate: output_rate,
         channels: channels as u32,
         duration_s: actual_duration,
