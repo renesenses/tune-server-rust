@@ -974,6 +974,10 @@ impl OutputTarget for LocalOutput {
 
                 let mut total_frames_fed: u64 = 0;
 
+                // Read and feed the rest of the stream
+                let mut read_buf = vec![0u8; 65536];
+                let mut leftover: Vec<u8> = Vec::new();
+
                 // Process leftover from header read
                 if !pcm_data.is_empty() {
                     let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
@@ -988,11 +992,11 @@ impl OutputTarget for LocalOutput {
                         );
                         total_frames_fed += (aligned_len / frame_bytes) as u64;
                     }
+                    // Carry over unaligned remainder bytes
+                    if aligned_len < pcm_data.len() {
+                        leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                    }
                 }
-
-                // Read and feed the rest of the stream
-                let mut read_buf = vec![0u8; 65536];
-                let mut leftover = Vec::new();
 
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -1292,6 +1296,15 @@ impl OutputTarget for LocalOutput {
                 None
             };
 
+            // Read and feed the rest of the stream
+            let mut read_buf = vec![0u8; 65536];
+            // Seed the leftover buffer with any unaligned remainder from the
+            // initial header read so byte alignment is preserved across reads.
+            // Previously the remainder was silently dropped, causing every
+            // subsequent 24-bit sample to be read from the wrong byte offset
+            // (white noise).
+            let mut leftover: Vec<u8> = Vec::new();
+
             // Process leftover from header read
             if !pcm_data.is_empty() {
                 let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
@@ -1306,11 +1319,11 @@ impl OutputTarget for LocalOutput {
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
                 }
+                // Carry over unaligned remainder bytes
+                if aligned_len < pcm_data.len() {
+                    leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                }
             }
-
-            // Read and feed the rest of the stream
-            let mut read_buf = vec![0u8; 65536];
-            let mut leftover = Vec::new();
             let mut total_bytes_read: u64 = 0;
             let mut first_data_logged = false;
             let stream_start = std::time::Instant::now();
@@ -2028,6 +2041,69 @@ mod tests {
         let out = simple_resample(&data, 44100, 88200, 2);
         // Should produce ~4 frames
         assert_eq!(out.len(), 8);
+    }
+
+    #[test]
+    fn test_pcm_bytes_to_f32_24bit_negative() {
+        // 24-bit minimum: 0x800000 = -8388608 -> -1.0
+        let bytes = [0x00, 0x00, 0x80]; // -8388608
+        let samples = pcm_bytes_to_f32(&bytes, 24);
+        assert_eq!(samples.len(), 1);
+        assert!(
+            (samples[0] + 1.0).abs() < 0.001,
+            "expected -1.0, got {}",
+            samples[0]
+        );
+
+        // Small negative: 0xFFFFFF = -1 -> ~ -0.000000119
+        let bytes2 = [0xFF, 0xFF, 0xFF];
+        let samples2 = pcm_bytes_to_f32(&bytes2, 24);
+        assert_eq!(samples2.len(), 1);
+        assert!(samples2[0] < 0.0, "expected negative, got {}", samples2[0]);
+    }
+
+    #[test]
+    fn test_24bit_frame_alignment() {
+        // Simulate the scenario that caused white noise: initial read
+        // from a WAV stream where the PCM data after the header is NOT
+        // a multiple of frame_bytes (6 for 24-bit stereo).
+        //
+        // Build a WAV header + 8 bytes of PCM (6 aligned + 2 remainder).
+        let wav_hdr = crate::audio::wav::build_wav_header(2, 44100, 24);
+        assert_eq!(wav_hdr.len(), 44);
+
+        // 2 channels * 3 bytes = 6 bytes per frame
+        let frame_bytes: usize = 6;
+
+        // Create 8 bytes of PCM data (1 full frame + 2 leftover bytes)
+        let pcm_data: Vec<u8> = vec![
+            // Frame 0: L=0x000001 R=0x000002
+            0x01, 0x00, 0x00, 0x02, 0x00, 0x00, // Frame 1 partial: first 2 bytes
+            0x03, 0x00,
+        ];
+
+        // Simulate the old buggy code: only process aligned, drop remainder
+        let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
+        assert_eq!(aligned_len, 6);
+        let remainder = pcm_data.len() - aligned_len;
+        assert_eq!(remainder, 2, "there should be 2 leftover bytes");
+
+        // The fix: carry remainder into leftover buffer
+        let mut leftover: Vec<u8> = Vec::new();
+        if aligned_len < pcm_data.len() {
+            leftover.extend_from_slice(&pcm_data[aligned_len..]);
+        }
+        assert_eq!(leftover.len(), 2);
+        assert_eq!(leftover, vec![0x03, 0x00]);
+
+        // Simulate next read arriving: 4 more bytes complete frame 1
+        let next_read: Vec<u8> = vec![0x00, 0x04, 0x00, 0x00];
+        leftover.extend_from_slice(&next_read);
+        // Now leftover has 6 bytes = 1 complete frame
+        let aligned_len2 = (leftover.len() / frame_bytes) * frame_bytes;
+        assert_eq!(aligned_len2, 6);
+        let samples = pcm_bytes_to_f32(&leftover[..aligned_len2], 24);
+        assert_eq!(samples.len(), 2); // L and R of frame 1
     }
 
     #[test]
