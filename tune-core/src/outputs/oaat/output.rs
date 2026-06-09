@@ -304,7 +304,7 @@ impl OutputTarget for OaatOutput {
 
             // Connect with retry
             let mut endpoint: Option<ConnectedEndpoint> = None;
-            for attempt in 1..=3u32 {
+            for attempt in 1..=5u32 {
                 debug!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
@@ -313,11 +313,11 @@ impl OutputTarget for OaatOutput {
                         break;
                     }
                     Err(e) => {
-                        if attempt < 3 {
-                            warn!(device = %device_name, error = %e, attempt, "oaat: connect failed, retry 1s");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if attempt < 5 {
+                            warn!(device = %device_name, error = %e, attempt, "oaat: connect failed, retry 500ms");
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         } else {
-                            error!(device = %device_name, error = %e, "oaat: connect failed after 3 attempts");
+                            error!(device = %device_name, error = %e, "oaat: connect failed after 5 attempts");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }

@@ -231,6 +231,11 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-all", post(enrich::enrich_all_library))
         .route("/enrich-all/status", get(enrich::enrich_all_status))
         .route("/artwork/rescan", post(artwork::rescan_all_artwork))
+        .route("/rescan-metadata", post(tracks::rescan_metadata))
+        .route(
+            "/rescan-metadata/status",
+            get(tracks::rescan_metadata_status),
+        )
         .route("/duplicates/smart", get(duplicates::smart_duplicates))
         .route(
             "/collections",
