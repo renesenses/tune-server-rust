@@ -72,7 +72,12 @@ impl SettingsRepo {
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let sql = self.dialect_sql(sql::get_by_key, sql::get_by_key);
         let params: [&dyn ToSqlValue; 1] = [&key];
-        match self.db.query_one(&sql, &params)? {
+        // Use query_one_strong to read through the write connection.
+        // Settings are frequently read immediately after a write (e.g.
+        // saving a Discogs token then checking discogs_token_set in
+        // get_config). The read-only WAL snapshot may lag behind the
+        // writer, returning stale NULL for a key that was just upserted.
+        match self.db.query_one_strong(&sql, &params)? {
             None => Ok(None),
             Some(row) => Ok(row.first().and_then(|v| v.as_string())),
         }
@@ -94,7 +99,8 @@ impl SettingsRepo {
     }
 
     pub fn all(&self) -> Result<Vec<(String, String)>, String> {
-        let rows = self.db.query_many(sql::list_all(), &[])?;
+        // Use query_many_strong for the same WAL snapshot reason as get().
+        let rows = self.db.query_many_strong(sql::list_all(), &[])?;
         Ok(rows
             .into_iter()
             .map(|cols| {

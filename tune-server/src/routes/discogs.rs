@@ -24,12 +24,14 @@ pub fn router() -> Router<AppState> {
 }
 
 fn discogs_token(state: &AppState) -> Option<String> {
+    // Check the DB first (set via web UI), then fall back to env/toml config.
     let settings = SettingsRepo::new(state.db.clone());
     settings
         .get("discogs_token")
         .ok()
         .flatten()
         .filter(|t| !t.is_empty())
+        .or_else(|| state.config.discogs_token.clone().filter(|t| !t.is_empty()))
 }
 
 async fn discogs_get(

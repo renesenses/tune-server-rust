@@ -49,7 +49,8 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             "id": "discogs", "name": "Discogs", "kind": "personal_token",
             "purpose": "Années + couvertures + crédits pour pressages obscurs.",
             "pricing": "free", "pricing_note": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
-            "configured": settings.get("discogs_token").ok().flatten().is_some(),
+            "configured": settings.get("discogs_token").ok().flatten().is_some()
+                || state.config.discogs_token.as_deref().is_some_and(|s| !s.is_empty()),
             "fields": [{"key": "token", "label": "Personal Access Token", "type": "password"}],
             "help_url": "https://www.discogs.com/settings/developers",
             "help_steps": ["Connecte-toi sur discogs.com.", "Va dans Settings → Developers.", "Clique 'Generate new token'.", "Colle le token ici."],
@@ -140,7 +141,14 @@ pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl
     let settings = SettingsRepo::new(state.db);
     let configured = match id.as_str() {
         "lastfm" => settings.get("lastfm_api_key").ok().flatten().is_some(),
-        "discogs" => settings.get("discogs_token").ok().flatten().is_some(),
+        "discogs" => {
+            settings.get("discogs_token").ok().flatten().is_some()
+                || state
+                    .config
+                    .discogs_token
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty())
+        }
         "genius" => settings.get("genius_token").ok().flatten().is_some(),
         "musicbrainz" => true,
         _ => false,
