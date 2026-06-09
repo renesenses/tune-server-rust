@@ -4,8 +4,12 @@ use tracing::{debug, info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
-/// Default HQPlayer HTTP Control API port.
+/// Default HQPlayer HTTP Control API port (v4/v5).
 pub const HQPLAYER_DEFAULT_PORT: u16 = 4321;
+/// HQPlayer v6 default port.
+pub const HQPLAYER_V6_PORT: u16 = 8019;
+/// Ports to try when auto-detecting HQPlayer.
+pub const HQPLAYER_PROBE_PORTS: &[u16] = &[4321, 8019];
 
 pub struct HqplayerOutput {
     name: String,
@@ -31,6 +35,23 @@ impl HqplayerOutput {
 
     fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
+    }
+
+    /// Probe a host to find which port HQPlayer is listening on.
+    /// Tries 4321 (v4/v5) then 8019 (v6) with a 3s timeout each.
+    pub async fn probe_port(host: &str) -> Option<u16> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        for &port in HQPLAYER_PROBE_PORTS {
+            let url = format!("http://{}:{}/api/status", host, port);
+            if client.get(&url).send().await.is_ok() {
+                info!(host, port, "hqplayer_port_detected");
+                return Some(port);
+            }
+        }
+        None
     }
 
     async fn api_get(&self, path: &str) -> Result<String, String> {

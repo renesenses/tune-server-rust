@@ -787,6 +787,17 @@ impl TrackRepo {
             .collect())
     }
 
+    /// List all local tracks (with file_path set). Used by rescan-metadata to
+    /// re-read tags from disk without doing a full library scan.
+    pub fn list_all_local(&self) -> Result<Vec<Track>, String> {
+        let sql = format!(
+            "{} WHERE t.file_path IS NOT NULL AND t.file_path != ''",
+            sql::select_track()
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
     pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, String> {
         let rows = self
             .db

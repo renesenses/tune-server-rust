@@ -550,24 +550,48 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
     let track_id = track.id.unwrap_or(0);
     let id = format!("track/{track_id}");
     let fmt = track.format.as_deref().unwrap_or("flac");
-    let mime = match fmt {
-        "flac" => "audio/flac",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "aac" | "m4a" => "audio/mp4",
-        "ogg" => "audio/ogg",
-        "aiff" | "aif" => "audio/x-aiff",
-        "dsf" | "dff" => "audio/x-dsd",
-        "wv" => "audio/x-wavpack",
-        "ape" => "audio/x-ape",
-        _ => "audio/flac",
+
+    // For formats that need transcoding (DSD, AIFF, WavPack, APE, ALAC),
+    // advertise the transcoded MIME type and extension so that DLNA renderers
+    // see a format they can actually play.
+    use crate::audio::formats::AudioFormat;
+    let source_format = AudioFormat::from_extension(fmt);
+    let needs_transcode = source_format
+        .as_ref()
+        .is_some_and(|f| f.needs_transcode_for_dlna());
+    let (advertised_ext, mime) = if needs_transcode {
+        let target = source_format.unwrap().dlna_transcode_target();
+        (target.container_format(), target.mime_type())
+    } else {
+        let m = match fmt {
+            "flac" => "audio/flac",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "aac" | "m4a" => "audio/mp4",
+            "ogg" => "audio/ogg",
+            _ => "audio/flac",
+        };
+        (fmt, m)
     };
 
-    let stream_url = format!("{base_url}/stream/{track_id}.{fmt}");
+    let stream_url = format!("{base_url}/stream/{track_id}.{advertised_ext}");
     let cover_url = track
         .cover_path
         .as_ref()
         .map(|c| format!("{base_url}/artwork/{c}"));
+
+    // For DSD tracks, advertise the PCM output sample rate (176.4/352.8 kHz)
+    // and 24-bit depth instead of the raw DSD rate (2.8/5.6 MHz) and 1-bit.
+    let (advertised_sr, advertised_bd) = if source_format == Some(AudioFormat::Dsd) {
+        let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
+        let pcm_rate = AudioFormat::Dsd.dsd_output_sample_rate(dsd_rate);
+        (Some(pcm_rate), Some(24u32))
+    } else {
+        (
+            track.sample_rate.map(|sr| sr as u32),
+            track.bit_depth.map(|bd| bd as u32),
+        )
+    };
 
     let mut builder = crate::outputs::didl::DidlBuilder::new(&track.title, &stream_url, mime)
         .item_id(&id)
@@ -577,8 +601,8 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         .artist_opt(track.artist_name.as_deref())
         .album_opt(track.album_title.as_deref())
         .album_art_opt(cover_url.as_deref())
-        .sample_rate_opt(track.sample_rate.map(|sr| sr as u32))
-        .bit_depth_opt(track.bit_depth.map(|bd| bd as u32))
+        .sample_rate_opt(advertised_sr)
+        .bit_depth_opt(advertised_bd)
         .file_size_opt(track.file_size.map(|s| s as u64));
 
     if track.duration_ms > 0 {
