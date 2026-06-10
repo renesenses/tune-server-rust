@@ -137,7 +137,7 @@ impl PodcastService {
             Podcast {
                 name: "Affaires sensibles".into(),
                 artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_16756.xml".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_13940.xml".into(),
                 cover_url: String::new(),
                 description: "Les grandes affaires qui ont marqué l'actualité".into(),
                 episode_count: 0,
