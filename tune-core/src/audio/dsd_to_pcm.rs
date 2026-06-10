@@ -57,6 +57,11 @@ impl DsdToPcmConverter {
         }
     }
 
+    /// Maximum total allocation (in bytes) that `process()` is allowed to
+    /// make for intermediate and output buffers combined.  This prevents
+    /// the global allocator from panicking on extreme inputs.
+    const MAX_PROCESS_ALLOC: usize = 512 * 1024 * 1024; // 512 MB
+
     /// Convert DSD data bytes to PCM samples.
     ///
     /// Input: interleaved DSD bytes (ch0_byte0, ch1_byte0, ch0_byte1, ch1_byte1, ...)
@@ -64,6 +69,9 @@ impl DsdToPcmConverter {
     ///
     /// Output: interleaved 24-bit PCM samples as little-endian bytes (3 bytes per sample).
     /// Layout: ch0_sample0 (3 bytes), ch1_sample0 (3 bytes), ch0_sample1 (3 bytes), ...
+    ///
+    /// Returns an empty Vec if the estimated allocation would exceed the
+    /// safety cap (512 MB).
     pub fn process(&self, dsd_data: &[u8]) -> Vec<u8> {
         let channels = self.channels;
         if channels == 0 || dsd_data.is_empty() {
@@ -81,9 +89,38 @@ impl DsdToPcmConverter {
             return Vec::new();
         }
 
+        // Memory guard: estimate total allocation before committing.
+        // channel_bits: channels * total_dsd_samples * 8 bytes (f64)
+        // output: output_samples_per_ch * channels * 3 bytes
+        let channel_bits_bytes = channels.saturating_mul(total_dsd_samples).saturating_mul(8);
+        let output_bytes = output_samples_per_ch
+            .saturating_mul(channels)
+            .saturating_mul(3);
+        let total_alloc = channel_bits_bytes.saturating_add(output_bytes);
+
+        if total_alloc > Self::MAX_PROCESS_ALLOC {
+            tracing::error!(
+                total_alloc_mb = total_alloc / (1024 * 1024),
+                max_mb = Self::MAX_PROCESS_ALLOC / (1024 * 1024),
+                dsd_data_len = dsd_data.len(),
+                channels,
+                decimation_ratio = self.decimation_ratio,
+                "dsd_process_rejected_oom_guard"
+            );
+            return Vec::new();
+        }
+
         // De-interleave DSD data into per-channel bit streams
         // and expand bytes to +1/-1 sample values for filtering
-        let mut channel_bits: Vec<Vec<f64>> = vec![Vec::with_capacity(total_dsd_samples); channels];
+        let mut channel_bits: Vec<Vec<f64>> = Vec::with_capacity(channels);
+        for _ in 0..channels {
+            let mut v = Vec::new();
+            if v.try_reserve(total_dsd_samples).is_err() {
+                tracing::error!(samples = total_dsd_samples, "dsd_channel_bits_alloc_failed");
+                return Vec::new();
+            }
+            channel_bits.push(v);
+        }
 
         for byte_idx in 0..total_bytes {
             for ch in 0..channels {
@@ -112,7 +149,12 @@ impl DsdToPcmConverter {
         let half_filter = filter_len / 2;
 
         // Output buffer: 3 bytes per sample, interleaved channels
-        let mut output = Vec::with_capacity(output_samples_per_ch * channels * 3);
+        let out_len = output_samples_per_ch * channels * 3;
+        let mut output = Vec::new();
+        if output.try_reserve(out_len).is_err() {
+            tracing::error!(bytes = out_len, "dsd_output_alloc_failed");
+            return Vec::new();
+        }
 
         for sample_idx in 0..output_samples_per_ch {
             for ch in 0..channels {
@@ -215,14 +257,18 @@ fn design_lowpass_fir(length: usize, decimation: usize) -> Vec<f64> {
 
 /// Choose the best output sample rate for a given DSD rate.
 ///
-/// Returns a rate that's a clean integer divisor of the DSD rate,
-/// preferring 176.4 kHz for DSD64 and 352.8 kHz for DSD128+.
+/// Returns a rate that's a clean integer divisor of the DSD rate.
+/// Capped at 176.4 kHz for ALL DSD rates to prevent excessive memory
+/// usage during DSD-to-PCM conversion.  352.8 kHz PCM is perceptually
+/// identical and most DACs cannot play it over DLNA/local output anyway.
+/// A DSD256 60-minute track at 352.8 kHz / 24-bit / stereo would need
+/// ~7.6 GB of PCM — capping to 176.4 kHz halves that to ~3.8 GB, and
+/// with the additional memory guard in decode_dsd_to_pcm the server
+/// stays well within safe limits.
 pub fn choose_output_rate(dsd_rate: u32) -> u32 {
     match dsd_rate {
-        r if r >= 11_000_000 => 352_800, // DSD256/512
-        r if r >= 5_000_000 => 352_800,  // DSD128
-        r if r >= 2_000_000 => 176_400,  // DSD64
-        _ => 176_400,                    // fallback
+        r if r >= 2_000_000 => 176_400, // DSD64/128/256/512 → cap at 176.4 kHz
+        _ => 176_400,                   // fallback
     }
 }
 
@@ -378,17 +424,18 @@ mod tests {
 
     #[test]
     fn choose_output_rate_dsd128() {
-        assert_eq!(choose_output_rate(5_644_800), 352_800);
+        // Capped to 176.4 kHz to prevent OOM on long DSD tracks
+        assert_eq!(choose_output_rate(5_644_800), 176_400);
     }
 
     #[test]
     fn choose_output_rate_dsd256() {
-        assert_eq!(choose_output_rate(11_289_600), 352_800);
+        assert_eq!(choose_output_rate(11_289_600), 176_400);
     }
 
     #[test]
     fn choose_output_rate_dsd512() {
-        assert_eq!(choose_output_rate(22_579_200), 352_800);
+        assert_eq!(choose_output_rate(22_579_200), 176_400);
     }
 
     #[test]

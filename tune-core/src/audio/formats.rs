@@ -168,26 +168,22 @@ impl AudioFormat {
     }
 
     /// For DSD sources, compute the appropriate PCM output sample rate.
-    /// DSD64 (2.8224 MHz) -> 176400 Hz (4x44100)
-    /// DSD128 (5.6448 MHz) -> 352800 Hz (8x44100)
-    /// DSD256 (11.2896 MHz) -> 352800 Hz (capped for compatibility)
-    /// DSD512 (22.5792 MHz) -> 352800 Hz (capped for compatibility)
+    /// All DSD rates (DSD64/128/256/512) -> 176400 Hz (capped to prevent OOM).
+    /// 352.8 kHz output is perceptually identical and most DACs cannot play
+    /// it over DLNA/local output.  A 60-min DSD256 track at 352.8 kHz
+    /// requires ~7.6 GB of PCM; capping to 176.4 kHz halves that.
     /// For non-DSD formats, returns the source sample rate unchanged.
     pub fn dsd_output_sample_rate(&self, source_sample_rate: u32) -> u32 {
         if *self != Self::Dsd {
             return source_sample_rate;
         }
-        // DSD sample rates are in the MHz range (e.g. 2_822_400 for DSD64)
-        // Some scanners store them divided (e.g. 2822400 or 5644800)
+        // All DSD rates cap to 176.4 kHz to prevent OOM on long tracks.
+        // DSD sample rates are in the MHz range (e.g. 2_822_400 for DSD64).
+        // Some scanners store them divided (e.g. 2822 or 5644).
         match source_sample_rate {
-            r if r >= 11_000_000 => 352_800, // DSD256/512 -> cap at 352.8kHz
-            r if r >= 5_000_000 => 352_800,  // DSD128 -> 352.8kHz
-            r if r >= 2_000_000 => 176_400,  // DSD64 -> 176.4kHz
-            // If scanner stored a lower value (some report 2822 or 5644), scale up
-            r if r >= 5000 => 352_800, // DSD128-ish
-            r if r >= 2000 => 176_400, // DSD64-ish
-            // Fallback: safe default for DSD
-            _ => 176_400,
+            r if r >= 2_000_000 => 176_400, // DSD64/128/256/512 -> 176.4kHz
+            r if r >= 2000 => 176_400,      // Scanner-divided values
+            _ => 176_400,                   // Fallback
         }
     }
 }
@@ -289,12 +285,13 @@ mod tests {
 
     #[test]
     fn dsd128_sample_rate() {
-        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(5_644_800), 352_800);
+        // Capped to 176.4 kHz to prevent OOM on long DSD tracks
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(5_644_800), 176_400);
     }
 
     #[test]
     fn dsd256_sample_rate() {
-        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(11_289_600), 352_800);
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(11_289_600), 176_400);
     }
 
     #[test]
@@ -543,6 +540,6 @@ mod tests {
 
     #[test]
     fn dsd512_sample_rate() {
-        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(22_579_200), 352_800);
+        assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(22_579_200), 176_400);
     }
 }

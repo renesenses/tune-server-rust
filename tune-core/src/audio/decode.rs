@@ -310,6 +310,11 @@ fn decode_symphonia(
     })
 }
 
+/// Maximum memory (in bytes) that DSD-to-PCM conversion is allowed to
+/// allocate for the output PCM buffer.  This prevents OOM crashes on
+/// very long DSD tracks (e.g. a 60-min DSD256 file).
+const DSD_MAX_PCM_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+
 /// Decode a DSD file (DSF or DFF) to PCM using native parsers.
 fn decode_dsd_to_pcm(
     file_path: &str,
@@ -332,6 +337,32 @@ fn decode_dsd_to_pcm(
     let lsb_first = ext == "dsf";
     let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
 
+    // Estimate the output PCM size and reject early if it would exceed the
+    // memory cap.  Each DSD byte = 8 bits; decimation_ratio DSD bits yield
+    // one PCM sample; each sample = 3 bytes (24-bit).
+    let decimation_ratio = (dsd_rate / output_rate) as usize;
+    let total_dsd_bytes_per_ch = dsd_data.len() / channels.max(1);
+    let total_dsd_bits_per_ch = total_dsd_bytes_per_ch * 8;
+    let est_samples_per_ch = total_dsd_bits_per_ch / decimation_ratio.max(1);
+    let est_pcm_bytes = est_samples_per_ch * channels * 3; // 3 bytes per 24-bit sample
+
+    if est_pcm_bytes > DSD_MAX_PCM_BYTES {
+        error!(
+            file = file_path,
+            est_pcm_mb = est_pcm_bytes / (1024 * 1024),
+            max_mb = DSD_MAX_PCM_BYTES / (1024 * 1024),
+            dsd_rate,
+            output_rate,
+            channels,
+            "dsd_decode_rejected_oom_guard"
+        );
+        return Err(format!(
+            "DSD decode would need ~{} MB (limit {} MB) — file too long for in-memory conversion",
+            est_pcm_bytes / (1024 * 1024),
+            DSD_MAX_PCM_BYTES / (1024 * 1024),
+        ));
+    }
+
     let converter = DsdToPcmConverter::new(dsd_rate, output_rate, channels, lsb_first);
 
     // Use native 24-bit output from the DSD converter.  The converter
@@ -345,8 +376,16 @@ fn decode_dsd_to_pcm(
     // caused malformed WAV streams that DLNA renderers such as the
     // Marantz SR7009 could not play.
     let pcm_24 = converter.process(&dsd_data);
+
+    // Drop DSD source data early to reduce peak memory.
+    drop(dsd_data);
+
     let num_samples = pcm_24.len() / 3;
-    let mut all_samples: Vec<i32> = Vec::with_capacity(num_samples);
+    let mut all_samples: Vec<i32> = Vec::new();
+    all_samples
+        .try_reserve(num_samples)
+        .map_err(|e| format!("DSD decode alloc failed ({num_samples} samples): {e}"))?;
+
     for i in 0..num_samples {
         let offset = i * 3;
         let lo = pcm_24[offset] as u32;
@@ -361,6 +400,9 @@ fn decode_dsd_to_pcm(
         };
         all_samples.push(val32);
     }
+
+    // Drop the 24-bit byte buffer now that we have i32 samples.
+    drop(pcm_24);
 
     // Apply seek and duration limits on the output PCM
     let skip_frames = if seek_s > 0.0 {
