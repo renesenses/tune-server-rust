@@ -7,6 +7,10 @@ use super::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+/// Timeout for the fire-and-forget Stop sent before SetAVTransportURI.
+/// Kept short (2s) because we don't need the response — SetAVTransportURI
+/// implicitly stops the current track on compliant renderers.
+const STOP_BEFORE_PLAY_TIMEOUT_MS: u64 = 2000;
 
 pub struct DlnaOutput {
     name: String,
@@ -15,6 +19,8 @@ pub struct DlnaOutput {
     av_transport_url: String,
     rendering_control_url: String,
     client: Client,
+    /// Short-timeout client used for fire-and-forget Stop before play.
+    stop_client: Client,
     play_delay_ms: u64,
 }
 
@@ -36,6 +42,12 @@ impl DlnaOutput {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
+            stop_client: Client::builder()
+                .timeout(std::time::Duration::from_millis(
+                    STOP_BEFORE_PLAY_TIMEOUT_MS,
+                ))
+                .build()
+                .unwrap_or_default(),
             play_delay_ms: 0,
         }
     }
@@ -43,6 +55,43 @@ impl DlnaOutput {
     pub fn with_play_delay(mut self, delay_ms: u64) -> Self {
         self.play_delay_ms = delay_ms;
         self
+    }
+
+    /// Send a SOAP action without retries and with the short-timeout client.
+    /// Used for the fire-and-forget Stop before play — we don't need to wait
+    /// for the response because SetAVTransportURI implicitly replaces the
+    /// current track.  Returns immediately after the single attempt.
+    async fn soap_action_fast(
+        &self,
+        url: &str,
+        service: &str,
+        action: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let soap = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:{action} xmlns:u="{service}">
+      {body}
+    </u:{action}>
+  </s:Body>
+</s:Envelope>"#
+        );
+        let soap_action = format!("{service}#{action}");
+
+        match self
+            .stop_client
+            .post(url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header("SOAPAction", format!("\"{soap_action}\""))
+            .body(soap)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("soap_fast: {e}")),
+        }
     }
 
     async fn soap_action(
@@ -187,13 +236,28 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let stop_resp = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
-        match &stop_resp {
-            Ok(_) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
-            Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+        // Fire-and-forget Stop with a tight deadline: give the renderer up to
+        // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
+        // accept SetAVTransportURI while playing (implicit stop), but we still
+        // send Stop for renderers like DMP-A8 that need it.  The short deadline
+        // ensures we don't block 2-10s waiting for a slow SOAP response.
+        let stop_fut = self.soap_action_fast(
+            &self.av_transport_url,
+            AV_TRANSPORT_URN,
+            "Stop",
+            "<InstanceID>0</InstanceID>",
+        );
+        tokio::select! {
+            result = stop_fut => {
+                match result {
+                    Ok(()) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
+                    Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                debug!(device = %self.name, "dlna_play_pre_stop_timeout_proceeding");
+            }
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let metadata = Self::didl_metadata(
             media.title,
