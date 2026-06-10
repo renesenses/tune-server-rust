@@ -23,6 +23,72 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_memory_diagnostics(state.outputs.clone());
     spawn_telemetry_reporter(state);
     spawn_local_audio_rescan(state);
+    spawn_ssdp_startup_scan(state);
+}
+
+fn spawn_ssdp_startup_scan(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Wait for the network stack and mDNS to settle before scanning.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        info!("ssdp_startup_scan_starting");
+
+        let scanner = state.scanner.lock().await;
+        let devices = scanner.rescan().await;
+        drop(scanner);
+
+        let mut registered = 0u32;
+        let mut outputs = state.outputs.lock().await;
+        for d in &devices {
+            let location = d.location.as_deref().unwrap_or("");
+            if location.is_empty() || outputs.contains(&d.id) {
+                continue;
+            }
+            if let Ok(desc) =
+                tune_core::discovery::xml_parser::fetch_device_description(location).await
+            {
+                if desc.is_media_renderer() {
+                    let service_urls = desc.service_urls();
+                    if let (Some(av), Some(rc)) = (
+                        service_urls.get("avtransport"),
+                        service_urls.get("renderingcontrol"),
+                    ) {
+                        let base = format!("http://{}:{}", d.host, d.port);
+                        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+                            d.name.clone(),
+                            d.id.clone(),
+                            d.host.clone(),
+                            format!("{base}{av}"),
+                            format!("{base}{rc}"),
+                        );
+                        outputs.register(Box::new(dlna));
+                        registered += 1;
+                    }
+                }
+            }
+        }
+        drop(outputs);
+
+        if registered > 0 {
+            // Auto-create zones for new devices
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            let existing_zones = zone_repo.list().unwrap_or_default();
+            for d in &devices {
+                if !existing_zones
+                    .iter()
+                    .any(|z| z.output_device_id.as_deref() == Some(&d.id))
+                {
+                    zone_repo.create(&d.name, Some(&d.id), Some("dlna")).ok();
+                }
+            }
+        }
+
+        info!(
+            registered,
+            total = devices.len(),
+            "ssdp_startup_scan_complete"
+        );
+    });
 }
 
 fn spawn_squeezebox_poller(state: &AppState) {
