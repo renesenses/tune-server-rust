@@ -283,54 +283,80 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
         .ok();
 }
 
-/// Fetch an artist image from the mozaiklabs API using a MusicBrainz artist ID.
-///
-/// The API returns JSON with a `data.image_url` field pointing to the image.
-/// Downloads and returns the image bytes.
+/// Fetch an artist image. Tries mozaiklabs first, then MusicBrainz/Wikimedia Commons.
 pub async fn fetch_artist_image(mbid: &str) -> Option<Vec<u8>> {
-    let api_url = format!("https://mozaiklabs.fr/api/v1/artists/{mbid}");
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
 
-    let resp = client.get(&api_url).send().await.ok()?;
+    if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
+        return Some(bytes);
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    fetch_artist_image_musicbrainz(&client, mbid).await
+}
+
+async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+    let resp = client
+        .get(format!("https://mozaiklabs.fr/api/v1/artists/{mbid}"))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
-
     let data: serde_json::Value = resp.json().await.ok()?;
     let image_url = data
         .pointer("/data/image_url")
         .or_else(|| data.get("image_url"))
         .and_then(|v| v.as_str())?;
-
     if image_url.is_empty() {
         return None;
     }
-
-    // Resolve relative URLs
     let full_url = if image_url.starts_with('/') {
         format!("https://mozaiklabs.fr{image_url}")
     } else {
         image_url.to_string()
     };
+    download_image(client, &full_url).await
+}
 
-    // Rate limit before downloading the image
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let img_resp = client.get(&full_url).send().await.ok()?;
-    if !img_resp.status().is_success() {
+async fn fetch_artist_image_musicbrainz(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+    let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
         return None;
     }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let relations = data["relations"].as_array()?;
+    let commons_page = relations.iter().find_map(|r| {
+        if r["type"].as_str() == Some("image") {
+            r["url"]["resource"].as_str().map(|s| s.to_string())
+        } else {
+            None
+        }
+    })?;
+    let filename = commons_page.rsplit("File:").next()?;
+    let direct_url = format!(
+        "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
+        filename.replace(' ', "_")
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    download_image(client, &direct_url).await
+}
 
-    let bytes = img_resp.bytes().await.ok()?;
-    // Reject tiny responses (likely error pages or placeholders)
+async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
     if bytes.len() < 1000 {
         return None;
     }
-
     Some(bytes.to_vec())
 }
 
