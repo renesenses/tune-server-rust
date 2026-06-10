@@ -61,6 +61,8 @@ pub struct TuneConfig {
     pub prebuffer_seconds: f64,
     pub local_exclusive_mode: bool,
     pub local_latency_ms: u32,
+    /// Audio host backend on Windows: "auto", "wasapi", or "asio".
+    pub local_audio_backend: String,
 
     // DSP
     pub dsp_enabled: bool,
@@ -170,6 +172,7 @@ impl Default for TuneConfig {
             prebuffer_seconds: 0.5,
             local_exclusive_mode: false,
             local_latency_ms: 50,
+            local_audio_backend: "auto".into(),
             dsp_enabled: false,
             dsp_filter: String::new(),
             dsp_impulse_response: String::new(),
@@ -238,6 +241,7 @@ impl TuneConfig {
         );
         env_u32("TUNE_MAX_SAMPLE_RATE", &mut config.max_sample_rate);
         env_u32("TUNE_MAX_BIT_DEPTH", &mut config.max_bit_depth);
+        env_str("TUNE_LOCAL_AUDIO_BACKEND", &mut config.local_audio_backend);
         env_bool("TUNE_METADATA_READONLY", &mut config.metadata_readonly);
         env_str("TUNE_DISCOGS_TOKEN", &mut config.discogs_token);
         env_str("TUNE_LASTFM_API_KEY", &mut config.lastfm_api_key);

@@ -254,7 +254,8 @@ fn spawn_local_audio_rescan(_state: &AppState) {}
 /// Removes devices that have disappeared (unless actively playing).
 #[cfg(feature = "local-audio")]
 pub async fn rescan_local_audio_devices(state: &AppState) {
-    let devices = tune_core::outputs::local::list_audio_devices();
+    let audio_backend = &state.config.local_audio_backend;
+    let devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
     let mut outputs = state.outputs.lock().await;
     let existing_ids: std::collections::HashSet<String> = outputs
         .list()
@@ -279,7 +280,11 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         }
 
         // New device found — register it
-        let local_out = tune_core::outputs::local::LocalOutput::new(dev.name.clone());
+        let local_out = tune_core::outputs::local::LocalOutput::with_options(
+            dev.name.clone(),
+            false,
+            audio_backend,
+        );
         outputs.register(Box::new(local_out));
         registered_count += 1;
 

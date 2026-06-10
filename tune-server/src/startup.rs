@@ -199,7 +199,8 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
 /// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
-    let devices = tune_core::outputs::local::list_audio_devices();
+    let audio_backend = &state.config.local_audio_backend;
+    let devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
@@ -207,7 +208,11 @@ pub async fn register_local_outputs(state: &AppState) {
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
-            let local_out = tune_core::outputs::local::LocalOutput::new(dev.name.clone());
+            let local_out = tune_core::outputs::local::LocalOutput::with_options(
+                dev.name.clone(),
+                false,
+                audio_backend,
+            );
             outputs.register(Box::new(local_out));
             info!(
                 name = %dev.name,

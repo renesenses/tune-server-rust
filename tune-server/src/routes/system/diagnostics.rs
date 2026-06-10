@@ -43,17 +43,23 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     drop(registry);
 
     // Audio outputs
-    let audio_outputs: Vec<String> = {
+    let audio_backend_pref = &state.config.local_audio_backend;
+    let (audio_outputs, audio_backend_name, asio_avail) = {
         #[cfg(feature = "local-audio")]
         {
-            tune_core::outputs::local::list_audio_devices()
-                .iter()
-                .map(|d| d.name.clone())
-                .collect()
+            let devs: Vec<String> =
+                tune_core::outputs::local::list_audio_devices_with_backend(audio_backend_pref)
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .collect();
+            let name = tune_core::outputs::local::active_backend_name(audio_backend_pref);
+            let asio = tune_core::outputs::local::asio_available();
+            (devs, name, asio)
         }
         #[cfg(not(feature = "local-audio"))]
         {
-            Vec::new()
+            let _ = audio_backend_pref;
+            (Vec::<String>::new(), "none", false)
         }
     };
 
@@ -92,6 +98,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "discovered_devices": devices_by_type,
         "connectors": connectors,
         "audio_outputs_available": audio_outputs,
+        "audio_backend": audio_backend_name,
+        "asio_available": asio_avail,
         "scan_status": {
             "status": scan_status,
             "tracks": tracks,

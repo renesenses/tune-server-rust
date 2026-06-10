@@ -19,6 +19,9 @@ music_dirs = [
 # qobuz_app_id = ""
 # qobuz_app_secret = ""
 
+# Audio backend on Windows: "auto", "wasapi", or "asio"
+# local_audio_backend = "auto"
+
 # DLNA play delay (ms) — for slow renderers (Atoll, Micromega, Wiim)
 # that need a pause between SetAVTransportURI and Play
 # dlna_play_delay_ms = 0

@@ -55,5 +55,6 @@ axum = { workspace = true }
 [features]
 default = ["local-audio"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
+asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
 postgres = ["dep:sqlx"]

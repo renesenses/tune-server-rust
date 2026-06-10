@@ -101,6 +101,9 @@ jobs:
       - name: Build (native, Windows with local-audio)
         if: "!matrix.cross && runner.os == 'Windows'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
+        # NOTE: To build with ASIO support, use --features oaat,local-audio,asio
+        # and set CPAL_ASIO_DIR to the ASIO SDK path. The ASIO SDK must be
+        # downloaded from Steinberg (https://www.steinberg.net/asiosdk).
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"

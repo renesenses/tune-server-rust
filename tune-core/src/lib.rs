@@ -66,6 +66,8 @@ pub fn enabled_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     #[cfg(feature = "local-audio")]
     features.push("local-audio");
+    #[cfg(feature = "asio")]
+    features.push("asio");
     #[cfg(feature = "oaat")]
     features.push("oaat");
     features

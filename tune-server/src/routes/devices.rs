@@ -176,14 +176,26 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn list_audio_devices() -> Json<Value> {
+async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
-        let devices = tune_core::outputs::local::list_audio_devices();
-        Json(json!(devices))
+        let backend = &state.config.local_audio_backend;
+        let devices = tune_core::outputs::local::list_audio_devices_with_backend(backend);
+        Json(json!({
+            "devices": devices,
+            "backend": tune_core::outputs::local::active_backend_name(backend),
+            "asio_available": tune_core::outputs::local::asio_available(),
+        }))
     }
     #[cfg(not(feature = "local-audio"))]
-    Json(json!([]))
+    {
+        let _ = state;
+        Json(json!({
+            "devices": [],
+            "backend": "none",
+            "asio_available": false,
+        }))
+    }
 }
 
 /// Trigger immediate re-enumeration of local audio devices (USB DAC hot-plug).

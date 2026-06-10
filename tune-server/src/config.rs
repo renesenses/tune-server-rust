@@ -34,6 +34,13 @@ pub struct TuneConfig {
     /// Format: `postgres://user:pass@host:5432/dbname`
     #[serde(default)]
     pub database_url: Option<String>,
+    /// Audio host backend on Windows: "auto", "wasapi", or "asio".
+    #[serde(default = "default_audio_backend")]
+    pub local_audio_backend: String,
+}
+
+fn default_audio_backend() -> String {
+    "auto".into()
 }
 
 impl TuneConfig {
@@ -67,6 +74,7 @@ impl Default for TuneConfig {
             openai_api_key: None,
             advertised_ip: None,
             database_url: None,
+            local_audio_backend: "auto".into(),
         }
     }
 }
@@ -185,6 +193,11 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.database_url = Some(v);
+        }
+        if let Ok(v) = std::env::var("TUNE_LOCAL_AUDIO_BACKEND")
+            && !v.is_empty()
+        {
+            config.local_audio_backend = v;
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();

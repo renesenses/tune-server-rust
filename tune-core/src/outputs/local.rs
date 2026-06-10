@@ -12,6 +12,111 @@ use tracing::{debug, info, warn};
 use super::traits::{OutputStatus, OutputTarget, TransportState};
 
 // ---------------------------------------------------------------------------
+// Audio host selection (WASAPI vs ASIO on Windows)
+// ---------------------------------------------------------------------------
+
+/// Select the cpal host based on the requested backend.
+///
+/// - `"asio"`: use the ASIO host (requires `asio` cargo feature; Windows only)
+/// - `"wasapi"`: use the default host (WASAPI on Windows)
+/// - `"auto"` (default): try ASIO first if available, fall back to default
+///
+/// On non-Windows platforms, always returns `cpal::default_host()`.
+pub fn select_host(backend: &str) -> cpal::Host {
+    let backend_lower = backend.to_lowercase();
+
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        match backend_lower.as_str() {
+            "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
+                Ok(host) => {
+                    info!(backend = "asio", "local_audio_host_selected");
+                    return host;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "local_audio_asio_host_unavailable — check ASIO driver installation"
+                    );
+                    info!(backend = "wasapi", "local_audio_host_fallback");
+                    return cpal::default_host();
+                }
+            },
+            "auto" => match cpal::host_from_id(cpal::HostId::Asio) {
+                Ok(host) => {
+                    info!(backend = "asio", "local_audio_host_selected_auto");
+                    return host;
+                }
+                Err(_) => {
+                    debug!("local_audio_asio_not_available_using_wasapi");
+                    return cpal::default_host();
+                }
+            },
+            _ => {
+                info!(backend = "wasapi", "local_audio_host_selected");
+                return cpal::default_host();
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        let _ = &backend_lower;
+        if backend_lower == "asio" {
+            warn!(
+                "local_audio_asio_requested_but_not_available — \
+                 ASIO requires Windows and the `asio` cargo feature"
+            );
+        }
+        cpal::default_host()
+    }
+}
+
+/// Returns the name of the audio backend for the given preference.
+pub fn active_backend_name(backend: &str) -> &'static str {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        match backend.to_lowercase().as_str() {
+            "asio" => "ASIO",
+            "wasapi" => "WASAPI",
+            "auto" => {
+                if cpal::host_from_id(cpal::HostId::Asio).is_ok() {
+                    "ASIO"
+                } else {
+                    "WASAPI"
+                }
+            }
+            _ => "WASAPI",
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        let _ = backend;
+        #[cfg(target_os = "windows")]
+        {
+            "WASAPI"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "CoreAudio"
+        }
+        #[cfg(target_os = "linux")]
+        {
+            "ALSA"
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            "default"
+        }
+    }
+}
+
+/// Returns `true` if this build includes ASIO support.
+pub fn asio_available() -> bool {
+    cfg!(all(target_os = "windows", feature = "asio"))
+}
+
+// ---------------------------------------------------------------------------
 // Device enumeration
 // ---------------------------------------------------------------------------
 
@@ -21,10 +126,19 @@ pub struct AudioDevice {
     pub is_default: bool,
     pub max_channels: u16,
     pub sample_rates: Vec<u32>,
+    /// The audio backend this device was enumerated from.
+    #[serde(default)]
+    pub backend: String,
 }
 
+/// List audio devices using the default host.
 pub fn list_audio_devices() -> Vec<AudioDevice> {
-    let host = cpal::default_host();
+    list_audio_devices_with_backend("auto")
+}
+
+/// List audio devices using the specified backend preference.
+pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
+    let host = select_host(backend);
     let host_name = host.id().name();
     let default_name = host
         .default_output_device()
@@ -111,6 +225,7 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
                     is_default,
                     max_channels,
                     sample_rates,
+                    backend: host_name.to_string(),
                 });
             }
         }
@@ -240,6 +355,8 @@ pub struct LocalOutput {
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
     exclusive_mode: bool,
+    /// Audio backend preference: "auto", "wasapi", or "asio" (Windows only).
+    audio_backend: String,
     /// Set by stop() to immediately silence the cpal callback, even if
     /// the playback thread hasn't exited yet.  Prevents overlapping audio
     /// when switching tracks and the old thread is still draining.
@@ -253,15 +370,17 @@ pub struct LocalOutput {
 
 impl LocalOutput {
     pub fn new(device_name: String) -> Self {
-        Self::new_with_exclusive(device_name, false)
+        Self::with_options(device_name, false, "auto")
     }
 
     /// Create a new `LocalOutput` with explicit exclusive-mode control.
-    ///
-    /// When `exclusive_mode` is `true` and the platform is macOS, playback
-    /// claims hog mode on the device and sets the hardware sample rate / bit
-    /// depth to match the source, bypassing the system audio mixer.
     pub fn new_with_exclusive(device_name: String, exclusive_mode: bool) -> Self {
+        Self::with_options(device_name, exclusive_mode, "auto")
+    }
+
+    /// Create a new `LocalOutput` with full control over exclusive mode and
+    /// audio backend selection.
+    pub fn with_options(device_name: String, exclusive_mode: bool, audio_backend: &str) -> Self {
         let device_id = format!("local:{device_name}");
         Self {
             device_name,
@@ -279,20 +398,14 @@ impl LocalOutput {
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
             exclusive_mode,
+            audio_backend: audio_backend.to_string(),
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
 
     /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
     pub fn supports_exclusive_mode() -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            true
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        cfg!(target_os = "macos") || cfg!(all(target_os = "windows", feature = "asio"))
     }
 }
 
@@ -678,6 +791,7 @@ impl OutputTarget for LocalOutput {
         let volume = self.volume.clone();
         let position_ms = self.position_ms.clone();
         let exclusive_mode = self.exclusive_mode;
+        let audio_backend = self.audio_backend.clone();
 
         // Store metadata
         *self.current_uri.lock().unwrap() = Some(url.clone());
@@ -811,7 +925,7 @@ impl OutputTarget for LocalOutput {
                 let dec_sr = dec_sample_rate;
                 let decoded_len = decoded_samples.len();
 
-                let host = cpal::default_host();
+                let host = select_host(&audio_backend);
                 let device = if device_name == "default" {
                     host.default_output_device()
                 } else {
@@ -1087,7 +1201,7 @@ impl OutputTarget for LocalOutput {
             let _ = exclusive_mode;
 
             // ------- Open cpal device (shared mode) -------
-            let host = cpal::default_host();
+            let host = select_host(&audio_backend);
             let device = if device_name == "default" {
                 host.default_output_device()
             } else {
@@ -1607,9 +1721,10 @@ impl OutputTarget for LocalOutput {
 
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
+        let backend = self.audio_backend.clone();
         // Probe on a blocking thread to avoid cpal blocking the async runtime
         tokio::task::spawn_blocking(move || {
-            let host = cpal::default_host();
+            let host = select_host(&backend);
             if name == "default" {
                 return host.default_output_device().is_some();
             }
