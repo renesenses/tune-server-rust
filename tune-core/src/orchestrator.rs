@@ -371,55 +371,71 @@ impl PlaybackOrchestrator {
             };
             tokio::spawn(async move {
                 debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
-                // Use spawn_blocking for the synchronous decode — reading from
-                // NAS/SMB paths can block for seconds and must not starve the
-                // tokio runtime (which also serves the HTTP stream to LocalOutput).
-                let fp_clone = fp.clone();
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm(
-                        &fp_clone,
-                        Some(out_sr),
-                        Some(channels as u32),
-                        0.0,
-                        0.0,
-                    )
-                })
-                .await;
 
-                let decode_result = match decode_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(error = %e, file = %fp, "transcode_decode_task_panic");
-                        return;
+                if target_format_str == "wav" {
+                    // PROGRESSIVE STREAMING: decode packet-by-packet and send
+                    // PCM chunks as they are decoded. The DLNA renderer can
+                    // start fetching immediately — no need to wait for the
+                    // entire file to be transcoded. This dramatically reduces
+                    // track transition latency (from multi-second to <500ms).
+                    let fp_clone = fp.clone();
+                    let tx_clone = tx.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming(
+                            &fp_clone,
+                            Some(out_sr),
+                            Some(channels as u32),
+                            tx_clone,
+                            32768,
+                        )
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(_bit_depth)) => {
+                            debug!(file = %fp, "transcode_complete_streaming");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, file = %fp, "transcode_streaming_decode_failed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
+                        }
                     }
-                };
+                } else {
+                    // Non-WAV target (e.g. FLAC encoding): must buffer all PCM
+                    // first because the encoder needs the full input to produce
+                    // a valid container. Still uses spawn_blocking for I/O.
+                    let fp_clone = fp.clone();
+                    let decode_result = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm(
+                            &fp_clone,
+                            Some(out_sr),
+                            Some(channels as u32),
+                            0.0,
+                            0.0,
+                        )
+                    })
+                    .await;
 
-                match decode_result {
-                    Ok(decoded) => {
-                        debug!(
-                            samples = decoded.samples_i32.len(),
-                            sample_rate = decoded.sample_rate,
-                            channels = decoded.channels,
-                            bit_depth = decoded.bit_depth,
-                            "transcode_decoded"
-                        );
-                        let pcm_bytes = decoded.pcm_bytes();
+                    let decode_result = match decode_result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, file = %fp, "transcode_decode_task_panic");
+                            return;
+                        }
+                    };
 
-                        if target_format_str == "wav" {
-                            // WAV target: send raw PCM only. The HTTP stream
-                            // handler already prepends a WAV header with the
-                            // correct data size (from duration_ms). Sending a
-                            // complete WAV (header + PCM) here would produce a
-                            // double header, causing silence on strict DLNA
-                            // renderers (e.g. Denon RCD-N12).
-                            for chunk in pcm_bytes.chunks(32768) {
-                                if tx.send(chunk.to_vec()).await.is_err() {
-                                    debug!("transcode_consumer_dropped");
-                                    return;
-                                }
-                            }
-                            debug!(file = %fp, pcm_bytes = pcm_bytes.len(), "transcode_complete_raw_pcm");
-                        } else {
+                    match decode_result {
+                        Ok(decoded) => {
+                            debug!(
+                                samples = decoded.samples_i32.len(),
+                                sample_rate = decoded.sample_rate,
+                                channels = decoded.channels,
+                                bit_depth = decoded.bit_depth,
+                                "transcode_decoded"
+                            );
+                            let pcm_bytes = decoded.pcm_bytes();
                             let actual_bd = decoded.bit_depth;
                             // Encode to target format using native bit depth
                             let mut encoder = crate::audio::encoder::AudioEncoder::new(
@@ -452,9 +468,9 @@ impl PlaybackOrchestrator {
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, file = %fp, "transcode_decode_failed");
+                        Err(e) => {
+                            warn!(error = %e, file = %fp, "transcode_decode_failed");
+                        }
                     }
                 }
             });
@@ -639,15 +655,18 @@ impl PlaybackOrchestrator {
                     }
                 };
 
-                // Decode to PCM — use spawn_blocking since decode does sync I/O
+                // Progressive decode: stream PCM chunks as they are decoded.
+                // The DLNA renderer can start fetching as soon as first chunks
+                // arrive, reducing transition latency after download completes.
                 let tmp_file_clone = tmp_file.clone();
+                let tx_clone = tx.clone();
                 let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm(
+                    crate::audio::decode::decode_to_pcm_streaming(
                         &tmp_file_clone,
                         Some(sr),
                         Some(2),
-                        0.0,
-                        0.0,
+                        tx_clone,
+                        32768,
                     )
                 })
                 .await;
@@ -655,38 +674,15 @@ impl PlaybackOrchestrator {
                 // Clean up temp file
                 let _ = std::fs::remove_file(&tmp_file);
 
-                let decode_result = match decode_result {
-                    Ok(r) => r,
+                match decode_result {
+                    Ok(Ok(_bit_depth)) => {
+                        debug!("streaming_transcode_complete_progressive");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "streaming_transcode_decode_failed");
+                    }
                     Err(e) => {
                         warn!(error = %e, "streaming_transcode_decode_task_panic");
-                        return;
-                    }
-                };
-
-                match decode_result {
-                    Ok(decoded) => {
-                        debug!(
-                            samples = decoded.samples_i32.len(),
-                            sample_rate = decoded.sample_rate,
-                            channels = decoded.channels,
-                            bit_depth = decoded.bit_depth,
-                            "streaming_transcode_decoded"
-                        );
-                        let pcm_bytes = decoded.pcm_bytes();
-
-                        // Send raw PCM only — the HTTP stream handler
-                        // prepends the WAV header. Sending a complete WAV
-                        // (header + PCM) would produce a double header.
-                        for chunk in pcm_bytes.chunks(32768) {
-                            if tx.send(chunk.to_vec()).await.is_err() {
-                                debug!("streaming_transcode_consumer_dropped");
-                                return;
-                            }
-                        }
-                        debug!(pcm_bytes = pcm_bytes.len(), "streaming_transcode_complete");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "streaming_transcode_decode_failed");
                     }
                 }
             });

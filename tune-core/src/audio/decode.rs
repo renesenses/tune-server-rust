@@ -9,6 +9,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Tr
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
+use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
@@ -161,6 +162,178 @@ pub fn decode_to_pcm(
             Err(format!("decode panic ({ext}): {msg}"))
         }
     }
+}
+
+/// Streaming decode: decodes a file packet-by-packet and sends PCM chunks
+/// progressively through the provided channel. This allows the HTTP stream
+/// handler to start serving data to the DLNA renderer immediately, without
+/// waiting for the entire file to be decoded.
+///
+/// Returns the source bit depth on success so the caller can set up headers.
+/// For non-symphonia formats (AIFF, DSD, WavPack, APE), falls back to full
+/// decode + chunked send (still benefits from the early session creation).
+pub fn decode_to_pcm_streaming(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+) -> Result<u16, String> {
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Non-symphonia formats: fall back to full decode then stream chunks.
+    // This still benefits from the session being created early.
+    if matches!(ext.as_str(), "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape") {
+        let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
+        let pcm_bytes = decoded.pcm_bytes();
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for streaming decode")?;
+        for chunk in pcm_bytes.chunks(chunk_size) {
+            if rt.block_on(tx.send(chunk.to_vec())).is_err() {
+                debug!("streaming_decode_consumer_dropped (fallback)");
+                return Ok(decoded.bit_depth);
+            }
+        }
+        return Ok(decoded.bit_depth);
+    }
+
+    // Symphonia streaming decode: packet-by-packet progressive output
+    let file = File::open(file_path).map_err(|e| format!("open: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let mut format: Box<dyn FormatReader> = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("probe: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("no default audio track")?;
+
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("track has no audio codec parameters".into()),
+    };
+    let track_id = track.id;
+    let source_channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u32)
+        .unwrap_or(2);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("decoder: {e}"))?;
+
+    let source_bd = audio_params.bits_per_sample.unwrap_or(16) as u16;
+    let shift = 32u16.saturating_sub(source_bd);
+
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|_| "no tokio runtime for streaming decode")?;
+
+    // Accumulate PCM bytes and flush when exceeding chunk_size.
+    // This avoids sending tiny per-packet buffers over the channel.
+    let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let mut total_samples: usize = 0;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(_) => break,
+        };
+
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let mut packet_samples: Vec<i32> = Vec::new();
+        decoded.copy_to_vec_interleaved::<i32>(&mut packet_samples);
+
+        // Normalize: right-justify samples (same as batch decode)
+        if shift > 0 && shift < 32 {
+            for s in packet_samples.iter_mut() {
+                *s >>= shift;
+            }
+        }
+
+        total_samples += packet_samples.len();
+
+        // Convert to PCM bytes based on bit depth
+        match source_bd {
+            24 => {
+                for s in &packet_samples {
+                    let b = s.to_le_bytes();
+                    pcm_buf.extend_from_slice(&[b[0], b[1], b[2]]);
+                }
+            }
+            32 => {
+                for s in &packet_samples {
+                    pcm_buf.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            _ => {
+                // 16-bit
+                for s in &packet_samples {
+                    pcm_buf.extend_from_slice(&(*s as i16).to_le_bytes());
+                }
+            }
+        }
+
+        // Flush accumulated buffer when it exceeds chunk_size
+        while pcm_buf.len() >= chunk_size {
+            let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+            if rt.block_on(tx.send(chunk)).is_err() {
+                debug!("streaming_decode_consumer_dropped");
+                return Ok(source_bd);
+            }
+        }
+    }
+
+    // Flush remaining bytes
+    if !pcm_buf.is_empty() {
+        if rt.block_on(tx.send(pcm_buf)).is_err() {
+            debug!("streaming_decode_consumer_dropped (final)");
+        }
+    }
+
+    let source_rate = audio_params.sample_rate.unwrap_or(44100);
+    let total_frames = total_samples as f64 / source_channels as f64;
+    let duration_s = total_frames / source_rate as f64;
+
+    debug!(
+        file = file_path,
+        samples = total_samples,
+        rate = source_rate,
+        channels = source_channels,
+        duration_s,
+        "decoded_symphonia_streaming"
+    );
+
+    Ok(source_bd)
 }
 
 /// Extract a human-readable message from a panic payload.

@@ -5,8 +5,9 @@ pub struct StreamTrack {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
     pub title: String,
-    #[serde(alias = "artist_name")]
+    #[serde(rename(serialize = "artist_name"), alias = "artist_name")]
     pub artist: String,
+    #[serde(rename(serialize = "album_title"), alias = "album_title")]
     pub album: Option<String>,
     pub album_id: Option<String>,
     pub duration_ms: u64,
@@ -22,7 +23,7 @@ pub struct StreamAlbum {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
     pub title: String,
-    #[serde(alias = "artist_name")]
+    #[serde(rename(serialize = "artist_name"), alias = "artist_name")]
     pub artist: String,
     pub artist_id: Option<String>,
     pub cover_path: Option<String>,
@@ -239,7 +240,10 @@ mod tests {
         // id should serialize as "source_id" due to rename
         assert_eq!(json["source_id"], "123");
         assert_eq!(json["title"], "So What");
-        assert_eq!(json["artist"], "Miles Davis");
+        // artist serializes as "artist_name" for web client compatibility
+        assert_eq!(json["artist_name"], "Miles Davis");
+        // album serializes as "album_title" for web client compatibility
+        assert_eq!(json["album_title"], "Kind of Blue");
         assert_eq!(json["cover_path"], "http://example.com/cover.jpg");
         assert_eq!(json["duration_ms"], 562000);
     }
@@ -273,6 +277,8 @@ mod tests {
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["source_id"], "789");
         assert_eq!(json["title"], "Kind of Blue");
+        // artist serializes as "artist_name" for web client compatibility
+        assert_eq!(json["artist_name"], "Miles Davis");
         assert_eq!(json["year"], 1959);
         assert_eq!(json["track_count"], 5);
     }

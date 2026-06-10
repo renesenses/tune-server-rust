@@ -436,10 +436,28 @@ async fn service_track_url(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let svc = svc.lock().await;
+    let mut svc = svc.lock().await;
 
     match svc.get_track_url(&track_id, None).await {
         Ok(url) => Json(json!(url)).into_response(),
+        Err(ref e) if e.contains("401") || e.contains("403") => {
+            // Token may have expired — attempt refresh and retry once
+            if svc.refresh_if_needed().await.unwrap_or(false) {
+                drop(svc);
+                state.save_tokens().await;
+                let svc = match get_svc(&state, &service).await {
+                    Ok(s) => s,
+                    Err(e) => return e.into_response(),
+                };
+                let svc = svc.lock().await;
+                match svc.get_track_url(&track_id, None).await {
+                    Ok(url) => Json(json!(url)).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                }
+            } else {
+                (StatusCode::BAD_GATEWAY, e.clone()).into_response()
+            }
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
@@ -546,7 +564,7 @@ async fn service_favorites(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let svc = svc.lock().await;
+    let mut svc = svc.lock().await;
     let result = match fav_type.as_str() {
         "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
         "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
@@ -558,6 +576,33 @@ async fn service_favorites(
     };
     match result {
         Ok(data) => Json(data).into_response(),
+        Err(ref e) if e.contains("401") || e.contains("403") => {
+            // Token expired — attempt refresh and retry
+            if svc.refresh_if_needed().await.unwrap_or(false) {
+                drop(svc);
+                state.save_tokens().await;
+                let svc = match get_svc(&state, &service).await {
+                    Ok(s) => s,
+                    Err(e) => return e.into_response(),
+                };
+                let svc = svc.lock().await;
+                let retry = match fav_type.as_str() {
+                    "tracks" => svc.get_user_tracks().await.map(|t| json!({ "tracks": t })),
+                    "albums" => svc.get_user_albums().await.map(|a| json!({ "albums": a })),
+                    "artists" => svc
+                        .get_user_artists()
+                        .await
+                        .map(|a| json!({ "artists": a })),
+                    _ => Err(format!("unknown favorite type: {fav_type}")),
+                };
+                match retry {
+                    Ok(data) => Json(data).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                }
+            } else {
+                (StatusCode::BAD_GATEWAY, e.clone()).into_response()
+            }
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
 }
