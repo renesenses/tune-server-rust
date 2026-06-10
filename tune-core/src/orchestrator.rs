@@ -221,10 +221,25 @@ impl PlaybackOrchestrator {
         if let Some(ref source) = req.source
             && source != "local"
         {
+            if source == "podcast" || source == "radio" {
+                return self.resolve_direct_url(req).await;
+            }
             return self.resolve_streaming_url(source, req).await;
         }
 
         self.resolve_local_track(req).await
+    }
+
+    async fn resolve_direct_url(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        let audio_url = req.source_id.as_deref().ok_or("source_id (audio URL) required for podcast/radio playback")?;
+        let title = req.title.clone().unwrap_or_else(|| "Episode".into());
+        let artist = req.artist_name.clone();
+        let album = req.album_title.clone();
+        let cover_url = req.cover_url.clone();
+        let duration_ms = req.duration_ms;
+        let source = req.source.clone().unwrap_or_else(|| "podcast".into());
+        let mime_type = guess_mime_from_url(audio_url);
+        Ok(ResolvedStream { url: audio_url.to_string(), mime_type: mime_type.to_string(), title, artist, album, duration_ms, source, cover_url, stream_id: None, file_size: None })
     }
 
     async fn resolve_local_track(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
@@ -1313,6 +1328,17 @@ impl PlaybackOrchestrator {
                 .ok();
         }
     }
+}
+
+fn guess_mime_from_url(url: &str) -> &'static str {
+    let lower = url.to_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    if path.ends_with(".mp3") { "audio/mpeg" }
+    else if path.ends_with(".m4a") || path.ends_with(".aac") || path.ends_with(".mp4") { "audio/mp4" }
+    else if path.ends_with(".ogg") || path.ends_with(".opus") { "audio/ogg" }
+    else if path.ends_with(".flac") { "audio/flac" }
+    else if path.ends_with(".wav") { "audio/wav" }
+    else { "audio/mpeg" }
 }
 
 #[cfg(test)]
