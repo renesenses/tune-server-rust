@@ -44,12 +44,12 @@ COPY web/ /app/web/
 # Ensure tune user can read the app but not write
 RUN chown -R root:root /app && chmod -R 755 /app
 
-# Create data directory owned by tune
-RUN mkdir -p /data && chown tune:tune /data
+# Create data + artwork_cache directories owned by tune
+RUN mkdir -p /data/artwork_cache && chown -R tune:tune /data
 
 ENV TUNE_PORT=8888 \
     TUNE_DB_PATH=/data/tune.db \
-    TUNE_ARTWORK_CACHE=/data/artwork_cache \
+    TUNE_ARTWORK_DIR=/data/artwork_cache \
     TUNE_WEB_DIR=/app/web \
     TUNE_MUSIC_DIRS='["/music"]' \
     TUNE_LOG_LEVEL=info \

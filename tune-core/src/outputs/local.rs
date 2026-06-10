@@ -58,29 +58,44 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
 
                 let is_default = name == default_name;
 
-                let (max_channels, sample_rates) = if let Ok(configs) =
-                    device.supported_output_configs()
-                {
-                    let mut max_ch = 0u16;
-                    let mut rates = Vec::new();
-                    for config in configs {
-                        max_ch = max_ch.max(config.channels());
-                        let min = config.min_sample_rate();
-                        let max = config.max_sample_rate();
-                        for &rate in &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000] {
-                            if rate >= min && rate <= max && !rates.contains(&rate) {
-                                rates.push(rate);
+                let (max_channels, sample_rates) = match device.supported_output_configs() {
+                    Ok(configs) => {
+                        let mut max_ch = 0u16;
+                        let mut rates = Vec::new();
+                        for config in configs {
+                            max_ch = max_ch.max(config.channels());
+                            let min = config.min_sample_rate();
+                            let max = config.max_sample_rate();
+                            for &rate in
+                                &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+                            {
+                                if rate >= min && rate <= max && !rates.contains(&rate) {
+                                    rates.push(rate);
+                                }
                             }
                         }
+                        rates.sort();
+
+                        // PipeWire's ALSA plugin can return Ok but with an
+                        // empty iterator — treat it like an error and fall
+                        // through to the fallback probe below.
+                        if max_ch == 0 || rates.is_empty() {
+                            debug!(
+                                device = %name,
+                                "local_audio_device_supported_configs_empty"
+                            );
+                            probe_device_fallback_caps(&device, &name)
+                        } else {
+                            (max_ch, rates)
+                        }
                     }
-                    rates.sort();
-                    (max_ch, rates)
-                } else {
-                    warn!(
-                        device = %name,
-                        "local_audio_device_no_supported_configs"
-                    );
-                    (2, vec![44100, 48000])
+                    Err(_) => {
+                        debug!(
+                            device = %name,
+                            "local_audio_device_supported_configs_failed"
+                        );
+                        probe_device_fallback_caps(&device, &name)
+                    }
                 };
 
                 info!(
@@ -1654,26 +1669,111 @@ fn feed_ring_abortable(
     }
 }
 
+/// Probe a device's capabilities when `supported_output_configs()` fails or
+/// returns an empty set (common with PipeWire's ALSA compatibility layer).
+///
+/// Strategy:
+/// 1. Try `default_output_config()` — this often works even when enumeration
+///    doesn't (PipeWire handles it at the session-manager level).
+/// 2. If that also fails, assume conservative defaults: stereo, 44100+48000 Hz.
+///    PipeWire will accept these and resample internally.
+fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u32>) {
+    if let Ok(default_cfg) = device.default_output_config() {
+        let cfg = default_cfg.config();
+        let ch = cfg.channels;
+        let sr = cfg.sample_rate;
+        // The default config gives us one known-good rate.  Also include
+        // the other standard rate (44100 or 48000) since PipeWire's
+        // resampler handles both transparently.
+        let mut rates = vec![sr];
+        let peer = if sr == 48000 { 44100 } else { 48000 };
+        if !rates.contains(&peer) {
+            rates.push(peer);
+        }
+        rates.sort();
+        info!(
+            device = %name,
+            channels = ch,
+            default_sr = sr,
+            rates = ?rates,
+            "local_audio_device_fallback_via_default_config"
+        );
+        (ch, rates)
+    } else {
+        // Last resort: assume stereo 44100/48000.  PipeWire will accept
+        // these through its ALSA PCM plugin even without enumeration.
+        info!(
+            device = %name,
+            "local_audio_device_fallback_to_assumed_stereo_44100_48000"
+        );
+        (2, vec![44100, 48000])
+    }
+}
+
 /// Find a cpal StreamConfig that matches the desired channels and sample rate.
+///
+/// When `supported_output_configs()` fails (PipeWire ALSA compat), falls back
+/// to `default_output_config()` and, as a last resort, returns a config with
+/// the requested parameters directly — PipeWire will accept and resample.
 fn find_matching_config(
     device: &cpal::Device,
     channels: u16,
     sample_rate: u32,
 ) -> Option<cpal::StreamConfig> {
-    let configs = device.supported_output_configs().ok()?;
-    for config in configs {
-        if config.channels() >= channels
-            && config.min_sample_rate() <= sample_rate
-            && config.max_sample_rate() >= sample_rate
-        {
+    // Primary path: enumerate supported configs
+    if let Ok(configs) = device.supported_output_configs() {
+        let configs_vec: Vec<_> = configs.collect();
+        if !configs_vec.is_empty() {
+            for config in &configs_vec {
+                if config.channels() >= channels
+                    && config.min_sample_rate() <= sample_rate
+                    && config.max_sample_rate() >= sample_rate
+                {
+                    return Some(cpal::StreamConfig {
+                        channels: channels.min(config.channels()),
+                        sample_rate,
+                        buffer_size: cpal::BufferSize::Default,
+                    });
+                }
+            }
+            // Configs exist but none match the requested rate — let caller
+            // handle with its own fallback logic (e.g. try source rate anyway).
+            return None;
+        }
+        // Empty config list — fall through to fallback
+    }
+
+    // Fallback for PipeWire / broken ALSA enumeration:
+    // Try default_output_config() which often works even when enumeration fails.
+    if let Ok(default_cfg) = device.default_output_config() {
+        let cfg = default_cfg.config();
+        // If the default config's rate matches what we want, use it directly.
+        // Otherwise return the default config — the caller will resample.
+        if cfg.sample_rate == sample_rate && cfg.channels >= channels {
             return Some(cpal::StreamConfig {
-                channels: channels.min(config.channels()),
+                channels,
                 sample_rate,
                 buffer_size: cpal::BufferSize::Default,
             });
         }
+        // Return default config even if rate differs — better than nothing.
+        // Caller will set up resampling.
+        return Some(cfg);
     }
-    None
+
+    // Last resort: return the requested config directly.  PipeWire's ALSA
+    // plugin accepts arbitrary configs and resamples/remixes internally.
+    // This will fail on real ALSA without PipeWire, but the caller's
+    // build_output_stream error handling covers that case.
+    debug!(
+        channels,
+        sample_rate, "find_matching_config_using_direct_params_pipewire_fallback"
+    );
+    Some(cpal::StreamConfig {
+        channels,
+        sample_rate,
+        buffer_size: cpal::BufferSize::Default,
+    })
 }
 
 /// Adapt channel count between source and output.
