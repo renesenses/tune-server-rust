@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::db::play_queue_repo::PlayQueueRepo;
 use crate::db::sqlite::SqliteDb;
@@ -160,9 +160,32 @@ pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
             continue;
         }
 
-        // Restore local queue
+        // Restore local queue — filter out track IDs that no longer exist in DB
         if !snapshot.local_track_ids.is_empty() {
-            if let Err(e) = repo.set_queue(zone_id, &snapshot.local_track_ids) {
+            let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+            let valid_ids: Vec<i64> = snapshot
+                .local_track_ids
+                .iter()
+                .copied()
+                .filter(|id| track_repo.get(*id).ok().flatten().is_some())
+                .collect();
+            if valid_ids.is_empty() {
+                debug!(
+                    zone_id,
+                    original = snapshot.local_track_ids.len(),
+                    "queue_restore_all_tracks_gone"
+                );
+                continue;
+            }
+            if valid_ids.len() < snapshot.local_track_ids.len() {
+                debug!(
+                    zone_id,
+                    original = snapshot.local_track_ids.len(),
+                    valid = valid_ids.len(),
+                    "queue_restore_filtered_stale_tracks"
+                );
+            }
+            if let Err(e) = repo.set_queue(zone_id, &valid_ids) {
                 warn!(zone_id, error = %e, "queue_restore_set_queue_failed");
                 continue;
             }
