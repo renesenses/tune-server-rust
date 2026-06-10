@@ -5,10 +5,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::info;
 
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::discovery::device::dedup_devices;
 use tune_core::discovery::xml_parser::fetch_device_description;
+use tune_core::outputs::bluos::BluosOutput;
 use tune_core::outputs::dlna::DlnaOutput;
 
 use crate::state::AppState;
@@ -17,6 +20,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_devices))
         .route("/list", get(list_devices))
+        .route("/add", post(add_device))
         .route("/scan", post(scan_devices))
         .route("/rescan", post(rescan_local_devices))
         .route("/audio", get(list_audio_devices))
@@ -97,6 +101,228 @@ async fn list_devices(State(state): State<AppState>) -> Json<Value> {
     }
 
     Json(json!(items))
+}
+
+// ---------------------------------------------------------------------------
+// Manual Device Addition
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AddDeviceRequest {
+    r#type: String,
+    host: String,
+    port: Option<u16>,
+    name: Option<String>,
+}
+
+async fn add_device(
+    State(state): State<AppState>,
+    Json(body): Json<AddDeviceRequest>,
+) -> impl IntoResponse {
+    let device_type = body.r#type.to_lowercase();
+    let host = body.host.trim().to_string();
+
+    if host.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "host is required"})),
+        )
+            .into_response();
+    }
+
+    match device_type.as_str() {
+        "bluos" => {
+            let port = body.port.unwrap_or(11000);
+            // Probe the device by fetching /Status
+            let probe_url = format!("http://{}:{}/Status", host, port);
+            let probe = state
+                .http_client
+                .get(&probe_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+
+            match probe {
+                Ok(resp) if resp.status().is_success() => {
+                    let xml = resp.text().await.unwrap_or_default();
+                    // Try to extract device name from Status XML if not provided
+                    let device_name = body.name.unwrap_or_else(|| {
+                        extract_xml_tag(&xml, "name")
+                            .or_else(|| extract_xml_tag(&xml, "modelName"))
+                            .unwrap_or_else(|| format!("BluOS {}", host))
+                    });
+                    let device_id = format!("bluos-{}-{}", host, port);
+
+                    let bluos = BluosOutput::new(
+                        device_name.clone(),
+                        device_id.clone(),
+                        host.clone(),
+                        port,
+                    );
+
+                    let mut outputs = state.outputs.lock().await;
+                    outputs.register(Box::new(bluos));
+                    drop(outputs);
+
+                    // Auto-create zone
+                    let zone_repo = ZoneRepo::new(state.db.clone());
+                    let existing = zone_repo.list().unwrap_or_default();
+                    let already = existing
+                        .iter()
+                        .any(|z| z.output_device_id.as_deref() == Some(&device_id));
+                    let zone_id = if already {
+                        let _ = zone_repo.set_online_by_device(&device_id, true);
+                        existing
+                            .iter()
+                            .find(|z| z.output_device_id.as_deref() == Some(&device_id))
+                            .and_then(|z| z.id)
+                    } else {
+                        zone_repo.create(&device_name, Some("bluos"), Some(&device_id)).ok()
+                    };
+
+                    info!(name = %device_name, id = %device_id, host = %host, port, "manual_bluos_device_added");
+
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "status": "ok",
+                            "device_id": device_id,
+                            "name": device_name,
+                            "type": "bluos",
+                            "host": host,
+                            "port": port,
+                            "zone_id": zone_id,
+                        })),
+                    )
+                        .into_response()
+                }
+                Ok(resp) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("BluOS device at {}:{} responded with status {}", host, port, resp.status()),
+                        "hint": "Verify the IP address and port. BluOS default port is 11000."
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("Cannot reach BluOS device at {}:{}: {}", host, port, e),
+                        "hint": "Verify the IP address is correct and the device is powered on."
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        "dlna" => {
+            let port = body.port.unwrap_or(80);
+            // For DLNA, try to fetch the device description XML
+            let location = format!("http://{}:{}/description.xml", host, port);
+            match fetch_device_description(&location).await {
+                Ok(desc) if desc.is_media_renderer() => {
+                    let service_urls = desc.service_urls();
+                    let av_url = service_urls.get("avtransport");
+                    let rc_url = service_urls.get("renderingcontrol");
+
+                    if let (Some(av), Some(rc)) = (av_url, rc_url) {
+                        let base = format!("http://{}:{}", host, port);
+                        let device_name = body.name.unwrap_or_else(|| {
+                            format!("DLNA {}", host)
+                        });
+                        let device_id = format!("dlna-{}-{}", host, port);
+                        let delay = state.config.play_delay_for(&device_name);
+
+                        let dlna = DlnaOutput::new(
+                            device_name.clone(),
+                            device_id.clone(),
+                            host.clone(),
+                            format!("{base}{av}"),
+                            format!("{base}{rc}"),
+                        )
+                        .with_play_delay(delay);
+
+                        let mut outputs = state.outputs.lock().await;
+                        outputs.register(Box::new(dlna));
+                        drop(outputs);
+
+                        // Auto-create zone
+                        let zone_repo = ZoneRepo::new(state.db.clone());
+                        let existing = zone_repo.list().unwrap_or_default();
+                        let already = existing
+                            .iter()
+                            .any(|z| z.output_device_id.as_deref() == Some(&device_id));
+                        let zone_id = if already {
+                            let _ = zone_repo.set_online_by_device(&device_id, true);
+                            existing
+                                .iter()
+                                .find(|z| z.output_device_id.as_deref() == Some(&device_id))
+                                .and_then(|z| z.id)
+                        } else {
+                            zone_repo.create(&device_name, Some("dlna"), Some(&device_id)).ok()
+                        };
+
+                        info!(name = %device_name, id = %device_id, host = %host, port, "manual_dlna_device_added");
+
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "status": "ok",
+                                "device_id": device_id,
+                                "name": device_name,
+                                "type": "dlna",
+                                "host": host,
+                                "port": port,
+                                "zone_id": zone_id,
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({
+                                "error": "Device is a media renderer but missing AVTransport or RenderingControl services",
+                                "hint": "This DLNA device may not support playback control."
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+                Ok(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("Device at {}:{} is not a DLNA Media Renderer", host, port),
+                        "hint": "Verify the device supports UPnP AV / DLNA rendering."
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("Cannot fetch DLNA description from {}:{}: {}", host, port, e),
+                        "hint": "Verify the IP address and port. Try browsing to the device description URL."
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Unsupported device type: '{}'. Supported: bluos, dlna", device_type),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Extract a tag value from XML (simple, non-recursive).
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let text = xml[start..end].trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 async fn scan_devices(State(state): State<AppState>) -> Json<Value> {

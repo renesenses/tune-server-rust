@@ -57,6 +57,10 @@ impl OutputTarget for BluosOutput {
         "bluos"
     }
 
+    fn host(&self) -> Option<&str> {
+        Some(&self.host)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.api_get("Play", &[("url", media.url)]).await?;
         info!(device = %self.name, url = media.url, "bluos_play");

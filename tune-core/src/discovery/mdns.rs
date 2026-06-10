@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::device::{DiscoveredDevice, OutputType};
 
@@ -176,11 +176,16 @@ impl MdnsScanner {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
+        let mut has_bluos = false;
         for config in &self.configs {
             let receiver = self
                 .daemon
                 .browse(&config.service_type)
                 .map_err(|e| format!("browse {}: {e}", config.service_type))?;
+
+            if config.output_type == OutputType::Bluos {
+                has_bluos = true;
+            }
 
             let state = self.state.clone();
             let event_tx = self.event_tx.clone();
@@ -203,6 +208,29 @@ impl MdnsScanner {
 
             info!(service = %config.service_type, "mdns_browse_started");
         }
+
+        // Diagnostic: warn after 30s if no BluOS device was discovered via mDNS.
+        // Helps users diagnose mDNS issues (firewalls, VLANs, VPN blocking multicast).
+        if has_bluos {
+            let state = self.state.clone();
+            self.tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let st = state.lock().await;
+                let bluos_count = st
+                    .devices
+                    .values()
+                    .filter(|d| d.device_type == OutputType::Bluos)
+                    .count();
+                if bluos_count == 0 {
+                    warn!(
+                        "mdns_no_bluos_devices_found after 30s — if you have BluOS devices, \
+                         check that mDNS/multicast is not blocked (firewall, VLAN, VPN). \
+                         You can add devices manually via POST /api/v1/devices/add"
+                    );
+                }
+            }));
+        }
+
         Ok(())
     }
 
