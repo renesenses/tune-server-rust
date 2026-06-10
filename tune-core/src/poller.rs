@@ -706,9 +706,13 @@ impl PositionPoller {
                     // (e.g. local/cpal output draining its ring buffer).
                     // Wait POSITION_PAST_END_TICKS consecutive ticks to avoid
                     // cutting off the last fraction of a second of audio.
-                    if track_duration_ms > 0
+                    // Add a 3-second margin to avoid cutting off the end of
+                    // tracks on DLNA renderers that report position slightly
+                    // ahead of actual playback.
+                    let end_margin_ms = 3000u64;
+                    if track_duration_ms > end_margin_ms
                         && played_enough
-                        && status.position_ms >= track_duration_ms
+                        && status.position_ms >= track_duration_ms.saturating_add(end_margin_ms)
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
