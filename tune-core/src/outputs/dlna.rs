@@ -280,8 +280,8 @@ impl OutputTarget for DlnaOutput {
         }
 
         if let Some(ref notify) = media.stream_ready {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified()).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), notify.notified())
+                .await;
             debug!(device = %self.name, "dlna_stream_ready_received");
         } else if self.play_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
