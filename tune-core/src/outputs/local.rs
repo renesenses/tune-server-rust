@@ -1546,10 +1546,13 @@ impl OutputTarget for LocalOutput {
         Ok(())
     }
 
-    async fn seek(&self, _position_ms: u64) -> Result<(), String> {
-        // Seek not supported for streaming local output — the HTTP stream
-        // is consumed sequentially. The orchestrator handles seek by
-        // re-issuing play_url from the desired offset.
+    async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        // The local output plays from an HTTP stream consumed sequentially,
+        // so true seek requires the orchestrator to restart the stream.
+        // However, we immediately update the reported position so that
+        // get_status() reflects the seek target during the grace period
+        // (prevents the progress bar from snapping back).
+        self.position_ms.store(position_ms, Ordering::SeqCst);
         Ok(())
     }
 

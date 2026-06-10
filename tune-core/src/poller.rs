@@ -27,6 +27,11 @@ pub struct ZonePollerMetrics {
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 3;
+/// Grace period (seconds) after a seek during which the poller does not
+/// overwrite the in-memory position with the value reported by the output.
+/// This prevents the progress bar from snapping back to the pre-seek
+/// position while the local/cpal output restarts its stream.
+const SEEK_GRACE_SECS: u64 = 3;
 /// After this many consecutive Stopped ticks without enough playback,
 /// treat as playback failure and stop the zone (don't advance).
 /// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
@@ -331,9 +336,24 @@ impl PositionPoller {
                 }
             };
 
-            self.playback
-                .update_position(zone_id, status.position_ms as i64)
-                .await;
+            // Check whether we're in the seek grace period: after a seek the
+            // in-memory position is authoritative and the output may still
+            // report the old (pre-seek) position until the stream restarts.
+            // During this window we skip overwriting position to prevent the
+            // progress bar from snapping back.
+            let in_seek_grace = zone_state
+                .last_seek_at
+                .map(|t| t.elapsed().as_secs() < SEEK_GRACE_SECS)
+                .unwrap_or(false);
+
+            if !in_seek_grace {
+                self.playback
+                    .update_position(zone_id, status.position_ms as i64)
+                    .await;
+                self.playback
+                    .emit_position(zone_id, status.position_ms as i64);
+            }
+
             if (status.volume - zone_state.volume).abs() > 0.005 {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
@@ -342,8 +362,6 @@ impl PositionPoller {
                     .update_volume(zone_id, vol_int)
                     .ok();
             }
-            self.playback
-                .emit_position(zone_id, status.position_ms as i64);
 
             // --- Persist position to DB periodically ---
             ps.ticks_since_db_save += 1;

@@ -7,6 +7,7 @@ pub mod radio_handler;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
@@ -50,6 +51,11 @@ pub struct ZoneState {
     /// previous track cannot trigger false advances.
     #[serde(default)]
     pub track_generation: u64,
+    /// Timestamp of the last seek operation.  The poller checks this and
+    /// suppresses stale position updates from the output for a brief grace
+    /// period so the UI doesn't snap back to the pre-seek position.
+    #[serde(skip)]
+    pub last_seek_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +80,7 @@ impl Default for ZoneState {
             queue_position: 0,
             queue_length: 0,
             track_generation: 0,
+            last_seek_at: None,
         }
     }
 }
@@ -145,6 +152,7 @@ impl PlaybackManager {
         state.position_ms = 0;
         state.now_playing = Some(np.clone());
         state.track_generation = state.track_generation.wrapping_add(1);
+        state.last_seek_at = None;
 
         self.emit(PlaybackEvent {
             event: "started".into(),
@@ -189,6 +197,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         let np_data = if let Some(state) = zones.get_mut(&zone_id) {
             state.state = PlayState::Stopped;
+            state.last_seek_at = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
             state.now_playing.as_ref().map(|np| {
@@ -233,6 +242,7 @@ impl PlaybackManager {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {
             state.position_ms = position_ms;
+            state.last_seek_at = Some(Instant::now());
         }
         self.emit(PlaybackEvent {
             event: "seek".into(),
