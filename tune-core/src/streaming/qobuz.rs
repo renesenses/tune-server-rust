@@ -26,7 +26,7 @@ impl QobuzService {
     pub fn new(app_id: String, app_secret: String) -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(45))
                 .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
                 .build()
                 .unwrap(),
@@ -85,11 +85,57 @@ impl QobuzService {
             req = req.header("X-User-Auth-Token", token.as_str());
         }
 
-        let resp = req.send().await.map_err(|e| format!("qobuz api: {e}"))?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) if self.use_proxy => {
+                // Proxy unreachable (timeout/network) — fallback to direct API
+                info!(path, error = %e, "qobuz_proxy_failed_trying_direct");
+                return self.api_get_direct(path, params).await;
+            }
+            Err(e) => return Err(format!("qobuz api: {e}")),
+        };
+
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
+            // If proxy returned 5xx, try direct
+            if self.use_proxy && status >= 500 {
+                info!(path, status, "qobuz_proxy_5xx_trying_direct");
+                return self.api_get_direct(path, params).await;
+            }
             info!(path, status, body = %body, "qobuz_api_error");
+            return Err(format!("qobuz {path}: {status} {body}"));
+        }
+
+        resp.json().await.map_err(|e| format!("qobuz json: {e}"))
+    }
+
+    /// Direct API call bypassing the proxy. Used as fallback when proxy is down.
+    async fn api_get_direct(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{API_BASE}{path}");
+        let app_id = self.app_id.as_str();
+        let mut query: Vec<(&str, &str)> = params.to_vec();
+        query.push(("app_id", app_id));
+
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&query)
+            .header("X-App-Id", app_id);
+
+        if let Some(ref token) = self.user_auth_token {
+            req = req.header("X-User-Auth-Token", token.as_str());
+        }
+
+        let resp = req.send().await.map_err(|e| format!("qobuz direct: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            info!(path, status, body = %body, "qobuz_direct_api_error");
             return Err(format!("qobuz {path}: {status} {body}"));
         }
 
@@ -661,6 +707,20 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+        let data = self
+            .api_get(
+                "/album/getFeatured",
+                &[("type", "new-releases"), ("limit", "50")],
+            )
+            .await?;
+        let albums = data["albums"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_album).collect())
+            .unwrap_or_default();
+        Ok(albums)
+    }
+
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
         Ok(vec![
             FeaturedSection {
@@ -678,6 +738,10 @@ impl StreamingService for QobuzService {
             FeaturedSection {
                 id: "editor-picks".into(),
                 name: "Editor Picks".into(),
+            },
+            FeaturedSection {
+                id: "most-streamed".into(),
+                name: "Most Streamed".into(),
             },
         ])
     }

@@ -136,8 +136,17 @@ struct RepeatQuery {
 
 #[derive(Deserialize)]
 struct QueueAddRequest {
+    #[serde(default)]
     track_ids: Vec<i64>,
     position: Option<i64>,
+    // Streaming track fields
+    source: Option<String>,
+    source_id: Option<String>,
+    title: Option<String>,
+    artist_name: Option<String>,
+    album_title: Option<String>,
+    cover_path: Option<String>,
+    duration_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -745,6 +754,65 @@ async fn queue_add(
     Json(body): Json<QueueAddRequest>,
 ) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::new(state.db.clone());
+
+    // --- Streaming track: add to streaming queue ---
+    if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
+        // Resolve metadata if not provided by the client
+        let (title, artist, album, cover, duration) = if body.title.is_some() {
+            (
+                body.title.clone().unwrap_or_default(),
+                body.artist_name.clone().unwrap_or_default(),
+                body.album_title.clone(),
+                body.cover_path.clone(),
+                body.duration_ms.unwrap_or(0),
+            )
+        } else {
+            // Fetch track metadata from the streaming service
+            let registry = state.services.lock().await;
+            if let Some(svc) = registry.get(source) {
+                let svc = svc.lock().await;
+                match svc.get_track(source_id).await {
+                    Ok(t) => (
+                        t.title,
+                        t.artist,
+                        t.album,
+                        t.cover_path,
+                        t.duration_ms as i64,
+                    ),
+                    Err(_) => ("Unknown".into(), String::new(), None, None, 0),
+                }
+            } else {
+                ("Unknown".into(), String::new(), None, None, 0)
+            }
+        };
+
+        let queue_item = vec![(source_id.clone(), title, artist, album, cover, duration)];
+        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_item) {
+            warn!(zone_id, error = %e, "append_streaming_queue_failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        let new_length = queue_repo.count(zone_id).unwrap_or(0);
+        let current_pos = state.playback.get_state(zone_id).await.queue_position;
+        state
+            .playback
+            .update_queue_info(zone_id, current_pos, new_length)
+            .await;
+        persist_queue_async(&state, zone_id);
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "added": 1, "queue_length": new_length })),
+        )
+            .into_response();
+    }
+
+    // --- Local tracks ---
+    if body.track_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "track_ids or source+source_id required".to_string(),
+        )
+            .into_response();
+    }
     match queue_repo.add_tracks(zone_id, &body.track_ids, body.position) {
         Ok(_) => {
             let new_length = queue_repo.count(zone_id).unwrap_or(0);

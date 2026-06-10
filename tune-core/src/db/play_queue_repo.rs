@@ -400,6 +400,40 @@ impl PlayQueueRepo {
         })
     }
 
+    /// Append tracks to the streaming queue for a zone (does NOT clear existing items).
+    pub fn append_streaming_queue(
+        &self,
+        zone_id: i64,
+        tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
+    ) -> Result<(), String> {
+        let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
+        if self.db.engine() == Engine::Sqlite {
+            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
+        }
+        // Get current count to compute starting position for new items
+        let current_count = self.count_streaming(zone_id).unwrap_or(0);
+
+        self.db.write_tx(&mut |tx| {
+            for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
+                tracks.iter().enumerate()
+            {
+                let pos = current_count + i as i64;
+                let p: [&dyn ToSqlValue; 8] = [
+                    &zone_id,
+                    &pos,
+                    source_id,
+                    title,
+                    artist,
+                    album,
+                    cover_url,
+                    duration_ms,
+                ];
+                tx.execute(&insert_streaming_sql, &p)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn get_streaming_queue(&self, zone_id: i64) -> Result<Vec<serde_json::Value>, String> {
         let select_sql = self.dialect_sql(sql::select_streaming, sql::select_streaming);
         // Ensure the streaming_queue table exists (SQLite-only lazy-

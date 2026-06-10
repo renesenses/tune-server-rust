@@ -380,6 +380,12 @@ impl PlaybackOrchestrator {
                     // track transition latency (from multi-second to <500ms).
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
+                    // Drop the original sender so the channel closes as soon as
+                    // decode_to_pcm_streaming finishes (tx_clone is the sole sender).
+                    // Without this, recv_chunk() on the HTTP stream handler would
+                    // block indefinitely after all data is sent, because the channel
+                    // only closes when ALL senders are dropped.
+                    drop(tx);
                     let result = tokio::task::spawn_blocking(move || {
                         crate::audio::decode::decode_to_pcm_streaming(
                             &fp_clone,
@@ -660,6 +666,8 @@ impl PlaybackOrchestrator {
                 // arrive, reducing transition latency after download completes.
                 let tmp_file_clone = tmp_file.clone();
                 let tx_clone = tx.clone();
+                // Drop the original sender so the channel closes when decode finishes.
+                drop(tx);
                 let decode_result = tokio::task::spawn_blocking(move || {
                     crate::audio::decode::decode_to_pcm_streaming(
                         &tmp_file_clone,
@@ -771,8 +779,17 @@ impl PlaybackOrchestrator {
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
     ) -> (bool, Option<String>) {
+        let lock_start = std::time::Instant::now();
         let output_arc = {
             let outputs = self.outputs.lock().await;
+            let elapsed = lock_start.elapsed();
+            if elapsed.as_millis() > 200 {
+                warn!(
+                    device_id,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "send_to_output_lock_contention"
+                );
+            }
             outputs.get(device_id)
         };
         if let Some(output_arc) = output_arc {

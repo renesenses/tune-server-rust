@@ -254,110 +254,137 @@ fn spawn_local_audio_rescan(_state: &AppState) {}
 /// Removes devices that have disappeared (unless actively playing).
 #[cfg(feature = "local-audio")]
 pub async fn rescan_local_audio_devices(state: &AppState) {
-    let audio_backend = &state.config.local_audio_backend;
-    let devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
-    let mut outputs = state.outputs.lock().await;
-    let existing_ids: std::collections::HashSet<String> = outputs
-        .list()
-        .into_iter()
-        .filter(|id| id.starts_with("local:"))
+    let audio_backend = state.config.local_audio_backend.clone();
+    // Enumerate devices on a blocking thread — CoreAudio/ALSA device
+    // enumeration can block for hundreds of milliseconds (or longer if a
+    // USB DAC is misbehaving), which starves the async runtime and delays
+    // play requests that need the outputs lock.
+    let backend_clone = audio_backend.clone();
+    let devices = match tokio::task::spawn_blocking(move || {
+        tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
+    })
+    .await
+    {
+        Ok(d) => d,
+        Err(_) => return, // task panicked — skip this cycle
+    };
+
+    // Collect new device IDs first (no lock needed)
+    let new_device_ids: std::collections::HashSet<String> = devices
+        .iter()
+        .map(|dev| format!("local:{}", dev.name))
         .collect();
 
-    let mut new_device_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-    let existing_zones = zone_repo.list().unwrap_or_default();
-    let mut registered_count = 0;
+    // Phase 1: Register new devices and remove stale ones (hold lock briefly)
+    let mut new_devices_to_zone: Vec<(String, String, bool)> = Vec::new();
+    {
+        let mut outputs = state.outputs.lock().await;
+        let existing_ids: std::collections::HashSet<String> = outputs
+            .list()
+            .into_iter()
+            .filter(|id| id.starts_with("local:"))
+            .collect();
 
-    for dev in &devices {
-        let device_id = format!("local:{}", dev.name);
-        new_device_ids.insert(device_id.clone());
+        let mut registered_count = 0;
 
-        // Skip if already registered — check both the pre-loop snapshot and
-        // the live registry (guards against cpal returning the same device
-        // name twice in a single enumeration).
-        if existing_ids.contains(&device_id) || outputs.contains(&device_id) {
-            continue; // already registered
+        for dev in &devices {
+            let device_id = format!("local:{}", dev.name);
+
+            // Skip if already registered
+            if existing_ids.contains(&device_id) || outputs.contains(&device_id) {
+                continue;
+            }
+
+            // New device found — register it
+            let local_out = tune_core::outputs::local::LocalOutput::with_options(
+                dev.name.clone(),
+                false,
+                &audio_backend,
+            );
+            outputs.register(Box::new(local_out));
+            registered_count += 1;
+
+            info!(
+                name = %dev.name,
+                device_id = %device_id,
+                default = dev.is_default,
+                channels = dev.max_channels,
+                "local_audio_hotplug_detected"
+            );
+
+            new_devices_to_zone.push((device_id, dev.name.clone(), dev.is_default));
         }
 
-        // New device found — register it
-        let local_out = tune_core::outputs::local::LocalOutput::with_options(
-            dev.name.clone(),
-            false,
-            audio_backend,
-        );
-        outputs.register(Box::new(local_out));
-        registered_count += 1;
-
-        info!(
-            name = %dev.name,
-            device_id = %device_id,
-            default = dev.is_default,
-            channels = dev.max_channels,
-            "local_audio_hotplug_detected"
-        );
-
-        // Auto-create a zone for the new device
-        let already = existing_zones
-            .iter()
-            .any(|z| z.output_device_id.as_deref() == Some(&device_id));
-        if !already {
-            let zone_name = if dev.is_default {
-                "This Computer".to_string()
+        // Remove devices that have disappeared, but only if not actively playing
+        for old_id in &existing_ids {
+            if new_device_ids.contains(old_id) {
+                continue;
+            }
+            let is_playing = if let Some(output) = outputs.get(old_id) {
+                let output = output.lock().await;
+                match output.get_status().await {
+                    Ok(status) => {
+                        status.state == tune_core::outputs::traits::TransportState::Playing
+                    }
+                    Err(_) => false,
+                }
             } else {
-                dev.name.clone()
+                false
             };
-            let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
-            if !name_taken {
-                if let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(&device_id)) {
-                    info!(
-                        name = %zone_name,
-                        zone_id = zid,
-                        device_id = %device_id,
-                        "local_audio_hotplug_zone_created"
-                    );
+
+            if !is_playing {
+                outputs.remove(old_id);
+                info!(device_id = %old_id, "local_audio_device_removed");
+            }
+        }
+
+        if registered_count > 0 {
+            info!(
+                new_devices = registered_count,
+                total = devices.len(),
+                "local_audio_rescan_complete"
+            );
+        }
+    } // outputs lock released here
+
+    // Phase 2: Create zones and emit events (no lock held)
+    if !new_devices_to_zone.is_empty() {
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let existing_zones = zone_repo.list().unwrap_or_default();
+
+        for (device_id, dev_name, is_default) in &new_devices_to_zone {
+            let already = existing_zones
+                .iter()
+                .any(|z| z.output_device_id.as_deref() == Some(device_id.as_str()));
+            if !already {
+                let zone_name = if *is_default {
+                    "This Computer".to_string()
+                } else {
+                    dev_name.clone()
+                };
+                let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
+                if !name_taken {
+                    if let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(device_id)) {
+                        info!(
+                            name = %zone_name,
+                            zone_id = zid,
+                            device_id = %device_id,
+                            "local_audio_hotplug_zone_created"
+                        );
+                    }
                 }
             }
+
+            // Emit event for UI refresh
+            state.event_bus.emit(
+                "device.discovered",
+                serde_json::json!({
+                    "id": device_id,
+                    "name": dev_name,
+                    "type": "local",
+                    "hotplug": true,
+                }),
+            );
         }
-
-        // Emit event for UI refresh
-        state.event_bus.emit(
-            "device.discovered",
-            serde_json::json!({
-                "id": &device_id,
-                "name": &dev.name,
-                "type": "local",
-                "hotplug": true,
-            }),
-        );
-    }
-
-    // Remove devices that have disappeared, but only if not actively playing
-    for old_id in &existing_ids {
-        if new_device_ids.contains(old_id) {
-            continue;
-        }
-        // Check if this device is currently playing before removing
-        let is_playing = if let Some(output) = outputs.get(old_id) {
-            let output = output.lock().await;
-            match output.get_status().await {
-                Ok(status) => status.state == tune_core::outputs::traits::TransportState::Playing,
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-
-        if !is_playing {
-            outputs.remove(old_id);
-            info!(device_id = %old_id, "local_audio_device_removed");
-        }
-    }
-
-    if registered_count > 0 {
-        info!(
-            new_devices = registered_count,
-            total = devices.len(),
-            "local_audio_rescan_complete"
-        );
     }
 }
