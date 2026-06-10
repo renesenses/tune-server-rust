@@ -91,18 +91,23 @@ impl TelemetryReporter {
         }
     }
 
-    /// Spawn a background task that reports telemetry once after 30s, then every 24h.
+    /// Spawn a background task that reports telemetry after 5 min (post-scan),
+    /// again after 1 hour, then every 24 hours.
     pub fn spawn(db: SqliteDb) {
         tokio::spawn(async move {
-            // Initial delay
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
             let start = std::time::Instant::now();
+            let mut first = true;
             loop {
                 let uptime_hours = start.elapsed().as_secs() / 3600;
                 Self::report(&db, None, uptime_hours).await;
-                // Sleep 24h
-                tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                if first {
+                    first = false;
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                }
             }
         });
     }
