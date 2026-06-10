@@ -27,7 +27,7 @@ impl AudioFormat {
             "ogg" | "oga" => Some(Self::Ogg),
             "opus" => Some(Self::Opus),
             "aiff" | "aif" => Some(Self::Aiff),
-            "dsf" | "dff" | "dst" => Some(Self::Dsd),
+            "dsf" | "dff" | "dst" | "dsd" => Some(Self::Dsd),
             "wv" => Some(Self::WavPack),
             "ape" => Some(Self::Ape),
             _ => None,
@@ -418,6 +418,14 @@ mod tests {
     #[test]
     fn from_extension_dst() {
         assert_eq!(AudioFormat::from_extension("dst"), Some(AudioFormat::Dsd));
+    }
+
+    #[test]
+    fn from_extension_dsd_normalized() {
+        // The metadata scanner normalizes "dsf"/"dff" to "dsd" in the DB.
+        // AudioFormat::from_extension must recognise this normalised form
+        // so the orchestrator correctly triggers DSD→PCM transcoding.
+        assert_eq!(AudioFormat::from_extension("dsd"), Some(AudioFormat::Dsd));
     }
 
     #[test]
