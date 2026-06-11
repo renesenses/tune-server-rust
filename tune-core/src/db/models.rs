@@ -383,6 +383,7 @@ mod tests {
             label: None,
             musicbrainz_recording_id: None,
             cover_path: None,
+            comments: None,
         };
         let json = serde_json::to_value(&track).unwrap();
         assert_eq!(json["title"], "So What");

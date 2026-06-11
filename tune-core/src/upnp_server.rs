@@ -774,6 +774,7 @@ mod tests {
             label: None,
             musicbrainz_recording_id: None,
             cover_path: Some("abc123".into()),
+            comments: None,
         };
         let xml = didl_track_item(&track, "album/10", "http://192.168.1.18:8085");
         assert!(xml.contains("So What"));

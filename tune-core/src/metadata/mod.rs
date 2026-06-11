@@ -912,6 +912,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         isrc: None,
         has_cover: false,
         credits: vec![],
+        comment: None,
     }
 }
 
@@ -979,6 +980,7 @@ fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         isrc: None,
         has_cover: false,
         credits: vec![],
+        comment: None,
     }
 }
 
