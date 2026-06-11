@@ -283,7 +283,7 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
         .ok();
 }
 
-/// Fetch an artist image. Tries mozaiklabs first, then MusicBrainz/Wikimedia Commons.
+/// Fetch an artist image. Tries mozaiklabs first, then Fanart.tv, then MusicBrainz/Wikimedia Commons.
 pub async fn fetch_artist_image(mbid: &str) -> Option<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
@@ -295,8 +295,35 @@ pub async fn fetch_artist_image(mbid: &str) -> Option<Vec<u8>> {
         return Some(bytes);
     }
 
+    // Try Fanart.tv (500ms delay)
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
+        return Some(bytes);
+    }
+
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     fetch_artist_image_musicbrainz(&client, mbid).await
+}
+
+/// Fetch an artist thumbnail from Fanart.tv using a MusicBrainz artist ID.
+async fn fetch_artist_image_fanart(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+    let api_key = std::env::var("FANART_TV_API_KEY").ok()?;
+    if api_key.is_empty() {
+        return None;
+    }
+    let url = format!("http://webservice.fanart.tv/v3/music/{mbid}?api_key={api_key}");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let thumb_url = data
+        .get("artistthumb")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("url"))
+        .and_then(|v| v.as_str())?;
+    download_image(client, thumb_url).await
 }
 
 async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
@@ -362,13 +389,60 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
 
 /// Run batch artist image enrichment for all artists with an MBID but no image.
 ///
-/// Iterates over artists without an `image_path`, fetches an image from
-/// the mozaiklabs API, saves it to the artwork cache, and updates the
-/// artist's `image_path` in the database.
+/// Phase 1: Check community-approved images from mozaiklabs.fr first.
+/// Phase 2: For remaining artists, fetch from mozaiklabs API / Fanart.tv / MusicBrainz,
+/// then submit discovered images back to the community (fire-and-forget).
 ///
 /// Respects rate limit: ~1 request/second.
 pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: PathBuf) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::new(db.clone());
+
+    // --- Phase 1: Bulk-apply community-approved artist images ---
+    let mut community_applied = 0u32;
+    if let Ok(approved) =
+        crate::cloud::community::fetch_approved_artist_images("https://mozaiklabs.fr", None).await
+    {
+        for img in &approved {
+            // Check if this artist is in our DB and still needs an image
+            if let Ok(Some(artist)) = artist_repo.get_by_musicbrainz_id(&img.mbid) {
+                if artist.image_path.is_some() {
+                    continue;
+                }
+                let artist_id = match artist.id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let client = reqwest::Client::builder()
+                    .user_agent(MB_USER_AGENT)
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build();
+                if let Ok(client) = client {
+                    if let Some(data) = download_image(&client, &img.image_url).await {
+                        let hash = artwork_hash(&format!("artist-mbid-{}", img.mbid));
+                        std::fs::create_dir_all(&cache_dir).ok();
+                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                            artist_repo.update_image(artist_id, &hash, "community").ok();
+                            community_applied += 1;
+                            info!(
+                                artist_id,
+                                artist = %img.artist_name,
+                                hash = %hash,
+                                "batch_artist_artwork_community_applied"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if community_applied > 0 {
+            info!(
+                community_applied,
+                "batch_artist_artwork_community_phase_done"
+            );
+        }
+    }
+
+    // --- Phase 2: Fetch from external sources for remaining artists ---
     let artists = match artist_repo.list_without_image() {
         Ok(a) => a,
         Err(e) => {
@@ -379,6 +453,20 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
 
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
+        // Store result even when nothing to fetch
+        let settings = crate::db::settings_repo::SettingsRepo::new(db);
+        settings
+            .set(
+                "artist_artwork_enrich_result",
+                &serde_json::json!({
+                    "total": 0,
+                    "enriched": 0,
+                    "failed": 0,
+                    "community_applied": community_applied,
+                })
+                .to_string(),
+            )
+            .ok();
         return;
     }
 
@@ -386,6 +474,14 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
         count = artists.len(),
         "batch_artist_artwork_enrichment_started"
     );
+
+    // Get instance_id for community submissions
+    let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+    let instance_id = settings
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
@@ -400,9 +496,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
                 let hash = artwork_hash(&format!("artist-mbid-{mbid}"));
                 std::fs::create_dir_all(&cache_dir).ok();
                 if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
-                    artist_repo
-                        .update_image(*artist_id, &hash, "mozaiklabs")
-                        .ok();
+                    artist_repo.update_image(*artist_id, &hash, "auto").ok();
                     enriched += 1;
                     info!(
                         artist_id,
@@ -411,6 +505,27 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
                         size = data.len(),
                         "batch_artist_artwork_enriched"
                     );
+
+                    // Fire-and-forget: submit to community for sharing
+                    if !instance_id.is_empty() {
+                        let mbid = mbid.clone();
+                        let name = name.clone();
+                        let instance_id = instance_id.clone();
+                        let image_data = data.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::cloud::community::submit_artist_image(
+                                "https://mozaiklabs.fr",
+                                &mbid,
+                                &name,
+                                &instance_id,
+                                &image_data,
+                            )
+                            .await
+                            {
+                                debug!(mbid = %mbid, error = %e, "community_artist_image_submit_failed");
+                            }
+                        });
+                    }
                 } else {
                     failed += 1;
                     warn!(artist_id, artist = %name, "batch_artist_artwork_save_failed");
@@ -425,11 +540,10 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
 
     info!(
         total = artists.len(),
-        enriched, failed, "batch_artist_artwork_enrichment_complete"
+        enriched, failed, community_applied, "batch_artist_artwork_enrichment_complete"
     );
 
     // Store result in settings for status reporting
-    let settings = crate::db::settings_repo::SettingsRepo::new(db);
     settings
         .set(
             "artist_artwork_enrich_result",
@@ -437,6 +551,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
                 "total": artists.len(),
                 "enriched": enriched,
                 "failed": failed,
+                "community_applied": community_applied,
             })
             .to_string(),
         )

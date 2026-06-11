@@ -235,14 +235,17 @@ pub(super) async fn batch_enrich_artist_artwork(
     let cache_dir = artwork_cache_dir();
     let db = state.db.clone();
 
-    // Check how many artists are missing images
+    // Count artists missing MBIDs (Phase 1 candidates)
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(state.db.clone());
+    let without_mbid = artist_repo.list_without_mbid().unwrap_or_default().len();
+
+    // Count artists missing images (Phase 2 candidates)
     let missing = artist_repo.list_without_image().unwrap_or_default();
 
-    if missing.is_empty() {
+    if missing.is_empty() && without_mbid == 0 {
         return Json(json!({
             "status": "skipped",
-            "message": "all artists with MBID already have images",
+            "message": "all artists already have MBID and images",
             "missing": 0,
         }))
         .into_response();
@@ -254,11 +257,16 @@ pub(super) async fn batch_enrich_artist_artwork(
     settings
         .set(
             "artist_artwork_enrich_result",
-            &json!({"total": missing.len(), "enriched": 0, "status": "running"}).to_string(),
+            &json!({"total": missing.len(), "enriched": 0, "without_mbid": without_mbid, "status": "running"}).to_string(),
         )
         .ok();
 
     tokio::spawn(async move {
+        // Phase 1: Match artists without MBID by searching MusicBrainz
+        let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
+        tracing::info!(matched, "batch_artist_mbid_phase_complete");
+
+        // Phase 2: Fetch images for all artists with MBID but no image
         tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
     });
 
@@ -266,8 +274,9 @@ pub(super) async fn batch_enrich_artist_artwork(
         StatusCode::ACCEPTED,
         Json(json!({
             "status": "accepted",
-            "message": "batch artist artwork enrichment started",
-            "artists_to_process": missing.len(),
+            "message": "batch artist enrichment started (Phase 1: MBID matching, Phase 2: image fetch)",
+            "artists_without_mbid": without_mbid,
+            "artists_without_image": missing.len(),
         })),
     )
         .into_response()

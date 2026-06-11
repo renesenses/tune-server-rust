@@ -465,6 +465,22 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
             let signal_path = build_signal_path(&ps, z, &state.db, renderer_label);
             obj.insert("signal_path".into(), json!(signal_path));
+            // Include stream_url for browser playback zones so the web client
+            // can feed it to an HTML5 <audio> element.
+            if let Some(ref np) = ps.now_playing {
+                if let Some(ref stream_id) = np.stream_id {
+                    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                        tune_core::discovery::ssdp::get_local_ip()
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|| "127.0.0.1".into())
+                    });
+                    let stream_url = format!(
+                        "http://{}:{}/stream/{}.flac",
+                        server_ip, state.port, stream_id
+                    );
+                    obj.insert("stream_url".into(), json!(stream_url));
+                }
+            }
         }
         result.push(v);
     }
@@ -497,6 +513,22 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
                 let signal_path = build_signal_path(&ps, &zone, &state.db, renderer_label);
                 obj.insert("signal_path".into(), json!(signal_path));
+                // Include stream_url for browser playback zones so the web client
+                // can feed it to an HTML5 <audio> element.
+                if let Some(ref np) = ps.now_playing {
+                    if let Some(ref stream_id) = np.stream_id {
+                        let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                            tune_core::discovery::ssdp::get_local_ip()
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_else(|| "127.0.0.1".into())
+                        });
+                        let stream_url = format!(
+                            "http://{}:{}/stream/{}.flac",
+                            server_ip, state.port, stream_id
+                        );
+                        obj.insert("stream_url".into(), json!(stream_url));
+                    }
+                }
             }
             Json(v).into_response()
         }
