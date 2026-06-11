@@ -36,6 +36,9 @@ pub struct StreamingQueueEntry {
     pub album_title: Option<String>,
     pub cover_url: Option<String>,
     pub duration_ms: i64,
+    /// Streaming service name (e.g. "tidal", "qobuz", "deezer").
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Directory where queue files are stored (same parent as the DB file).
@@ -79,6 +82,7 @@ pub fn save_queue(db: &SqliteDb, db_path: &str, zone_id: i64, zone_state: &ZoneS
             album_title: item["album_title"].as_str().map(String::from),
             cover_url: item["cover_path"].as_str().map(String::from),
             duration_ms: item["duration_ms"].as_i64().unwrap_or(0),
+            source: item["source"].as_str().map(String::from),
         })
         .collect();
 
@@ -196,21 +200,29 @@ pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
 
         // Restore streaming queue
         if !snapshot.streaming_tracks.is_empty() {
-            let tracks: Vec<(String, String, String, Option<String>, Option<String>, i64)> =
-                snapshot
-                    .streaming_tracks
-                    .iter()
-                    .map(|t| {
-                        (
-                            t.source_id.clone(),
-                            t.title.clone(),
-                            t.artist_name.clone(),
-                            t.album_title.clone(),
-                            t.cover_url.clone(),
-                            t.duration_ms,
-                        )
-                    })
-                    .collect();
+            let tracks: Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<String>,
+            )> = snapshot
+                .streaming_tracks
+                .iter()
+                .map(|t| {
+                    (
+                        t.source_id.clone(),
+                        t.title.clone(),
+                        t.artist_name.clone(),
+                        t.album_title.clone(),
+                        t.cover_url.clone(),
+                        t.duration_ms,
+                        t.source.clone(),
+                    )
+                })
+                .collect();
             if let Err(e) = repo.set_streaming_queue(zone_id, &tracks) {
                 warn!(zone_id, error = %e, "queue_restore_streaming_failed");
                 continue;
@@ -258,6 +270,7 @@ mod tests {
                 album_title: Some("Album".into()),
                 cover_url: None,
                 duration_ms: 200_000,
+                source: Some("tidal".into()),
             }],
             repeat_mode: "all".into(),
             shuffle: true,

@@ -108,7 +108,7 @@ pub mod sql {
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -116,13 +116,14 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             d.placeholder(7),
-            d.placeholder(8)
+            d.placeholder(8),
+            d.placeholder(9)
         )
     }
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position FROM streaming_queue WHERE zone_id = {} ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source FROM streaming_queue WHERE zone_id = {} ORDER BY position",
             d.placeholder(1)
         )
     }
@@ -364,7 +365,15 @@ impl PlayQueueRepo {
     pub fn set_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
+        tracks: &[(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        )],
     ) -> Result<(), String> {
         let delete_queue_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
@@ -380,11 +389,11 @@ impl PlayQueueRepo {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_queue_sql, &p)?;
             tx.execute(&delete_streaming_sql, &p)?;
-            for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
+            for (i, (source_id, title, artist, album, cover_url, duration_ms, source)) in
                 tracks.iter().enumerate()
             {
                 let pos = i as i64;
-                let p: [&dyn ToSqlValue; 8] = [
+                let p: [&dyn ToSqlValue; 9] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -393,6 +402,7 @@ impl PlayQueueRepo {
                     album,
                     cover_url,
                     duration_ms,
+                    source,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -404,7 +414,15 @@ impl PlayQueueRepo {
     pub fn append_streaming_queue(
         &self,
         zone_id: i64,
-        tracks: &[(String, String, String, Option<String>, Option<String>, i64)],
+        tracks: &[(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        )],
     ) -> Result<(), String> {
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
         if self.db.engine() == Engine::Sqlite {
@@ -414,11 +432,11 @@ impl PlayQueueRepo {
         let current_count = self.count_streaming(zone_id).unwrap_or(0);
 
         self.db.write_tx(&mut |tx| {
-            for (i, (source_id, title, artist, album, cover_url, duration_ms)) in
+            for (i, (source_id, title, artist, album, cover_url, duration_ms, source)) in
                 tracks.iter().enumerate()
             {
                 let pos = current_count + i as i64;
-                let p: [&dyn ToSqlValue; 8] = [
+                let p: [&dyn ToSqlValue; 9] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -427,6 +445,7 @@ impl PlayQueueRepo {
                     album,
                     cover_url,
                     duration_ms,
+                    source,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -454,6 +473,7 @@ impl PlayQueueRepo {
                     "cover_path": cols.get(4).and_then(|v| v.as_string()),
                     "duration_ms": cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
                     "position": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "source": cols.get(7).and_then(|v| v.as_string()),
                 })
             })
             .collect();
@@ -655,6 +675,7 @@ mod tests {
                 Some("Album 1".into()),
                 Some("http://cover1.jpg".into()),
                 300_000i64,
+                Some("tidal".into()),
             ),
             (
                 "src-2".into(),
@@ -663,6 +684,7 @@ mod tests {
                 None,
                 None,
                 250_000i64,
+                Some("tidal".into()),
             ),
         ];
 
@@ -672,8 +694,10 @@ mod tests {
         assert_eq!(queue[0]["title"], "Song 1");
         assert_eq!(queue[0]["artist_name"], "Artist 1");
         assert_eq!(queue[0]["duration_ms"], 300_000);
+        assert_eq!(queue[0]["source"], "tidal");
         assert_eq!(queue[1]["title"], "Song 2");
         assert!(queue[1]["album_title"].is_null());
+        assert_eq!(queue[1]["source"], "tidal");
     }
 
     #[test]
@@ -688,6 +712,7 @@ mod tests {
             None,
             None,
             100_000i64,
+            Some("qobuz".into()),
         )];
         repo.set_streaming_queue(1, &tracks1).unwrap();
 
@@ -698,12 +723,14 @@ mod tests {
             None,
             None,
             200_000i64,
+            Some("tidal".into()),
         )];
         repo.set_streaming_queue(1, &tracks2).unwrap();
 
         let queue = repo.get_streaming_queue(1).unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0]["title"], "New");
+        assert_eq!(queue[0]["source"], "tidal");
     }
 
     #[test]
@@ -712,7 +739,7 @@ mod tests {
         let p = PostgresDialect;
         assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?)"));
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4)"));
-        assert!(sql::insert_streaming(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"));
+        assert!(sql::insert_streaming(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
     }
 
     #[test]

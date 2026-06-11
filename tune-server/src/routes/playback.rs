@@ -383,6 +383,7 @@ async fn play(
                             t.album.clone(),
                             t.cover_path.clone(),
                             t.duration_ms as i64,
+                            Some(source.clone()),
                         )
                     })
                     .collect();
@@ -462,6 +463,7 @@ async fn play(
                             t.album.clone(),
                             t.cover_path.clone(),
                             t.duration_ms as i64,
+                            Some(source.clone()),
                         )
                     })
                     .collect();
@@ -486,6 +488,7 @@ async fn play(
         && body.track_ids.is_none()
     {
         let source_id_val = body.source_id.clone().unwrap_or_default();
+        let source_for_q = body.source.clone();
         let title_val = body.title.clone().unwrap_or_default();
         let artist_val = body.artist_name.clone().unwrap_or_default();
         let album_val = body.album_title.clone();
@@ -522,6 +525,7 @@ async fn play(
                     album_val,
                     cover_val,
                     duration_val,
+                    source_for_q,
                 )];
                 if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
                     warn!(zone_id, error = %e, "set_streaming_queue_failed");
@@ -860,12 +864,20 @@ async fn queue_add(
             }
         };
 
-        let queue_item = vec![(source_id.clone(), title, artist, album, cover, duration)];
+        let queue_item = vec![(
+            source_id.clone(),
+            title,
+            artist,
+            album,
+            cover,
+            duration,
+            Some(source.clone()),
+        )];
         if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_item) {
             warn!(zone_id, error = %e, "append_streaming_queue_failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-        let new_length = queue_repo.count(zone_id).unwrap_or(0);
+        let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
         let current_pos = state.playback.get_state(zone_id).await.queue_position;
         state
             .playback
@@ -1221,20 +1233,28 @@ async fn do_transfer(
         .get_streaming_queue(from_zone)
         .unwrap_or_default();
     if !streaming_items.is_empty() {
-        let tracks: Vec<(String, String, String, Option<String>, Option<String>, i64)> =
-            streaming_items
-                .iter()
-                .map(|item| {
-                    (
-                        item["source_id"].as_str().unwrap_or("").to_string(),
-                        item["title"].as_str().unwrap_or("").to_string(),
-                        item["artist_name"].as_str().unwrap_or("").to_string(),
-                        item["album_title"].as_str().map(String::from),
-                        item["cover_path"].as_str().map(String::from),
-                        item["duration_ms"].as_i64().unwrap_or(0),
-                    )
-                })
-                .collect();
+        let tracks: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        )> = streaming_items
+            .iter()
+            .map(|item| {
+                (
+                    item["source_id"].as_str().unwrap_or("").to_string(),
+                    item["title"].as_str().unwrap_or("").to_string(),
+                    item["artist_name"].as_str().unwrap_or("").to_string(),
+                    item["album_title"].as_str().map(String::from),
+                    item["cover_path"].as_str().map(String::from),
+                    item["duration_ms"].as_i64().unwrap_or(0),
+                    item["source"].as_str().map(String::from),
+                )
+            })
+            .collect();
         if let Err(e) = queue_repo.set_streaming_queue(target_zone, &tracks) {
             warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
         }
