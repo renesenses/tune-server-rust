@@ -26,7 +26,8 @@ pub struct CreateZone {
 
 #[derive(Deserialize)]
 struct UpdateVolume {
-    volume: i32,
+    /// Accepts both 0.0-1.0 (float from web client) and 0-100 (integer legacy).
+    volume: f64,
 }
 
 #[derive(Deserialize)]
@@ -744,11 +745,28 @@ async fn update_volume(
     Path(id): Path<i64>,
     Json(body): Json<UpdateVolume>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
-    match repo.update_volume(id, body.volume) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    // Normalise: web client sends 0.0–1.0, legacy clients may send 0–100.
+    let volume_f = if body.volume > 1.0 {
+        body.volume / 100.0
+    } else {
+        body.volume
+    };
+    let volume_int = (volume_f * 100.0).round() as i32;
+
+    // Persist to DB
+    let repo = ZoneRepo::new(state.db.clone());
+    if let Err(e) = repo.update_volume(id, volume_int) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+
+    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
+    let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    state
+        .orchestrator
+        .set_volume(id, volume_f, device_id.as_deref())
+        .await;
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn update_muted(
@@ -756,11 +774,20 @@ async fn update_muted(
     Path(id): Path<i64>,
     Json(body): Json<UpdateMuted>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
-    match repo.update_muted(id, body.muted) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    // Persist to DB
+    let repo = ZoneRepo::new(state.db.clone());
+    if let Err(e) = repo.update_muted(id, body.muted) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+
+    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
+    let device_id = repo.get(id).ok().flatten().and_then(|z| z.output_device_id);
+    state
+        .orchestrator
+        .set_mute(id, body.muted, device_id.as_deref())
+        .await;
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn rename_zone(

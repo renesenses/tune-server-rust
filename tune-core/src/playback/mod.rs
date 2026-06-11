@@ -263,6 +263,18 @@ impl PlaybackManager {
         });
     }
 
+    pub async fn set_mute(&self, zone_id: i64, muted: bool) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.muted = muted;
+        }
+        self.emit(PlaybackEvent {
+            event: "muted".into(),
+            zone_id,
+            data: serde_json::json!({ "muted": muted }),
+        });
+    }
+
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
         let mut zones = self.zones.lock().await;
         if let Some(state) = zones.get_mut(&zone_id) {

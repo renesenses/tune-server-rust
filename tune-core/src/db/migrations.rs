@@ -408,6 +408,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_profile_email_and_argon2_password",
         up: "",
     },
+    Migration {
+        version: 29,
+        name: "add_smart_collections_extra_columns",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -665,6 +670,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 28 {
             add_column_if_missing(db, "profiles", "email", "TEXT");
             add_column_if_missing(db, "profiles", "password_hash_v2", "TEXT");
+        }
+        if migration.version == 29 {
+            add_column_if_missing(db, "smart_collections", "description", "TEXT");
+            add_column_if_missing(db, "smart_collections", "icon", "TEXT");
+            add_column_if_missing(db, "smart_collections", "color", "TEXT");
         }
 
         db.execute(
