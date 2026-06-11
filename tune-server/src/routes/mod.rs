@@ -47,6 +47,7 @@ pub mod setlistfm;
 pub mod shazam;
 pub mod siri;
 pub mod smart_ai;
+pub mod smart_collections;
 pub mod smart_playlists;
 pub mod snapcast;
 pub mod sonos;
@@ -253,7 +254,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/profiles", profiles::router())
         .nest("/tags", tags::router())
         .nest("/metadata", metadata::router())
-        .nest("/smart-collections", smart_playlists::router())
+        .nest("/library/smart-playlists", smart_playlists::router())
+        .nest("/library/smart-collections", smart_collections::router())
         .nest("/export", export::router())
         .nest("/network", network::router())
         .nest("/dashboard", dashboard::router())

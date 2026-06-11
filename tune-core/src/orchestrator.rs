@@ -1140,6 +1140,18 @@ impl PlaybackOrchestrator {
         }
     }
 
+    pub async fn set_mute(&self, zone_id: i64, muted: bool, device_id: Option<&str>) {
+        self.playback.set_mute(zone_id, muted).await;
+        if let Some(did) = device_id {
+            let outputs = self.outputs.lock().await;
+            if let Some(output) = outputs.get(did) {
+                if let Err(e) = output.lock().await.set_mute(muted).await {
+                    warn!(zone_id, error = %e, "device_set_mute_failed");
+                }
+            }
+        }
+    }
+
     /// Persist the play_queue table for a zone with the given local track IDs.
     /// Called after queue mutations to keep the DB in sync with in-memory state.
     pub fn persist_local_queue(&self, zone_id: i64, track_ids: &[i64], current_position: i64) {

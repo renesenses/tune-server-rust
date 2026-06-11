@@ -275,8 +275,49 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
 async fn play(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
-    Json(body): Json<PlayRequest>,
+    body: Option<Json<PlayRequest>>,
 ) -> impl IntoResponse {
+    // When called with an empty body (e.g. Play after Stop), resume the
+    // current track instead of returning 400 "no track source specified".
+    let body = match body {
+        Some(Json(b)) => b,
+        None => {
+            let current = state.playback.get_state(zone_id).await;
+            if let Some(ref np) = current.now_playing {
+                let output_device_id = get_zone_device_id(&state, zone_id);
+                let orch_req = tune_core::orchestrator::PlayRequest {
+                    zone_id,
+                    output_device_id,
+                    track_id: np.track_id,
+                    source: if np.source == "local" {
+                        None
+                    } else {
+                        Some(np.source.clone())
+                    },
+                    source_id: np.source_id.clone(),
+                    title: Some(np.title.clone()),
+                    artist_name: np.artist_name.clone(),
+                    album_title: np.album_title.clone(),
+                    cover_url: np.cover_path.clone(),
+                    duration_ms: Some(np.duration_ms),
+                };
+                return match state.orchestrator.play(orch_req).await {
+                    Ok(result) => {
+                        persist_queue_async(&state, zone_id);
+                        Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                            .into_response()
+                    }
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                };
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                "no track source specified and nothing to resume",
+            )
+                .into_response();
+        }
+    };
+
     let track_repo = TrackRepo::new(state.db.clone());
     let queue_repo = PlayQueueRepo::new(state.db.clone());
 
@@ -511,6 +552,39 @@ async fn play(
     } else if let Some(id) = body.track_id {
         vec![id]
     } else {
+        // No track source specified — try to resume the current track.
+        // This handles the case where the user presses Play after Stop:
+        // the web/Flutter client sends POST /play with an empty body.
+        let current = state.playback.get_state(zone_id).await;
+        if let Some(ref np) = current.now_playing {
+            let output_device_id = body
+                .output_device_id
+                .or_else(|| get_zone_device_id(&state, zone_id));
+            let orch_req = tune_core::orchestrator::PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: np.track_id,
+                source: if np.source == "local" {
+                    None
+                } else {
+                    Some(np.source.clone())
+                },
+                source_id: np.source_id.clone(),
+                title: Some(np.title.clone()),
+                artist_name: np.artist_name.clone(),
+                album_title: np.album_title.clone(),
+                cover_url: np.cover_path.clone(),
+                duration_ms: Some(np.duration_ms),
+            };
+            return match state.orchestrator.play(orch_req).await {
+                Ok(result) => {
+                    persist_queue_async(&state, zone_id);
+                    Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                        .into_response()
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            };
+        }
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
 

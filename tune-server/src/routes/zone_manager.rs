@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
         .route("/overview", get(overview))
         .route("/zones", get(list_managed_zones))
         .route("/zones/{id}/hot-swap", post(hot_swap_zone))
+        .route("/zones/{id}/mute", post(mute_zone))
         .route("/groups", get(list_groups).post(create_group))
         .route(
             "/groups/{id}",
@@ -261,6 +262,41 @@ async fn hot_swap_zone(
         "status": "swapped",
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Mute
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MuteRequest {
+    muted: bool,
+}
+
+async fn mute_zone(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<MuteRequest>,
+) -> impl IntoResponse {
+    let zone_repo = ZoneRepo::new(state.db.clone());
+
+    // Persist to DB
+    if let Err(e) = zone_repo.update_muted(id, body.muted) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
+    // Forward to the output device (Squeezebox LMS, DLNA, etc.)
+    let device_id = zone_repo
+        .get(id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    state
+        .orchestrator
+        .set_mute(id, body.muted, device_id.as_deref())
+        .await;
+
+    Json(json!({ "zone_id": id, "muted": body.muted })).into_response()
 }
 
 // ---------------------------------------------------------------------------
