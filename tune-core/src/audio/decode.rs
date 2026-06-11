@@ -761,4 +761,70 @@ mod decode_integration_tests {
         assert!(can_decode_native("test.dsf"));
         assert!(can_decode_native("test.dff"));
     }
+
+    #[test]
+    fn resolve_bit_depth_from_bits_per_sample() {
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = Some(24);
+        assert_eq!(resolve_bit_depth(&params), 24);
+
+        params.bits_per_sample = Some(16);
+        assert_eq!(resolve_bit_depth(&params), 16);
+    }
+
+    #[test]
+    fn resolve_bit_depth_from_alac_magic_cookie_24bit() {
+        // Simulate an ALAC magic cookie (24 bytes): byte 5 = bit_depth = 24
+        let mut cookie = vec![0u8; 24];
+        cookie[5] = 24; // bit_depth field
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = None;
+        params.extra_data = Some(cookie.into_boxed_slice());
+        assert_eq!(resolve_bit_depth(&params), 24);
+    }
+
+    #[test]
+    fn resolve_bit_depth_from_alac_magic_cookie_16bit() {
+        let mut cookie = vec![0u8; 24];
+        cookie[5] = 16;
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = None;
+        params.extra_data = Some(cookie.into_boxed_slice());
+        assert_eq!(resolve_bit_depth(&params), 16);
+    }
+
+    #[test]
+    fn resolve_bit_depth_from_alac_magic_cookie_with_prefix() {
+        // 48-byte cookie with frma + alac atom prefixes (12+12 = 24 prefix + 24 payload)
+        let mut cookie = vec![0u8; 48];
+        // frma atom at offset 4
+        cookie[4..8].copy_from_slice(b"frma");
+        // alac atom at offset 16
+        cookie[16..20].copy_from_slice(b"alac");
+        // bit_depth at byte 5 of 24-byte payload (offset 24+5=29)
+        cookie[29] = 24;
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = None;
+        params.extra_data = Some(cookie.into_boxed_slice());
+        assert_eq!(resolve_bit_depth(&params), 24);
+    }
+
+    #[test]
+    fn resolve_bit_depth_fallback_no_extra_data() {
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = None;
+        params.extra_data = None;
+        assert_eq!(resolve_bit_depth(&params), 16);
+    }
+
+    #[test]
+    fn resolve_bit_depth_explicit_overrides_cookie() {
+        // If bits_per_sample is set, extra_data is not consulted
+        let mut cookie = vec![0u8; 24];
+        cookie[5] = 24;
+        let mut params = AudioCodecParameters::new();
+        params.bits_per_sample = Some(16);
+        params.extra_data = Some(cookie.into_boxed_slice());
+        assert_eq!(resolve_bit_depth(&params), 16);
+    }
 }
