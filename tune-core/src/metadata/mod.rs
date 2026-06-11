@@ -59,6 +59,7 @@ pub struct TrackMetadata {
     pub isrc: Option<String>,
     pub has_cover: bool,
     pub credits: Vec<TrackCredit>,
+    pub comment: Option<String>,
 }
 
 /// Split a multi-genre tag string into individual genres.
@@ -760,6 +761,7 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         isrc,
         has_cover,
         credits,
+        comment: None,
     })
 }
 
@@ -827,6 +829,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         isrc: None,
         has_cover: false,
         credits: vec![],
+        comment: None,
     })
 }
 
@@ -1131,6 +1134,7 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
         credits,
+        comment: tag.comment().map(|s| s.to_string()),
     })
 }
 

@@ -16,7 +16,7 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn select_track() -> &'static str {
-        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, t.album_artist, t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, al.cover_path, t.genres, t.comments FROM tracks t LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -31,10 +31,10 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments";
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
-        let placeholders: Vec<String> = (1..=26).map(|i| d.placeholder(i)).collect();
+        let placeholders: Vec<String> = (1..=27).map(|i| d.placeholder(i)).collect();
         format!(
             "INSERT INTO tracks ({INSERT_COLS}) VALUES ({})",
             placeholders.join(", ")
@@ -43,7 +43,7 @@ pub mod sql {
 
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE tracks SET title = {}, album_id = {}, artist_id = {}, album_artist = {}, disc_number = {}, disc_subtitle = {}, track_number = {}, duration_ms = {}, file_path = {}, format = {}, sample_rate = {}, bit_depth = {}, channels = {}, file_mtime = {}, file_size = {}, audio_hash = {}, genre = {}, genres = {}, composer = {}, year = {}, bpm = {}, label = {}, musicbrainz_recording_id = {} WHERE id = {}",
+            "UPDATE tracks SET title = {}, album_id = {}, artist_id = {}, album_artist = {}, disc_number = {}, disc_subtitle = {}, track_number = {}, duration_ms = {}, file_path = {}, format = {}, sample_rate = {}, bit_depth = {}, channels = {}, file_mtime = {}, file_size = {}, audio_hash = {}, genre = {}, genres = {}, composer = {}, year = {}, bpm = {}, label = {}, musicbrainz_recording_id = {}, comments = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -68,6 +68,7 @@ pub mod sql {
             d.placeholder(22),
             d.placeholder(23),
             d.placeholder(24),
+            d.placeholder(25),
         )
     }
 
@@ -284,7 +285,7 @@ impl TrackRepo {
 
     pub fn create(&self, track: &Track) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
-        let params: [&dyn ToSqlValue; 26] = [
+        let params: [&dyn ToSqlValue; 27] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -311,6 +312,7 @@ impl TrackRepo {
             &track.bpm,
             &track.label,
             &track.musicbrainz_recording_id,
+            &track.comments,
         ];
         self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
@@ -319,7 +321,7 @@ impl TrackRepo {
     pub fn update(&self, track: &Track) -> Result<(), String> {
         let id = track.id.ok_or("track has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
-        let params: [&dyn ToSqlValue; 24] = [
+        let params: [&dyn ToSqlValue; 25] = [
             &track.title,
             &track.album_id,
             &track.artist_id,
@@ -343,6 +345,7 @@ impl TrackRepo {
             &track.bpm,
             &track.label,
             &track.musicbrainz_recording_id,
+            &track.comments,
             &id,
         ];
         self.db.execute(&sql, &params)?;
@@ -589,7 +592,7 @@ impl TrackRepo {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
         for track in tracks {
-            let params: [&dyn ToSqlValue; 26] = [
+            let params: [&dyn ToSqlValue; 27] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -616,6 +619,7 @@ impl TrackRepo {
                 &track.bpm,
                 &track.label,
                 &track.musicbrainz_recording_id,
+                &track.comments,
             ];
             if self.db.execute(&insert_sql, &params).is_ok() {
                 count += 1;
@@ -635,7 +639,7 @@ impl TrackRepo {
         let mut count = 0usize;
         for track in tracks {
             let Some(id) = track.id else { continue };
-            let params: [&dyn ToSqlValue; 24] = [
+            let params: [&dyn ToSqlValue; 25] = [
                 &track.title,
                 &track.album_id,
                 &track.artist_id,
@@ -659,6 +663,7 @@ impl TrackRepo {
                 &track.bpm,
                 &track.label,
                 &track.musicbrainz_recording_id,
+                &track.comments,
                 &id,
             ];
             if self.db.execute(&update_sql, &params).is_ok() {
@@ -867,6 +872,7 @@ fn row_to_track(cols: &Vec<SqlValue>) -> Track {
         musicbrainz_recording_id: cols.get(27).and_then(|v| v.as_string()),
         cover_path: cols.get(28).and_then(|v| v.as_string()),
         genres: cols.get(29).and_then(|v| v.as_string()),
+        comments: cols.get(30).and_then(|v| v.as_string()),
     }
 }
 

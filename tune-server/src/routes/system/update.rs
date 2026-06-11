@@ -529,6 +529,87 @@ pub(super) async fn changelog() -> Json<Value> {
                     ]},
                 ]
             },
+            {
+                "version": "0.8.50",
+                "date": "2026-06-05",
+                "sections": [
+                    { "title": "Nouveautes", "items": [
+                        "Auth JWT multi-utilisateurs",
+                        "AI Assistant Claude (11 outils)",
+                        "Plugin SDK + EventBus",
+                        "PostgreSQL abstraction complète",
+                        "Tune Bridge (WebSocket cloud-to-home)",
+                        "Intégration cloud mozaiklabs.fr (SSO, télémétrie)",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.58",
+                "date": "2026-06-06",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "ALAC 24-bit décodage (hiss fix)",
+                        "WAL checkpoint stale reads",
+                        "M4A scan fallback",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Docker officiel multi-arch",
+                        "FFmpeg entièrement supprimé — pipeline 100% Rust",
+                        "5 décodeurs natifs (ALAC, AAC, MP3, Vorbis, Opus)",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.65",
+                "date": "2026-06-08",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Fix DLNA darTZeel coupure 2s",
+                        "Volume buttons web client (PUT + int 0-100)",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "HQPlayer output (v4/v5/v6)",
+                        "OAAT protocol (9 crates, crates.io)",
+                        "Community metadata (covers + artist images)",
+                        "Forum 7 langues (350 traductions)",
+                        "MusicBrainz batch MBID matching",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.70",
+                "date": "2026-06-09",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Volume slider (debounce + DLNA normalisation)",
+                        "Podcast Affaires Sensibles (feed URL corrigée)",
+                        "Zones fantômes filtrées de En cours d'écoute",
+                        "Télémétrie report après scan (5 min au lieu de 30s)",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Page Ambassadeurs (mozaiklabs.fr/ambassadors)",
+                        "Page Fabricants OAAT (mozaiklabs.fr/oaat/manufacturers)",
+                        "Admin Tune Cloud (instances, SSO, bridges)",
+                        "Threads privés forum",
+                        "Images artistes fallback MusicBrainz/Wikimedia",
+                    ]},
+                ]
+            },
+            {
+                "version": "0.8.83",
+                "date": "2026-06-11",
+                "sections": [
+                    { "title": "Corrections", "items": [
+                        "Scrollbar plus large + visible sur Windows",
+                        "Thème persisté après sync serveur",
+                        "Quoi de neuf : parsing du format changelog API",
+                    ]},
+                    { "title": "Nouveautes", "items": [
+                        "Next/Prev instantanés (DLNA async en background)",
+                        "Tune Widget macOS (tray app Tauri v2)",
+                    ]},
+                ]
+            },
         ]
     }))
 }

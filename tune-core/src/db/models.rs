@@ -147,6 +147,7 @@ pub struct Track {
     pub label: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
     pub cover_path: Option<String>,
+    pub comments: Option<String>,
 }
 
 impl Track {
@@ -182,6 +183,7 @@ impl Track {
             label: None,
             musicbrainz_recording_id: None,
             cover_path: None,
+            comments: None,
         }
     }
 }

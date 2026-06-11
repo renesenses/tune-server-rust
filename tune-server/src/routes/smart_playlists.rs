@@ -243,6 +243,22 @@ fn build_smart_query(
                 format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0))
             }
             ("title", "contains") => format!("t.title LIKE '%{}%'", value.replace('\'', "''")),
+            ("comments", "contains") => {
+                format!("t.comments LIKE '%{}%'", value.replace('\'', "''"))
+            }
+            ("comments", "eq") | ("comments", "equals") => {
+                format!("t.comments = '{}'", value.replace('\'', "''"))
+            }
+            ("comments", "starts_with") => {
+                format!("t.comments LIKE '{}%'", value.replace('\'', "''"))
+            }
+            ("comments", "ends_with") => {
+                format!("t.comments LIKE '%{}'", value.replace('\'', "''"))
+            }
+            ("comments", "is_empty") => "(t.comments IS NULL OR t.comments = '')".to_string(),
+            ("comments", "is_not_empty") => {
+                "(t.comments IS NOT NULL AND t.comments != '')".to_string()
+            }
             ("play_count", "eq") => {
                 let n = value.parse::<i64>().unwrap_or(0);
                 if n == 0 {

@@ -245,7 +245,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     year INTEGER,
     bpm REAL,
     label TEXT,
-    musicbrainz_recording_id TEXT
+    musicbrainz_recording_id TEXT,
+    comments TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

@@ -371,6 +371,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                         track.label = meta.label.clone();
                         track.isrc = meta.isrc.clone();
                         track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
+                        track.comments = meta.comment.clone();
                         to_update.push(track);
                         continue;
                     }
@@ -405,6 +406,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     track.label = meta.label.clone();
                     track.isrc = meta.isrc.clone();
                     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
+                    track.comments = meta.comment.clone();
                     to_insert.push(track);
                 }
 

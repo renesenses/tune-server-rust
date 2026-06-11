@@ -113,6 +113,7 @@ pub fn build_track_from_metadata(
     track.label = meta.label.clone();
     track.isrc = meta.isrc.clone();
     track.musicbrainz_recording_id = meta.musicbrainz_recording_id.clone();
+    track.comments = meta.comment.clone();
 
     Some((track, album_id))
 }

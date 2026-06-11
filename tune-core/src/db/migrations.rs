@@ -413,6 +413,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_smart_collections_extra_columns",
         up: "",
     },
+    Migration {
+        version: 30,
+        name: "add_track_comments",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -675,6 +680,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "smart_collections", "description", "TEXT");
             add_column_if_missing(db, "smart_collections", "icon", "TEXT");
             add_column_if_missing(db, "smart_collections", "color", "TEXT");
+        }
+        if migration.version == 30 {
+            add_column_if_missing(db, "tracks", "comments", "TEXT");
         }
 
         db.execute(

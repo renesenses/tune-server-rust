@@ -1,407 +1,471 @@
-use serde::{Deserialize, Serialize};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
-use crate::db::sqlite::SqliteDb;
+use crate::error::AppError;
+use crate::state::AppState;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmartCollection {
-    pub id: Option<i64>,
-    pub name: String,
-    pub rules: Vec<Rule>,
-    pub match_mode: MatchMode,
-    pub sort_by: Option<String>,
-    pub sort_order: SortOrder,
-    pub limit: Option<i64>,
+#[derive(Deserialize)]
+struct CreateCollection {
+    name: String,
+    rules: Value,
+    match_mode: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_limit: Option<i64>,
+    description: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MatchMode {
-    All,
-    Any,
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct UpdateCollection {
+    name: Option<String>,
+    rules: Option<Value>,
+    match_mode: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_limit: Option<i64>,
+    description: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SortOrder {
-    Asc,
-    Desc,
+#[derive(Deserialize)]
+struct PreviewRequest {
+    rules: Value,
+    match_mode: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
+    max_limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    pub field: String,
-    pub operator: Operator,
-    pub value: String,
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(list_collections).post(create_collection))
+        .route(
+            "/{id}",
+            get(get_collection)
+                .put(update_collection)
+                .delete(delete_collection),
+        )
+        .route("/{id}/albums", get(resolve_albums))
+        .route("/preview", post(preview_albums))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Operator {
-    Equals,
-    NotEquals,
-    Contains,
-    NotContains,
-    StartsWith,
-    EndsWith,
-    GreaterThan,
-    LessThan,
-    Between,
-    IsEmpty,
-    IsNotEmpty,
-}
-
-impl SmartCollection {
-    pub fn compile_sql(&self) -> (String, Vec<String>) {
-        let mut conditions = Vec::new();
-        let mut params = Vec::new();
-
-        for rule in &self.rules {
-            let (cond, rule_params) = compile_rule(rule);
-            conditions.push(cond);
-            params.extend(rule_params);
-        }
-
-        let join = match self.match_mode {
-            MatchMode::All => " AND ",
-            MatchMode::Any => " OR ",
-        };
-
-        let where_clause = if conditions.is_empty() {
-            "1=1".to_string()
-        } else {
-            conditions.join(join)
-        };
-
-        let mut sql = format!(
-            "SELECT t.id FROM tracks t \
-             LEFT JOIN albums al ON t.album_id = al.id \
-             LEFT JOIN artists ar ON t.artist_id = ar.id \
-             WHERE {where_clause}"
-        );
-
-        if let Some(ref sort) = self.sort_by {
-            let col = field_to_column(sort);
-            let order = match self.sort_order {
-                SortOrder::Asc => "ASC",
-                SortOrder::Desc => "DESC",
-            };
-            sql.push_str(&format!(" ORDER BY {col} {order}"));
-        }
-
-        if let Some(limit) = self.limit {
-            sql.push_str(&format!(" LIMIT {limit}"));
-        }
-
-        (sql, params)
-    }
-}
-
-fn field_to_column(field: &str) -> &str {
-    match field {
-        "title" => "t.title",
-        "artist" => "ar.name",
-        "album" => "al.title",
-        "genre" => "t.genre",
-        "year" => "al.year",
-        "duration" => "t.duration_ms",
-        "rating" => "t.rating",
-        "play_count" => "t.play_count",
-        "added_at" => "t.created_at",
-        "track_number" => "t.track_number",
-        "disc_number" => "t.disc_number",
-        "sample_rate" => "t.sample_rate",
-        "bit_depth" => "t.bit_depth",
-        "format" => "t.format",
-        "composer" => "t.composer",
-        "bpm" => "t.bpm",
-        _ => "t.title",
-    }
-}
-
-fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
-    let col = field_to_column(&rule.field);
-    match rule.operator {
-        Operator::Equals => (format!("{col} = ?"), vec![rule.value.clone()]),
-        Operator::NotEquals => (format!("{col} != ?"), vec![rule.value.clone()]),
-        Operator::Contains => (
-            format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}%", rule.value)],
-        ),
-        Operator::NotContains => (
-            format!("{col} NOT LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}%", rule.value)],
-        ),
-        Operator::StartsWith => (
-            format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("{}%", rule.value)],
-        ),
-        Operator::EndsWith => (
-            format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}", rule.value)],
-        ),
-        Operator::GreaterThan => (format!("{col} > ?"), vec![rule.value.clone()]),
-        Operator::LessThan => (format!("{col} < ?"), vec![rule.value.clone()]),
-        Operator::Between => {
-            let parts: Vec<&str> = rule.value.splitn(2, ',').collect();
-            if parts.len() == 2 {
-                (
-                    format!("{col} BETWEEN ? AND ?"),
-                    vec![parts[0].trim().to_string(), parts[1].trim().to_string()],
-                )
-            } else {
-                (format!("{col} = ?"), vec![rule.value.clone()])
-            }
-        }
-        Operator::IsEmpty => (format!("({col} IS NULL OR {col} = '')"), vec![]),
-        Operator::IsNotEmpty => (format!("({col} IS NOT NULL AND {col} != '')"), vec![]),
-    }
-}
-
-pub struct SmartCollectionRepo {
-    db: SqliteDb,
-}
-
-impl SmartCollectionRepo {
-    pub fn new(db: SqliteDb) -> Self {
-        Self { db }
-    }
-
-    pub fn save(&self, collection: &SmartCollection) -> Result<i64, String> {
-        let rules_json = serde_json::to_string(&collection.rules).map_err(|e| e.to_string())?;
-        let match_mode =
-            serde_json::to_string(&collection.match_mode).map_err(|e| e.to_string())?;
-        let sort_order =
-            serde_json::to_string(&collection.sort_order).map_err(|e| e.to_string())?;
-
-        let conn = self.db.connection().lock().unwrap();
-
-        if let Some(id) = collection.id {
-            conn.execute(
-                "UPDATE smart_collections SET name=?, rules=?, match_mode=?, sort_by=?, sort_order=?, max_limit=? WHERE id=?",
-                rusqlite::params![collection.name, rules_json, match_mode, collection.sort_by, sort_order, collection.limit, id],
-            ).map_err(|e| e.to_string())?;
-            Ok(id)
-        } else {
-            conn.execute(
-                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order, max_limit) VALUES (?, ?, ?, ?, ?, ?)",
-                rusqlite::params![collection.name, rules_json, match_mode, collection.sort_by, sort_order, collection.limit],
-            ).map_err(|e| e.to_string())?;
-            Ok(conn.last_insert_rowid())
-        }
-    }
-
-    pub fn get(&self, id: i64) -> Result<Option<SmartCollection>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections WHERE id = ?")
-            .map_err(|e| e.to_string())?;
-
-        stmt.query_row(rusqlite::params![id], |row| {
-            let rules_json: String = row.get(2)?;
-            let match_mode_json: String = row.get(3)?;
-            let sort_order_json: String = row.get(5)?;
-
-            Ok(SmartCollection {
-                id: row.get(0).ok(),
-                name: row.get(1)?,
-                rules: serde_json::from_str(&rules_json).unwrap_or_default(),
-                match_mode: serde_json::from_str(&match_mode_json).unwrap_or(MatchMode::All),
-                sort_by: row.get(4).ok().flatten(),
-                sort_order: serde_json::from_str(&sort_order_json).unwrap_or(SortOrder::Asc),
-                limit: row.get(6).ok().flatten(),
+async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let items: Vec<Value> = conn
+        .prepare(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+             description, icon, color, created_at \
+             FROM smart_collections ORDER BY name",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
+                let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "name": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "rules": rules,
+                    "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
+                    "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
+                    "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
+                    "description": row.get::<_, Option<String>>(7).ok().flatten(),
+                    "icon": row.get::<_, Option<String>>(8).ok().flatten(),
+                    "color": row.get::<_, Option<String>>(9).ok().flatten(),
+                    "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
+                }))
             })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .optional()
+        .unwrap_or_default();
+    drop(conn);
+    Ok(Json(json!(items)))
+}
+
+async fn create_collection(
+    State(state): State<AppState>,
+    Json(body): Json<CreateCollection>,
+) -> Result<impl IntoResponse, AppError> {
+    let rules_json = body.rules.to_string();
+    let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
+    let sort_by = body.sort_by.clone();
+    let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
+
+    let result = {
+        let conn = state
+            .db
+            .connection()
+            .lock()
+            .map_err(|e| AppError::internal(format!("{e}")))?;
+        conn.execute(
+            "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                body.name, rules_json, match_mode, sort_by, sort_order,
+                body.max_limit, body.description, body.icon, body.color
+            ],
+        )
+        .map(|_| conn.last_insert_rowid())
         .map_err(|e| e.to_string())
-    }
+    };
 
-    pub fn list(&self) -> Result<Vec<SmartCollection>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections ORDER BY name")
-            .map_err(|e| e.to_string())?;
-
-        let collections = stmt
-            .query_map([], |row| {
-                let rules_json: String = row.get(2)?;
-                let match_mode_json: String = row.get(3)?;
-                let sort_order_json: String = row.get(5)?;
-
-                Ok(SmartCollection {
-                    id: row.get(0).ok(),
-                    name: row.get(1)?,
-                    rules: serde_json::from_str(&rules_json).unwrap_or_default(),
-                    match_mode: serde_json::from_str(&match_mode_json).unwrap_or(MatchMode::All),
-                    sort_by: row.get(4).ok().flatten(),
-                    sort_order: serde_json::from_str(&sort_order_json).unwrap_or(SortOrder::Asc),
-                    limit: row.get(6).ok().flatten(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(collections)
-    }
-
-    pub fn delete(&self, id: i64) -> Result<(), String> {
-        self.db
-            .execute("DELETE FROM smart_collections WHERE id = ?", &[&id])?;
-        Ok(())
-    }
-
-    pub fn execute_query(&self, collection: &SmartCollection) -> Result<Vec<i64>, String> {
-        let (sql, params) = collection.compile_sql();
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-            .iter()
-            .map(|p| p as &dyn rusqlite::types::ToSql)
-            .collect();
-
-        let ids = stmt
-            .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(ids)
+    match result {
+        Ok(id) => {
+            let created = json!({
+                "id": id,
+                "name": body.name,
+                "rules": body.rules,
+                "match_mode": match_mode,
+                "sort_by": sort_by,
+                "sort_order": sort_order,
+                "max_limit": body.max_limit,
+                "description": body.description,
+                "icon": body.icon,
+                "color": body.color,
+            });
+            Ok((StatusCode::CREATED, Json(created)).into_response())
+        }
+        Err(e) => Err(AppError::internal(e)),
     }
 }
 
-use rusqlite::OptionalExtension;
+async fn get_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let result = conn.query_row(
+        "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+         description, icon, color, created_at \
+         FROM smart_collections WHERE id = ?",
+        rusqlite::params![id],
+        |row| {
+            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            Ok(json!({
+                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                "name": row.get::<_, Option<String>>(1).ok().flatten(),
+                "rules": rules,
+                "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
+                "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
+                "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
+                "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
+                "description": row.get::<_, Option<String>>(7).ok().flatten(),
+                "icon": row.get::<_, Option<String>>(8).ok().flatten(),
+                "color": row.get::<_, Option<String>>(9).ok().flatten(),
+                "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
+            }))
+        },
+    );
+    drop(conn);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    match result {
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
+}
 
-    #[test]
-    fn compile_equals_rule() {
-        let collection = SmartCollection {
-            id: None,
-            name: "Rock Tracks".into(),
-            rules: vec![Rule {
-                field: "genre".into(),
-                operator: Operator::Equals,
-                value: "Rock".into(),
-            }],
-            match_mode: MatchMode::All,
-            sort_by: Some("title".into()),
-            sort_order: SortOrder::Asc,
-            limit: Some(100),
+async fn update_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateCollection>,
+) -> impl IntoResponse {
+    if let Some(ref name) = body.name {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[name as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref rules) = body.rules {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET rules = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[&rules.to_string() as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref match_mode) = body.match_mode {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET match_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[match_mode as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref sort_by) = body.sort_by {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET sort_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[sort_by as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref sort_order) = body.sort_order {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[sort_order as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref max_limit) = body.max_limit {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET max_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[max_limit as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref description) = body.description {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[description as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref icon) = body.icon {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET icon = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[icon as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    if let Some(ref color) = body.color {
+        state
+            .db
+            .execute(
+                "UPDATE smart_collections SET color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                &[color as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn delete_collection(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    state
+        .db
+        .execute("DELETE FROM smart_collections WHERE id = ?", &[&id])
+        .ok();
+    StatusCode::NO_CONTENT
+}
+
+/// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).
+fn build_album_query(
+    rules_json: &str,
+    match_mode: &str,
+    sort_by: &str,
+    sort_order: &str,
+    max_limit: Option<i64>,
+) -> (String, String, String) {
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+
+    let mut conditions = Vec::new();
+    for rule in &rules {
+        let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
+        let op = rule
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("contains");
+        let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+        let cond = match (field, op) {
+            ("genre", "eq") => format!("t.genre = '{}'", value.replace('\'', "''")),
+            ("genre", "contains") => format!("t.genre LIKE '%{}%'", value.replace('\'', "''")),
+            ("artist", "eq") => format!("ar.name = '{}'", value.replace('\'', "''")),
+            ("artist", "contains") => format!("ar.name LIKE '%{}%'", value.replace('\'', "''")),
+            ("album", "eq") => format!("al.title = '{}'", value.replace('\'', "''")),
+            ("album", "contains") => format!("al.title LIKE '%{}%'", value.replace('\'', "''")),
+            ("year", "eq") => format!("al.year = {}", value.parse::<i32>().unwrap_or(0)),
+            ("year", "gte") => format!("al.year >= {}", value.parse::<i32>().unwrap_or(0)),
+            ("year", "lte") => format!("al.year <= {}", value.parse::<i32>().unwrap_or(0)),
+            ("year", "between") => {
+                let parts: Vec<&str> = value.splitn(2, ',').collect();
+                if parts.len() == 2 {
+                    format!(
+                        "al.year BETWEEN {} AND {}",
+                        parts[0].trim().parse::<i32>().unwrap_or(0),
+                        parts[1].trim().parse::<i32>().unwrap_or(9999)
+                    )
+                } else {
+                    format!("al.year = {}", value.parse::<i32>().unwrap_or(0))
+                }
+            }
+            ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
+            ("sample_rate", "gte") => {
+                format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("bit_depth", "gte") => {
+                format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("label", "eq") => format!("al.label = '{}'", value.replace('\'', "''")),
+            ("label", "contains") => format!("al.label LIKE '%{}%'", value.replace('\'', "''")),
+            _ => continue,
         };
-
-        let (sql, params) = collection.compile_sql();
-        assert!(sql.contains("t.genre = ?"));
-        assert!(sql.contains("ORDER BY t.title ASC"));
-        assert!(sql.contains("LIMIT 100"));
-        assert_eq!(params, vec!["Rock"]);
+        conditions.push(cond);
     }
 
-    #[test]
-    fn compile_multiple_rules_all() {
-        let collection = SmartCollection {
-            id: None,
-            name: "Test".into(),
-            rules: vec![
-                Rule {
-                    field: "genre".into(),
-                    operator: Operator::Contains,
-                    value: "Jazz".into(),
-                },
-                Rule {
-                    field: "year".into(),
-                    operator: Operator::GreaterThan,
-                    value: "2000".into(),
-                },
-            ],
-            match_mode: MatchMode::All,
-            sort_by: None,
-            sort_order: SortOrder::Asc,
-            limit: None,
-        };
+    let joiner = if match_mode == "any" { " OR " } else { " AND " };
 
-        let (sql, params) = collection.compile_sql();
-        assert!(sql.contains(" AND "));
-        assert!(sql.contains("t.genre LIKE ? COLLATE NOCASE"));
-        assert!(sql.contains("al.year > ?"));
-        assert_eq!(params.len(), 2);
-    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(joiner))
+    };
 
-    #[test]
-    fn compile_any_mode() {
-        let collection = SmartCollection {
-            id: None,
-            name: "Mixed".into(),
-            rules: vec![
-                Rule {
-                    field: "genre".into(),
-                    operator: Operator::Equals,
-                    value: "Rock".into(),
-                },
-                Rule {
-                    field: "genre".into(),
-                    operator: Operator::Equals,
-                    value: "Pop".into(),
-                },
-            ],
-            match_mode: MatchMode::Any,
-            sort_by: None,
-            sort_order: SortOrder::Asc,
-            limit: None,
-        };
+    let order = if sort_by == "random" {
+        "ORDER BY RANDOM()".to_string()
+    } else {
+        format!(
+            "ORDER BY {} {}",
+            match sort_by {
+                "artist" => "ar.name",
+                "album" | "title" => "al.title",
+                "year" => "al.year",
+                "added_at" => "al.id",
+                "track_count" => "track_count",
+                _ => "al.title",
+            },
+            if sort_order == "desc" { "DESC" } else { "ASC" }
+        )
+    };
 
-        let (sql, _) = collection.compile_sql();
-        assert!(sql.contains(" OR "));
-    }
+    let limit_clause = max_limit.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
-    #[test]
-    fn compile_between() {
-        let rule = Rule {
-            field: "year".into(),
-            operator: Operator::Between,
-            value: "1990, 2000".into(),
-        };
-        let (cond, params) = compile_rule(&rule);
-        assert!(cond.contains("BETWEEN"));
-        assert_eq!(params, vec!["1990", "2000"]);
-    }
+    (where_clause, order, limit_clause)
+}
 
-    #[test]
-    fn compile_is_empty() {
-        let rule = Rule {
-            field: "composer".into(),
-            operator: Operator::IsEmpty,
-            value: String::new(),
-        };
-        let (cond, params) = compile_rule(&rule);
-        assert!(cond.contains("IS NULL"));
-        assert!(params.is_empty());
-    }
+/// Execute a smart album query and return album rows as JSON values.
+fn execute_album_query(
+    state: &AppState,
+    where_clause: &str,
+    order: &str,
+    limit_clause: &str,
+) -> Result<Vec<Value>, AppError> {
+    let sql = format!(
+        "SELECT al.id, al.title, ar.name, al.year, al.cover_path, al.genre, \
+         COUNT(t.id) AS track_count \
+         FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id \
+         {} \
+         GROUP BY al.id \
+         {} {}",
+        where_clause, order, limit_clause
+    );
 
-    #[test]
-    fn empty_rules() {
-        let collection = SmartCollection {
-            id: None,
-            name: "All".into(),
-            rules: vec![],
-            match_mode: MatchMode::All,
-            sort_by: None,
-            sort_order: SortOrder::Asc,
-            limit: None,
-        };
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok(json!({
+                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
+                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
+                    "year": row.get::<_, Option<i32>>(3).ok().flatten(),
+                    "cover_path": row.get::<_, Option<String>>(4).ok().flatten(),
+                    "genre": row.get::<_, Option<String>>(5).ok().flatten(),
+                    "track_count": row.get::<_, i64>(6).unwrap_or(0),
+                }))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .unwrap_or_default())
+}
 
-        let (sql, params) = collection.compile_sql();
-        assert!(sql.contains("1=1"));
-        assert!(params.is_empty());
-    }
+/// Load a smart collection's criteria from the DB.
+fn load_collection_criteria(
+    state: &AppState,
+    id: i64,
+) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    Ok(conn
+        .query_row(
+            "SELECT rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections WHERE id = ?",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
+                    row.get::<_, String>(1).unwrap_or_else(|_| "all".into()),
+                    row.get::<_, String>(2).unwrap_or_else(|_| "title".into()),
+                    row.get::<_, String>(3).unwrap_or_else(|_| "asc".into()),
+                    row.get::<_, Option<i64>>(4).ok().flatten(),
+                ))
+            },
+        )
+        .ok())
+}
 
-    #[test]
-    fn field_mapping() {
-        assert_eq!(field_to_column("title"), "t.title");
-        assert_eq!(field_to_column("artist"), "ar.name");
-        assert_eq!(field_to_column("year"), "al.year");
-        assert_eq!(field_to_column("unknown"), "t.title");
-    }
+async fn resolve_albums(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, AppError> {
+    let Some((rules_json, match_mode, sort_by, sort_order, max_limit)) =
+        load_collection_criteria(&state, id)?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+
+    let (where_clause, order, limit_clause) =
+        build_album_query(&rules_json, &match_mode, &sort_by, &sort_order, max_limit);
+    let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+
+    Ok(Json(json!({"albums": albums, "total": albums.len()})).into_response())
+}
+
+async fn preview_albums(
+    State(state): State<AppState>,
+    Json(body): Json<PreviewRequest>,
+) -> Result<Json<Value>, AppError> {
+    let rules_json = body.rules.to_string();
+    let match_mode = body.match_mode.as_deref().unwrap_or("all");
+    let sort_by = body.sort_by.as_deref().unwrap_or("title");
+    let sort_order = body.sort_order.as_deref().unwrap_or("asc");
+
+    let (where_clause, order, limit_clause) =
+        build_album_query(&rules_json, match_mode, sort_by, sort_order, body.max_limit);
+    let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+
+    Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }
