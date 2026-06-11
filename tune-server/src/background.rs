@@ -77,7 +77,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 .iter()
                 .any(|z| z.output_device_id.as_deref() == Some(&d.id))
             {
-                zone_repo.create(&d.name, Some(&d.id), Some("dlna")).ok();
+                zone_repo.create(&d.name, Some("dlna"), Some(&d.id)).ok();
                 info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_created");
             }
         }

@@ -113,7 +113,32 @@ impl PlaybackOrchestrator {
         })
     }
 
-    pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+    pub async fn play(&self, mut req: PlayRequest) -> Result<PlayResult, String> {
+        // Ensure output_device_id is populated: if the caller didn't provide
+        // it (e.g. web client sends only zone_id + track_id), look it up from
+        // the zone's DB record.  This is the primary gate for send_to_output —
+        // without it, the stream is created but never sent to the output device.
+        if req.output_device_id.is_none() {
+            let looked_up = ZoneRepo::new(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
+            if looked_up.is_some() {
+                debug!(
+                    zone_id = req.zone_id,
+                    device_id = ?looked_up,
+                    "output_device_id_resolved_from_zone_db"
+                );
+            } else {
+                warn!(
+                    zone_id = req.zone_id,
+                    "output_device_id_missing_not_in_request_nor_zone_db"
+                );
+            }
+            req.output_device_id = looked_up;
+        }
+
         // Clean up any gapless-prepared session for this zone before
         // creating a new stream.
         self.cleanup_gapless_session(req.zone_id).await;
@@ -184,6 +209,10 @@ impl PlaybackOrchestrator {
             };
             self.send_to_output(device_id, &media).await
         } else {
+            warn!(
+                zone_id = req.zone_id,
+                "no_output_device_id_skipping_send_to_output"
+            );
             (false, None)
         };
 
