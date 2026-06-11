@@ -3,7 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -13,6 +13,57 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
+
+/// Resolve the actual audio bit depth from codec parameters.
+///
+/// Symphonia's ISOMP4 demuxer does not populate `bits_per_sample` for ALAC
+/// tracks (only PCM codecs get it). The ALAC decoder also doesn't propagate
+/// the value from the magic cookie to the codec parameters. This leaves
+/// `bits_per_sample == None` for ALL ALAC files, regardless of actual depth.
+///
+/// When `bits_per_sample` is absent, this function inspects the codec's
+/// `extra_data` (the ALAC magic cookie) to extract the true bit depth.
+/// The cookie layout has `bit_depth` at byte offset 5 (0-indexed) within
+/// the 24-byte payload.
+///
+/// Without this fix, 24-bit ALAC files are decoded as 16-bit, producing a
+/// WAV stream whose PCM data mismatches the header — causing silence or
+/// errors on DLNA renderers.
+fn resolve_bit_depth(params: &AudioCodecParameters) -> u16 {
+    if let Some(bps) = params.bits_per_sample {
+        return bps as u16;
+    }
+
+    // ALAC magic cookie: the raw extra_data may be 24 or 48 bytes.
+    // Skip optional `frma` (12 bytes) and `alac` (12 bytes) atom prefixes,
+    // then byte 5 of the remaining 24-byte payload is the bit depth.
+    if let Some(ref extra) = params.extra_data {
+        let mut buf: &[u8] = extra;
+
+        // Skip optional frma atom prefix
+        if buf.len() >= 12 && &buf[4..8] == b"frma" {
+            buf = &buf[12..];
+        }
+        // Skip optional alac atom prefix
+        if buf.len() >= 12 && &buf[4..8] == b"alac" {
+            buf = &buf[12..];
+        }
+
+        if buf.len() >= 24 {
+            let bd = buf[5];
+            if bd > 0 && bd <= 32 {
+                debug!(
+                    bit_depth = bd,
+                    "resolved_bit_depth_from_extra_data (ALAC magic cookie)"
+                );
+                return bd as u16;
+            }
+        }
+    }
+
+    // Ultimate fallback
+    16
+}
 
 pub struct DecodedAudio {
     pub samples_i32: Vec<i32>,
@@ -238,7 +289,7 @@ pub fn decode_to_pcm_streaming(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    let source_bd = audio_params.bits_per_sample.unwrap_or(16) as u16;
+    let source_bd = resolve_bit_depth(&audio_params);
     let shift = 32u16.saturating_sub(source_bd);
 
     let rt = tokio::runtime::Handle::try_current()
@@ -406,7 +457,7 @@ fn decode_symphonia(
         );
     }
 
-    let source_bd = audio_params.bits_per_sample.unwrap_or(16) as u16;
+    let source_bd = resolve_bit_depth(&audio_params);
 
     let mut all_samples: Vec<i32> = Vec::new();
     let max_samples = if max_duration_s > 0.0 {
