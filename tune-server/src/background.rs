@@ -69,17 +69,16 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
         }
         drop(outputs);
 
-        if registered > 0 {
-            // Auto-create zones for new devices
-            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-            let existing_zones = zone_repo.list().unwrap_or_default();
-            for d in &devices {
-                if !existing_zones
-                    .iter()
-                    .any(|z| z.output_device_id.as_deref() == Some(&d.id))
-                {
-                    zone_repo.create(&d.name, Some(&d.id), Some("dlna")).ok();
-                }
+        // Auto-create zones for discovered devices (skip if zone already exists)
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let existing_zones = zone_repo.list().unwrap_or_default();
+        for d in &devices {
+            if !existing_zones
+                .iter()
+                .any(|z| z.output_device_id.as_deref() == Some(&d.id))
+            {
+                zone_repo.create(&d.name, Some(&d.id), Some("dlna")).ok();
+                info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_created");
             }
         }
 
