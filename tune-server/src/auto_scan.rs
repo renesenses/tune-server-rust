@@ -360,9 +360,18 @@ pub fn spawn_file_watcher(db: SqliteDb, wait_for_scan: Option<Arc<AtomicBool>>) 
                     while !flag.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
-                    // Drain any stale events that accumulated during the scan
-                    let _ = watcher.poll_changes(std::time::Duration::from_millis(100));
                     info!("file_watcher_scan_complete_starting_watch");
+                }
+                // Always drain stale events before entering the watch loop.
+                // On macOS, FSEvents replays recent events from the persistent
+                // journal when a new stream is created, even with
+                // kFSEventStreamEventIdSinceNow.  Give it 2 seconds to flush
+                // (the default FSEvents coalescing latency) to avoid
+                // reprocessing events that already happened before startup.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let stale = watcher.poll_changes(std::time::Duration::from_millis(200));
+                if !stale.is_empty() {
+                    info!(count = stale.len(), "file_watcher_drained_stale_events");
                 }
                 loop {
                     let changes = watcher.poll_debounced(

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{debug, info, warn};
 
@@ -40,7 +41,19 @@ impl FileWatcher {
                 Ok(event) => {
                     let change_type = match event.kind {
                         EventKind::Create(_) => Some(ChangeType::Added),
-                        EventKind::Modify(_) => Some(ChangeType::Modified),
+                        // Only treat data/content changes and renames as
+                        // modifications.  Ignore metadata-only changes
+                        // (xattr, Finder info, inode meta) — on macOS,
+                        // Spotlight indexing writes extended attributes to
+                        // audio files after they are read, which fires
+                        // Modify(Metadata(Extended)) events.  Treating
+                        // those as content changes creates an infinite
+                        // read→xattr→event→read loop (seen on Ventura).
+                        EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Modify(ModifyKind::Name(_))
+                        | EventKind::Modify(ModifyKind::Any) => Some(ChangeType::Modified),
+                        EventKind::Modify(ModifyKind::Metadata(_))
+                        | EventKind::Modify(ModifyKind::Other) => None,
                         EventKind::Remove(_) => Some(ChangeType::Deleted),
                         _ => None,
                     };
