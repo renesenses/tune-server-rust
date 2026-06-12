@@ -36,10 +36,12 @@ pub fn router() -> Router<AppState> {
 // ---------------------------------------------------------------------------
 
 fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
-    let client_id = settings.get("mozaik_client_id").ok().flatten()?;
-    if client_id.is_empty() {
-        return None;
-    }
+    let client_id = settings
+        .get("mozaik_client_id")
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
+        .filter(|s| !s.is_empty())?;
     let base_url = settings
         .get("mozaik_base_url")
         .ok()
