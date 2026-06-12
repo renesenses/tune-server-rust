@@ -819,6 +819,11 @@ impl PositionPoller {
             .await
         {
             Ok(resolved) => {
+                if let Some(ref sid) = resolved.stream_id {
+                    if !self.orchestrator.wait_stream_data_ready(sid, 5000).await {
+                        debug!(zone_id, "gapless_data_ready_timeout");
+                    }
+                }
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     outputs.get(device_id)
@@ -835,7 +840,6 @@ impl PositionPoller {
                         duration_ms: resolved.duration_ms,
                         file_size: None,
                         file_path: None,
-                        stream_ready: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");

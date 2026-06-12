@@ -230,12 +230,49 @@ pub fn decode_to_pcm_streaming(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
 ) -> Result<u16, String> {
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        tx,
+        chunk_size,
+        None,
+    )
+}
+
+pub fn decode_to_pcm_streaming_with_notify(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+) -> Result<u16, String> {
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        tx,
+        chunk_size,
+        Some(data_ready),
+    )
+}
+
+fn decode_to_pcm_streaming_inner(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<u16, String> {
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
+    let mut first_chunk_sent = false;
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
     if matches!(ext.as_str(), "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape") {
@@ -247,6 +284,12 @@ pub fn decode_to_pcm_streaming(
             if rt.block_on(tx.send(chunk.to_vec())).is_err() {
                 debug!("streaming_decode_consumer_dropped (fallback)");
                 return Ok(decoded.bit_depth);
+            }
+            if !first_chunk_sent {
+                first_chunk_sent = true;
+                if let Some(ref n) = data_ready {
+                    n.notify_one();
+                }
             }
         }
         return Ok(decoded.bit_depth);
@@ -354,12 +397,17 @@ pub fn decode_to_pcm_streaming(
             }
         }
 
-        // Flush accumulated buffer when it exceeds chunk_size
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
             if rt.block_on(tx.send(chunk)).is_err() {
                 debug!("streaming_decode_consumer_dropped");
                 return Ok(source_bd);
+            }
+            if !first_chunk_sent {
+                first_chunk_sent = true;
+                if let Some(ref n) = data_ready {
+                    n.notify_one();
+                }
             }
         }
     }

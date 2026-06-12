@@ -51,6 +51,7 @@ pub struct StreamSession {
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     pub first_request: std::sync::Arc<tokio::sync::Notify>,
+    pub data_ready: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl StreamSession {
@@ -72,6 +73,7 @@ impl StreamSession {
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
+            data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -101,16 +103,37 @@ impl AudioStreamer {
         info: StreamInfo,
         bit_perfect: bool,
         buffer_size: usize,
-    ) -> (String, mpsc::Sender<Vec<u8>>) {
+    ) -> (
+        String,
+        mpsc::Sender<Vec<u8>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StreamSession::new(id.clone(), info, bit_perfect, buffer_size);
         let tx = session.tx.clone();
+        let data_ready = session.data_ready.clone();
         self.sessions
             .lock()
             .await
             .insert(id.clone(), Arc::new(session));
         info!(stream_id = %id, "stream_session_created");
-        (id, tx)
+        (id, tx, data_ready)
+    }
+
+    pub async fn wait_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
+        let notify = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(stream_id).map(|s| s.data_ready.clone())
+        };
+        let Some(notify) = notify else {
+            return false;
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            notify.notified(),
+        )
+        .await
+        .is_ok()
     }
 
     pub async fn create_file_session(
@@ -159,30 +182,6 @@ impl AudioStreamer {
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {
         self.sessions.clone()
-    }
-
-    pub async fn get_stream_ready_notify(
-        &self,
-        stream_id: &str,
-    ) -> Option<std::sync::Arc<tokio::sync::Notify>> {
-        let sessions = self.sessions.lock().await;
-        sessions.get(stream_id).map(|s| s.first_request.clone())
-    }
-
-    pub async fn wait_first_request(&self, stream_id: &str, timeout_ms: u64) -> bool {
-        let session = {
-            let sessions = self.sessions.lock().await;
-            sessions.get(stream_id).cloned()
-        };
-        let Some(session) = session else {
-            return false;
-        };
-        tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            session.first_request.notified(),
-        )
-        .await
-        .is_ok()
     }
 
     pub async fn cleanup_stale_sessions(&self) -> usize {
@@ -265,7 +264,7 @@ mod tests {
             file_size: None,
             duration_ms: None,
         };
-        let (id, _tx) = streamer.create_session(info, false, 128).await;
+        let (id, _tx, _data_ready) = streamer.create_session(info, false, 128).await;
         assert!(!id.is_empty());
         streamer.remove_session(&id).await;
     }
