@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -88,6 +88,73 @@ pub(super) async fn album_artwork(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+pub(super) async fn upload_album_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let album_repo = AlbumRepo::new(state.db);
+    if album_repo.get(id).ok().flatten().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "album not found"})),
+        )
+            .into_response();
+    }
+
+    let mut image_data: Option<Vec<u8>> = None;
+    let mut ext = "jpg".to_string();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "image" || name == "file" || name == "artwork" {
+            if let Some(ct) = field.content_type() {
+                if ct.contains("png") {
+                    ext = "png".to_string();
+                }
+            }
+            image_data = field.bytes().await.ok().map(|b| b.to_vec());
+        }
+    }
+
+    let Some(data) = image_data else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no image provided"})),
+        )
+            .into_response();
+    };
+
+    let cache_dir = artwork_cache_dir();
+    std::fs::create_dir_all(&cache_dir).ok();
+    let hash = tune_core::library::artwork::artwork_hash(&format!("album-upload-{id}"));
+    let path = cache_dir.join(format!("{hash}.{ext}"));
+    if std::fs::write(&path, &data).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to save image"})),
+        )
+            .into_response();
+    }
+
+    album_repo.force_update_cover_path(id, &hash).ok();
+
+    // Return the updated album
+    match album_repo.get(id) {
+        Ok(Some(album)) => Json(json!({
+            "album": album.to_json(),
+            "hash": hash,
+            "size": data.len(),
+        }))
+        .into_response(),
+        _ => Json(json!({
+            "album_id": id,
+            "hash": hash,
+            "size": data.len(),
+        }))
+        .into_response(),
+    }
 }
 
 pub(super) async fn proxy_artwork(

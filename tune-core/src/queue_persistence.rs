@@ -244,6 +244,32 @@ pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
     }
 }
 
+/// Load all queue snapshots from disk without modifying the DB.
+/// Used at startup to extract metadata (repeat_mode, shuffle, position, lengths).
+pub fn load_all_snapshots(db_path: &str) -> Vec<QueueSnapshot> {
+    let dir = queue_dir(db_path);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut snapshots = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(snapshot) = serde_json::from_str::<QueueSnapshot>(&content) {
+                snapshots.push(snapshot);
+            }
+        }
+    }
+    snapshots
+}
+
 /// Delete the queue snapshot file for a zone (e.g., when the queue is cleared).
 pub fn delete_queue_file(db_path: &str, zone_id: i64) {
     let path = queue_file_path(db_path, zone_id);

@@ -303,6 +303,19 @@ async fn play(
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
+                        // Restore queue_length from DB so the poller can
+                        // advance tracks (fixes repeat-all after restart).
+                        let qr = PlayQueueRepo::new(state.db.clone());
+                        let local_c = qr.count(zone_id).unwrap_or(0);
+                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+                        let q_len = if local_c > 0 { local_c } else { stream_c };
+                        if q_len > 0 {
+                            let cur_pos = state.playback.get_state(zone_id).await.queue_position;
+                            state
+                                .playback
+                                .update_queue_info(zone_id, cur_pos, q_len)
+                                .await;
+                        }
                         persist_queue_async(&state, zone_id);
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
@@ -696,10 +709,41 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 duration_ms: Some(np.duration_ms),
             };
             return match state.orchestrator.play(orch_req).await {
-                Ok(result) => Json(build_zone_json_with_result(&state, zone_id, &result).await)
-                    .into_response(),
+                Ok(result) => {
+                    // Restore queue_length from DB so the poller can
+                    // advance tracks (fixes repeat-all after restart).
+                    let qr = PlayQueueRepo::new(state.db.clone());
+                    let local_c = qr.count(zone_id).unwrap_or(0);
+                    let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+                    let q_len = if local_c > 0 { local_c } else { stream_c };
+                    if q_len > 0 {
+                        let cur_pos = state.playback.get_state(zone_id).await.queue_position;
+                        state
+                            .playback
+                            .update_queue_info(zone_id, cur_pos, q_len)
+                            .await;
+                    }
+                    Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                        .into_response()
+                }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             };
+        }
+    }
+
+    // For a normal resume (paused → playing), also ensure queue_length is
+    // populated — it may be zero after a server restart.
+    {
+        let qr = PlayQueueRepo::new(state.db.clone());
+        let local_c = qr.count(zone_id).unwrap_or(0);
+        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+        let q_len = if local_c > 0 { local_c } else { stream_c };
+        if q_len > 0 {
+            let cur_pos = state.playback.get_state(zone_id).await.queue_position;
+            state
+                .playback
+                .update_queue_info(zone_id, cur_pos, q_len)
+                .await;
         }
     }
 
@@ -794,6 +838,7 @@ async fn toggle_shuffle(
     let current = state.playback.get_state(zone_id).await;
     let enabled = q.enabled.unwrap_or(!current.shuffle);
     state.playback.set_shuffle(zone_id, enabled).await;
+    persist_queue_async(&state, zone_id);
     Json(json!({ "shuffle": enabled }))
 }
 
@@ -808,6 +853,7 @@ async fn set_repeat(
         _ => tune_core::playback::RepeatMode::Off,
     };
     state.playback.set_repeat(zone_id, mode).await;
+    persist_queue_async(&state, zone_id);
     Json(json!({ "repeat": mode }))
 }
 

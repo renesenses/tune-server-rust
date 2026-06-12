@@ -490,3 +490,45 @@ pub(super) async fn album_completeness(
         "completeness_pct": if expected > 0 { (actual_tracks as f64 / expected as f64 * 100.0).round() } else { 100.0 },
     })))
 }
+
+// ---------------------------------------------------------------------------
+// PUT /albums/{id} — update album metadata (mirrors POST /metadata/albums/{id}/edit)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(super) struct AlbumUpdate {
+    title: Option<String>,
+    artist_name: Option<String>,
+    genre: Option<String>,
+    year: Option<i32>,
+    label: Option<String>,
+}
+
+pub(super) async fn update_album(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<AlbumUpdate>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db);
+    let mut album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    if let Some(ref v) = body.title {
+        album.title = v.clone();
+    }
+    if let Some(ref v) = body.genre {
+        album.genre = Some(v.clone());
+    }
+    if let Some(v) = body.year {
+        album.year = Some(v);
+    }
+    if let Some(ref v) = body.label {
+        album.label = Some(v.clone());
+    }
+
+    repo.update(&album).ok();
+
+    Json(album.to_json()).into_response()
+}

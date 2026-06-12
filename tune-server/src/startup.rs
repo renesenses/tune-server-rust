@@ -12,6 +12,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
     restore_queues(state, config);
+    restore_queue_metadata(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(&state.db);
@@ -20,6 +21,54 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 /// Restore persisted queue snapshots from JSON files on disk.
 fn restore_queues(state: &AppState, config: &TuneConfig) {
     tune_core::queue_persistence::restore_all_queues(&state.db, &config.db_path);
+}
+
+/// After queues are restored into the DB, load snapshot metadata (repeat_mode,
+/// shuffle, queue_length, current_position) into the PlaybackManager so the
+/// poller's `next_position()` sees the correct values after a server restart.
+async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
+    let snapshots = tune_core::queue_persistence::load_all_snapshots(&config.db_path);
+    let queue_repo = tune_core::db::play_queue_repo::PlayQueueRepo::new(state.db.clone());
+
+    for snap in &snapshots {
+        let zone_id = snap.zone_id;
+
+        // Determine queue length from DB (authoritative after restore_all_queues).
+        let local_count = queue_repo.count(zone_id).unwrap_or(0);
+        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
+        let queue_len = if local_count > 0 {
+            local_count
+        } else {
+            streaming_count
+        };
+
+        if queue_len > 0 {
+            state
+                .playback
+                .update_queue_info(zone_id, snap.current_position, queue_len)
+                .await;
+        }
+
+        // Restore repeat mode
+        let repeat = match snap.repeat_mode.as_str() {
+            "one" => tune_core::playback::RepeatMode::One,
+            "all" => tune_core::playback::RepeatMode::All,
+            _ => tune_core::playback::RepeatMode::Off,
+        };
+        state.playback.set_repeat(zone_id, repeat).await;
+
+        // Restore shuffle
+        state.playback.set_shuffle(zone_id, snap.shuffle).await;
+
+        info!(
+            zone_id,
+            queue_len,
+            position = snap.current_position,
+            repeat_mode = %snap.repeat_mode,
+            shuffle = snap.shuffle,
+            "queue_metadata_restored"
+        );
+    }
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.

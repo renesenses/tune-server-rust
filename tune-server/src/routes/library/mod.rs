@@ -13,7 +13,7 @@ mod stats;
 mod tracks;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -138,7 +138,10 @@ pub fn router() -> Router<AppState> {
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
         .route("/albums/{id}/completeness", get(albums::album_completeness))
-        .route("/albums/{id}", get(albums::get_album))
+        .route(
+            "/albums/{id}",
+            get(albums::get_album).put(albums::update_album),
+        )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
         .route("/tracks", get(tracks::list_tracks))
         .route("/tracks/count", get(tracks::track_count))
@@ -184,7 +187,10 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats::library_stats))
         .route("/artwork/{hash}", get(artwork::serve_artwork))
         .route("/artwork/proxy", get(artwork::proxy_artwork))
-        .route("/albums/{id}/artwork", get(artwork::album_artwork))
+        .route(
+            "/albums/{id}/artwork",
+            get(artwork::album_artwork).post(artwork::upload_album_artwork),
+        )
         .route(
             "/albums/{id}/artwork/enrich",
             post(artwork::enrich_album_artwork),
