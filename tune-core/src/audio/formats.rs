@@ -14,6 +14,7 @@ pub enum AudioFormat {
     Dsd,
     WavPack,
     Ape,
+    Wma,
 }
 
 impl AudioFormat {
@@ -30,6 +31,7 @@ impl AudioFormat {
             "dsf" | "dff" | "dst" | "dsd" => Some(Self::Dsd),
             "wv" => Some(Self::WavPack),
             "ape" => Some(Self::Ape),
+            "wma" | "asf" => Some(Self::Wma),
             _ => None,
         }
     }
@@ -45,7 +47,7 @@ impl AudioFormat {
             Self::Ogg => "ogg",
             Self::Opus => "opus",
             Self::Aiff => "aiff",
-            Self::Dsd | Self::WavPack | Self::Ape => "wav",
+            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => "wav",
         }
     }
 
@@ -62,6 +64,7 @@ impl AudioFormat {
             Self::Aiff => "pcm_s16be",
             Self::Dsd => "pcm_s24le",
             Self::WavPack | Self::Ape => "pcm_s24le",
+            Self::Wma => "pcm_s16le",
         }
     }
 
@@ -78,6 +81,7 @@ impl AudioFormat {
             Self::Dsd => "application/x-dsd",
             Self::WavPack => "audio/x-wavpack",
             Self::Ape => "audio/x-ape",
+            Self::Wma => "audio/x-ms-wma",
         }
     }
 }
@@ -144,6 +148,7 @@ impl AudioFormat {
             Self::Dsd => "DSD",
             Self::WavPack => "WavPack",
             Self::Ape => "APE",
+            Self::Wma => "WMA",
         }
     }
 
@@ -152,7 +157,7 @@ impl AudioFormat {
     pub fn needs_transcode_for_dlna(&self) -> bool {
         matches!(
             self,
-            Self::Aiff | Self::Dsd | Self::WavPack | Self::Ape | Self::Alac
+            Self::Aiff | Self::Dsd | Self::WavPack | Self::Ape | Self::Alac | Self::Wma
         )
     }
 
@@ -162,7 +167,7 @@ impl AudioFormat {
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
             Self::Aiff => AudioFormat::Flac,
-            Self::Alac | Self::Dsd | Self::WavPack | Self::Ape => AudioFormat::Wav,
+            Self::Alac | Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
             other => *other,
         }
     }
@@ -240,6 +245,11 @@ mod tests {
     }
 
     #[test]
+    fn wma_needs_transcode() {
+        assert!(AudioFormat::Wma.needs_transcode_for_dlna());
+    }
+
+    #[test]
     fn flac_no_transcode() {
         assert!(!AudioFormat::Flac.needs_transcode_for_dlna());
     }
@@ -275,6 +285,11 @@ mod tests {
     #[test]
     fn ape_transcodes_to_wav() {
         assert_eq!(AudioFormat::Ape.dlna_transcode_target(), AudioFormat::Wav);
+    }
+
+    #[test]
+    fn wma_transcodes_to_wav() {
+        assert_eq!(AudioFormat::Wma.dlna_transcode_target(), AudioFormat::Wav);
     }
 
     #[test]
@@ -416,6 +431,12 @@ mod tests {
     }
 
     #[test]
+    fn from_extension_wma() {
+        assert_eq!(AudioFormat::from_extension("wma"), Some(AudioFormat::Wma));
+        assert_eq!(AudioFormat::from_extension("asf"), Some(AudioFormat::Wma));
+    }
+
+    #[test]
     fn from_extension_dst() {
         assert_eq!(AudioFormat::from_extension("dst"), Some(AudioFormat::Dsd));
     }
@@ -448,6 +469,7 @@ mod tests {
         assert_eq!(AudioFormat::WavPack.mime_type(), "audio/x-wavpack");
         assert_eq!(AudioFormat::Ape.mime_type(), "audio/x-ape");
         assert_eq!(AudioFormat::Alac.mime_type(), "audio/mp4");
+        assert_eq!(AudioFormat::Wma.mime_type(), "audio/x-ms-wma");
     }
 
     #[test]
@@ -463,6 +485,7 @@ mod tests {
         assert_eq!(AudioFormat::Dsd.container_format(), "wav");
         assert_eq!(AudioFormat::WavPack.container_format(), "wav");
         assert_eq!(AudioFormat::Ape.container_format(), "wav");
+        assert_eq!(AudioFormat::Wma.container_format(), "wav");
     }
 
     #[test]
@@ -477,6 +500,7 @@ mod tests {
         assert_eq!(AudioFormat::Aiff.codec_name(), "pcm_s16be");
         assert_eq!(AudioFormat::WavPack.codec_name(), "pcm_s24le");
         assert_eq!(AudioFormat::Ape.codec_name(), "pcm_s24le");
+        assert_eq!(AudioFormat::Wma.codec_name(), "pcm_s16le");
     }
 
     #[test]

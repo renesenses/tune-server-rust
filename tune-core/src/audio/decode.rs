@@ -119,6 +119,7 @@ pub fn can_decode_native(file_path: &str) -> bool {
             | "dff"
             | "wv"
             | "ape"
+            | "wma"
     )
 }
 
@@ -191,6 +192,16 @@ pub fn decode_to_pcm(
                 Err(format!("APE decode panic: {msg}"))
             }
         };
+    }
+
+    if ext == "wma" || ext == "asf" {
+        return decode_wma_via_ffmpeg(
+            file_path,
+            target_sample_rate,
+            target_channels,
+            seek_s,
+            max_duration_s,
+        );
     }
 
     // Wrap symphonia decode in catch_unwind — an unsupported codec or
@@ -298,7 +309,10 @@ fn decode_to_pcm_streaming_inner(
     let mut first_chunk_sent = false;
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
-    if matches!(ext.as_str(), "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape") {
+    if matches!(
+        ext.as_str(),
+        "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape" | "wma" | "asf"
+    ) {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         let pcm_bytes = decoded.pcm_bytes();
         let rt = tokio::runtime::Handle::try_current()
@@ -478,6 +492,142 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "unknown panic".to_string()
     }
+}
+
+/// Decode a WMA/ASF file to PCM via FFmpeg subprocess.
+///
+/// Symphonia does not support the WMA codec or ASF container, so we shell out
+/// to FFmpeg which handles all WMA variants (WMA v1/v2/Pro/Lossless).
+/// FFmpeg outputs raw signed 16-bit little-endian PCM to stdout.
+fn decode_wma_via_ffmpeg(
+    file_path: &str,
+    _target_sample_rate: Option<u32>,
+    _target_channels: Option<u32>,
+    seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    use std::process::Command;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+
+    if seek_s > 0.0 {
+        cmd.args(["-ss", &format!("{seek_s}")]);
+    }
+
+    cmd.args(["-i", file_path]);
+
+    if max_duration_s > 0.0 {
+        cmd.args(["-t", &format!("{max_duration_s}")]);
+    }
+
+    // Probe the file first to get sample rate and channels
+    let probe_output = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,channels,bits_per_raw_sample",
+            "-of",
+            "csv=p=0",
+            file_path,
+        ])
+        .output()
+        .map_err(|e| format!("ffprobe failed (is ffmpeg installed?): {e}"))?;
+
+    if !probe_output.status.success() {
+        let stderr = String::from_utf8_lossy(&probe_output.stderr);
+        return Err(format!("ffprobe error: {stderr}"));
+    }
+
+    let probe_str = String::from_utf8_lossy(&probe_output.stdout);
+    let parts: Vec<&str> = probe_str.trim().split(',').collect();
+    let source_rate: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(44100);
+    let source_channels: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(2);
+    // WMA is typically 16-bit; WMA Lossless can be 24-bit
+    let source_bd: u16 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let out_bd = if source_bd >= 24 { 24u16 } else { 16u16 };
+
+    let pcm_fmt = if out_bd == 24 { "s24le" } else { "s16le" };
+    cmd.args([
+        "-f",
+        pcm_fmt,
+        "-acodec",
+        &format!("pcm_{pcm_fmt}"),
+        "-ar",
+        &source_rate.to_string(),
+        "-ac",
+        &source_channels.to_string(),
+        "-",
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("ffmpeg failed (is ffmpeg installed?): {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg WMA decode error: {stderr}"));
+    }
+
+    let pcm_data = output.stdout;
+    let bytes_per_sample = if out_bd == 24 { 3 } else { 2 };
+    let num_samples = pcm_data.len() / bytes_per_sample;
+
+    let mut samples: Vec<i32> = Vec::with_capacity(num_samples);
+    if out_bd == 24 {
+        for i in 0..num_samples {
+            let offset = i * 3;
+            if offset + 2 >= pcm_data.len() {
+                break;
+            }
+            let lo = pcm_data[offset] as u32;
+            let mid = pcm_data[offset + 1] as u32;
+            let hi = pcm_data[offset + 2] as u32;
+            let val24 = lo | (mid << 8) | (hi << 16);
+            let val32 = if val24 & 0x80_0000 != 0 {
+                (val24 | 0xFF00_0000) as i32
+            } else {
+                val24 as i32
+            };
+            samples.push(val32);
+        }
+    } else {
+        for i in 0..num_samples {
+            let offset = i * 2;
+            if offset + 1 >= pcm_data.len() {
+                break;
+            }
+            let val = i16::from_le_bytes([pcm_data[offset], pcm_data[offset + 1]]);
+            samples.push(val as i32);
+        }
+    }
+
+    let total_frames = samples.len() as f64 / source_channels as f64;
+    let duration_s = total_frames / source_rate as f64;
+
+    debug!(
+        file = file_path,
+        samples = samples.len(),
+        rate = source_rate,
+        channels = source_channels,
+        bit_depth = out_bd,
+        duration_s,
+        "decoded_wma_ffmpeg"
+    );
+
+    Ok(DecodedAudio {
+        samples_i32: samples,
+        bit_depth: out_bd,
+        sample_rate: source_rate,
+        channels: source_channels,
+        duration_s,
+    })
 }
 
 /// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
@@ -735,6 +885,7 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.dff"));
         assert!(can_decode_native("song.ape"));
         assert!(can_decode_native("song.wv"));
+        assert!(can_decode_native("song.wma"));
     }
 
     #[test]

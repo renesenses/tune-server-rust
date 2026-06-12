@@ -555,7 +555,7 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
     let id = format!("track/{track_id}");
     let fmt = track.format.as_deref().unwrap_or("flac");
 
-    // For formats that need transcoding (DSD, AIFF, WavPack, APE, ALAC),
+    // For formats that need transcoding (DSD, AIFF, WavPack, APE, ALAC, WMA),
     // advertise the transcoded MIME type and extension so that DLNA renderers
     // see a format they can actually play.
     use crate::audio::formats::AudioFormat;

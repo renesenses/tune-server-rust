@@ -344,7 +344,7 @@ impl PlaybackOrchestrator {
             .is_some_and(|id| id.starts_with("local:"));
         let local_needs_wav = is_local_output && source_format.is_some();
 
-        // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs
+        // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC, WMA) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
         let is_network_output = matches!(
             zone_output_type.as_deref(),
@@ -998,7 +998,7 @@ impl PlaybackOrchestrator {
         media: &crate::outputs::traits::PlayMedia<'_>,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
-        let output_arc = {
+        let (output_arc, used_device_id) = {
             let outputs = self.outputs.lock().await;
             let elapsed = lock_start.elapsed();
             if elapsed.as_millis() > 200 {
@@ -1008,19 +1008,44 @@ impl PlaybackOrchestrator {
                     "send_to_output_lock_contention"
                 );
             }
-            outputs.get(device_id)
+            match outputs.get(device_id) {
+                Some(arc) => (Some(arc), device_id.to_string()),
+                None if device_id.starts_with("local:") => {
+                    // The stored local device is no longer registered (e.g. USB
+                    // DAC unplugged, macOS renamed the device after update).
+                    // Fall back to any other registered local output — the user's
+                    // zone should still produce audio rather than silently failing.
+                    let fallback = outputs
+                        .list()
+                        .into_iter()
+                        .find(|id| id.starts_with("local:"));
+                    if let Some(ref fallback_id) = fallback {
+                        warn!(
+                            requested = device_id,
+                            fallback = %fallback_id,
+                            "output_not_found_falling_back_to_other_local — \
+                             the configured local output device is no longer available; \
+                             using another registered local output"
+                        );
+                        (outputs.get(fallback_id), fallback_id.clone())
+                    } else {
+                        (None, device_id.to_string())
+                    }
+                }
+                None => (None, device_id.to_string()),
+            }
         };
         if let Some(output_arc) = output_arc {
             let output = output_arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
                     drop(output);
-                    info!(device_id, "output_play_sent");
+                    info!(device_id = %used_device_id, "output_play_sent");
                     (true, None)
                 }
                 Err(e) => {
                     drop(output);
-                    warn!(device_id, error = %e, "output_play_failed");
+                    warn!(device_id = %used_device_id, error = %e, "output_play_failed");
                     (false, Some(format!("Output device error: {e}")))
                 }
             }

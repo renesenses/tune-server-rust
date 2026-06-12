@@ -81,8 +81,34 @@ impl ExclusiveOutput {
             macos_helpers::get_default_device_id(false)
                 .ok_or_else(|| "No default output device found".to_string())?
         } else {
-            macos_helpers::get_device_id_from_name(device_name, false)
-                .ok_or_else(|| format!("Audio device not found: {device_name}"))?
+            match macos_helpers::get_device_id_from_name(device_name, false) {
+                Some(id) => id,
+                None => {
+                    // Device name not found — fall back to default output.
+                    // This handles USB DACs that change names after re-plug or
+                    // macOS audio device renaming after system updates.
+                    match macos_helpers::get_default_device_id(false) {
+                        Some(default_id) => {
+                            let default_name = macos_helpers::get_device_name(default_id)
+                                .unwrap_or_else(|_| "unknown".to_string());
+                            warn!(
+                                requested = %device_name,
+                                fallback = %default_name,
+                                fallback_id = default_id,
+                                "coreaudio_exclusive_device_not_found_falling_back_to_default — \
+                                 the configured device is unavailable; using the system default \
+                                 output device for exclusive mode"
+                            );
+                            default_id
+                        }
+                        None => {
+                            return Err(format!(
+                                "Audio device not found: {device_name} (and no default device available)"
+                            ));
+                        }
+                    }
+                }
+            }
         };
 
         let resolved_name =

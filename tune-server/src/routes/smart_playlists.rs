@@ -192,7 +192,7 @@ async fn update_smart_playlist(
             )
             .ok();
     }
-    StatusCode::NO_CONTENT
+    Json(json!({"ok": true}))
 }
 
 async fn delete_smart_playlist(
@@ -203,7 +203,7 @@ async fn delete_smart_playlist(
         .db
         .execute("DELETE FROM smart_playlists WHERE id = ?", &[&id])
         .ok();
-    StatusCode::NO_CONTENT
+    Json(json!({"ok": true}))
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart playlist criteria.

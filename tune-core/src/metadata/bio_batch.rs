@@ -73,9 +73,9 @@ async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Wikipedia REST API → page extract
+    // Wikipedia MediaWiki API → full intro extract (not just first sentence)
     let wp_url = format!(
-        "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
+        "https://{wiki_lang}.wikipedia.org/w/api.php?action=query&titles={}&prop=extracts&exintro=1&explaintext=1&format=json",
         urlencoding::encode(&wiki_title)
     );
     let wp_resp = client.get(&wp_url).send().await.ok()?;
@@ -83,11 +83,13 @@ async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<
         return None;
     }
     let wp_data: serde_json::Value = wp_resp.json().await.ok()?;
-    let extract = wp_data.get("extract")?.as_str()?;
+    let pages = wp_data.pointer("/query/pages")?;
+    let page = pages.as_object()?.values().next()?;
+    let extract = page.get("extract")?.as_str()?;
     if extract.len() < 50 {
         return None;
     }
-    Some(extract.to_string())
+    Some(extract.trim().to_string())
 }
 
 /// Last.fm artist.getInfo → bio summary.

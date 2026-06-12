@@ -291,6 +291,13 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
             }
         }
 
+        // Clean up orphan albums with 0 tracks (ghost entries from
+        // artist_id changes or interrupted scans) — bug #593.
+        let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
+        if orphan_albums > 0 {
+            info!(orphan_albums, "auto_scan_orphan_albums_cleaned");
+        }
+
         info!(
             total = stats.total_files,
             ok = stats.metadata_ok,
@@ -300,6 +307,7 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
             updated,
             skipped,
             artwork = albums_with_cover.len(),
+            orphan_albums,
             "auto_scan_complete"
         );
 

@@ -926,26 +926,18 @@ impl OutputTarget for LocalOutput {
                 let decoded_len = decoded_samples.len();
 
                 let host = select_host(&audio_backend);
-                let device = if device_name == "default" {
-                    host.default_output_device()
-                } else {
-                    host.output_devices().ok().and_then(|mut devs| {
-                        devs.find(|d| {
-                            d.description()
-                                .map(|desc| {
-                                    let n = desc.name().to_string();
-                                    n == device_name || n.contains(&device_name)
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                };
-
-                let Some(device) = device else {
-                    warn!(name = %device_name, "audio_device_not_found");
+                let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name)
+                else {
+                    warn!(name = %device_name, "audio_device_not_found_compressed");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 };
+                if fell_back {
+                    info!(
+                        original = %device_name,
+                        "audio_device_fallback_used_for_compressed_stream"
+                    );
+                }
 
                 // Try source sample rate first, then fall back to device default
                 let output_config = find_matching_config(&device, dec_ch, dec_sr)
@@ -1202,40 +1194,20 @@ impl OutputTarget for LocalOutput {
 
             // ------- Open cpal device (shared mode) -------
             let host = select_host(&audio_backend);
-            let device = if device_name == "default" {
-                host.default_output_device()
-            } else {
-                host.output_devices().ok().and_then(|mut devs| {
-                    devs.find(|d| {
-                        d.description()
-                            .map(|desc| {
-                                let n = desc.name().to_string();
-                                n == device_name || n.contains(&device_name)
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-            };
-
-            let Some(device) = device else {
-                // Log all available devices for diagnosis (e.g. USB DAC not found)
-                let available: Vec<String> = host
-                    .output_devices()
-                    .map(|devs| {
-                        devs.filter_map(|d| {
-                            d.description().ok().map(|desc| desc.name().to_string())
-                        })
-                        .collect()
-                    })
-                    .unwrap_or_default();
+            let Some((device, fell_back)) = find_device_with_fallback(&host, &device_name) else {
                 warn!(
                     requested = %device_name,
-                    available = ?available,
-                    "audio_device_not_found"
+                    "audio_device_not_found_no_fallback"
                 );
                 playing.store(false, Ordering::SeqCst);
                 return;
             };
+            if fell_back {
+                info!(
+                    original = %device_name,
+                    "audio_device_fallback_used_for_wav_stream"
+                );
+            }
 
             // Try to find a config matching the stream's sample rate.
             // If the device doesn't explicitly list the source rate, try it
@@ -1784,6 +1756,72 @@ fn feed_ring_abortable(
             // Ring buffer full — wait a bit
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+/// Find an audio output device by name, falling back to the default device if
+/// the requested device is not found.
+///
+/// On macOS (and USB DACs in general), device IDs/names can change between
+/// reboots, reconnections, or macOS audio routing changes.  When the stored
+/// zone `device_name` no longer matches any enumerated device, playback would
+/// silently fail with no audio output.  This function prevents that by falling
+/// back to the system default output device and logging a clear warning.
+///
+/// Returns `(device, fell_back)` where `fell_back` is `true` if the default
+/// device was used instead of the requested one.
+fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cpal::Device, bool)> {
+    if device_name == "default" {
+        return host.default_output_device().map(|d| (d, false));
+    }
+
+    // Try exact or substring match first
+    let found = host.output_devices().ok().and_then(|mut devs| {
+        devs.find(|d| {
+            d.description()
+                .map(|desc| {
+                    let n = desc.name().to_string();
+                    n == device_name || n.contains(device_name)
+                })
+                .unwrap_or(false)
+        })
+    });
+
+    if let Some(device) = found {
+        return Some((device, false));
+    }
+
+    // Device not found — log available devices and fall back to default
+    let available: Vec<String> = host
+        .output_devices()
+        .map(|devs| {
+            devs.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(default_device) = host.default_output_device() {
+        let default_name = default_device
+            .description()
+            .map(|desc| desc.name().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        warn!(
+            requested = %device_name,
+            fallback = %default_name,
+            available = ?available,
+            "audio_device_not_found_falling_back_to_default — \
+             the configured device is unavailable (unplugged, renamed, or \
+             macOS audio routing changed); using the system default output \
+             device instead"
+        );
+        Some((default_device, true))
+    } else {
+        warn!(
+            requested = %device_name,
+            available = ?available,
+            "audio_device_not_found_no_default_available"
+        );
+        None
     }
 }
 
