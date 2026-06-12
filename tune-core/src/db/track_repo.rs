@@ -5,6 +5,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
 use super::sqlite::SqliteDb;
+use crate::error::TuneError;
 
 /// Engine-agnostic SQL builders for track_repo.
 ///
@@ -270,11 +271,24 @@ impl TrackRepo {
     }
 
     // ─── Group A: simple ports via DbBackend ──────────────────────
+    //
+    // Internal methods use TuneError for typed errors (Db, NotFound, etc.).
+    // Public API returns Result<T, String> for backward-compat with callers.
+    // The bridge: `.map_err(String::from)` converts TuneError → String at the boundary.
 
-    pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
+    fn get_inner(&self, id: i64) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+        Ok(self
+            .db
+            .query_one(&sql, &params)
+            .map_err(TuneError::Db)?
+            .as_ref()
+            .map(row_to_track))
+    }
+
+    pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
+        self.get_inner(id).map_err(String::from)
     }
 
     pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
@@ -283,7 +297,7 @@ impl TrackRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
-    pub fn create(&self, track: &Track) -> Result<i64, String> {
+    fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::insert, sql::insert);
         let params: [&dyn ToSqlValue; 27] = [
             &track.title,
@@ -314,12 +328,18 @@ impl TrackRepo {
             &track.musicbrainz_recording_id,
             &track.comments,
         ];
-        self.db.execute(&sql, &params)?;
+        self.db.execute(&sql, &params).map_err(TuneError::Db)?;
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn update(&self, track: &Track) -> Result<(), String> {
-        let id = track.id.ok_or("track has no id")?;
+    pub fn create(&self, track: &Track) -> Result<i64, String> {
+        self.create_inner(track).map_err(String::from)
+    }
+
+    fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
+        let id = track
+            .id
+            .ok_or_else(|| TuneError::NotFound("track has no id".into()))?;
         let sql = self.dialect_sql(sql::update, sql::update);
         let params: [&dyn ToSqlValue; 25] = [
             &track.title,
@@ -348,8 +368,12 @@ impl TrackRepo {
             &track.comments,
             &id,
         ];
-        self.db.execute(&sql, &params)?;
+        self.db.execute(&sql, &params).map_err(TuneError::Db)?;
         Ok(())
+    }
+
+    pub fn update(&self, track: &Track) -> Result<(), String> {
+        self.update_inner(track).map_err(String::from)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {

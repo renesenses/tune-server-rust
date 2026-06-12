@@ -366,16 +366,20 @@ fn browse_albums(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 
 fn browse_genres(state: &UpnpState) -> DidlResult {
     // Fetch distinct genres from the albums table
-    let conn = state.db.connection().lock().unwrap();
-    let mut stmt = conn
+    let Ok(conn) = state.db.connection().lock() else {
+        return DidlResult {
+            xml: didl_wrap(""),
+            total: 0,
+            returned: 0,
+        };
+    };
+    let genres: Vec<String> = conn
         .prepare("SELECT DISTINCT genre FROM albums WHERE genre IS NOT NULL AND genre != '' ORDER BY genre COLLATE NOCASE")
-        .unwrap();
-    let genres: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
         .unwrap_or_default();
-    drop(stmt);
     drop(conn);
 
     let mut inner = String::new();
@@ -560,7 +564,11 @@ fn didl_track_item(track: &Track, parent_id: &str, base_url: &str) -> String {
         .as_ref()
         .is_some_and(|f| f.needs_transcode_for_dlna());
     let (advertised_ext, mime) = if needs_transcode {
-        let target = source_format.unwrap().dlna_transcode_target();
+        // Safety: needs_transcode is only true when source_format.is_some_and(...),
+        // so expect() here documents this invariant rather than risking a silent bug.
+        let target = source_format
+            .expect("needs_transcode implies Some")
+            .dlna_transcode_target();
         (target.container_format(), target.mime_type())
     } else {
         let m = match fmt {

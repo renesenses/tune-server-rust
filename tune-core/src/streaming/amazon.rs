@@ -44,7 +44,7 @@ impl AmazonMusicService {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| Client::new()),
             access_token: None,
             refresh_token: None,
             device_id: uuid::Uuid::new_v4().to_string(),
@@ -78,15 +78,16 @@ impl AmazonMusicService {
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref token) = self.access_token {
-            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            if let Ok(val) = format!("Bearer {token}").parse() {
+                headers.insert("Authorization", val);
+            }
         }
-        headers.insert("X-Amzn-Device-Id", self.device_id.parse().unwrap());
-        headers.insert(
-            "X-Amzn-Music-Domain",
-            format!("music.amazon.{}", self.region_tld())
-                .parse()
-                .unwrap(),
-        );
+        if let Ok(val) = self.device_id.parse() {
+            headers.insert("X-Amzn-Device-Id", val);
+        }
+        if let Ok(val) = format!("music.amazon.{}", self.region_tld()).parse() {
+            headers.insert("X-Amzn-Music-Domain", val);
+        }
         headers
     }
 

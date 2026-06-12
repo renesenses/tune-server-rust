@@ -36,7 +36,7 @@ impl DeezerService {
                 .timeout(Duration::from_secs(30))
                 .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| Client::new()),
             access_token: None,
             username: None,
             user_id: None,
@@ -400,7 +400,7 @@ impl StreamingService for DeezerService {
             .map_err(|e| format!("deezer oauth json: {e}"))?;
 
         if let Some(err) = data.get("error_reason").and_then(|v| v.as_str()) {
-            return Err(format!("deezer oauth error: {err}"));
+            return Err(format!("deezer oauth error: {err}").into());
         }
 
         let token = data["access_token"]
@@ -764,7 +764,7 @@ impl StreamingService for DeezerService {
             "albums" => format!("/user/me/albums?album_id={item_id}"),
             "artists" => format!("/user/me/artists?artist_id={item_id}"),
             "playlists" => format!("/user/me/playlists?playlist_id={item_id}"),
-            _ => return Err(format!("deezer: unknown favorite type: {fav_type}")),
+            _ => return Err(format!("deezer: unknown favorite type: {fav_type}").into()),
         };
 
         let mut url = format!("{API_BASE}{endpoint}");
@@ -779,7 +779,7 @@ impl StreamingService for DeezerService {
             .map_err(|e| format!("deezer add_favorite: {e}"))?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("deezer add_favorite: {body}"));
+            return Err(format!("deezer add_favorite: {body}").into());
         }
         Ok(())
     }
@@ -793,7 +793,7 @@ impl StreamingService for DeezerService {
             "albums" => format!("/user/me/albums?album_id={item_id}"),
             "artists" => format!("/user/me/artists?artist_id={item_id}"),
             "playlists" => format!("/user/me/playlists?playlist_id={item_id}"),
-            _ => return Err(format!("deezer: unknown favorite type: {fav_type}")),
+            _ => return Err(format!("deezer: unknown favorite type: {fav_type}").into()),
         };
 
         let mut url = format!("{API_BASE}{endpoint}");
@@ -808,7 +808,7 @@ impl StreamingService for DeezerService {
             .map_err(|e| format!("deezer remove_favorite: {e}"))?;
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("deezer remove_favorite: {body}"));
+            return Err(format!("deezer remove_favorite: {body}").into());
         }
         Ok(())
     }

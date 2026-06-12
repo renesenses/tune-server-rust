@@ -35,7 +35,7 @@ impl SpotifyService {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| Client::new()),
             client_id: std::env::var("TUNE_SPOTIFY_CLIENT_ID")
                 .or_else(|_| std::env::var("SPOTIFY_CLIENT_ID"))
                 .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into()),
@@ -327,7 +327,7 @@ impl StreamingService for SpotifyService {
 
             let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
             if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
-                return Err(format!("spotify: {err}"));
+                return Err(format!("spotify: {err}").into());
             }
 
             self.access_token = data["access_token"].as_str().map(Into::into);
@@ -622,7 +622,7 @@ impl StreamingService for SpotifyService {
             "tracks" => format!("/me/tracks?ids={item_id}"),
             "albums" => format!("/me/albums?ids={item_id}"),
             "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_put(&path).await
     }
@@ -632,7 +632,7 @@ impl StreamingService for SpotifyService {
             "tracks" => format!("/me/tracks?ids={item_id}"),
             "albums" => format!("/me/albums?ids={item_id}"),
             "artists" => format!("/me/following?type=artist&ids={item_id}"),
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_delete(&path).await
     }

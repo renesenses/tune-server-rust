@@ -29,7 +29,7 @@ impl QobuzService {
                 .timeout(Duration::from_secs(45))
                 .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| Client::new()),
             app_id,
             app_secret,
             user_auth_token: None,
@@ -776,7 +776,7 @@ impl StreamingService for QobuzService {
             "tracks" => "track_ids",
             "albums" => "album_ids",
             "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_post("/favorite/create", &[(key, item_id)]).await?;
         Ok(())
@@ -787,7 +787,7 @@ impl StreamingService for QobuzService {
             "tracks" => "track_ids",
             "albums" => "album_ids",
             "artists" => "artist_ids",
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_post("/favorite/delete", &[(key, item_id)]).await?;
         Ok(())

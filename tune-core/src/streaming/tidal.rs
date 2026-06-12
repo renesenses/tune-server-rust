@@ -122,7 +122,7 @@ impl TidalService {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| Client::new()),
             tokens: Mutex::new(TokenState {
                 access_token: None,
                 refresh_token: None,
@@ -1025,7 +1025,7 @@ impl StreamingService for TidalService {
             "tracks" => ("tracks", "trackIds"),
             "albums" => ("albums", "albumIds"),
             "artists" => ("artists", "artistIds"),
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_post_form(
             &format!("/users/{user_id}/favorites/{path_type}"),
@@ -1041,7 +1041,7 @@ impl StreamingService for TidalService {
             "tracks" => "tracks",
             "albums" => "albums",
             "artists" => "artists",
-            _ => return Err(format!("unknown favorite type: {fav_type}")),
+            _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_delete(&format!("/users/{user_id}/favorites/{path_type}/{item_id}"))
             .await
