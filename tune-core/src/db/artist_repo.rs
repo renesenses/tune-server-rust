@@ -103,6 +103,10 @@ pub mod sql {
         "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
+    pub fn list_without_image_no_mbid() -> &'static str {
+        "SELECT id, name FROM artists WHERE (image_path IS NULL OR image_path = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
+    }
+
     pub fn update_mbid() -> &'static str {
         "UPDATE artists SET musicbrainz_id = ?2 WHERE id = ?1"
     }
@@ -307,6 +311,21 @@ impl ArtistRepo {
 
     pub fn list_without_mbid(&self) -> Result<Vec<(i64, String)>, String> {
         let rows = self.db.query_many(sql::list_without_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Return all artists without image AND without MBID.
+    /// Each entry is (artist_id, name).
+    pub fn list_without_image_no_mbid(&self) -> Result<Vec<(i64, String)>, String> {
+        let rows = self.db.query_many(sql::list_without_image_no_mbid(), &[])?;
         Ok(rows
             .into_iter()
             .map(|cols| {

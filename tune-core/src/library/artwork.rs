@@ -283,26 +283,48 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
         .ok();
 }
 
-/// Fetch an artist image. Tries mozaiklabs first, then Fanart.tv, then MusicBrainz/Wikimedia Commons.
-pub async fn fetch_artist_image(mbid: &str) -> Option<Vec<u8>> {
+/// Fetch an artist image from multiple sources (best-effort cascade).
+///
+/// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
+/// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs.
+pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
 
+    // 1. Mozaiklabs community (fastest, no rate limit)
     if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
         return Some(bytes);
     }
 
-    // Try Fanart.tv (500ms delay)
+    // 2. Fanart.tv
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
         return Some(bytes);
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    fetch_artist_image_musicbrainz(&client, mbid).await
+    // 3. TheAudioDB (free API, good coverage)
+    if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
+        return Some(bytes);
+    }
+
+    // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
+        return Some(bytes);
+    }
+
+    // 6. Discogs (if token configured, search by artist name)
+    if !artist_name.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name).await {
+            return Some(bytes);
+        }
+    }
+
+    None
 }
 
 /// Fetch an artist thumbnail from Fanart.tv using a MusicBrainz artist ID.
@@ -351,28 +373,127 @@ async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> 
     download_image(client, &full_url).await
 }
 
-async fn fetch_artist_image_musicbrainz(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+/// Fetch artist image from TheAudioDB (free API key "2").
+async fn fetch_artist_image_theaudiodb(client: &reqwest::Client, mbid: &str) -> Option<Vec<u8>> {
+    let url = format!("https://theaudiodb.com/api/v1/json/2/artist-mb.php?i={mbid}");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let artist = data["artists"].as_array()?.first()?;
+    let thumb_url = artist["strArtistThumb"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| artist["strArtistFanart"].as_str().filter(|s| !s.is_empty()))
+        .or_else(|| artist["strArtistCutout"].as_str().filter(|s| !s.is_empty()))?;
+    download_image(client, thumb_url).await
+}
+
+/// Fetch artist image from MusicBrainz: tries direct Wikimedia image relation
+/// first, then falls back to Wikidata → P18 image property.
+async fn fetch_artist_image_musicbrainz_full(
+    client: &reqwest::Client,
+    mbid: &str,
+) -> Option<Vec<u8>> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let relations = data["relations"].as_array()?;
-    let commons_page = relations.iter().find_map(|r| {
+    let relations = match data["relations"].as_array() {
+        Some(r) => r,
+        None => return None,
+    };
+
+    // Try direct Wikimedia Commons image relation
+    if let Some(commons_page) = relations.iter().find_map(|r| {
         if r["type"].as_str() == Some("image") {
             r["url"]["resource"].as_str().map(|s| s.to_string())
         } else {
             None
         }
+    }) {
+        if let Some(filename) = commons_page.rsplit("File:").next() {
+            let direct_url = format!(
+                "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
+                filename.replace(' ', "_")
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Some(bytes) = download_image(client, &direct_url).await {
+                return Some(bytes);
+            }
+        }
+    }
+
+    // Fallback: Wikidata relation → P18 image → Wikimedia Commons
+    let wikidata_url = relations.iter().find_map(|r| {
+        if r["type"].as_str() == Some("wikidata") {
+            r["url"]["resource"].as_str().map(|s| s.to_string())
+        } else {
+            None
+        }
     })?;
-    let filename = commons_page.rsplit("File:").next()?;
+    let qid = wikidata_url.rsplit('/').next()?;
+    if !qid.starts_with('Q') {
+        return None;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    fetch_image_from_wikidata(client, qid).await
+}
+
+/// Resolve a Wikidata entity QID to an image via the P18 property.
+async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Option<Vec<u8>> {
+    let url = format!("https://www.wikidata.org/wiki/Special:EntityData/{qid}.json");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let image_filename = data
+        .pointer(&format!("/entities/{qid}/claims/P18"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|claim| claim.pointer("/mainsnak/datavalue/value"))
+        .and_then(|v| v.as_str())?;
     let direct_url = format!(
         "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
-        filename.replace(' ', "_")
+        image_filename.replace(' ', "_")
     );
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     download_image(client, &direct_url).await
+}
+
+/// Fetch artist image from Discogs by searching the artist name.
+async fn fetch_artist_image_discogs(
+    client: &reqwest::Client,
+    artist_name: &str,
+) -> Option<Vec<u8>> {
+    let token = std::env::var("TUNE_DISCOGS_TOKEN")
+        .or_else(|_| std::env::var("DISCOGS_TOKEN"))
+        .ok()?;
+    if token.is_empty() {
+        return None;
+    }
+    let resp = client
+        .get("https://api.discogs.com/database/search")
+        .query(&[("type", "artist"), ("per_page", "1"), ("q", artist_name)])
+        .header("Authorization", format!("Discogs token={token}"))
+        .header("User-Agent", "TuneServer/1.0")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let cover_url = data["results"]
+        .as_array()?
+        .first()?
+        .get("cover_image")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.contains("spacer.gif"))?;
+    download_image(client, cover_url).await
 }
 
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
@@ -490,7 +611,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
         // Rate limit: wait 1.1s between requests
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-        match fetch_artist_image(mbid).await {
+        match fetch_artist_image(mbid, name).await {
             Some(data) => {
                 // Use artist-specific hash key (same as manual upload)
                 let hash = artwork_hash(&format!("artist-mbid-{mbid}"));
@@ -540,7 +661,65 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
 
     info!(
         total = artists.len(),
-        enriched, failed, community_applied, "batch_artist_artwork_enrichment_complete"
+        enriched, failed, community_applied, "batch_artist_artwork_phase2_complete"
+    );
+
+    // --- Phase 3: Try Discogs by name for artists without MBID and without image ---
+    let mut discogs_enriched = 0u32;
+    let discogs_available = std::env::var("TUNE_DISCOGS_TOKEN")
+        .or_else(|_| std::env::var("DISCOGS_TOKEN"))
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+
+    if discogs_available {
+        let no_mbid_artists = match artist_repo.list_without_image_no_mbid() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(error = %e, "batch_artist_artwork_no_mbid_list_failed");
+                Vec::new()
+            }
+        };
+
+        if !no_mbid_artists.is_empty() {
+            info!(
+                count = no_mbid_artists.len(),
+                "batch_artist_artwork_phase3_discogs_started"
+            );
+            let client = reqwest::Client::builder()
+                .user_agent(MB_USER_AGENT)
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+
+            for (artist_id, name) in &no_mbid_artists {
+                // Discogs rate limit: 60 req/min → 1s between requests
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+                if let Some(data) = fetch_artist_image_discogs(&client, name).await {
+                    let hash = artwork_hash(&format!("artist-name-{name}"));
+                    std::fs::create_dir_all(&cache_dir).ok();
+                    if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                        artist_repo.update_image(*artist_id, &hash, "discogs").ok();
+                        discogs_enriched += 1;
+                        info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
+                    }
+                }
+            }
+            info!(
+                discogs_enriched,
+                total = no_mbid_artists.len(),
+                "batch_artist_artwork_phase3_complete"
+            );
+        }
+    }
+
+    let total_enriched = enriched + discogs_enriched;
+    info!(
+        total_enriched,
+        phase2_enriched = enriched,
+        phase3_discogs = discogs_enriched,
+        community_applied,
+        "batch_artist_artwork_enrichment_complete"
     );
 
     // Store result in settings for status reporting
@@ -549,7 +728,9 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
             "artist_artwork_enrich_result",
             &serde_json::json!({
                 "total": artists.len(),
-                "enriched": enriched,
+                "enriched": total_enriched,
+                "phase2_enriched": enriched,
+                "phase3_discogs": discogs_enriched,
                 "failed": failed,
                 "community_applied": community_applied,
             })
