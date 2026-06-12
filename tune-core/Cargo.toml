@@ -26,6 +26,7 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 urlencoding = { workspace = true }
 cpal = { version = "0.17", optional = true }
 rust_cast = { workspace = true }

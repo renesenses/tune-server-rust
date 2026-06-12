@@ -4223,6 +4223,7 @@ dependencies = [
  "sqlx",
  "symphonia",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",

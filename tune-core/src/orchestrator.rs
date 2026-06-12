@@ -448,32 +448,34 @@ impl PlaybackOrchestrator {
             tokio::spawn(async move {
                 debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
+                // Create audio-levels channel for ALL transcode paths so the
+                // web client VU-meter works regardless of output type.
+                let (levels_tx, levels_rx) =
+                    std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                if let Some(ref bus) = ev_bus {
+                    let bus = bus.clone();
+                    tokio::spawn(async move {
+                        while let Ok(lvl) = levels_rx.recv() {
+                            bus.emit(
+                                "playback.audio_levels",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "rms_left_db": lvl.rms_left_db(),
+                                    "rms_right_db": lvl.rms_right_db(),
+                                    "peak_left_db": lvl.peak_left_db(),
+                                    "peak_right_db": lvl.peak_right_db(),
+                                    "rms_left": lvl.rms_left,
+                                    "rms_right": lvl.rms_right,
+                                }),
+                            );
+                        }
+                    });
+                }
+
                 if target_format_str == "wav" {
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
                     drop(tx);
-
-                    let (levels_tx, levels_rx) =
-                        std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
-                    if let Some(ref bus) = ev_bus {
-                        let bus = bus.clone();
-                        tokio::spawn(async move {
-                            while let Ok(lvl) = levels_rx.recv() {
-                                bus.emit(
-                                    "playback.audio_levels",
-                                    serde_json::json!({
-                                        "zone_id": zone_id,
-                                        "rms_left_db": lvl.rms_left_db(),
-                                        "rms_right_db": lvl.rms_right_db(),
-                                        "peak_left_db": lvl.peak_left_db(),
-                                        "peak_right_db": lvl.peak_right_db(),
-                                        "rms_left": lvl.rms_left,
-                                        "rms_right": lvl.rms_right,
-                                    }),
-                                );
-                            }
-                        });
-                    }
 
                     let result = tokio::task::spawn_blocking(move || {
                         crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -534,6 +536,16 @@ impl PlaybackOrchestrator {
                             );
                             let pcm_bytes = decoded.pcm_bytes();
                             let actual_bd = decoded.bit_depth;
+                            let actual_ch = decoded.channels as u16;
+
+                            // Compute and emit audio levels from PCM before encoding
+                            for chunk in pcm_bytes.chunks(32768) {
+                                let _ = levels_tx.send(crate::audio::levels::compute_levels(
+                                    chunk, actual_bd, actual_ch,
+                                ));
+                            }
+                            drop(levels_tx);
+
                             // Encode to target format using native bit depth
                             let mut encoder = crate::audio::encoder::AudioEncoder::new(
                                 &target_format_str,
@@ -603,6 +615,62 @@ impl PlaybackOrchestrator {
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
+
+            // Parallel decode-for-levels: decode the audio in the background
+            // purely to emit VU-meter events for the web client. This does not
+            // affect the actual audio stream served to the output device.
+            if let Some(ref bus) = self.event_bus {
+                let bus = bus.clone();
+                let fp = file_path.clone();
+                let zone_id = req.zone_id;
+                let sr = sample_rate;
+                let ch = channels as u32;
+                tokio::spawn(async move {
+                    let (levels_tx, levels_rx) =
+                        std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                    let bus_clone = bus.clone();
+                    tokio::spawn(async move {
+                        while let Ok(lvl) = levels_rx.recv() {
+                            bus_clone.emit(
+                                "playback.audio_levels",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "rms_left_db": lvl.rms_left_db(),
+                                    "rms_right_db": lvl.rms_right_db(),
+                                    "peak_left_db": lvl.peak_left_db(),
+                                    "peak_right_db": lvl.peak_right_db(),
+                                    "rms_left": lvl.rms_left,
+                                    "rms_right": lvl.rms_right,
+                                }),
+                            );
+                        }
+                    });
+                    // Decode the file to PCM in the background — output is
+                    // discarded, only levels are forwarded via levels_tx.
+                    let result = tokio::task::spawn_blocking(move || {
+                        let decoded =
+                            crate::audio::decode::decode_to_pcm(&fp, Some(sr), Some(ch), 0.0, 0.0);
+                        if let Ok(ref dec) = decoded {
+                            let pcm = dec.pcm_bytes();
+                            let bd = dec.bit_depth;
+                            let c = dec.channels as u16;
+                            for chunk in pcm.chunks(32768) {
+                                if levels_tx
+                                    .send(crate::audio::levels::compute_levels(chunk, bd, c))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                    if let Err(e) = result {
+                        debug!(error = %e, "passthrough_levels_task_panic");
+                    }
+                });
+            }
+
             (
                 session_id,
                 mime,
@@ -720,7 +788,7 @@ impl PlaybackOrchestrator {
                 duration_ms: None,
             };
 
-            let (session_id, tx, _data_ready) =
+            let (session_id, tx, data_ready) =
                 self.streamer.create_session(wav_info, false, 256).await;
 
             info!(
@@ -731,8 +799,35 @@ impl PlaybackOrchestrator {
                 "streaming_transcode_to_wav_for_local_output"
             );
 
+            let ev_bus = self.event_bus.clone();
+            let zone_id = req.zone_id;
+
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
+                // Audio-levels channel so the web client VU-meter works for
+                // streaming-service content played through local/OAAT outputs.
+                let (levels_tx, levels_rx) =
+                    std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                if let Some(ref bus) = ev_bus {
+                    let bus = bus.clone();
+                    tokio::spawn(async move {
+                        while let Ok(lvl) = levels_rx.recv() {
+                            bus.emit(
+                                "playback.audio_levels",
+                                serde_json::json!({
+                                    "zone_id": zone_id,
+                                    "rms_left_db": lvl.rms_left_db(),
+                                    "rms_right_db": lvl.rms_right_db(),
+                                    "peak_left_db": lvl.peak_left_db(),
+                                    "peak_right_db": lvl.peak_right_db(),
+                                    "rms_left": lvl.rms_left,
+                                    "rms_right": lvl.rms_right,
+                                }),
+                            );
+                        }
+                    });
+                }
+
                 // Download to temp file on a blocking thread
                 let tmp_path = std::env::temp_dir()
                     .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
@@ -787,12 +882,14 @@ impl PlaybackOrchestrator {
                 // Drop the original sender so the channel closes when decode finishes.
                 drop(tx);
                 let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming(
+                    crate::audio::decode::decode_to_pcm_streaming_with_levels(
                         &tmp_file_clone,
                         Some(sr),
                         Some(2),
                         tx_clone,
                         32768,
+                        data_ready,
+                        levels_tx,
                     )
                 })
                 .await;

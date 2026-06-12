@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::TuneError;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamTrack {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]

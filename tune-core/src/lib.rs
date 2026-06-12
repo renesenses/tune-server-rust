@@ -1,5 +1,8 @@
 #![deny(unused_imports)]
 
+pub mod error;
+pub use error::TuneError;
+
 pub mod ai;
 pub mod alarms;
 pub mod api_analytics;
