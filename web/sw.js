@@ -1,5 +1,5 @@
-const CACHE_NAME = 'tune-v2';
-const PRECACHE = [];
+const CACHE_NAME = 'tune-v1';
+const PRECACHE = ['/', '/index.html'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(PRECACHE)));
@@ -16,7 +16,7 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  if (e.request.url.includes('/api/') || e.request.url.includes('/ws')) return;
+  if (e.request.url.includes('/api/') || e.request.url.includes('/ws') || e.request.url.includes('/stream/')) return;
   // Network-first: always try the network, fall back to cache offline
   e.respondWith(
     fetch(e.request)
