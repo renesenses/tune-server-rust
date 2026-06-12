@@ -53,11 +53,11 @@ pub mod sql {
         format!(
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
              COALESCE(t.id, h.track_id) as track_id, \
-             t.cover_path, COALESCE(t.album_title, h.album_title) as album_title, \
+             al.cover_path, COALESCE(al.title, h.album_title) as album_title, \
              h.source \
              FROM listen_history h \
-             LEFT JOIN (SELECT id, title, artist_name, cover_path, album_title, source FROM tracks GROUP BY title, artist_name) t \
-             ON h.title = t.title AND (h.artist_name = t.artist_name OR h.artist_name IS NULL) AND t.source = 'local' \
+             LEFT JOIN tracks t ON h.track_id = t.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
              GROUP BY h.title, h.artist_name \
              ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
