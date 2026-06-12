@@ -657,19 +657,26 @@ impl PlaybackOrchestrator {
         // mid-session (search still works without auth, but playback doesn't).
         let stream_data = match svc.get_track_url(source_id, None).await {
             Ok(data) => data,
-            Err(ref e) if e.contains("401") || e.contains("403") => {
+            Err(ref e)
+                if {
+                    let msg = e.to_string();
+                    msg.contains("401") || msg.contains("403")
+                } =>
+            {
                 info!(
                     service = service_name,
                     error = %e,
                     "streaming_auth_error_attempting_refresh"
                 );
                 if svc.refresh_if_needed().await.unwrap_or(false) {
-                    svc.get_track_url(source_id, None).await?
+                    svc.get_track_url(source_id, None)
+                        .await
+                        .map_err(|e| e.to_string())?
                 } else {
-                    return Err(e.clone());
+                    return Err(e.to_string());
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.to_string()),
         };
 
         let info = StreamInfo {
