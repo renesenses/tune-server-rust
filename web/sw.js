@@ -1,5 +1,5 @@
-const CACHE_NAME = 'tune-v1';
-const PRECACHE = ['/', '/index.html'];
+const CACHE_NAME = 'tune-v2';
+const PRECACHE = [];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(PRECACHE)));

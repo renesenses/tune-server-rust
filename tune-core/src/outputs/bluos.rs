@@ -62,7 +62,17 @@ impl OutputTarget for BluosOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        self.api_get("Play", &[("url", media.url)]).await?;
+        // BluOS expects the url parameter without re-encoding — .query()
+        // would double-encode http:// in the stream URL, causing silent failure.
+        let play_url = format!("{}/Play?url={}", self.base_url(), media.url);
+        self.client
+            .get(&play_url)
+            .send()
+            .await
+            .map_err(|e| format!("bluos Play: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("bluos Play read: {e}"))?;
         info!(device = %self.name, url = media.url, "bluos_play");
         Ok(())
     }
