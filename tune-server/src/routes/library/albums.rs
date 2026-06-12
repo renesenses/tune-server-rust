@@ -496,6 +496,7 @@ pub(super) async fn album_completeness(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub(super) struct AlbumUpdate {
     title: Option<String>,
     artist_name: Option<String>,
