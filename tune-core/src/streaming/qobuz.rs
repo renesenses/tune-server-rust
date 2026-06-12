@@ -692,10 +692,10 @@ impl StreamingService for QobuzService {
         let limit_str = limit.to_string();
         let data = self
             .api_get(
-                "/genre/get",
+                "/album/getFeatured",
                 &[
-                    ("genre_id", genre_id),
-                    ("type", "albums"),
+                    ("type", "new-releases"),
+                    ("genre_ids", genre_id),
                     ("limit", &limit_str),
                 ],
             )

@@ -61,6 +61,12 @@ pub struct ResolvedStream {
     pub cover_url: Option<String>,
     pub stream_id: Option<String>,
     pub file_size: Option<u64>,
+    /// Audio sample rate in Hz for the output stream (e.g. 176400 for DSD64->PCM).
+    pub sample_rate: Option<u32>,
+    /// Output bit depth (e.g. 24 for DSD->PCM).
+    pub bit_depth: Option<u32>,
+    /// Number of audio channels.
+    pub channels: Option<u32>,
 }
 
 pub struct ResolvedQueueItem {
@@ -202,6 +208,9 @@ impl PlaybackOrchestrator {
                 duration_ms: resolved.duration_ms.map(|d| d as u64),
                 file_size: resolved.file_size,
                 file_path: local_file_path.as_deref(),
+                sample_rate: resolved.sample_rate,
+                bit_depth: resolved.bit_depth,
+                channels: resolved.channels,
             };
             self.send_to_output(device_id, &media).await
         } else {
@@ -278,6 +287,9 @@ impl PlaybackOrchestrator {
             cover_url,
             stream_id: None,
             file_size: None,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
         })
     }
 
@@ -351,7 +363,15 @@ impl PlaybackOrchestrator {
         let needs_transcode =
             needs_transcode_for_output || oaat_needs_wav || local_needs_wav || needs_downsample;
 
-        let (session_id, out_mime, out_ext, resolved_file_size) = if needs_transcode {
+        let (
+            session_id,
+            out_mime,
+            out_ext,
+            resolved_file_size,
+            resolved_sr,
+            resolved_bd,
+            resolved_ch,
+        ) = if needs_transcode {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
             let target_fmt = if oaat_needs_wav || local_needs_wav {
                 AudioFormat::Wav
@@ -552,7 +572,15 @@ impl PlaybackOrchestrator {
                 }
             });
 
-            (session_id, out_mime, out_ext, transcode_file_size)
+            (
+                session_id,
+                out_mime,
+                out_ext,
+                transcode_file_size,
+                Some(out_sr),
+                Some(out_bd as u32),
+                Some(channels as u32),
+            )
         } else {
             // Standard passthrough: serve the raw file
             let mime = source_format
@@ -575,7 +603,15 @@ impl PlaybackOrchestrator {
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
-            (session_id, mime, fmt.clone(), passthrough_file_size)
+            (
+                session_id,
+                mime,
+                fmt.clone(),
+                passthrough_file_size,
+                Some(sample_rate),
+                Some(bit_depth as u32),
+                Some(channels as u32),
+            )
         };
 
         let server_ip = self.server_ip();
@@ -594,6 +630,9 @@ impl PlaybackOrchestrator {
             cover_url: track.cover_path,
             stream_id: Some(session_id),
             file_size: resolved_file_size,
+            sample_rate: resolved_sr,
+            bit_depth: resolved_bd,
+            channels: resolved_ch,
         })
     }
 
@@ -822,6 +861,9 @@ impl PlaybackOrchestrator {
             cover_url: cover_path,
             stream_id: sid,
             file_size: None,
+            sample_rate: Some(stream_data.quality.sample_rate),
+            bit_depth: Some(stream_data.quality.bit_depth as u32),
+            channels: Some(2),
         })
     }
 

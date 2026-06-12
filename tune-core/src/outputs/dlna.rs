@@ -161,25 +161,19 @@ impl DlnaOutput {
         .await
     }
 
-    fn didl_metadata(
-        title: Option<&str>,
-        artist: Option<&str>,
-        album: Option<&str>,
-        mime_type: &str,
-        url: &str,
-        cover_url: Option<&str>,
-        duration_ms: Option<u64>,
-        file_size: Option<u64>,
-    ) -> String {
-        DidlBuilder::new(title.unwrap_or("Unknown"), url, mime_type)
+    fn didl_metadata(media: &PlayMedia<'_>) -> String {
+        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
             .protocol_style(ProtocolStyle::Dlna)
             .dlna_art_profile(true)
             .item_id("1")
-            .artist_opt(artist)
-            .album_opt(album)
-            .album_art_opt(cover_url)
-            .duration_ms_opt(duration_ms)
-            .file_size_opt(file_size)
+            .artist_opt(media.artist)
+            .album_opt(media.album)
+            .album_art_opt(media.cover_url)
+            .duration_ms_opt(media.duration_ms)
+            .file_size_opt(media.file_size)
+            .sample_rate_opt(media.sample_rate)
+            .bit_depth_opt(media.bit_depth)
+            .channels_opt(media.channels)
             .build_escaped()
     }
 
@@ -259,16 +253,7 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
-        let metadata = Self::didl_metadata(
-            media.title,
-            media.artist,
-            media.album,
-            media.mime_type,
-            media.url,
-            media.cover_url,
-            media.duration_ms,
-            media.file_size,
-        );
+        let metadata = Self::didl_metadata(media);
         let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
             media.url
@@ -409,16 +394,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let metadata = Self::didl_metadata(
-            media.title,
-            media.artist,
-            media.album,
-            media.mime_type,
-            media.url,
-            media.cover_url,
-            media.duration_ms,
-            media.file_size,
-        );
+        let metadata = Self::didl_metadata(media);
         self.av_action("SetNextAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
             media.url
@@ -493,16 +469,17 @@ mod tests {
 
     #[test]
     fn didl_metadata_with_cover_and_album() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("Test Track"),
-            Some("Test Artist"),
-            Some("Test Album"),
-            "audio/flac",
-            "http://example.com/stream",
-            Some("http://example.com/cover.jpg"),
-            Some(256_000),
-            Some(50_000_000),
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            title: Some("Test Track"),
+            artist: Some("Test Artist"),
+            album: Some("Test Album"),
+            cover_url: Some("http://example.com/cover.jpg"),
+            duration_ms: Some(256_000),
+            file_size: Some(50_000_000),
+            ..Default::default()
+        });
         assert!(didl.contains("Test Track"));
         assert!(didl.contains("Test Artist"));
         assert!(didl.contains("Test Album"));
@@ -537,16 +514,12 @@ mod tests {
 
     #[test]
     fn didl_metadata_without_cover() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("Title"),
-            None,
-            None,
-            "audio/flac",
-            "http://example.com/stream",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            title: Some("Title"),
+            ..Default::default()
+        });
         assert!(didl.contains("Title"));
         assert!(!didl.contains("albumArtURI"));
         assert!(!didl.contains("upnp:album"));
@@ -557,16 +530,13 @@ mod tests {
 
     #[test]
     fn didl_metadata_null_artist_string() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("Title"),
-            Some("null"),
-            None,
-            "audio/flac",
-            "http://example.com/stream",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            title: Some("Title"),
+            artist: Some("null"),
+            ..Default::default()
+        });
         assert!(
             !didl.contains("dc:creator"),
             "literal 'null' artist must be omitted"
@@ -575,31 +545,25 @@ mod tests {
 
     #[test]
     fn didl_metadata_empty_artist() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("Title"),
-            Some(""),
-            None,
-            "audio/flac",
-            "http://example.com/stream",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            title: Some("Title"),
+            artist: Some(""),
+            ..Default::default()
+        });
         assert!(!didl.contains("dc:creator"), "empty artist must be omitted");
     }
 
     #[test]
     fn didl_escapes_special_chars() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("Rock & Roll"),
-            Some("AC/DC"),
-            None,
-            "audio/flac",
-            "http://example.com/stream?a=1&b=2",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://example.com/stream?a=1&b=2",
+            mime_type: "audio/flac",
+            title: Some("Rock & Roll"),
+            artist: Some("AC/DC"),
+            ..Default::default()
+        });
         // build_escaped() double-escapes ampersands: first XML-escape for
         // DIDL content, then partial_escape for SOAP embedding.
         // "&" -> "&amp;" (XML) -> "&amp;amp;" (SOAP partial escape)
@@ -612,16 +576,12 @@ mod tests {
 
     #[test]
     fn didl_dlna_flags_wav() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("T"),
-            None,
-            None,
-            "audio/wav",
-            "http://x/s",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://x/s",
+            mime_type: "audio/wav",
+            title: Some("T"),
+            ..Default::default()
+        });
         assert!(
             didl.contains("DLNA.ORG_PN=LPCM"),
             "WAV must have LPCM profile"
@@ -630,19 +590,40 @@ mod tests {
 
     #[test]
     fn didl_dlna_flags_mp3() {
-        let didl = DlnaOutput::didl_metadata(
-            Some("T"),
-            None,
-            None,
-            "audio/mpeg",
-            "http://x/s",
-            None,
-            None,
-            None,
-        );
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://x/s",
+            mime_type: "audio/mpeg",
+            title: Some("T"),
+            ..Default::default()
+        });
         assert!(
             didl.contains("DLNA.ORG_PN=MP3"),
             "MP3 must have MP3 profile"
+        );
+    }
+
+    #[test]
+    fn didl_metadata_includes_audio_params() {
+        let didl = DlnaOutput::didl_metadata(&PlayMedia {
+            url: "http://x/s.wav",
+            mime_type: "audio/wav",
+            title: Some("DSD Track"),
+            sample_rate: Some(176_400),
+            bit_depth: Some(24),
+            channels: Some(2),
+            ..Default::default()
+        });
+        assert!(
+            didl.contains("sampleFrequency=\"176400\""),
+            "DIDL must include sampleFrequency for DSD->PCM"
+        );
+        assert!(
+            didl.contains("bitsPerSample=\"24\""),
+            "DIDL must include bitsPerSample for DSD->PCM"
+        );
+        assert!(
+            didl.contains("nrAudioChannels=\"2\""),
+            "DIDL must include nrAudioChannels for DSD->PCM"
         );
     }
 

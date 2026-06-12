@@ -47,8 +47,20 @@ struct TokenState {
     token_expires: Option<Instant>,
 }
 
+/// Cached stream URL with its resolved quality metadata.
+#[derive(Clone)]
+struct CachedUrl {
+    url: String,
+    mime_type: String,
+    codec: String,
+    sample_rate: u32,
+    bit_depth: u16,
+    bitrate: Option<u32>,
+    created: Instant,
+}
+
 struct UrlCache {
-    entries: HashMap<String, (String, Instant)>,
+    entries: HashMap<String, CachedUrl>,
     ttl: Duration,
 }
 
@@ -60,22 +72,22 @@ impl UrlCache {
         }
     }
 
-    fn get(&self, key: &str) -> Option<&str> {
-        self.entries.get(key).and_then(|(url, created)| {
-            if created.elapsed() < self.ttl {
-                Some(url.as_str())
+    fn get(&self, key: &str) -> Option<&CachedUrl> {
+        self.entries.get(key).and_then(|entry| {
+            if entry.created.elapsed() < self.ttl {
+                Some(entry)
             } else {
                 None
             }
         })
     }
 
-    fn set(&mut self, key: String, url: String) {
+    fn set(&mut self, key: String, entry: CachedUrl) {
         if self.entries.len() > 1000 {
-            self.entries
-                .retain(|_, (_, created)| created.elapsed() < self.ttl);
+            let ttl = self.ttl;
+            self.entries.retain(|_, e| e.created.elapsed() < ttl);
         }
-        self.entries.insert(key, (url, Instant::now()));
+        self.entries.insert(key, entry);
     }
 }
 
@@ -314,6 +326,7 @@ impl TidalService {
             ("audioquality", quality),
             ("playbackmode", "STREAM"),
             ("assetpresentation", "FULL"),
+            ("countryCode", self.country_code.as_str()),
         ];
         let resp = self
             .client
@@ -705,15 +718,15 @@ impl StreamingService for TidalService {
     ) -> Result<StreamUrl, String> {
         {
             let cache = self.url_cache.lock().await;
-            if let Some(url) = cache.get(track_id) {
+            if let Some(cached) = cache.get(track_id) {
                 return Ok(StreamUrl {
-                    url: url.to_string(),
-                    mime_type: "audio/flac".into(),
+                    url: cached.url.clone(),
+                    mime_type: cached.mime_type.clone(),
                     quality: StreamQuality {
-                        codec: "FLAC".into(),
-                        sample_rate: 44100,
-                        bit_depth: 16,
-                        bitrate: None,
+                        codec: cached.codec.clone(),
+                        sample_rate: cached.sample_rate,
+                        bit_depth: cached.bit_depth,
+                        bitrate: cached.bitrate,
                         channels: 2,
                     },
                     expires_at: None,
@@ -722,30 +735,50 @@ impl StreamingService for TidalService {
         }
 
         let requested_quality = quality.unwrap_or(self.quality.as_str());
-        let data = self
-            .fetch_playback_info(track_id, requested_quality)
-            .await?;
 
-        let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
-        let has_manifest = data["manifest"].as_str().is_some();
-
-        let data = if (!has_manifest || manifest_mime == "application/dash+xml")
-            && requested_quality != "LOSSLESS"
-        {
-            info!(
-                track_id,
-                manifest_mime, has_manifest, "tidal_fallback_to_lossless"
-            );
-            let fallback = self.fetch_playback_info(track_id, "LOSSLESS").await?;
-            if fallback["manifest"].as_str().is_none() && requested_quality != "HIGH" {
-                info!(track_id, "tidal_fallback_to_high");
-                self.fetch_playback_info(track_id, "HIGH").await?
-            } else {
-                fallback
-            }
-        } else {
-            data
+        // Quality fallback cascade: HI_RES_LOSSLESS → HI_RES → LOSSLESS → HIGH
+        // Tidal returns DASH manifests for qualities the subscription doesn't
+        // support or that require MQA decoding. We need a direct FLAC/AAC URL,
+        // so we try each level until we get a usable (non-DASH) manifest.
+        let fallback_chain: &[&str] = match requested_quality {
+            "HI_RES_LOSSLESS" => &["HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", "HIGH"],
+            "HI_RES" => &["HI_RES", "LOSSLESS", "HIGH"],
+            "LOSSLESS" => &["LOSSLESS", "HIGH"],
+            _ => &[requested_quality, "HIGH"],
         };
+
+        let mut data = None;
+        for &q in fallback_chain {
+            match self.fetch_playback_info(track_id, q).await {
+                Ok(d) => {
+                    let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
+                    let has_manifest = d["manifest"].as_str().is_some();
+                    if has_manifest && manifest_mime != "application/dash+xml" {
+                        data = Some(d);
+                        break;
+                    }
+                    info!(
+                        track_id,
+                        quality = q,
+                        manifest_mime,
+                        has_manifest,
+                        "tidal_quality_returned_dash_trying_next"
+                    );
+                }
+                Err(e) => {
+                    info!(
+                        track_id,
+                        quality = q,
+                        error = %e,
+                        "tidal_quality_fetch_failed_trying_next"
+                    );
+                }
+            }
+        }
+
+        let data = data.ok_or_else(|| {
+            format!("tidal: no usable stream found for track {track_id} (all qualities returned DASH or failed)")
+        })?;
 
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
         let decoded =
@@ -770,31 +803,51 @@ impl StreamingService for TidalService {
             .and_then(|m| if m.contains("dash") { None } else { Some(m) })
             .unwrap_or("audio/flac");
 
+        // Determine codec from the audio quality level:
+        // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
+        // Only HIGH and below are AAC
+        let codec = match audio_quality {
+            "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
+            _ => "AAC",
+        };
+
+        let bitrate = if codec == "FLAC" {
+            data["bitDepth"]
+                .as_u64()
+                .map(|_| sample_rate * (bit_depth as u32) * 2)
+        } else {
+            Some(320_000) // AAC HIGH = 320kbps
+        };
+
         {
             let mut cache = self.url_cache.lock().await;
-            cache.set(track_id.to_string(), url.clone());
+            cache.set(
+                track_id.to_string(),
+                CachedUrl {
+                    url: url.clone(),
+                    mime_type: mime_type.to_string(),
+                    codec: codec.into(),
+                    sample_rate,
+                    bit_depth,
+                    bitrate,
+                    created: Instant::now(),
+                },
+            );
         }
 
         info!(
             track_id,
-            audio_quality, sample_rate, bit_depth, "tidal_stream_url"
+            audio_quality, codec, sample_rate, bit_depth, "tidal_stream_url"
         );
 
         Ok(StreamUrl {
             url,
             mime_type: mime_type.to_string(),
             quality: StreamQuality {
-                codec: if audio_quality.contains("LOSSLESS") {
-                    "FLAC"
-                } else {
-                    "AAC"
-                }
-                .into(),
+                codec: codec.into(),
                 sample_rate,
                 bit_depth,
-                bitrate: data["bitDepth"]
-                    .as_u64()
-                    .map(|_| sample_rate * (bit_depth as u32) * 2),
+                bitrate,
                 channels: 2,
             },
             expires_at: None,

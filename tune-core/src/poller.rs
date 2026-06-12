@@ -840,6 +840,9 @@ impl PositionPoller {
                         duration_ms: resolved.duration_ms,
                         file_size: None,
                         file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        channels: None,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");

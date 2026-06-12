@@ -47,6 +47,13 @@ pub struct PlayMedia<'a> {
     pub file_size: Option<u64>,
     /// Local file path for outputs that can read directly (OAAT).
     pub file_path: Option<&'a str>,
+    /// Audio sample rate in Hz (e.g. 176400 for DSD64->PCM).
+    /// Used by DLNA renderers that require sampleFrequency in DIDL-Lite.
+    pub sample_rate: Option<u32>,
+    /// Audio bit depth (e.g. 24 for DSD->PCM transcoding).
+    pub bit_depth: Option<u32>,
+    /// Number of audio channels (e.g. 2 for stereo).
+    pub channels: Option<u32>,
 }
 
 impl Default for PlayMedia<'_> {
@@ -61,6 +68,9 @@ impl Default for PlayMedia<'_> {
             duration_ms: None,
             file_size: None,
             file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
         }
     }
 }

@@ -210,6 +210,11 @@ impl DidlBuilder {
         self
     }
 
+    pub fn channels_opt(mut self, ch: Option<u32>) -> Self {
+        self.channels = ch;
+        self
+    }
+
     pub fn track_number(mut self, num: u32) -> Self {
         self.track_number = Some(num);
         self

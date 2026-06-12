@@ -127,9 +127,27 @@ pub async fn handle_stream(
     } else {
         None
     };
+
+    // DLNA renderers (Marantz SR7009, Eversolo DMP-A8) send Range: bytes=0-
+    // even for the initial request and expect a 206 Partial Content response
+    // with Content-Range.  Without this, they reject the stream and stop
+    // playback.  When we know the content length, honour the Range request
+    // by responding with 206 + Content-Range.
+    let range_bytes_zero = req_headers
+        .get("Range")
+        .and_then(|v| v.to_str().ok())
+        .filter(|r| r.starts_with("bytes=0-"));
+    let use_partial = range_bytes_zero.is_some() && wav_length.is_some();
+
     if let Some(len) = wav_length {
         headers.insert("Content-Length", HeaderValue::from(len));
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        if use_partial {
+            headers.insert(
+                "Content-Range",
+                HeaderValue::from_str(&format!("bytes 0-{}/{}", len - 1, len)).unwrap(),
+            );
+        }
     }
 
     let wants_icy = req_headers
@@ -186,7 +204,13 @@ pub async fn handle_stream(
         }
     });
 
-    (StatusCode::OK, headers, body).into_response()
+    let status = if use_partial {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+
+    (status, headers, body).into_response()
 }
 
 // ─── File serving with Range ────────────────────────────────────
