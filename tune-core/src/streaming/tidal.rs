@@ -239,7 +239,12 @@ impl TidalService {
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let tags = item["mediaMetadata"]["tags"].as_array();
         let is_hires = tags
-            .map(|t| t.iter().any(|v| v.as_str() == Some("HIRES_LOSSLESS")))
+            .map(|t| {
+                t.iter().any(|v| {
+                    let s = v.as_str().unwrap_or("");
+                    s == "HIRES_LOSSLESS" || s == "MQA"
+                })
+            })
             .unwrap_or(false);
         let audio_quality = item["audioQuality"].as_str().unwrap_or(if is_hires {
             "HI_RES_LOSSLESS"
@@ -248,6 +253,7 @@ impl TidalService {
         });
         let (sample_rate, bit_depth) = match audio_quality {
             "HI_RES_LOSSLESS" => (96000, 24),
+            "HI_RES" => (48000, 24),
             _ => (44100, 16),
         };
 
@@ -389,7 +395,8 @@ impl TidalService {
         }
         match audio_quality {
             "HI_RES_LOSSLESS" => (96000, 24),
-            "LOSSLESS" | "HI_RES" => (44100, 16),
+            "HI_RES" => (48000, 24),
+            "LOSSLESS" => (44100, 16),
             _ => (44100, 16),
         }
     }
@@ -737,9 +744,10 @@ impl StreamingService for TidalService {
         let requested_quality = quality.unwrap_or(self.quality.as_str());
 
         // Quality fallback cascade: HI_RES_LOSSLESS → HI_RES → LOSSLESS → HIGH
-        // Tidal returns DASH manifests for qualities the subscription doesn't
-        // support or that require MQA decoding. We need a direct FLAC/AAC URL,
-        // so we try each level until we get a usable (non-DASH) manifest.
+        // Try the highest quality first, fall back only on API errors or
+        // genuinely unsupported quality levels (e.g. subscription too low).
+        // DASH manifests are now parsed to extract the direct stream URL —
+        // Tidal legitimately uses DASH for Hi-Res FLAC delivery.
         let fallback_chain: &[&str] = match requested_quality {
             "HI_RES_LOSSLESS" => &["HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", "HIGH"],
             "HI_RES" => &["HI_RES", "LOSSLESS", "HIGH"],
@@ -751,18 +759,18 @@ impl StreamingService for TidalService {
         for &q in fallback_chain {
             match self.fetch_playback_info(track_id, q).await {
                 Ok(d) => {
-                    let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
                     let has_manifest = d["manifest"].as_str().is_some();
-                    if has_manifest && manifest_mime != "application/dash+xml" {
+                    if has_manifest {
                         data = Some(d);
                         break;
                     }
+                    let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
                     info!(
                         track_id,
                         quality = q,
                         manifest_mime,
                         has_manifest,
-                        "tidal_quality_returned_dash_trying_next"
+                        "tidal_no_manifest_trying_next"
                     );
                 }
                 Err(e) => {
@@ -777,15 +785,22 @@ impl StreamingService for TidalService {
         }
 
         let data = data.ok_or_else(|| {
-            format!("tidal: no usable stream found for track {track_id} (all qualities returned DASH or failed)")
+            format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
         })?;
 
         let manifest = data["manifest"].as_str().ok_or("no manifest")?;
+        let manifest_mime = data["manifestMimeType"].as_str().unwrap_or("");
         let decoded =
             String::from_utf8(base64_decode(manifest).map_err(|e| format!("base64: {e}"))?)
                 .map_err(|e| format!("utf8: {e}"))?;
 
-        let url = if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+        let url = if manifest_mime == "application/dash+xml" {
+            // DASH manifest (MPD XML) — extract the direct stream URL from <BaseURL>
+            extract_dash_base_url(&decoded).ok_or_else(|| {
+                format!("tidal: could not extract BaseURL from DASH manifest for track {track_id}")
+            })?
+        } else if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            // BTS manifest (JSON with urls array)
             manifest_json["urls"]
                 .as_array()
                 .and_then(|urls| urls.first())
@@ -798,10 +813,13 @@ impl StreamingService for TidalService {
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
         let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
-        let mime_type = data["manifestMimeType"]
-            .as_str()
-            .and_then(|m| if m.contains("dash") { None } else { Some(m) })
-            .unwrap_or("audio/flac");
+        let mime_type = if manifest_mime.contains("dash") {
+            "audio/flac"
+        } else if !manifest_mime.is_empty() {
+            manifest_mime
+        } else {
+            "audio/flac"
+        };
 
         // Determine codec from the audio quality level:
         // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
@@ -1294,6 +1312,24 @@ fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
     base64_decode(&standard)
 }
 
+/// Extract the first `<BaseURL>` content from a DASH MPD manifest.
+/// Tidal Hi-Res FLAC streams are delivered via DASH; the MPD XML contains
+/// one or more `<BaseURL>` elements with direct HTTPS URLs to the FLAC data.
+fn extract_dash_base_url(mpd: &str) -> Option<String> {
+    // Look for <BaseURL>...</BaseURL> — simple XML extraction without
+    // pulling in a full XML parser dependency.
+    let start_tag = "<BaseURL>";
+    let end_tag = "</BaseURL>";
+    let start = mpd.find(start_tag)? + start_tag.len();
+    let end = mpd[start..].find(end_tag)? + start;
+    let url = mpd[start..end].trim();
+    if url.starts_with("http") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,6 +1541,45 @@ mod tests {
         // "Hello" in base64url without padding
         let result = base64_decode_url("SGVsbG8").unwrap();
         assert_eq!(String::from_utf8(result).unwrap(), "Hello");
+    }
+
+    #[test]
+    fn extract_dash_base_url_valid() {
+        let mpd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+  <Period>
+    <AdaptationSet mimeType="audio/flac">
+      <Representation>
+        <BaseURL>https://sp-pr-fa.audio.tidal.com/mediatracks/abc123/0.flac</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let url = extract_dash_base_url(mpd);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://sp-pr-fa.audio.tidal.com/mediatracks/abc123/0.flac")
+        );
+    }
+
+    #[test]
+    fn extract_dash_base_url_missing() {
+        let mpd = r#"<?xml version="1.0"?><MPD><Period></Period></MPD>"#;
+        assert!(extract_dash_base_url(mpd).is_none());
+    }
+
+    #[test]
+    fn extract_dash_base_url_non_http() {
+        let mpd = "<MPD><BaseURL>relative/path.flac</BaseURL></MPD>";
+        assert!(extract_dash_base_url(mpd).is_none());
+    }
+
+    #[test]
+    fn parse_quality_metadata_fallback_hi_res() {
+        let data = json!({});
+        let (sr, bd) = TidalService::parse_quality_metadata(&data, "HI_RES");
+        assert_eq!(sr, 48000);
+        assert_eq!(bd, 24);
     }
 
     #[test]

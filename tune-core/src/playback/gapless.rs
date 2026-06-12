@@ -2,7 +2,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::orchestrator::PlaybackOrchestrator;
-use crate::outputs::traits::{OutputStatus, TransportState};
+use crate::outputs::traits::{OutputStatus, PlayMedia, TransportState};
 
 const PREBUFFER_THRESHOLD_MS: u64 = 15_000;
 
@@ -91,15 +91,21 @@ impl GaplessHandler {
                 let outputs = orchestrator.outputs.lock().await;
                 if let Some(output) = outputs.get(device_id) {
                     let out = output.lock().await;
-                    match out
-                        .set_next_url(
-                            &resolved.url,
-                            &resolved.mime_type,
-                            Some(&resolved.title),
-                            resolved.artist.as_deref(),
-                        )
-                        .await
-                    {
+                    let media = PlayMedia {
+                        url: &resolved.url,
+                        mime_type: &resolved.mime_type,
+                        title: Some(&resolved.title),
+                        artist: resolved.artist.as_deref(),
+                        album: resolved.album.as_deref(),
+                        cover_url: resolved.cover_url.as_deref(),
+                        duration_ms: resolved.duration_ms,
+                        file_size: resolved.file_size,
+                        file_path: None,
+                        sample_rate: resolved.sample_rate,
+                        bit_depth: resolved.bit_depth,
+                        channels: resolved.channels,
+                    };
+                    match out.set_next_media(&media).await {
                         Ok(()) => {
                             *self.state.lock().await = GaplessState::Ready;
                             *self.next_url_set.lock().await = true;

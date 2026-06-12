@@ -186,7 +186,7 @@ async fn update_collection(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateCollection>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     if let Some(ref name) = body.name {
         state
             .db
@@ -268,7 +268,42 @@ async fn update_collection(
             )
             .ok();
     }
-    StatusCode::NO_CONTENT
+
+    // Return the updated collection as JSON
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let result = conn.query_row(
+        "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+         description, icon, color, created_at \
+         FROM smart_collections WHERE id = ?",
+        rusqlite::params![id],
+        |row| {
+            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            Ok(json!({
+                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                "name": row.get::<_, Option<String>>(1).ok().flatten(),
+                "rules": rules,
+                "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
+                "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
+                "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
+                "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
+                "description": row.get::<_, Option<String>>(7).ok().flatten(),
+                "icon": row.get::<_, Option<String>>(8).ok().flatten(),
+                "color": row.get::<_, Option<String>>(9).ok().flatten(),
+                "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
+            }))
+        },
+    );
+    drop(conn);
+
+    match result {
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 async fn delete_collection(
@@ -279,7 +314,7 @@ async fn delete_collection(
         .db
         .execute("DELETE FROM smart_collections WHERE id = ?", &[&id])
         .ok();
-    StatusCode::NO_CONTENT
+    Json(json!({"deleted": true, "id": id}))
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart collection criteria (album-level).

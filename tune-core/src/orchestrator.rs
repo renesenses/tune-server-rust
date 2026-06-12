@@ -78,6 +78,14 @@ pub struct ResolvedQueueItem {
     pub cover_url: Option<String>,
     pub duration_ms: Option<u64>,
     pub stream_id: Option<String>,
+    /// Audio sample rate in Hz (e.g. 44100, 96000).
+    pub sample_rate: Option<u32>,
+    /// Audio bit depth (e.g. 16, 24).
+    pub bit_depth: Option<u32>,
+    /// Number of audio channels (e.g. 2 for stereo).
+    pub channels: Option<u32>,
+    /// File size in bytes for the stream.
+    pub file_size: Option<u64>,
 }
 
 impl PlaybackOrchestrator {
@@ -1561,8 +1569,12 @@ impl PlaybackOrchestrator {
                 artist: resolved.artist,
                 album,
                 cover_url: self.resolve_cover_url(raw_cover.as_deref()),
-                duration_ms: None,
+                duration_ms: resolved.duration_ms.map(|d| d as u64),
                 stream_id: resolved.stream_id,
+                sample_rate: resolved.sample_rate,
+                bit_depth: resolved.bit_depth,
+                channels: resolved.channels,
+                file_size: resolved.file_size,
             });
         }
 
@@ -1620,6 +1632,10 @@ impl PlaybackOrchestrator {
             cover_url: self.resolve_cover_url(raw_cover.as_deref()),
             duration_ms: resolved.duration_ms.map(|d| d as u64),
             stream_id: resolved.stream_id,
+            sample_rate: resolved.sample_rate,
+            bit_depth: resolved.bit_depth,
+            channels: resolved.channels,
+            file_size: resolved.file_size,
         })
     }
 

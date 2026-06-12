@@ -155,7 +155,7 @@ async fn update_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateSmartPlaylist>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     if let Some(ref name) = body.name {
         state
             .db
@@ -183,6 +183,15 @@ async fn update_smart_playlist(
             )
             .ok();
     }
+    if let Some(ref sort_order) = body.sort_order {
+        state
+            .db
+            .execute(
+                "UPDATE smart_playlists SET sort_order = ? WHERE id = ?",
+                &[sort_order as &dyn rusqlite::types::ToSql, &id],
+            )
+            .ok();
+    }
     if let Some(ref max_tracks) = body.max_tracks {
         state
             .db
@@ -192,7 +201,36 @@ async fn update_smart_playlist(
             )
             .ok();
     }
-    Json(json!({"ok": true}))
+
+    // Return the updated smart playlist as JSON
+    let conn = state
+        .db
+        .connection()
+        .lock()
+        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let result = conn.query_row(
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?",
+        rusqlite::params![id],
+        |row| {
+            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            Ok(json!({
+                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
+                "name": row.get::<_, Option<String>>(1).ok().flatten(),
+                "rules": rules,
+                "sort_by": row.get::<_, Option<String>>(3).ok().flatten(),
+                "sort_order": row.get::<_, Option<String>>(4).ok().flatten(),
+                "max_tracks": row.get::<_, Option<i64>>(5).ok().flatten(),
+                "created_at": row.get::<_, Option<String>>(6).ok().flatten(),
+            }))
+        },
+    );
+    drop(conn);
+
+    match result {
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 async fn delete_smart_playlist(
@@ -203,7 +241,7 @@ async fn delete_smart_playlist(
         .db
         .execute("DELETE FROM smart_playlists WHERE id = ?", &[&id])
         .ok();
-    Json(json!({"ok": true}))
+    Json(json!({"deleted": true, "id": id}))
 }
 
 /// Build WHERE, ORDER, LIMIT clauses from smart playlist criteria.
@@ -355,7 +393,7 @@ fn execute_smart_track_query(
                     "genre": row.get::<_, Option<String>>(6).ok().flatten(),
                     "year": row.get::<_, Option<i32>>(7).ok().flatten(),
                     "album_id": row.get::<_, Option<i64>>(8).ok().flatten(),
-                    "album_cover": row.get::<_, Option<String>>(9).ok().flatten(),
+                    "cover_path": row.get::<_, Option<String>>(9).ok().flatten(),
                 }))
             })
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
@@ -428,7 +466,7 @@ async fn smart_collection_albums(
                     "album_id": album_id,
                     "album_title": track.get("album_title"),
                     "artist_name": track.get("artist_name"),
-                    "album_cover": track.get("album_cover"),
+                    "cover_path": track.get("cover_path"),
                     "year": track.get("year"),
                 }));
             }

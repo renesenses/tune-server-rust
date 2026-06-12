@@ -838,11 +838,11 @@ impl PositionPoller {
                         album: resolved.album.as_deref(),
                         cover_url: resolved.cover_url.as_deref(),
                         duration_ms: resolved.duration_ms,
-                        file_size: None,
+                        file_size: resolved.file_size,
                         file_path: None,
-                        sample_rate: None,
-                        bit_depth: None,
-                        channels: None,
+                        sample_rate: resolved.sample_rate,
+                        bit_depth: resolved.bit_depth,
+                        channels: resolved.channels,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");
