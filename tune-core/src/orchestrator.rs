@@ -180,10 +180,6 @@ impl PlaybackOrchestrator {
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
-            let stream_ready = match resolved.stream_id {
-                Some(ref sid) => self.streamer.get_stream_ready_notify(sid).await,
-                None => None,
-            };
             let local_file_path = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
                     TrackRepo::new(self.db.clone())
@@ -205,7 +201,6 @@ impl PlaybackOrchestrator {
                 duration_ms: resolved.duration_ms.map(|d| d as u64),
                 file_size: resolved.file_size,
                 file_path: local_file_path.as_deref(),
-                stream_ready,
             };
             self.send_to_output(device_id, &media).await
         } else {
@@ -418,7 +413,7 @@ impl PlaybackOrchestrator {
             // attribute so DLNA renderers know the correct stream size.
             let transcode_file_size = info.wav_content_length();
 
-            let (session_id, tx) = self.streamer.create_session(info, false, 256).await;
+            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
 
             // Native transcoding pipeline: decode with native decoders, encode to target format
             let fp = file_path.clone();
@@ -431,26 +426,17 @@ impl PlaybackOrchestrator {
                 debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
                 if target_format_str == "wav" {
-                    // PROGRESSIVE STREAMING: decode packet-by-packet and send
-                    // PCM chunks as they are decoded. The DLNA renderer can
-                    // start fetching immediately — no need to wait for the
-                    // entire file to be transcoded. This dramatically reduces
-                    // track transition latency (from multi-second to <500ms).
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
-                    // Drop the original sender so the channel closes as soon as
-                    // decode_to_pcm_streaming finishes (tx_clone is the sole sender).
-                    // Without this, recv_chunk() on the HTTP stream handler would
-                    // block indefinitely after all data is sent, because the channel
-                    // only closes when ALL senders are dropped.
                     drop(tx);
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming(
+                        crate::audio::decode::decode_to_pcm_streaming_with_notify(
                             &fp_clone,
                             Some(out_sr),
                             Some(channels as u32),
                             tx_clone,
                             32768,
+                            data_ready,
                         )
                     })
                     .await;
@@ -661,7 +647,8 @@ impl PlaybackOrchestrator {
                 duration_ms: None,
             };
 
-            let (session_id, tx) = self.streamer.create_session(wav_info, false, 256).await;
+            let (session_id, tx, _data_ready) =
+                self.streamer.create_session(wav_info, false, 256).await;
 
             info!(
                 service = service_name,
@@ -1438,7 +1425,10 @@ impl PlaybackOrchestrator {
         })
     }
 
-    /// Persist the current playback position to the database.
+    pub async fn wait_stream_data_ready(&self, stream_id: &str, timeout_ms: u64) -> bool {
+        self.streamer.wait_data_ready(stream_id, timeout_ms).await
+    }
+
     async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {

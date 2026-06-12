@@ -47,9 +47,6 @@ pub struct PlayMedia<'a> {
     pub file_size: Option<u64>,
     /// Local file path for outputs that can read directly (OAAT).
     pub file_path: Option<&'a str>,
-    /// Signalled by the HTTP streamer when the renderer makes its first GET request.
-    /// DLNA outputs wait on this before sending Play to avoid buffer underrun clicks.
-    pub stream_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl Default for PlayMedia<'_> {
@@ -64,7 +61,6 @@ impl Default for PlayMedia<'_> {
             duration_ms: None,
             file_size: None,
             file_path: None,
-            stream_ready: None,
         }
     }
 }
