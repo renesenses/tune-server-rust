@@ -168,7 +168,16 @@ impl OutputTarget for BluosOutput {
             .is_ok()
     }
 
-    async fn set_next_media(&self, _media: &PlayMedia<'_>) -> Result<(), String> {
+    async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        // BluOS /Add?prepend=1 queues the next track for gapless playback.
+        // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
+        let add_url = format!("{}/Add?url={}&prepend=1", self.base_url(), media.url);
+        self.client
+            .get(&add_url)
+            .send()
+            .await
+            .map_err(|e| format!("bluos Add: {e}"))?;
+        info!(device = %self.name, url = media.url, "bluos_set_next");
         Ok(())
     }
 }
