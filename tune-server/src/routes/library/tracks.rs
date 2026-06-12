@@ -96,7 +96,7 @@ pub(super) async fn get_track(
     match repo.get(id) {
         Ok(Some(track)) => Json(json!(track)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -221,7 +221,7 @@ pub(super) async fn track_all_tags(
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let mut result = serde_json::to_value(&track).unwrap_or_default();
@@ -399,7 +399,11 @@ pub(super) async fn identify_track(
     let fp = match tune_core::metadata::fingerprint::generate_fingerprint(&file_path).await {
         Ok(fp) => fp,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
 
@@ -449,7 +453,7 @@ pub(super) async fn track_waveform(
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
     let file_path = match track.file_path.as_deref() {

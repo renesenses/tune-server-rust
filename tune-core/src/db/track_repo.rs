@@ -5,7 +5,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
 use super::sqlite::SqliteDb;
-use crate::error::TuneError;
+use crate::TuneError;
 
 /// Engine-agnostic SQL builders for track_repo.
 ///
@@ -274,7 +274,7 @@ impl TrackRepo {
     //
     // Internal methods use TuneError for typed errors (Db, NotFound, etc.).
     // Public API returns Result<T, String> for backward-compat with callers.
-    // The bridge: `.map_err(String::from)` converts TuneError → String at the boundary.
+    // The bridge: `.map_err(TuneError::from)` converts TuneError → String at the boundary.
 
     fn get_inner(&self, id: i64) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
@@ -287,11 +287,11 @@ impl TrackRepo {
             .map(row_to_track))
     }
 
-    pub fn get(&self, id: i64) -> Result<Option<Track>, String> {
-        self.get_inner(id).map_err(String::from)
+    pub fn get(&self, id: i64) -> Result<Option<Track>, TuneError> {
+        self.get_inner(id).map_err(TuneError::from)
     }
 
-    pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, String> {
+    pub fn get_by_path(&self, file_path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
@@ -332,8 +332,8 @@ impl TrackRepo {
         Ok(self.db.last_insert_rowid())
     }
 
-    pub fn create(&self, track: &Track) -> Result<i64, String> {
-        self.create_inner(track).map_err(String::from)
+    pub fn create(&self, track: &Track) -> Result<i64, TuneError> {
+        self.create_inner(track).map_err(TuneError::from)
     }
 
     fn update_inner(&self, track: &Track) -> Result<(), TuneError> {
@@ -372,18 +372,18 @@ impl TrackRepo {
         Ok(())
     }
 
-    pub fn update(&self, track: &Track) -> Result<(), String> {
-        self.update_inner(track).map_err(String::from)
+    pub fn update(&self, track: &Track) -> Result<(), TuneError> {
+        self.update_inner(track).map_err(TuneError::from)
     }
 
-    pub fn delete(&self, id: i64) -> Result<(), String> {
+    pub fn delete(&self, id: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn delete_all(&self) -> Result<u64, String> {
+    pub fn delete_all(&self) -> Result<u64, TuneError> {
         // 4 sequential DELETEs — wrap in write_tx for atomicity.
         let mut count: u64 = 0;
         let count_ref = &mut count;
@@ -397,21 +397,21 @@ impl TrackRepo {
         Ok(count)
     }
 
-    pub fn delete_by_path(&self, file_path: &str) -> Result<(), String> {
+    pub fn delete_by_path(&self, file_path: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::delete_by_path, sql::delete_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn count(&self) -> Result<i64, String> {
+    pub fn count(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
     }
 
-    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
             "{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT {} OFFSET {}",
             sql::select_track(),
@@ -434,35 +434,35 @@ impl TrackRepo {
         file_path: &str,
         mtime: f64,
         file_size: i64,
-    ) -> Result<(), String> {
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
         let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), String> {
+    pub fn update_audio_hash(&self, file_path: &str, audio_hash: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_audio_hash, sql::update_audio_hash);
         let params: [&dyn ToSqlValue; 2] = [&audio_hash, &file_path];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, String> {
+    pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, String> {
+    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, String> {
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
@@ -472,13 +472,13 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, String> {
+    pub fn find_by_path(&self, path: &str) -> Result<Option<Track>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&path];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
-    pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, String> {
+    pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
         let like = format!("%{title}%");
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
@@ -499,7 +499,7 @@ impl TrackRepo {
         &self,
         audio_hash: &str,
         album_id: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, TuneError> {
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
             Engine::Postgres => PostgresDialect.placeholder(i),
@@ -519,7 +519,7 @@ impl TrackRepo {
         Ok(n > 0)
     }
 
-    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
+    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, TuneError> {
         // Both engines accept `ORDER BY RANDOM()` (SQLite) /
         // `ORDER BY random()` (PG). The lowercase form works on both.
         let make_ph = |i: usize| match self.db.engine() {
@@ -538,7 +538,7 @@ impl TrackRepo {
             .collect())
     }
 
-    pub fn count_doubtful(&self) -> Result<i64, String> {
+    pub fn count_doubtful(&self) -> Result<i64, TuneError> {
         let sql = format!(
             "SELECT COUNT(*) FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
@@ -555,7 +555,7 @@ impl TrackRepo {
             .unwrap_or(0))
     }
 
-    pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, String> {
+    pub fn list_doubtful(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
             Engine::Postgres => PostgresDialect.placeholder(i),
@@ -575,7 +575,7 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, String> {
+    pub fn get_multiple(&self, ids: &[i64]) -> Result<Vec<Track>, TuneError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -612,7 +612,7 @@ impl TrackRepo {
     /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
     /// Using `write_tx` here would fail with "cannot start a transaction
     /// within a transaction" when the caller already holds one.
-    pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+    pub fn create_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
         for track in tracks {
@@ -658,7 +658,7 @@ impl TrackRepo {
     /// The caller is responsible for wrapping the call in a transaction
     /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
     /// See `create_batch` for rationale.
-    pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, String> {
+    pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
         let update_sql = self.dialect_sql(sql::update, sql::update);
         let mut count = 0usize;
         for track in tracks {
@@ -700,7 +700,7 @@ impl TrackRepo {
     // ─── Group B: metadata accessors via DbBackend ───────────────────
     // Backed by migration `003_track_metadata_columns.sql` on PG.
 
-    pub fn get_synced_lyrics(&self, track_id: i64) -> Result<Option<String>, String> {
+    pub fn get_synced_lyrics(&self, track_id: i64) -> Result<Option<String>, TuneError> {
         let sql = self.dialect_sql(sql::get_synced_lyrics, sql::get_synced_lyrics);
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         Ok(self
@@ -710,14 +710,14 @@ impl TrackRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
-    pub fn set_synced_lyrics(&self, track_id: i64, json: &str) -> Result<(), String> {
+    pub fn set_synced_lyrics(&self, track_id: i64, json: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_synced_lyrics, sql::set_synced_lyrics);
         let params: [&dyn ToSqlValue; 2] = [&json, &track_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn get_trailing_silence(&self, track_id: i64) -> Result<Option<i64>, String> {
+    pub fn get_trailing_silence(&self, track_id: i64) -> Result<Option<i64>, TuneError> {
         let sql = self.dialect_sql(sql::get_trailing_silence, sql::get_trailing_silence);
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         Ok(self
@@ -727,7 +727,7 @@ impl TrackRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_i64())))
     }
 
-    pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), String> {
+    pub fn set_trailing_silence(&self, track_id: i64, ms: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_trailing_silence, sql::set_trailing_silence);
         let params: [&dyn ToSqlValue; 2] = [&ms, &track_id];
         self.db.execute(&sql, &params)?;
@@ -739,21 +739,21 @@ impl TrackRepo {
         track_id: i64,
         fingerprint: &str,
         confidence: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_acoustid, sql::set_acoustid);
         let params: [&dyn ToSqlValue; 3] = [&fingerprint, &confidence, &track_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn list_unidentified(&self, limit: i64) -> Result<Vec<Track>, String> {
+    pub fn list_unidentified(&self, limit: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_unidentified, sql::list_unidentified);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, String> {
+    pub fn get_waveform(&self, track_id: i64) -> Result<Option<String>, TuneError> {
         let sql = self.dialect_sql(sql::get_waveform, sql::get_waveform);
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         Ok(self
@@ -763,7 +763,7 @@ impl TrackRepo {
             .and_then(|cols| cols.first().and_then(|v| v.as_string())))
     }
 
-    pub fn set_waveform(&self, track_id: i64, json: &str) -> Result<(), String> {
+    pub fn set_waveform(&self, track_id: i64, json: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::set_waveform, sql::set_waveform);
         let params: [&dyn ToSqlValue; 2] = [&json, &track_id];
         self.db.execute(&sql, &params)?;
@@ -773,7 +773,7 @@ impl TrackRepo {
     pub fn get_credits(
         &self,
         track_id: i64,
-    ) -> Result<Vec<crate::db::models::TrackCredit>, String> {
+    ) -> Result<Vec<crate::db::models::TrackCredit>, TuneError> {
         let sql = self.dialect_sql(sql::get_credits, sql::get_credits);
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         let rows = self.db.query_many(&sql, &params)?;
@@ -791,7 +791,7 @@ impl TrackRepo {
             .collect())
     }
 
-    pub fn get_all_paths(&self) -> Result<HashSet<String>, String> {
+    pub fn get_all_paths(&self) -> Result<HashSet<String>, TuneError> {
         let rows = self.db.query_many(sql::get_all_paths(), &[])?;
         Ok(rows
             .into_iter()
@@ -802,7 +802,7 @@ impl TrackRepo {
     #[allow(clippy::type_complexity)]
     pub fn get_all_local_file_info(
         &self,
-    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, String> {
+    ) -> Result<HashMap<String, (i64, Option<f64>, Option<i64>)>, TuneError> {
         let rows = self.db.query_many(sql::get_all_local_file_info(), &[])?;
         Ok(rows
             .into_iter()
@@ -818,7 +818,7 @@ impl TrackRepo {
 
     /// List all local tracks (with file_path set). Used by rescan-metadata to
     /// re-read tags from disk without doing a full library scan.
-    pub fn list_all_local(&self) -> Result<Vec<Track>, String> {
+    pub fn list_all_local(&self) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
             "{} WHERE t.file_path IS NOT NULL AND t.file_path != ''",
             sql::select_track()
@@ -827,7 +827,7 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
-    pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, String> {
+    pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, TuneError> {
         let rows = self
             .db
             .query_many(sql::get_existing_audio_hash_album_pairs(), &[])?;
@@ -841,7 +841,7 @@ impl TrackRepo {
             .collect())
     }
 
-    pub fn deduplicate(&self) -> Result<i64, String> {
+    pub fn deduplicate(&self) -> Result<i64, TuneError> {
         let count_sql = "SELECT COUNT(*) FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL)";
         let delete_sql = "DELETE FROM tracks WHERE id IN (SELECT t1.id FROM tracks t1 WHERE EXISTS (SELECT 1 FROM tracks t2 WHERE t2.audio_hash = t1.audio_hash AND t2.id < t1.id AND t1.audio_hash IS NOT NULL))";
         let mut count: i64 = 0;

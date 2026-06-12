@@ -170,7 +170,7 @@ pub(super) async fn import_roon(
 
                                     match track_repo.create(&track) {
                                         Ok(_) => imported += 1,
-                                        Err(e) => errors.push(e),
+                                        Err(e) => errors.push(e.to_string()),
                                     }
                                 }
                             }
@@ -370,7 +370,7 @@ pub(super) async fn import_plex(
 
                 match track_repo.create(&new_track) {
                     Ok(_) => imported += 1,
-                    Err(e) => errors.push(e),
+                    Err(e) => errors.push(e.to_string()),
                 }
             }
         }

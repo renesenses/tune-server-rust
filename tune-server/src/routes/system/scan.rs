@@ -757,7 +757,7 @@ pub(super) async fn library_clear(State(state): State<AppState>) -> Json<Value> 
         }
         Err(e) => {
             tracing::warn!(error = %e, "library_clear_failed");
-            Json(json!({"ok": false, "error": e}))
+            Json(json!({"ok": false, "error": e.to_string()}))
         }
     }
 }

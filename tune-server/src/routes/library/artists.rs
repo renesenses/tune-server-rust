@@ -42,7 +42,7 @@ pub(super) async fn get_artist(
     match repo.get(id) {
         Ok(Some(artist)) => Json(json!(artist)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

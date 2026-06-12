@@ -121,7 +121,7 @@ pub(super) async fn get_album(
     match repo.get(id) {
         Ok(Some(album)) => Json(album.to_json()).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -159,7 +159,7 @@ pub(super) async fn rate_album(
     let profile_id = body.profile_id.unwrap_or(1);
     match repo.rate_album(id, profile_id, body.rating, body.note.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
@@ -173,7 +173,7 @@ pub(super) async fn get_album_rating(
     match repo.get_rating(id, profile_id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
         Ok(None) => Json(json!({ "rating": null, "album_id": id })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

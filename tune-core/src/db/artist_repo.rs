@@ -4,6 +4,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Artist;
 use super::sqlite::SqliteDb;
+use crate::TuneError;
 
 /// Engine-agnostic SQL builders for artist_repo.
 ///
@@ -150,7 +151,7 @@ impl ArtistRepo {
         }
     }
 
-    pub fn get(&self, id: i64) -> Result<Option<Artist>, String> {
+    pub fn get(&self, id: i64) -> Result<Option<Artist>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         Ok(self
@@ -160,7 +161,7 @@ impl ArtistRepo {
             .map(row_to_artist))
     }
 
-    pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, String> {
+    pub fn get_by_name(&self, name: &str) -> Result<Option<Artist>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
         let params: [&dyn ToSqlValue; 1] = [&name];
         Ok(self
@@ -170,7 +171,7 @@ impl ArtistRepo {
             .map(row_to_artist))
     }
 
-    pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, String> {
+    pub fn get_by_musicbrainz_id(&self, mbid: &str) -> Result<Option<Artist>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
         let params: [&dyn ToSqlValue; 1] = [&mbid];
         Ok(self
@@ -180,7 +181,7 @@ impl ArtistRepo {
             .map(row_to_artist))
     }
 
-    pub fn create(&self, artist: &Artist) -> Result<i64, String> {
+    pub fn create(&self, artist: &Artist) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 7] = [
             &artist.name,
@@ -209,7 +210,7 @@ impl ArtistRepo {
         name: &str,
         musicbrainz_id: Option<&str>,
         sort_name: Option<&str>,
-    ) -> Result<Artist, String> {
+    ) -> Result<Artist, TuneError> {
         if let Some(mbid) = musicbrainz_id {
             let sql = self.dialect_sql(sql::get_by_musicbrainz_id, sql::get_by_musicbrainz_id);
             let params: [&dyn ToSqlValue; 1] = [&mbid];
@@ -240,7 +241,7 @@ impl ArtistRepo {
         })
     }
 
-    pub fn update(&self, artist: &Artist) -> Result<(), String> {
+    pub fn update(&self, artist: &Artist) -> Result<(), TuneError> {
         let id = artist.id.ok_or("artist has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
         let params: [&dyn ToSqlValue; 8] = [
@@ -257,21 +258,21 @@ impl ArtistRepo {
         Ok(())
     }
 
-    pub fn delete(&self, id: i64) -> Result<(), String> {
+    pub fn delete(&self, id: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn count(&self) -> Result<i64, String> {
+    pub fn count(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
     }
 
-    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, String> {
+    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, TuneError> {
         let sql = self.dialect_sql(sql::list, sql::list);
         let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
@@ -280,7 +281,7 @@ impl ArtistRepo {
 
     /// Delete artists that have zero tracks referencing them.
     /// Single tx for count-then-delete atomicity.
-    pub fn cleanup_orphans(&self) -> Result<i64, String> {
+    pub fn cleanup_orphans(&self) -> Result<i64, TuneError> {
         let mut count: i64 = 0;
         let count_ref = &mut count;
         self.db.write_tx(&mut |tx| {
@@ -299,7 +300,7 @@ impl ArtistRepo {
 
     /// Return all artists that have a MusicBrainz ID but no image set.
     /// Each entry is (artist_id, name, musicbrainz_id).
-    pub fn list_without_image(&self) -> Result<Vec<(i64, String, String)>, String> {
+    pub fn list_without_image(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_image(), &[])?;
         Ok(rows
             .into_iter()
@@ -313,7 +314,7 @@ impl ArtistRepo {
             .collect())
     }
 
-    pub fn list_without_mbid(&self) -> Result<Vec<(i64, String)>, String> {
+    pub fn list_without_mbid(&self) -> Result<Vec<(i64, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_mbid(), &[])?;
         Ok(rows
             .into_iter()
@@ -328,7 +329,7 @@ impl ArtistRepo {
 
     /// Return all artists without image AND without MBID.
     /// Each entry is (artist_id, name).
-    pub fn list_without_image_no_mbid(&self) -> Result<Vec<(i64, String)>, String> {
+    pub fn list_without_image_no_mbid(&self) -> Result<Vec<(i64, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_image_no_mbid(), &[])?;
         Ok(rows
             .into_iter()
@@ -341,7 +342,7 @@ impl ArtistRepo {
             .collect())
     }
 
-    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, String)>, String> {
+    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_bio(), &[])?;
         Ok(rows
             .into_iter()
@@ -355,7 +356,7 @@ impl ArtistRepo {
             .collect())
     }
 
-    pub fn update_bio(&self, id: i64, bio: &str) -> Result<(), String> {
+    pub fn update_bio(&self, id: i64, bio: &str) -> Result<(), TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => "UPDATE artists SET bio = ? WHERE id = ?",
             Engine::Postgres => "UPDATE artists SET bio = $1 WHERE id = $2",
@@ -365,14 +366,14 @@ impl ArtistRepo {
         Ok(())
     }
 
-    pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), String> {
+    pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         self.db
             .execute(sql::update_mbid(), &[&id as &dyn ToSqlValue, &mbid])?;
         Ok(())
     }
 
     /// Update only the image_path and image_source for an artist.
-    pub fn update_image(&self, id: i64, hash: &str, source: &str) -> Result<(), String> {
+    pub fn update_image(&self, id: i64, hash: &str, source: &str) -> Result<(), TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => "UPDATE artists SET image_path = ?, image_source = ? WHERE id = ?",
             Engine::Postgres => {
@@ -384,7 +385,7 @@ impl ArtistRepo {
         Ok(())
     }
 
-    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, String> {
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let sql = self.dialect_sql(sql::search, sql::search);

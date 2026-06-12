@@ -4,6 +4,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Album;
 use super::sqlite::SqliteDb;
+use crate::TuneError;
 
 /// Engine-agnostic SQL builders for album_repo.
 pub mod sql {
@@ -249,13 +250,13 @@ impl AlbumRepo {
         }
     }
 
-    pub fn get(&self, id: i64) -> Result<Option<Album>, String> {
+    pub fn get(&self, id: i64) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
-    pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, String> {
+    pub fn get_by_title(&self, title: &str) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_title, sql::get_by_title);
         let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
@@ -264,7 +265,7 @@ impl AlbumRepo {
     /// Like `get_by_title` but reads through the write connection.
     /// Used by the scanner when running inside a `BEGIN IMMEDIATE` to
     /// see albums created earlier in the same transaction.
-    pub fn get_by_title_strong(&self, title: &str) -> Result<Option<Album>, String> {
+    pub fn get_by_title_strong(&self, title: &str) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_title, sql::get_by_title);
         let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self
@@ -279,7 +280,7 @@ impl AlbumRepo {
         title: &str,
         artist_id: i64,
         year: Option<i32>,
-    ) -> Result<Option<Album>, String> {
+    ) -> Result<Option<Album>, TuneError> {
         if let Some(y) = year {
             let sql =
                 self.dialect_sql(sql::get_by_title_artist_year, sql::get_by_title_artist_year);
@@ -293,7 +294,7 @@ impl AlbumRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
-    pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, String> {
+    pub fn get_by_title_only(&self, title: &str) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_title_only, sql::get_by_title_only);
         let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
@@ -302,7 +303,7 @@ impl AlbumRepo {
     /// Like `get_by_title_only` but reads through the write connection.
     /// Used by the scanner when running inside a `BEGIN IMMEDIATE` to
     /// see albums created earlier in the same transaction.
-    pub fn get_by_title_only_strong(&self, title: &str) -> Result<Option<Album>, String> {
+    pub fn get_by_title_only_strong(&self, title: &str) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(sql::get_by_title_only, sql::get_by_title_only);
         let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self
@@ -312,7 +313,10 @@ impl AlbumRepo {
             .map(row_to_album))
     }
 
-    pub fn get_by_musicbrainz_release_id(&self, release_id: &str) -> Result<Option<Album>, String> {
+    pub fn get_by_musicbrainz_release_id(
+        &self,
+        release_id: &str,
+    ) -> Result<Option<Album>, TuneError> {
         let sql = self.dialect_sql(
             sql::get_by_musicbrainz_release_id,
             sql::get_by_musicbrainz_release_id,
@@ -321,7 +325,7 @@ impl AlbumRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_album))
     }
 
-    pub fn create(&self, album: &Album) -> Result<i64, String> {
+    pub fn create(&self, album: &Album) -> Result<i64, TuneError> {
         let sql = self.dialect_sql(sql::create, sql::create);
         let params: [&dyn ToSqlValue; 22] = [
             &album.title,
@@ -372,7 +376,7 @@ impl AlbumRepo {
         title: &str,
         artist_id: i64,
         year: Option<i32>,
-    ) -> Result<Album, String> {
+    ) -> Result<Album, TuneError> {
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
             return Ok(found);
         }
@@ -395,7 +399,7 @@ impl AlbumRepo {
         artist_id: i64,
         year: Option<i32>,
         mbid: Option<&str>,
-    ) -> Result<Album, String> {
+    ) -> Result<Album, TuneError> {
         if let Some(release_id) = mbid {
             let sql = self.dialect_sql(
                 sql::get_by_musicbrainz_release_id,
@@ -430,7 +434,7 @@ impl AlbumRepo {
         title: &str,
         artist_id: i64,
         year: Option<i32>,
-    ) -> Result<Option<Album>, String> {
+    ) -> Result<Option<Album>, TuneError> {
         if let Some(y) = year {
             let sql =
                 self.dialect_sql(sql::get_by_title_artist_year, sql::get_by_title_artist_year);
@@ -448,7 +452,7 @@ impl AlbumRepo {
             .map(row_to_album))
     }
 
-    pub fn update(&self, album: &Album) -> Result<(), String> {
+    pub fn update(&self, album: &Album) -> Result<(), TuneError> {
         let id = album.id.ok_or("album has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
         let params: [&dyn ToSqlValue; 18] = [
@@ -475,7 +479,7 @@ impl AlbumRepo {
         Ok(())
     }
 
-    pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
+    pub fn update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_cover_path, sql::update_cover_path);
         let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
         self.db.execute(&sql, &params)?;
@@ -484,21 +488,25 @@ impl AlbumRepo {
 
     /// Like `update_cover_path` but always overwrites the existing value.
     /// Used by rescan endpoints where the user explicitly wants to refresh artwork.
-    pub fn force_update_cover_path(&self, album_id: i64, cover_path: &str) -> Result<(), String> {
+    pub fn force_update_cover_path(
+        &self,
+        album_id: i64,
+        cover_path: &str,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::force_update_cover_path, sql::force_update_cover_path);
         let params: [&dyn ToSqlValue; 2] = [&cover_path, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn update_track_count(&self, album_id: i64) -> Result<(), String> {
+    pub fn update_track_count(&self, album_id: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_track_count, sql::update_track_count);
         let params: [&dyn ToSqlValue; 2] = [&album_id, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), String> {
+    pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
         // 7 references to the same album_id parameter. SQLite uses `?`
         // for each; PG would use $1..$7 — we build the placeholder list
         // via the dialect to keep both engines happy.
@@ -531,14 +539,14 @@ impl AlbumRepo {
         Ok(())
     }
 
-    pub fn delete(&self, id: i64) -> Result<(), String> {
+    pub fn delete(&self, id: i64) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
 
-    pub fn delete_orphans(&self) -> Result<i64, String> {
+    pub fn delete_orphans(&self) -> Result<i64, TuneError> {
         let mut count: i64 = 0;
         let count_ref = &mut count;
         self.db.write_tx(&mut |tx| {
@@ -555,28 +563,28 @@ impl AlbumRepo {
         Ok(count)
     }
 
-    pub fn count(&self) -> Result<i64, String> {
+    pub fn count(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
     }
 
-    pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, String> {
+    pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_recent, sql::list_recent);
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
 
-    pub fn list_by_release_group(&self, group_id: &str) -> Result<Vec<Album>, String> {
+    pub fn list_by_release_group(&self, group_id: &str) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_release_group, sql::list_by_release_group);
         let params: [&dyn ToSqlValue; 1] = [&group_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
 
-    pub fn list_release_groups(&self) -> Result<Vec<(String, Vec<Album>)>, String> {
+    pub fn list_release_groups(&self) -> Result<Vec<(String, Vec<Album>)>, TuneError> {
         let rows = self.db.query_many(&sql::list_release_groups(), &[])?;
         let albums: Vec<Album> = rows.iter().map(row_to_album).collect();
 
@@ -590,7 +598,7 @@ impl AlbumRepo {
         Ok(groups.into_iter().filter(|(_, v)| v.len() > 1).collect())
     }
 
-    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, String> {
+    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Album>, TuneError> {
         self.list_sorted(limit, offset, "title", "asc")
     }
 
@@ -600,7 +608,7 @@ impl AlbumRepo {
         offset: i64,
         sort: &str,
         order: &str,
-    ) -> Result<Vec<Album>, String> {
+    ) -> Result<Vec<Album>, TuneError> {
         self.list_filtered(limit, offset, sort, order, None, None)
     }
 
@@ -612,7 +620,7 @@ impl AlbumRepo {
         order: &str,
         format: Option<&str>,
         quality: Option<&str>,
-    ) -> Result<Vec<Album>, String> {
+    ) -> Result<Vec<Album>, TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
         } else {
@@ -683,7 +691,7 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
-    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, String> {
+    pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
         let rows = self.db.query_many(&sql, &params)?;
@@ -694,7 +702,7 @@ impl AlbumRepo {
     /// delimiter-separated text column or the structured `genres`
     /// JSON array (via `dialect.json_array_contains_lower`). Now
     /// PG-compatible.
-    pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, String> {
+    pub fn list_by_genre(&self, genre: &str) -> Result<Vec<Album>, TuneError> {
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
             Engine::Postgres => PostgresDialect.placeholder(i),
@@ -723,7 +731,7 @@ impl AlbumRepo {
     #[allow(clippy::type_complexity)]
     pub fn list_without_cover(
         &self,
-    ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, String> {
+    ) -> Result<Vec<(i64, String, Option<String>, Option<String>)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_cover(), &[])?;
         Ok(rows
             .into_iter()
@@ -740,7 +748,7 @@ impl AlbumRepo {
 
     /// Return all local albums without bio.
     /// Each entry is (album_id, title, artist_name).
-    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, Option<String>)>, String> {
+    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
         let rows = self.db.query_many(sql::list_without_bio(), &[])?;
         Ok(rows
             .into_iter()
@@ -754,7 +762,7 @@ impl AlbumRepo {
             .collect())
     }
 
-    pub fn update_bio(&self, album_id: i64, bio: &str) -> Result<(), String> {
+    pub fn update_bio(&self, album_id: i64, bio: &str) -> Result<(), TuneError> {
         let sql = match self.db.engine() {
             Engine::Sqlite => "UPDATE albums SET bio = ? WHERE id = ?",
             Engine::Postgres => "UPDATE albums SET bio = $1 WHERE id = $2",
@@ -764,7 +772,7 @@ impl AlbumRepo {
         Ok(())
     }
 
-    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {
+    pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
