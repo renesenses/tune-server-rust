@@ -421,11 +421,11 @@ impl HistoryRepo {
 
         // ── Top albums ──
         let albums_sql = format!(
-            "SELECT h.album_title, h.artist_name, a.cover_path, COUNT(*) as plays
+            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays
              FROM listen_history h
              LEFT JOIN albums a ON a.title = h.album_title
              {where_clause} {and_or} h.album_title IS NOT NULL
-             GROUP BY h.album_title, h.artist_name, a.cover_path
+             GROUP BY h.album_title, h.artist_name, cover_path
              ORDER BY plays DESC LIMIT {top_n}",
             and_or = if where_clause.is_empty() {
                 "WHERE"
@@ -763,8 +763,8 @@ mod tests {
         assert_eq!(recent.len(), 2);
 
         let top = repo.top_tracks(5).unwrap();
-        assert_eq!(top[0].0, "So What");
-        assert_eq!(top[0].2, 2);
+        assert_eq!(top[0]["title"], "So What");
+        assert_eq!(top[0]["plays"], 2);
 
         let dashboard = repo.dashboard().unwrap();
         assert_eq!(dashboard.total_listens, 2);
@@ -923,8 +923,8 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?)"));
-        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7)"));
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
@@ -949,6 +949,7 @@ mod tests {
             duration_ms: 100_000,
             listened_at: None,
             zone_id: Some(1),
+            cover_url: None,
         })
         .unwrap();
 
@@ -976,6 +977,7 @@ mod tests {
             duration_ms: 0,
             listened_at: None,
             zone_id: None,
+            cover_url: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);

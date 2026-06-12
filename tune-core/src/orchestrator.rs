@@ -241,6 +241,7 @@ impl PlaybackOrchestrator {
             &resolved.source,
             resolved.duration_ms.unwrap_or(0),
             req.zone_id,
+            cover_path.as_deref(),
         );
 
         info!(
@@ -1076,6 +1077,7 @@ impl PlaybackOrchestrator {
         source: &str,
         duration_ms: i64,
         zone_id: i64,
+        cover_url: Option<&str>,
     ) {
         let repo = HistoryRepo::new(self.db.clone());
         repo.record(&ListenRecord {
@@ -1088,6 +1090,7 @@ impl PlaybackOrchestrator {
             duration_ms,
             listened_at: None,
             zone_id: Some(zone_id),
+            cover_url: cover_url.map(Into::into),
         })
         .ok();
 
@@ -1923,6 +1926,7 @@ mod tests {
             "local",
             180_000,
             zone_id,
+            None,
         );
 
         let repo = HistoryRepo::new(orch.db.clone());
