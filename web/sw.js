@@ -1,42 +1,33 @@
-const ASSETS_CACHE = 'tune-assets';
+const CACHE_NAME = 'tune-v1';
+const PRECACHE = ['/', '/index.html'];
 
-self.addEventListener('install', () => {
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(PRECACHE)));
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== ASSETS_CACHE).map(k => caches.delete(k)))
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
     )
   );
   self.clients.claim();
 });
 
 self.addEventListener('fetch', (e) => {
-  // Skip API, WebSocket, and streaming
   if (e.request.url.includes('/api/') || e.request.url.includes('/ws') || e.request.url.includes('/stream/')) return;
-
-  // HTML pages: always network, never cache
-  if (e.request.mode === 'navigate' || e.request.url.endsWith('/')) {
-    e.respondWith(fetch(e.request));
-    return;
-  }
-
-  // Assets (JS/CSS with content hashes): cache-first (immutable)
-  if (e.request.url.match(/\.[a-f0-9]{8}\.(js|css)$/)) {
-    e.respondWith(
-      caches.match(e.request).then(cached => cached || fetch(e.request).then(resp => {
-        caches.open(ASSETS_CACHE).then(c => c.put(e.request, resp.clone()));
-        return resp;
-      }))
-    );
-    return;
-  }
-
-  // Everything else: network-first
+  // Network-first: always try the network, fall back to cache offline
   e.respondWith(
-    fetch(e.request).catch(() => caches.match(e.request))
+    fetch(e.request)
+      .then(resp => {
+        if (resp.ok) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
+        }
+        return resp;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
 
