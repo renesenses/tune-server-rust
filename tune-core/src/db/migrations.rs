@@ -423,6 +423,11 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_streaming_queue_source",
         up: "",
     },
+    Migration {
+        version: 32,
+        name: "add_listen_history_cover_url",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -691,6 +696,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 31 {
             add_column_if_missing(db, "streaming_queue", "source", "TEXT");
+        }
+        if migration.version == 32 {
+            add_column_if_missing(db, "listen_history", "cover_url", "TEXT");
         }
 
         db.execute(

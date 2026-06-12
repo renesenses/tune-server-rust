@@ -19,14 +19,15 @@ pub mod sql {
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, duration_ms, zone_id) VALUES ({}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, duration_ms, zone_id, cover_url) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
             d.placeholder(6),
-            d.placeholder(7)
+            d.placeholder(7),
+            d.placeholder(8)
         )
     }
 
@@ -53,7 +54,8 @@ pub mod sql {
         format!(
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
              COALESCE(t.id, h.track_id) as track_id, \
-             al.cover_path, COALESCE(al.title, h.album_title) as album_title, \
+             COALESCE(al.cover_path, h.cover_url) as cover_path, \
+             COALESCE(al.title, h.album_title) as album_title, \
              h.source \
              FROM listen_history h \
              LEFT JOIN tracks t ON h.track_id = t.id \
@@ -114,6 +116,7 @@ pub struct ListenRecord {
     pub duration_ms: i64,
     pub listened_at: Option<String>,
     pub zone_id: Option<i64>,
+    pub cover_url: Option<String>,
 }
 
 pub struct HistoryRepo {
@@ -142,7 +145,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 7] = [
+        let params: [&dyn ToSqlValue; 8] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -150,6 +153,7 @@ impl HistoryRepo {
             &rec.source,
             &rec.duration_ms,
             &rec.zone_id,
+            &rec.cover_url,
         ];
         self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
@@ -720,6 +724,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         duration_ms: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
         listened_at: cols.get(7).and_then(|v| v.as_string()),
         zone_id: cols.get(8).and_then(|v| v.as_i64()),
+        cover_url: None,
     }
 }
 
@@ -748,6 +753,7 @@ mod tests {
             duration_ms: 562_000,
             listened_at: None,
             zone_id: None,
+            cover_url: None,
         };
 
         repo.record(&rec).unwrap();
@@ -779,6 +785,7 @@ mod tests {
                 duration_ms: 300_000,
                 listened_at: None,
                 zone_id: None,
+                cover_url: None,
             })
             .unwrap();
         }
@@ -793,6 +800,7 @@ mod tests {
                 duration_ms: 400_000,
                 listened_at: None,
                 zone_id: None,
+                cover_url: None,
             })
             .unwrap();
         }
@@ -819,6 +827,7 @@ mod tests {
                 duration_ms: 300_000,
                 listened_at: None,
                 zone_id: None,
+                cover_url: None,
             })
             .unwrap();
         }
@@ -844,6 +853,7 @@ mod tests {
             duration_ms: 0,
             listened_at: None,
             zone_id: None,
+            cover_url: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -862,6 +872,7 @@ mod tests {
             duration_ms: 300_000,
             listened_at: None,
             zone_id: None,
+            cover_url: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -874,6 +885,7 @@ mod tests {
             duration_ms: 200_000,
             listened_at: None,
             zone_id: None,
+            cover_url: None,
         })
         .unwrap();
 
@@ -897,6 +909,7 @@ mod tests {
                 duration_ms: 0,
                 listened_at: None,
                 zone_id: None,
+                cover_url: None,
             })
             .unwrap();
         }
