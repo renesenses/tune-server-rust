@@ -11,10 +11,8 @@ use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
-use tune_core::playback::PlayState;
 
 use crate::error::AppError;
-use crate::routes::dto::{TrackResponse, ZoneResponse};
 use crate::state::AppState;
 
 /// Persist the queue state for a zone to disk (non-blocking).
@@ -30,81 +28,71 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
     });
 }
 
-/// Build a stream URL for browser-playback zones.
-fn make_stream_url(state: &AppState, stream_id: &str) -> String {
-    let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-        tune_core::discovery::ssdp::get_local_ip()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".into())
-    });
-    format!(
-        "http://{}:{}/stream/{}.flac",
-        server_ip, state.port, stream_id
-    )
-}
-
-fn play_state_str(ps: PlayState) -> String {
-    match ps {
-        PlayState::Stopped => "stopped".into(),
-        PlayState::Playing => "playing".into(),
-        PlayState::Paused => "paused".into(),
-    }
-}
-
-async fn build_zone_response(state: &AppState, zone_id: i64) -> ZoneResponse {
+async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
-
-    let stream_url = zone_state
-        .now_playing
-        .as_ref()
-        .and_then(|np| np.stream_id.as_ref())
-        .map(|sid| make_stream_url(state, sid));
-
-    ZoneResponse {
-        id: zone_id,
-        name: zone_db.as_ref().map(|z| z.name.clone()),
-        output_type: zone_db.as_ref().and_then(|z| z.output_type.clone()),
-        output_device_id: zone_db.as_ref().and_then(|z| z.output_device_id.clone()),
-        volume: zone_state.volume,
-        state: play_state_str(zone_state.state),
-        current_track: zone_state.now_playing.as_ref().map(TrackResponse::from),
-        position_ms: zone_state.position_ms,
-        queue_length: zone_state.queue_length,
-        queue_position: zone_state.queue_position,
-        muted: zone_state.muted,
-        stream_url,
-        error: None,
-        output_sent: None,
+    let mut v = json!({
+        "id": zone_id,
+        "name": zone_db.as_ref().map(|z| &z.name),
+        "output_type": zone_db.as_ref().and_then(|z| z.output_type.as_ref()),
+        "output_device_id": zone_db.as_ref().and_then(|z| z.output_device_id.as_ref()),
+        "volume": zone_state.volume,
+        "state": zone_state.state,
+        "current_track": zone_state.now_playing.as_ref().map(|np| json!({
+            "id": np.track_id,
+            "title": np.title,
+            "artist_name": np.artist_name,
+            "album_title": np.album_title,
+            "cover_path": np.cover_path,
+            "duration_ms": np.duration_ms,
+            "source": np.source,
+            "source_id": np.source_id,
+        })),
+        "position_ms": zone_state.position_ms,
+        "queue_length": zone_state.queue_length,
+        "queue_position": zone_state.queue_position,
+        "muted": zone_state.muted,
+    });
+    // Include stream_url for browser playback zones so the web client
+    // can feed it to an HTML5 <audio> element.
+    if let Some(ref np) = zone_state.now_playing {
+        if let Some(ref stream_id) = np.stream_id {
+            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                tune_core::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into())
+            });
+            let ext = "flac";
+            let stream_url = format!(
+                "http://{}:{}/stream/{}.{}",
+                server_ip, state.port, stream_id, ext
+            );
+            v.as_object_mut()
+                .unwrap()
+                .insert("stream_url".into(), json!(stream_url));
+        }
     }
-}
-
-async fn build_zone_response_with_result(
-    state: &AppState,
-    zone_id: i64,
-    result: &PlayResult,
-) -> ZoneResponse {
-    let mut zone = build_zone_response(state, zone_id).await;
-    zone.error = result.error.clone();
-    zone.output_sent = Some(result.output_sent);
-    // PlayResult may carry its own stream_url (e.g. from the orchestrator)
-    if let Some(ref url) = result.stream_url {
-        zone.stream_url = Some(url.clone());
-    }
-    zone
-}
-
-// Keep thin wrappers that return `Value` so every existing call site compiles
-// unchanged.  We will migrate callers to use the typed versions directly in
-// follow-up passes.
-async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
-    serde_json::to_value(build_zone_response(state, zone_id).await).unwrap_or_default()
+    v
 }
 
 async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &PlayResult) -> Value {
-    serde_json::to_value(build_zone_response_with_result(state, zone_id, result).await)
-        .unwrap_or_default()
+    let mut zone = build_zone_json(state, zone_id).await;
+    if let Some(ref err) = result.error {
+        zone.as_object_mut()
+            .unwrap()
+            .insert("error".into(), json!(err));
+    }
+    zone.as_object_mut()
+        .unwrap()
+        .insert("output_sent".into(), json!(result.output_sent));
+    // Expose stream_url for browser playback zones
+    if let Some(ref url) = result.stream_url {
+        zone.as_object_mut()
+            .unwrap()
+            .insert("stream_url".into(), json!(url));
+    }
+    zone
 }
 
 #[derive(Deserialize)]

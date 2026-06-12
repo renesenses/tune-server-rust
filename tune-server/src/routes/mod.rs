@@ -10,7 +10,6 @@ pub mod deezer_proxy_handler;
 pub mod devices;
 pub mod discogs;
 pub mod dj;
-pub mod dto;
 pub mod eq_pro;
 pub mod export;
 pub mod graphql;
