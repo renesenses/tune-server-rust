@@ -67,14 +67,7 @@ async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams
 async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::new(state.db);
-    let items: Vec<Value> = repo
-        .top_tracks(limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(title, artist, plays)| {
-            json!({ "title": title, "artist_name": artist, "plays": plays })
-        })
-        .collect();
+    let items = repo.top_tracks(limit).unwrap_or_default();
     Json(json!(items))
 }
 

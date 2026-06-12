@@ -475,17 +475,7 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
 
 fn fetch_top_tracks(state: &AppState, limit: i64) -> Vec<Value> {
     let repo = HistoryRepo::new(state.db.clone());
-    repo.top_tracks(limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(title, artist, plays)| {
-            json!({
-                "title": title,
-                "artist_name": artist,
-                "plays": plays,
-            })
-        })
-        .collect()
+    repo.top_tracks(limit).unwrap_or_default()
 }
 
 /// If Tidal/Qobuz authenticated, fetch their featured/new-releases.

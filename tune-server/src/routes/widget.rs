@@ -36,14 +36,7 @@ async fn widget_data(
 
     // Recent tracks from history
     let repo = HistoryRepo::new(state.db.clone());
-    let recent: Vec<Value> = repo
-        .top_tracks(5)
-        .unwrap_or_default()
-        .into_iter()
-        .map(
-            |(title, artist, plays)| json!({"title": title, "artist_name": artist, "plays": plays}),
-        )
-        .collect();
+    let recent = repo.top_tracks(5).unwrap_or_default();
 
     Json(json!({
         "now_playing": zone_state.now_playing,
@@ -130,18 +123,7 @@ async fn widget_recent(
     let limit = params.limit.unwrap_or(10);
     let repo = HistoryRepo::new(state.db.clone());
 
-    let tracks: Vec<Value> = repo
-        .top_tracks(limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(title, artist, plays)| {
-            json!({
-                "title": title,
-                "artist_name": artist,
-                "plays": plays,
-            })
-        })
-        .collect();
+    let tracks = repo.top_tracks(limit).unwrap_or_default();
 
     let albums: Vec<Value> = repo
         .top_albums(limit)
