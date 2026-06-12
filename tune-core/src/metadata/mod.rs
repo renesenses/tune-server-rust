@@ -1,6 +1,7 @@
 pub mod artist_enrichment;
 pub mod auto_fix;
 pub mod batch;
+pub mod bio_batch;
 pub mod credit_enricher;
 pub mod enrichment;
 pub mod fingerprint;

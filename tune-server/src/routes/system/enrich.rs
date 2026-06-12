@@ -36,6 +36,33 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
     )
 }
 
+pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoResponse {
+    let artist_db = state.db.clone();
+    let album_db = state.db.clone();
+
+    let artist_repo = ArtistRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::new(state.db.clone());
+    let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
+    let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
+
+    tokio::spawn(async move {
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios(artist_db).await;
+    });
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tune_core::metadata::bio_batch::batch_enrich_album_bios(album_db).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "bio_enrichment_started",
+            "artists_without_bio": without_artist_bio,
+            "albums_without_bio": without_album_bio,
+        })),
+    )
+}
+
 pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let album_repo = AlbumRepo::new(state.db.clone());
     let artist_repo = ArtistRepo::new(state.db.clone());

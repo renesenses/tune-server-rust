@@ -206,6 +206,10 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name, a.musicbrainz_release_id FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.cover_path IS NULL OR a.cover_path = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    pub fn list_without_bio() -> &'static str {
+        "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
+    }
+
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
@@ -732,6 +736,32 @@ impl AlbumRepo {
                 )
             })
             .collect())
+    }
+
+    /// Return all local albums without bio.
+    /// Each entry is (album_id, title, artist_name).
+    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, Option<String>)>, String> {
+        let rows = self.db.query_many(sql::list_without_bio(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                )
+            })
+            .collect())
+    }
+
+    pub fn update_bio(&self, album_id: i64, bio: &str) -> Result<(), String> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => "UPDATE albums SET bio = ? WHERE id = ?",
+            Engine::Postgres => "UPDATE albums SET bio = $1 WHERE id = $2",
+        };
+        let params: [&dyn ToSqlValue; 2] = [&bio, &album_id];
+        self.db.execute(sql, &params)?;
+        Ok(())
     }
 
     pub fn search(&self, query: &str, limit: i64) -> Result<Vec<Album>, String> {

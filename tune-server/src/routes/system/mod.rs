@@ -119,6 +119,7 @@ pub fn router() -> Router<AppState> {
         .route("/api-docs", get(diagnostics::api_docs))
         .route("/api-insights", get(diagnostics::api_insights))
         .route("/enrich", post(enrich::system_enrich))
+        .route("/enrich-bios", post(enrich::enrich_bios))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
 }

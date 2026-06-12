@@ -107,6 +107,10 @@ pub mod sql {
         "SELECT id, name FROM artists WHERE (image_path IS NULL OR image_path = '') AND (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
 
+    pub fn list_without_bio() -> &'static str {
+        "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
     pub fn update_mbid() -> &'static str {
         "UPDATE artists SET musicbrainz_id = ?2 WHERE id = ?1"
     }
@@ -335,6 +339,30 @@ impl ArtistRepo {
                 )
             })
             .collect())
+    }
+
+    pub fn list_without_bio(&self) -> Result<Vec<(i64, String, String)>, String> {
+        let rows = self.db.query_many(sql::list_without_bio(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    pub fn update_bio(&self, id: i64, bio: &str) -> Result<(), String> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => "UPDATE artists SET bio = ? WHERE id = ?",
+            Engine::Postgres => "UPDATE artists SET bio = $1 WHERE id = $2",
+        };
+        let params: [&dyn ToSqlValue; 2] = [&bio, &id];
+        self.db.execute(sql, &params)?;
+        Ok(())
     }
 
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), String> {
