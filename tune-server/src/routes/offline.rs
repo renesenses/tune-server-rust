@@ -315,9 +315,10 @@ async fn download_single_track(
                 }
             }
             Err(e) => {
+                let err_msg = e.to_string();
                 db.execute(
                     "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
-                    &[&e as &dyn rusqlite::types::ToSql, &id],
+                    &[&err_msg as &dyn rusqlite::types::ToSql, &id],
                 )
                 .ok();
             }

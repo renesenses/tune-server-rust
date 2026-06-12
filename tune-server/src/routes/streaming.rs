@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -29,6 +29,38 @@ async fn get_svc(
         .get(name)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown service: {name}")))
     // registry lock drops here
+}
+
+/// Convert a service method result into a JSON response (OK -> 200, Err -> 502).
+fn svc_response<R: serde::Serialize, E: std::fmt::Display>(result: Result<R, E>) -> Response {
+    match result {
+        Ok(data) => Json(json!(data)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+/// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
+macro_rules! with_svc {
+    ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
+        let arc = match get_svc($state, $service).await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let $svc = arc.lock().await;
+        svc_response($body)
+    }};
+}
+
+/// Same as `with_svc!` but acquires a mutable lock.
+macro_rules! with_svc_mut {
+    ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
+        let arc = match get_svc($state, $service).await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let mut $svc = arc.lock().await;
+        svc_response($body)
+    }};
 }
 
 #[derive(Deserialize)]
@@ -101,6 +133,159 @@ pub fn router() -> Router<AppState> {
         .route("/spotify/callback", get(spotify_callback))
 }
 
+// ---------------------------------------------------------------------------
+// Simple read-only handlers (via with_svc!)
+// ---------------------------------------------------------------------------
+
+async fn service_search(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Query(q): Query<SearchQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(20);
+    with_svc!(&state, &service, |svc| svc.search(&q.q, limit).await)
+}
+
+async fn service_albums(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_user_albums().await)
+}
+
+async fn service_album(
+    State(state): State<AppState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
+}
+
+async fn service_album_tracks(
+    State(state): State<AppState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_tracks(&album_id)
+        .await)
+}
+
+async fn service_artist(
+    State(state): State<AppState>,
+    Path((service, artist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_artist(&artist_id).await)
+}
+
+async fn service_artist_albums(
+    State(state): State<AppState>,
+    Path((service, artist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_artist_albums(&artist_id)
+        .await)
+}
+
+async fn service_artist_top_tracks(
+    State(state): State<AppState>,
+    Path((service, artist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_artist_top_tracks(&artist_id)
+        .await)
+}
+
+async fn service_playlists(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_user_playlists().await)
+}
+
+async fn service_playlist(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_playlist(&playlist_id).await)
+}
+
+async fn service_playlist_tracks(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_playlist_tracks(&playlist_id)
+        .await)
+}
+
+async fn service_track(
+    State(state): State<AppState>,
+    Path((service, track_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_track(&track_id).await)
+}
+
+async fn service_featured(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_featured().await)
+}
+
+async fn service_new_releases(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_new_releases().await)
+}
+
+async fn service_genres(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_genres().await)
+}
+
+async fn service_genre_albums(
+    State(state): State<AppState>,
+    Path((service, genre_id)): Path<(String, String)>,
+    Query(q): Query<LimitQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(50);
+    with_svc!(&state, &service, |svc| svc
+        .get_genre_albums(&genre_id, limit)
+        .await)
+}
+
+async fn service_featured_sections(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_featured_sections().await)
+}
+
+async fn service_featured_section(
+    State(state): State<AppState>,
+    Path((service, section)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_featured_section(&section)
+        .await)
+}
+
+// ---------------------------------------------------------------------------
+// Mutable handlers (via with_svc_mut!)
+// ---------------------------------------------------------------------------
+
+async fn service_add_favorite(
+    State(state): State<AppState>,
+    Path((service, fav_type, item_id)): Path<(String, String, String)>,
+) -> Response {
+    with_svc_mut!(&state, &service, |svc| svc
+        .add_favorite(&fav_type, &item_id)
+        .await)
+}
+
+async fn service_remove_favorite(
+    State(state): State<AppState>,
+    Path((service, fav_type, item_id)): Path<(String, String, String)>,
+) -> Response {
+    with_svc_mut!(&state, &service, |svc| svc
+        .remove_favorite(&fav_type, &item_id)
+        .await)
+}
+
+// ---------------------------------------------------------------------------
+// Complex handlers (custom logic beyond simple get_svc + call + respond)
+// ---------------------------------------------------------------------------
+
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
     // Timeout to avoid blocking the Settings page if a streaming service auth check hangs
     let map = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -119,10 +304,7 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Object(map))
 }
 
-async fn service_status(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
+async fn service_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -152,7 +334,7 @@ async fn service_auth(
     State(state): State<AppState>,
     Path(service): Path<String>,
     raw_body: axum::body::Bytes,
-) -> impl IntoResponse {
+) -> Response {
     let body: Option<Value> = if raw_body.is_empty() {
         None
     } else {
@@ -190,22 +372,20 @@ async fn service_auth(
             .into_response()
         }
         Err(e) => {
+            let err_msg = e.to_string();
             state.event_bus.emit(
                 "streaming.auth.failed",
                 json!({
                     "service": &service,
-                    "error": &e,
+                    "error": &err_msg,
                 }),
             );
-            (StatusCode::BAD_REQUEST, e).into_response()
+            (StatusCode::BAD_REQUEST, err_msg).into_response()
         }
     }
 }
 
-async fn auth_poll_status(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
+async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -231,16 +411,13 @@ async fn auth_poll_status(
         Err(e) => Json(json!({
             "service": service,
             "authenticated": false,
-            "message": e,
+            "message": e.to_string(),
         }))
         .into_response(),
     }
 }
 
-async fn service_logout(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
+async fn service_logout(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -252,186 +429,10 @@ async fn service_logout(
     Json(json!({ "service": service, "status": "logged_out" })).into_response()
 }
 
-async fn service_search(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-    Query(q): Query<SearchQuery>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    let limit = q.limit.unwrap_or(20);
-
-    match svc.search(&q.q, limit).await {
-        Ok(results) => Json(json!(results)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_albums(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_user_albums().await {
-        Ok(albums) => Json(json!(albums)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_album(
-    State(state): State<AppState>,
-    Path((service, album_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_album(&album_id).await {
-        Ok(album) => Json(json!(album)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_album_tracks(
-    State(state): State<AppState>,
-    Path((service, album_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_album_tracks(&album_id).await {
-        Ok(tracks) => Json(json!(tracks)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_artist(
-    State(state): State<AppState>,
-    Path((service, artist_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_artist(&artist_id).await {
-        Ok(artist) => Json(json!(artist)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_artist_albums(
-    State(state): State<AppState>,
-    Path((service, artist_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    match svc.get_artist_albums(&artist_id).await {
-        Ok(albums) => Json(json!(albums)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_artist_top_tracks(
-    State(state): State<AppState>,
-    Path((service, artist_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    match svc.get_artist_top_tracks(&artist_id).await {
-        Ok(tracks) => Json(json!(tracks)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_playlists(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_user_playlists().await {
-        Ok(playlists) => Json(json!(playlists)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_playlist(
-    State(state): State<AppState>,
-    Path((service, playlist_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_playlist(&playlist_id).await {
-        Ok(playlist) => Json(json!(playlist)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_playlist_tracks(
-    State(state): State<AppState>,
-    Path((service, playlist_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_playlist_tracks(&playlist_id).await {
-        Ok(tracks) => Json(json!(tracks)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_track(
-    State(state): State<AppState>,
-    Path((service, track_id)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_track(&track_id).await {
-        Ok(track) => Json(json!(track)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
 async fn service_track_url(
     State(state): State<AppState>,
     Path((service, track_id)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -440,7 +441,12 @@ async fn service_track_url(
 
     match svc.get_track_url(&track_id, None).await {
         Ok(url) => Json(json!(url)).into_response(),
-        Err(ref e) if e.contains("401") || e.contains("403") => {
+        Err(ref e)
+            if {
+                let msg = e.to_string();
+                msg.contains("401") || msg.contains("403")
+            } =>
+        {
             // Token may have expired — attempt refresh and retry once
             if svc.refresh_if_needed().await.unwrap_or(false) {
                 drop(svc);
@@ -452,114 +458,20 @@ async fn service_track_url(
                 let svc = svc.lock().await;
                 match svc.get_track_url(&track_id, None).await {
                     Ok(url) => Json(json!(url)).into_response(),
-                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
-                (StatusCode::BAD_GATEWAY, e.clone()).into_response()
+                (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
             }
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_featured(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_featured().await {
-        Ok(items) => Json(json!(items)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_new_releases(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-
-    match svc.get_new_releases().await {
-        Ok(items) => Json(json!(items)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_genres(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    match svc.get_genres().await {
-        Ok(genres) => Json(json!(genres)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_genre_albums(
-    State(state): State<AppState>,
-    Path((service, genre_id)): Path<(String, String)>,
-    Query(q): Query<LimitQuery>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    let limit = q.limit.unwrap_or(50);
-    match svc.get_genre_albums(&genre_id, limit).await {
-        Ok(albums) => Json(json!(albums)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_featured_sections(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    match svc.get_featured_sections().await {
-        Ok(sections) => Json(json!(sections)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_featured_section(
-    State(state): State<AppState>,
-    Path((service, section)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let svc = svc.lock().await;
-    match svc.get_featured_section(&section).await {
-        Ok(albums) => Json(json!(albums)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }
 
 async fn service_favorites(
     State(state): State<AppState>,
     Path((service, fav_type)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -576,7 +488,12 @@ async fn service_favorites(
     };
     match result {
         Ok(data) => Json(data).into_response(),
-        Err(ref e) if e.contains("401") || e.contains("403") => {
+        Err(ref e)
+            if {
+                let msg = e.to_string();
+                msg.contains("401") || msg.contains("403")
+            } =>
+        {
             // Token expired — attempt refresh and retry
             if svc.refresh_if_needed().await.unwrap_or(false) {
                 drop(svc);
@@ -593,55 +510,21 @@ async fn service_favorites(
                         .get_user_artists()
                         .await
                         .map(|a| json!({ "artists": a })),
-                    _ => Err(format!("unknown favorite type: {fav_type}")),
+                    _ => Err("unknown favorite type".into()),
                 };
                 match retry {
                     Ok(data) => Json(data).into_response(),
-                    Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
-                (StatusCode::BAD_GATEWAY, e.clone()).into_response()
+                (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
             }
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
-async fn service_add_favorite(
-    State(state): State<AppState>,
-    Path((service, fav_type, item_id)): Path<(String, String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let mut svc = svc.lock().await;
-    match svc.add_favorite(&fav_type, &item_id).await {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_remove_favorite(
-    State(state): State<AppState>,
-    Path((service, fav_type, item_id)): Path<(String, String, String)>,
-) -> impl IntoResponse {
-    let svc = match get_svc(&state, &service).await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let mut svc = svc.lock().await;
-    match svc.remove_favorite(&fav_type, &item_id).await {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
-    }
-}
-
-async fn service_enable(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    // Apply to in-memory service immediately (no restart needed)
+async fn service_enable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.lock().await;
         svc.set_enabled(true);
@@ -654,11 +537,7 @@ async fn service_enable(
     Json(json!({"service": service, "enabled": true})).into_response()
 }
 
-async fn service_disable(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
-    // Apply to in-memory service immediately (no restart needed)
+async fn service_disable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.lock().await;
         svc.set_enabled(false);
@@ -671,10 +550,7 @@ async fn service_disable(
     Json(json!({"service": service, "enabled": false})).into_response()
 }
 
-async fn service_auth_url(
-    State(state): State<AppState>,
-    Path(service): Path<String>,
-) -> impl IntoResponse {
+async fn service_auth_url(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -686,9 +562,13 @@ async fn service_auth_url(
             "user_code": status.user_code,
         }))
         .into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stubs & OAuth callbacks
+// ---------------------------------------------------------------------------
 
 async fn youtube_home() -> Json<Value> {
     Json(json!({"sections": [], "message": "YouTube home not yet implemented"}))
@@ -716,7 +596,7 @@ struct SpotifyCallbackQuery {
 async fn spotify_callback(
     State(state): State<AppState>,
     Query(q): Query<SpotifyCallbackQuery>,
-) -> impl IntoResponse {
+) -> Response {
     if let Some(ref error) = q.error {
         return Json(json!({"error": error})).into_response();
     }
@@ -741,7 +621,7 @@ async fn spotify_callback(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
@@ -755,7 +635,7 @@ struct CompareQuery {
 async fn compare_services(
     State(state): State<AppState>,
     Query(q): Query<CompareQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let service_names: Vec<&str> = q.services.split(',').map(|s| s.trim()).collect();
     if service_names.len() < 2 {
         return (
@@ -799,7 +679,7 @@ async fn compare_services(
                 );
             }
             Err(e) => {
-                results.insert(name.to_string(), json!({"error": e}));
+                results.insert(name.to_string(), json!({"error": e.to_string()}));
             }
         }
     }

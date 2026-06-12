@@ -350,7 +350,7 @@ async fn play(
         let svc = svc.lock().await;
         let tracks = match svc.get_album_tracks(album_id).await {
             Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+            Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         };
         drop(svc);
         drop(registry);
@@ -430,7 +430,7 @@ async fn play(
         let svc = svc.lock().await;
         let tracks = match svc.get_playlist_tracks(playlist_id).await {
             Ok(t) => t,
-            Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+            Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         };
         drop(svc);
         drop(registry);
