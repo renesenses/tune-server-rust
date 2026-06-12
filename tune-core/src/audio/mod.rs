@@ -8,6 +8,7 @@ pub mod dsf;
 pub mod encoder;
 pub mod formats;
 pub mod iso_sacd;
+pub mod levels;
 pub mod mixer;
 pub mod pipeline;
 pub mod resampler;

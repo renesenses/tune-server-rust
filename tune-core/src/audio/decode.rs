@@ -237,6 +237,7 @@ pub fn decode_to_pcm_streaming(
         tx,
         chunk_size,
         None,
+        None,
     )
 }
 
@@ -255,6 +256,27 @@ pub fn decode_to_pcm_streaming_with_notify(
         tx,
         chunk_size,
         Some(data_ready),
+        None,
+    )
+}
+
+pub fn decode_to_pcm_streaming_with_levels(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: std::sync::mpsc::Sender<super::levels::AudioLevels>,
+) -> Result<u16, String> {
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
     )
 }
 
@@ -265,6 +287,7 @@ fn decode_to_pcm_streaming_inner(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: Option<std::sync::mpsc::Sender<super::levels::AudioLevels>>,
 ) -> Result<u16, String> {
     let ext = Path::new(file_path)
         .extension()
@@ -280,6 +303,7 @@ fn decode_to_pcm_streaming_inner(
         let pcm_bytes = decoded.pcm_bytes();
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| "no tokio runtime for streaming decode")?;
+        let ch = target_channels.unwrap_or(decoded.channels as u32) as u16;
         for chunk in pcm_bytes.chunks(chunk_size) {
             if rt.block_on(tx.send(chunk.to_vec())).is_err() {
                 debug!("streaming_decode_consumer_dropped (fallback)");
@@ -290,6 +314,9 @@ fn decode_to_pcm_streaming_inner(
                 if let Some(ref n) = data_ready {
                     n.notify_one();
                 }
+            }
+            if let Some(ref ltx) = levels_tx {
+                let _ = ltx.send(super::levels::compute_levels(chunk, decoded.bit_depth, ch));
             }
         }
         return Ok(decoded.bit_depth);
@@ -399,6 +426,13 @@ fn decode_to_pcm_streaming_inner(
 
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+            if let Some(ref ltx) = levels_tx {
+                let _ = ltx.send(super::levels::compute_levels(
+                    &chunk,
+                    source_bd,
+                    source_channels as u16,
+                ));
+            }
             if rt.block_on(tx.send(chunk)).is_err() {
                 debug!("streaming_decode_consumer_dropped");
                 return Ok(source_bd);

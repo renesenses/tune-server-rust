@@ -50,6 +50,11 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
         let total_discovered = files.len();
 
+        let discovered_paths: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
         let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
         let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
         let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
@@ -487,6 +492,25 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 }
             },
         );
+
+        // Prune tracks whose files no longer exist on disk
+        {
+            let mut pruned = 0i64;
+            for (db_path, &(track_id, _, _)) in &existing_tracks {
+                if !discovered_paths.contains(db_path.as_str()) {
+                    if track_repo.delete(track_id).is_ok() {
+                        pruned += 1;
+                    }
+                }
+            }
+            if pruned > 0 {
+                tracing::info!(pruned, "post_scan_stale_tracks_removed");
+                event_bus.emit(
+                    "library.scan.progress",
+                    json!({ "pruned": pruned }),
+                );
+            }
+        }
 
         // Backfill + album stats in a single transaction
         if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {

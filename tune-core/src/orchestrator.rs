@@ -11,6 +11,7 @@ use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
 use crate::db::zone_repo::ZoneRepo;
+use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
 use crate::playback::{NowPlaying, PlaybackManager};
@@ -23,8 +24,7 @@ pub struct PlaybackOrchestrator {
     pub services: Arc<Mutex<ServiceRegistry>>,
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub advertised_ip: Option<String>,
-    /// Stream sessions created by gapless preparation (resolve_queue_item_url).
-    /// Keyed by zone_id. Cleaned up when the zone starts a new track or stops.
+    pub event_bus: Option<Arc<EventBus>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
 }
 
@@ -90,6 +90,7 @@ impl PlaybackOrchestrator {
             services,
             outputs,
             advertised_ip,
+            event_bus: None,
             gapless_sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -422,6 +423,8 @@ impl PlaybackOrchestrator {
             } else {
                 target_fmt.container_format().to_string()
             };
+            let ev_bus = self.event_bus.clone();
+            let zone_id = req.zone_id;
             tokio::spawn(async move {
                 debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
@@ -429,14 +432,38 @@ impl PlaybackOrchestrator {
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
                     drop(tx);
+
+                    let (levels_tx, levels_rx) =
+                        std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                    if let Some(ref bus) = ev_bus {
+                        let bus = bus.clone();
+                        tokio::spawn(async move {
+                            while let Ok(lvl) = levels_rx.recv() {
+                                bus.emit(
+                                    "playback.audio_levels",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "rms_left_db": lvl.rms_left_db(),
+                                        "rms_right_db": lvl.rms_right_db(),
+                                        "peak_left_db": lvl.peak_left_db(),
+                                        "peak_right_db": lvl.peak_right_db(),
+                                        "rms_left": lvl.rms_left,
+                                        "rms_right": lvl.rms_right,
+                                    }),
+                                );
+                            }
+                        });
+                    }
+
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_with_notify(
+                        crate::audio::decode::decode_to_pcm_streaming_with_levels(
                             &fp_clone,
                             Some(out_sr),
                             Some(channels as u32),
                             tx_clone,
                             32768,
                             data_ready,
+                            levels_tx,
                         )
                     })
                     .await;
