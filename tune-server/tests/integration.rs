@@ -236,6 +236,84 @@ async fn not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// ── Library listing tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn library_albums_empty() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/library/albums").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["items"].is_array());
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total"], 0);
+    assert!(body["limit"].is_number());
+    assert!(body["offset"].is_number());
+}
+
+#[tokio::test]
+async fn library_artists_empty() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/library/artists").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["items"].is_array());
+    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total"], 0);
+    assert!(body["limit"].is_number());
+    assert!(body["offset"].is_number());
+}
+
+// ── Scan trigger test ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn system_scan_trigger() {
+    let app = make_app();
+
+    // Trigger a scan — returns 202 Accepted
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/system/scan")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["status"], "scanning");
+
+    // Scan status endpoint should report scanning or idle
+    let (status, body) = get(&app, "/api/v1/system/scan/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["status"].is_string());
+    let scan_state = body["status"].as_str().unwrap();
+    assert!(
+        scan_state == "scanning" || scan_state == "idle",
+        "unexpected scan status: {scan_state}"
+    );
+}
+
+// ── Error / 404 tests ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn album_not_found() {
+    let app = make_app();
+    let (status, _) = get(&app, "/api/v1/library/albums/999999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn nonexistent_api_route() {
+    let app = make_app();
+    let (status, body) = get(&app, "/api/v1/nonexistent").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "not found");
+}
+
 // ── Zone consistency tests ──────────────────────────────────────────
 
 #[tokio::test]
