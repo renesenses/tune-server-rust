@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::traits::*;
 
@@ -385,7 +385,22 @@ impl TidalService {
             info!(track_id, quality, status, body = %body, "tidal_playback_info_error");
             return Err(format!("tidal playback {status}: {body}"));
         }
-        serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
+
+        // Log key fields from the Tidal playback response (without the manifest
+        // blob which is large) — this is essential for diagnosing quality issues.
+        debug!(
+            track_id,
+            requested_quality = quality,
+            returned_quality = parsed["audioQuality"].as_str().unwrap_or("?"),
+            codec = parsed["codec"].as_str().unwrap_or("?"),
+            manifest_mime = parsed["manifestMimeType"].as_str().unwrap_or("?"),
+            bit_depth = ?parsed["bitDepth"].as_u64(),
+            sample_rate = ?parsed["sampleRate"].as_u64(),
+            "tidal_playback_info_raw"
+        );
+        Ok(parsed)
     }
 
     fn parse_quality_metadata(data: &serde_json::Value, audio_quality: &str) -> (u32, u16) {
@@ -408,6 +423,25 @@ impl TidalService {
                 self.country_code = cc.into();
             }
             info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
+        }
+        // Fetch subscription type for quality diagnostics
+        if let Some(uid) = self.user_id {
+            if let Ok(sub) = self.api_get(&format!("/users/{uid}/subscription")).await {
+                let sub_type = sub["subscription"]["type"]
+                    .as_str()
+                    .or_else(|| sub["type"].as_str())
+                    .unwrap_or("unknown");
+                self.subscription = Some(sub_type.into());
+                let highest = sub["subscription"]["highestSoundQuality"]
+                    .as_str()
+                    .or_else(|| sub["highestSoundQuality"].as_str())
+                    .unwrap_or("unknown");
+                info!(
+                    subscription = sub_type,
+                    highest_quality = highest,
+                    "tidal_subscription_info"
+                );
+            }
         }
     }
 
@@ -756,22 +790,86 @@ impl StreamingService for TidalService {
         };
 
         let mut data = None;
+        let mut downgraded_fallback: Option<serde_json::Value> = None;
         for &q in fallback_chain {
             match self.fetch_playback_info(track_id, q).await {
                 Ok(d) => {
                     let has_manifest = d["manifest"].as_str().is_some();
-                    if has_manifest {
+                    if !has_manifest {
+                        let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
+                        info!(
+                            track_id,
+                            quality = q,
+                            manifest_mime,
+                            has_manifest,
+                            "tidal_no_manifest_trying_next"
+                        );
+                        continue;
+                    }
+                    // Check if Tidal actually returned the requested quality or
+                    // downgraded silently (e.g. HI_RES_LOSSLESS → HIGH AAC).
+                    let returned_quality = d["audioQuality"].as_str().unwrap_or("UNKNOWN");
+                    let returned_codec = d["codec"].as_str().unwrap_or("UNKNOWN");
+                    let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
+                    let bit_depth = d["bitDepth"].as_u64();
+                    let sample_rate = d["sampleRate"].as_u64();
+
+                    debug!(
+                        track_id,
+                        requested = q,
+                        returned = returned_quality,
+                        returned_codec,
+                        manifest_mime,
+                        ?bit_depth,
+                        ?sample_rate,
+                        "tidal_playback_info_response"
+                    );
+
+                    if returned_quality == q {
+                        // Got exactly what we requested — use it
                         data = Some(d);
                         break;
                     }
-                    let manifest_mime = d["manifestMimeType"].as_str().unwrap_or("");
-                    info!(
-                        track_id,
-                        quality = q,
-                        manifest_mime,
-                        has_manifest,
-                        "tidal_no_manifest_trying_next"
-                    );
+
+                    // Tidal downgraded our quality. The quality hierarchy is:
+                    // HI_RES_LOSSLESS > HI_RES > LOSSLESS > HIGH
+                    // Accept if the returned quality is at least lossless,
+                    // otherwise keep looking.
+                    let returned_rank = quality_rank(returned_quality);
+                    let requested_rank = quality_rank(q);
+
+                    if returned_rank >= requested_rank {
+                        // Tidal returned same or higher quality than requested — use it
+                        data = Some(d);
+                        break;
+                    }
+
+                    // Tidal downgraded. If returned quality is still lossless+,
+                    // save it as a candidate but keep trying.
+                    if returned_rank >= 2 {
+                        // LOSSLESS or better — acceptable fallback
+                        info!(
+                            track_id,
+                            requested = q,
+                            returned = returned_quality,
+                            "tidal_quality_downgraded_but_lossless"
+                        );
+                        if downgraded_fallback.is_none() {
+                            downgraded_fallback = Some(d);
+                        }
+                    } else {
+                        // Got HIGH/LOW (lossy) — save only if nothing better found
+                        warn!(
+                            track_id,
+                            requested = q,
+                            returned = returned_quality,
+                            subscription = ?self.subscription,
+                            "tidal_quality_downgraded_to_lossy"
+                        );
+                        if downgraded_fallback.is_none() {
+                            downgraded_fallback = Some(d);
+                        }
+                    }
                 }
                 Err(e) => {
                     info!(
@@ -781,6 +879,21 @@ impl StreamingService for TidalService {
                         "tidal_quality_fetch_failed_trying_next"
                     );
                 }
+            }
+        }
+
+        // Use the best available data: exact match first, then best downgraded fallback
+        if data.is_none() {
+            if let Some(fb) = downgraded_fallback {
+                let fb_quality = fb["audioQuality"].as_str().unwrap_or("UNKNOWN");
+                warn!(
+                    track_id,
+                    requested = requested_quality,
+                    actual = fb_quality,
+                    subscription = ?self.subscription,
+                    "tidal_using_downgraded_quality_no_better_available"
+                );
+                data = Some(fb);
             }
         }
 
@@ -813,13 +926,6 @@ impl StreamingService for TidalService {
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
         let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
-        let mime_type = if manifest_mime.contains("dash") {
-            "audio/flac"
-        } else if !manifest_mime.is_empty() {
-            manifest_mime
-        } else {
-            "audio/flac"
-        };
 
         // Determine codec from the audio quality level:
         // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
@@ -827,6 +933,14 @@ impl StreamingService for TidalService {
         let codec = match audio_quality {
             "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
             _ => "AAC",
+        };
+
+        let mime_type = if codec == "FLAC" {
+            "audio/flac"
+        } else if !manifest_mime.is_empty() && manifest_mime != "application/dash+xml" {
+            manifest_mime
+        } else {
+            "audio/mp4"
         };
 
         let bitrate = if codec == "FLAC" {
@@ -853,10 +967,28 @@ impl StreamingService for TidalService {
             );
         }
 
-        info!(
-            track_id,
-            audio_quality, codec, sample_rate, bit_depth, "tidal_stream_url"
-        );
+        if codec == "AAC" {
+            warn!(
+                track_id,
+                requested = requested_quality,
+                returned = audio_quality,
+                codec,
+                sample_rate,
+                bit_depth,
+                subscription = ?self.subscription,
+                "tidal_stream_url_lossy — Tidal returned AAC instead of FLAC"
+            );
+        } else {
+            info!(
+                track_id,
+                requested = requested_quality,
+                returned = audio_quality,
+                codec,
+                sample_rate,
+                bit_depth,
+                "tidal_stream_url"
+            );
+        }
 
         Ok(StreamUrl {
             url,
@@ -1274,6 +1406,17 @@ impl StreamingService for TidalService {
             restored = true;
         }
         restored
+    }
+}
+
+/// Rank audio quality levels for comparison. Higher = better.
+fn quality_rank(quality: &str) -> u8 {
+    match quality {
+        "HI_RES_LOSSLESS" => 4,
+        "HI_RES" => 3,
+        "LOSSLESS" => 2,
+        "HIGH" => 1,
+        _ => 0,
     }
 }
 
