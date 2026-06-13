@@ -129,7 +129,7 @@ impl TidalService {
                 token_expires: None,
             }),
             country_code: "US".into(),
-            quality: "HI_RES_LOSSLESS".into(),
+            quality: "HI_RES".into(),
             username: None,
             user_id: None,
             subscription: None,
