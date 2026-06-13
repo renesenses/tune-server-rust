@@ -241,7 +241,17 @@ impl TuneConfig {
         );
         env_u32("TUNE_MAX_SAMPLE_RATE", &mut config.max_sample_rate);
         env_u32("TUNE_MAX_BIT_DEPTH", &mut config.max_bit_depth);
+        env_bool(
+            "TUNE_LOCAL_EXCLUSIVE_MODE",
+            &mut config.local_exclusive_mode,
+        );
         env_str("TUNE_LOCAL_AUDIO_BACKEND", &mut config.local_audio_backend);
+
+        // If ASIO backend is explicitly requested, enable exclusive mode
+        // automatically (ASIO is inherently exclusive).
+        if config.local_audio_backend.to_lowercase() == "asio" && !config.local_exclusive_mode {
+            config.local_exclusive_mode = true;
+        }
         env_bool("TUNE_METADATA_READONLY", &mut config.metadata_readonly);
         env_str("TUNE_DISCOGS_TOKEN", &mut config.discogs_token);
         env_str("TUNE_LASTFM_API_KEY", &mut config.lastfm_api_key);

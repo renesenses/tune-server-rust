@@ -1,4 +1,6 @@
 pub mod airplay;
+#[cfg(all(target_os = "windows", feature = "asio"))]
+pub mod asio_exclusive;
 pub mod bluos;
 pub mod bridge;
 pub mod chromecast;

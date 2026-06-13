@@ -1188,8 +1188,145 @@ impl OutputTarget for LocalOutput {
                 return;
             }
 
-            // Suppress unused-variable warning on non-macOS platforms
-            #[cfg(not(target_os = "macos"))]
+            // ------- Exclusive mode path (Windows ASIO) -------
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            if exclusive_mode {
+                use super::asio_exclusive::AsioExclusiveOutput;
+
+                info!(
+                    device = %device_name,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    "local_audio_asio_exclusive_mode_active"
+                );
+
+                // Ring buffer: ~2 seconds of audio at source sample rate
+                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
+                let ring = Arc::new(RingBuf::new(ring_cap));
+
+                let exclusive = match AsioExclusiveOutput::new(
+                    &device_name,
+                    sample_rate,
+                    bit_depth as u32,
+                    channels as u32,
+                    ring.clone(),
+                    volume.clone(),
+                    paused.clone(),
+                ) {
+                    Ok(ex) => ex,
+                    Err(e) => {
+                        warn!(error = %e, "asio_exclusive_init_failed_falling_back_to_shared");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
+
+                // Feed audio data (no resampling needed -- hardware is set to source rate)
+                let pcm_data = if data_offset < header_buf.len() {
+                    header_buf[data_offset..].to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                let mut total_frames_fed: u64 = 0;
+
+                // Read and feed the rest of the stream
+                let mut read_buf = vec![0u8; 65536];
+                let mut leftover: Vec<u8> = Vec::new();
+
+                // Process leftover from header read
+                if !pcm_data.is_empty() {
+                    let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
+                    if aligned_len > 0 {
+                        let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+                        feed_ring_abortable(
+                            &ring,
+                            &samples,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
+                        total_frames_fed += (aligned_len / frame_bytes) as u64;
+                    }
+                    // Carry over unaligned remainder bytes
+                    if aligned_len < pcm_data.len() {
+                        leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                    }
+                }
+
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if force_silent.load(Ordering::Relaxed) {
+                        debug!("local_audio_asio_exclusive_aborted_by_stop");
+                        break;
+                    }
+
+                    let n = match reader.read(&mut read_buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_asio_exclusive_read_error");
+                            break;
+                        }
+                    };
+
+                    leftover.extend_from_slice(&read_buf[..n]);
+
+                    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
+                    if aligned_len == 0 {
+                        continue;
+                    }
+
+                    let samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
+                    let remainder = leftover[aligned_len..].to_vec();
+                    leftover = remainder;
+
+                    feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+
+                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+
+                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                    position_ms.store(pos, Ordering::Relaxed);
+                }
+
+                // Wait for ring buffer to drain
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if force_silent.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if ring.available() == 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // AsioExclusiveOutput::drop() releases the ASIO device
+                drop(exclusive);
+                playing.store(false, Ordering::SeqCst);
+                info!(
+                    device = %device_name,
+                    frames = total_frames_fed,
+                    "local_audio_asio_exclusive_stopped"
+                );
+                return;
+            }
+
+            // Suppress unused-variable warning on platforms without exclusive mode
+            #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "asio"))))]
             let _ = exclusive_mode;
 
             // ------- Open cpal device (shared mode) -------

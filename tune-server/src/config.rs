@@ -37,6 +37,10 @@ pub struct TuneConfig {
     /// Audio host backend on Windows: "auto", "wasapi", or "asio".
     #[serde(default = "default_audio_backend")]
     pub local_audio_backend: String,
+    /// When true, use exclusive/bit-perfect audio mode (CoreAudio hog mode
+    /// on macOS, ASIO exclusive on Windows).
+    #[serde(default)]
+    pub local_exclusive_mode: bool,
 }
 
 fn default_audio_backend() -> String {
@@ -75,6 +79,7 @@ impl Default for TuneConfig {
             advertised_ip: None,
             database_url: None,
             local_audio_backend: "auto".into(),
+            local_exclusive_mode: false,
         }
     }
 }
@@ -198,6 +203,14 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.local_audio_backend = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_LOCAL_EXCLUSIVE_MODE") {
+            config.local_exclusive_mode = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes");
+        }
+        // If ASIO backend is explicitly requested, enable exclusive mode
+        // automatically (ASIO is inherently exclusive).
+        if config.local_audio_backend.to_lowercase() == "asio" && !config.local_exclusive_mode {
+            config.local_exclusive_mode = true;
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();
