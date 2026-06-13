@@ -1059,13 +1059,14 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
-                // Adapt channels and resample if needed
+                // Adapt channels and resample if needed (using rubato
+                // sinc resampler for high-quality rate conversion)
                 let mut samples = decoded_samples;
                 if dec_ch != output_ch {
                     samples = adapt_channels(&samples, dec_ch, output_ch);
                 }
                 if dec_sr != output_sr {
-                    samples = simple_resample(&samples, dec_sr, output_sr, output_ch);
+                    samples = rubato_resample_batch(&samples, dec_sr, output_sr, output_ch);
                 }
 
                 // Pre-fill the ring buffer before starting the cpal stream.
@@ -2364,6 +2365,55 @@ fn simple_resample(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> 
             out.push(s0 + (s1 - s0) * frac);
         }
     }
+    out
+}
+
+/// Resample a complete buffer of interleaved f32 samples using rubato sinc.
+///
+/// Used for compressed streams where all decoded data is available at once.
+/// Creates and consumes a temporary resampler internally.
+fn rubato_resample_batch(samples: &[f32], from_sr: u32, to_sr: u32, channels: u16) -> Vec<f32> {
+    if from_sr == to_sr || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ch = channels as usize;
+    if ch == 0 {
+        return Vec::new();
+    }
+
+    let ratio = to_sr as f64 / from_sr as f64;
+    let sinc_len = 256;
+    let window = WindowFunction::BlackmanHarris2;
+    let f_cutoff = calculate_cutoff(sinc_len, window);
+    let params = SincInterpolationParameters {
+        sinc_len,
+        f_cutoff,
+        interpolation: SincInterpolationType::Cubic,
+        oversampling_factor: 256,
+        window,
+    };
+    let mut resampler =
+        match Async::<f32>::new_sinc(ratio, 1.1, &params, 1024, ch, FixedAsync::Input) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                warn!(error = %e, "rubato_batch_resampler_creation_failed_using_linear");
+                return simple_resample(samples, from_sr, to_sr, channels);
+            }
+        };
+
+    // Resample using the chunk helper, then flush
+    let mut out = rubato_resample_chunk(&mut resampler, samples, channels, false);
+    let flushed = rubato_resample_chunk(&mut resampler, &[], channels, true);
+    out.extend_from_slice(&flushed);
+
+    info!(
+        from_sr,
+        to_sr,
+        in_samples = samples.len(),
+        out_samples = out.len(),
+        "rubato_batch_resample_complete"
+    );
+
     out
 }
 
