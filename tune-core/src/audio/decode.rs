@@ -98,6 +98,55 @@ impl DecodedAudio {
     }
 }
 
+/// Convert right-justified i32 samples from one bit depth to another,
+/// producing raw PCM bytes at the target depth.
+///
+/// Source samples are assumed to be right-justified (i.e. a 24-bit sample
+/// occupies bits 0..23 of the i32, a 16-bit sample occupies bits 0..15).
+fn convert_pcm_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
+    match to_bd {
+        24 => samples
+            .iter()
+            .map(|s| {
+                let v = match from_bd {
+                    32 => *s >> 8,
+                    16 => (*s as i32) << 8,
+                    _ => *s,
+                };
+                let b = v.to_le_bytes();
+                [b[0], b[1], b[2]]
+            })
+            .flat_map(|a| a.into_iter())
+            .collect(),
+        32 => samples
+            .iter()
+            .map(|s| {
+                let v = match from_bd {
+                    24 => *s << 8,
+                    16 => (*s as i32) << 16,
+                    _ => *s,
+                };
+                v.to_le_bytes()
+            })
+            .flat_map(|a| a.into_iter())
+            .collect(),
+        _ => {
+            // 16-bit output
+            samples
+                .iter()
+                .flat_map(|s| {
+                    let v = match from_bd {
+                        32 => (*s >> 16) as i16,
+                        24 => (*s >> 8) as i16,
+                        _ => *s as i16,
+                    };
+                    v.to_le_bytes()
+                })
+                .collect()
+        }
+    }
+}
+
 pub fn can_decode_native(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
@@ -245,6 +294,7 @@ pub fn decode_to_pcm_streaming(
         file_path,
         target_sample_rate,
         target_channels,
+        None,
         tx,
         chunk_size,
         None,
@@ -264,6 +314,7 @@ pub fn decode_to_pcm_streaming_with_notify(
         file_path,
         target_sample_rate,
         target_channels,
+        None,
         tx,
         chunk_size,
         Some(data_ready),
@@ -275,6 +326,7 @@ pub fn decode_to_pcm_streaming_with_levels(
     file_path: &str,
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
@@ -284,6 +336,7 @@ pub fn decode_to_pcm_streaming_with_levels(
         file_path,
         target_sample_rate,
         target_channels,
+        target_bit_depth,
         tx,
         chunk_size,
         Some(data_ready),
@@ -295,6 +348,7 @@ fn decode_to_pcm_streaming_inner(
     file_path: &str,
     target_sample_rate: Option<u32>,
     target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -314,14 +368,21 @@ fn decode_to_pcm_streaming_inner(
         "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape" | "wma" | "asf"
     ) {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
-        let pcm_bytes = decoded.pcm_bytes();
+        // Use target_bit_depth if provided, otherwise use the decoder's native depth.
+        // This ensures the PCM byte encoding matches the WAV header declaration.
+        let output_bd = target_bit_depth.unwrap_or(decoded.bit_depth);
+        let pcm_bytes = if output_bd != decoded.bit_depth {
+            convert_pcm_bit_depth(&decoded.samples_i32, decoded.bit_depth, output_bd)
+        } else {
+            decoded.pcm_bytes()
+        };
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| "no tokio runtime for streaming decode")?;
         let ch = target_channels.unwrap_or(decoded.channels as u32) as u16;
         for chunk in pcm_bytes.chunks(chunk_size) {
             if rt.block_on(tx.send(chunk.to_vec())).is_err() {
                 debug!("streaming_decode_consumer_dropped (fallback)");
-                return Ok(decoded.bit_depth);
+                return Ok(output_bd);
             }
             if !first_chunk_sent {
                 first_chunk_sent = true;
@@ -330,10 +391,10 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(chunk, decoded.bit_depth, ch));
+                let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch));
             }
         }
-        return Ok(decoded.bit_depth);
+        return Ok(output_bd);
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
@@ -376,6 +437,18 @@ fn decode_to_pcm_streaming_inner(
     let source_bd = resolve_bit_depth(&audio_params);
     let shift = 32u16.saturating_sub(source_bd);
 
+    // Use target_bit_depth if provided, otherwise use the source's native depth.
+    // This ensures the PCM byte encoding matches the WAV header declaration.
+    let output_bd = target_bit_depth.unwrap_or(source_bd);
+    if output_bd != source_bd {
+        debug!(
+            source_bd,
+            output_bd,
+            file = file_path,
+            "streaming_decode_bit_depth_conversion"
+        );
+    }
+
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
 
@@ -417,23 +490,46 @@ fn decode_to_pcm_streaming_inner(
 
         total_samples += packet_samples.len();
 
-        // Convert to PCM bytes based on bit depth
-        match source_bd {
+        // Convert to PCM bytes based on output bit depth.
+        // When target_bit_depth differs from source_bd, the samples are
+        // already right-justified to source_bd range, so we re-quantize
+        // to the output depth (e.g. 32-bit source -> 24-bit output by
+        // taking the upper 24 bits, or 24-bit source -> 16-bit output
+        // by truncating to the upper 16 bits).
+        match output_bd {
             24 => {
                 for s in &packet_samples {
-                    let b = s.to_le_bytes();
+                    // If source is 32-bit, shift right by 8 to get upper 24 bits
+                    let v = if source_bd == 32 { *s >> 8 } else { *s };
+                    let b = v.to_le_bytes();
                     pcm_buf.extend_from_slice(&[b[0], b[1], b[2]]);
                 }
             }
             32 => {
                 for s in &packet_samples {
-                    pcm_buf.extend_from_slice(&s.to_le_bytes());
+                    // If source is 24-bit or 16-bit, shift left to fill 32-bit range
+                    let v = if source_bd == 24 {
+                        *s << 8
+                    } else if source_bd == 16 {
+                        (*s as i32) << 16
+                    } else {
+                        *s
+                    };
+                    pcm_buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
             _ => {
-                // 16-bit
+                // 16-bit output
                 for s in &packet_samples {
-                    pcm_buf.extend_from_slice(&(*s as i16).to_le_bytes());
+                    // If source is 24-bit, shift right by 8; if 32-bit, by 16
+                    let v = if source_bd == 32 {
+                        (*s >> 16) as i16
+                    } else if source_bd == 24 {
+                        (*s >> 8) as i16
+                    } else {
+                        *s as i16
+                    };
+                    pcm_buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
@@ -443,13 +539,13 @@ fn decode_to_pcm_streaming_inner(
             if let Some(ref ltx) = levels_tx {
                 let _ = ltx.send(super::levels::compute_levels(
                     &chunk,
-                    source_bd,
+                    output_bd,
                     source_channels as u16,
                 ));
             }
             if rt.block_on(tx.send(chunk)).is_err() {
                 debug!("streaming_decode_consumer_dropped");
-                return Ok(source_bd);
+                return Ok(output_bd);
             }
             if !first_chunk_sent {
                 first_chunk_sent = true;
@@ -476,11 +572,13 @@ fn decode_to_pcm_streaming_inner(
         samples = total_samples,
         rate = source_rate,
         channels = source_channels,
+        source_bd,
+        output_bd,
         duration_s,
         "decoded_symphonia_streaming"
     );
 
-    Ok(source_bd)
+    Ok(output_bd)
 }
 
 /// Extract a human-readable message from a panic payload.

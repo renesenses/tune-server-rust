@@ -986,10 +986,13 @@ impl OutputTarget for LocalOutput {
                 let silent_cb = force_silent.clone();
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
-                // Minimum: ~20ms of audio at the output sample rate.
+                // Minimum: ~200ms of audio at the output sample rate.
+                // (v0.8.97 used 20ms which was too low — macOS CoreAudio
+                // can request large buffers and underrun immediately after
+                // the gate opens, producing audible artifacts.)
                 let data_started = Arc::new(AtomicBool::new(false));
                 let data_started_cb = data_started.clone();
-                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 50; // ~20ms
+                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
 
                 let stream = match device.build_output_stream(
                     &output_config,
@@ -1039,12 +1042,6 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
-                if let Err(e) = stream.play() {
-                    warn!(error = %e, "audio_stream_play_failed");
-                    playing.store(false, Ordering::SeqCst);
-                    return;
-                }
-
                 // Adapt channels and resample if needed
                 let mut samples = decoded_samples;
                 if dec_ch != output_ch {
@@ -1054,8 +1051,34 @@ impl OutputTarget for LocalOutput {
                     samples = simple_resample(&samples, dec_sr, output_sr, output_ch);
                 }
 
-                // Feed all samples to ring buffer
-                feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
+                // Pre-fill the ring buffer before starting the cpal stream.
+                // For compressed streams all data is already decoded, so we
+                // push as much as fits (~200ms or more) before calling play().
+                let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
+                let prefill_count = samples.len().min(prefill_target.max(ring.capacity() / 2));
+                let initial_written = ring.push(&samples[..prefill_count]);
+
+                if let Err(e) = stream.play() {
+                    warn!(error = %e, "audio_stream_play_failed");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                info!(
+                    device = %device_name,
+                    prefill_samples = initial_written,
+                    "local_audio_compressed_playing_after_prefill"
+                );
+
+                // Feed remaining samples to ring buffer
+                if initial_written < samples.len() {
+                    feed_ring_abortable(
+                        &ring,
+                        &samples[initial_written..],
+                        &stop_rx,
+                        &paused,
+                        Some(&force_silent),
+                    );
+                }
 
                 // Update position
                 let total_frames = decoded_len as u64 / dec_ch as u64;
@@ -1462,9 +1485,12 @@ impl OutputTarget for LocalOutput {
                 (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) * 2;
             let ring_preferred = Arc::new(RingBuf::new(ring_cap_preferred));
             ring_preferred.clear(); // Defensive: zero-fill before callback can read
-            // Minimum buffer: ~20ms of audio before the callback starts reading
+            // Minimum buffer: ~200ms of audio before the callback starts reading.
+            // (v0.8.97 used 20ms which was too low — macOS CoreAudio can
+            // request large buffers and underrun immediately after the gate
+            // opens, producing audible artifacts.)
             let min_buffer_preferred =
-                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) / 50;
+                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) / 5;
             let stream_result = build_stream(
                 &preferred_config,
                 ring_preferred.clone(),
@@ -1497,7 +1523,7 @@ impl OutputTarget for LocalOutput {
                             data_started_shared.store(false, Ordering::SeqCst);
                             let min_buffer_fb = (default_cfg.sample_rate as usize)
                                 * (default_cfg.channels as usize)
-                                / 50; // ~20ms
+                                / 5; // ~200ms
                             match build_stream(
                                 &default_cfg,
                                 ring_fb.clone(),
@@ -1546,13 +1572,10 @@ impl OutputTarget for LocalOutput {
                 "local_audio_stream_config"
             );
 
-            if let Err(e) = stream.play() {
-                warn!(error = %e, "audio_stream_play_failed");
-                playing.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            info!(device = %device_name, url = %url, "local_audio_playing");
+            // DO NOT call stream.play() yet — we pre-fill the ring buffer
+            // first to prevent CoreAudio from pulling uninitialized/empty
+            // buffers in the first few callbacks.  The stream is started
+            // after enough data has been buffered (~200ms).
 
             // ------- Feed audio data from HTTP stream to ring buffer -------
             let pcm_data = if data_offset < header_buf.len() {
@@ -1625,6 +1648,28 @@ impl OutputTarget for LocalOutput {
                 let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
                 if aligned_len > 0 {
                     let mut samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+
+                    // Diagnostic: log first few f32 samples and detect anomalies.
+                    // White noise manifests as high-amplitude random values in
+                    // what should be a gentle attack.
+                    if !samples.is_empty() {
+                        let first_8: Vec<f32> = samples.iter().take(8).copied().collect();
+                        let max_abs = samples
+                            .iter()
+                            .take(200)
+                            .fold(0.0f32, |m, &s| m.max(s.abs()));
+                        let non_zero = samples.iter().take(200).filter(|&&s| s != 0.0).count();
+                        info!(
+                            first_samples = ?first_8,
+                            max_abs_200 = max_abs,
+                            non_zero_in_200 = non_zero,
+                            total_samples = samples.len(),
+                            bit_depth,
+                            frame_bytes,
+                            "local_audio_initial_samples_diagnostic"
+                        );
+                    }
+
                     if needs_channel_adapt {
                         samples = adapt_channels(&samples, channels, output_ch);
                     }
@@ -1642,6 +1687,26 @@ impl OutputTarget for LocalOutput {
             let mut total_bytes_read: u64 = 0;
             let mut first_data_logged = false;
             let stream_start = std::time::Instant::now();
+
+            // Pre-fill the ring buffer before starting the cpal stream.
+            // Target: ~200ms of audio so the first callback has enough data.
+            let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
+            let mut stream_started = false;
+
+            // Check if initial header data was enough to meet the prefill target
+            if ring.available() >= prefill_target {
+                if let Err(e) = stream.play() {
+                    warn!(error = %e, "audio_stream_play_failed");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                stream_started = true;
+                info!(
+                    device = %device_name,
+                    prefill_samples = ring.available(),
+                    "local_audio_playing_after_prefill"
+                );
+            }
 
             loop {
                 // Check for stop signal (non-blocking)
@@ -1738,9 +1803,43 @@ impl OutputTarget for LocalOutput {
 
                 total_frames_fed += (aligned_len / frame_bytes) as u64;
 
+                // Start the cpal stream once enough data has been pre-filled.
+                // This ensures the audio device never pulls from an empty/sparse
+                // ring buffer, eliminating white noise at track start.
+                if !stream_started && ring.available() >= prefill_target {
+                    if let Err(e) = stream.play() {
+                        warn!(error = %e, "audio_stream_play_failed");
+                        playing.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    stream_started = true;
+                    info!(
+                        device = %device_name,
+                        prefill_samples = ring.available(),
+                        total_bytes_read,
+                        elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                        "local_audio_playing_after_prefill"
+                    );
+                }
+
                 // Update position
                 let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
                 position_ms.store(pos, Ordering::Relaxed);
+            }
+
+            // If the stream was never started (very short track or error),
+            // start it now with whatever data we have.
+            if !stream_started {
+                if let Err(e) = stream.play() {
+                    warn!(error = %e, "audio_stream_play_failed_final");
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
+                info!(
+                    device = %device_name,
+                    ring_available = ring.available(),
+                    "local_audio_playing_short_track_or_eof"
+                );
             }
 
             // Flush the resampler: feed silence to get remaining buffered samples

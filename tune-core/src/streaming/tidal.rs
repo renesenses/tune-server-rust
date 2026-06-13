@@ -106,6 +106,7 @@ pub struct TidalService {
     subscription: Option<String>,
     url_cache: Arc<Mutex<UrlCache>>,
     pending_device_auth: Option<DeviceAuthResponse>,
+    device_auth_started: Option<Instant>,
     featured_cache: Option<FeaturedCache>,
     enabled_override: Option<bool>,
 }
@@ -135,6 +136,7 @@ impl TidalService {
             subscription: None,
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
             pending_device_auth: None,
+            device_auth_started: None,
             featured_cache: None,
             enabled_override: None,
         }
@@ -644,14 +646,23 @@ impl StreamingService for TidalService {
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
 
+            let status_code = resp.status().as_u16();
+            let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+            if status_code != 200 {
+                warn!(status = status_code, body = %body, "tidal_device_authorization_failed");
+                return Err(format!("device authorization failed: {status_code} {body}"));
+            }
+
             let device_auth: DeviceAuthResponse =
-                resp.json().await.map_err(|e| format!("parse: {e}"))?;
+                serde_json::from_str(&body).map_err(|e| format!("parse device auth: {e}"))?;
             info!(
                 user_code = %device_auth.user_code,
                 uri = %device_auth.verification_uri_complete,
+                expires_in = device_auth.expires_in,
                 "tidal_device_auth_started"
             );
             self.pending_device_auth = Some(device_auth.clone());
+            self.device_auth_started = Some(Instant::now());
 
             let url = if device_auth.verification_uri_complete.starts_with("http") {
                 device_auth.verification_uri_complete
@@ -669,6 +680,24 @@ impl StreamingService for TidalService {
         info!(has_pending = self.pending_device_auth.is_some(), device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
 
         if let Some(ref pending) = self.pending_device_auth.clone() {
+            // Check if the device code has expired (Tidal typically gives 300s)
+            let max_lifetime = Duration::from_secs(pending.expires_in.max(300));
+            if let Some(started) = self.device_auth_started {
+                if started.elapsed() > max_lifetime {
+                    warn!(
+                        elapsed_secs = started.elapsed().as_secs(),
+                        expires_in = pending.expires_in,
+                        "tidal_device_code_expired — clearing pending auth"
+                    );
+                    self.pending_device_auth = None;
+                    self.device_auth_started = None;
+                    return Ok(AuthStatus {
+                        authenticated: false,
+                        ..Default::default()
+                    });
+                }
+            }
+
             let resp = self
                 .client
                 .post(format!("{AUTH_BASE}/token"))
@@ -684,28 +713,48 @@ impl StreamingService for TidalService {
                 .map_err(|e| format!("token: {e}"))?;
 
             let status_code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+
             if status_code != 200 {
-                let body = resp.text().await.unwrap_or_default();
                 info!(status = status_code, body = %body, "tidal_token_exchange");
+                // If Tidal says the device code is expired or invalid, clear it
+                // so the user can start a fresh device auth flow.
+                if body.contains("expired") || body.contains("invalid_grant") {
+                    warn!("tidal_device_code_rejected — clearing pending auth");
+                    self.pending_device_auth = None;
+                    self.device_auth_started = None;
+                }
                 return Ok(AuthStatus {
                     authenticated: false,
                     ..Default::default()
                 });
             }
 
-            let token: TokenResponse =
-                resp.json().await.map_err(|e| format!("token parse: {e}"))?;
+            info!(body = %body, "tidal_token_exchange_success");
+
+            let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+                warn!(error = %e, body = %body, "tidal_token_parse_failed");
+                format!("token parse: {e}")
+            })?;
+            let access_token_clone = token.access_token.clone();
             {
                 let mut ts = self.tokens.lock().await;
                 ts.access_token = Some(token.access_token);
                 ts.refresh_token = token.refresh_token;
                 ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
             }
-            self.user_id = token.user_id;
+            // user_id: use the response field if present, otherwise extract from JWT
+            self.user_id = token
+                .user_id
+                .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
             self.pending_device_auth = None;
+            self.device_auth_started = None;
             self.country_code = "FR".into();
 
             info!(user_id = ?self.user_id, "tidal_authenticated");
+
+            // Fetch username and subscription info now that we're authenticated
+            self.refresh_user_info().await;
         }
 
         Ok(self.auth_status().await)
@@ -713,13 +762,22 @@ impl StreamingService for TidalService {
 
     async fn auth_status(&self) -> AuthStatus {
         let ts = self.tokens.lock().await;
+        // Consider the token expired if we know the expiry and it's in the past.
+        // Also check if we have a refresh_token — if not, a dead access_token
+        // means we can't recover and must report unauthenticated.
+        let token_expired = ts
+            .token_expires
+            .map(|t| Instant::now() > t)
+            .unwrap_or(false);
+        let effectively_authenticated =
+            ts.access_token.is_some() && (!token_expired || ts.refresh_token.is_some());
         AuthStatus {
-            authenticated: ts.access_token.is_some(),
+            authenticated: effectively_authenticated,
             username: self.username.clone(),
             subscription: self.subscription.clone(),
-            expires_at: ts.token_expires.map(|t| {
-                let remaining = t.duration_since(Instant::now()).as_secs();
-                format!("{remaining}s")
+            expires_at: ts.token_expires.and_then(|t| {
+                t.checked_duration_since(Instant::now())
+                    .map(|d| format!("{}s", d.as_secs()))
             }),
             ..Default::default()
         }
@@ -1420,6 +1478,10 @@ impl StreamingService for TidalService {
                 expires_in: 300,
                 interval: 2,
             });
+            // Set device_auth_started to now — the code may already be expired
+            // from a previous session, but the expiration check in authenticate()
+            // will clear it on the first poll attempt.
+            self.device_auth_started = Some(Instant::now());
             restored = true;
         }
         restored
