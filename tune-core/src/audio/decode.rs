@@ -278,7 +278,7 @@ pub fn decode_to_pcm_streaming_with_levels(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-    levels_tx: std::sync::mpsc::Sender<super::levels::AudioLevels>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
 ) -> Result<u16, String> {
     decode_to_pcm_streaming_inner(
         file_path,
@@ -298,7 +298,7 @@ fn decode_to_pcm_streaming_inner(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
-    levels_tx: Option<std::sync::mpsc::Sender<super::levels::AudioLevels>>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
 ) -> Result<u16, String> {
     let ext = Path::new(file_path)
         .extension()

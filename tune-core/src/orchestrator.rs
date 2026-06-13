@@ -459,12 +459,15 @@ impl PlaybackOrchestrator {
 
                 // Create audio-levels channel for ALL transcode paths so the
                 // web client VU-meter works regardless of output type.
-                let (levels_tx, levels_rx) =
-                    std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                // Uses tokio unbounded channel: the sender is sync-safe (works
+                // inside spawn_blocking), the receiver is async (does not block
+                // a tokio worker thread — the old std::sync::mpsc::recv() did).
+                let (levels_tx, mut levels_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
                 if let Some(ref bus) = ev_bus {
                     let bus = bus.clone();
                     tokio::spawn(async move {
-                        while let Ok(lvl) = levels_rx.recv() {
+                        while let Some(lvl) = levels_rx.recv().await {
                             bus.emit(
                                 "playback.audio_levels",
                                 serde_json::json!({
@@ -628,56 +631,69 @@ impl PlaybackOrchestrator {
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
             // affect the actual audio stream served to the output device.
-            if let Some(ref bus) = self.event_bus {
-                let bus = bus.clone();
-                let fp = file_path.clone();
-                let zone_id = req.zone_id;
-                let sr = sample_rate;
-                let ch = channels as u32;
-                tokio::spawn(async move {
-                    let (levels_tx, levels_rx) =
-                        std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
-                    let bus_clone = bus.clone();
+            // Skip DSD/exotic formats that need heavy conversion — they go
+            // through the transcode path which already computes levels inline.
+            let skip_passthrough_levels = source_format
+                .as_ref()
+                .is_some_and(|f| f.needs_transcode_for_dlna());
+            if !skip_passthrough_levels {
+                if let Some(ref bus) = self.event_bus {
+                    let bus = bus.clone();
+                    let fp = file_path.clone();
+                    let zone_id = req.zone_id;
+                    let sr = sample_rate;
+                    let ch = channels as u32;
                     tokio::spawn(async move {
-                        while let Ok(lvl) = levels_rx.recv() {
-                            bus_clone.emit(
-                                "playback.audio_levels",
-                                serde_json::json!({
-                                    "zone_id": zone_id,
-                                    "rms_left_db": lvl.rms_left_db(),
-                                    "rms_right_db": lvl.rms_right_db(),
-                                    "peak_left_db": lvl.peak_left_db(),
-                                    "peak_right_db": lvl.peak_right_db(),
-                                    "rms_left": lvl.rms_left,
-                                    "rms_right": lvl.rms_right,
-                                }),
+                        let (levels_tx, mut levels_rx) = tokio::sync::mpsc::unbounded_channel::<
+                            crate::audio::levels::AudioLevels,
+                        >();
+                        let bus_clone = bus.clone();
+                        tokio::spawn(async move {
+                            while let Some(lvl) = levels_rx.recv().await {
+                                bus_clone.emit(
+                                    "playback.audio_levels",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "rms_left_db": lvl.rms_left_db(),
+                                        "rms_right_db": lvl.rms_right_db(),
+                                        "peak_left_db": lvl.peak_left_db(),
+                                        "peak_right_db": lvl.peak_right_db(),
+                                        "rms_left": lvl.rms_left,
+                                        "rms_right": lvl.rms_right,
+                                    }),
+                                );
+                            }
+                        });
+                        // Decode the file to PCM in the background — output is
+                        // discarded, only levels are forwarded via levels_tx.
+                        let result = tokio::task::spawn_blocking(move || {
+                            let decoded = crate::audio::decode::decode_to_pcm(
+                                &fp,
+                                Some(sr),
+                                Some(ch),
+                                0.0,
+                                0.0,
                             );
-                        }
-                    });
-                    // Decode the file to PCM in the background — output is
-                    // discarded, only levels are forwarded via levels_tx.
-                    let result = tokio::task::spawn_blocking(move || {
-                        let decoded =
-                            crate::audio::decode::decode_to_pcm(&fp, Some(sr), Some(ch), 0.0, 0.0);
-                        if let Ok(ref dec) = decoded {
-                            let pcm = dec.pcm_bytes();
-                            let bd = dec.bit_depth;
-                            let c = dec.channels as u16;
-                            for chunk in pcm.chunks(32768) {
-                                if levels_tx
-                                    .send(crate::audio::levels::compute_levels(chunk, bd, c))
-                                    .is_err()
-                                {
-                                    break;
+                            if let Ok(ref dec) = decoded {
+                                let pcm = dec.pcm_bytes();
+                                let bd = dec.bit_depth;
+                                let c = dec.channels as u16;
+                                for chunk in pcm.chunks(32768) {
+                                    if levels_tx
+                                        .send(crate::audio::levels::compute_levels(chunk, bd, c))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
                             }
+                        })
+                        .await;
+                        if let Err(e) = result {
+                            debug!(error = %e, "passthrough_levels_task_panic");
                         }
-                    })
-                    .await;
-                    if let Err(e) = result {
-                        debug!(error = %e, "passthrough_levels_task_panic");
-                    }
-                });
+                    });
+                }
             }
 
             (
@@ -815,12 +831,12 @@ impl PlaybackOrchestrator {
             tokio::spawn(async move {
                 // Audio-levels channel so the web client VU-meter works for
                 // streaming-service content played through local/OAAT outputs.
-                let (levels_tx, levels_rx) =
-                    std::sync::mpsc::channel::<crate::audio::levels::AudioLevels>();
+                let (levels_tx, mut levels_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
                 if let Some(ref bus) = ev_bus {
                     let bus = bus.clone();
                     tokio::spawn(async move {
-                        while let Ok(lvl) = levels_rx.recv() {
+                        while let Some(lvl) = levels_rx.recv().await {
                             bus.emit(
                                 "playback.audio_levels",
                                 serde_json::json!({
