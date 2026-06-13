@@ -303,24 +303,41 @@ impl OutputTarget for OaatOutput {
                 tls: false,
             };
 
-            // Connect with retry — retries the full connect+clock sequence
-            // to handle endpoints that close during negotiation after a track skip.
+            // Connect with retry — each attempt has a 3s timeout to avoid
+            // hanging on TCP SYN timeout (127s on Linux) when the endpoint
+            // is restarting its listener after a track stop.
             let mut endpoint: Option<ConnectedEndpoint> = None;
             for attempt in 1..=15u32 {
-                debug!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
-                match ConnectedEndpoint::connect(&config, endpoint_addr).await {
-                    Ok(ep) => {
+                info!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ConnectedEndpoint::connect(&config, endpoint_addr),
+                )
+                .await
+                {
+                    Ok(Ok(ep)) => {
                         info!(device = %device_name, endpoint_name = %ep.info.endpoint_name, "oaat: connected");
                         endpoint = Some(ep);
                         break;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         if attempt < 15 {
-                            let delay = 300 + 200 * attempt as u64;
-                            debug!(device = %device_name, error = %e, attempt, delay_ms = delay, "oaat: connect retry");
+                            let delay = 500 + 300 * attempt as u64;
+                            info!(device = %device_name, error = %e, attempt, delay_ms = delay, "oaat: connect retry");
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         } else {
                             error!(device = %device_name, error = %e, "oaat: connect failed after 15 attempts");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        if attempt < 15 {
+                            let delay = 500 + 300 * attempt as u64;
+                            info!(device = %device_name, attempt, delay_ms = delay, "oaat: connect timed out, retry");
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        } else {
+                            error!(device = %device_name, "oaat: connect timed out after 15 attempts");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
