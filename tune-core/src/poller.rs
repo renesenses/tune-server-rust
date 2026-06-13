@@ -492,6 +492,7 @@ impl PositionPoller {
                     ps.gapless_sent_at = None;
                     ps.stopped_ticks = 0;
                     ps.peak_position_ms = 0;
+                    ps.last_position_ms = 0;
                     ps.track_started_at = None;
                     if let Some(next_pos) = Self::next_position(zone_state) {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
@@ -544,6 +545,7 @@ impl PositionPoller {
                             ps.gapless_sent_at = None;
                             ps.stopped_ticks = 0;
                             ps.peak_position_ms = 0;
+                            ps.last_position_ms = 0;
                             ps.track_started_at = None;
                             if let Some(next_pos) = Self::next_position(zone_state) {
                                 if let Err(e) = self
@@ -661,7 +663,9 @@ impl PositionPoller {
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
                         ps.peak_position_ms = 0;
+                        ps.last_position_ms = 0;
                         ps.track_started_at = None;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");

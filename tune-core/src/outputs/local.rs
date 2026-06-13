@@ -965,14 +965,31 @@ impl OutputTarget for LocalOutput {
                     );
                 }
 
-                // Try source sample rate first, then fall back to device default
-                let output_config = find_matching_config(&device, dec_ch, dec_sr)
-                    .or_else(|| device.default_output_config().ok().map(|c| c.config()))
-                    .unwrap_or(cpal::StreamConfig {
-                        channels: dec_ch,
-                        sample_rate: dec_sr,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
+                // Prefer device's default rate and resample if needed.
+                // Same rationale as the WAV path: opening at the source
+                // rate in shared mode is unreliable on macOS/Windows.
+                let output_config = {
+                    let default_cfg = device.default_output_config().ok().map(|c| c.config());
+                    let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
+                    if default_sr == Some(dec_sr) {
+                        default_cfg.unwrap()
+                    } else if let Some(cfg) = default_cfg {
+                        info!(
+                            source_sr = dec_sr,
+                            device_sr = cfg.sample_rate,
+                            "local_audio_compressed_rate_mismatch_will_resample"
+                        );
+                        cfg
+                    } else {
+                        find_matching_config(&device, dec_ch, dec_sr).unwrap_or(
+                            cpal::StreamConfig {
+                                channels: dec_ch,
+                                sample_rate: dec_sr,
+                                buffer_size: cpal::BufferSize::Default,
+                            },
+                        )
+                    }
+                };
 
                 let output_sr = output_config.sample_rate;
                 let output_ch = output_config.channels;
@@ -1415,24 +1432,60 @@ impl OutputTarget for LocalOutput {
                 );
             }
 
-            // Try to find a config matching the stream's sample rate.
-            // If the device doesn't explicitly list the source rate, try it
-            // anyway — WASAPI shared mode will resample in the driver (better
-            // quality than our linear interpolation). Only fall back to default
-            // config if cpal rejects the stream config at build time.
-            let preferred_config = find_matching_config(&device, channels, sample_rate)
-                .unwrap_or_else(|| {
-                    // Attempt source rate even if not in reported range
-                    cpal::StreamConfig {
-                        channels,
-                        sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                    }
-                });
+            // Determine the output config for shared mode.
+            //
+            // Strategy: prefer the device's default/native sample rate and
+            // resample with rubato when the source rate differs.  This is more
+            // reliable than trying to open the device at the source rate:
+            //
+            // - On macOS, cpal's CoreAudio backend does NOT call
+            //   `set_sample_rate` for output streams (only for input).  So
+            //   `build_output_stream` at 96 kHz "succeeds" (CoreAudio inserts
+            //   an internal converter), but the conversion is unreliable on
+            //   many devices/macOS versions and produces white noise.
+            //
+            // - On Windows WASAPI shared mode, the system mixer runs at a
+            //   fixed rate (usually 48 kHz); requesting a different rate may
+            //   be rejected or silently mis-converted.
+            //
+            // By always opening at the device's native rate and doing our own
+            // high-quality sinc resampling (rubato), we guarantee correct
+            // output on all platforms.
+            //
+            // If the source rate happens to match the device rate, no
+            // resampling occurs (zero overhead).
+            let output_config = {
+                // First, get the device's default config (reflects actual
+                // operating rate on most platforms).
+                let default_cfg = device.default_output_config().ok().map(|c| c.config());
+                let default_sr = default_cfg.as_ref().map(|c| c.sample_rate);
 
-            // Build output stream — try preferred config first, fall back to
-            // device default if the device rejects the source sample rate
-            // (common on Windows where WASAPI shared mode locks to 48 kHz).
+                if default_sr == Some(sample_rate) {
+                    // Device is already at the source rate — use it directly
+                    default_cfg.unwrap()
+                } else if let Some(cfg) = default_cfg {
+                    // Device rate differs from source — open at device rate,
+                    // rubato will resample.
+                    info!(
+                        source_sr = sample_rate,
+                        device_sr = cfg.sample_rate,
+                        "local_audio_rate_mismatch_will_resample"
+                    );
+                    cfg
+                } else {
+                    // No default config available — try source rate as last
+                    // resort (PipeWire, etc.).
+                    find_matching_config(&device, channels, sample_rate).unwrap_or(
+                        cpal::StreamConfig {
+                            channels,
+                            sample_rate,
+                            buffer_size: cpal::BufferSize::Default,
+                        },
+                    )
+                }
+            };
+
+            // Build output stream at the chosen rate.
             let silent_cb_outer = force_silent.clone();
             // Gate: the cpal callback outputs silence until enough real data
             // has been buffered in the ring buffer.  This prevents stale or
@@ -1480,77 +1533,66 @@ impl OutputTarget for LocalOutput {
 
             let finished_flag = Arc::new(AtomicBool::new(false));
 
-            // First attempt: preferred config (source sample rate)
-            let ring_cap_preferred =
-                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) * 2;
-            let ring_preferred = Arc::new(RingBuf::new(ring_cap_preferred));
-            ring_preferred.clear(); // Defensive: zero-fill before callback can read
+            let ring_cap =
+                (output_config.sample_rate as usize) * (output_config.channels as usize) * 2;
+            let ring_buf = Arc::new(RingBuf::new(ring_cap));
+            ring_buf.clear(); // Defensive: zero-fill before callback can read
             // Minimum buffer: ~200ms of audio before the callback starts reading.
             // (v0.8.97 used 20ms which was too low — macOS CoreAudio can
             // request large buffers and underrun immediately after the gate
             // opens, producing audible artifacts.)
-            let min_buffer_preferred =
-                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) / 5;
+            let min_buffer =
+                (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
             let stream_result = build_stream(
-                &preferred_config,
-                ring_preferred.clone(),
+                &output_config,
+                ring_buf.clone(),
                 volume.clone(),
                 paused.clone(),
                 finished_flag.clone(),
                 silent_cb_outer.clone(),
                 data_started_shared.clone(),
-                min_buffer_preferred,
+                min_buffer,
             );
 
             let (stream, actual_config, ring) = match stream_result {
-                Ok(s) => (s, preferred_config, ring_preferred),
+                Ok(s) => (s, output_config, ring_buf),
                 Err(first_err) => {
-                    // Fall back to device default config + rubato resampling
-                    let fallback_config = device.default_output_config().map(|c| c.config());
-                    match fallback_config {
-                        Ok(default_cfg) => {
+                    // Last resort: try the source sample rate directly —
+                    // some platforms (PipeWire) accept arbitrary rates.
+                    let source_cfg = cpal::StreamConfig {
+                        channels,
+                        sample_rate,
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    let ring_cap_fb =
+                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
+                    let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                    ring_fb.clear();
+                    data_started_shared.store(false, Ordering::SeqCst);
+                    let min_buffer_fb =
+                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) / 5;
+                    match build_stream(
+                        &source_cfg,
+                        ring_fb.clone(),
+                        volume.clone(),
+                        paused.clone(),
+                        finished_flag.clone(),
+                        silent_cb_outer.clone(),
+                        data_started_shared.clone(),
+                        min_buffer_fb,
+                    ) {
+                        Ok(s) => {
                             info!(
-                                default_sr = default_cfg.sample_rate,
-                                default_ch = default_cfg.channels,
-                                "local_audio_fallback_to_device_default"
+                                source_sr = sample_rate,
+                                "local_audio_fallback_to_source_rate"
                             );
-                            let ring_cap_fb = (default_cfg.sample_rate as usize)
-                                * (default_cfg.channels as usize)
-                                * 2;
-                            let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
-                            ring_fb.clear(); // Defensive: zero-fill
-                            // Reset data_started for the fallback config
-                            data_started_shared.store(false, Ordering::SeqCst);
-                            let min_buffer_fb = (default_cfg.sample_rate as usize)
-                                * (default_cfg.channels as usize)
-                                / 5; // ~200ms
-                            match build_stream(
-                                &default_cfg,
-                                ring_fb.clone(),
-                                volume.clone(),
-                                paused.clone(),
-                                finished_flag.clone(),
-                                silent_cb_outer.clone(),
-                                data_started_shared.clone(),
-                                min_buffer_fb,
-                            ) {
-                                Ok(s) => (s, default_cfg, ring_fb),
-                                Err(second_err) => {
-                                    warn!(
-                                        first_error = %first_err,
-                                        second_error = %second_err,
-                                        "audio_stream_build_failed_both_configs"
-                                    );
-                                    playing.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
+                            (s, source_cfg, ring_fb)
                         }
-                        Err(cfg_err) => {
+                        Err(second_err) => {
                             warn!(
                                 first_error = %first_err,
-                                config_error = %cfg_err,
-                                "audio_stream_build_failed"
+                                second_error = %second_err,
+                                "audio_stream_build_failed_both_configs"
                             );
                             playing.store(false, Ordering::SeqCst);
                             return;

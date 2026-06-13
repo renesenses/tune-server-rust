@@ -1502,6 +1502,11 @@ impl PlaybackOrchestrator {
             // intact so it doesn't falsely detect track-end on renderers
             // that briefly report Stopped during gapless transitions.
             self.playback.update_now_playing(zone_id, np).await;
+            // Reset position to 0 — the new track starts from the beginning.
+            // Without this, the UI shows the cumulative position from the
+            // previous track until the next poller tick overwrites it.
+            self.playback.update_position(zone_id, 0).await;
+            self.playback.emit_position(zone_id, 0);
             self.playback
                 .update_queue_info(zone_id, position, queue.len() as i64)
                 .await;
@@ -1536,8 +1541,11 @@ impl PlaybackOrchestrator {
                 stream_id: None,
             };
             // Same rationale: gapless metadata-only advance must not
-            // bump track_generation and must not reset position to 0.
+            // bump track_generation — but position MUST reset to 0
+            // because the new track starts from the beginning.
             self.playback.update_now_playing(zone_id, np).await;
+            self.playback.update_position(zone_id, 0).await;
+            self.playback.emit_position(zone_id, 0);
             self.playback
                 .update_queue_info(zone_id, position, streaming.len() as i64)
                 .await;

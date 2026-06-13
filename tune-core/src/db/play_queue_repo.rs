@@ -16,7 +16,7 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn queue_select_base() -> &'static str {
-        "SELECT pq.id, pq.zone_id, pq.track_id, pq.position, pq.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path FROM play_queue pq LEFT JOIN tracks t ON pq.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        "SELECT pq.id, pq.zone_id, pq.track_id, pq.position, pq.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path, t.format, t.sample_rate, t.bit_depth FROM play_queue pq LEFT JOIN tracks t ON pq.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
 
     pub fn get_queue<D: SqlDialect>(d: &D) -> String {
@@ -185,6 +185,9 @@ pub struct QueueItem {
     pub duration_ms: Option<i64>,
     pub file_path: Option<String>,
     pub cover_path: Option<String>,
+    pub format: Option<String>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
 }
 
 pub struct PlayQueueRepo {
@@ -514,6 +517,9 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
         duration_ms: cols.get(8).and_then(|v| v.as_i64()),
         file_path: cols.get(9).and_then(|v| v.as_string()),
         cover_path: cols.get(10).and_then(|v| v.as_string()),
+        format: cols.get(11).and_then(|v| v.as_string()),
+        sample_rate: cols.get(12).and_then(|v| v.as_i64()),
+        bit_depth: cols.get(13).and_then(|v| v.as_i64()),
     }
 }
 
