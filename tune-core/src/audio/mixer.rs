@@ -1,3 +1,84 @@
+use super::channels::build_downmix_matrix;
+
+/// Downmix interleaved PCM samples from `source_channels` to `target_channels`.
+///
+/// Uses ITU-R BS.775 coefficients for standard layouts (5.1->stereo, 7.1->stereo).
+/// Returns the input unchanged if no downmix is needed (source <= target).
+///
+/// `samples` are interleaved f32 PCM: [L0, R0, C0, LFE0, BL0, BR0, L1, R1, ...].
+pub fn downmix(samples: &[f32], source_channels: u16, target_channels: u16) -> Vec<f32> {
+    if source_channels <= target_channels {
+        return samples.to_vec();
+    }
+
+    let src = source_channels as usize;
+    let tgt = target_channels as usize;
+
+    let matrix = match build_downmix_matrix(source_channels, target_channels) {
+        Some(m) => m,
+        None => return samples.to_vec(),
+    };
+
+    let frame_count = samples.len() / src;
+    let mut output = Vec::with_capacity(frame_count * tgt);
+
+    for frame in 0..frame_count {
+        let in_offset = frame * src;
+        for out_ch in 0..tgt {
+            let mut sum = 0.0f32;
+            let row_offset = out_ch * src;
+            for in_ch in 0..src {
+                sum += samples[in_offset + in_ch] * matrix[row_offset + in_ch];
+            }
+            // Soft clip to [-1.0, 1.0] to prevent overflow
+            output.push(sum.clamp(-1.0, 1.0));
+        }
+    }
+
+    output
+}
+
+/// Downmix interleaved i16 PCM bytes from `source_channels` to `target_channels`.
+///
+/// Convenience wrapper that operates on raw i16 LE byte buffers.
+pub fn downmix_i16_bytes(data: &[u8], source_channels: u16, target_channels: u16) -> Vec<u8> {
+    if source_channels <= target_channels {
+        return data.to_vec();
+    }
+
+    let src = source_channels as usize;
+    let tgt = target_channels as usize;
+    let bytes_per_sample = 2usize;
+    let frame_size = src * bytes_per_sample;
+    let frame_count = data.len() / frame_size;
+
+    let matrix = match build_downmix_matrix(source_channels, target_channels) {
+        Some(m) => m,
+        None => return data.to_vec(),
+    };
+
+    let mut output = Vec::with_capacity(frame_count * tgt * bytes_per_sample);
+
+    for frame in 0..frame_count {
+        let base = frame * frame_size;
+        for out_ch in 0..tgt {
+            let mut sum = 0.0f64;
+            let row_offset = out_ch * src;
+            for in_ch in 0..src {
+                let pos = base + in_ch * bytes_per_sample;
+                if pos + 1 < data.len() {
+                    let sample = i16::from_le_bytes([data[pos], data[pos + 1]]);
+                    sum += sample as f64 * matrix[row_offset + in_ch] as f64;
+                }
+            }
+            let clamped = sum.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+            output.extend_from_slice(&clamped.to_le_bytes());
+        }
+    }
+
+    output
+}
+
 pub struct PcmMixer {
     channels: u16,
     bit_depth: u16,
@@ -203,5 +284,61 @@ mod tests {
         let mixed = mixer.mix_buffers(&[&buf1, &buf2], &[1.0, 1.0]);
         let val = (mixed[0] as i32) | ((mixed[1] as i32) << 8) | ((mixed[2] as i32) << 16);
         assert_eq!(val, 8192);
+    }
+
+    #[test]
+    fn downmix_passthrough_when_not_needed() {
+        let samples = vec![0.5f32, -0.3, 0.1, 0.2];
+        let result = downmix(&samples, 2, 2);
+        assert_eq!(result, samples);
+    }
+
+    #[test]
+    fn downmix_passthrough_upmix() {
+        let samples = vec![0.5f32, -0.3];
+        let result = downmix(&samples, 1, 2);
+        assert_eq!(result, samples);
+    }
+
+    #[test]
+    fn downmix_51_to_stereo() {
+        // One frame of 5.1: FL=0.5, FR=-0.5, FC=0.3, LFE=0.0, BL=0.1, BR=-0.1
+        let samples = vec![0.5, -0.5, 0.3, 0.0, 0.1, -0.1];
+        let result = downmix(&samples, 6, 2);
+        assert_eq!(result.len(), 2);
+        // L = FL + 0.707*FC + 0.707*BL = 0.5 + 0.2121 + 0.0707 = 0.7828
+        assert!((result[0] - 0.7828).abs() < 0.01);
+        // R = FR + 0.707*FC + 0.707*BR = -0.5 + 0.2121 + -0.0707 = -0.3586
+        assert!((result[1] - (-0.3586)).abs() < 0.01);
+    }
+
+    #[test]
+    fn downmix_i16_bytes_passthrough() {
+        let data: Vec<u8> = 1000i16
+            .to_le_bytes()
+            .iter()
+            .chain(2000i16.to_le_bytes().iter())
+            .copied()
+            .collect();
+        let result = downmix_i16_bytes(&data, 2, 2);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn downmix_i16_bytes_51_to_stereo() {
+        // One frame: FL=10000, FR=-10000, FC=5000, LFE=0, BL=2000, BR=-2000
+        let samples: Vec<i16> = vec![10000, -10000, 5000, 0, 2000, -2000];
+        let mut data = Vec::new();
+        for s in &samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let result = downmix_i16_bytes(&data, 6, 2);
+        assert_eq!(result.len(), 4); // 2 channels * 2 bytes
+        let left = i16::from_le_bytes([result[0], result[1]]);
+        let right = i16::from_le_bytes([result[2], result[3]]);
+        // L = 10000 + 0.707*5000 + 0.707*2000 = 10000 + 3535 + 1414 = 14949
+        assert!((left as f64 - 14949.0).abs() < 10.0);
+        // R = -10000 + 0.707*5000 + 0.707*(-2000) = -10000 + 3535 - 1414 = -7879
+        assert!((right as f64 - (-7879.0)).abs() < 10.0);
     }
 }
