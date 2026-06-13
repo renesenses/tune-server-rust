@@ -1003,13 +1003,12 @@ impl OutputTarget for LocalOutput {
                 let silent_cb = force_silent.clone();
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
-                // Minimum: ~200ms of audio at the output sample rate.
-                // (v0.8.97 used 20ms which was too low — macOS CoreAudio
-                // can request large buffers and underrun immediately after
-                // the gate opens, producing audible artifacts.)
+                // Minimum: ~500ms of audio at the output sample rate.
+                // (v0.8.97=20ms, v0.8.98=200ms — still too low for macOS
+                // CoreAudio which can request 1024+ frame buffers.)
                 let data_started = Arc::new(AtomicBool::new(false));
                 let data_started_cb = data_started.clone();
-                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
+                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
 
                 let stream = match device.build_output_stream(
                     &output_config,
@@ -1072,7 +1071,7 @@ impl OutputTarget for LocalOutput {
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
                 // push as much as fits (~200ms or more) before calling play().
-                let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
+                let prefill_target = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
                 let prefill_count = samples.len().min(prefill_target.max(ring.capacity() / 2));
                 let initial_written = ring.push(&samples[..prefill_count]);
 
@@ -1732,8 +1731,8 @@ impl OutputTarget for LocalOutput {
             let stream_start = std::time::Instant::now();
 
             // Pre-fill the ring buffer before starting the cpal stream.
-            // Target: ~200ms of audio so the first callback has enough data.
-            let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
+            // Target: ~500ms of audio so the first callback has enough data.
+            let prefill_target = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
             let mut stream_started = false;
 
             // Check if initial header data was enough to meet the prefill target
