@@ -68,7 +68,7 @@ fn radiofrance_channel_id(_station_name: &str, stream_url: &str) -> u32 {
 }
 
 async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<IcyMetadata> {
-    let url = format!("https://api.radiofrance.fr/livemeta/live/{channel}/now");
+    let url = format!("https://api.radiofrance.fr/livemeta/pull/{channel}");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -82,19 +82,18 @@ async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<
 
     let body: serde_json::Value = resp.json().await.ok()?;
 
-    // The API nests track info under "now.firstLine" (title) and "now.secondLine" (subtitle / artist).
-    // Alternatively "now.song.title" / "now.song.interpreters".
-    let now = body.get("now")?;
+    // New API format: levels[0].items[position] → step UUID → steps[uuid]
+    let levels = body.get("levels")?.as_array()?;
+    let level = levels.first()?;
+    let position = level.get("position")?.as_u64()? as usize;
+    let items = level.get("items")?.as_array()?;
+    let current_id = items.get(position)?.as_str()?;
+    let steps = body.get("steps")?.as_object()?;
+    let now = steps.get(current_id)?;
 
     let title = now
-        .get("firstLine")
-        .and_then(|v| v.get("title").or(Some(v)))
+        .get("title")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            now.get("song")
-                .and_then(|s| s.get("title"))
-                .and_then(|v| v.as_str())
-        })
         .unwrap_or("")
         .to_string();
 
@@ -103,8 +102,7 @@ async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<
     }
 
     let artist = now
-        .get("secondLine")
-        .and_then(|v| v.get("title").or(Some(v)))
+        .get("authors")
         .and_then(|v| v.as_str())
         .or_else(|| {
             now.get("song")
