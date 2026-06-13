@@ -180,11 +180,21 @@ impl TidalService {
             let body = resp.text().await.unwrap_or_default();
             warn!(status, body = %body, "tidal_refresh_token_rejected");
             if body.contains("invalid_client") {
-                warn!("tidal_client_id_mismatch — clearing tokens, reconnection required");
+                // Only clear the refresh_token — the access_token may still
+                // be valid and should keep working until it expires naturally.
+                // Clearing the access_token immediately kills all API calls
+                // even though the token is still accepted by Tidal.
+                // This typically happens after a CLIENT_ID change: the old
+                // refresh_token is bound to the previous client and cannot
+                // be used with the new one, but the access_token is still
+                // valid for its remaining lifetime.
+                warn!(
+                    "tidal_client_id_mismatch — clearing refresh_token, reconnection required when access_token expires"
+                );
                 let mut ts = self.tokens.lock().await;
-                ts.access_token = None;
                 ts.refresh_token = None;
-                ts.token_expires = None;
+                // Leave access_token and token_expires intact so API calls
+                // continue working until the token expires naturally.
             }
             return Err("refresh token rejected".into());
         }
