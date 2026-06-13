@@ -250,7 +250,7 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -303,7 +303,8 @@ impl OutputTarget for OaatOutput {
                 tls: false,
             };
 
-            // Connect with retry
+            // Connect with retry — retries the full connect+clock sequence
+            // to handle endpoints that close during negotiation after a track skip.
             let mut endpoint: Option<ConnectedEndpoint> = None;
             for attempt in 1..=5u32 {
                 debug!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
@@ -315,8 +316,11 @@ impl OutputTarget for OaatOutput {
                     }
                     Err(e) => {
                         if attempt < 5 {
-                            warn!(device = %device_name, error = %e, attempt, "oaat: connect failed, retry 500ms");
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            warn!(device = %device_name, error = %e, attempt, "oaat: connect failed, retry");
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                500 * attempt as u64,
+                            ))
+                            .await;
                         } else {
                             error!(device = %device_name, error = %e, "oaat: connect failed after 5 attempts");
                             playing.store(false, Ordering::SeqCst);
@@ -858,9 +862,49 @@ impl OutputTarget for OaatOutput {
                     warn!(device = %device_name, response = ?other, "oaat: unexpected response");
                 }
                 Ok(None) => {
-                    error!(device = %device_name, "oaat: endpoint closed during negotiation");
-                    playing.store(false, Ordering::SeqCst);
-                    return;
+                    warn!(device = %device_name, "oaat: endpoint closed during negotiation, reconnecting");
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    match ConnectedEndpoint::connect(&config, endpoint_addr).await {
+                        Ok(ep) => {
+                            endpoint = ep;
+                            endpoint.clock_sync_bootstrap().await.ok();
+                            if let Err(e) = endpoint
+                                .propose_format(
+                                    &stream_id,
+                                    cur_format,
+                                    cur_sample_rate,
+                                    cur_channels.min(8) as u8,
+                                    layout,
+                                    cur_bits as u8,
+                                )
+                                .await
+                            {
+                                error!(device = %device_name, error = %e, "oaat: reconnect format propose failed");
+                                playing.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                endpoint.response_rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Some(oaat_controller::EndpointResponse::FormatAccept(_))) => {
+                                    info!(device = %device_name, "oaat: format accepted after reconnect");
+                                }
+                                _ => {
+                                    error!(device = %device_name, "oaat: format negotiation failed after reconnect");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(device = %device_name, error = %e, "oaat: reconnect failed");
+                            playing.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
                 }
                 Err(_) => {
                     error!(device = %device_name, "oaat: format negotiation timed out");

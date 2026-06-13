@@ -344,19 +344,11 @@ impl QobuzService {
     /// "Studio" / "HiFi" subscriptions max out at CD quality (format_id 6).
     /// "Sublime" / "Sublime+" can access Hi-Res (format_id 27).
     fn best_format_id_for_subscription(&self) -> &str {
-        match self.subscription.as_deref() {
-            Some(sub) => {
-                let lower = sub.to_lowercase();
-                if lower.contains("sublime") {
-                    "27"
-                } else {
-                    // Studio, HiFi, Premium, or unknown → safe default to CD quality
-                    "6"
-                }
-            }
-            // No subscription info available → try Hi-Res, fallback handled by caller
-            None => "27",
-        }
+        // Always try Hi-Res (27) first — the caller falls back to CD (6) if
+        // the subscription doesn't support it. This avoids silently
+        // downsampling Hi-Res content for users whose subscription field
+        // isn't detected as "sublime".
+        "27"
     }
 
     /// Low-level fetch of a track streaming URL with a specific format_id.
