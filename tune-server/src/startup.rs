@@ -9,6 +9,7 @@ use crate::state::AppState;
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    deduplicate_zones(&state.db);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
     restore_queues(state, config);
@@ -16,6 +17,28 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(&state.db);
+}
+
+/// Remove duplicate zones (same output_device_id) and add a unique index to
+/// prevent future duplicates.  Must run before any discovery task starts.
+fn deduplicate_zones(db: &tune_core::db::sqlite::SqliteDb) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+    match zone_repo.deduplicate() {
+        Ok(removed) if removed > 0 => {
+            info!(removed, "zone_duplicates_removed");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "zone_dedup_failed");
+        }
+    }
+    // Add a unique index on output_device_id (idempotent) so duplicate zones
+    // can never be created again at the SQL level.
+    if let Err(e) = db.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
+    ) {
+        tracing::warn!(error = %e, "zone_unique_index_failed");
+    }
 }
 
 /// Restore persisted queue snapshots from JSON files on disk.
@@ -253,7 +276,6 @@ pub async fn register_local_outputs(state: &AppState) {
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-        let existing_zones = zone_repo.list().unwrap_or_default();
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
@@ -272,24 +294,29 @@ pub async fn register_local_outputs(state: &AppState) {
                 "local_audio_output_registered"
             );
 
-            let already = existing_zones
-                .iter()
-                .any(|z| z.output_device_id.as_deref() == Some(&device_id));
-            if !already {
-                let zone_name = if dev.is_default {
-                    "This Computer".to_string()
-                } else {
-                    dev.name.clone()
-                };
-                let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
-                if !name_taken
-                    && let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(&device_id))
-                {
+            let zone_name = if dev.is_default {
+                "This Computer".to_string()
+            } else {
+                dev.name.clone()
+            };
+            match zone_repo.get_or_create(&zone_name, Some("local"), &device_id) {
+                Ok((zid, true)) => {
                     info!(
                         name = %zone_name,
                         zone_id = zid,
                         device_id = %device_id,
                         "local_audio_zone_auto_created"
+                    );
+                }
+                Ok((_, false)) => {
+                    // Zone already exists for this device
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        name = %zone_name,
+                        device_id = %device_id,
+                        error = %e,
+                        "local_audio_zone_create_failed"
                     );
                 }
             }

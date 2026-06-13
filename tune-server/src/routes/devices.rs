@@ -166,18 +166,14 @@ async fn add_device(
 
                     // Auto-create zone
                     let zone_repo = ZoneRepo::new(state.db.clone());
-                    let existing = zone_repo.list().unwrap_or_default();
-                    let already = existing
-                        .iter()
-                        .any(|z| z.output_device_id.as_deref() == Some(&device_id));
-                    let zone_id = if already {
-                        let _ = zone_repo.set_online_by_device(&device_id, true);
-                        existing
-                            .iter()
-                            .find(|z| z.output_device_id.as_deref() == Some(&device_id))
-                            .and_then(|z| z.id)
-                    } else {
-                        zone_repo.create(&device_name, Some("bluos"), Some(&device_id)).ok()
+                    let zone_id = match zone_repo.get_or_create(&device_name, Some("bluos"), &device_id) {
+                        Ok((zid, created)) => {
+                            if !created {
+                                let _ = zone_repo.set_online_by_device(&device_id, true);
+                            }
+                            Some(zid)
+                        }
+                        Err(_) => None,
                     };
 
                     info!(name = %device_name, id = %device_id, host = %host, port, "manual_bluos_device_added");
@@ -247,18 +243,14 @@ async fn add_device(
 
                         // Auto-create zone
                         let zone_repo = ZoneRepo::new(state.db.clone());
-                        let existing = zone_repo.list().unwrap_or_default();
-                        let already = existing
-                            .iter()
-                            .any(|z| z.output_device_id.as_deref() == Some(&device_id));
-                        let zone_id = if already {
-                            let _ = zone_repo.set_online_by_device(&device_id, true);
-                            existing
-                                .iter()
-                                .find(|z| z.output_device_id.as_deref() == Some(&device_id))
-                                .and_then(|z| z.id)
-                        } else {
-                            zone_repo.create(&device_name, Some("dlna"), Some(&device_id)).ok()
+                        let zone_id = match zone_repo.get_or_create(&device_name, Some("dlna"), &device_id) {
+                            Ok((zid, created)) => {
+                                if !created {
+                                    let _ = zone_repo.set_online_by_device(&device_id, true);
+                                }
+                                Some(zid)
+                            }
+                            Err(_) => None,
                         };
 
                         info!(name = %device_name, id = %device_id, host = %host, port, "manual_dlna_device_added");

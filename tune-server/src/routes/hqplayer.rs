@@ -188,21 +188,22 @@ async fn discover_and_register_inner(
     // Auto-create zone if not already present
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
     let existing = zone_repo.list().unwrap_or_default();
-    let already = existing
-        .iter()
-        .any(|z| z.output_device_id.as_deref() == Some(&*device_id));
-    if already {
-        let _ = zone_repo.set_online_by_device(&device_id, true);
-        tracing::info!(name = %output_name, id = %device_id, "hqplayer_zone_reconnected");
+    let name_taken = existing.iter().any(|z| z.name == output_name);
+    let zone_name = if name_taken {
+        format!("HQPlayer ({host})")
     } else {
-        let name_taken = existing.iter().any(|z| z.name == output_name);
-        let zone_name = if name_taken {
-            format!("HQPlayer ({host})")
-        } else {
-            output_name.clone()
-        };
-        if let Ok(zid) = zone_repo.create(&zone_name, Some("hqplayer"), Some(&device_id)) {
+        output_name.clone()
+    };
+    match zone_repo.get_or_create(&zone_name, Some("hqplayer"), &device_id) {
+        Ok((zid, true)) => {
             tracing::info!(name = %zone_name, zone_id = zid, "hqplayer_zone_auto_created");
+        }
+        Ok((_, false)) => {
+            let _ = zone_repo.set_online_by_device(&device_id, true);
+            tracing::info!(name = %output_name, id = %device_id, "hqplayer_zone_reconnected");
+        }
+        Err(e) => {
+            tracing::warn!(name = %zone_name, id = %device_id, error = %e, "hqplayer_zone_create_failed");
         }
     }
 

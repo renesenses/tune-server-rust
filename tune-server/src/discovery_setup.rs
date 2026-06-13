@@ -129,11 +129,7 @@ async fn handle_ssdp_discovered(
     let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
 
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
-    let existing = zone_repo.list().unwrap_or_default();
-    let already = existing
-        .iter()
-        .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
-    if already {
+    if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
         let _ = zone_repo.set_online_by_device(&dev.id, true);
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
         event_bus.emit(
@@ -146,6 +142,7 @@ async fn handle_ssdp_discovered(
         );
     } else if !is_tv {
         let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+        let existing = zone_repo.list().unwrap_or_default();
         let name_taken = existing.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
             dev.name.clone()
@@ -157,8 +154,17 @@ async fn handle_ssdp_discovered(
         } else {
             "dlna"
         };
-        if let Ok(zid) = zone_repo.create(&zone_name, Some(type_str), Some(&dev.id)) {
-            info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "zone_auto_created");
+        match zone_repo.get_or_create(&zone_name, Some(type_str), &dev.id) {
+            Ok((zid, true)) => {
+                info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
+            }
+            Ok((zid, false)) => {
+                let _ = zone_repo.set_online_by_device(&dev.id, true);
+                info!(name = %zone_name, zone_id = zid, device = %dev.id, "ssdp_zone_already_existed");
+            }
+            Err(e) => {
+                tracing::warn!(name = %zone_name, device = %dev.id, error = %e, "ssdp_zone_create_failed");
+            }
         }
     }
 }
@@ -275,14 +281,13 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
                         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
-                        let existing = zone_repo.list().unwrap_or_default();
-                        let already_by_device = existing
-                            .iter()
-                            .any(|z| z.output_device_id.as_deref() == Some(&dev.id));
-                        if already_by_device {
+                        if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
                         } else {
+                            // Check if a zone with the same name exists but different device_id
+                            // (device_id may have changed after a firmware update / re-pairing).
+                            let existing = zone_repo.list().unwrap_or_default();
                             let same_name_zone = existing.iter().find(|z| z.name == dev.name);
                             if let Some(z) = same_name_zone
                                 && let Some(zid) = z.id
@@ -291,12 +296,21 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 let _ = zone_repo.set_online_by_device(&dev.id, true);
                                 info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                             } else {
-                                if let Ok(zid) = zone_repo.create(
+                                match zone_repo.get_or_create(
                                     &dev.name,
                                     Some(output_type_str),
-                                    Some(&dev.id),
+                                    &dev.id,
                                 ) {
-                                    info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                    Ok((zid, true)) => {
+                                        info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                    }
+                                    Ok((zid, false)) => {
+                                        let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                        info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                    }
                                 }
                             }
                         }

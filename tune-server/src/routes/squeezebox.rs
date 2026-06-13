@@ -270,7 +270,6 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
 
     let mut registered = Vec::new();
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-    let existing_zones = zone_repo.list().unwrap_or_default();
 
     for player in &players {
         let player_id = match player.get("playerid").and_then(|v| v.as_str()) {
@@ -298,20 +297,16 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
         tracing::info!(name = %player_name, id = %device_id, lms_host = %lms_host_str, lms_port, "squeezebox_output_registered");
 
         // Auto-create zone if not already present
-        let already_by_device = existing_zones
-            .iter()
-            .any(|z| z.output_device_id.as_deref() == Some(&device_id));
-        if already_by_device {
-            let _ = zone_repo.set_online_by_device(&device_id, true);
-            tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
-        } else {
-            let name_taken = existing_zones.iter().any(|z| z.name == player_name);
-            if !name_taken {
-                if let Ok(zid) =
-                    zone_repo.create(&player_name, Some("squeezebox"), Some(&device_id))
-                {
-                    tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
-                }
+        match zone_repo.get_or_create(&player_name, Some("squeezebox"), &device_id) {
+            Ok((zid, true)) => {
+                tracing::info!(name = %player_name, zone_id = zid, "squeezebox_zone_auto_created");
+            }
+            Ok((_, false)) => {
+                let _ = zone_repo.set_online_by_device(&device_id, true);
+                tracing::info!(name = %player_name, id = %device_id, "squeezebox_zone_reconnected");
+            }
+            Err(e) => {
+                tracing::warn!(name = %player_name, id = %device_id, error = %e, "squeezebox_zone_create_failed");
             }
         }
 

@@ -71,14 +71,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
 
         // Auto-create zones for discovered devices (skip if zone already exists)
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-        let existing_zones = zone_repo.list().unwrap_or_default();
         for d in &devices {
-            if !existing_zones
-                .iter()
-                .any(|z| z.output_device_id.as_deref() == Some(&d.id))
-            {
-                zone_repo.create(&d.name, Some("dlna"), Some(&d.id)).ok();
-                info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_created");
+            match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
+                Ok((zid, true)) => {
+                    info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
+                }
+                Ok((_, false)) => {
+                    let _ = zone_repo.set_online_by_device(&d.id, true);
+                }
+                Err(e) => {
+                    tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
+                }
             }
         }
 
@@ -297,17 +300,17 @@ fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
     });
 }
 
-/// Periodically re-enumerate local audio devices (every 30s) to detect USB DACs
+/// Periodically re-enumerate local audio devices (every 120s) to detect USB DACs
 /// that were plugged in after startup or took time to initialize.
 #[cfg(feature = "local-audio")]
 fn spawn_local_audio_rescan(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         // Initial delay to avoid conflicting with startup registration
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         loop {
             rescan_local_audio_devices(&state).await;
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         }
     });
 }
@@ -415,28 +418,27 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-        let existing_zones = zone_repo.list().unwrap_or_default();
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
-            let already = existing_zones
-                .iter()
-                .any(|z| z.output_device_id.as_deref() == Some(device_id.as_str()));
-            if !already {
-                let zone_name = if *is_default {
-                    "This Computer".to_string()
-                } else {
-                    dev_name.clone()
-                };
-                let name_taken = existing_zones.iter().any(|z| z.name == zone_name);
-                if !name_taken {
-                    if let Ok(zid) = zone_repo.create(&zone_name, Some("local"), Some(device_id)) {
-                        info!(
-                            name = %zone_name,
-                            zone_id = zid,
-                            device_id = %device_id,
-                            "local_audio_hotplug_zone_created"
-                        );
-                    }
+            let zone_name = if *is_default {
+                "This Computer".to_string()
+            } else {
+                dev_name.clone()
+            };
+            match zone_repo.get_or_create(&zone_name, Some("local"), device_id) {
+                Ok((zid, true)) => {
+                    info!(
+                        name = %zone_name,
+                        zone_id = zid,
+                        device_id = %device_id,
+                        "local_audio_hotplug_zone_created"
+                    );
+                }
+                Ok((_, false)) => {
+                    // Zone already exists — nothing to do
+                }
+                Err(e) => {
+                    tracing::warn!(name = %zone_name, device_id = %device_id, error = %e, "local_audio_hotplug_zone_create_failed");
                 }
             }
 

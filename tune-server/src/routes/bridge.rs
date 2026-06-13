@@ -249,7 +249,6 @@ async fn handle_devices(
     registered: &Arc<Mutex<Vec<String>>>,
 ) {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-    let existing_zones = zone_repo.list().unwrap_or_default();
 
     for dev in devices {
         let full_id = format!("bridge:{bridge_id}:{}", dev.id);
@@ -272,19 +271,16 @@ async fn handle_devices(
         registered.lock().await.push(full_id.clone());
 
         // Auto-create zone if not exists
-        let already = existing_zones
-            .iter()
-            .any(|z| z.output_device_id.as_deref() == Some(&full_id));
-        if already {
-            let _ = zone_repo.set_online_by_device(&full_id, true);
-            info!(name = %dev.name, id = %full_id, "bridge zone reconnected");
-        } else {
-            let name_taken = existing_zones.iter().any(|z| z.name == dev.name);
-            if !name_taken {
-                if let Ok(zid) = zone_repo.create(&dev.name, Some(&dev.device_type), Some(&full_id))
-                {
-                    info!(name = %dev.name, zone_id = zid, "bridge zone created");
-                }
+        match zone_repo.get_or_create(&dev.name, Some(&dev.device_type), &full_id) {
+            Ok((zid, true)) => {
+                info!(name = %dev.name, zone_id = zid, "bridge zone created");
+            }
+            Ok((_, false)) => {
+                let _ = zone_repo.set_online_by_device(&full_id, true);
+                info!(name = %dev.name, id = %full_id, "bridge zone reconnected");
+            }
+            Err(e) => {
+                tracing::warn!(name = %dev.name, id = %full_id, error = %e, "bridge zone create failed");
             }
         }
 

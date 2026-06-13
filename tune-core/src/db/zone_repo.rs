@@ -16,6 +16,13 @@ pub mod sql {
         format!("SELECT {COLS} FROM zones WHERE id = {}", d.placeholder(1))
     }
 
+    pub fn get_by_device_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT {COLS} FROM zones WHERE output_device_id = {}",
+            d.placeholder(1)
+        )
+    }
+
     pub fn list_all() -> String {
         format!("SELECT {COLS} FROM zones ORDER BY name")
     }
@@ -27,6 +34,12 @@ pub mod sql {
             d.placeholder(2),
             d.placeholder(3)
         )
+    }
+
+    /// Delete duplicate zones, keeping only the one with the lowest id for each
+    /// output_device_id. Returns the DELETE statement.
+    pub fn deduplicate() -> &'static str {
+        "DELETE FROM zones WHERE id NOT IN (SELECT MIN(id) FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id) AND output_device_id IS NOT NULL AND output_device_id IN (SELECT output_device_id FROM zones WHERE output_device_id IS NOT NULL GROUP BY output_device_id HAVING COUNT(*) > 1)"
     }
 
     pub fn update_field<D: SqlDialect>(d: &D, field: &str) -> String {
@@ -144,6 +157,19 @@ impl ZoneRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_zone))
     }
 
+    /// Look up a zone by its output device id.
+    pub fn get_by_device_id(&self, device_id: &str) -> Result<Option<Zone>, String> {
+        let sql = self.dialect_sql(sql::get_by_device_id, sql::get_by_device_id);
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        // Try read path first, fall back to strong (same pattern as list).
+        if let Some(row) = self.db.query_one(&sql, &params)? {
+            return Ok(Some(row_to_zone(&row)));
+        }
+        // Strong read to see the writer's own pending commits (WAL lag).
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.first().map(row_to_zone))
+    }
+
     pub fn list(&self) -> Result<Vec<Zone>, String> {
         // First try the read path (cheap, no contention with writes).
         // If empty, fall back to query_many_strong — under WAL the
@@ -178,6 +204,47 @@ impl ZoneRepo {
         let params: [&dyn ToSqlValue; 3] = [&name, &output_type, &output_device_id];
         self.db.execute(&create_sql, &params)?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// Atomically get an existing zone by output_device_id, or create a new one.
+    /// Returns `(zone_id, created)` where `created` is true if a new zone was inserted.
+    ///
+    /// If a concurrent writer inserts the same device_id between our check and
+    /// our INSERT (race), the UNIQUE index will reject the INSERT.  We catch
+    /// that and return the existing zone instead of propagating the error.
+    pub fn get_or_create(
+        &self,
+        name: &str,
+        output_type: Option<&str>,
+        output_device_id: &str,
+    ) -> Result<(i64, bool), String> {
+        // Check if a zone with this device_id already exists.
+        if let Some(existing) = self.get_by_device_id(output_device_id)? {
+            if let Some(id) = existing.id {
+                return Ok((id, false));
+            }
+        }
+        // No existing zone — try to create one.
+        match self.create(name, output_type, Some(output_device_id)) {
+            Ok(id) => Ok((id, true)),
+            Err(e) if e.contains("UNIQUE constraint failed") => {
+                // Race: another thread inserted the same device_id between our
+                // check and our INSERT.  Return the existing zone.
+                if let Some(existing) = self.get_by_device_id(output_device_id)? {
+                    if let Some(id) = existing.id {
+                        return Ok((id, false));
+                    }
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove duplicate zones that share the same output_device_id, keeping only
+    /// the one with the lowest id. Returns the number of duplicates removed.
+    pub fn deduplicate(&self) -> Result<usize, String> {
+        self.db.execute(sql::deduplicate(), &[])
     }
 
     pub fn update_volume(&self, id: i64, volume: i32) -> Result<(), String> {
@@ -533,6 +600,79 @@ mod tests {
         let zones_after_commit = repo.list().unwrap();
         assert_eq!(zones_after_commit.len(), 1);
         assert_eq!(zones_after_commit[0].name, "Living Room");
+    }
+
+    #[test]
+    fn get_or_create_idempotent() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let (id1, created1) = repo
+            .get_or_create("Living Room", Some("dlna"), "uuid:123")
+            .unwrap();
+        assert!(created1);
+
+        let (id2, created2) = repo
+            .get_or_create("Living Room", Some("dlna"), "uuid:123")
+            .unwrap();
+        assert!(!created2);
+        assert_eq!(id1, id2);
+
+        // Only 1 zone should exist
+        assert_eq!(repo.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn get_by_device_id() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        repo.create("Zone A", Some("dlna"), Some("uuid:aaa"))
+            .unwrap();
+        repo.create("Zone B", Some("dlna"), Some("uuid:bbb"))
+            .unwrap();
+
+        let found = repo.get_by_device_id("uuid:aaa").unwrap().unwrap();
+        assert_eq!(found.name, "Zone A");
+
+        let found_b = repo.get_by_device_id("uuid:bbb").unwrap().unwrap();
+        assert_eq!(found_b.name, "Zone B");
+
+        assert!(repo.get_by_device_id("uuid:nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn deduplicate_removes_extra_zones() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        // Simulate the bug: 3 zones with the same device_id
+        repo.create("Zone A", Some("dlna"), Some("uuid:123"))
+            .unwrap();
+        repo.create("Zone A", Some("dlna"), Some("uuid:123"))
+            .unwrap();
+        repo.create("Zone A", Some("dlna"), Some("uuid:123"))
+            .unwrap();
+        // Plus a unique zone
+        repo.create("Zone B", Some("dlna"), Some("uuid:456"))
+            .unwrap();
+        // Plus a zone with no device (manual zone)
+        repo.create("Zone C", None, None).unwrap();
+
+        assert_eq!(repo.count().unwrap(), 5);
+
+        let removed = repo.deduplicate().unwrap();
+        assert_eq!(removed, 2); // 2 duplicate uuid:123 entries removed
+
+        assert_eq!(repo.count().unwrap(), 3); // 1 uuid:123 + 1 uuid:456 + 1 no-device
+
+        // The remaining uuid:123 zone should be the one with lowest id
+        let zones = repo.list().unwrap();
+        let z123: Vec<_> = zones
+            .iter()
+            .filter(|z| z.output_device_id.as_deref() == Some("uuid:123"))
+            .collect();
+        assert_eq!(z123.len(), 1);
     }
 
     #[test]
