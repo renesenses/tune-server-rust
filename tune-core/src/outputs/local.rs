@@ -440,6 +440,25 @@ impl RingBuf {
         (w.wrapping_sub(r)) as usize
     }
 
+    /// Reset the ring buffer: zero out the underlying storage and reset
+    /// the read/write cursors.  Called on track change to ensure no stale
+    /// PCM data from a previous track leaks into the new one.
+    pub fn clear(&self) {
+        // Reset cursors first so the reader sees an empty buffer
+        self.read.store(0, Ordering::SeqCst);
+        self.write.store(0, Ordering::SeqCst);
+        // Zero-fill the underlying storage to eliminate stale samples.
+        // Safety: single-threaded clear (called before the cpal callback
+        // starts reading from a freshly created ring buffer).
+        let cap = self.buf.len();
+        unsafe {
+            let ptr = self.buf.as_ptr() as *mut f32;
+            for i in 0..cap {
+                *ptr.add(i) = 0.0;
+            }
+        }
+    }
+
     /// Push samples into the ring buffer. Returns number actually written.
     pub fn push(&self, samples: &[f32]) -> usize {
         let cap = self.capacity();
@@ -774,6 +793,13 @@ impl OutputTarget for LocalOutput {
     ) -> Result<(), String> {
         self.stop().await.ok();
 
+        // Brief pause after stopping the old stream to allow the OS audio
+        // subsystem (CoreAudio / WASAPI / ALSA) to fully release the device.
+        // Without this, reopening the device immediately can cause the first
+        // few hundred milliseconds of the new stream to contain stale data
+        // from the previous session, perceived as white noise / static.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         // Create a FRESH force_silent flag for the new stream.
         // The old stream's callback keeps its clone of the previous Arc
         // (which was set to true by stop()), so it stays silent.
@@ -953,10 +979,17 @@ impl OutputTarget for LocalOutput {
 
                 let ring_cap = (output_sr as usize) * (output_ch as usize) * 2;
                 let ring = Arc::new(RingBuf::new(ring_cap));
+                ring.clear(); // Defensive: zero-fill before callback can read
                 let ring_cb = ring.clone();
                 let vol_cb = volume.clone();
                 let paused_cb = paused.clone();
                 let silent_cb = force_silent.clone();
+                // Gate: output silence until enough real data has been buffered.
+                // Prevents stale/garbage audio during track transitions.
+                // Minimum: ~20ms of audio at the output sample rate.
+                let data_started = Arc::new(AtomicBool::new(false));
+                let data_started_cb = data_started.clone();
+                let min_buffer_samples = (output_sr as usize) * (output_ch as usize) / 50; // ~20ms
 
                 let stream = match device.build_output_stream(
                     &output_config,
@@ -964,6 +997,17 @@ impl OutputTarget for LocalOutput {
                         if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
                             data.fill(0.0);
                             return;
+                        }
+                        // Wait for a minimum amount of data before starting
+                        // to read from the ring buffer. This prevents the
+                        // audio device from playing stale/garbage samples
+                        // during track transitions.
+                        if !data_started_cb.load(Ordering::Acquire) {
+                            if ring_cb.available() < min_buffer_samples {
+                                data.fill(0.0);
+                                return;
+                            }
+                            data_started_cb.store(true, Ordering::Release);
                         }
                         let read = ring_cb.pop(data);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -1062,6 +1106,7 @@ impl OutputTarget for LocalOutput {
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
                 let ring = Arc::new(RingBuf::new(ring_cap));
+                ring.clear(); // Defensive: zero-fill before callback reads
 
                 let exclusive = match ExclusiveOutput::new(
                     &device_name,
@@ -1204,6 +1249,7 @@ impl OutputTarget for LocalOutput {
                 // Ring buffer: ~2 seconds of audio at source sample rate
                 let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
                 let ring = Arc::new(RingBuf::new(ring_cap));
+                ring.clear(); // Defensive: zero-fill before callback reads
 
                 let exclusive = match AsioExclusiveOutput::new(
                     &device_name,
@@ -1365,18 +1411,35 @@ impl OutputTarget for LocalOutput {
             // device default if the device rejects the source sample rate
             // (common on Windows where WASAPI shared mode locks to 48 kHz).
             let silent_cb_outer = force_silent.clone();
+            // Gate: the cpal callback outputs silence until enough real data
+            // has been buffered in the ring buffer.  This prevents stale or
+            // garbage audio from reaching the DAC during track transitions.
+            let data_started_shared = Arc::new(AtomicBool::new(false));
             let build_stream = |cfg: &cpal::StreamConfig,
                                 ring_cb: Arc<RingBuf>,
                                 vol_cb: Arc<AtomicU32>,
                                 paused_cb: Arc<AtomicBool>,
                                 _finished_cb: Arc<AtomicBool>,
-                                silent_cb: Arc<AtomicBool>| {
+                                silent_cb: Arc<AtomicBool>,
+                                ds_cb: Arc<AtomicBool>,
+                                min_buf: usize| {
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                         if paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed) {
                             data.fill(0.0);
                             return;
+                        }
+                        // Wait for a minimum amount of data before starting
+                        // to read from the ring buffer. This prevents the
+                        // audio device from playing stale/garbage samples
+                        // during track transitions.
+                        if !ds_cb.load(Ordering::Acquire) {
+                            if ring_cb.available() < min_buf {
+                                data.fill(0.0);
+                                return;
+                            }
+                            ds_cb.store(true, Ordering::Release);
                         }
                         let read = ring_cb.pop(data);
                         let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -1398,6 +1461,10 @@ impl OutputTarget for LocalOutput {
             let ring_cap_preferred =
                 (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) * 2;
             let ring_preferred = Arc::new(RingBuf::new(ring_cap_preferred));
+            ring_preferred.clear(); // Defensive: zero-fill before callback can read
+            // Minimum buffer: ~20ms of audio before the callback starts reading
+            let min_buffer_preferred =
+                (preferred_config.sample_rate as usize) * (preferred_config.channels as usize) / 50;
             let stream_result = build_stream(
                 &preferred_config,
                 ring_preferred.clone(),
@@ -1405,6 +1472,8 @@ impl OutputTarget for LocalOutput {
                 paused.clone(),
                 finished_flag.clone(),
                 silent_cb_outer.clone(),
+                data_started_shared.clone(),
+                min_buffer_preferred,
             );
 
             let (stream, actual_config, ring) = match stream_result {
@@ -1423,6 +1492,12 @@ impl OutputTarget for LocalOutput {
                                 * (default_cfg.channels as usize)
                                 * 2;
                             let ring_fb = Arc::new(RingBuf::new(ring_cap_fb));
+                            ring_fb.clear(); // Defensive: zero-fill
+                            // Reset data_started for the fallback config
+                            data_started_shared.store(false, Ordering::SeqCst);
+                            let min_buffer_fb = (default_cfg.sample_rate as usize)
+                                * (default_cfg.channels as usize)
+                                / 50; // ~20ms
                             match build_stream(
                                 &default_cfg,
                                 ring_fb.clone(),
@@ -1430,6 +1505,8 @@ impl OutputTarget for LocalOutput {
                                 paused.clone(),
                                 finished_flag.clone(),
                                 silent_cb_outer.clone(),
+                                data_started_shared.clone(),
+                                min_buffer_fb,
                             ) {
                                 Ok(s) => (s, default_cfg, ring_fb),
                                 Err(second_err) => {
@@ -2405,6 +2482,24 @@ mod tests {
         let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         assert_eq!(ring.push(&data), 4); // only 4 fit
         assert_eq!(ring.available(), 4);
+    }
+
+    #[test]
+    fn test_ring_buffer_clear() {
+        let ring = RingBuf::new(16);
+        let data = [1.0f32, 2.0, 3.0, 4.0];
+        ring.push(&data);
+        assert_eq!(ring.available(), 4);
+
+        ring.clear();
+        assert_eq!(ring.available(), 0);
+
+        // After clear, reading should return zeros
+        let mut out = [0.0f32; 4];
+        ring.push(&[5.0, 6.0]);
+        assert_eq!(ring.pop(&mut out), 2);
+        assert_eq!(out[0], 5.0);
+        assert_eq!(out[1], 6.0);
     }
 
     #[test]
