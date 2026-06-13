@@ -250,7 +250,7 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -306,7 +306,7 @@ impl OutputTarget for OaatOutput {
             // Connect with retry — retries the full connect+clock sequence
             // to handle endpoints that close during negotiation after a track skip.
             let mut endpoint: Option<ConnectedEndpoint> = None;
-            for attempt in 1..=5u32 {
+            for attempt in 1..=15u32 {
                 debug!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
@@ -315,14 +315,12 @@ impl OutputTarget for OaatOutput {
                         break;
                     }
                     Err(e) => {
-                        if attempt < 5 {
-                            warn!(device = %device_name, error = %e, attempt, "oaat: connect failed, retry");
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                500 * attempt as u64,
-                            ))
-                            .await;
+                        if attempt < 15 {
+                            let delay = 300 + 200 * attempt as u64;
+                            debug!(device = %device_name, error = %e, attempt, delay_ms = delay, "oaat: connect retry");
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         } else {
-                            error!(device = %device_name, error = %e, "oaat: connect failed after 5 attempts");
+                            error!(device = %device_name, error = %e, "oaat: connect failed after 15 attempts");
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
