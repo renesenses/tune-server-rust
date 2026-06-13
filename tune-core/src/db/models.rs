@@ -151,6 +151,16 @@ pub struct Track {
 }
 
 impl Track {
+    /// Serialize to JSON with computed fields (`channel_badge`).
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        if let Some(obj) = v.as_object_mut() {
+            let badge = crate::audio::channels::channel_badge(self.channels as u16);
+            obj.insert("channel_badge".into(), serde_json::json!(badge));
+        }
+        v
+    }
+
     pub fn new(title: String) -> Self {
         Self {
             id: None,

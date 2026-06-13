@@ -1,6 +1,7 @@
 pub mod aiff;
 pub mod analyzer;
 pub mod ape;
+pub mod channels;
 pub mod decode;
 pub mod dff;
 pub mod dsd_to_pcm;

@@ -92,6 +92,8 @@ pub struct AudioCapabilities {
     pub max_sample_rate: u32,
     pub max_bit_depth: u16,
     pub supports_gapless: bool,
+    /// Maximum number of audio channels the target supports (default: 2 = stereo).
+    pub max_channels: u16,
 }
 
 pub fn dlna_capabilities() -> AudioCapabilities {
@@ -105,6 +107,75 @@ pub fn dlna_capabilities() -> AudioCapabilities {
         max_sample_rate: 192000,
         max_bit_depth: 24,
         supports_gapless: true,
+        max_channels: 2,
+    }
+}
+
+pub fn airplay_capabilities() -> AudioCapabilities {
+    AudioCapabilities {
+        formats: vec![AudioFormat::Alac, AudioFormat::Aac],
+        max_sample_rate: 44100,
+        max_bit_depth: 16,
+        supports_gapless: true,
+        max_channels: 2,
+    }
+}
+
+pub fn chromecast_capabilities() -> AudioCapabilities {
+    AudioCapabilities {
+        formats: vec![
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Ogg,
+        ],
+        max_sample_rate: 96000,
+        max_bit_depth: 24,
+        supports_gapless: true,
+        max_channels: 2,
+    }
+}
+
+pub fn bluos_capabilities() -> AudioCapabilities {
+    AudioCapabilities {
+        formats: vec![
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Ogg,
+        ],
+        max_sample_rate: 192000,
+        max_bit_depth: 24,
+        supports_gapless: false,
+        max_channels: 2,
+    }
+}
+
+pub fn squeezebox_capabilities() -> AudioCapabilities {
+    AudioCapabilities {
+        formats: vec![
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aac,
+            AudioFormat::Ogg,
+        ],
+        max_sample_rate: 192000,
+        max_bit_depth: 24,
+        supports_gapless: true,
+        max_channels: 2,
+    }
+}
+
+pub fn local_capabilities() -> AudioCapabilities {
+    AudioCapabilities {
+        formats: vec![AudioFormat::Wav],
+        max_sample_rate: 384000,
+        max_bit_depth: 32,
+        supports_gapless: true,
+        max_channels: 2,
     }
 }
 
@@ -114,9 +185,41 @@ pub fn can_passthrough(
     source_bit_depth: u16,
     target: &AudioCapabilities,
 ) -> bool {
-    target.formats.contains(&source_format)
-        && source_sample_rate <= target.max_sample_rate
-        && source_bit_depth <= target.max_bit_depth
+    can_passthrough_with_channels(
+        source_format,
+        source_sample_rate,
+        source_bit_depth,
+        2,
+        target,
+    )
+}
+
+/// Check if the source can be passed through to the target without transcoding,
+/// taking channel count into account.
+pub fn can_passthrough_with_channels(
+    source_format: AudioFormat,
+    source_sample_rate: u32,
+    source_bit_depth: u16,
+    source_channels: u16,
+    target: &AudioCapabilities,
+) -> bool {
+    if !target.formats.contains(&source_format) {
+        return false;
+    }
+    if source_channels > target.max_channels {
+        return false;
+    }
+    // DSD is 1-bit at MHz rates -- skip normal rate/depth checks
+    if source_format == AudioFormat::Dsd {
+        return true;
+    }
+    if source_sample_rate > target.max_sample_rate {
+        return false;
+    }
+    if source_bit_depth > target.max_bit_depth {
+        return false;
+    }
+    true
 }
 
 impl AudioFormat {
@@ -203,7 +306,13 @@ pub fn best_output_format(
     source_bit_depth: u16,
     target: &AudioCapabilities,
 ) -> AudioFormat {
-    if can_passthrough(source_format, source_sample_rate, source_bit_depth, target) {
+    if can_passthrough_with_channels(
+        source_format,
+        source_sample_rate,
+        source_bit_depth,
+        2,
+        target,
+    ) {
         return source_format;
     }
     let preferred = [
@@ -568,5 +677,94 @@ mod tests {
     #[test]
     fn dsd512_sample_rate() {
         assert_eq!(AudioFormat::Dsd.dsd_output_sample_rate(22_579_200), 352_800);
+    }
+
+    // --- Multichannel tests ---
+
+    #[test]
+    fn dlna_capabilities_has_max_channels() {
+        let caps = dlna_capabilities();
+        assert_eq!(caps.max_channels, 2);
+    }
+
+    #[test]
+    fn airplay_capabilities_check() {
+        let caps = airplay_capabilities();
+        assert!(caps.formats.contains(&AudioFormat::Alac));
+        assert_eq!(caps.max_sample_rate, 44100);
+        assert_eq!(caps.max_channels, 2);
+    }
+
+    #[test]
+    fn chromecast_capabilities_check() {
+        let caps = chromecast_capabilities();
+        assert!(caps.formats.contains(&AudioFormat::Ogg));
+        assert_eq!(caps.max_sample_rate, 96000);
+        assert_eq!(caps.max_channels, 2);
+    }
+
+    #[test]
+    fn local_capabilities_check() {
+        let caps = local_capabilities();
+        assert_eq!(caps.max_sample_rate, 384000);
+        assert_eq!(caps.max_bit_depth, 32);
+        assert_eq!(caps.max_channels, 2);
+    }
+
+    #[test]
+    fn passthrough_multichannel_rejected() {
+        let caps = dlna_capabilities(); // max_channels = 2
+        // 6-channel FLAC should NOT pass through a stereo-only renderer
+        assert!(!can_passthrough_with_channels(
+            AudioFormat::Flac,
+            44100,
+            16,
+            6,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn passthrough_multichannel_accepted() {
+        let mut caps = dlna_capabilities();
+        caps.max_channels = 8; // AVR with 7.1
+        // 6-channel FLAC should pass through an 8-channel renderer
+        assert!(can_passthrough_with_channels(
+            AudioFormat::Flac,
+            44100,
+            16,
+            6,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn passthrough_dsd_multichannel() {
+        let mut caps = dlna_capabilities();
+        caps.max_channels = 6;
+        caps.formats.push(AudioFormat::Dsd);
+        // DSD multichannel should pass through if channels fit
+        assert!(can_passthrough_with_channels(
+            AudioFormat::Dsd,
+            2_822_400,
+            1,
+            6,
+            &caps
+        ));
+        // But not if exceeds max
+        assert!(!can_passthrough_with_channels(
+            AudioFormat::Dsd,
+            2_822_400,
+            1,
+            8,
+            &caps
+        ));
+    }
+
+    #[test]
+    fn backward_compat_can_passthrough() {
+        // Existing can_passthrough (without channels) defaults to 2ch
+        let caps = dlna_capabilities();
+        assert!(can_passthrough(AudioFormat::Flac, 96000, 24, &caps));
     }
 }
