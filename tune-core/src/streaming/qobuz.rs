@@ -703,7 +703,7 @@ impl StreamingService for QobuzService {
         let data = self
             .api_get(
                 "/album/getFeatured",
-                &[("type", "new-releases"), ("limit", "50")],
+                &[("type", "new-releases"), ("limit", "200")],
             )
             .await?;
         let albums = data["albums"]["items"]
