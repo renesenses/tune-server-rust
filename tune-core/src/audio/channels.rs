@@ -1,7 +1,7 @@
 //! Multichannel audio support: layout enum, device detection, downmix matrices.
 //!
 //! Ported from Python `tune_server/audio/formats.py` (feat/multichannel branch).
-//! Supports up to 16 channels (9.1.6 Auro-3D).
+//! Supports up to 32 channels (Trinnov Altitude).
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,10 @@ pub enum ChannelLayout {
     Surround714,
     /// 16 channels — 9.1.6 Auro-3D
     Surround916,
+    /// 24 channels — 13.1.10 or custom immersive
+    Immersive24,
+    /// 32 channels — Trinnov Altitude / custom processor
+    Immersive32,
 }
 
 impl ChannelLayout {
@@ -40,6 +44,8 @@ impl ChannelLayout {
             Self::Surround514 => 10,
             Self::Surround714 => 12,
             Self::Surround916 => 16,
+            Self::Immersive24 => 24,
+            Self::Immersive32 => 32,
         }
     }
 
@@ -52,7 +58,9 @@ impl ChannelLayout {
             7 | 8 => Self::Surround71,
             9 | 10 => Self::Surround514,
             11 | 12 => Self::Surround714,
-            _ => Self::Surround916,
+            13..=16 => Self::Surround916,
+            17..=24 => Self::Immersive24,
+            _ => Self::Immersive32,
         }
     }
 
@@ -66,6 +74,8 @@ impl ChannelLayout {
             Self::Surround514 => Some("5.1.4"),
             Self::Surround714 => Some("7.1.4 Atmos"),
             Self::Surround916 => Some("9.1.6 Auro-3D"),
+            Self::Immersive24 => Some("Immersive 24ch"),
+            Self::Immersive32 => Some("Immersive 32ch"),
         }
     }
 
@@ -88,6 +98,13 @@ pub fn channel_badge(channels: u16) -> Option<&'static str> {
 /// Known multichannel-capable device name/model patterns (case-insensitive)
 /// with their maximum supported channel count.
 const MULTICHANNEL_CAPABLE_PATTERNS: &[(&str, u16)] = &[
+    ("trinnov", 32),
+    ("altitude", 32),
+    ("datasat", 32),
+    ("storm audio", 24),
+    ("stormaudio", 24),
+    ("jbl synthesis", 16),
+    ("lyngdorf", 16),
     ("marantz", 8),
     ("denon", 8),
     ("yamaha", 8),
@@ -96,6 +113,8 @@ const MULTICHANNEL_CAPABLE_PATTERNS: &[(&str, u16)] = &[
     ("nad", 8),
     ("anthem", 8),
     ("arcam", 8),
+    ("emotiva", 8),
+    ("monoprice", 8),
     ("sonos arc", 6),
     ("sonos beam", 6),
     ("samsung", 6),
