@@ -168,7 +168,6 @@ pub fn can_decode_native(file_path: &str) -> bool {
             | "dff"
             | "wv"
             | "ape"
-            | "wma"
     )
 }
 
@@ -1167,7 +1166,7 @@ mod decode_integration_tests {
         assert!(can_decode_native("song.dff"));
         assert!(can_decode_native("song.ape"));
         assert!(can_decode_native("song.wv"));
-        assert!(can_decode_native("song.wma"));
+        assert!(!can_decode_native("song.wma")); // WMA requires external FFmpeg
     }
 
     #[test]
