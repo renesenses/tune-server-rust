@@ -179,6 +179,13 @@ impl TidalService {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             warn!(status, body = %body, "tidal_refresh_token_rejected");
+            if body.contains("invalid_client") {
+                warn!("tidal_client_id_mismatch — clearing tokens, reconnection required");
+                let mut ts = self.tokens.lock().await;
+                ts.access_token = None;
+                ts.refresh_token = None;
+                ts.token_expires = None;
+            }
             return Err("refresh token rejected".into());
         }
 
