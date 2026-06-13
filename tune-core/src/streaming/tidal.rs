@@ -12,8 +12,8 @@ use super::traits::*;
 
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
-const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
+const CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
+const CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenResponse {
