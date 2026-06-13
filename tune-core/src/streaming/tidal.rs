@@ -181,22 +181,18 @@ impl TidalService {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             warn!(status, body = %body, "tidal_refresh_token_rejected");
-            if body.contains("invalid_client") {
-                // Only clear the refresh_token — the access_token may still
-                // be valid and should keep working until it expires naturally.
-                // Clearing the access_token immediately kills all API calls
-                // even though the token is still accepted by Tidal.
-                // This typically happens after a CLIENT_ID change: the old
-                // refresh_token is bound to the previous client and cannot
-                // be used with the new one, but the access_token is still
-                // valid for its remaining lifetime.
+            if status >= 400 && status < 500 {
+                // Any 4xx from the token endpoint means the refresh_token is
+                // permanently invalid (wrong client_id, revoked, expired).
+                // Clear both tokens so auth_status reports unauthenticated
+                // and the user sees "reconnect" in the UI.
                 warn!(
-                    "tidal_client_id_mismatch — clearing refresh_token, reconnection required when access_token expires"
+                    "tidal_refresh_permanently_failed — clearing all tokens, reconnection required"
                 );
                 let mut ts = self.tokens.lock().await;
                 ts.refresh_token = None;
-                // Leave access_token and token_expires intact so API calls
-                // continue working until the token expires naturally.
+                ts.access_token = None;
+                ts.token_expires = None;
             }
             return Err("refresh token rejected".into());
         }
@@ -768,7 +764,7 @@ impl StreamingService for TidalService {
         let token_expired = ts
             .token_expires
             .map(|t| Instant::now() > t)
-            .unwrap_or(false);
+            .unwrap_or(ts.refresh_token.is_none());
         let effectively_authenticated =
             ts.access_token.is_some() && (!token_expired || ts.refresh_token.is_some());
         AuthStatus {
