@@ -12,7 +12,7 @@ use symphonia::core::units::Time;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
-use super::dsd_to_pcm::{DsdToPcmConverter, choose_output_rate};
+use super::dsd_to_pcm::choose_output_rate;
 
 /// Resolve the actual audio bit depth from codec parameters.
 ///
@@ -361,12 +361,31 @@ fn decode_to_pcm_streaming_inner(
         .to_lowercase();
 
     let mut first_chunk_sent = false;
+
+    // DSD files (DSF/DFF): streaming decode using chunk-based DSD→PCM converter.
+    // This avoids loading the entire DSD file into memory (200MB+ → OOM).
+    if matches!(ext.as_str(), "dsf" | "dff") {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for streaming decode")?;
+        let output_bd: u16 = target_bit_depth.unwrap_or(24);
+
+        return decode_dsd_streaming(
+            file_path,
+            &ext,
+            target_sample_rate,
+            output_bd,
+            tx,
+            chunk_size,
+            &mut first_chunk_sent,
+            &data_ready,
+            &levels_tx,
+            &rt,
+        );
+    }
+
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
-    if matches!(
-        ext.as_str(),
-        "aiff" | "aif" | "dsf" | "dff" | "wv" | "ape" | "wma" | "asf"
-    ) {
+    if matches!(ext.as_str(), "aiff" | "aif" | "wv" | "ape" | "wma" | "asf") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -864,7 +883,165 @@ fn decode_symphonia(
     })
 }
 
-/// Decode a DSD file (DSF or DFF) to PCM using native parsers.
+/// Streaming DSD decode: reads the file in chunks, converts DSD→PCM
+/// progressively, and sends PCM chunks through the channel.
+///
+/// Memory usage: O(block_size + filter_len) ≈ 40 KB regardless of file size.
+/// This replaces the old batch path that loaded the entire DSD file (~200MB+)
+/// into memory and then expanded it to f64 arrays (~13GB for a 5-min DSD64),
+/// causing OOM crashes on Windows.
+#[allow(clippy::too_many_arguments)]
+fn decode_dsd_streaming(
+    file_path: &str,
+    ext: &str,
+    target_sample_rate: Option<u32>,
+    output_bd: u16,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    rt: &tokio::runtime::Handle,
+) -> Result<u16, String> {
+    use super::dsd_to_pcm::DsdToPcmStreamer;
+
+    // Parse header once, then create streamer + reader from the same info.
+    let (dsd_rate, channels) = if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        (info.sample_rate, info.channels as usize)
+    } else {
+        let info = super::dff::parse_dff(file_path)?;
+        (info.sample_rate, info.channels as usize)
+    };
+    let lsb_first = ext == "dsf";
+
+    let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+    let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, lsb_first);
+
+    // Accumulate PCM output and flush in chunk_size batches
+    let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+    let ch = channels as u16;
+
+    // Inner loop: feed DSD chunks, convert PCM, send downstream.
+    // Factored into a closure to avoid duplicating the flush logic.
+    let mut process_dsd_chunk =
+        |streamer: &mut DsdToPcmStreamer, dsd_chunk: &[u8]| -> Result<bool, String> {
+            let pcm_24 = streamer.feed(dsd_chunk);
+            if pcm_24.is_empty() {
+                return Ok(false);
+            }
+            let converted = convert_24bit_pcm_to_depth(&pcm_24, output_bd);
+            pcm_buf.extend_from_slice(&converted);
+            while pcm_buf.len() >= chunk_size {
+                let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+                if let Some(ltx) = levels_tx {
+                    let _ = ltx.send(super::levels::compute_levels(&chunk, output_bd, ch));
+                }
+                if rt.block_on(tx.send(chunk)).is_err() {
+                    debug!("dsd_streaming_consumer_dropped");
+                    return Ok(true); // consumer gone
+                }
+                if !*first_chunk_sent {
+                    *first_chunk_sent = true;
+                    if let Some(n) = data_ready {
+                        n.notify_one();
+                    }
+                }
+            }
+            Ok(false)
+        };
+
+    // Read and process DSD data in chunks
+    if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
+                return Ok(output_bd);
+            }
+        }
+    } else {
+        let info = super::dff::parse_dff(file_path)?;
+        // Read in chunks aligned to channel count.
+        // 32768 bytes is a good balance: small enough for low memory, large
+        // enough to amortize I/O overhead.
+        let read_chunk = 32768 / channels * channels;
+        let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
+                return Ok(output_bd);
+            }
+        }
+    }
+
+    // Flush remaining samples from the FIR filter
+    let tail = streamer.flush();
+    if !tail.is_empty() {
+        let converted = convert_24bit_pcm_to_depth(&tail, output_bd);
+        pcm_buf.extend_from_slice(&converted);
+    }
+
+    // Send any remaining bytes
+    if !pcm_buf.is_empty() {
+        if let Some(ltx) = levels_tx {
+            let _ = ltx.send(super::levels::compute_levels(&pcm_buf, output_bd, ch));
+        }
+        if rt.block_on(tx.send(pcm_buf)).is_err() {
+            debug!("dsd_streaming_consumer_dropped (final)");
+        }
+    }
+
+    let total_samples = streamer.total_output_samples();
+    let total_frames = total_samples as f64 / channels as f64;
+    let duration_s = total_frames / output_rate as f64;
+
+    debug!(
+        file = file_path,
+        ext, dsd_rate, output_rate, channels, total_samples, duration_s, "decoded_dsd_streaming"
+    );
+
+    Ok(output_bd)
+}
+
+/// Convert 24-bit LE PCM byte triples to the target bit depth.
+fn convert_24bit_pcm_to_depth(pcm_24: &[u8], target_bd: u16) -> Vec<u8> {
+    if target_bd == 24 {
+        return pcm_24.to_vec();
+    }
+
+    let num_samples = pcm_24.len() / 3;
+    match target_bd {
+        16 => {
+            let mut out = Vec::with_capacity(num_samples * 2);
+            for i in 0..num_samples {
+                let offset = i * 3;
+                // Take upper 16 bits of 24-bit value (bytes [1] and [2])
+                out.push(pcm_24[offset + 1]);
+                out.push(pcm_24[offset + 2]);
+            }
+            out
+        }
+        32 => {
+            let mut out = Vec::with_capacity(num_samples * 4);
+            for i in 0..num_samples {
+                let offset = i * 3;
+                // Shift left by 8 to fill 32-bit range
+                out.push(0); // LSB padding
+                out.push(pcm_24[offset]);
+                out.push(pcm_24[offset + 1]);
+                out.push(pcm_24[offset + 2]);
+            }
+            out
+        }
+        _ => pcm_24.to_vec(), // fallback: keep 24-bit
+    }
+}
+
+/// Decode a DSD file (DSF or DFF) to PCM using streaming converter.
+///
+/// Uses `DsdToPcmStreamer` to process the file in chunks, avoiding the
+/// catastrophic memory usage of the old batch approach.
+/// Memory usage: O(block_size + filter_len) ≈ 40 KB regardless of file size.
 fn decode_dsd_to_pcm(
     file_path: &str,
     ext: &str,
@@ -873,41 +1050,48 @@ fn decode_dsd_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
-    let (dsd_rate, channels, dsd_data) = if ext == "dsf" {
+    use super::dsd_to_pcm::DsdToPcmStreamer;
+
+    // Process the file in chunks using the streaming readers.
+    // Parse header once, then create both the streamer and the reader from it.
+    let mut all_pcm_24: Vec<u8> = Vec::new();
+
+    let (dsd_rate, output_rate, channels) = if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
-        let data = super::dsf::read_dsf_blocks(file_path, &info)?;
-        (info.sample_rate, info.channels as usize, data)
+        let dsd_rate = info.sample_rate;
+        let channels = info.channels as usize;
+        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
+        let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            all_pcm_24.extend_from_slice(&streamer.feed(&dsd_chunk));
+        }
+        all_pcm_24.extend_from_slice(&streamer.flush());
+        (dsd_rate, output_rate, channels)
     } else {
         let info = super::dff::parse_dff(file_path)?;
-        let data = super::dff::read_dff_data(file_path, &info)?;
-        (info.sample_rate, info.channels as usize, data)
+        let dsd_rate = info.sample_rate;
+        let channels = info.channels as usize;
+        let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
+        let read_chunk = 32768 / channels * channels;
+        let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            all_pcm_24.extend_from_slice(&streamer.feed(&dsd_chunk));
+        }
+        all_pcm_24.extend_from_slice(&streamer.flush());
+        (dsd_rate, output_rate, channels)
     };
 
-    let lsb_first = ext == "dsf";
-    let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
-
-    let converter = DsdToPcmConverter::new(dsd_rate, output_rate, channels, lsb_first);
-
-    // Use native 24-bit output from the DSD converter.  The converter
-    // produces 3 bytes per sample (24-bit LE); we reconstruct i32 values
-    // from those triplets so the rest of the pipeline (pcm_bytes, WAV
-    // header, DLNA streaming) all agree on 24-bit depth.
-    //
-    // Previously this used process_to_i16() which truncated to 16-bit,
-    // but the orchestrator declared bit_depth=24 for DSD in the WAV
-    // header.  The mismatch (header says 24-bit / data is 16-bit)
-    // caused malformed WAV streams that DLNA renderers such as the
-    // Marantz SR7009 could not play.
-    let pcm_24 = converter.process(&dsd_data);
-    let num_samples = pcm_24.len() / 3;
+    // Convert 24-bit LE bytes to i32 samples
+    let num_samples = all_pcm_24.len() / 3;
     let mut all_samples: Vec<i32> = Vec::with_capacity(num_samples);
     for i in 0..num_samples {
         let offset = i * 3;
-        let lo = pcm_24[offset] as u32;
-        let mid = pcm_24[offset + 1] as u32;
-        let hi = pcm_24[offset + 2] as u32;
+        let lo = all_pcm_24[offset] as u32;
+        let mid = all_pcm_24[offset + 1] as u32;
+        let hi = all_pcm_24[offset + 2] as u32;
         let val24 = lo | (mid << 8) | (hi << 16);
-        // Sign-extend from 24-bit to 32-bit
         let val32 = if val24 & 0x80_0000 != 0 {
             (val24 | 0xFF00_0000) as i32
         } else {

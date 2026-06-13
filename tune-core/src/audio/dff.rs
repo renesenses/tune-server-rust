@@ -241,6 +241,62 @@ pub fn read_dff_data(path: &str, info: &DffInfo) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// Streaming DFF reader that yields DSD data in fixed-size chunks.
+///
+/// DFF data is already byte-interleaved, so no de-interleaving is needed.
+/// This reader simply reads the data section in fixed-size chunks to avoid
+/// loading the entire file into memory.
+///
+/// Memory usage: O(chunk_size), typically 32 KB per call.
+pub struct DffStreamReader {
+    file: File,
+    remaining: usize,
+    chunk_buf: Vec<u8>,
+}
+
+impl DffStreamReader {
+    /// Open a DFF file for streaming reading.
+    ///
+    /// `read_chunk_size`: how many bytes to read per `next_chunk()` call.
+    /// Must be a multiple of `channels` to maintain byte alignment.
+    pub fn open(path: &str, info: &DffInfo, read_chunk_size: usize) -> Result<Self, String> {
+        if info.compression != "DSD " {
+            return Err(format!(
+                "DFF: unsupported compression '{}' (only uncompressed DSD supported)",
+                info.compression
+            ));
+        }
+
+        let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+        file.seek(SeekFrom::Start(info.data_offset))
+            .map_err(|e| format!("dff seek: {e}"))?;
+
+        Ok(DffStreamReader {
+            file,
+            remaining: info.data_size as usize,
+            chunk_buf: vec![0u8; read_chunk_size],
+        })
+    }
+
+    /// Read the next chunk of byte-interleaved DSD data.
+    ///
+    /// Returns `Ok(Some(chunk))` or `Ok(None)` at EOF.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+
+        let to_read = self.chunk_buf.len().min(self.remaining);
+        let buf = &mut self.chunk_buf[..to_read];
+        self.file
+            .read_exact(buf)
+            .map_err(|e| format!("dff read chunk: {e}"))?;
+        self.remaining -= to_read;
+
+        Ok(Some(buf.to_vec()))
+    }
+}
+
 /// Parse DFF header from an in-memory buffer (for testing).
 pub fn parse_dff_from_bytes(data: &[u8]) -> Result<DffInfo, String> {
     use std::io::Cursor;

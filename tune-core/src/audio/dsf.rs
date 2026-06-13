@@ -216,6 +216,100 @@ pub fn read_dsf_blocks(path: &str, info: &DsfInfo) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Streaming DSF reader that yields DSD data in byte-interleaved chunks.
+///
+/// Instead of loading the entire DSF data section into memory, this reads
+/// one super-block at a time and de-interleaves it. Each `next_chunk()`
+/// call returns one super-block's worth of byte-interleaved DSD data,
+/// suitable for feeding to `DsdToPcmStreamer`.
+///
+/// Memory usage: O(block_size * channels) per call, typically ~8-32 KB.
+pub struct DsfStreamReader {
+    file: File,
+    info: DsfInfo,
+    block_idx: usize,
+    blocks_per_channel: usize,
+    bytes_read_total: usize,
+    super_block_buf: Vec<u8>,
+}
+
+impl DsfStreamReader {
+    /// Open a DSF file for streaming reading.
+    pub fn open(path: &str, info: DsfInfo) -> Result<Self, String> {
+        let mut file = File::open(path).map_err(|e| format!("dsf open: {e}"))?;
+        file.seek(SeekFrom::Start(info.data_offset))
+            .map_err(|e| format!("dsf seek: {e}"))?;
+
+        let block_size = info.block_size as usize;
+        let channels = info.channels as usize;
+        let total_bytes_per_channel = ((info.total_samples + 7) / 8) as usize;
+        let blocks_per_channel = (total_bytes_per_channel + block_size - 1) / block_size;
+        let super_block_size = block_size * channels;
+
+        Ok(DsfStreamReader {
+            file,
+            info,
+            block_idx: 0,
+            blocks_per_channel,
+            bytes_read_total: 0,
+            super_block_buf: vec![0u8; super_block_size],
+        })
+    }
+
+    /// Read the next chunk of byte-interleaved DSD data.
+    ///
+    /// Returns `Ok(Some(chunk))` with interleaved bytes, or `Ok(None)` at EOF.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.block_idx >= self.blocks_per_channel {
+            return Ok(None);
+        }
+
+        let block_size = self.info.block_size as usize;
+        let channels = self.info.channels as usize;
+        let total_bytes_per_channel = ((self.info.total_samples + 7) / 8) as usize;
+        let data_size = self.info.data_size as usize;
+        let super_block_size = block_size * channels;
+
+        let remaining_data = data_size.saturating_sub(self.bytes_read_total);
+        let to_read = super_block_size.min(remaining_data);
+        if to_read == 0 {
+            return Ok(None);
+        }
+
+        let buf = &mut self.super_block_buf[..to_read];
+        self.file
+            .read_exact(buf)
+            .map_err(|e| format!("dsf read block {}: {e}", self.block_idx))?;
+        self.bytes_read_total += to_read;
+
+        // De-interleave this super-block into byte-interleaved output
+        let base_byte = self.block_idx * block_size;
+        let bytes_in_this_block = block_size.min(total_bytes_per_channel.saturating_sub(base_byte));
+
+        let mut output = vec![0u8; bytes_in_this_block * channels];
+
+        for ch in 0..channels {
+            let ch_block_start = ch * block_size;
+            let available = to_read.saturating_sub(ch_block_start);
+            let copy_len = bytes_in_this_block.min(available);
+
+            for b in 0..copy_len {
+                let src_idx = ch_block_start + b;
+                if src_idx >= to_read {
+                    break;
+                }
+                let dst_idx = b * channels + ch;
+                if dst_idx < output.len() {
+                    output[dst_idx] = self.super_block_buf[src_idx];
+                }
+            }
+        }
+
+        self.block_idx += 1;
+        Ok(Some(output))
+    }
+}
+
 /// Parse DSF header from an in-memory buffer (for testing).
 pub fn parse_dsf_from_bytes(data: &[u8]) -> Result<DsfInfo, String> {
     if data.len() < 28 + 52 + 12 {

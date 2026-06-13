@@ -226,6 +226,247 @@ pub fn choose_output_rate(dsd_rate: u32) -> u32 {
     }
 }
 
+/// Streaming DSD-to-PCM converter that processes DSD data in chunks.
+///
+/// Unlike `DsdToPcmConverter::process()` which loads the entire DSD file
+/// into memory (causing OOM for large DSD files -- a 5-min DSD64 stereo
+/// file expands to ~13 GB of f64 arrays), this converter maintains a small
+/// sliding buffer of just `filter_len` DSD samples per channel and produces
+/// PCM output incrementally.
+///
+/// Memory usage: O(filter_len * channels) ≈ 16 KB regardless of file size.
+pub struct DsdToPcmStreamer {
+    /// How many DSD bits map to one PCM sample.
+    decimation_ratio: usize,
+    /// FIR filter coefficients.
+    filter_coeffs: Vec<f64>,
+    /// Number of audio channels.
+    channels: usize,
+    /// Output PCM sample rate in Hz.
+    pub output_rate: u32,
+    /// Output bit depth (always 24).
+    pub output_depth: u32,
+    /// Whether input DSD bits are LSB-first (DSF) or MSB-first (DFF).
+    lsb_first: bool,
+    /// Per-channel ring buffer of DSD sample values (+1.0 / -1.0).
+    /// Length = filter_len per channel. We only keep as many samples
+    /// as needed for the FIR filter window.
+    ring_bufs: Vec<Vec<f64>>,
+    /// Write position in the ring buffer (wraps at filter_len).
+    ring_pos: usize,
+    /// Total DSD samples fed so far (across all calls to `feed`), per channel.
+    total_dsd_samples: usize,
+    /// Number of PCM output samples already emitted per channel.
+    output_sample_idx: usize,
+}
+
+impl DsdToPcmStreamer {
+    /// Create a new streaming converter.
+    ///
+    /// - `dsd_rate`: DSD sample rate (e.g., 2_822_400 for DSD64)
+    /// - `target_rate`: desired PCM output rate (e.g., 176_400)
+    /// - `channels`: number of audio channels
+    /// - `lsb_first`: true for DSF (LSB first), false for DFF (MSB first)
+    pub fn new(dsd_rate: u32, target_rate: u32, channels: usize, lsb_first: bool) -> Self {
+        let decimation_ratio = (dsd_rate / target_rate) as usize;
+        assert!(decimation_ratio > 0, "decimation ratio must be > 0");
+
+        let filter_len = match decimation_ratio {
+            1..=16 => 256,
+            17..=32 => 512,
+            33..=64 => 1024,
+            _ => 2048,
+        };
+
+        let filter_coeffs = design_lowpass_fir(filter_len, decimation_ratio);
+
+        DsdToPcmStreamer {
+            decimation_ratio,
+            filter_coeffs: filter_coeffs.clone(),
+            channels,
+            output_rate: target_rate,
+            output_depth: 24,
+            lsb_first,
+            ring_bufs: vec![vec![0.0f64; filter_len]; channels],
+            ring_pos: 0,
+            total_dsd_samples: 0,
+            output_sample_idx: 0,
+        }
+    }
+
+    /// Feed a chunk of interleaved DSD bytes and return the resulting PCM.
+    ///
+    /// Input layout: ch0_byte0, ch1_byte0, ch0_byte1, ch1_byte1, ...
+    /// (same interleaving as DSF after de-blocking, or DFF natively).
+    ///
+    /// Output: 24-bit LE PCM bytes (3 bytes per sample, interleaved channels).
+    ///
+    /// Call this repeatedly with successive chunks from the file. The converter
+    /// maintains internal state between calls. The chunk size can vary.
+    pub fn feed(&mut self, dsd_chunk: &[u8]) -> Vec<u8> {
+        let channels = self.channels;
+        if channels == 0 || dsd_chunk.is_empty() {
+            return Vec::new();
+        }
+
+        let filter_len = self.filter_coeffs.len();
+        let half_filter = filter_len / 2;
+
+        // Parse input bytes into DSD sample values and push into ring buffers
+        let total_bytes = dsd_chunk.len() / channels;
+
+        // Estimate max output samples from this chunk
+        let new_dsd_samples = total_bytes * 8;
+        let total_after = self.total_dsd_samples + new_dsd_samples;
+        let max_new_output = total_after / self.decimation_ratio;
+        let new_outputs = max_new_output.saturating_sub(self.output_sample_idx);
+        let mut output = Vec::with_capacity(new_outputs * channels * 3);
+
+        for byte_idx in 0..total_bytes {
+            for ch in 0..channels {
+                let src_idx = byte_idx * channels + ch;
+                if src_idx >= dsd_chunk.len() {
+                    break;
+                }
+                let byte = dsd_chunk[src_idx];
+                for bit in 0..8u8 {
+                    let bit_val = if self.lsb_first {
+                        (byte >> bit) & 1
+                    } else {
+                        (byte >> (7 - bit)) & 1
+                    };
+                    let sample = if bit_val == 1 { 1.0 } else { -1.0 };
+
+                    // Write into ring buffer
+                    self.ring_bufs[ch][self.ring_pos % filter_len] = sample;
+
+                    // Only advance ring_pos after all channels for this sample
+                    if ch == channels - 1 {
+                        self.ring_pos += 1;
+                        self.total_dsd_samples += 1;
+
+                        // Check if we can emit a new PCM sample.
+                        // An output sample at index `n` is centered at DSD position:
+                        //   center = n * decimation_ratio + decimation_ratio / 2
+                        // We need all filter taps to be available, i.e. we need
+                        //   center + half_filter <= total_dsd_samples
+                        let next_center = self.output_sample_idx * self.decimation_ratio
+                            + self.decimation_ratio / 2;
+                        let needed = next_center + half_filter;
+
+                        while needed <= self.total_dsd_samples
+                            && self.total_dsd_samples >= filter_len
+                        {
+                            // Emit one PCM sample per channel
+                            let center = self.output_sample_idx * self.decimation_ratio
+                                + self.decimation_ratio / 2;
+
+                            for emit_ch in 0..channels {
+                                let mut sum = 0.0f64;
+                                for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
+                                    let pos =
+                                        (center as isize) - (half_filter as isize) + (k as isize);
+                                    if pos >= 0 && (pos as usize) < self.total_dsd_samples {
+                                        // Map absolute DSD position to ring buffer position
+                                        // The ring buffer holds the last `filter_len` samples.
+                                        // ring_pos points to the next write position.
+                                        // The oldest sample in the ring is at index ring_pos % filter_len.
+                                        // Absolute position `p` maps to ring index:
+                                        //   (ring_pos - (total_dsd_samples - p)) % filter_len
+                                        let age = self.total_dsd_samples - pos as usize;
+                                        if age <= filter_len {
+                                            let ring_idx =
+                                                (self.ring_pos + filter_len - age) % filter_len;
+                                            sum += self.ring_bufs[emit_ch][ring_idx] * coeff;
+                                        }
+                                        // Samples older than filter_len are zero-padded
+                                    }
+                                }
+
+                                let clamped = sum.clamp(-1.0, 1.0);
+                                let pcm_val = (clamped * 8_388_607.0) as i32;
+                                let bytes = pcm_val.to_le_bytes();
+                                output.push(bytes[0]);
+                                output.push(bytes[1]);
+                                output.push(bytes[2]);
+                            }
+
+                            self.output_sample_idx += 1;
+
+                            // Re-check for next output sample
+                            let next_center = self.output_sample_idx * self.decimation_ratio
+                                + self.decimation_ratio / 2;
+                            if next_center + half_filter > self.total_dsd_samples {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    /// Flush any remaining samples at the end of the stream.
+    /// Produces PCM for any DSD samples that haven't been output yet
+    /// (due to the FIR filter needing future samples that don't exist).
+    pub fn flush(&mut self) -> Vec<u8> {
+        let channels = self.channels;
+        let filter_len = self.filter_coeffs.len();
+        let half_filter = filter_len / 2;
+
+        // How many more output samples could we theoretically produce?
+        // The maximum output index is total_dsd_samples / decimation_ratio
+        let max_outputs = if self.total_dsd_samples > 0 {
+            self.total_dsd_samples / self.decimation_ratio
+        } else {
+            0
+        };
+
+        let remaining = max_outputs.saturating_sub(self.output_sample_idx);
+        if remaining == 0 {
+            return Vec::new();
+        }
+
+        let mut output = Vec::with_capacity(remaining * channels * 3);
+
+        for _ in 0..remaining {
+            let center = self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
+
+            for ch in 0..channels {
+                let mut sum = 0.0f64;
+                for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
+                    let pos = (center as isize) - (half_filter as isize) + (k as isize);
+                    if pos >= 0 && (pos as usize) < self.total_dsd_samples {
+                        let age = self.total_dsd_samples - pos as usize;
+                        if age <= filter_len {
+                            let ring_idx = (self.ring_pos + filter_len - age) % filter_len;
+                            sum += self.ring_bufs[ch][ring_idx] * coeff;
+                        }
+                    }
+                }
+
+                let clamped = sum.clamp(-1.0, 1.0);
+                let pcm_val = (clamped * 8_388_607.0) as i32;
+                let bytes = pcm_val.to_le_bytes();
+                output.push(bytes[0]);
+                output.push(bytes[1]);
+                output.push(bytes[2]);
+            }
+
+            self.output_sample_idx += 1;
+        }
+
+        output
+    }
+
+    /// Total number of PCM samples emitted so far (across all channels).
+    pub fn total_output_samples(&self) -> usize {
+        self.output_sample_idx * self.channels
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +677,137 @@ mod tests {
             0,
             "24-bit output should be a multiple of 3 bytes"
         );
+    }
+
+    // --- DsdToPcmStreamer tests ---
+
+    #[test]
+    fn streamer_produces_output() {
+        let channels = 2;
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+
+        let total_bytes = 2048 * channels;
+        let dsd_data: Vec<u8> = (0..total_bytes).map(|_| 0x55u8).collect();
+
+        let pcm = streamer.feed(&dsd_data);
+        let flush = streamer.flush();
+
+        let total_pcm = pcm.len() + flush.len();
+        assert!(total_pcm > 0, "streamer should produce PCM output");
+        assert_eq!(total_pcm % 3, 0, "output should be 24-bit (3 bytes/sample)");
+        assert_eq!(
+            (total_pcm / 3) % channels,
+            0,
+            "output should have correct channel count"
+        );
+    }
+
+    #[test]
+    fn streamer_silence_pattern() {
+        // Alternating 0x55 pattern = near-silence
+        let channels = 1;
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+
+        let dsd_data = vec![0x55u8; 4096];
+        let pcm_24 = streamer.feed(&dsd_data);
+        let flush = streamer.flush();
+
+        let mut all_pcm = pcm_24;
+        all_pcm.extend_from_slice(&flush);
+
+        // Convert to i16 for easy checking
+        let num_samples = all_pcm.len() / 3;
+        assert!(num_samples > 10, "should produce at least 10 samples");
+
+        let mut max_abs: i32 = 0;
+        for i in num_samples / 4..3 * num_samples / 4 {
+            let offset = i * 3;
+            let lo = all_pcm[offset] as u32;
+            let mid = all_pcm[offset + 1] as u32;
+            let hi = all_pcm[offset + 2] as u32;
+            let val24 = lo | (mid << 8) | (hi << 16);
+            let val32 = if val24 & 0x80_0000 != 0 {
+                (val24 | 0xFF00_0000) as i32
+            } else {
+                val24 as i32
+            };
+            let val16 = val32 >> 8;
+            if val16.abs() > max_abs {
+                max_abs = val16.abs();
+            }
+        }
+        assert!(
+            max_abs < 1000,
+            "alternating DSD pattern should be near-silence, max abs = {max_abs}"
+        );
+    }
+
+    #[test]
+    fn streamer_chunked_matches_single_feed() {
+        // Feeding data in multiple small chunks should produce the same output
+        // as feeding it all at once.
+        let channels = 2;
+        let total_bytes = 1024 * channels;
+        let dsd_data: Vec<u8> = (0..total_bytes).map(|i| (i % 256) as u8).collect();
+
+        // Single feed
+        let mut streamer1 = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+        let pcm1 = streamer1.feed(&dsd_data);
+        let flush1 = streamer1.flush();
+        let mut all1 = pcm1;
+        all1.extend_from_slice(&flush1);
+
+        // Chunked feed (feed in small chunks)
+        let mut streamer2 = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+        let chunk_size = 64 * channels; // 64 bytes per channel per chunk
+        let mut all2 = Vec::new();
+        for chunk in dsd_data.chunks(chunk_size) {
+            all2.extend_from_slice(&streamer2.feed(chunk));
+        }
+        all2.extend_from_slice(&streamer2.flush());
+
+        assert_eq!(
+            all1.len(),
+            all2.len(),
+            "single feed and chunked feed should produce same length"
+        );
+        assert_eq!(
+            all1, all2,
+            "single feed and chunked feed should produce identical output"
+        );
+    }
+
+    #[test]
+    fn streamer_dsd128() {
+        let channels = 2;
+        let mut streamer = DsdToPcmStreamer::new(5_644_800, 352_800, channels, true);
+        assert_eq!(streamer.output_rate, 352_800);
+
+        let dsd_data = vec![0xAAu8; 4096 * channels];
+        let pcm = streamer.feed(&dsd_data);
+        let flush = streamer.flush();
+        let total = pcm.len() + flush.len();
+        assert!(total > 0, "DSD128 streaming should produce output");
+    }
+
+    #[test]
+    fn streamer_dff_msb_first() {
+        let channels = 1;
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, false);
+
+        let dsd_data = vec![0xAAu8; 4096];
+        let pcm = streamer.feed(&dsd_data);
+        let flush = streamer.flush();
+        let total = pcm.len() + flush.len();
+        assert!(total > 0, "DFF MSB-first streaming should produce output");
+    }
+
+    #[test]
+    fn streamer_empty_input() {
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, 2, true);
+        let pcm = streamer.feed(&[]);
+        assert!(pcm.is_empty());
+        let flush = streamer.flush();
+        assert!(flush.is_empty());
     }
 }
