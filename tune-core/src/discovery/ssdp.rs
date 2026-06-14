@@ -604,7 +604,7 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
     let probe_ip = udp_probe_ip();
     if let Some(ip) = probe_ip {
         if !is_virtual_ip(ip) {
-            info!(ip = %ip, method = "udp_probe", "local_ip_detected");
+            debug!(ip = %ip, method = "udp_probe", "local_ip_detected");
             return Some(ip);
         }
         debug!(ip = %ip, "udp_probe_returned_virtual_ip_skipping");
@@ -642,7 +642,7 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
         // Pick highest-scoring candidate
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         if let Some((ip, _)) = candidates.first() {
-            info!(ip = %ip, method = "interface_enum", "local_ip_detected");
+            debug!(ip = %ip, method = "interface_enum", "local_ip_detected");
             return Some(*ip);
         }
     }
