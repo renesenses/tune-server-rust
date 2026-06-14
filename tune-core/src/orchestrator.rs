@@ -508,9 +508,24 @@ impl PlaybackOrchestrator {
                     out_sr = max_sr;
                 }
             }
-            let out_bd: u16 = if src_fmt == AudioFormat::Dsd {
+            let out_bd: u16 = if local_needs_wav {
+                // Local output (cpal/WASAPI): always use 32-bit WAV.
+                //
+                // Symphonia decodes all audio into AudioBuffer<i32> (left-justified
+                // 32-bit integers) regardless of source bit depth.  When packing
+                // these into 24-bit (3 bytes/sample), any mismatch between the
+                // reported source_bd and the actual sample range causes byte
+                // misalignment in the PCM stream — the local parser then reads
+                // from wrong offsets, producing white noise.
+                //
+                // Using 32-bit eliminates this class of bugs entirely: each i32
+                // sample is written as 4 bytes, matching the WAV header's declared
+                // byte width.  The local output converts to f32 for cpal anyway,
+                // so there is zero quality loss.
+                32
+            } else if src_fmt == AudioFormat::Dsd {
                 24
-            } else if oaat_needs_wav || local_needs_wav {
+            } else if oaat_needs_wav {
                 bit_depth.max(16).min(24)
             } else {
                 bit_depth.max(16)

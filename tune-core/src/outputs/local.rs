@@ -1691,6 +1691,9 @@ impl OutputTarget for LocalOutput {
             } else {
                 None
             };
+            // Buffer for resampler frame leftover: holds samples that don't
+            // fill a complete resampler block, carried over to the next read.
+            let mut resample_leftover: Vec<f32> = Vec::new();
 
             // Read and feed the rest of the stream
             let mut read_buf = vec![0u8; 65536];
@@ -1732,7 +1735,13 @@ impl OutputTarget for LocalOutput {
                         samples = adapt_channels(&samples, channels, output_ch);
                     }
                     if needs_resample {
-                        samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
+                        samples = rubato_resample_chunk(
+                            &mut resampler,
+                            &samples,
+                            output_ch,
+                            false,
+                            &mut resample_leftover,
+                        );
                     }
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
@@ -1854,7 +1863,13 @@ impl OutputTarget for LocalOutput {
                     samples = adapt_channels(&samples, channels, output_ch);
                 }
                 if needs_resample {
-                    samples = rubato_resample_chunk(&mut resampler, &samples, output_ch, false);
+                    samples = rubato_resample_chunk(
+                        &mut resampler,
+                        &samples,
+                        output_ch,
+                        false,
+                        &mut resample_leftover,
+                    );
                 }
 
                 feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
@@ -1900,9 +1915,15 @@ impl OutputTarget for LocalOutput {
                 );
             }
 
-            // Flush the resampler: feed silence to get remaining buffered samples
+            // Flush the resampler: process any leftover frames + drain internal delay
             if needs_resample {
-                let flushed = rubato_resample_chunk(&mut resampler, &[], output_ch, true);
+                let flushed = rubato_resample_chunk(
+                    &mut resampler,
+                    &[],
+                    output_ch,
+                    true,
+                    &mut resample_leftover,
+                );
                 if !flushed.is_empty() {
                     feed_ring_abortable(&ring, &flushed, &stop_rx, &paused, Some(&force_silent));
                 }
@@ -2426,8 +2447,15 @@ fn rubato_resample_batch(samples: &[f32], from_sr: u32, to_sr: u32, channels: u1
         };
 
     // Resample using the chunk helper, then flush
-    let mut out = rubato_resample_chunk(&mut resampler, samples, channels, false);
-    let flushed = rubato_resample_chunk(&mut resampler, &[], channels, true);
+    let mut batch_leftover: Vec<f32> = Vec::new();
+    let mut out = rubato_resample_chunk(
+        &mut resampler,
+        samples,
+        channels,
+        false,
+        &mut batch_leftover,
+    );
+    let flushed = rubato_resample_chunk(&mut resampler, &[], channels, true, &mut batch_leftover);
     out.extend_from_slice(&flushed);
 
     info!(
@@ -2454,6 +2482,7 @@ fn rubato_resample_chunk(
     samples: &[f32],
     channels: u16,
     flush: bool,
+    resample_leftover: &mut Vec<f32>,
 ) -> Vec<f32> {
     use rubato::audioadapter_buffers::direct::InterleavedSlice;
     use rubato::audioadapter_buffers::owned::InterleavedOwned;
@@ -2464,93 +2493,146 @@ fn rubato_resample_chunk(
     };
 
     let ch = channels as usize;
-    let in_frames = if flush {
-        // Feed enough silence to flush the resampler's internal delay
-        resampler.input_frames_next()
-    } else {
-        if samples.is_empty() || ch == 0 {
-            return Vec::new();
-        }
-        samples.len() / ch
-    };
-
-    if in_frames == 0 && !flush {
+    if ch == 0 {
         return Vec::new();
     }
 
-    // Build the input buffer — either from real samples or silence for flush
-    let input_data: Vec<f32>;
+    // Combine leftover from previous call with new samples.
+    // This avoids using rubato's partial_len during continuous streaming,
+    // which pads the remainder with silence and corrupts subsequent output
+    // (perceived as white noise on 24-bit audio where frame counts rarely
+    // align to the resampler's block size).
+    let combined: Vec<f32>;
     let input_ref: &[f32] = if flush {
-        input_data = vec![0.0f32; in_frames * ch];
-        &input_data
+        // When flushing, drain leftover first, then feed silence
+        if !resample_leftover.is_empty() {
+            combined = resample_leftover.drain(..).collect();
+            &combined
+        } else {
+            &[]
+        }
     } else {
-        // Ensure we have a whole number of frames
-        let usable = (samples.len() / ch) * ch;
-        &samples[..usable]
+        if resample_leftover.is_empty() {
+            // Fast path: no leftover, use new samples directly
+            let usable = (samples.len() / ch) * ch;
+            &samples[..usable]
+        } else {
+            // Prepend leftover from previous call
+            combined = resample_leftover
+                .drain(..)
+                .chain(samples.iter().copied())
+                .collect();
+            let usable = (combined.len() / ch) * ch;
+            // Any sub-frame remainder goes back to leftover (shouldn't happen
+            // since both leftover and samples are frame-aligned, but be safe)
+            if usable < combined.len() {
+                resample_leftover.extend_from_slice(&combined[usable..]);
+            }
+            &combined[..usable]
+        }
     };
+
     let actual_in_frames = input_ref.len() / ch;
 
-    if actual_in_frames == 0 {
-        return Vec::new();
-    }
-
-    // Process the input in chunks of input_frames_next() size
+    // Process only complete resampler blocks (input_frames_next() frames each).
+    // Carry over any remaining frames to the next call instead of using
+    // partial_len, which pads with silence and introduces artifacts.
     let mut all_output = Vec::new();
     let mut offset = 0;
 
-    while offset < actual_in_frames || (flush && offset == 0) {
+    while offset < actual_in_frames {
         let chunk_needed = resampler.input_frames_next();
-        let chunk_available = actual_in_frames.saturating_sub(offset);
+        let chunk_available = actual_in_frames - offset;
 
-        let chunk_frames = chunk_available.min(chunk_needed);
-        let is_partial = chunk_frames < chunk_needed;
-
-        if chunk_frames == 0 && !is_partial {
-            break;
-        }
-
-        let chunk_slice = &input_ref[offset * ch..(offset + chunk_frames) * ch];
-
-        let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_frames) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(error = %e, "rubato_input_adapter_error");
+        if chunk_available < chunk_needed {
+            if flush {
+                // End of track: process remaining frames with silence padding
+                let chunk_slice = &input_ref[offset * ch..actual_in_frames * ch];
+                let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_available) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(error = %e, "rubato_input_adapter_error_flush");
+                        break;
+                    }
+                };
+                let out_frames = resampler.output_frames_next();
+                let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
+                let indexing = rubato::Indexing {
+                    input_offset: 0,
+                    output_offset: 0,
+                    partial_len: Some(chunk_available),
+                    active_channels_mask: None,
+                };
+                match resampler.process_into_buffer(
+                    &input_adapter,
+                    &mut output_buf,
+                    Some(&indexing),
+                ) {
+                    Ok((_nbr_in, nbr_out)) => {
+                        let out_data = output_buf.take_data();
+                        all_output.extend_from_slice(&out_data[..nbr_out * ch]);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "rubato_process_error_flush");
+                    }
+                }
+                offset = actual_in_frames;
+            } else {
+                // Continuous streaming: save remainder for next call
+                resample_leftover.extend_from_slice(&input_ref[offset * ch..actual_in_frames * ch]);
                 break;
             }
-        };
+        } else {
+            // Full block available — process without partial_len
+            let chunk_slice = &input_ref[offset * ch..(offset + chunk_needed) * ch];
+            let input_adapter = match InterleavedSlice::new(chunk_slice, ch, chunk_needed) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(error = %e, "rubato_input_adapter_error");
+                    break;
+                }
+            };
 
+            let out_frames = resampler.output_frames_next();
+            let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
+
+            match resampler.process_into_buffer(&input_adapter, &mut output_buf, None) {
+                Ok((_nbr_in, nbr_out)) => {
+                    let out_data = output_buf.take_data();
+                    all_output.extend_from_slice(&out_data[..nbr_out * ch]);
+                }
+                Err(e) => {
+                    warn!(error = %e, "rubato_process_error");
+                    break;
+                }
+            }
+
+            offset += chunk_needed;
+        }
+    }
+
+    // If flushing and we processed all leftover above, now feed a block of
+    // pure silence to drain the resampler's internal delay line.
+    if flush && offset >= actual_in_frames {
+        let silence_frames = resampler.input_frames_next();
+        let silence = vec![0.0f32; silence_frames * ch];
+        let input_adapter = match InterleavedSlice::new(&silence, ch, silence_frames) {
+            Ok(a) => a,
+            Err(_) => return all_output,
+        };
         let out_frames = resampler.output_frames_next();
         let mut output_buf = InterleavedOwned::<f32>::new(0.0f32, ch, out_frames);
-
-        let partial_len = if is_partial { Some(chunk_frames) } else { None };
         let indexing = rubato::Indexing {
             input_offset: 0,
             output_offset: 0,
-            partial_len,
+            partial_len: Some(0),
             active_channels_mask: None,
         };
-
-        match resampler.process_into_buffer(&input_adapter, &mut output_buf, Some(&indexing)) {
-            Ok((_nbr_in, nbr_out)) => {
-                // Extract interleaved output
-                let out_data = output_buf.take_data();
-                all_output.extend_from_slice(&out_data[..nbr_out * ch]);
-            }
-            Err(e) => {
-                warn!(error = %e, "rubato_process_error");
-                break;
-            }
-        }
-
-        offset += chunk_frames;
-
-        // If this was a flush with a partial chunk, we're done
-        if flush && is_partial {
-            break;
-        }
-        // If we've exhausted input and it was partial, stop
-        if is_partial {
-            break;
+        if let Ok((_nbr_in, nbr_out)) =
+            resampler.process_into_buffer(&input_adapter, &mut output_buf, Some(&indexing))
+        {
+            let out_data = output_buf.take_data();
+            all_output.extend_from_slice(&out_data[..nbr_out * ch]);
         }
     }
 
@@ -2807,6 +2889,95 @@ mod tests {
         assert_eq!(aligned_len2, 6);
         let samples = pcm_bytes_to_f32(&leftover[..aligned_len2], 24);
         assert_eq!(samples.len(), 2); // L and R of frame 1
+    }
+
+    #[test]
+    fn test_resample_chunk_no_silence_padding() {
+        // Verify that rubato_resample_chunk does NOT use partial_len (silence
+        // padding) during continuous streaming.  This was the root cause of
+        // white noise on 24-bit audio: frame counts from HTTP reads rarely
+        // aligned to the resampler's block size (1024), so every chunk had a
+        // trailing partial block padded with silence.
+        use rubato::{
+            Async, FixedAsync, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+            calculate_cutoff,
+        };
+
+        let ch = 2usize;
+        let ratio = 48000.0 / 96000.0; // downsample 2:1
+        let sinc_len = 64;
+        let window = WindowFunction::BlackmanHarris2;
+        let f_cutoff = calculate_cutoff(sinc_len, window);
+        let params = SincInterpolationParameters {
+            sinc_len,
+            f_cutoff,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 128,
+            window,
+        };
+        let mut resampler: Option<Async<f32>> =
+            Some(Async::new_sinc(ratio, 1.1, &params, 1024, ch, FixedAsync::Input).unwrap());
+
+        let mut resample_leftover: Vec<f32> = Vec::new();
+
+        // Simulate two chunks of 683 frames (not aligned to 1024 block size).
+        // This is what happens with 24-bit stereo: 65536 bytes / 6 = ~10922 frames,
+        // 10922 % 1024 = 682 remainder.  Here we use a single remainder-sized chunk.
+        let chunk1: Vec<f32> = (0..683 * ch).map(|i| (i as f32 * 0.001).sin()).collect();
+        let chunk2: Vec<f32> = (0..683 * ch).map(|i| (i as f32 * 0.002).sin()).collect();
+
+        // First call: 683 frames < 1024 block size, so all go to leftover
+        let out1 = rubato_resample_chunk(
+            &mut resampler,
+            &chunk1,
+            ch as u16,
+            false,
+            &mut resample_leftover,
+        );
+        // No output yet (not enough frames for a complete block)
+        assert!(
+            out1.is_empty(),
+            "expected no output from first partial chunk, got {} samples",
+            out1.len()
+        );
+        assert_eq!(
+            resample_leftover.len(),
+            683 * ch,
+            "leftover should hold all 683 frames"
+        );
+
+        // Second call: leftover (683) + new (683) = 1366 frames >= 1024
+        let out2 = rubato_resample_chunk(
+            &mut resampler,
+            &chunk2,
+            ch as u16,
+            false,
+            &mut resample_leftover,
+        );
+        // Should have output from 1 complete block (1024 input -> ~512 output frames)
+        assert!(
+            !out2.is_empty(),
+            "expected output after accumulating enough frames"
+        );
+        // Leftover should have 1366 - 1024 = 342 frames
+        assert_eq!(resample_leftover.len(), 342 * ch);
+
+        // Flush: process remaining 342 frames with silence padding
+        let flushed =
+            rubato_resample_chunk(&mut resampler, &[], ch as u16, true, &mut resample_leftover);
+        assert!(
+            !flushed.is_empty(),
+            "flush should produce output from remaining frames"
+        );
+        assert!(
+            resample_leftover.is_empty(),
+            "leftover should be empty after flush"
+        );
+
+        // Verify no NaN or infinity in output
+        for s in out2.iter().chain(flushed.iter()) {
+            assert!(s.is_finite(), "output contains non-finite value: {}", s);
+        }
     }
 
     #[test]
