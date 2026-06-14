@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::TuneError;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamTrack {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
@@ -112,87 +114,89 @@ pub trait StreamingService: Send + Sync {
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
 
-    async fn authenticate(&mut self, credentials: &serde_json::Value)
-    -> Result<AuthStatus, String>;
+    async fn authenticate(
+        &mut self,
+        credentials: &serde_json::Value,
+    ) -> Result<AuthStatus, TuneError>;
     async fn auth_status(&self) -> AuthStatus;
-    async fn logout(&mut self) -> Result<(), String>;
+    async fn logout(&mut self) -> Result<(), TuneError>;
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String>;
-    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String>;
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError>;
+    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError>;
     async fn get_track_url(
         &self,
         track_id: &str,
         quality: Option<&str>,
-    ) -> Result<StreamUrl, String>;
-    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String>;
-    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String>;
-    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String>;
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<StreamUrl, TuneError>;
+    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError>;
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
+    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError>;
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = artist_id;
         Ok(vec![])
     }
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let _ = artist_id;
         Ok(vec![])
     }
-    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String>;
-    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String>;
+    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
 
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String>;
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String>;
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String>;
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError>;
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError>;
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError>;
 
     async fn create_playlist(
         &self,
         _name: &str,
         _description: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, TuneError> {
         Err("create_playlist not supported by this service".into())
     }
     async fn add_tracks_to_playlist(
         &self,
         _playlist_id: &str,
         _track_ids: &[String],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, TuneError> {
         Err("add_tracks_to_playlist not supported by this service".into())
     }
     fn supports_write(&self) -> bool {
         false
     }
 
-    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
     }
-    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Ok(vec![])
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
         Ok(vec![])
     }
     async fn get_genre_albums(
         &self,
         genre_id: &str,
         limit: usize,
-    ) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = (genre_id, limit);
         Ok(vec![])
     }
-    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         Ok(vec![])
     }
-    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let _ = section_id;
         Ok(vec![])
     }
-    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
     }
-    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err("not supported".into())
     }
-    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err("not supported".into())
     }
@@ -206,7 +210,7 @@ pub trait StreamingService: Send + Sync {
 
     async fn post_restore(&mut self) {}
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         Ok(false)
     }
 }

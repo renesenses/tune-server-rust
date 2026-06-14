@@ -31,6 +31,7 @@ async fn get_svc(
     // registry lock drops here
 }
 
+<<<<<<< Updated upstream
 /// Convert a service method result into a JSON response (OK -> 200, Err -> 502).
 fn svc_response<R: serde::Serialize, E: std::fmt::Display>(result: Result<R, E>) -> Response {
     match result {
@@ -61,6 +62,44 @@ macro_rules! with_svc_mut {
         let mut $svc = arc.lock().await;
         svc_response($body)
     }};
+=======
+/// Helper: acquire a read-only lock on a streaming service, run `f`, and
+/// return a JSON response (or BAD_GATEWAY on error).
+async fn with_service<F, Fut, R>(state: &AppState, service: &str, f: F) -> Response
+where
+    F: FnOnce(&dyn StreamingService) -> Fut,
+    Fut: std::future::Future<Output = Result<R, String>>,
+    R: serde::Serialize,
+{
+    let svc = match get_svc(state, service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.lock().await;
+    match f(&*svc).await {
+        Ok(data) => Json(json!(data)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// Helper: acquire a mutable lock on a streaming service, run `f`, and
+/// return a JSON response (or BAD_GATEWAY on error).
+async fn with_service_mut<F, Fut, R>(state: &AppState, service: &str, f: F) -> Response
+where
+    F: FnOnce(&mut dyn StreamingService) -> Fut,
+    Fut: std::future::Future<Output = Result<R, String>>,
+    R: serde::Serialize,
+{
+    let svc = match get_svc(state, service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match f(&mut *svc).await {
+        Ok(data) => Json(json!(data)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+>>>>>>> Stashed changes
 }
 
 #[derive(Deserialize)]
@@ -135,7 +174,11 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
+<<<<<<< Updated upstream
 // Simple read-only handlers (via with_svc!)
+=======
+// Simple read-only handlers (via with_service)
+>>>>>>> Stashed changes
 // ---------------------------------------------------------------------------
 
 async fn service_search(
@@ -144,49 +187,77 @@ async fn service_search(
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(20);
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.search(&q.q, limit).await)
 }
 
 async fn service_albums(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     with_svc!(&state, &service, |svc| svc.get_user_albums().await)
+=======
+    with_service(&state, &service, |svc| svc.search(&q.q, limit)).await
+}
+
+async fn service_albums(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_service(&state, &service, |svc| svc.get_user_albums()).await
+>>>>>>> Stashed changes
 }
 
 async fn service_album(
     State(state): State<AppState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_album(&album_id).await)
+=======
+    with_service(&state, &service, |svc| svc.get_album(&album_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_album_tracks(
     State(state): State<AppState>,
     Path((service, album_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_album_tracks(&album_id)
         .await)
+=======
+    with_service(&state, &service, |svc| svc.get_album_tracks(&album_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_artist(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_artist(&artist_id).await)
+=======
+    with_service(&state, &service, |svc| svc.get_artist(&artist_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_artist_albums(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_artist_albums(&artist_id)
         .await)
+=======
+    with_service(&state, &service, |svc| svc.get_artist_albums(&artist_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_artist_top_tracks(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_artist_top_tracks(&artist_id)
         .await)
@@ -194,44 +265,84 @@ async fn service_artist_top_tracks(
 
 async fn service_playlists(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     with_svc!(&state, &service, |svc| svc.get_user_playlists().await)
+=======
+    with_service(&state, &service, |svc| svc.get_artist_top_tracks(&artist_id)).await
+}
+
+async fn service_playlists(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_service(&state, &service, |svc| svc.get_user_playlists()).await
+>>>>>>> Stashed changes
 }
 
 async fn service_playlist(
     State(state): State<AppState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_playlist(&playlist_id).await)
+=======
+    with_service(&state, &service, |svc| svc.get_playlist(&playlist_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_playlist_tracks(
     State(state): State<AppState>,
     Path((service, playlist_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_playlist_tracks(&playlist_id)
         .await)
+=======
+    with_service(&state, &service, |svc| svc.get_playlist_tracks(&playlist_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_track(
     State(state): State<AppState>,
     Path((service, track_id)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_track(&track_id).await)
 }
 
 async fn service_featured(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     with_svc!(&state, &service, |svc| svc.get_featured().await)
+=======
+    with_service(&state, &service, |svc| svc.get_track(&track_id)).await
+}
+
+async fn service_featured(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_service(&state, &service, |svc| svc.get_featured()).await
+>>>>>>> Stashed changes
 }
 
 async fn service_new_releases(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_new_releases().await)
 }
 
 async fn service_genres(State(state): State<AppState>, Path(service): Path<String>) -> Response {
     with_svc!(&state, &service, |svc| svc.get_genres().await)
+=======
+    with_service(&state, &service, |svc| svc.get_new_releases()).await
+}
+
+async fn service_genres(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_service(&state, &service, |svc| svc.get_genres()).await
+>>>>>>> Stashed changes
 }
 
 async fn service_genre_albums(
@@ -240,22 +351,31 @@ async fn service_genre_albums(
     Query(q): Query<LimitQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50);
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_genre_albums(&genre_id, limit)
         .await)
+=======
+    with_service(&state, &service, |svc| svc.get_genre_albums(&genre_id, limit)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_featured_sections(
     State(state): State<AppState>,
     Path(service): Path<String>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc.get_featured_sections().await)
+=======
+    with_service(&state, &service, |svc| svc.get_featured_sections()).await
+>>>>>>> Stashed changes
 }
 
 async fn service_featured_section(
     State(state): State<AppState>,
     Path((service, section)): Path<(String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc!(&state, &service, |svc| svc
         .get_featured_section(&section)
         .await)
@@ -263,21 +383,33 @@ async fn service_featured_section(
 
 // ---------------------------------------------------------------------------
 // Mutable handlers (via with_svc_mut!)
+=======
+    with_service(&state, &service, |svc| svc.get_featured_section(&section)).await
+}
+
+// ---------------------------------------------------------------------------
+// Mutable handlers (via with_service_mut)
+>>>>>>> Stashed changes
 // ---------------------------------------------------------------------------
 
 async fn service_add_favorite(
     State(state): State<AppState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc_mut!(&state, &service, |svc| svc
         .add_favorite(&fav_type, &item_id)
         .await)
+=======
+    with_service_mut(&state, &service, |svc| svc.add_favorite(&fav_type, &item_id)).await
+>>>>>>> Stashed changes
 }
 
 async fn service_remove_favorite(
     State(state): State<AppState>,
     Path((service, fav_type, item_id)): Path<(String, String, String)>,
 ) -> Response {
+<<<<<<< Updated upstream
     with_svc_mut!(&state, &service, |svc| svc
         .remove_favorite(&fav_type, &item_id)
         .await)
@@ -285,6 +417,13 @@ async fn service_remove_favorite(
 
 // ---------------------------------------------------------------------------
 // Complex handlers (custom logic beyond simple get_svc + call + respond)
+=======
+    with_service_mut(&state, &service, |svc| svc.remove_favorite(&fav_type, &item_id)).await
+}
+
+// ---------------------------------------------------------------------------
+// Complex handlers (custom logic, kept explicit)
+>>>>>>> Stashed changes
 // ---------------------------------------------------------------------------
 
 async fn list_services(State(state): State<AppState>) -> Json<Value> {
@@ -305,7 +444,14 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Object(map))
 }
 
+<<<<<<< Updated upstream
 async fn service_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn service_status(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+>>>>>>> Stashed changes
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -386,7 +532,14 @@ async fn service_auth(
     }
 }
 
+<<<<<<< Updated upstream
 async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn auth_poll_status(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+>>>>>>> Stashed changes
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -418,7 +571,14 @@ async fn auth_poll_status(State(state): State<AppState>, Path(service): Path<Str
     }
 }
 
+<<<<<<< Updated upstream
 async fn service_logout(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn service_logout(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+>>>>>>> Stashed changes
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -465,7 +625,11 @@ async fn service_track_url(
                 (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
             }
         }
+<<<<<<< Updated upstream
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+=======
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+>>>>>>> Stashed changes
     }
 }
 
@@ -525,7 +689,15 @@ async fn service_favorites(
     }
 }
 
+<<<<<<< Updated upstream
 async fn service_enable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn service_enable(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    // Apply to in-memory service immediately (no restart needed)
+>>>>>>> Stashed changes
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.lock().await;
         svc.set_enabled(true);
@@ -538,7 +710,15 @@ async fn service_enable(State(state): State<AppState>, Path(service): Path<Strin
     Json(json!({"service": service, "enabled": true})).into_response()
 }
 
+<<<<<<< Updated upstream
 async fn service_disable(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn service_disable(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    // Apply to in-memory service immediately (no restart needed)
+>>>>>>> Stashed changes
     if let Ok(svc) = get_svc(&state, &service).await {
         let mut svc = svc.lock().await;
         svc.set_enabled(false);
@@ -551,7 +731,14 @@ async fn service_disable(State(state): State<AppState>, Path(service): Path<Stri
     Json(json!({"service": service, "enabled": false})).into_response()
 }
 
+<<<<<<< Updated upstream
 async fn service_auth_url(State(state): State<AppState>, Path(service): Path<String>) -> Response {
+=======
+async fn service_auth_url(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+>>>>>>> Stashed changes
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
