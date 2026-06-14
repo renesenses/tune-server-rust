@@ -13,7 +13,7 @@ mod stats;
 mod tracks;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -176,6 +176,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/enrich-credits", post(credits::enrich_all_credits))
         .route("/tracks/{id}/all-tags", get(tracks::track_all_tags))
+        .route(
+            "/tracks/{id}/metadata",
+            get(tracks::track_metadata_get).put(tracks::track_metadata_put),
+        )
         .route("/browse", get(browse::browse_roots))
         .route("/browse/dir", get(browse::browse_directory))
         .route("/folders", get(browse::browse_folders))

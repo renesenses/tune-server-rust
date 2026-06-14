@@ -415,11 +415,45 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     to_insert.push(track);
                 }
 
+                // Collect extended metadata for tracks in this batch
+                let mut extended_meta_paths: Vec<String> = Vec::new();
+                for sf in &batch {
+                    if sf.metadata.is_some() {
+                        extended_meta_paths.push(sf.path.clone());
+                    }
+                }
+
                 // Batch insert + update using prepared statements
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
                 inserted += batch_inserted;
                 updated += batch_updated;
+
+                // Store extended metadata (composer, conductor, ReplayGain, MusicBrainz, etc.)
+                // in the track_metadata table. Read extended tags and batch-insert.
+                {
+                    let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::new(db.clone());
+                    let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
+
+                    for path_str in &extended_meta_paths {
+                        let path = std::path::Path::new(path_str);
+                        // Look up the track_id by file_path
+                        if let Ok(Some(track)) = track_repo.get_by_path(path_str) {
+                            if let Some(track_id) = track.id {
+                                let ext_meta = tune_core::metadata::read_extended_metadata(path);
+                                if !ext_meta.is_empty() {
+                                    meta_entries.push((track_id, ext_meta));
+                                }
+                            }
+                        }
+                    }
+
+                    if !meta_entries.is_empty() {
+                        if let Err(e) = meta_repo.set_batch_multi(&meta_entries) {
+                            tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
+                        }
+                    }
+                }
 
                 // Update track_count + album stats for albums touched in this batch
                 // so albums are never visible with 0 tracks between batches.

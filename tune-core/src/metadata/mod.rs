@@ -13,6 +13,7 @@ pub mod suggestions;
 pub mod tag_writer;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1143,6 +1144,162 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 
 pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
     try_read_metadata(path).ok()
+}
+
+/// Read extended metadata tags beyond the core fields already stored in the tracks table.
+/// Returns a HashMap of key-value pairs suitable for the track_metadata table.
+/// This extracts tags like composer, conductor, lyricist, performer, remixer,
+/// ReplayGain values, MusicBrainz IDs, and other extended fields.
+pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
+    use lofty::config::{ParseOptions, ParsingMode};
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::{Accessor, ItemKey};
+
+    let mut meta = HashMap::new();
+
+    let tagged = match Probe::open(path).and_then(|p| {
+        p.options(
+            ParseOptions::new()
+                .parsing_mode(ParsingMode::Relaxed)
+                .max_junk_bytes(1024 * 1024),
+        )
+        .guess_file_type()?
+        .read()
+    }) {
+        Ok(t) => t,
+        Err(_) => return meta,
+    };
+
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => return meta,
+    };
+
+    let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
+
+    // Sort-order fields
+    if let Some(v) = get(ItemKey::TrackArtistSortOrder) {
+        meta.insert("sort_artist".into(), v);
+    }
+    if let Some(v) = get(ItemKey::AlbumTitleSortOrder) {
+        meta.insert("sort_album".into(), v);
+    }
+    if let Some(v) = get(ItemKey::AlbumArtistSortOrder) {
+        meta.insert("sort_album_artist".into(), v);
+    }
+
+    // Credits / personnel
+    if let Some(v) = get(ItemKey::Composer) {
+        meta.insert("composer".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Conductor) {
+        meta.insert("conductor".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Lyricist) {
+        meta.insert("lyricist".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Performer) {
+        meta.insert("performer".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Remixer) {
+        meta.insert("remixer".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Label) {
+        meta.insert("label".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Producer) {
+        meta.insert("producer".into(), v);
+    }
+
+    // Descriptive
+    if let Some(v) = get(ItemKey::Bpm) {
+        meta.insert("bpm".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Mood) {
+        meta.insert("mood".into(), v);
+    }
+    if let Some(v) = get(ItemKey::ContentGroup) {
+        meta.insert("grouping".into(), v);
+    }
+    if let Some(v) = get(ItemKey::FlagCompilation) {
+        meta.insert("compilation".into(), v);
+    }
+    if let Some(v) = tag.comment().map(|s| s.to_string()) {
+        meta.insert("comment".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Lyrics) {
+        meta.insert("lyrics".into(), v);
+    }
+
+    // Identifiers
+    if let Some(v) = get(ItemKey::Isrc) {
+        meta.insert("isrc".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Barcode) {
+        meta.insert("barcode".into(), v);
+    }
+    if let Some(v) = get(ItemKey::CatalogNumber) {
+        meta.insert("catalog_number".into(), v);
+    }
+    if let Some(v) = get(ItemKey::OriginalMediaType) {
+        meta.insert("media_type".into(), v);
+    }
+
+    // Dates
+    if let Some(v) = get(ItemKey::ReleaseDate) {
+        meta.insert("release_date".into(), v);
+    }
+    if let Some(v) = get(ItemKey::OriginalReleaseDate) {
+        meta.insert("original_date".into(), v);
+    }
+
+    // Technical
+    if let Some(v) = get(ItemKey::EncodedBy) {
+        meta.insert("encoder".into(), v);
+    }
+    if let Some(v) = get(ItemKey::CopyrightMessage) {
+        meta.insert("copyright".into(), v);
+    }
+    if let Some(v) = get(ItemKey::Language) {
+        meta.insert("language".into(), v);
+    }
+
+    // ReplayGain
+    if let Some(v) = get(ItemKey::ReplayGainTrackGain) {
+        meta.insert("rg_track_gain".into(), v);
+    }
+    if let Some(v) = get(ItemKey::ReplayGainTrackPeak) {
+        meta.insert("rg_track_peak".into(), v);
+    }
+    if let Some(v) = get(ItemKey::ReplayGainAlbumGain) {
+        meta.insert("rg_album_gain".into(), v);
+    }
+    if let Some(v) = get(ItemKey::ReplayGainAlbumPeak) {
+        meta.insert("rg_album_peak".into(), v);
+    }
+
+    // MusicBrainz IDs
+    if let Some(v) = get(ItemKey::MusicBrainzRecordingId) {
+        meta.insert("mb_track_id".into(), v);
+    }
+    if let Some(v) = get(ItemKey::MusicBrainzReleaseId) {
+        meta.insert("mb_release_id".into(), v);
+    }
+    if let Some(v) = get(ItemKey::MusicBrainzArtistId) {
+        meta.insert("mb_artist_id".into(), v);
+    }
+    if let Some(v) = get(ItemKey::MusicBrainzReleaseArtistId) {
+        meta.insert("mb_release_artist_id".into(), v);
+    }
+    if let Some(v) = get(ItemKey::MusicBrainzReleaseGroupId) {
+        meta.insert("mb_release_group_id".into(), v);
+    }
+    if let Some(v) = get(ItemKey::MusicBrainzWorkId) {
+        meta.insert("mb_work_id".into(), v);
+    }
+
+    meta
 }
 
 pub struct MetadataUpdate {

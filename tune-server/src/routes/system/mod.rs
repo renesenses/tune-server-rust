@@ -31,6 +31,10 @@ pub fn router() -> Router<AppState> {
             "/settings/theme",
             axum::routing::put(config::set_theme).get(config::get_theme),
         )
+        .route(
+            "/settings/metadata-fields",
+            get(config::get_metadata_fields).put(config::set_metadata_fields),
+        )
         .route("/library/clear", post(scan::library_clear))
         .route("/scan", post(scan::trigger_scan))
         .route("/scan/status", get(scan::scan_status))

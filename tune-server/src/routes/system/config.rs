@@ -468,3 +468,102 @@ pub(super) async fn restart() -> impl IntoResponse {
     });
     Json(json!({ "status": "restarting" }))
 }
+
+// ---------------------------------------------------------------------------
+// Metadata fields configuration
+// ---------------------------------------------------------------------------
+
+/// Full catalog of available extended metadata fields.
+/// (key, label_fr, category)
+const METADATA_FIELDS: &[(&str, &str, &str)] = &[
+    ("album_artist", "Artiste de l'album", "Identification"),
+    ("sort_artist", "Tri artiste", "Identification"),
+    ("sort_album", "Tri album", "Identification"),
+    ("composer", "Compositeur", "Crédits"),
+    ("conductor", "Chef d'orchestre", "Crédits"),
+    ("lyricist", "Parolier", "Crédits"),
+    ("performer", "Interprète", "Crédits"),
+    ("remixer", "Remixeur", "Crédits"),
+    ("label", "Label", "Crédits"),
+    ("producer", "Producteur", "Crédits"),
+    ("bpm", "BPM", "Classification"),
+    ("mood", "Ambiance", "Classification"),
+    ("grouping", "Regroupement", "Classification"),
+    ("compilation", "Compilation", "Classification"),
+    ("comment", "Commentaire", "Texte"),
+    ("lyrics", "Paroles", "Texte"),
+    ("isrc", "ISRC", "Identifiants"),
+    ("barcode", "Code-barres", "Identifiants"),
+    ("catalog_number", "Réf. catalogue", "Identifiants"),
+    ("media_type", "Support", "Identifiants"),
+    ("release_date", "Date de sortie", "Dates"),
+    ("original_date", "Date originale", "Dates"),
+    ("encoder", "Encodeur", "Technique"),
+    ("copyright", "Copyright", "Technique"),
+    ("language", "Langue", "Technique"),
+    ("rg_track_gain", "ReplayGain piste", "ReplayGain"),
+    ("rg_album_gain", "ReplayGain album", "ReplayGain"),
+];
+
+const DEFAULT_VISIBLE_FIELDS: &[&str] = &["composer", "conductor", "label"];
+
+pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    let enabled_keys: Vec<String> = settings
+        .get("metadata_visible_fields")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            DEFAULT_VISIBLE_FIELDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+
+    // Group fields by category, preserving catalog order
+    let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
+    for &(key, label, category) in METADATA_FIELDS {
+        let enabled = enabled_keys.iter().any(|k| k == key);
+        let field = json!({ "key": key, "label": label, "enabled": enabled });
+
+        if let Some(cat) = categories.iter_mut().find(|(name, _)| *name == category) {
+            cat.1.push(field);
+        } else {
+            categories.push((category, vec![field]));
+        }
+    }
+
+    let result: Vec<Value> = categories
+        .into_iter()
+        .map(|(name, fields)| json!({ "name": name, "fields": fields }))
+        .collect();
+
+    Json(json!({ "categories": result }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct MetadataFieldsBody {
+    fields: Vec<String>,
+}
+
+pub(super) async fn set_metadata_fields(
+    State(state): State<AppState>,
+    Json(body): Json<MetadataFieldsBody>,
+) -> Json<Value> {
+    let settings = SettingsRepo::new(state.db);
+    // Only keep keys that exist in the catalog
+    let valid_keys: Vec<&str> = body
+        .fields
+        .iter()
+        .filter_map(|k| {
+            METADATA_FIELDS
+                .iter()
+                .find(|(key, _, _)| *key == k.as_str())
+                .map(|(key, _, _)| *key)
+        })
+        .collect();
+    let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
+    settings.set("metadata_visible_fields", &json_val).ok();
+    Json(json!({ "fields": valid_keys }))
+}

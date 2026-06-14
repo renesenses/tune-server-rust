@@ -18,5 +18,6 @@ pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;
 pub mod tag_repo;
+pub mod track_metadata_repo;
 pub mod track_repo;
 pub mod zone_repo;

@@ -622,3 +622,44 @@ pub(super) async fn rescan_metadata_status(State(state): State<AppState>) -> Jso
         "result": result,
     }))
 }
+
+// --- Track extended metadata endpoints ---
+
+/// GET /api/v1/library/tracks/{id}/metadata
+/// Returns all extended metadata key-value pairs for a track.
+pub(super) async fn track_metadata_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    use tune_core::db::track_metadata_repo::TrackMetadataRepo;
+
+    let repo = TrackMetadataRepo::new(state.db);
+    match repo.get_all(id) {
+        Ok(meta) => Json(json!(meta)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// PUT /api/v1/library/tracks/{id}/metadata
+/// Batch-sets extended metadata fields from a JSON object body.
+pub(super) async fn track_metadata_put(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use tune_core::db::track_metadata_repo::TrackMetadataRepo;
+
+    // Verify the track exists
+    let track_repo = TrackRepo::new(state.db.clone());
+    match track_repo.get(id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+
+    let repo = TrackMetadataRepo::new(state.db);
+    match repo.set_batch(id, &body) {
+        Ok(()) => Json(json!({"status": "ok", "fields": body.len()})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
