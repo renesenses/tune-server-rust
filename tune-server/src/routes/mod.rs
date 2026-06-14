@@ -344,8 +344,8 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.services.clone());
 
     let mut app = Router::new()
-        .nest("/api/v1", api)
         .route("/add-station", get(radios::add_from_web))
+        .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
