@@ -287,31 +287,112 @@ impl PlaybackOrchestrator {
         let mime_type = guess_mime_from_url(audio_url);
         let is_radio = source == "radio";
 
-        let (url, stream_id) = if is_radio {
-            let ext = mime_type.split('/').last().unwrap_or("aac");
-            let info = StreamInfo {
-                format: ext.to_string(),
-                mime_type: mime_type.to_string(),
-                sample_rate: 44100,
-                bit_depth: 16,
-                channels: 2,
-                file_size: None,
-                duration_ms: None,
+        let is_local_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
+        let is_oaat_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+
+        let (url, stream_id, out_mime, out_sr, out_bd, out_ch) =
+            if is_radio && (is_local_output || is_oaat_output) {
+                // Local/OAAT outputs cannot play compressed streams directly —
+                // they expect raw PCM in a WAV container.  For radio (infinite
+                // stream), we decode the HTTP stream progressively to PCM and
+                // serve it as WAV through a streaming session.
+                let wav_info = StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    channels: 2,
+                    file_size: None,
+                    duration_ms: None,
+                };
+
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(wav_info, false, 256).await;
+
+                info!(
+                    source = "radio",
+                    url = %audio_url,
+                    "radio_decode_to_wav_for_local_output"
+                );
+
+                let radio_url = audio_url.to_string();
+                tokio::spawn(async move {
+                    // Download + decode in a blocking thread since symphonia and
+                    // reqwest::blocking are both synchronous.
+                    let result = tokio::task::spawn_blocking(move || {
+                        decode_radio_stream_to_pcm(radio_url, tx, data_ready)
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            debug!("radio_local_decode_stream_ended");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "radio_local_decode_failed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "radio_local_decode_task_panic");
+                        }
+                    }
+                });
+
+                let server_ip = self.server_ip();
+                let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                (
+                    stream_url,
+                    Some(session_id),
+                    "audio/wav".to_string(),
+                    Some(44100u32),
+                    Some(16u32),
+                    Some(2u32),
+                )
+            } else if is_radio {
+                // Network outputs (DLNA, etc.): use proxy session as before
+                let ext = mime_type.split('/').last().unwrap_or("aac");
+                let info = StreamInfo {
+                    format: ext.to_string(),
+                    mime_type: mime_type.to_string(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    channels: 2,
+                    file_size: None,
+                    duration_ms: None,
+                };
+                let sid = self
+                    .streamer
+                    .create_proxy_session(info, audio_url.to_string(), true)
+                    .await;
+                let server_ip = self.server_ip();
+                let stream_url = self.streamer.get_stream_url(&sid, &server_ip, ext);
+                (
+                    stream_url,
+                    Some(sid),
+                    mime_type.to_string(),
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                (
+                    audio_url.to_string(),
+                    None,
+                    mime_type.to_string(),
+                    None,
+                    None,
+                    None,
+                )
             };
-            let sid = self
-                .streamer
-                .create_proxy_session(info, audio_url.to_string(), true)
-                .await;
-            let server_ip = self.server_ip();
-            let stream_url = self.streamer.get_stream_url(&sid, &server_ip, ext);
-            (stream_url, Some(sid))
-        } else {
-            (audio_url.to_string(), None)
-        };
 
         Ok(ResolvedStream {
             url,
-            mime_type: mime_type.to_string(),
+            mime_type: out_mime,
             title,
             artist,
             album,
@@ -320,9 +401,9 @@ impl PlaybackOrchestrator {
             cover_url,
             stream_id,
             file_size: None,
-            sample_rate: None,
-            bit_depth: None,
-            channels: None,
+            sample_rate: out_sr,
+            bit_depth: out_bd,
+            channels: out_ch,
         })
     }
 
@@ -1728,6 +1809,178 @@ fn guess_mime_from_url(url: &str) -> &'static str {
     } else {
         "audio/mpeg"
     }
+}
+
+/// Decode an infinite radio HTTP stream to PCM and send chunks through the
+/// session channel.  Runs on a blocking thread (called via spawn_blocking).
+///
+/// Uses symphonia with `ReadOnlySource` to handle the non-seekable HTTP stream.
+/// Decodes packets progressively and converts to interleaved 16-bit PCM bytes.
+/// The loop runs until the stream ends, the sender is dropped (stop), or an
+/// unrecoverable error occurs.
+fn decode_radio_stream_to_pcm(
+    url: String,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+) -> Result<(), String> {
+    use symphonia::core::audio::conv::IntoSample;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+    use symphonia::core::meta::MetadataOptions;
+    use tracing::{debug, info, warn};
+
+    // Open HTTP connection — no total timeout for infinite radio streams
+    let response = reqwest::blocking::Client::builder()
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .and_then(|c| c.get(&url).send())
+        .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("radio HTTP error: {}", response.status()));
+    }
+
+    info!(url = %url, "radio_local_decode_stream_connected");
+
+    // Wrap the HTTP response body (Read-only, non-seekable) for symphonia
+    let source = ReadOnlySource::new(response);
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+
+    // Provide a hint based on the URL extension to help probe
+    let mut hint = Hint::new();
+    let lower = url.to_lowercase();
+    let path_part = lower.split('?').next().unwrap_or(&lower);
+    if path_part.ends_with(".mp3") {
+        hint.with_extension("mp3");
+    } else if path_part.ends_with(".aac") || path_part.ends_with(".m4a") {
+        hint.with_extension("aac");
+    } else if path_part.ends_with(".ogg") {
+        hint.with_extension("ogg");
+    } else if path_part.ends_with(".flac") {
+        hint.with_extension("flac");
+    } else {
+        // Most radio streams are MP3 or AAC; default to mp3 hint
+        hint.with_extension("mp3");
+    }
+
+    let mut format: Box<dyn symphonia::core::formats::FormatReader> =
+        symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| format!("radio probe failed: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("radio stream: no audio track found")?;
+
+    let audio_params = match &track.codec_params {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err("radio stream: no audio codec parameters".into()),
+    };
+    let track_id = track.id;
+    let source_channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+    let source_sample_rate = audio_params.sample_rate.unwrap_or(44100);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("radio decoder init failed: {e}"))?;
+
+    info!(
+        channels = source_channels,
+        sample_rate = source_sample_rate,
+        "radio_local_decode_started"
+    );
+
+    let rt =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime for radio decode")?;
+
+    let mut first_chunk_sent = false;
+    let mut pcm_buf: Vec<u8> = Vec::with_capacity(65536);
+    let chunk_size: usize = 32768;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break, // Stream ended (unlikely for radio)
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                debug!("radio_local_decode_eof");
+                break;
+            }
+            Err(e) => {
+                // For radio streams, transient errors can occur.
+                // Log and break — the orchestrator will handle reconnection
+                // if the user restarts playback.
+                warn!(error = %e, "radio_local_decode_packet_error");
+                break;
+            }
+        };
+
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!(error = %e, "radio_local_decode_frame_skip");
+                continue;
+            }
+        };
+
+        // Convert decoded audio buffer to interleaved 16-bit PCM bytes
+        let channels = decoded.spec().channels().count();
+        let frames = decoded.frames();
+        let mut packet_buf: Vec<u8> = Vec::with_capacity(frames * channels * 2);
+
+        // Get samples as interleaved f32, then convert to i16 LE bytes
+        let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
+        decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
+
+        for sample in &interleaved {
+            let s16: i16 = (*sample).into_sample();
+            packet_buf.extend_from_slice(&s16.to_le_bytes());
+        }
+
+        pcm_buf.extend_from_slice(&packet_buf);
+
+        // Flush accumulated PCM when we have enough
+        while pcm_buf.len() >= chunk_size {
+            let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+            if rt.block_on(tx.send(chunk)).is_err() {
+                // Receiver dropped — playback was stopped
+                debug!("radio_local_decode_consumer_dropped");
+                return Ok(());
+            }
+            if !first_chunk_sent {
+                first_chunk_sent = true;
+                data_ready.notify_one();
+            }
+        }
+    }
+
+    // Flush remaining PCM
+    if !pcm_buf.is_empty() {
+        let _ = rt.block_on(tx.send(pcm_buf));
+        if !first_chunk_sent {
+            data_ready.notify_one();
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
