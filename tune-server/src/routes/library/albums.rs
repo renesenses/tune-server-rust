@@ -311,8 +311,10 @@ pub(super) async fn merge_duplicate_albums_route(
         .connection()
         .lock()
         .map_err(|e| AppError::internal(format!("{e}")))?;
+    // Case-insensitive grouping: LOWER(title) catches duplicates that differ
+    // only by case (e.g. "The Dark Side of the Moon" vs "The Dark Side Of The Moon").
     let dupes: Vec<(String, String)> = conn
-        .prepare("SELECT title, GROUP_CONCAT(id) FROM albums GROUP BY title HAVING COUNT(id) > 1")
+        .prepare("SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())

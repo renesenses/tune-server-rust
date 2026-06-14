@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, oneshot};
 use tracing::info;
 
+use tune_core::db::backend::DbBackend;
 use tune_core::db::engine::Engine;
 use tune_core::db::sqlite::SqliteDb;
 use tune_core::discovery::ssdp::SsdpScanner;
@@ -24,6 +25,11 @@ use crate::config::TuneConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqliteDb,
+    /// Engine-agnostic backend. Points to the same `SqliteDb` by default,
+    /// or to a `PostgresBackend` when `TUNE_DATABASE_URL` is a postgres://
+    /// DSN and the `postgres` feature is enabled.  Repos ported to
+    /// `Arc<dyn DbBackend>` should use this field via `with_backend()`.
+    pub backend: Arc<dyn DbBackend>,
     pub streamer: Arc<AudioStreamer>,
     pub playback: Arc<PlaybackManager>,
     pub services: Arc<Mutex<ServiceRegistry>>,
@@ -49,38 +55,31 @@ pub struct AppState {
 impl AppState {
     pub fn new(db_path: &str, port: u16, tune_config: TuneConfig) -> Result<Self, String> {
         // Engine selection: check TUNE_DATABASE_URL for PostgreSQL, else
-        // default to SQLite. When PG is configured, we log the intent and
-        // fall through to the SQLite path for now — full PG wiring
-        // (Arc<dyn DbBackend> in AppState) is Phase 6. The config
-        // plumbing is landed here so `tune-cli db migrate-to-postgres`
-        // and future PG-only deployments can detect the env.
+        // default to SQLite.
         let selected_engine = tune_config
             .database_url
             .as_deref()
             .map(Engine::from_connection_string)
             .unwrap_or(Engine::Sqlite);
 
-        if selected_engine == Engine::Postgres {
-            let pg_url = tune_config.database_url.as_deref().unwrap_or("(none)");
-            info!(
-                engine = "postgres",
-                url = %pg_url.split('@').last().unwrap_or(pg_url),
-                "database_engine_selected (PG support is compile-time gated; \
-                 falling back to SQLite for this boot)"
-            );
-        } else {
-            info!(engine = "sqlite", path = %db_path, "database_engine_selected");
-        }
-
+        // Always open SQLite — it serves as the fallback for code paths
+        // not yet ported to Arc<dyn DbBackend> and as the local cache
+        // even when PG is the primary store.
         let db = SqliteDb::open(db_path)?;
         db.init_schema()?;
         tune_core::db::migrations::run_migrations(&db)?;
+
+        // Build the backend: PG when configured + feature-enabled, else SQLite.
+        let backend: Arc<dyn DbBackend> =
+            Self::create_backend(selected_engine, &tune_config, &db, db_path)?;
 
         let streamer = Arc::new(AudioStreamer::new(port));
         let playback = Arc::new(PlaybackManager::new());
 
         let mut services = ServiceRegistry::new();
-        services.register(Box::new(tune_core::streaming::tidal::TidalService::new()));
+        services.register(Box::new(
+            tune_core::streaming::tidal::TidalService::with_quality(&tune_config.tidal_quality),
+        ));
         services.register(Box::new(tune_core::streaming::qobuz::QobuzService::new(
             std::env::var("QOBUZ_APP_ID").unwrap_or_default(),
             std::env::var("QOBUZ_APP_SECRET").unwrap_or_default(),
@@ -135,6 +134,7 @@ impl AppState {
 
         Ok(Self {
             db,
+            backend,
             streamer,
             playback,
             services,
@@ -155,6 +155,55 @@ impl AppState {
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
         })
+    }
+
+    /// Build the appropriate `DbBackend` based on the selected engine.
+    fn create_backend(
+        engine: Engine,
+        config: &TuneConfig,
+        sqlite_db: &SqliteDb,
+        db_path: &str,
+    ) -> Result<Arc<dyn DbBackend>, String> {
+        match engine {
+            Engine::Sqlite => {
+                info!(engine = "sqlite", path = %db_path, "database_engine_selected");
+                Ok(Arc::new(sqlite_db.clone()))
+            }
+            Engine::Postgres => {
+                #[cfg(feature = "postgres")]
+                {
+                    let pg_url = config
+                        .database_url
+                        .as_deref()
+                        .ok_or("TUNE_DATABASE_URL is required for postgres engine")?;
+                    let safe_url = pg_url.split('@').last().unwrap_or(pg_url);
+                    info!(engine = "postgres", url = %safe_url, "database_engine_selected");
+
+                    // Connect to PG and run migrations synchronously
+                    // (we're inside AppState::new which is sync).
+                    let backend = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let pg = tune_core::db::postgres::PostgresDb::connect(pg_url).await?;
+                            tune_core::db::migrations::run_pg_migrations(pg.pool()).await?;
+                            let backend =
+                                tune_core::db::backend::PostgresBackend::new(pg.pool().clone());
+                            Ok::<_, String>(Arc::new(backend) as Arc<dyn DbBackend>)
+                        })
+                    })?;
+
+                    info!("postgres_backend_ready");
+                    Ok(backend)
+                }
+
+                #[cfg(not(feature = "postgres"))]
+                {
+                    let _ = config;
+                    Err("PostgreSQL engine requested but the `postgres` feature \
+                         is not enabled. Rebuild with `--features postgres`."
+                        .into())
+                }
+            }
+        }
     }
 
     pub async fn restore_tokens(&self) {

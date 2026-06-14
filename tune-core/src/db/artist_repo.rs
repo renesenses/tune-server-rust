@@ -112,8 +112,12 @@ pub mod sql {
         "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
-    pub fn update_mbid() -> &'static str {
-        "UPDATE artists SET musicbrainz_id = ?2 WHERE id = ?1"
+    pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
+            d.placeholder(2),
+            d.placeholder(1)
+        )
     }
 
     /// Engine-agnostic full-text search.
@@ -367,8 +371,8 @@ impl ArtistRepo {
     }
 
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
-        self.db
-            .execute(sql::update_mbid(), &[&id as &dyn ToSqlValue, &mbid])?;
+        let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
+        self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
         Ok(())
     }
 

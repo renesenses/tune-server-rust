@@ -149,7 +149,7 @@ impl TidalService {
                 token_expires: None,
             }),
             country_code: "US".into(),
-            quality: "HI_RES".into(),
+            quality: "HI_RES_LOSSLESS".into(),
             username: None,
             user_id: None,
             subscription: None,
@@ -160,6 +160,14 @@ impl TidalService {
             featured_cache: None,
             enabled_override: None,
         }
+    }
+
+    /// Create a TidalService with a specific quality setting from config.
+    /// Valid values: "HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", "HIGH"
+    pub fn with_quality(quality: &str) -> Self {
+        let mut svc = Self::new();
+        svc.quality = quality.into();
+        svc
     }
 
     /// Get current access token from the token state.
