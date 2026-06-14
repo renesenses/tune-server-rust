@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use super::traits::*;
 
+use crate::TuneError;
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const LOGIN_BASE: &str = "https://login.tidal.com";
@@ -984,7 +985,7 @@ impl StreamingService for TidalService {
         }
     }
 
-    async fn logout(&mut self) -> Result<(), String> {
+    async fn logout(&mut self) -> Result<(), TuneError> {
         {
             let mut ts = self.tokens.lock().await;
             ts.access_token = None;
@@ -994,7 +995,7 @@ impl StreamingService for TidalService {
         Ok(())
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(&format!(
                 "/search?query={}&limit={limit}&types=TRACKS,ALBUMS,ARTISTS",
@@ -1023,7 +1024,7 @@ impl StreamingService for TidalService {
         })
     }
 
-    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String> {
+    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
         let data = self.api_get(&format!("/tracks/{track_id}")).await?;
         Ok(Self::map_track(&data))
     }
@@ -1032,7 +1033,7 @@ impl StreamingService for TidalService {
         &self,
         track_id: &str,
         quality: Option<&str>,
-    ) -> Result<StreamUrl, String> {
+    ) -> Result<StreamUrl, TuneError> {
         {
             let cache = self.url_cache.lock().await;
             if let Some(cached) = cache.get(track_id) {
@@ -1280,12 +1281,12 @@ impl StreamingService for TidalService {
         })
     }
 
-    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {
+    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
         let data = self.api_get(&format!("/albums/{album_id}")).await?;
         Ok(Self::map_album(&data))
     }
 
-    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/albums/{album_id}/tracks?limit=100"))
             .await?;
@@ -1296,12 +1297,12 @@ impl StreamingService for TidalService {
         Ok(tracks)
     }
 
-    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String> {
+    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self.api_get(&format!("/artists/{artist_id}")).await?;
         Ok(Self::map_artist(&data))
     }
 
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(&format!("/artists/{artist_id}/albums?limit=50"))
             .await?;
@@ -1312,7 +1313,7 @@ impl StreamingService for TidalService {
         Ok(albums)
     }
 
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/artists/{artist_id}/toptracks?limit=20"))
             .await?;
@@ -1323,12 +1324,12 @@ impl StreamingService for TidalService {
         Ok(tracks)
     }
 
-    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
+    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         let data = self.api_get(&format!("/playlists/{playlist_id}")).await?;
         Ok(Self::map_playlist(&data))
     }
 
-    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/playlists/{playlist_id}/tracks?limit=100"))
             .await?;
@@ -1339,7 +1340,7 @@ impl StreamingService for TidalService {
         Ok(tracks)
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self.api_get("/genres").await?;
         let genres = data
             .as_array()
@@ -1352,7 +1353,7 @@ impl StreamingService for TidalService {
         &self,
         genre_id: &str,
         limit: usize,
-    ) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(&format!(
                 "/genres/{}/albums?limit={limit}",
@@ -1366,7 +1367,7 @@ impl StreamingService for TidalService {
         Ok(albums)
     }
 
-    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         if let Some(ref cache) = self.featured_cache
             && cache.fetched_at.elapsed() < Duration::from_secs(300)
         {
@@ -1416,7 +1417,7 @@ impl StreamingService for TidalService {
         Ok(result)
     }
 
-    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         if let Some(ref cache) = self.featured_cache
             && cache.fetched_at.elapsed() < Duration::from_secs(300)
             && let Some((_, albums)) = cache.sections.iter().find(|(s, _)| s.id == section_id)
@@ -1428,7 +1429,7 @@ impl StreamingService for TidalService {
         Ok(vec![])
     }
 
-    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self
             .api_get(&format!("/users/{user_id}/favorites/tracks?limit=100"))
@@ -1445,7 +1446,7 @@ impl StreamingService for TidalService {
         Ok(tracks)
     }
 
-    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let user_id = self.user_id.ok_or("no user_id")?;
         let (path_type, form_key) = match fav_type {
             "tracks" => ("tracks", "trackIds"),
@@ -1461,7 +1462,7 @@ impl StreamingService for TidalService {
         Ok(())
     }
 
-    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let user_id = self.user_id.ok_or("no user_id")?;
         let path_type = match fav_type {
             "tracks" => "tracks",
@@ -1473,7 +1474,7 @@ impl StreamingService for TidalService {
             .await
     }
 
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let mut all = Vec::new();
         let mut offset = 0u32;
@@ -1503,7 +1504,7 @@ impl StreamingService for TidalService {
         &self,
         name: &str,
         description: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, TuneError> {
         let user_id = self
             .user_id
             .ok_or("tidal: not authenticated (no user_id)")?;
@@ -1525,7 +1526,7 @@ impl StreamingService for TidalService {
         &self,
         playlist_id: &str,
         track_ids: &[String],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, TuneError> {
         let mut added = 0;
         for chunk in track_ids.chunks(100) {
             let ids_csv = chunk.join(",");
@@ -1543,7 +1544,7 @@ impl StreamingService for TidalService {
         self.user_id.is_some()
     }
 
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self
@@ -1561,7 +1562,7 @@ impl StreamingService for TidalService {
         Ok(albums)
     }
 
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         // Use stored user_id instead of /users/me
         let user_id = self.user_id.ok_or("no user_id — re-authenticate")?;
         let data = self
@@ -1579,7 +1580,7 @@ impl StreamingService for TidalService {
         Ok(artists)
     }
 
-    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         let data = self.api_get("/featured/playlists?limit=50").await?;
         let playlists = data["items"]
             .as_array()
@@ -1588,7 +1589,7 @@ impl StreamingService for TidalService {
         Ok(playlists)
     }
 
-    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self.api_get("/featured/new/albums?limit=50").await?;
         let albums = data["items"]
             .as_array()
@@ -1601,7 +1602,7 @@ impl StreamingService for TidalService {
         self.refresh_user_info().await;
     }
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         let needs_refresh = {
             let ts = self.tokens.lock().await;
             ts.token_expires
