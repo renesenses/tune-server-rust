@@ -922,7 +922,14 @@ impl PlaybackOrchestrator {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.max(16).min(24);
+            // Local output: 32-bit to avoid 24-bit byte misalignment noise
+            // (see local_needs_wav comment in resolve_local_track).
+            // OAAT: cap at 24-bit (endpoints may not support 32-bit WAV).
+            let bd = if is_local_stream {
+                32
+            } else {
+                stream_data.quality.bit_depth.max(16).min(24)
+            };
 
             let wav_info = StreamInfo {
                 format: "wav".into(),
