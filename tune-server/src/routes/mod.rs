@@ -236,7 +236,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/zones", zones_and_playback)
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
-        .route("/radios/add", get(radios::add_from_web))
+        .route("/add-radio", get(radios::add_from_web))
         .nest("/radio-favorites", radios::radio_favorites_router())
         .route("/radio/auto", get(auto_dj_handler))
         .route("/voice-search", axum::routing::post(voice::voice_search))
