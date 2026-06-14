@@ -8,7 +8,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
-use tune_core::playback::NowPlaying;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -131,51 +130,22 @@ async fn play_radio(
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
     };
 
-    let device_id = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
-        .get(zone_id)
-        .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id);
-
-    let np = NowPlaying {
+    let play_req = tune_core::orchestrator::PlayRequest {
+        zone_id,
+        output_device_id: None,
         track_id: None,
-        title: radio.name.clone(),
+        source: Some("radio".into()),
+        source_id: Some(radio.url.clone()),
+        title: Some(radio.name.clone()),
         artist_name: Some("Live Radio".into()),
         album_title: Some("Live Radio".into()),
-        cover_path: radio.logo_url.clone(),
-        duration_ms: 0,
-        source: "radio".into(),
-        source_id: Some(id.to_string()),
-        stream_id: None,
+        cover_url: radio.logo_url.clone(),
+        duration_ms: None,
     };
-    state.playback.play(zone_id, np).await;
 
-    let (output_sent, output_error) = if let Some(ref did) = device_id {
-        let output_arc = {
-            let outputs = state.outputs.lock().await;
-            outputs.get(did)
-        };
-        if let Some(output_arc) = output_arc {
-            let output = output_arc.lock().await;
-            let media = tune_core::outputs::PlayMedia {
-                url: &radio.url,
-                mime_type: "audio/aac",
-                title: Some(&radio.name),
-                cover_url: radio.logo_url.as_deref(),
-                ..Default::default()
-            };
-            match output.play_media(&media).await {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(format!("Output device error: {e}"))),
-            }
-        } else {
-            (
-                false,
-                Some("Device not yet discovered. Please retry in a few seconds.".into()),
-            )
-        }
-    } else {
-        (false, None)
+    let (output_sent, output_error) = match state.orchestrator.play(play_req).await {
+        Ok(result) => (result.output_sent, result.error),
+        Err(e) => (false, Some(e)),
     };
 
     repo.record_play(id).ok();

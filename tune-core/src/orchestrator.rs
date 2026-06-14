@@ -285,8 +285,32 @@ impl PlaybackOrchestrator {
         let duration_ms = req.duration_ms;
         let source = req.source.clone().unwrap_or_else(|| "podcast".into());
         let mime_type = guess_mime_from_url(audio_url);
+        let is_radio = source == "radio";
+
+        let (url, stream_id) = if is_radio {
+            let ext = mime_type.split('/').last().unwrap_or("aac");
+            let info = StreamInfo {
+                format: ext.to_string(),
+                mime_type: mime_type.to_string(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+            };
+            let sid = self
+                .streamer
+                .create_proxy_session(info, audio_url.to_string(), true)
+                .await;
+            let server_ip = self.server_ip();
+            let stream_url = self.streamer.get_stream_url(&sid, &server_ip, ext);
+            (stream_url, Some(sid))
+        } else {
+            (audio_url.to_string(), None)
+        };
+
         Ok(ResolvedStream {
-            url: audio_url.to_string(),
+            url,
             mime_type: mime_type.to_string(),
             title,
             artist,
@@ -294,7 +318,7 @@ impl PlaybackOrchestrator {
             duration_ms,
             source,
             cover_url,
-            stream_id: None,
+            stream_id,
             file_size: None,
             sample_rate: None,
             bit_depth: None,
@@ -2023,5 +2047,59 @@ mod tests {
         let queue_repo = PlayQueueRepo::new(orch.db.clone());
         let queue = queue_repo.get_queue(zone_id).unwrap();
         assert_eq!(queue.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn radio_resolve_creates_proxy_session() {
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some("http://icecast.radiofrance.fr/fip-hifi.aac".into()),
+            title: Some("FIP".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_some(),
+            "radio must create a proxy session"
+        );
+        assert!(
+            resolved.url.contains("/stream/"),
+            "radio URL must be proxied through local streamer, got: {}",
+            resolved.url
+        );
+        assert!(
+            !resolved.url.contains("icecast.radiofrance.fr"),
+            "radio URL must NOT be the raw external URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn podcast_resolve_returns_raw_url() {
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("podcast".into()),
+            source_id: Some("https://cdn.podcast.com/episode.mp3".into()),
+            title: Some("Episode 1".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: Some(3600000),
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        assert!(
+            resolved.stream_id.is_none(),
+            "podcast should not create proxy session"
+        );
+        assert_eq!(resolved.url, "https://cdn.podcast.com/episode.mp3");
     }
 }
