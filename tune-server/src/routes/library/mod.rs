@@ -13,7 +13,7 @@ mod stats;
 mod tracks;
 
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::Value;
 
