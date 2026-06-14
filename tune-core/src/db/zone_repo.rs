@@ -10,7 +10,7 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate";
+    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume";
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("SELECT {COLS} FROM zones WHERE id = {}", d.placeholder(1))
@@ -118,6 +118,7 @@ pub struct Zone {
     pub last_track_source: Option<String>,
     pub last_track_source_id: Option<String>,
     pub max_sample_rate: Option<u32>,
+    pub fixed_volume: bool,
 }
 
 pub struct ZoneRepo {
@@ -299,6 +300,14 @@ impl ZoneRepo {
         Ok(())
     }
 
+    pub fn update_fixed_volume(&self, id: i64, enabled: bool) -> Result<(), String> {
+        let val = if enabled { 1i64 } else { 0i64 };
+        let sql = self.update_field_sql("fixed_volume");
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val = if online { 1i64 } else { 0i64 };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
@@ -401,6 +410,7 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         last_track_source: cols.get(12).and_then(|v| v.as_string()),
         last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
         max_sample_rate: cols.get(14).and_then(|v| v.as_i64()).map(|v| v as u32),
+        fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }
 

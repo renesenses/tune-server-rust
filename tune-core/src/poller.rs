@@ -210,8 +210,8 @@ impl PositionPoller {
                 }
             };
 
-            // Sync volume from device regardless of state
-            if status.volume > 0.001 {
+            // Sync volume from device regardless of state (skip if fixed_volume)
+            if !zone.fixed_volume && status.volume > 0.001 {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 crate::db::zone_repo::ZoneRepo::new(self.db.clone())
@@ -354,7 +354,13 @@ impl PositionPoller {
                     .emit_position(zone_id, status.position_ms as i64);
             }
 
-            if (status.volume - zone_state.volume).abs() > 0.005 {
+            // Sync volume from device (skip if fixed_volume)
+            let zone_fixed_volume = all_zones
+                .iter()
+                .find(|z| z.id == Some(zone_id))
+                .map(|z| z.fixed_volume)
+                .unwrap_or(false);
+            if !zone_fixed_volume && (status.volume - zone_state.volume).abs() > 0.005 {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 let db = self.db.clone();

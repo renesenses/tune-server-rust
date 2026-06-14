@@ -1470,6 +1470,14 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn set_volume(&self, zone_id: i64, volume: f64, device_id: Option<&str>) {
+        // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
+        // skip sending to the device — the DAC/renderer handles volume.
+        let zone = ZoneRepo::new(self.db.clone()).get(zone_id).ok().flatten();
+        if zone.as_ref().is_some_and(|z| z.fixed_volume) {
+            self.playback.set_volume(zone_id, 1.0).await;
+            return;
+        }
+
         self.playback.set_volume(zone_id, volume).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
