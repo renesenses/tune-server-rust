@@ -220,7 +220,6 @@ pub fn router(state: AppState) -> Router {
 
     let zones_and_playback = zones::router().merge(playback::router());
     let api = Router::new()
-        .route("/web/add-station", get(radios::add_from_web))
         .route(
             "/playback/shuffle-all",
             axum::routing::post(playback::shuffle_all),
@@ -345,6 +344,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.services.clone());
 
     let mut app = Router::new()
+        .route("/api/v1/web/add-station", get(radios::add_from_web))
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
