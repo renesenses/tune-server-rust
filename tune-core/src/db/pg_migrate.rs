@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS tracks (
 
 CREATE TABLE IF NOT EXISTS track_credits (
     id BIGSERIAL PRIMARY KEY,
-    track_id TEXT NOT NULL ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
     artist_id TEXT,
     artist_name TEXT NOT NULL,
     role TEXT DEFAULT 'performer',
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS track_credits (
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
-    track_id TEXT NOT NULL ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (track_id, key)
@@ -208,8 +208,8 @@ CREATE TABLE IF NOT EXISTS playlists (
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id BIGSERIAL PRIMARY KEY,
-    playlist_id TEXT NOT NULL ON DELETE CASCADE,
-    track_id TEXT NOT NULL ON DELETE CASCADE,
+    playlist_id TEXT NOT NULL,
+    track_id TEXT NOT NULL,
     position TEXT NOT NULL DEFAULT 0
 );
 
@@ -236,8 +236,8 @@ CREATE TABLE IF NOT EXISTS zones (
 
 CREATE TABLE IF NOT EXISTS play_queue (
     id BIGSERIAL PRIMARY KEY,
-    zone_id TEXT NOT NULL ON DELETE CASCADE,
-    track_id TEXT NOT NULL ON DELETE CASCADE,
+    zone_id TEXT NOT NULL,
+    track_id TEXT NOT NULL,
     position TEXT NOT NULL DEFAULT 0,
     is_current TEXT DEFAULT 0
 );
@@ -257,7 +257,7 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 
 CREATE TABLE IF NOT EXISTS listen_history (
     id BIGSERIAL PRIMARY KEY,
-    track_id TEXT ON DELETE SET NULL,
+    track_id TEXT,
     title TEXT NOT NULL,
     artist_name TEXT,
     album_title TEXT,
@@ -330,7 +330,7 @@ CREATE TABLE IF NOT EXISTS tags (
 
 CREATE TABLE IF NOT EXISTS item_tags (
     id BIGSERIAL PRIMARY KEY,
-    tag_id TEXT NOT NULL ON DELETE CASCADE,
+    tag_id TEXT NOT NULL,
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
     UNIQUE(tag_id, item_type, item_id)
@@ -338,7 +338,7 @@ CREATE TABLE IF NOT EXISTS item_tags (
 
 CREATE TABLE IF NOT EXISTS album_ratings (
     id BIGSERIAL PRIMARY KEY,
-    album_id TEXT NOT NULL ON DELETE CASCADE,
+    album_id TEXT NOT NULL,
     profile_id TEXT NOT NULL DEFAULT 1,
     rating TEXT NOT NULL CHECK(rating >= 1 AND rating <= 5),
     note TEXT,
@@ -374,7 +374,7 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 
 CREATE TABLE IF NOT EXISTS bookmarks (
     id BIGSERIAL PRIMARY KEY,
-    track_id TEXT ON DELETE CASCADE,
+    track_id TEXT,
     position_ms TEXT NOT NULL DEFAULT 0,
     label TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
@@ -382,7 +382,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 
 CREATE TABLE IF NOT EXISTS alarms (
     id BIGSERIAL PRIMARY KEY,
-    zone_id TEXT ON DELETE CASCADE,
+    zone_id TEXT,
     time TEXT NOT NULL,
     enabled TEXT DEFAULT 1,
     days TEXT DEFAULT '1,2,3,4,5,6,7',
@@ -452,7 +452,7 @@ CREATE TABLE IF NOT EXISTS sync_links (
 
 CREATE TABLE IF NOT EXISTS sync_link_snapshots (
     id BIGSERIAL PRIMARY KEY,
-    playlist_link_id TEXT NOT NULL ON DELETE CASCADE,
+    playlist_link_id TEXT NOT NULL,
     side TEXT NOT NULL,
     tracks_json TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -460,7 +460,7 @@ CREATE TABLE IF NOT EXISTS sync_link_snapshots (
 
 CREATE TABLE IF NOT EXISTS track_source_links (
     id BIGSERIAL PRIMARY KEY,
-    track_id TEXT NOT NULL ON DELETE CASCADE,
+    track_id TEXT NOT NULL,
     service TEXT NOT NULL,
     service_track_id TEXT NOT NULL,
     confidence TEXT NOT NULL DEFAULT 0.0,
