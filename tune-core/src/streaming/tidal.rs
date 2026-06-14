@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -12,8 +13,15 @@ use super::traits::*;
 
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
-const CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
-const CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
+const LOGIN_BASE: &str = "https://login.tidal.com";
+const CLIENT_ID: &str = "n9JALqHugEUxV4MZ";
+const CLIENT_SECRET: &str = "lRVni78WylpAt6kLcqcUi9N0AuAgbDpurjpM33BmUPY=";
+const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
+
+/// Legacy Device Code client — kept for backward compatibility with
+/// existing refresh tokens that were issued under this client_id.
+const LEGACY_CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
+const LEGACY_CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenResponse {
@@ -45,6 +53,14 @@ struct TokenState {
     access_token: Option<String>,
     refresh_token: Option<String>,
     token_expires: Option<Instant>,
+}
+
+/// PKCE state stored while waiting for the OAuth callback.
+#[derive(Debug, Clone)]
+struct PkceState {
+    code_verifier: String,
+    state: String,
+    started_at: Instant,
 }
 
 /// Cached stream URL with its resolved quality metadata.
@@ -105,6 +121,9 @@ pub struct TidalService {
     user_id: Option<u64>,
     subscription: Option<String>,
     url_cache: Arc<Mutex<UrlCache>>,
+    /// PKCE OAuth2 pending state (primary auth flow).
+    pending_pkce: Option<PkceState>,
+    /// Legacy Device Code pending state (fallback auth flow).
     pending_device_auth: Option<DeviceAuthResponse>,
     device_auth_started: Option<Instant>,
     featured_cache: Option<FeaturedCache>,
@@ -135,6 +154,7 @@ impl TidalService {
             user_id: None,
             subscription: None,
             url_cache: Arc::new(Mutex::new(UrlCache::new(240))),
+            pending_pkce: None,
             pending_device_auth: None,
             device_auth_started: None,
             featured_cache: None,
@@ -148,6 +168,136 @@ impl TidalService {
         ts.access_token
             .clone()
             .ok_or_else(|| "not authenticated".into())
+    }
+
+    // ---- PKCE helpers ----
+
+    /// Generate a cryptographically random code verifier (43-128 URL-safe chars).
+    fn generate_code_verifier() -> String {
+        const CHARSET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+        // Use multiple UUIDs for entropy (each v4 UUID has 122 bits of randomness)
+        let mut result = String::with_capacity(128);
+        for _ in 0..3 {
+            let uuid = uuid::Uuid::new_v4();
+            let bytes = uuid.as_bytes();
+            for &b in bytes {
+                if result.len() >= 128 {
+                    break;
+                }
+                result.push(CHARSET[(b as usize) % CHARSET.len()] as char);
+            }
+        }
+        // Ensure minimum length of 43 (3 UUIDs * 16 bytes = 48 chars, always enough)
+        result
+    }
+
+    /// Generate the S256 code challenge from a code verifier.
+    fn generate_code_challenge(verifier: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(verifier.as_bytes());
+        let hash = hasher.finalize();
+        base64url_encode(&hash)
+    }
+
+    /// Generate a random state parameter for CSRF protection.
+    fn generate_state() -> String {
+        uuid::Uuid::new_v4().to_string().replace('-', "")
+    }
+
+    /// Build the Tidal authorization URL for PKCE flow.
+    fn build_authorize_url(code_challenge: &str, state: &str) -> String {
+        format!(
+            "{LOGIN_BASE}/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}",
+            urlencoding::encode(CLIENT_ID),
+            urlencoding::encode(REDIRECT_URI),
+            urlencoding::encode(
+                "user.read playback collection.read collection.write playlists.read playlists.write entitlements.read search.read"
+            ),
+        )
+    }
+
+    /// Exchange an authorization code for tokens (PKCE flow).
+    async fn exchange_code_for_tokens(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<TokenResponse, String> {
+        let resp = self
+            .client
+            .post(format!("{AUTH_BASE}/token"))
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("client_secret", CLIENT_SECRET),
+                ("code", code),
+                ("redirect_uri", REDIRECT_URI),
+                ("grant_type", "authorization_code"),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("pkce token exchange: {e}"))?;
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+
+        if status != 200 {
+            warn!(status, body = %body, "tidal_pkce_token_exchange_failed");
+            return Err(format!("tidal PKCE token exchange failed: {status} {body}"));
+        }
+
+        let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+            warn!(error = %e, body = %body, "tidal_pkce_token_parse_failed");
+            format!("token parse: {e}")
+        })?;
+        Ok(token)
+    }
+
+    /// Handle the OAuth callback after user authorizes in browser.
+    /// Called from the `/api/v1/streaming/tidal/callback` route.
+    pub async fn handle_oauth_callback(
+        &mut self,
+        code: &str,
+        state: &str,
+    ) -> Result<AuthStatus, String> {
+        let pkce = self
+            .pending_pkce
+            .take()
+            .ok_or("no pending PKCE auth — start authentication first")?;
+
+        // Verify state matches (CSRF protection)
+        if pkce.state != state {
+            // Put it back so user can retry
+            self.pending_pkce = Some(pkce);
+            return Err("state mismatch — possible CSRF attack".into());
+        }
+
+        // Check if PKCE flow has expired (5 minutes max)
+        if pkce.started_at.elapsed() > Duration::from_secs(300) {
+            return Err("PKCE authorization expired — please restart authentication".into());
+        }
+
+        let token = self
+            .exchange_code_for_tokens(code, &pkce.code_verifier)
+            .await?;
+        let access_token_clone = token.access_token.clone();
+        {
+            let mut ts = self.tokens.lock().await;
+            ts.access_token = Some(token.access_token);
+            ts.refresh_token = token.refresh_token;
+            ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
+        }
+        self.user_id = token
+            .user_id
+            .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
+        self.country_code = "FR".into();
+
+        info!(user_id = ?self.user_id, "tidal_pkce_authenticated");
+
+        // Fetch username and subscription info
+        self.refresh_user_info().await;
+
+        Ok(self.auth_status().await)
     }
 
     /// Attempt to refresh the access token using the refresh_token.
@@ -632,11 +782,36 @@ impl StreamingService for TidalService {
         &mut self,
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, String> {
+        // If already authenticated with valid tokens, return current status
+        {
+            let ts = self.tokens.lock().await;
+            if ts.access_token.is_some() && ts.refresh_token.is_some() {
+                let token_ok = ts.token_expires.map(|t| Instant::now() < t).unwrap_or(true); // no expiry tracked = assume OK
+                if token_ok {
+                    drop(ts);
+                    return Ok(self.auth_status().await);
+                }
+            }
+        }
+
+        // --- Handle PKCE callback (code + state from OAuth redirect) ---
+        if let Some(code) = credentials.get("code").and_then(|v| v.as_str()) {
+            let state = credentials
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            return self.handle_oauth_callback(code, state).await;
+        }
+
+        // --- Device Code flow (legacy fallback, explicitly requested) ---
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
             let resp = self
                 .client
                 .post(format!("{AUTH_BASE}/device_authorization"))
-                .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
+                .form(&[
+                    ("client_id", LEGACY_CLIENT_ID),
+                    ("scope", "r_usr w_usr w_sub"),
+                ])
                 .send()
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
@@ -672,87 +847,110 @@ impl StreamingService for TidalService {
             });
         }
 
-        info!(has_pending = self.pending_device_auth.is_some(), device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
+        // --- Poll pending Device Code flow ---
+        if self.pending_device_auth.is_some() {
+            info!(has_pending = true, device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
 
-        if let Some(ref pending) = self.pending_device_auth.clone() {
-            // Check if the device code has expired (Tidal typically gives 300s)
-            let max_lifetime = Duration::from_secs(pending.expires_in.max(300));
-            if let Some(started) = self.device_auth_started {
-                if started.elapsed() > max_lifetime {
-                    warn!(
-                        elapsed_secs = started.elapsed().as_secs(),
-                        expires_in = pending.expires_in,
-                        "tidal_device_code_expired — clearing pending auth"
-                    );
-                    self.pending_device_auth = None;
-                    self.device_auth_started = None;
+            if let Some(ref pending) = self.pending_device_auth.clone() {
+                // Check if the device code has expired (Tidal typically gives 300s)
+                let max_lifetime = Duration::from_secs(pending.expires_in.max(300));
+                if let Some(started) = self.device_auth_started {
+                    if started.elapsed() > max_lifetime {
+                        warn!(
+                            elapsed_secs = started.elapsed().as_secs(),
+                            expires_in = pending.expires_in,
+                            "tidal_device_code_expired — clearing pending auth"
+                        );
+                        self.pending_device_auth = None;
+                        self.device_auth_started = None;
+                        return Ok(AuthStatus {
+                            authenticated: false,
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                let resp = self
+                    .client
+                    .post(format!("{AUTH_BASE}/token"))
+                    .form(&[
+                        ("client_id", LEGACY_CLIENT_ID),
+                        ("client_secret", LEGACY_CLIENT_SECRET),
+                        ("device_code", pending.device_code.as_str()),
+                        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                        ("scope", "r_usr w_usr w_sub"),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|e| format!("token: {e}"))?;
+
+                let status_code = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+
+                if status_code != 200 {
+                    info!(status = status_code, body = %body, "tidal_token_exchange");
+                    // If Tidal says the device code is expired or invalid, clear it
+                    // so the user can start a fresh device auth flow.
+                    if body.contains("expired") || body.contains("invalid_grant") {
+                        warn!("tidal_device_code_rejected — clearing pending auth");
+                        self.pending_device_auth = None;
+                        self.device_auth_started = None;
+                    }
                     return Ok(AuthStatus {
                         authenticated: false,
                         ..Default::default()
                     });
                 }
-            }
 
-            let resp = self
-                .client
-                .post(format!("{AUTH_BASE}/token"))
-                .form(&[
-                    ("client_id", CLIENT_ID),
-                    ("client_secret", CLIENT_SECRET),
-                    ("device_code", &pending.device_code),
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ("scope", "r_usr w_usr w_sub"),
-                ])
-                .send()
-                .await
-                .map_err(|e| format!("token: {e}"))?;
+                info!(body = %body, "tidal_token_exchange_success");
 
-            let status_code = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-
-            if status_code != 200 {
-                info!(status = status_code, body = %body, "tidal_token_exchange");
-                // If Tidal says the device code is expired or invalid, clear it
-                // so the user can start a fresh device auth flow.
-                if body.contains("expired") || body.contains("invalid_grant") {
-                    warn!("tidal_device_code_rejected — clearing pending auth");
-                    self.pending_device_auth = None;
-                    self.device_auth_started = None;
+                let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
+                    warn!(error = %e, body = %body, "tidal_token_parse_failed");
+                    format!("token parse: {e}")
+                })?;
+                let access_token_clone = token.access_token.clone();
+                {
+                    let mut ts = self.tokens.lock().await;
+                    ts.access_token = Some(token.access_token);
+                    ts.refresh_token = token.refresh_token;
+                    ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
                 }
-                return Ok(AuthStatus {
-                    authenticated: false,
-                    ..Default::default()
-                });
+                // user_id: use the response field if present, otherwise extract from JWT
+                self.user_id = token
+                    .user_id
+                    .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
+                self.pending_device_auth = None;
+                self.device_auth_started = None;
+                self.country_code = "FR".into();
+
+                info!(user_id = ?self.user_id, "tidal_authenticated");
+
+                // Fetch username and subscription info now that we're authenticated
+                self.refresh_user_info().await;
             }
 
-            info!(body = %body, "tidal_token_exchange_success");
-
-            let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-                warn!(error = %e, body = %body, "tidal_token_parse_failed");
-                format!("token parse: {e}")
-            })?;
-            let access_token_clone = token.access_token.clone();
-            {
-                let mut ts = self.tokens.lock().await;
-                ts.access_token = Some(token.access_token);
-                ts.refresh_token = token.refresh_token;
-                ts.token_expires = Some(Instant::now() + Duration::from_secs(token.expires_in));
-            }
-            // user_id: use the response field if present, otherwise extract from JWT
-            self.user_id = token
-                .user_id
-                .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
-            self.pending_device_auth = None;
-            self.device_auth_started = None;
-            self.country_code = "FR".into();
-
-            info!(user_id = ?self.user_id, "tidal_authenticated");
-
-            // Fetch username and subscription info now that we're authenticated
-            self.refresh_user_info().await;
+            return Ok(self.auth_status().await);
         }
 
-        Ok(self.auth_status().await)
+        // --- Default: start PKCE flow (primary) ---
+        let verifier = Self::generate_code_verifier();
+        let challenge = Self::generate_code_challenge(&verifier);
+        let state = Self::generate_state();
+        let authorize_url = Self::build_authorize_url(&challenge, &state);
+
+        info!(url = %authorize_url, "tidal_pkce_auth_started");
+
+        self.pending_pkce = Some(PkceState {
+            code_verifier: verifier,
+            state: state.clone(),
+            started_at: Instant::now(),
+        });
+
+        Ok(AuthStatus {
+            authenticated: false,
+            verification_url: Some(authorize_url),
+            ..Default::default()
+        })
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -1519,6 +1717,27 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Base64url-encode (no padding) — used for PKCE code challenges.
+fn base64url_encode(data: &[u8]) -> String {
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::new();
+    let mut buf: u32 = 0;
+    let mut bits = 0;
+    for &byte in data {
+        buf = (buf << 8) | byte as u32;
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            output.push(table[((buf >> bits) & 0x3F) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        buf <<= 6 - bits;
+        output.push(table[(buf & 0x3F) as usize] as char);
+    }
+    output
+}
+
 fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
     let padded = match input.len() % 4 {
         2 => format!("{input}=="),
@@ -1995,5 +2214,96 @@ mod tests {
             400,
             r#"{"error":"INVALID_CLIENT"}"#,
         ));
+    }
+
+    // ---- PKCE tests ----
+
+    #[test]
+    fn pkce_client_id_is_correct() {
+        // Regression test: ensure we're using our own registered Tidal app
+        assert_eq!(CLIENT_ID, "n9JALqHugEUxV4MZ");
+    }
+
+    #[test]
+    fn pkce_code_verifier_length() {
+        let verifier = TidalService::generate_code_verifier();
+        assert!(
+            verifier.len() >= 43 && verifier.len() <= 128,
+            "code_verifier length {} not in 43..=128",
+            verifier.len()
+        );
+    }
+
+    #[test]
+    fn pkce_code_verifier_url_safe() {
+        let verifier = TidalService::generate_code_verifier();
+        for c in verifier.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '~',
+                "code_verifier contains invalid char: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn pkce_code_verifier_unique() {
+        // Two generated verifiers must be different (randomness check)
+        let v1 = TidalService::generate_code_verifier();
+        let v2 = TidalService::generate_code_verifier();
+        assert_ne!(v1, v2, "code verifiers should be unique");
+    }
+
+    #[test]
+    fn pkce_code_challenge_is_sha256_base64url() {
+        // Known test vector: SHA256("foobar") = base64url encoded
+        let challenge = TidalService::generate_code_challenge("foobar");
+        // SHA256("foobar") = w6uP8Tcg6K2QR905Rms8iXTlksL6OD1KOWBxTK7wxPI
+        // Verify it's the correct SHA256+base64url
+        let mut hasher = Sha256::new();
+        hasher.update(b"foobar");
+        let hash = hasher.finalize();
+        let expected = base64url_encode(&hash);
+        assert_eq!(challenge, expected);
+        // Must not contain + or / or = (those are standard base64, not base64url)
+        assert!(!challenge.contains('+'));
+        assert!(!challenge.contains('/'));
+        assert!(!challenge.contains('='));
+    }
+
+    #[test]
+    fn pkce_authorize_url_format() {
+        let challenge = "test_challenge_abc123";
+        let state = "test_state_xyz";
+        let url = TidalService::build_authorize_url(challenge, state);
+
+        assert!(url.starts_with("https://login.tidal.com/authorize?"));
+        assert!(url.contains("client_id=n9JALqHugEUxV4MZ"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("redirect_uri="));
+        assert!(url.contains("localhost%3A8888"));
+        assert!(url.contains("code_challenge=test_challenge_abc123"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=test_state_xyz"));
+        assert!(url.contains("scope="));
+        assert!(url.contains("r_usr"));
+        assert!(url.contains("w_usr"));
+        assert!(url.contains("w_sub"));
+    }
+
+    #[test]
+    fn pkce_redirect_uri_is_correct() {
+        assert_eq!(
+            REDIRECT_URI,
+            "http://localhost:8888/api/v1/streaming/tidal/callback"
+        );
+    }
+
+    #[test]
+    fn base64url_encode_known_vector() {
+        // Known: base64url("Hello") = "SGVsbG8"
+        let result = base64url_encode(b"Hello");
+        assert_eq!(result, "SGVsbG8");
+        // Ensure no padding
+        assert!(!result.contains('='));
     }
 }

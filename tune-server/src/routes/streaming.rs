@@ -131,6 +131,7 @@ pub fn router() -> Router<AppState> {
         .route("/youtube/moods", get(youtube_moods))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        .route("/tidal/callback", get(tidal_callback))
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +623,93 @@ async fn spotify_callback(
             .into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TidalCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+async fn tidal_callback(
+    State(state): State<AppState>,
+    Query(q): Query<TidalCallbackQuery>,
+) -> Response {
+    if let Some(ref error) = q.error {
+        let desc = q.error_description.as_deref().unwrap_or(error);
+        return axum::response::Html(format!(
+            r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center">
+<h1 style="color:#ef4444">Tidal Authentication Failed</h1>
+<p>{desc}</p>
+<p style="color:#888">You can close this tab and try again.</p>
+</div></body></html>"#
+        ))
+        .into_response();
+    }
+
+    let Some(code) = q.code else {
+        return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
+    };
+    let callback_state = q.state.as_deref().unwrap_or("");
+
+    let svc = match get_svc(&state, "tidal").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+
+    // Use authenticate with the code+state credentials (same pattern as Spotify)
+    match svc
+        .authenticate(&json!({"code": code, "state": callback_state}))
+        .await
+    {
+        Ok(status) => {
+            let username = status.username.clone().unwrap_or_default();
+            drop(svc);
+            state.save_tokens().await;
+            if status.authenticated {
+                state.event_bus.emit(
+                    "streaming.auth.success",
+                    json!({
+                        "service": "tidal",
+                        "username": &username,
+                    }),
+                );
+            }
+            axum::response::Html(format!(
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center">
+<h1 style="color:#4ade80">Tidal Connected!</h1>
+<p>Logged in as <strong>{username}</strong></p>
+<p style="color:#888">You can close this tab.</p>
+<script>setTimeout(function(){{ window.close(); }}, 3000);</script>
+</div></body></html>"#
+            ))
+            .into_response()
+        }
+        Err(e) => {
+            let err_msg = e.to_string();
+            state.event_bus.emit(
+                "streaming.auth.failed",
+                json!({
+                    "service": "tidal",
+                    "error": &err_msg,
+                }),
+            );
+            axum::response::Html(format!(
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center">
+<h1 style="color:#ef4444">Tidal Authentication Failed</h1>
+<p>{err_msg}</p>
+<p style="color:#888">You can close this tab and try again.</p>
+</div></body></html>"#
+            ))
+            .into_response()
+        }
     }
 }
 
