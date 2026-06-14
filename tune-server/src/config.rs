@@ -41,10 +41,18 @@ pub struct TuneConfig {
     /// on macOS, ASIO exclusive on Windows).
     #[serde(default)]
     pub local_exclusive_mode: bool,
+    /// Tidal audio quality: "HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", or "HIGH".
+    /// Defaults to "HI_RES_LOSSLESS" (FLAC 24-bit up to 192kHz).
+    #[serde(default = "default_tidal_quality")]
+    pub tidal_quality: String,
 }
 
 fn default_audio_backend() -> String {
     "auto".into()
+}
+
+fn default_tidal_quality() -> String {
+    "HI_RES_LOSSLESS".into()
 }
 
 impl TuneConfig {
@@ -80,6 +88,7 @@ impl Default for TuneConfig {
             database_url: None,
             local_audio_backend: "auto".into(),
             local_exclusive_mode: false,
+            tidal_quality: "HI_RES_LOSSLESS".into(),
         }
     }
 }
@@ -211,6 +220,11 @@ impl TuneConfig {
         // automatically (ASIO is inherently exclusive).
         if config.local_audio_backend.to_lowercase() == "asio" && !config.local_exclusive_mode {
             config.local_exclusive_mode = true;
+        }
+        if let Ok(v) = std::env::var("TUNE_TIDAL_QUALITY")
+            && !v.is_empty()
+        {
+            config.tidal_quality = v;
         }
         if let Ok(v) = std::env::var("TUNE_MUSIC_DIRS") {
             let trimmed = v.trim();

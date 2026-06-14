@@ -849,15 +849,169 @@ impl DbBackend for PostgresBackend {
 
     fn write_tx(
         &self,
-        _f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
     ) -> Result<(), String> {
-        // Bridging sqlx's owned async Transaction to a sync trait
-        // object on a closure that may itself want to call block_on is
-        // non-trivial and out of scope for phase 5. SQLite is the only
-        // engine used in production today; the 6 transactional repos
-        // ship with SQLite-only correctness, and PG support is added
-        // when a deploy actually needs it.
-        Err("write_tx: Postgres support not yet implemented (phase 6)".into())
+        let pool = self.pool.clone();
+        let last_id_handle = self.last_id.clone();
+
+        // Bridge async sqlx transaction into the sync closure boundary.
+        // `block_in_place` is safe here because Tune runs on a
+        // multi-threaded tokio runtime (`#[tokio::main]`).
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let tx = pool
+                    .begin()
+                    .await
+                    .map_err(|e| format!("pg begin tx: {e}"))?;
+
+                let tx_cell = std::cell::RefCell::new(tx);
+                let handle = PgTxHandle {
+                    tx: &tx_cell,
+                    last_id: last_id_handle.clone(),
+                };
+
+                let result = f(&handle);
+
+                let tx = tx_cell.into_inner();
+                match result {
+                    Ok(()) => {
+                        tx.commit().await.map_err(|e| format!("pg commit: {e}"))?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tx.rollback()
+                            .await
+                            .map_err(|e2| format!("pg rollback after error ({e}): {e2}"))?;
+                        Err(e)
+                    }
+                }
+            })
+        })
+    }
+}
+
+/// Postgres-backed transaction handle. Wraps a `RefCell`-guarded
+/// reference to a `sqlx::Transaction` for the duration of the
+/// `write_tx` closure.
+///
+/// Each operation inside the closure runs via `block_in_place` +
+/// `block_on` to bridge async sqlx into the sync `DbTxHandle` trait.
+/// The `RefCell` provides interior mutability so the `&self` methods
+/// on `DbTxHandle` can borrow the transaction mutably (sqlx requires
+/// `&mut Transaction` for execute/fetch). Single-threaded access is
+/// guaranteed because `write_tx` is synchronous and the handle never
+/// escapes the closure.
+#[cfg(feature = "postgres")]
+struct PgTxHandle<'a> {
+    tx: &'a std::cell::RefCell<sqlx::Transaction<'static, sqlx::Postgres>>,
+    last_id: std::sync::Arc<std::sync::Mutex<i64>>,
+}
+
+#[cfg(feature = "postgres")]
+impl DbTxHandle for PgTxHandle<'_> {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let mut sql_owned = sql.to_string();
+        let last_id_handle = self.last_id.clone();
+
+        // Auto-append RETURNING id for bare INSERTs (same logic as
+        // PostgresBackend::execute).
+        let upper = sql_owned.to_ascii_uppercase();
+        let trimmed = upper.trim_end_matches(';').trim_end();
+        let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
+        let has_returning = trimmed.contains("RETURNING");
+        if is_insert && !has_returning {
+            let trailing_semi = sql_owned.ends_with(';');
+            sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
+            sql_owned.push_str(" RETURNING id");
+            if trailing_semi {
+                sql_owned.push(';');
+            }
+        }
+        let returning = is_insert || trimmed.ends_with("RETURNING ID");
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut tx_guard = self.tx.borrow_mut();
+                if returning {
+                    let mut q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql_owned));
+                    for v in &owned {
+                        q = bind_sqlvalue_scalar(q, v);
+                    }
+                    let id = q
+                        .fetch_one(&mut **tx_guard)
+                        .await
+                        .map_err(|e| format!("pg tx execute (returning): {e}"))?;
+                    *last_id_handle.lock().unwrap() = id;
+                    Ok(1)
+                } else {
+                    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
+                    for v in &owned {
+                        q = bind_sqlvalue(q, v);
+                    }
+                    let result = q
+                        .execute(&mut **tx_guard)
+                        .await
+                        .map_err(|e| format!("pg tx execute: {e}"))?;
+                    Ok(result.rows_affected() as usize)
+                }
+            })
+        })
+    }
+
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let sql_owned = sql.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut tx_guard = self.tx.borrow_mut();
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
+                for v in &owned {
+                    q = bind_sqlvalue(q, v);
+                }
+                let row_opt = q
+                    .fetch_optional(&mut **tx_guard)
+                    .await
+                    .map_err(|e| format!("pg tx query_one: {e}"))?;
+                match row_opt {
+                    None => Ok(None),
+                    Some(row) => Ok(Some(pgrow_to_sqlvalues(&row)?)),
+                }
+            })
+        })
+    }
+
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
+        let sql_owned = sql.to_string();
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut tx_guard = self.tx.borrow_mut();
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql_owned));
+                for v in &owned {
+                    q = bind_sqlvalue(q, v);
+                }
+                let rows = q
+                    .fetch_all(&mut **tx_guard)
+                    .await
+                    .map_err(|e| format!("pg tx query_many: {e}"))?;
+                rows.iter().map(pgrow_to_sqlvalues).collect()
+            })
+        })
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        *self.last_id.lock().unwrap()
     }
 }
 

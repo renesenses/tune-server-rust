@@ -222,10 +222,29 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
                 db.execute_batch("BEGIN IMMEDIATE").ok();
 
                 for sf in &batch {
+                    if sf.metadata.is_none() {
+                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
+                        continue;
+                    }
+
+                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
+                    // Without this, build_track_from_metadata can create a ghost album
+                    // (with cover but no tracks) for files that are ultimately skipped.
+                    if let Some(&(_existing_id, existing_mtime, existing_size)) =
+                        existing_tracks.get(&sf.path)
+                    {
+                        let file_changed = existing_mtime
+                            .is_none_or(|m| (m - sf.mtime as f64).abs() > 0.5)
+                            || (existing_size != Some(sf.file_size as i64));
+                        if !file_changed {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+
                     let Some((mut track, album_id)) =
                         build_track_from_metadata(sf, &artist_repo, &album_repo)
                     else {
-                        tracing::warn!(path = %sf.path, "scan_track_skipped_no_metadata");
                         continue;
                     };
 
@@ -240,18 +259,8 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
                         albums_with_cover.insert(aid);
                     }
 
-                    if let Some(&(existing_id, existing_mtime, existing_size)) =
-                        existing_tracks.get(&sf.path)
-                    {
-                        let file_changed = existing_mtime
-                            .is_none_or(|m| (m - sf.mtime as f64).abs() > 0.5)
-                            || (existing_size != Some(sf.file_size as i64));
-
-                        if !file_changed {
-                            skipped += 1;
-                            continue;
-                        }
-
+                    // File already exists and has changed — collect for batch update
+                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
                         track.id = Some(existing_id);
                         to_update.push(track);
                         continue;

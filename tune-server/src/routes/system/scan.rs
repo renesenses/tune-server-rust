@@ -157,6 +157,22 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                         continue;
                     };
 
+                    // Early-exit: skip unchanged files BEFORE resolving artist/album.
+                    // Without this, get_or_create_with_mbid can create a ghost album
+                    // entry (with cover art but no tracks) for files that are ultimately
+                    // skipped — the root cause of "duplicate covers after rescan" (#593).
+                    if let Some(&(_existing_id, existing_mtime, existing_size)) =
+                        existing_tracks.get(&sf.path)
+                    {
+                        let file_changed = existing_mtime
+                            .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                            || existing_size.map_or(true, |s| s != sf.file_size as i64);
+                        if !file_changed {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+
                     // Determine if this is a compilation (Various Artists)
                     let is_compilation = meta.compilation
                         || meta
@@ -332,20 +348,9 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             .unwrap_or_default()
                     });
 
-                    // Check if this file already exists in the DB
-                    if let Some(&(existing_id, existing_mtime, existing_size)) =
-                        existing_tracks.get(&sf.path)
-                    {
-                        let file_changed = existing_mtime
-                            .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
-                            || existing_size.map_or(true, |s| s != sf.file_size as i64);
-
-                        if !file_changed {
-                            skipped += 1;
-                            continue;
-                        }
-
-                        // File changed -- collect for batch update
+                    // File already exists and has changed — collect for batch update
+                    // (unchanged files were already skipped by the early-exit above)
+                    if let Some(&(existing_id, _, _)) = existing_tracks.get(&sf.path) {
                         let mut track = tune_core::db::models::Track::new(title);
                         track.id = Some(existing_id);
                         track.album_id = album_id;
@@ -595,6 +600,73 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 [],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
+            }
+            // Merge duplicate local albums (same title, case-insensitive).
+            // After a rescan, tag changes can create a second album entry for
+            // tracks that already belonged to an existing album (e.g. when
+            // album_artist changed). Merging moves all tracks to the album
+            // with the most tracks, so the orphan cleanup below can delete the
+            // now-empty duplicate. This is the definitive fix for bug #593
+            // ("Doublons pochettes albums apres rescan").
+            {
+                let dupes: Vec<(String, String)> = conn
+                    .prepare(
+                        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
+                         WHERE source = 'local' \
+                         GROUP BY LOWER(title) HAVING COUNT(id) > 1",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                    })
+                    .unwrap_or_default();
+                let mut merged_albums = 0usize;
+                for (_title, ids_str) in &dupes {
+                    let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
+                    if ids.len() < 2 {
+                        continue;
+                    }
+                    // Keep the album with the most tracks
+                    let mut best_id = ids[0];
+                    let mut best_count = 0i64;
+                    for &aid in &ids {
+                        let cnt: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                                rusqlite::params![aid],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        if cnt > best_count {
+                            best_count = cnt;
+                            best_id = aid;
+                        }
+                    }
+                    for &aid in &ids {
+                        if aid != best_id {
+                            conn.execute(
+                                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                                rusqlite::params![best_id, aid],
+                            )
+                            .ok();
+                            conn.execute(
+                                "DELETE FROM albums WHERE id = ?",
+                                rusqlite::params![aid],
+                            )
+                            .ok();
+                            merged_albums += 1;
+                        }
+                    }
+                }
+                if merged_albums > 0 {
+                    // Refresh track_count for albums that received tracks from merged duplicates
+                    conn.execute_batch(
+                        "UPDATE albums SET track_count = \
+                         (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
+                    )
+                    .ok();
+                    tracing::info!(merged_albums, "post_scan_duplicate_albums_merged");
+                }
             }
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
             let orphan_albums = conn.execute(

@@ -798,6 +798,108 @@ pub fn latest_version() -> i32 {
     MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
 }
 
+// ─── PostgreSQL migration runner ─────────────────────────────────────
+
+/// Embedded PG migration scripts. Each tuple is (version, name, sql).
+/// The SQL files are compiled into the binary so no filesystem access
+/// is needed at runtime.
+#[cfg(feature = "postgres")]
+const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
+    (
+        1,
+        "initial_schema",
+        include_str!("../../migrations/postgres/001_initial_schema.sql"),
+    ),
+    (
+        2,
+        "fts_tsvector",
+        include_str!("../../migrations/postgres/002_fts_tsvector.sql"),
+    ),
+    (
+        3,
+        "track_metadata_columns",
+        include_str!("../../migrations/postgres/003_track_metadata_columns.sql"),
+    ),
+    (
+        4,
+        "listen_history",
+        include_str!("../../migrations/postgres/004_listen_history.sql"),
+    ),
+    (
+        5,
+        "additional_tables",
+        include_str!("../../migrations/postgres/005_additional_tables.sql"),
+    ),
+    (
+        6,
+        "missing_columns",
+        include_str!("../../migrations/postgres/006_missing_columns.sql"),
+    ),
+];
+
+/// Run all pending PostgreSQL migrations against the pool.
+///
+/// Uses a `schema_version` table (matching the convention in the SQL
+/// files) to track which migrations have been applied.  Migrations
+/// that wrap their body in `BEGIN; … COMMIT;` are executed as-is;
+/// the runner does not add an outer transaction so that each script
+/// controls its own transactional boundaries.
+#[cfg(feature = "postgres")]
+pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
+    // Ensure the tracking table exists.  The 001 script creates
+    // `schema_version`, but on a truly empty database we need it
+    // before we can query it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMPTZ DEFAULT now(),
+            name TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("pg create schema_version: {e}"))?;
+
+    // What has already been applied?
+    let current: i32 =
+        sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("pg read schema_version: {e}"))?;
+
+    for &(version, name, sql) in PG_MIGRATIONS {
+        if version <= current {
+            continue;
+        }
+
+        info!(version, name, "pg_migration_applying");
+
+        // Each migration file manages its own BEGIN/COMMIT, so we
+        // execute the raw SQL directly.
+        sqlx::raw_sql(sql)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("pg migration {version} ({name}): {e}"))?;
+
+        info!(version, name, "pg_migration_applied");
+    }
+
+    // Run ANALYZE on key tables for the query planner.
+    sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")
+        .execute(pool)
+        .await
+        .ok();
+    info!("pg_analyze_complete");
+
+    Ok(())
+}
+
+/// Latest PG migration version (for diagnostics).
+#[cfg(feature = "postgres")]
+pub fn pg_latest_version() -> i32 {
+    PG_MIGRATIONS.last().map(|&(v, _, _)| v).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
