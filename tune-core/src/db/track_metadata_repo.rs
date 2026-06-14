@@ -1,0 +1,251 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::backend::{DbBackend, ToSqlValue};
+use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use super::sqlite::SqliteDb;
+
+/// Engine-agnostic SQL builders for track_metadata_repo.
+pub mod sql {
+    use super::SqlDialect;
+
+    pub fn get_all<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT key, value FROM track_metadata WHERE track_id = {} ORDER BY key",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn upsert<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES ({}, {}, {}) \
+             ON CONFLICT (track_id, key) DO UPDATE SET value = excluded.value",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn delete_one<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM track_metadata WHERE track_id = {} AND key = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn delete_all<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM track_metadata WHERE track_id = {}",
+            d.placeholder(1)
+        )
+    }
+}
+
+pub struct TrackMetadataRepo {
+    db: Arc<dyn DbBackend>,
+}
+
+impl TrackMetadataRepo {
+    pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
+        Self { db }
+    }
+
+    fn dialect_sql<F1, F2>(&self, sqlite: F1, postgres: F2) -> String
+    where
+        F1: FnOnce(&SqliteDialect) -> String,
+        F2: FnOnce(&PostgresDialect) -> String,
+    {
+        match self.db.engine() {
+            Engine::Sqlite => sqlite(&SqliteDialect),
+            Engine::Postgres => postgres(&PostgresDialect),
+        }
+    }
+
+    /// Get all metadata key-value pairs for a track.
+    pub fn get_all(&self, track_id: i64) -> Result<HashMap<String, String>, String> {
+        let sql = self.dialect_sql(sql::get_all, sql::get_all);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        let mut map = HashMap::new();
+        for cols in rows {
+            let key = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+            let value = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+            if !key.is_empty() {
+                map.insert(key, value);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Set a single metadata field (upsert).
+    pub fn set(&self, track_id: i64, key: &str, value: &str) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::upsert, sql::upsert);
+        let params: [&dyn ToSqlValue; 3] = [&track_id, &key, &value];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Set multiple metadata fields in a batch (upsert each).
+    pub fn set_batch(&self, track_id: i64, fields: &HashMap<String, String>) -> Result<(), String> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(sql::upsert, sql::upsert);
+        for (key, value) in fields {
+            let params: [&dyn ToSqlValue; 3] = [&track_id, &key.as_str(), &value.as_str()];
+            self.db.execute(&sql, &params)?;
+        }
+        Ok(())
+    }
+
+    /// Delete a single metadata field.
+    pub fn delete(&self, track_id: i64, key: &str) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::delete_one, sql::delete_one);
+        let params: [&dyn ToSqlValue; 2] = [&track_id, &key];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Delete all metadata for a track.
+    pub fn delete_all(&self, track_id: i64) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::delete_all, sql::delete_all);
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Batch-set metadata for multiple tracks at once (used by scanner).
+    /// Takes a vec of (track_id, fields) pairs and inserts them all.
+    pub fn set_batch_multi(
+        &self,
+        entries: &[(i64, HashMap<String, String>)],
+    ) -> Result<(), String> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(sql::upsert, sql::upsert);
+        for (track_id, fields) in entries {
+            for (key, value) in fields {
+                let params: [&dyn ToSqlValue; 3] = [track_id, &key.as_str(), &value.as_str()];
+                self.db.execute(&sql, &params)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations;
+
+    fn setup_db() -> SqliteDb {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        // Insert a dummy track so FK constraint is satisfied
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'Test Artist');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Test Album', 1);
+             INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, disc_number, track_number, channels)
+             VALUES (1, 'Test Track', 1, 1, 300000, 1, 1, 2);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn set_and_get() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "composer", "Bach").unwrap();
+        repo.set(1, "conductor", "Karajan").unwrap();
+
+        let meta = repo.get_all(1).unwrap();
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta.get("composer").unwrap(), "Bach");
+        assert_eq!(meta.get("conductor").unwrap(), "Karajan");
+    }
+
+    #[test]
+    fn upsert_overwrites() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "composer", "Bach").unwrap();
+        repo.set(1, "composer", "Mozart").unwrap();
+
+        let meta = repo.get_all(1).unwrap();
+        assert_eq!(meta.get("composer").unwrap(), "Mozart");
+    }
+
+    #[test]
+    fn set_batch() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        let mut fields = HashMap::new();
+        fields.insert("composer".into(), "Beethoven".into());
+        fields.insert("conductor".into(), "Furtwangler".into());
+        fields.insert("label".into(), "DG".into());
+
+        repo.set_batch(1, &fields).unwrap();
+
+        let meta = repo.get_all(1).unwrap();
+        assert_eq!(meta.len(), 3);
+        assert_eq!(meta.get("label").unwrap(), "DG");
+    }
+
+    #[test]
+    fn delete_one() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "composer", "Bach").unwrap();
+        repo.set(1, "conductor", "Karajan").unwrap();
+        repo.delete(1, "composer").unwrap();
+
+        let meta = repo.get_all(1).unwrap();
+        assert_eq!(meta.len(), 1);
+        assert!(meta.get("composer").is_none());
+        assert_eq!(meta.get("conductor").unwrap(), "Karajan");
+    }
+
+    #[test]
+    fn delete_all() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "composer", "Bach").unwrap();
+        repo.set(1, "conductor", "Karajan").unwrap();
+        repo.delete_all(1).unwrap();
+
+        let meta = repo.get_all(1).unwrap();
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn empty_track_returns_empty_map() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        let meta = repo.get_all(1).unwrap();
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn with_backend_constructor() {
+        let db = setup_db();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = TrackMetadataRepo::with_backend(backend);
+        repo.set(1, "mood", "happy").unwrap();
+        let meta = repo.get_all(1).unwrap();
+        assert_eq!(meta.get("mood").unwrap(), "happy");
+    }
+}
