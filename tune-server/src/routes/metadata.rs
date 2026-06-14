@@ -72,6 +72,9 @@ pub fn router() -> Router<AppState> {
         // Artist enrichment
         .route("/artists/{id}/enrich", get(enrich_artist))
         .route("/artists/{id}/similar", get(similar_artists))
+        // Cover art enrichment (web client compatibility)
+        .route("/covers/album/{id}", post(fetch_album_cover))
+        .route("/covers/search", get(search_covers))
         // Genre fix tools
         .route("/fix-genres", post(fix_genres))
         .route("/fix-genres-by-artist", post(fix_genres_by_artist))
@@ -1428,4 +1431,169 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
         "details": details,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /covers/album/{id} — web client compatibility endpoint
+// ---------------------------------------------------------------------------
+
+/// Fetch and assign a cover to an album. Tries Cover Art Archive (via MBID
+/// or MusicBrainz search), then Discogs. Compatible with the Python server's
+/// `POST /metadata/covers/album/{id}` endpoint that the web client calls.
+async fn fetch_album_cover(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::new(state.db.clone());
+    let album = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "album not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let artist = album.artist_name.as_deref().unwrap_or("");
+
+    // Step 1: Determine MBID — use existing or search MusicBrainz
+    let mbid = match album
+        .musicbrainz_release_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => Some(id.to_string()),
+        None => {
+            if !artist.is_empty() && !album.title.is_empty() {
+                let found =
+                    tune_core::library::artwork::search_musicbrainz_release(artist, &album.title)
+                        .await;
+                if let Some(ref discovered_mbid) = found {
+                    state
+                        .db
+                        .execute(
+                            "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
+                            &[discovered_mbid as &dyn rusqlite::types::ToSql, &id],
+                        )
+                        .ok();
+                    tracing::info!(
+                        album_id = id,
+                        mbid = %discovered_mbid,
+                        album = %album.title,
+                        "fetch_album_cover_mbid_discovered"
+                    );
+                }
+                found
+            } else {
+                None
+            }
+        }
+    };
+
+    // Step 2: Try Cover Art Archive
+    if let Some(ref mbid_val) = mbid {
+        if let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await {
+            let cache_dir = super::library::artwork_cache_dir();
+            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
+            if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
+            {
+                repo.force_update_cover_path(id, &hash).ok();
+                return Json(json!({
+                    "ok": true,
+                    "cover_path": hash,
+                    "source": "coverartarchive",
+                    "size": data.len(),
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    // Step 3: Try Discogs fallback
+    let discogs_token = state
+        .config
+        .discogs_token
+        .clone()
+        .or_else(|| std::env::var("TUNE_DISCOGS_TOKEN").ok())
+        .or_else(|| std::env::var("DISCOGS_TOKEN").ok())
+        .unwrap_or_default();
+
+    if !discogs_token.is_empty() && !album.title.is_empty() {
+        let cache_dir = super::library::artwork_cache_dir();
+        let cache_str = cache_dir.to_string_lossy().to_string();
+        if let Some(path) = tune_core::library::cover_fetcher::fetch_cover_from_discogs(
+            &album.title,
+            artist,
+            &discogs_token,
+            &cache_str,
+        )
+        .await
+        {
+            // Extract filename as hash or use the path
+            let hash = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&path)
+                .to_string();
+            repo.force_update_cover_path(id, &hash).ok();
+            return Json(json!({
+                "ok": true,
+                "cover_path": hash,
+                "source": "discogs",
+            }))
+            .into_response();
+        }
+    }
+
+    Json(json!({"ok": false, "error": "No cover found"})).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /covers/search — search for covers from multiple sources
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CoverSearchParams {
+    album: String,
+    artist: Option<String>,
+    release_id: Option<String>,
+}
+
+async fn search_covers(
+    State(state): State<AppState>,
+    Query(params): Query<CoverSearchParams>,
+) -> impl IntoResponse {
+    let discogs_token = state
+        .config
+        .discogs_token
+        .clone()
+        .or_else(|| std::env::var("TUNE_DISCOGS_TOKEN").ok())
+        .or_else(|| std::env::var("DISCOGS_TOKEN").ok())
+        .unwrap_or_default();
+
+    let cache_dir = super::library::artwork_cache_dir();
+    let cache_str = cache_dir.to_string_lossy().to_string();
+
+    let results = tune_core::library::cover_fetcher::search_covers(
+        &params.album,
+        params.artist.as_deref().unwrap_or(""),
+        params.release_id.as_deref().unwrap_or(""),
+        &discogs_token,
+        &cache_str,
+    )
+    .await;
+
+    let results_json: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "source": r.source,
+                "local_path": r.local_path,
+            })
+        })
+        .collect();
+
+    Json(json!({"results": results_json}))
 }

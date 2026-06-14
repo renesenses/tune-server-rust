@@ -10,6 +10,8 @@ use super::device::{DiscoveredDevice, OutputType};
 pub const AIRPLAY_SERVICE: &str = "_raop._tcp.local.";
 pub const AIRPLAY2_SERVICE: &str = "_airplay._tcp.local.";
 pub const BLUOS_SERVICE: &str = "_musc._tcp.local.";
+pub const BLUOS_SERVICE2: &str = "_musp._tcp.local.";
+pub const BLUOS_SERVICE3: &str = "_musz._tcp.local.";
 pub const CHROMECAST_SERVICE: &str = "_googlecast._tcp.local.";
 pub const SQUEEZEBOX_SERVICE: &str = "_slimcli._tcp.local.";
 pub const TUNE_SERVICE: &str = "_tune-server._tcp.local.";
@@ -79,11 +81,16 @@ impl MdnsScanner {
     }
 
     pub fn with_bluos(mut self) -> Self {
-        self.configs.push(MdnsServiceConfig {
-            service_type: BLUOS_SERVICE.to_string(),
-            output_type: OutputType::Bluos,
-            default_port: 11000,
-        });
+        // BluOS devices advertise multiple mDNS service types: _musc, _musp,
+        // _musz.  Browse all of them to maximise discovery reliability
+        // (some devices/networks only respond to a subset).
+        for svc in [BLUOS_SERVICE, BLUOS_SERVICE2, BLUOS_SERVICE3] {
+            self.configs.push(MdnsServiceConfig {
+                service_type: svc.to_string(),
+                output_type: OutputType::Bluos,
+                default_port: 11000,
+            });
+        }
         self
     }
 
@@ -300,13 +307,14 @@ async fn handle_event(
 
             let mut st = state.lock().await;
 
-            // For AirPlay: skip RAOP if AirPlay2 already registered for this host (or vice versa)
-            if output_type == OutputType::Airplay {
+            // Skip duplicate services for the same host+type (e.g. RAOP vs
+            // AirPlay2, or _musc vs _musp vs _musz for BluOS).
+            if output_type == OutputType::Airplay || output_type == OutputType::Bluos {
                 let host_already = st.devices.values().any(|d| {
-                    d.device_type == OutputType::Airplay && d.host == device.host && d.id != dev_id
+                    d.device_type == output_type && d.host == device.host && d.id != dev_id
                 });
                 if host_already {
-                    debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_airplay_dup_skipped");
+                    debug!(id = %dev_id, name = %device.name, host = %device.host, service = service_type, "mdns_dup_skipped");
                     drop(st);
                     return;
                 }
@@ -549,6 +557,8 @@ mod tests {
     fn service_constants_end_with_local() {
         assert!(AIRPLAY_SERVICE.ends_with(".local."));
         assert!(BLUOS_SERVICE.ends_with(".local."));
+        assert!(BLUOS_SERVICE2.ends_with(".local."));
+        assert!(BLUOS_SERVICE3.ends_with(".local."));
         assert!(CHROMECAST_SERVICE.ends_with(".local."));
         assert!(SQUEEZEBOX_SERVICE.ends_with(".local."));
         assert!(TUNE_SERVICE.ends_with(".local."));

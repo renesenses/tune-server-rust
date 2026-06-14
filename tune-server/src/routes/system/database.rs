@@ -60,6 +60,49 @@ pub(super) async fn database_optimize(State(state): State<AppState>) -> impl Int
     }
 }
 
+/// POST /system/database/rebuild-fts — Rebuild all FTS5 search indexes.
+///
+/// Necessary after manual DB corrections (sqlite3 CLI, DB Browser, etc.)
+/// because the FTS triggers only fire for writes that go through SQLite's
+/// trigger mechanism. Direct INSERT/UPDATE/DELETE via external tools can
+/// leave the FTS indexes out of sync, causing search to return stale or
+/// empty results while stats and browse still show the correct counts.
+///
+/// Also performs a WAL checkpoint so that read-only connections (used by
+/// the browse/list endpoints) immediately see any recent writes.
+pub(super) async fn rebuild_fts(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = match state.db.connection().lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("db lock: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let result = tune_core::library::full_text_search::rebuild_fts_contentless(&conn);
+
+    // Checkpoint WAL so read-only connections see the rebuilt FTS data immediately
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
+    drop(conn);
+
+    match result {
+        Ok(rows) => Json(json!({
+            "status": "ok",
+            "rows_indexed": rows,
+            "message": "FTS indexes rebuilt successfully. Search should now reflect current library state.",
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 pub(super) async fn export_database(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {

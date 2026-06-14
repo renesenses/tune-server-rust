@@ -1,5 +1,14 @@
 //! Full-text search — SQLite-only implementation using FTS5 virtual tables.
 //!
+//! The FTS5 tables are **contentless** (`content=''`) with triggers that
+//! keep them in sync with the source tables. This works perfectly when
+//! all writes go through the Tune server (the triggers fire on every
+//! INSERT/UPDATE/DELETE). However, if a user edits the SQLite database
+//! directly (e.g. via `sqlite3` CLI or DB Browser), the triggers may not
+//! fire or the FTS content may drift. The `rebuild_fts_contentless`
+//! function handles this by deleting all FTS rows and re-inserting from
+//! the source tables.
+//!
 //! Phase 4 of the PostgreSQL support roadmap will introduce a parallel
 //! module (or trait split) that targets PostgreSQL: tsvector columns
 //! materialised on the source tables, GIN indexes, and `@@ to_tsquery`
@@ -85,6 +94,93 @@ pub fn rebuild_fts(conn: &Connection) {
         }
     }
     info!("fts_rebuilt_all");
+}
+
+/// Rebuild FTS5 contentless tables by deleting all FTS rows and
+/// re-inserting from the source tables. This is the correct approach
+/// for `content=''` FTS tables (the standard `rebuild` command only
+/// works when `content=<table>` points to an actual table whose
+/// columns match the FTS columns).
+///
+/// The multi-column FTS tables (tracks_fts, albums_fts, artists_fts)
+/// use triggers to stay in sync, but manual DB edits bypass triggers.
+/// Call this after manual DB corrections, backup restores, or whenever
+/// search results seem out of sync with the actual library.
+pub fn rebuild_fts_contentless(conn: &Connection) -> Result<i64, String> {
+    let start = std::time::Instant::now();
+    let mut total_rows = 0i64;
+
+    // For contentless FTS5 tables (content=''), we cannot use
+    // `DELETE FROM fts_name` — instead we use the special FTS5
+    // `delete-all` command to clear all rows, then re-insert.
+    //
+    // For content-backed FTS5 tables (content='<table>'), `rebuild`
+    // would work, but `delete-all` + re-insert is correct for both.
+
+    // --- tracks_fts: title, artist_name, album_title, genre, composer ---
+    match conn.execute_batch("INSERT INTO tracks_fts(tracks_fts) VALUES('delete-all')") {
+        Ok(_) => {}
+        Err(e) => {
+            // Table might not exist yet (fresh DB before migration 12)
+            warn!(error = %e, "fts_rebuild_delete_tracks_fts");
+        }
+    }
+    match conn.execute(
+        "INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) \
+         SELECT t.id, t.title, \
+                (SELECT name FROM artists WHERE id = t.artist_id), \
+                (SELECT title FROM albums WHERE id = t.album_id), \
+                t.genre, t.composer \
+         FROM tracks t",
+        [],
+    ) {
+        Ok(n) => {
+            total_rows += n as i64;
+            info!(rows = n, "fts_rebuild_tracks_fts");
+        }
+        Err(e) => warn!(error = %e, "fts_rebuild_insert_tracks_fts"),
+    }
+
+    // --- albums_fts: title, artist_name, genre ---
+    match conn.execute_batch("INSERT INTO albums_fts(albums_fts) VALUES('delete-all')") {
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "fts_rebuild_delete_albums_fts"),
+    }
+    match conn.execute(
+        "INSERT INTO albums_fts(rowid, title, artist_name, genre) \
+         SELECT a.id, a.title, \
+                (SELECT name FROM artists WHERE id = a.artist_id), \
+                a.genre \
+         FROM albums a",
+        [],
+    ) {
+        Ok(n) => {
+            total_rows += n as i64;
+            info!(rows = n, "fts_rebuild_albums_fts");
+        }
+        Err(e) => warn!(error = %e, "fts_rebuild_insert_albums_fts"),
+    }
+
+    // --- artists_fts: name, sort_name ---
+    match conn.execute_batch("INSERT INTO artists_fts(artists_fts) VALUES('delete-all')") {
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "fts_rebuild_delete_artists_fts"),
+    }
+    match conn.execute(
+        "INSERT INTO artists_fts(rowid, name, sort_name) \
+         SELECT id, name, sort_name FROM artists",
+        [],
+    ) {
+        Ok(n) => {
+            total_rows += n as i64;
+            info!(rows = n, "fts_rebuild_artists_fts");
+        }
+        Err(e) => warn!(error = %e, "fts_rebuild_insert_artists_fts"),
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    info!(total_rows, elapsed_ms, "fts_rebuild_contentless_complete");
+    Ok(total_rows)
 }
 
 pub fn search_where(table_name: &str) -> String {
@@ -221,5 +317,73 @@ mod tests {
         let conn = db.connection().lock().unwrap();
         setup_fts(&conn);
         rebuild_fts(&conn);
+    }
+
+    #[test]
+    fn rebuild_fts_contentless_repopulates_after_manual_edit() {
+        let db = test_db();
+        let conn = db.connection().lock().unwrap();
+
+        // Insert data via normal path (triggers fire)
+        conn.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Pink Floyd')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO albums (id, title, artist_id, year) VALUES (1, 'The Wall', 1, 1979)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, genre) VALUES (1, 'Comfortably Numb', 1, 1, 'Rock')",
+            [],
+        ).unwrap();
+
+        // Verify FTS has data
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artists_fts", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            fts_count > 0,
+            "FTS should have data after trigger-based inserts"
+        );
+
+        // Simulate FTS corruption: clear FTS content using the contentless delete-all command
+        conn.execute_batch(
+            "INSERT INTO artists_fts(artists_fts) VALUES('delete-all'); \
+             INSERT INTO albums_fts(albums_fts) VALUES('delete-all'); \
+             INSERT INTO tracks_fts(tracks_fts) VALUES('delete-all');",
+        )
+        .unwrap();
+
+        // Verify FTS is empty
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artists_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0, "FTS should be empty after manual delete");
+
+        // Rebuild
+        let rows = rebuild_fts_contentless(&conn).unwrap();
+        assert!(
+            rows >= 3,
+            "Should have rebuilt at least 3 rows (1 artist + 1 album + 1 track)"
+        );
+
+        // Verify FTS is repopulated
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artists_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "artists_fts should have 1 row after rebuild");
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM albums_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "albums_fts should have 1 row after rebuild");
+
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tracks_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1, "tracks_fts should have 1 row after rebuild");
     }
 }

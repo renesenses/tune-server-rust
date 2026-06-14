@@ -584,6 +584,20 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
         }
 
+        // Rebuild FTS indexes so search reflects the current library state.
+        // The FTS tables are contentless (content='') and rely on triggers,
+        // but manual DB edits or batch operations can leave them stale.
+        // A full rebuild after scan guarantees consistency.
+        if let Ok(conn) = db.connection().lock() {
+            match tune_core::library::full_text_search::rebuild_fts_contentless(&conn) {
+                Ok(rows) => tracing::info!(rows, "post_scan_fts_rebuilt"),
+                Err(e) => tracing::warn!(error = %e, "post_scan_fts_rebuild_failed"),
+            }
+            // Checkpoint WAL so read-only connections see all scan results
+            // immediately (prevents "stats show count but browse is empty").
+            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
+        }
+
         let settings = SettingsRepo::new(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");

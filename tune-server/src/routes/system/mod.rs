@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
         .route("/restart", post(config::restart))
         .route("/database/status", get(database::database_status))
         .route("/database/optimize", post(database::database_optimize))
+        .route("/database/rebuild-fts", post(database::rebuild_fts))
         .route(
             "/music-dirs",
             get(config::get_music_dirs).post(config::add_music_dir),

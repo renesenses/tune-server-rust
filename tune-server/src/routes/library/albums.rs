@@ -57,16 +57,28 @@ pub(super) async fn list_albums(
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
     let total = repo.count().unwrap_or(0);
-    let items = repo
-        .list_filtered(
-            limit,
-            offset,
-            sort,
-            order,
-            p.format.as_deref(),
-            p.quality.as_deref(),
-        )
-        .unwrap_or_default();
+    let items = match repo.list_filtered(
+        limit,
+        offset,
+        sort,
+        order,
+        p.format.as_deref(),
+        p.quality.as_deref(),
+    ) {
+        Ok(albums) => albums,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                sort,
+                order,
+                limit,
+                offset,
+                total,
+                "list_albums_query_failed — stats show {total} albums but query returned error"
+            );
+            Vec::new()
+        }
+    };
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }

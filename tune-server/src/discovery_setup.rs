@@ -378,5 +378,97 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
         }
     });
 
+    // After 15s, check for AirPlay zones whose host also speaks BluOS.
+    // This catches Bluesound/NAD devices where _musc._tcp mDNS browse
+    // didn't fire (common on Windows when multicast is partially blocked).
+    {
+        let outputs = state.outputs.clone();
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            probe_airplay_for_bluos(&outputs, &db).await;
+        });
+    }
+
     handle
+}
+
+/// For every AirPlay zone, probe port 11000 to see if the device supports
+/// BluOS.  If so, register a BluOS output and upgrade the zone.
+async fn probe_airplay_for_bluos(outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>, db: &SqliteDb) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+    let zones = zone_repo.list().unwrap_or_default();
+
+    let airplay_zones: Vec<_> = zones
+        .iter()
+        .filter(|z| z.output_type.as_deref() == Some("airplay"))
+        .collect();
+
+    if airplay_zones.is_empty() {
+        return;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    for z in airplay_zones {
+        let Some(ref dev_id) = z.output_device_id else {
+            continue;
+        };
+        // Extract host from mDNS device_id "airplay-{host}-{port}"
+        let host = match dev_id.splitn(3, '-').nth(1) {
+            Some(h) if !h.is_empty() => h,
+            _ => continue,
+        };
+
+        // Skip if a BluOS zone already exists for this host
+        let already_bluos = zones.iter().any(|zz| {
+            zz.output_type.as_deref() == Some("bluos")
+                && zz
+                    .output_device_id
+                    .as_deref()
+                    .map_or(false, |id| id.splitn(3, '-').nth(1) == Some(host))
+        });
+        if already_bluos {
+            continue;
+        }
+
+        let probe_url = format!("http://{host}:11000/Status");
+        match client.get(&probe_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bluos_id = format!("bluos-{host}-11000");
+                let bluos = tune_core::outputs::bluos::BluosOutput::new(
+                    z.name.clone(),
+                    bluos_id.clone(),
+                    host.to_string(),
+                    11000,
+                );
+
+                let mut reg = outputs.lock().await;
+                // Remove the old AirPlay output
+                reg.remove(dev_id);
+                reg.register(Box::new(bluos));
+                drop(reg);
+
+                if let Some(zid) = z.id {
+                    let _ = zone_repo.update_output_device(zid, &bluos_id);
+                    let _ = zone_repo.update_output_type(zid, "bluos");
+                    let _ = zone_repo.set_online_by_device(&bluos_id, true);
+                }
+
+                info!(
+                    name = %z.name,
+                    host = host,
+                    old_id = %dev_id,
+                    new_id = %bluos_id,
+                    "bluos_fallback_probe_upgraded_airplay_zone"
+                );
+            }
+            _ => {
+                tracing::debug!(host = host, name = %z.name, "bluos_fallback_probe_no_response");
+            }
+        }
+    }
 }

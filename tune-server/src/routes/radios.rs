@@ -37,7 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
-        .route("/add-from-web", get(add_from_web))
+        .route("/web/add", get(add_from_web))
         .route(
             "/{id}",
             get(get_radio).put(update_radio).delete(delete_radio),

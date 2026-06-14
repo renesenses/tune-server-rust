@@ -30,7 +30,19 @@ pub(super) async fn list_artists(
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let total = repo.count().unwrap_or(0);
-    let items = repo.list(limit, offset).unwrap_or_default();
+    let items = match repo.list(limit, offset) {
+        Ok(artists) => artists,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                limit,
+                offset,
+                total,
+                "list_artists_query_failed — stats show {total} artists but query returned error"
+            );
+            Vec::new()
+        }
+    };
     Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
