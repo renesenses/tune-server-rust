@@ -40,6 +40,21 @@ pub mod sql {
             d.placeholder(1)
         )
     }
+
+    /// Search track_metadata for rows where `key` is one of the searchable
+    /// metadata fields and `value` matches a LIKE pattern.
+    /// Returns (track_id, key, value) triples.
+    pub fn search_by_value<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT DISTINCT track_id, key, value FROM track_metadata \
+             WHERE key IN ('composer','conductor','lyricist','performer','remixer',\
+             'producer','label','comment','lyrics','isrc','catalog_number') \
+             AND LOWER(value) LIKE LOWER({}) \
+             LIMIT {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 }
 
 pub struct TrackMetadataRepo {
@@ -117,6 +132,29 @@ impl TrackMetadataRepo {
         let params: [&dyn ToSqlValue; 1] = [&track_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Search track_metadata for tracks whose searchable metadata fields
+    /// contain the given query string. Returns a vec of (track_id, key, value)
+    /// for each matching row.
+    pub fn search_by_value(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, String)>, String> {
+        let like = format!("%{query}%");
+        let sql = self.dialect_sql(sql::search_by_value, sql::search_by_value);
+        let params: [&dyn ToSqlValue; 2] = [&like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| {
+                let track_id = cols.first().and_then(|v| v.as_i64())?;
+                let key = cols.get(1).and_then(|v| v.as_string())?;
+                let value = cols.get(2).and_then(|v| v.as_string())?;
+                Some((track_id, key, value))
+            })
+            .collect())
     }
 
     /// Batch-set metadata for multiple tracks at once (used by scanner).
@@ -247,5 +285,56 @@ mod tests {
         repo.set(1, "mood", "happy").unwrap();
         let meta = repo.get_all(1).unwrap();
         assert_eq!(meta.get("mood").unwrap(), "happy");
+    }
+
+    #[test]
+    fn search_by_value_finds_conductor() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "conductor", "Herbert von Karajan").unwrap();
+        repo.set(1, "bpm", "120").unwrap(); // non-searchable field
+
+        let results = repo.search_by_value("Karajan", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1, "conductor");
+        assert_eq!(results[0].2, "Herbert von Karajan");
+    }
+
+    #[test]
+    fn search_by_value_excludes_non_searchable_keys() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        // bpm is not in the searchable keys list
+        repo.set(1, "bpm", "120").unwrap();
+        repo.set(1, "rg_track_gain", "-3.5").unwrap();
+        repo.set(1, "mb_recording_id", "abc-123").unwrap();
+
+        let results = repo.search_by_value("120", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_by_value_case_insensitive() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "label", "Deutsche Grammophon").unwrap();
+
+        let results = repo.search_by_value("deutsche", 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_by_value_empty_when_no_match() {
+        let db = setup_db();
+        let repo = TrackMetadataRepo::new(db);
+
+        repo.set(1, "composer", "Bach").unwrap();
+
+        let results = repo.search_by_value("Mozart", 10).unwrap();
+        assert!(results.is_empty());
     }
 }
