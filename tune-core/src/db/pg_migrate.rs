@@ -753,7 +753,17 @@ fn bind_migration_value<'q>(
         SqlValue::Int(i) => query.bind(*i),
         SqlValue::Real(f) => query.bind(*f),
         SqlValue::Bool(b) => query.bind(if *b { 1i64 } else { 0i64 }),
-        SqlValue::Text(s) => query.bind(s.clone()),
+        SqlValue::Text(s) => {
+            // SQLite stores everything as TEXT. PG needs native types.
+            // Try parsing as integer, then float, then fall back to text.
+            if let Ok(i) = s.parse::<i64>() {
+                query.bind(i)
+            } else if let Ok(f) = s.parse::<f64>() {
+                query.bind(f)
+            } else {
+                query.bind(s.clone())
+            }
+        }
         SqlValue::Blob(b) => query.bind(b.clone()),
     }
 }
