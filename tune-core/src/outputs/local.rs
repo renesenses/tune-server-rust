@@ -1542,7 +1542,7 @@ impl OutputTarget for LocalOutput {
             // request large buffers and underrun immediately after the gate
             // opens, producing audible artifacts.)
             let min_buffer =
-                (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
+                (output_config.sample_rate as usize) * (output_config.channels as usize) / 2;
             let stream_result = build_stream(
                 &output_config,
                 ring_buf.clone(),
@@ -1570,7 +1570,7 @@ impl OutputTarget for LocalOutput {
                     ring_fb.clear();
                     data_started_shared.store(false, Ordering::SeqCst);
                     let min_buffer_fb =
-                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) / 5;
+                        (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) / 2;
                     match build_stream(
                         &source_cfg,
                         ring_fb.clone(),
@@ -1641,14 +1641,14 @@ impl OutputTarget for LocalOutput {
             // Using FixedAsync::Input so we feed fixed-size input chunks.
             let mut resampler: Option<Async<f32>> = if needs_resample {
                 let ratio = output_sr as f64 / sample_rate as f64;
-                let sinc_len = 256;
+                let sinc_len = 64;
                 let window = WindowFunction::BlackmanHarris2;
                 let f_cutoff = calculate_cutoff(sinc_len, window);
                 let params = SincInterpolationParameters {
                     sinc_len,
                     f_cutoff,
-                    interpolation: SincInterpolationType::Cubic,
-                    oversampling_factor: 256,
+                    interpolation: SincInterpolationType::Linear,
+                    oversampling_factor: 128,
                     window,
                 };
                 match Async::<f32>::new_sinc(
@@ -2381,14 +2381,14 @@ fn rubato_resample_batch(samples: &[f32], from_sr: u32, to_sr: u32, channels: u1
     }
 
     let ratio = to_sr as f64 / from_sr as f64;
-    let sinc_len = 256;
+    let sinc_len = 64;
     let window = WindowFunction::BlackmanHarris2;
     let f_cutoff = calculate_cutoff(sinc_len, window);
     let params = SincInterpolationParameters {
         sinc_len,
         f_cutoff,
-        interpolation: SincInterpolationType::Cubic,
-        oversampling_factor: 256,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 128,
         window,
     };
     let mut resampler =

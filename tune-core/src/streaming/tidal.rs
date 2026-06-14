@@ -181,11 +181,10 @@ impl TidalService {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             warn!(status, body = %body, "tidal_refresh_token_rejected");
-            if status >= 400 && status < 500 {
-                // Any 4xx from the token endpoint means the refresh_token is
-                // permanently invalid (wrong client_id, revoked, expired).
-                // Clear both tokens so auth_status reports unauthenticated
-                // and the user sees "reconnect" in the UI.
+
+            let permanently_invalid = is_refresh_permanently_invalid(status, &body);
+
+            if permanently_invalid {
                 warn!(
                     "tidal_refresh_permanently_failed — clearing all tokens, reconnection required"
                 );
@@ -1533,6 +1532,27 @@ fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
 /// Extract the first `<BaseURL>` content from a DASH MPD manifest.
 /// Tidal Hi-Res FLAC streams are delivered via DASH; the MPD XML contains
 /// one or more `<BaseURL>` elements with direct HTTPS URLs to the FLAC data.
+/// Decide whether a token-endpoint error means the refresh_token is PERMANENTLY
+/// invalid and all tokens should be cleared.
+///
+/// Only returns `true` for:
+/// - 401 Unauthorized (bad credentials)
+/// - 400 with body containing "invalid_grant" or "invalid_client" (token
+///   revoked/expired/wrong client)
+///
+/// Returns `false` for transient errors like 429 (rate limit), other 400
+/// sub-errors, or 5xx server errors.
+fn is_refresh_permanently_invalid(status: u16, body: &str) -> bool {
+    if status == 401 {
+        return true;
+    }
+    if status == 400 {
+        let lower = body.to_lowercase();
+        return lower.contains("invalid_grant") || lower.contains("invalid_client");
+    }
+    false
+}
+
 fn extract_dash_base_url(mpd: &str) -> Option<String> {
     // Look for <BaseURL>...</BaseURL> — simple XML extraction without
     // pulling in a full XML parser dependency.
@@ -1917,5 +1937,63 @@ mod tests {
         assert!(!svc.supports_write());
         svc.user_id = Some(12345);
         assert!(svc.supports_write());
+    }
+
+    #[test]
+    fn refresh_permanently_invalid_401() {
+        // 401 always means permanently invalid regardless of body
+        assert!(is_refresh_permanently_invalid(401, ""));
+        assert!(is_refresh_permanently_invalid(401, "anything"));
+    }
+
+    #[test]
+    fn refresh_permanently_invalid_400_invalid_grant() {
+        assert!(is_refresh_permanently_invalid(
+            400,
+            r#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#,
+        ));
+    }
+
+    #[test]
+    fn refresh_permanently_invalid_400_invalid_client() {
+        assert!(is_refresh_permanently_invalid(
+            400,
+            r#"{"error":"invalid_client"}"#,
+        ));
+    }
+
+    #[test]
+    fn refresh_not_permanently_invalid_429() {
+        // 429 Too Many Requests — transient, must NOT clear tokens
+        assert!(!is_refresh_permanently_invalid(429, "rate limited"));
+    }
+
+    #[test]
+    fn refresh_not_permanently_invalid_400_other() {
+        // 400 without invalid_grant/invalid_client — should NOT clear tokens
+        assert!(!is_refresh_permanently_invalid(
+            400,
+            r#"{"error":"server_error","error_description":"temporary failure"}"#,
+        ));
+    }
+
+    #[test]
+    fn refresh_not_permanently_invalid_500() {
+        // 5xx server errors — transient, must NOT clear tokens
+        assert!(!is_refresh_permanently_invalid(500, "internal error"));
+        assert!(!is_refresh_permanently_invalid(503, "service unavailable"));
+    }
+
+    #[test]
+    fn refresh_permanently_invalid_case_insensitive() {
+        // Body matching should be case-insensitive
+        assert!(is_refresh_permanently_invalid(
+            400,
+            r#"{"error":"Invalid_Grant"}"#,
+        ));
+        assert!(is_refresh_permanently_invalid(
+            400,
+            r#"{"error":"INVALID_CLIENT"}"#,
+        ));
     }
 }
