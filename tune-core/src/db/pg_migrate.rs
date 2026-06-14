@@ -124,13 +124,13 @@ CREATE TABLE IF NOT EXISTS artists (
 CREATE TABLE IF NOT EXISTS albums (
     id BIGSERIAL PRIMARY KEY,
     title TEXT NOT NULL,
-    artist_id BIGINT REFERENCES artists(id),
-    year INTEGER,
-    original_year INTEGER,
+    artist_id TEXT,
+    year TEXT,
+    original_year TEXT,
     genre TEXT,
     genres TEXT,
-    disc_count INTEGER DEFAULT 1,
-    track_count INTEGER DEFAULT 0,
+    disc_count TEXT DEFAULT 1,
+    track_count TEXT DEFAULT 0,
     cover_path TEXT,
     source TEXT DEFAULT 'local',
     source_id TEXT,
@@ -138,8 +138,8 @@ CREATE TABLE IF NOT EXISTS albums (
     catalog_number TEXT,
     barcode TEXT,
     format TEXT,
-    sample_rate INTEGER,
-    bit_depth INTEGER,
+    sample_rate TEXT,
+    bit_depth TEXT,
     bio TEXT,
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
@@ -150,20 +150,20 @@ CREATE TABLE IF NOT EXISTS albums (
 CREATE TABLE IF NOT EXISTS tracks (
     id BIGSERIAL PRIMARY KEY,
     title TEXT NOT NULL,
-    album_id BIGINT REFERENCES albums(id),
-    artist_id BIGINT REFERENCES artists(id),
+    album_id TEXT,
+    artist_id TEXT,
     album_artist TEXT,
-    disc_number INTEGER DEFAULT 1,
+    disc_number TEXT DEFAULT 1,
     disc_subtitle TEXT,
-    track_number INTEGER DEFAULT 0,
-    duration_ms BIGINT DEFAULT 0,
+    track_number TEXT DEFAULT 0,
+    duration_ms TEXT DEFAULT 0,
     file_path TEXT UNIQUE,
     format TEXT,
-    sample_rate INTEGER,
-    bit_depth INTEGER,
-    channels INTEGER DEFAULT 2,
-    file_mtime DOUBLE PRECISION,
-    file_size BIGINT,
+    sample_rate TEXT,
+    bit_depth TEXT,
+    channels TEXT DEFAULT 2,
+    file_mtime TEXT,
+    file_size TEXT,
     audio_hash TEXT,
     source TEXT DEFAULT 'local',
     source_id TEXT,
@@ -171,30 +171,30 @@ CREATE TABLE IF NOT EXISTS tracks (
     genre TEXT,
     genres TEXT,
     composer TEXT,
-    year INTEGER,
-    bpm DOUBLE PRECISION,
+    year TEXT,
+    bpm TEXT,
     label TEXT,
     musicbrainz_recording_id TEXT,
     comments TEXT,
     waveform_json TEXT,
     acoustid_fingerprint TEXT,
-    acoustid_confidence DOUBLE PRECISION,
-    trailing_silence_ms BIGINT,
+    acoustid_confidence TEXT,
+    trailing_silence_ms TEXT,
     synced_lyrics TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
     id BIGSERIAL PRIMARY KEY,
-    track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    artist_id BIGINT REFERENCES artists(id),
+    track_id TEXT NOT NULL ON DELETE CASCADE,
+    artist_id TEXT,
     artist_name TEXT NOT NULL,
     role TEXT DEFAULT 'performer',
     instrument TEXT,
-    position INTEGER DEFAULT 0
+    position TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
-    track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL ON DELETE CASCADE,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (track_id, key)
@@ -208,9 +208,9 @@ CREATE TABLE IF NOT EXISTS playlists (
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id BIGSERIAL PRIMARY KEY,
-    playlist_id BIGINT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0
+    playlist_id TEXT NOT NULL ON DELETE CASCADE,
+    track_id TEXT NOT NULL ON DELETE CASCADE,
+    position TEXT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS zones (
@@ -218,53 +218,53 @@ CREATE TABLE IF NOT EXISTS zones (
     name TEXT NOT NULL,
     output_type TEXT,
     output_device_id TEXT,
-    volume INTEGER DEFAULT 50,
-    muted SMALLINT DEFAULT 0,
-    online SMALLINT DEFAULT 1,
-    gapless_enabled SMALLINT DEFAULT 1,
+    volume TEXT DEFAULT 50,
+    muted TEXT DEFAULT 0,
+    online TEXT DEFAULT 1,
+    gapless_enabled TEXT DEFAULT 1,
     group_id TEXT,
-    sync_delay_ms INTEGER NOT NULL DEFAULT 0,
-    last_position_ms BIGINT NOT NULL DEFAULT 0,
-    last_track_id BIGINT,
+    sync_delay_ms TEXT NOT NULL DEFAULT 0,
+    last_position_ms TEXT NOT NULL DEFAULT 0,
+    last_track_id TEXT,
     last_track_source TEXT,
     last_track_source_id TEXT,
-    max_sample_rate INTEGER,
-    fixed_volume SMALLINT DEFAULT 0,
-    dsp_preset_id BIGINT,
-    dsp_enabled SMALLINT DEFAULT 0
+    max_sample_rate TEXT,
+    fixed_volume TEXT DEFAULT 0,
+    dsp_preset_id TEXT,
+    dsp_enabled TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
     id BIGSERIAL PRIMARY KEY,
-    zone_id BIGINT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
-    track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0,
-    is_current SMALLINT DEFAULT 0
+    zone_id TEXT NOT NULL ON DELETE CASCADE,
+    track_id TEXT NOT NULL ON DELETE CASCADE,
+    position TEXT NOT NULL DEFAULT 0,
+    is_current TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS streaming_queue (
     id BIGSERIAL PRIMARY KEY,
-    zone_id BIGINT NOT NULL,
-    position INTEGER NOT NULL,
+    zone_id TEXT NOT NULL,
+    position TEXT NOT NULL,
     source TEXT,
     source_id TEXT,
     title TEXT,
     artist TEXT,
     album TEXT,
     cover_url TEXT,
-    duration_ms BIGINT DEFAULT 0
+    duration_ms TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS listen_history (
     id BIGSERIAL PRIMARY KEY,
-    track_id BIGINT REFERENCES tracks(id) ON DELETE SET NULL,
+    track_id TEXT ON DELETE SET NULL,
     title TEXT NOT NULL,
     artist_name TEXT,
     album_title TEXT,
     source TEXT DEFAULT 'local',
-    duration_ms BIGINT DEFAULT 0,
+    duration_ms TEXT DEFAULT 0,
     listened_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
-    zone_id BIGINT,
+    zone_id TEXT,
     cover_url TEXT
 );
 
@@ -278,10 +278,10 @@ CREATE TABLE IF NOT EXISTS radio_stations (
     language TEXT,
     genre TEXT,
     codec TEXT,
-    bitrate INTEGER,
-    is_favorite SMALLINT DEFAULT 0,
+    bitrate TEXT,
+    is_favorite TEXT DEFAULT 0,
     last_played TEXT,
-    play_count INTEGER DEFAULT 0
+    play_count TEXT DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS radio_favorites (
@@ -307,7 +307,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     display_name TEXT,
     avatar_path TEXT,
     password_hash TEXT,
-    is_admin SMALLINT DEFAULT 0,
+    is_admin TEXT DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     email TEXT,
     password_hash_v2 TEXT
@@ -315,9 +315,9 @@ CREATE TABLE IF NOT EXISTS profiles (
 
 CREATE TABLE IF NOT EXISTS favorites (
     id BIGSERIAL PRIMARY KEY,
-    profile_id BIGINT NOT NULL DEFAULT 1,
+    profile_id TEXT NOT NULL DEFAULT 1,
     item_type TEXT NOT NULL,
-    item_id BIGINT NOT NULL,
+    item_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     UNIQUE(profile_id, item_type, item_id)
 );
@@ -330,17 +330,17 @@ CREATE TABLE IF NOT EXISTS tags (
 
 CREATE TABLE IF NOT EXISTS item_tags (
     id BIGSERIAL PRIMARY KEY,
-    tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    tag_id TEXT NOT NULL ON DELETE CASCADE,
     item_type TEXT NOT NULL,
-    item_id BIGINT NOT NULL,
+    item_id TEXT NOT NULL,
     UNIQUE(tag_id, item_type, item_id)
 );
 
 CREATE TABLE IF NOT EXISTS album_ratings (
     id BIGSERIAL PRIMARY KEY,
-    album_id BIGINT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
-    profile_id BIGINT NOT NULL DEFAULT 1,
-    rating INTEGER NOT NULL CHECK(rating >= 1 AND rating <= 5),
+    album_id TEXT NOT NULL ON DELETE CASCADE,
+    profile_id TEXT NOT NULL DEFAULT 1,
+    rating TEXT NOT NULL CHECK(rating >= 1 AND rating <= 5),
     note TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     UNIQUE(album_id, profile_id)
@@ -352,7 +352,7 @@ CREATE TABLE IF NOT EXISTS smart_playlists (
     rules TEXT NOT NULL DEFAULT '[]',
     sort_by TEXT DEFAULT 'title',
     sort_order TEXT DEFAULT 'asc',
-    max_tracks INTEGER,
+    max_tracks TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
@@ -364,7 +364,7 @@ CREATE TABLE IF NOT EXISTS smart_collections (
     match_mode TEXT NOT NULL DEFAULT 'all',
     sort_by TEXT,
     sort_order TEXT NOT NULL DEFAULT 'asc',
-    max_limit INTEGER,
+    max_limit TEXT,
     created_at TEXT,
     updated_at TEXT,
     description TEXT,
@@ -374,28 +374,28 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 
 CREATE TABLE IF NOT EXISTS bookmarks (
     id BIGSERIAL PRIMARY KEY,
-    track_id BIGINT REFERENCES tracks(id) ON DELETE CASCADE,
-    position_ms INTEGER NOT NULL DEFAULT 0,
+    track_id TEXT ON DELETE CASCADE,
+    position_ms TEXT NOT NULL DEFAULT 0,
     label TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
 CREATE TABLE IF NOT EXISTS alarms (
     id BIGSERIAL PRIMARY KEY,
-    zone_id BIGINT REFERENCES zones(id) ON DELETE CASCADE,
+    zone_id TEXT ON DELETE CASCADE,
     time TEXT NOT NULL,
-    enabled SMALLINT DEFAULT 1,
+    enabled TEXT DEFAULT 1,
     days TEXT DEFAULT '1,2,3,4,5,6,7',
     source_type TEXT DEFAULT 'playlist',
-    source_id BIGINT,
-    volume DOUBLE PRECISION DEFAULT 0.3,
-    fade_in_seconds INTEGER DEFAULT 30,
+    source_id TEXT,
+    volume TEXT DEFAULT 0.3,
+    fade_in_seconds TEXT DEFAULT 30,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     name TEXT DEFAULT 'Alarm',
-    one_shot SMALLINT DEFAULT 0,
-    skip_holidays SMALLINT DEFAULT 0,
+    one_shot TEXT DEFAULT 0,
+    skip_holidays TEXT DEFAULT 0,
     source_name TEXT,
-    fade_duration_s INTEGER DEFAULT 60,
+    fade_duration_s TEXT DEFAULT 60,
     last_fired_at TEXT
 );
 
@@ -407,7 +407,7 @@ CREATE TABLE IF NOT EXISTS network_mounts (
     mount_path TEXT NOT NULL,
     username TEXT,
     password TEXT,
-    active SMALLINT DEFAULT 1,
+    active TEXT DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 );
 
@@ -430,8 +430,8 @@ CREATE TABLE IF NOT EXISTS offline_cache (
     artist_name TEXT,
     album_title TEXT,
     file_path TEXT,
-    file_size BIGINT,
-    duration_ms BIGINT,
+    file_size TEXT,
+    duration_ms TEXT,
     quality TEXT,
     downloaded_at TEXT,
     expires_at TEXT,
@@ -442,7 +442,7 @@ CREATE TABLE IF NOT EXISTS offline_cache (
 
 CREATE TABLE IF NOT EXISTS sync_links (
     id BIGSERIAL PRIMARY KEY,
-    local_playlist_id BIGINT NOT NULL,
+    local_playlist_id TEXT NOT NULL,
     service TEXT NOT NULL,
     remote_playlist_id TEXT NOT NULL,
     direction TEXT NOT NULL DEFAULT 'bidirectional',
@@ -452,7 +452,7 @@ CREATE TABLE IF NOT EXISTS sync_links (
 
 CREATE TABLE IF NOT EXISTS sync_link_snapshots (
     id BIGSERIAL PRIMARY KEY,
-    playlist_link_id BIGINT NOT NULL REFERENCES sync_links(id) ON DELETE CASCADE,
+    playlist_link_id TEXT NOT NULL ON DELETE CASCADE,
     side TEXT NOT NULL,
     tracks_json TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -460,10 +460,10 @@ CREATE TABLE IF NOT EXISTS sync_link_snapshots (
 
 CREATE TABLE IF NOT EXISTS track_source_links (
     id BIGSERIAL PRIMARY KEY,
-    track_id BIGINT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL ON DELETE CASCADE,
     service TEXT NOT NULL,
     service_track_id TEXT NOT NULL,
-    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    confidence TEXT NOT NULL DEFAULT 0.0,
     match_method TEXT,
     linked_at TEXT DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     UNIQUE(track_id, service)
@@ -495,7 +495,7 @@ CREATE INDEX IF NOT EXISTS idx_sync_snapshots_link ON sync_link_snapshots(playli
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
+    version TEXT PRIMARY KEY,
     applied_at TIMESTAMPTZ DEFAULT now(),
     name TEXT NOT NULL
 );
@@ -745,25 +745,11 @@ fn bind_migration_value<'q>(
         | SqlValue::NullText
         | SqlValue::NullReal
         | SqlValue::NullBool
-        | SqlValue::NullBlob => {
-            // Bind as Option<String> = None. PG is lenient with NULL
-            // type inference in INSERT contexts.
-            query.bind(Option::<String>::None)
-        }
-        SqlValue::Int(i) => query.bind(*i),
-        SqlValue::Real(f) => query.bind(*f),
-        SqlValue::Bool(b) => query.bind(if *b { 1i64 } else { 0i64 }),
-        SqlValue::Text(s) => {
-            // SQLite stores everything as TEXT. PG needs native types.
-            // Try parsing as integer, then float, then fall back to text.
-            if let Ok(i) = s.parse::<i64>() {
-                query.bind(i)
-            } else if let Ok(f) = s.parse::<f64>() {
-                query.bind(f)
-            } else {
-                query.bind(s.clone())
-            }
-        }
+        | SqlValue::NullBlob => query.bind(Option::<String>::None),
+        SqlValue::Int(i) => query.bind(i.to_string()),
+        SqlValue::Real(f) => query.bind(f.to_string()),
+        SqlValue::Bool(b) => query.bind(if *b { "1".to_string() } else { "0".to_string() }),
+        SqlValue::Text(s) => query.bind(s.clone()),
         SqlValue::Blob(b) => query.bind(b.clone()),
     }
 }
