@@ -344,12 +344,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.services.clone());
 
     let mut app = Router::new()
-        .route("/add-station", get(radios::add_from_web))
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
         .with_state(state)
+        .route("/add-station", get(|axum::extract::Query(q): axum::extract::Query<radios::AddFromWebQuery>| async move {
+            axum::response::Html(format!(
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong></p><p style="color:#888">Vous pouvez fermer cet onglet.</p></div></body></html>"#,
+                q.name
+            ))
+        }))
         .merge(stream_handler::router(streamer_sessions))
         .merge(deezer_proxy);
 

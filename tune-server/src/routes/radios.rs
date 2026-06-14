@@ -180,11 +180,11 @@ struct FavoriteToggle {
 
 #[derive(Deserialize)]
 pub struct AddFromWebQuery {
-    name: String,
-    url: String,
-    genre: Option<String>,
-    country: Option<String>,
-    logo_url: Option<String>,
+    pub name: String,
+    pub url: String,
+    pub genre: Option<String>,
+    pub country: Option<String>,
+    pub logo_url: Option<String>,
 }
 
 pub async fn add_from_web(
