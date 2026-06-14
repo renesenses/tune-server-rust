@@ -323,83 +323,92 @@ impl DsdToPcmStreamer {
         let mut output = Vec::with_capacity(new_outputs * channels * 3);
 
         for byte_idx in 0..total_bytes {
+            // Read the DSD byte for each channel at this byte position.
+            // Each byte contains 8 DSD samples (1-bit each).
+            // We must process one DSD sample at a time across ALL channels
+            // (bit-interleaved) so that ring_pos advances uniformly.
+            // The old code iterated `for ch { for bit }` which caused
+            // all 8 bits of channel 0 to overwrite the same ring position
+            // before ring_pos advanced — destroying 7/8 of channel 0's data.
+            let mut ch_bytes = [0u8; 8]; // max 8 channels
+            let mut valid_channels = channels;
             for ch in 0..channels {
                 let src_idx = byte_idx * channels + ch;
                 if src_idx >= dsd_chunk.len() {
+                    valid_channels = ch;
                     break;
                 }
-                let byte = dsd_chunk[src_idx];
-                for bit in 0..8u8 {
+                ch_bytes[ch] = dsd_chunk[src_idx];
+            }
+            if valid_channels == 0 {
+                break;
+            }
+
+            for bit in 0..8u8 {
+                // Write one DSD sample from each channel into its ring buffer
+                for ch in 0..valid_channels {
                     let bit_val = if self.lsb_first {
-                        (byte >> bit) & 1
+                        (ch_bytes[ch] >> bit) & 1
                     } else {
-                        (byte >> (7 - bit)) & 1
+                        (ch_bytes[ch] >> (7 - bit)) & 1
                     };
                     let sample = if bit_val == 1 { 1.0 } else { -1.0 };
-
-                    // Write into ring buffer
                     self.ring_bufs[ch][self.ring_pos % filter_len] = sample;
+                }
 
-                    // Only advance ring_pos after all channels for this sample
-                    if ch == channels - 1 {
-                        self.ring_pos += 1;
-                        self.total_dsd_samples += 1;
+                // Advance ring_pos once per DSD sample position (all channels written)
+                self.ring_pos += 1;
+                self.total_dsd_samples += 1;
 
-                        // Check if we can emit a new PCM sample.
-                        // An output sample at index `n` is centered at DSD position:
-                        //   center = n * decimation_ratio + decimation_ratio / 2
-                        // We need all filter taps to be available, i.e. we need
-                        //   center + half_filter <= total_dsd_samples
-                        let next_center = self.output_sample_idx * self.decimation_ratio
-                            + self.decimation_ratio / 2;
-                        let needed = next_center + half_filter;
+                // Check if we can emit a new PCM sample.
+                // An output sample at index `n` is centered at DSD position:
+                //   center = n * decimation_ratio + decimation_ratio / 2
+                // We need all filter taps to be available, i.e. we need
+                //   center + half_filter <= total_dsd_samples
+                let next_center =
+                    self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
+                let needed = next_center + half_filter;
 
-                        while needed <= self.total_dsd_samples
-                            && self.total_dsd_samples >= filter_len
-                        {
-                            // Emit one PCM sample per channel
-                            let center = self.output_sample_idx * self.decimation_ratio
-                                + self.decimation_ratio / 2;
+                while needed <= self.total_dsd_samples && self.total_dsd_samples >= filter_len {
+                    // Emit one PCM sample per channel
+                    let center =
+                        self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
 
-                            for emit_ch in 0..channels {
-                                let mut sum = 0.0f64;
-                                for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
-                                    let pos =
-                                        (center as isize) - (half_filter as isize) + (k as isize);
-                                    if pos >= 0 && (pos as usize) < self.total_dsd_samples {
-                                        // Map absolute DSD position to ring buffer position
-                                        // The ring buffer holds the last `filter_len` samples.
-                                        // ring_pos points to the next write position.
-                                        // The oldest sample in the ring is at index ring_pos % filter_len.
-                                        // Absolute position `p` maps to ring index:
-                                        //   (ring_pos - (total_dsd_samples - p)) % filter_len
-                                        let age = self.total_dsd_samples - pos as usize;
-                                        if age <= filter_len {
-                                            let ring_idx =
-                                                (self.ring_pos + filter_len - age) % filter_len;
-                                            sum += self.ring_bufs[emit_ch][ring_idx] * coeff;
-                                        }
-                                        // Samples older than filter_len are zero-padded
-                                    }
+                    for emit_ch in 0..channels {
+                        let mut sum = 0.0f64;
+                        for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
+                            let pos = (center as isize) - (half_filter as isize) + (k as isize);
+                            if pos >= 0 && (pos as usize) < self.total_dsd_samples {
+                                // Map absolute DSD position to ring buffer position
+                                // The ring buffer holds the last `filter_len` samples.
+                                // ring_pos points to the next write position.
+                                // The oldest sample in the ring is at index ring_pos % filter_len.
+                                // Absolute position `p` maps to ring index:
+                                //   (ring_pos - (total_dsd_samples - p)) % filter_len
+                                let age = self.total_dsd_samples - pos as usize;
+                                if age <= filter_len {
+                                    let ring_idx = (self.ring_pos + filter_len - age) % filter_len;
+                                    sum += self.ring_bufs[emit_ch][ring_idx] * coeff;
                                 }
-
-                                let clamped = sum.clamp(-1.0, 1.0);
-                                let pcm_val = (clamped * 8_388_607.0) as i32;
-                                let bytes = pcm_val.to_le_bytes();
-                                output.push(bytes[0]);
-                                output.push(bytes[1]);
-                                output.push(bytes[2]);
-                            }
-
-                            self.output_sample_idx += 1;
-
-                            // Re-check for next output sample
-                            let next_center = self.output_sample_idx * self.decimation_ratio
-                                + self.decimation_ratio / 2;
-                            if next_center + half_filter > self.total_dsd_samples {
-                                break;
+                                // Samples older than filter_len are zero-padded
                             }
                         }
+
+                        let clamped = sum.clamp(-1.0, 1.0);
+                        let pcm_val = (clamped * 8_388_607.0) as i32;
+                        let bytes = pcm_val.to_le_bytes();
+                        output.push(bytes[0]);
+                        output.push(bytes[1]);
+                        output.push(bytes[2]);
+                    }
+
+                    self.output_sample_idx += 1;
+
+                    // Re-check for next output sample
+                    let next_center =
+                        self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
+                    if next_center + half_filter > self.total_dsd_samples {
+                        break;
                     }
                 }
             }
@@ -809,5 +818,134 @@ mod tests {
         assert!(pcm.is_empty());
         let flush = streamer.flush();
         assert!(flush.is_empty());
+    }
+
+    #[test]
+    fn streamer_matches_batch_stereo() {
+        // The streaming converter must produce identical output to the batch
+        // converter for the same input data.  This catches bugs in the ring
+        // buffer indexing (e.g. overwriting channel 0's samples because
+        // ring_pos didn't advance between bits within a byte).
+        let channels = 2;
+        let total_bytes = 512 * channels;
+        // Use a deterministic non-trivial pattern (not silence or DC)
+        let dsd_data: Vec<u8> = (0..total_bytes)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+
+        // Batch converter
+        let batch = DsdToPcmConverter::new(2_822_400, 176_400, channels, true);
+        let batch_pcm = batch.process(&dsd_data);
+
+        // Streaming converter (single feed)
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+        let stream_pcm = streamer.feed(&dsd_data);
+        let stream_flush = streamer.flush();
+        let mut all_stream = stream_pcm;
+        all_stream.extend_from_slice(&stream_flush);
+
+        // Both should produce the same number of samples
+        assert_eq!(
+            batch_pcm.len(),
+            all_stream.len(),
+            "batch and streaming should produce same byte count"
+        );
+
+        // Compare sample by sample (allow tiny rounding differences from f64 arithmetic)
+        let num_samples = batch_pcm.len() / 3;
+        let mut max_diff: i32 = 0;
+        for i in 0..num_samples {
+            let off = i * 3;
+            let batch_val = {
+                let lo = batch_pcm[off] as u32;
+                let mid = batch_pcm[off + 1] as u32;
+                let hi = batch_pcm[off + 2] as u32;
+                let v = lo | (mid << 8) | (hi << 16);
+                if v & 0x80_0000 != 0 {
+                    (v | 0xFF00_0000) as i32
+                } else {
+                    v as i32
+                }
+            };
+            let stream_val = {
+                let lo = all_stream[off] as u32;
+                let mid = all_stream[off + 1] as u32;
+                let hi = all_stream[off + 2] as u32;
+                let v = lo | (mid << 8) | (hi << 16);
+                if v & 0x80_0000 != 0 {
+                    (v | 0xFF00_0000) as i32
+                } else {
+                    v as i32
+                }
+            };
+            let diff = (batch_val - stream_val).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+
+        assert!(
+            max_diff <= 1,
+            "batch and streaming outputs should match (max sample diff = {max_diff})"
+        );
+    }
+
+    #[test]
+    fn streamer_matches_batch_mono() {
+        // Mono should also match (mono was less affected by the original bug
+        // since there's only one channel, but verify for completeness).
+        let channels = 1;
+        let total_bytes = 512;
+        let dsd_data: Vec<u8> = (0..total_bytes)
+            .map(|i| ((i * 37 + 13) % 256) as u8)
+            .collect();
+
+        let batch = DsdToPcmConverter::new(2_822_400, 176_400, channels, true);
+        let batch_pcm = batch.process(&dsd_data);
+
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+        let stream_pcm = streamer.feed(&dsd_data);
+        let stream_flush = streamer.flush();
+        let mut all_stream = stream_pcm;
+        all_stream.extend_from_slice(&stream_flush);
+
+        assert_eq!(batch_pcm.len(), all_stream.len());
+
+        let num_samples = batch_pcm.len() / 3;
+        let mut max_diff: i32 = 0;
+        for i in 0..num_samples {
+            let off = i * 3;
+            let batch_val = {
+                let lo = batch_pcm[off] as u32;
+                let mid = batch_pcm[off + 1] as u32;
+                let hi = batch_pcm[off + 2] as u32;
+                let v = lo | (mid << 8) | (hi << 16);
+                if v & 0x80_0000 != 0 {
+                    (v | 0xFF00_0000) as i32
+                } else {
+                    v as i32
+                }
+            };
+            let stream_val = {
+                let lo = all_stream[off] as u32;
+                let mid = all_stream[off + 1] as u32;
+                let hi = all_stream[off + 2] as u32;
+                let v = lo | (mid << 8) | (hi << 16);
+                if v & 0x80_0000 != 0 {
+                    (v | 0xFF00_0000) as i32
+                } else {
+                    v as i32
+                }
+            };
+            let diff = (batch_val - stream_val).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+        }
+
+        assert!(
+            max_diff <= 1,
+            "batch and streaming mono outputs should match (max sample diff = {max_diff})"
+        );
     }
 }
