@@ -466,7 +466,7 @@ impl StreamingService for QobuzService {
     async fn authenticate(
         &mut self,
         credentials: &serde_json::Value,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         let username = credentials["username"]
             .as_str()
             .ok_or("username required")?;
@@ -484,13 +484,13 @@ impl StreamingService for QobuzService {
         self.auth_status_internal()
     }
 
-    async fn logout(&mut self) -> Result<(), String> {
+    async fn logout(&mut self) -> Result<(), TuneError> {
         self.user_auth_token = None;
         self.username = None;
         Ok(())
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(
                 "/catalog/search",
@@ -519,7 +519,7 @@ impl StreamingService for QobuzService {
         })
     }
 
-    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String> {
+    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
         let data = self
             .api_get("/track/get", &[("track_id", track_id)])
             .await?;
@@ -530,7 +530,7 @@ impl StreamingService for QobuzService {
         &self,
         track_id: &str,
         quality: Option<&str>,
-    ) -> Result<StreamUrl, String> {
+    ) -> Result<StreamUrl, TuneError> {
         // Determine the best format_id based on quality request and subscription level.
         // Qobuz format_id values: 5=MP3, 6=FLAC 16/44, 7=FLAC 24/96, 27=FLAC 24/192.
         // "Studio" (formerly "HiFi") subscribers max out at format_id 6.
@@ -563,14 +563,14 @@ impl StreamingService for QobuzService {
         }
     }
 
-    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {
+    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
         let data = self
             .api_get("/album/get", &[("album_id", album_id)])
             .await?;
         Ok(Self::map_album(&data))
     }
 
-    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get("/album/get", &[("album_id", album_id)])
             .await?;
@@ -613,14 +613,14 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
-    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String> {
+    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self
             .api_get("/artist/get", &[("artist_id", artist_id)])
             .await?;
         Ok(Self::map_artist(&data))
     }
 
-    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
+    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         let data = self
             .api_get("/playlist/get", &[("playlist_id", playlist_id)])
             .await?;
@@ -638,7 +638,7 @@ impl StreamingService for QobuzService {
         })
     }
 
-    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(
                 "/playlist/get",
@@ -656,7 +656,7 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self
             .api_get("/genre/list", &[("offset", "0"), ("limit", "500")])
             .await
@@ -680,7 +680,7 @@ impl StreamingService for QobuzService {
         &self,
         genre_id: &str,
         limit: usize,
-    ) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         let limit_str = limit.to_string();
         let data = self
             .api_get(
@@ -699,7 +699,7 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
-    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(
                 "/album/getFeatured",
@@ -713,7 +713,7 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
-    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         Ok(vec![
             FeaturedSection {
                 id: "new-releases".into(),
@@ -738,7 +738,7 @@ impl StreamingService for QobuzService {
         ])
     }
 
-    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(
                 "/album/getFeatured",
@@ -752,7 +752,7 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
-    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let items = self
             .api_get_all_pages(
                 "/favorite/getUserFavorites",
@@ -763,7 +763,7 @@ impl StreamingService for QobuzService {
         Ok(items.iter().map(Self::map_track).collect())
     }
 
-    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let key = match fav_type {
             "tracks" => "track_ids",
             "albums" => "album_ids",
@@ -774,7 +774,7 @@ impl StreamingService for QobuzService {
         Ok(())
     }
 
-    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let key = match fav_type {
             "tracks" => "track_ids",
             "albums" => "album_ids",
@@ -785,7 +785,7 @@ impl StreamingService for QobuzService {
         Ok(())
     }
 
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         let data = self
             .api_get("/playlist/getUserPlaylists", &[("limit", "500")])
             .await?;
@@ -808,7 +808,7 @@ impl StreamingService for QobuzService {
         Ok(playlists)
     }
 
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(
                 "/artist/get",
@@ -826,7 +826,7 @@ impl StreamingService for QobuzService {
         Ok(albums)
     }
 
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(
                 "/artist/get",
@@ -849,7 +849,7 @@ impl StreamingService for QobuzService {
         &self,
         name: &str,
         description: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, TuneError> {
         let desc = description.unwrap_or("Created by Tune");
         let resp = self
             .api_post(
@@ -872,7 +872,7 @@ impl StreamingService for QobuzService {
         &self,
         playlist_id: &str,
         track_ids: &[String],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, TuneError> {
         let mut added = 0;
         for chunk in track_ids.chunks(50) {
             let ids_csv = chunk.join(",");
@@ -890,7 +890,7 @@ impl StreamingService for QobuzService {
         self.user_auth_token.is_some()
     }
 
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let items = self
             .api_get_all_pages(
                 "/favorite/getUserFavorites",
@@ -901,7 +901,7 @@ impl StreamingService for QobuzService {
         Ok(items.iter().map(Self::map_album).collect())
     }
 
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         let items = self
             .api_get_all_pages(
                 "/favorite/getUserFavorites",
@@ -912,7 +912,7 @@ impl StreamingService for QobuzService {
         Ok(items.iter().map(Self::map_artist).collect())
     }
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         if self.user_auth_token.is_none() {
             return Ok(false);
         }

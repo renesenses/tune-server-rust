@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::traits::*;
+use crate::TuneError;
 
 const AMAZON_AUTH_URL: &str = "https://api.amazon.com/auth/o2/";
 const AMAZON_TUNE_API: &str = "https://music.amazon.com/api/";
@@ -280,7 +281,7 @@ impl StreamingService for AmazonMusicService {
         self.enabled_override = Some(enabled);
     }
 
-    async fn authenticate(&mut self, _credentials: &Value) -> Result<AuthStatus, String> {
+    async fn authenticate(&mut self, _credentials: &Value) -> Result<AuthStatus, TuneError> {
         // Device code flow — step 1: request code pair
         let resp = self
             .client
@@ -340,7 +341,7 @@ impl StreamingService for AmazonMusicService {
         }
     }
 
-    async fn logout(&mut self) -> Result<(), String> {
+    async fn logout(&mut self) -> Result<(), TuneError> {
         self.access_token = None;
         self.refresh_token = None;
         *self.device_code.lock().await = None;
@@ -348,7 +349,7 @@ impl StreamingService for AmazonMusicService {
         Ok(())
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         if self.access_token.is_none() {
             return Ok(SearchResults {
                 tracks: vec![],
@@ -384,7 +385,7 @@ impl StreamingService for AmazonMusicService {
         })
     }
 
-    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String> {
+    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
         let data = self.api_get(&format!("tracks/{track_id}")).await?;
         Ok(self.map_track(&data))
     }
@@ -393,7 +394,7 @@ impl StreamingService for AmazonMusicService {
         &self,
         track_id: &str,
         _quality: Option<&str>,
-    ) -> Result<StreamUrl, String> {
+    ) -> Result<StreamUrl, TuneError> {
         if let Some(cached) = self.get_cached_url(track_id).await {
             let (sr, bd) = if self.quality == "ULTRA_HD" {
                 (96000, 24)
@@ -455,51 +456,51 @@ impl StreamingService for AmazonMusicService {
         })
     }
 
-    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {
+    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
         let data = self.api_get(&format!("albums/{album_id}")).await?;
         Ok(self.map_album(&data))
     }
 
-    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.api_get(&format!("albums/{album_id}/tracks")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|t| self.map_track(t)).collect())
     }
 
-    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String> {
+    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self.api_get(&format!("artists/{artist_id}")).await?;
         Ok(self.map_artist(&data))
     }
 
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self.api_get(&format!("artists/{artist_id}/albums")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|a| self.map_album(a)).collect())
     }
 
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.api_get(&format!("artists/{artist_id}/tracks")).await?;
         let items = data.as_array().cloned().unwrap_or_default();
         Ok(items.iter().map(|t| self.map_track(t)).collect())
     }
 
-    async fn get_playlist(&self, _playlist_id: &str) -> Result<StreamPlaylist, String> {
+    async fn get_playlist(&self, _playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         Err("not implemented".into())
     }
 
-    async fn get_playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_playlist_tracks(&self, _playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         Err("not implemented".into())
     }
 
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
     }
 
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Ok(vec![])
     }
 
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         Ok(vec![])
     }
 
@@ -537,7 +538,7 @@ impl StreamingService for AmazonMusicService {
         }
     }
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         if self.access_token.is_some() && self.refresh_token.is_some() {
             Ok(self.refresh_access_token().await)
         } else {

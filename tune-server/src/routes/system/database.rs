@@ -214,29 +214,73 @@ pub(super) async fn database_import(
 
 #[derive(Deserialize)]
 pub(super) struct DbConnectionTest {
-    engine: String,
+    /// Engine type: "sqlite" or "postgresql". Defaults to "postgresql".
+    engine: Option<String>,
+    /// Connection string (for postgresql)
     connection_string: Option<String>,
+    /// Alternative field name: URL
+    url: Option<String>,
 }
 
 pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> impl IntoResponse {
-    match body.engine.as_str() {
+    let engine = body.engine.as_deref().unwrap_or("postgresql");
+    let conn_str = body
+        .url
+        .as_deref()
+        .or(body.connection_string.as_deref())
+        .unwrap_or("postgresql://localhost/tune");
+
+    match engine {
         "sqlite" => Json(json!({"status": "ok", "engine": "sqlite"})).into_response(),
-        "postgresql" => {
-            let conn_str = body
-                .connection_string
-                .as_deref()
-                .unwrap_or("postgresql://localhost/tune");
-            if conn_str.starts_with("postgresql://") || conn_str.starts_with("postgres://") {
-                Json(json!({
-                    "status": "ok",
-                    "engine": "postgresql",
-                    "message": "PostgreSQL support planned for v2.1. Connection string format is valid.",
-                }))
-                .into_response()
-            } else {
-                (
+        "postgresql" | "postgres" => {
+            if !conn_str.starts_with("postgresql://") && !conn_str.starts_with("postgres://") {
+                return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error": "invalid connection string, must start with postgresql:// or postgres://"})),
+                )
+                    .into_response();
+            }
+
+            #[cfg(feature = "postgres")]
+            {
+                match tune_core::db::pg_migrate::test_connection(conn_str).await {
+                    Ok(result) => {
+                        // Extract short version (e.g. "16.2") from full version string
+                        let short_version = result
+                            .version
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("unknown");
+                        Json(json!({
+                            "status": "ok",
+                            "engine": "postgres",
+                            "version": short_version,
+                            "version_full": result.version,
+                        }))
+                        .into_response()
+                    }
+                    Err(e) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "status": "error",
+                            "engine": "postgres",
+                            "error": e,
+                        })),
+                    )
+                        .into_response(),
+                }
+            }
+
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = conn_str;
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({
+                        "status": "error",
+                        "engine": "postgres",
+                        "error": "PostgreSQL support not compiled. Rebuild with --features postgres.",
+                    })),
                 )
                     .into_response()
             }
@@ -251,19 +295,112 @@ pub(super) async fn test_db_connection(Json(body): Json<DbConnectionTest>) -> im
     }
 }
 
-pub(super) async fn migrate_database(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(Deserialize)]
+pub(super) struct MigrateRequest {
+    /// PostgreSQL connection URL
+    url: Option<String>,
+    /// Alternative field name
+    connection_string: Option<String>,
+}
+
+/// POST /system/database/migrate
+///
+/// One-shot migration: copies all data from the current SQLite database
+/// to a PostgreSQL instance. The PG schema is created automatically.
+/// Idempotent — safe to run multiple times (ON CONFLICT DO NOTHING).
+///
+/// Request body: `{"url": "postgresql://user:pass@host:5432/dbname"}`
+///
+/// This does NOT switch the running engine — Tune continues to use
+/// SQLite after the migration. The PG database is populated and ready
+/// for a future engine switch.
+pub(super) async fn migrate_database(
+    State(state): State<AppState>,
+    Json(body): Json<MigrateRequest>,
+) -> impl IntoResponse {
+    let pg_url = body
+        .url
+        .as_deref()
+        .or(body.connection_string.as_deref())
+        .unwrap_or("");
+
+    if pg_url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "error": "missing 'url' field. Provide a PostgreSQL connection URL.",
+                "example": {"url": "postgresql://tune:tune2026@localhost:5432/tune"},
+            })),
+        )
+            .into_response();
+    }
+
+    if !pg_url.starts_with("postgresql://") && !pg_url.starts_with("postgres://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "error": "invalid URL, must start with postgresql:// or postgres://",
+            })),
+        )
+            .into_response();
+    }
+
+    // Pre-flight: count rows to report in the response
     let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
     let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let artists = ArtistRepo::new(state.db).count().unwrap_or(0);
+    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
 
-    Json(json!({
-        "status": "not_implemented",
-        "message": "SQLite -> PostgreSQL migration planned for v2.1. Current engine: SQLite.",
-        "current_engine": "sqlite",
-        "row_counts": {
-            "artists": artists,
-            "albums": albums,
-            "tracks": tracks,
-        },
-    }))
+    #[cfg(feature = "postgres")]
+    {
+        let start = Instant::now();
+        match tune_core::db::pg_migrate::migrate_sqlite_to_pg(&state.db, pg_url).await {
+            Ok(result) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                Json(json!({
+                    "status": "complete",
+                    "tables_migrated": result.tables_migrated,
+                    "total_rows": result.total_rows,
+                    "duration_ms": duration_ms,
+                    "source": {
+                        "engine": "sqlite",
+                        "artists": artists,
+                        "albums": albums,
+                        "tracks": tracks,
+                    },
+                    "details": result.details,
+                    "errors": result.errors,
+                }))
+                .into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "error": e,
+                    "source": {
+                        "engine": "sqlite",
+                        "artists": artists,
+                        "albums": albums,
+                        "tracks": tracks,
+                    },
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (pg_url, tracks, albums, artists);
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "status": "error",
+                "error": "PostgreSQL support not compiled. Rebuild with --features postgres.",
+            })),
+        )
+            .into_response()
+    }
 }

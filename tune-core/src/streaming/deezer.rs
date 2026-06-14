@@ -4,6 +4,7 @@ use reqwest::Client;
 use tracing::info;
 
 use super::traits::*;
+use crate::TuneError;
 
 const API_BASE: &str = "https://api.deezer.com";
 const OAUTH_TOKEN_URL: &str = "https://connect.deezer.com/oauth/access_token.php";
@@ -359,7 +360,7 @@ impl StreamingService for DeezerService {
     async fn authenticate(
         &mut self,
         credentials: &serde_json::Value,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         // Path 1: ARL token (full streaming with decrypt proxy)
         if let Some(arl) = credentials["arl"].as_str() {
             self.authenticate_arl(arl).await?;
@@ -421,7 +422,7 @@ impl StreamingService for DeezerService {
         }
     }
 
-    async fn logout(&mut self) -> Result<(), String> {
+    async fn logout(&mut self) -> Result<(), TuneError> {
         self.access_token = None;
         self.username = None;
         self.user_id = None;
@@ -430,7 +431,7 @@ impl StreamingService for DeezerService {
 
     // ── search ───────────────────────────────────────────────────────
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let encoded = urlencoding::encode(query);
         let data = self
             .api_get(&format!("/search?q={encoded}&limit={limit}"))
@@ -462,7 +463,7 @@ impl StreamingService for DeezerService {
 
     // ── track ────────────────────────────────────────────────────────
 
-    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, String> {
+    async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
         let data = self.api_get(&format!("/track/{track_id}")).await?;
         Ok(Self::map_track(&data))
     }
@@ -471,7 +472,7 @@ impl StreamingService for DeezerService {
         &self,
         track_id: &str,
         _quality: Option<&str>,
-    ) -> Result<StreamUrl, String> {
+    ) -> Result<StreamUrl, TuneError> {
         // Path 1: local decrypt proxy (full quality, plain audio for DLNA)
         if let (Some(base), true) = (&self.proxy_base_url, self.has_full_streaming()) {
             let ext = if self.quality == "FLAC" {
@@ -547,31 +548,31 @@ impl StreamingService for DeezerService {
 
     // ── album ────────────────────────────────────────────────────────
 
-    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, String> {
+    async fn get_album(&self, album_id: &str) -> Result<StreamAlbum, TuneError> {
         let data = self.api_get(&format!("/album/{album_id}")).await?;
         Ok(Self::map_album(&data))
     }
 
-    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.api_get(&format!("/album/{album_id}/tracks")).await?;
         Ok(Self::collect_data(&data, Self::map_track))
     }
 
     // ── artist ───────────────────────────────────────────────────────
 
-    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, String> {
+    async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self.api_get(&format!("/artist/{artist_id}")).await?;
         Ok(Self::map_artist(&data))
     }
 
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(&format!("/artist/{artist_id}/albums?limit=50"))
             .await?;
         Ok(Self::collect_data(&data, Self::map_album))
     }
 
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/artist/{artist_id}/top?limit=20"))
             .await?;
@@ -580,12 +581,12 @@ impl StreamingService for DeezerService {
 
     // ── playlist ─────────────────────────────────────────────────────
 
-    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, String> {
+    async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         let data = self.api_get(&format!("/playlist/{playlist_id}")).await?;
         Ok(Self::map_playlist(&data))
     }
 
-    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/playlist/{playlist_id}/tracks?limit=500"))
             .await?;
@@ -594,7 +595,7 @@ impl StreamingService for DeezerService {
 
     // ── user library (requires auth) ─────────────────────────────────
 
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -606,7 +607,7 @@ impl StreamingService for DeezerService {
         &self,
         name: &str,
         _description: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, TuneError> {
         let token = self
             .access_token
             .as_deref()
@@ -633,7 +634,7 @@ impl StreamingService for DeezerService {
         &self,
         playlist_id: &str,
         track_ids: &[String],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, TuneError> {
         let token = self
             .access_token
             .as_deref()
@@ -658,7 +659,7 @@ impl StreamingService for DeezerService {
         self.access_token.is_some() && self.user_id.is_some()
     }
 
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -666,7 +667,7 @@ impl StreamingService for DeezerService {
         Ok(Self::collect_data(&data, Self::map_album))
     }
 
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -674,7 +675,7 @@ impl StreamingService for DeezerService {
         Ok(Self::collect_data(&data, Self::map_artist))
     }
 
-    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -684,17 +685,17 @@ impl StreamingService for DeezerService {
 
     // ── browse / editorial ───────────────────────────────────────────
 
-    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         let data = self.api_get("/chart/0/playlists?limit=50").await?;
         Ok(Self::collect_data(&data, Self::map_playlist))
     }
 
-    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self.api_get("/chart/0/albums?limit=50").await?;
         Ok(Self::collect_data(&data, Self::map_album))
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self.api_get("/genre").await?;
         Ok(Self::collect_data(&data, Self::map_genre))
     }
@@ -703,7 +704,7 @@ impl StreamingService for DeezerService {
         &self,
         genre_id: &str,
         limit: usize,
-    ) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         // Deezer editorial endpoint gives albums for a genre
         let data = self
             .api_get(&format!("/editorial/{genre_id}/releases?limit={limit}"))
@@ -729,7 +730,7 @@ impl StreamingService for DeezerService {
         }
     }
 
-    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, String> {
+    async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         Ok(vec![
             FeaturedSection {
                 id: "charts".into(),
@@ -742,7 +743,7 @@ impl StreamingService for DeezerService {
         ])
     }
 
-    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         match section_id {
             "charts" => {
                 let data = self.api_get("/chart/0/albums?limit=50").await?;
@@ -755,7 +756,7 @@ impl StreamingService for DeezerService {
 
     // ── favorites ────────────────────────────────────────────────────
 
-    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -784,7 +785,7 @@ impl StreamingService for DeezerService {
         Ok(())
     }
 
-    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         self.access_token
             .as_ref()
             .ok_or_else(|| "deezer: not authenticated".to_string())?;
@@ -871,7 +872,7 @@ impl StreamingService for DeezerService {
         }
     }
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         // Deezer tokens don't expire unless revoked, but validate if present
         if self.access_token.is_none() {
             return Ok(false);

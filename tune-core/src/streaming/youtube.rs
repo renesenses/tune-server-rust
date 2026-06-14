@@ -93,7 +93,7 @@ impl StreamingService for YouTubeService {
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Err("not authenticated".into())
     }
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         Err("not authenticated".into())
     }
 }

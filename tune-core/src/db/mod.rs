@@ -5,6 +5,8 @@ pub mod engine;
 pub mod history_repo;
 pub mod migrations;
 pub mod models;
+#[cfg(feature = "postgres")]
+pub mod pg_migrate;
 pub mod play_queue_repo;
 pub mod playlist_repo;
 #[cfg(feature = "postgres")]

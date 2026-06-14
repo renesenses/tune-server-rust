@@ -308,7 +308,7 @@ impl StreamingService for SpotifyService {
     async fn authenticate(
         &mut self,
         credentials: &serde_json::Value,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         if let Some(code) = credentials.get("code").and_then(|v| v.as_str()) {
             let verifier = self.code_verifier.take().ok_or("no code verifier")?;
             let resp = self
@@ -361,7 +361,7 @@ impl StreamingService for SpotifyService {
         }
     }
 
-    async fn logout(&mut self) -> Result<(), String> {
+    async fn logout(&mut self) -> Result<(), TuneError> {
         self.access_token = None;
         self.refresh_token = None;
         self.username = None;
@@ -369,7 +369,7 @@ impl StreamingService for SpotifyService {
         Ok(())
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, String> {
+    async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError> {
         let data = self
             .api_get(&format!(
                 "/search?q={}&type=track,album,artist&limit={limit}",
@@ -393,20 +393,20 @@ impl StreamingService for SpotifyService {
         })
     }
 
-    async fn get_track(&self, id: &str) -> Result<StreamTrack, String> {
+    async fn get_track(&self, id: &str) -> Result<StreamTrack, TuneError> {
         self.api_get(&format!("/tracks/{id}"))
             .await
             .map(|d| Self::map_track(&d))
     }
-    async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, String> {
+    async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
         Err("Spotify requires Connect/librespot for streaming".into())
     }
-    async fn get_album(&self, id: &str) -> Result<StreamAlbum, String> {
+    async fn get_album(&self, id: &str) -> Result<StreamAlbum, TuneError> {
         self.api_get(&format!("/albums/{id}"))
             .await
             .map(|d| Self::map_album(&d))
     }
-    async fn get_album_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_album_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         self.api_get(&format!("/albums/{id}/tracks?limit=50"))
             .await
             .map(|d| {
@@ -416,12 +416,12 @@ impl StreamingService for SpotifyService {
                     .unwrap_or_default()
             })
     }
-    async fn get_artist(&self, id: &str) -> Result<StreamArtist, String> {
+    async fn get_artist(&self, id: &str) -> Result<StreamArtist, TuneError> {
         self.api_get(&format!("/artists/{id}"))
             .await
             .map(|d| Self::map_artist(&d))
     }
-    async fn get_playlist(&self, id: &str) -> Result<StreamPlaylist, String> {
+    async fn get_playlist(&self, id: &str) -> Result<StreamPlaylist, TuneError> {
         let d = self.api_get(&format!("/playlists/{id}")).await?;
         Ok(StreamPlaylist {
             id: d["id"].as_str().unwrap_or("").into(),
@@ -436,7 +436,7 @@ impl StreamingService for SpotifyService {
             owner: d["owner"]["display_name"].as_str().map(Into::into),
         })
     }
-    async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         self.api_get(&format!("/playlists/{id}/tracks?limit=100"))
             .await
             .map(|d| {
@@ -450,7 +450,7 @@ impl StreamingService for SpotifyService {
                     .unwrap_or_default()
             })
     }
-    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         self.api_get("/me/playlists?limit=50").await.map(|d| {
             d["items"]
                 .as_array()
@@ -463,7 +463,7 @@ impl StreamingService for SpotifyService {
         &self,
         name: &str,
         description: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, TuneError> {
         let user_id = self
             .user_id
             .as_deref()
@@ -486,7 +486,7 @@ impl StreamingService for SpotifyService {
         &self,
         playlist_id: &str,
         track_ids: &[String],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, TuneError> {
         let uris: Vec<String> = track_ids
             .iter()
             .map(|id| {
@@ -511,7 +511,7 @@ impl StreamingService for SpotifyService {
         self.access_token.is_some() && self.user_id.is_some()
     }
 
-    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(&format!(
                 "/artists/{artist_id}/albums?include_groups=album,single&limit=50"
@@ -523,7 +523,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, String> {
+    async fn get_artist_top_tracks(&self, artist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self
             .api_get(&format!("/artists/{artist_id}/top-tracks"))
             .await?;
@@ -533,7 +533,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self.api_get("/browse/new-releases?limit=50").await?;
         Ok(data["albums"]["items"]
             .as_array()
@@ -541,7 +541,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, String> {
+    async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         let data = self.api_get("/browse/featured-playlists?limit=50").await?;
         Ok(data["playlists"]["items"]
             .as_array()
@@ -549,7 +549,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, String> {
+    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self.api_get("/browse/categories?limit=50").await?;
         Ok(data["categories"]["items"]
             .as_array()
@@ -561,7 +561,7 @@ impl StreamingService for SpotifyService {
         &self,
         genre_id: &str,
         limit: usize,
-    ) -> Result<Vec<StreamAlbum>, String> {
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         let data = self
             .api_get(&format!(
                 "/browse/categories/{genre_id}/playlists?limit={limit}"
@@ -605,7 +605,7 @@ impl StreamingService for SpotifyService {
         Ok(albums)
     }
 
-    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, String> {
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         let data = self.api_get("/me/tracks?limit=50").await?;
         Ok(data["items"]
             .as_array()
@@ -617,7 +617,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let path = match fav_type {
             "tracks" => format!("/me/tracks?ids={item_id}"),
             "albums" => format!("/me/albums?ids={item_id}"),
@@ -627,7 +627,7 @@ impl StreamingService for SpotifyService {
         self.api_put(&path).await
     }
 
-    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), String> {
+    async fn remove_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let path = match fav_type {
             "tracks" => format!("/me/tracks?ids={item_id}"),
             "albums" => format!("/me/albums?ids={item_id}"),
@@ -636,7 +636,7 @@ impl StreamingService for SpotifyService {
         };
         self.api_delete(&path).await
     }
-    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, String> {
+    async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         self.api_get("/me/albums?limit=50").await.map(|d| {
             d["items"]
                 .as_array()
@@ -648,7 +648,7 @@ impl StreamingService for SpotifyService {
                 .unwrap_or_default()
         })
     }
-    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, String> {
+    async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         self.api_get("/me/following?type=artist&limit=50")
             .await
             .map(|d| {
@@ -659,7 +659,7 @@ impl StreamingService for SpotifyService {
             })
     }
 
-    async fn refresh_if_needed(&mut self) -> Result<bool, String> {
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         let needs_refresh = self
             .token_expires
             .map(|exp| {
