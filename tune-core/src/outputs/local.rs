@@ -1641,16 +1641,32 @@ impl OutputTarget for LocalOutput {
             // Using FixedAsync::Input so we feed fixed-size input chunks.
             let mut resampler: Option<Async<f32>> = if needs_resample {
                 let ratio = output_sr as f64 / sample_rate as f64;
-                let sinc_len = 64;
+                // Adaptive resampler params based on conversion ratio:
+                //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
+                //   ratio > 2.0 (e.g. 176.4kHz→48kHz, 192kHz→48kHz): lighter params
+                //     to avoid real-time stuttering on Windows (still ~90dB SNR)
+                let inv_ratio = 1.0 / ratio; // > 1.0 when downsampling
+                let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
+                    (32_usize, 64_usize) // lighter: 176.4/192kHz → 48kHz
+                } else {
+                    (64_usize, 128_usize) // standard: 96kHz → 48kHz
+                };
                 let window = WindowFunction::BlackmanHarris2;
                 let f_cutoff = calculate_cutoff(sinc_len, window);
                 let params = SincInterpolationParameters {
                     sinc_len,
                     f_cutoff,
                     interpolation: SincInterpolationType::Linear,
-                    oversampling_factor: 128,
+                    oversampling_factor,
                     window,
                 };
+                info!(
+                    from_sr = sample_rate,
+                    to_sr = output_sr,
+                    sinc_len,
+                    oversampling_factor,
+                    "rubato_resampler_adaptive_params"
+                );
                 match Async::<f32>::new_sinc(
                     ratio,
                     1.1,
@@ -2381,14 +2397,23 @@ fn rubato_resample_batch(samples: &[f32], from_sr: u32, to_sr: u32, channels: u1
     }
 
     let ratio = to_sr as f64 / from_sr as f64;
-    let sinc_len = 64;
+    // Adaptive resampler params based on conversion ratio:
+    //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
+    //   ratio > 2.0 (e.g. 176.4kHz→48kHz, 192kHz→48kHz): lighter params
+    //     to avoid real-time stuttering on Windows (still ~90dB SNR)
+    let inv_ratio = 1.0 / ratio; // > 1.0 when downsampling
+    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
+        (32_usize, 64_usize) // lighter: 176.4/192kHz → 48kHz
+    } else {
+        (64_usize, 128_usize) // standard: 96kHz → 48kHz
+    };
     let window = WindowFunction::BlackmanHarris2;
     let f_cutoff = calculate_cutoff(sinc_len, window);
     let params = SincInterpolationParameters {
         sinc_len,
         f_cutoff,
         interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 128,
+        oversampling_factor,
         window,
     };
     let mut resampler =
