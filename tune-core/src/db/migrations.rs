@@ -475,6 +475,11 @@ CREATE TABLE IF NOT EXISTS track_metadata (
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
 ",
     },
+    Migration {
+        version: 35,
+        name: "add_zone_fixed_volume",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -746,6 +751,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 32 {
             add_column_if_missing(db, "listen_history", "cover_url", "TEXT");
+        }
+        if migration.version == 35 {
+            add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
         }
 
         db.execute(

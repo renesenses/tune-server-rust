@@ -51,6 +51,8 @@ struct PatchZone {
     sync_delay_ms: Option<i32>,
     /// Max output sample rate in Hz (e.g. 96000, 88200). null = no limit (passthrough).
     max_sample_rate: Option<Option<u32>>,
+    /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
+    fixed_volume: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -257,8 +259,9 @@ fn build_signal_path(
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
         .unwrap_or(false);
 
-    // Volume at 100% means no software volume adjustment
-    let volume_full = ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
+    // Volume at 100% means no software volume adjustment.
+    // Fixed-volume zones always output at full volume (bit-perfect).
+    let volume_full = zone.fixed_volume || ps.volume >= 1.0 || ps.volume <= 0.0; // 0.0 means no software vol set
 
     // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC) for network outputs.
     // FLAC, WAV, MP3, AAC are natively supported and pass through without transcoding.
@@ -582,6 +585,16 @@ async fn patch_zone(
         && let Err(e) = repo.update_max_sample_rate(id, rate)
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Some(fixed) = body.fixed_volume {
+        if let Err(e) = repo.update_fixed_volume(id, fixed) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // When enabling fixed_volume, pin volume to 100% in DB and in-memory
+        if fixed {
+            repo.update_volume(id, 100).ok();
+            state.playback.set_volume(id, 1.0).await;
+        }
     }
     get_zone(State(state), Path(id)).await.into_response()
 }

@@ -292,7 +292,8 @@ CREATE TABLE IF NOT EXISTS zones (
     last_track_id INTEGER,
     last_track_source TEXT,
     last_track_source_id TEXT,
-    max_sample_rate INTEGER
+    max_sample_rate INTEGER,
+    fixed_volume INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
