@@ -4,6 +4,7 @@ use std::path::Path;
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::*;
+use lofty::tag::ItemKey;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -185,6 +186,164 @@ pub struct WriteResult {
     pub fields_written: usize,
 }
 
+// --- Extended metadata writing (HashMap-based) ---
+
+/// Map a Tune metadata field name to the corresponding lofty `ItemKey`.
+/// These keys match the ones used in `read_extended_metadata`.
+fn tune_key_to_lofty(key: &str) -> Option<ItemKey> {
+    match key {
+        // Credits / personnel
+        "composer" => Some(ItemKey::Composer),
+        "conductor" => Some(ItemKey::Conductor),
+        "lyricist" => Some(ItemKey::Lyricist),
+        "performer" => Some(ItemKey::Performer),
+        "remixer" => Some(ItemKey::Remixer),
+        "label" => Some(ItemKey::Label),
+        "producer" => Some(ItemKey::Producer),
+
+        // Descriptive
+        "bpm" => Some(ItemKey::Bpm),
+        "mood" => Some(ItemKey::Mood),
+        "comment" => Some(ItemKey::Comment),
+        "lyrics" => Some(ItemKey::Lyrics),
+        "grouping" => Some(ItemKey::ContentGroup),
+        "compilation" => Some(ItemKey::FlagCompilation),
+
+        // Identifiers
+        "isrc" => Some(ItemKey::Isrc),
+        "barcode" => Some(ItemKey::Barcode),
+        "catalog_number" => Some(ItemKey::CatalogNumber),
+        "media_type" => Some(ItemKey::OriginalMediaType),
+
+        // Dates
+        "release_date" => Some(ItemKey::ReleaseDate),
+        "original_date" => Some(ItemKey::OriginalReleaseDate),
+
+        // Technical
+        "copyright" => Some(ItemKey::CopyrightMessage),
+        "language" => Some(ItemKey::Language),
+        "encoder" => Some(ItemKey::EncodedBy),
+
+        // Sort order
+        "sort_artist" => Some(ItemKey::TrackArtistSortOrder),
+        "sort_album" => Some(ItemKey::AlbumTitleSortOrder),
+        "sort_album_artist" => Some(ItemKey::AlbumArtistSortOrder),
+
+        // Core fields (album_artist written via ItemKey)
+        "album_artist" => Some(ItemKey::AlbumArtist),
+
+        // MusicBrainz IDs
+        "mb_track_id" => Some(ItemKey::MusicBrainzRecordingId),
+        "mb_release_id" => Some(ItemKey::MusicBrainzReleaseId),
+        "mb_artist_id" => Some(ItemKey::MusicBrainzArtistId),
+        "mb_release_artist_id" => Some(ItemKey::MusicBrainzReleaseArtistId),
+        "mb_release_group_id" => Some(ItemKey::MusicBrainzReleaseGroupId),
+        "mb_work_id" => Some(ItemKey::MusicBrainzWorkId),
+
+        // ReplayGain (read-only typically, but allow writing)
+        "rg_track_gain" => Some(ItemKey::ReplayGainTrackGain),
+        "rg_track_peak" => Some(ItemKey::ReplayGainTrackPeak),
+        "rg_album_gain" => Some(ItemKey::ReplayGainAlbumGain),
+        "rg_album_peak" => Some(ItemKey::ReplayGainAlbumPeak),
+
+        _ => None,
+    }
+}
+
+/// Returns true if the file extension is not supported for tag writing.
+fn is_unsupported_format(file_path: &str) -> bool {
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // DFF has no standard tag support
+    matches!(ext.as_str(), "dff")
+}
+
+/// Write extended metadata fields to an audio file's tags.
+///
+/// For each key in `fields`:
+/// - If the value is empty, the corresponding tag item is removed.
+/// - If the value is non-empty, the tag item is inserted/replaced.
+///
+/// Skips unsupported formats (DFF) and missing files gracefully.
+pub async fn write_metadata_to_file(
+    file_path: &str,
+    fields: &HashMap<String, String>,
+) -> Result<WriteResult, String> {
+    if is_unsupported_format(file_path) {
+        return Err("unsupported format for tag writing".into());
+    }
+    if !Path::new(file_path).exists() {
+        return Err("file not found".into());
+    }
+    let path = file_path.to_string();
+    let fields = fields.clone();
+    tokio::task::spawn_blocking(move || write_metadata_to_file_sync(&path, &fields))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+}
+
+fn write_metadata_to_file_sync(
+    file_path: &str,
+    fields: &HashMap<String, String>,
+) -> Result<WriteResult, String> {
+    let mut tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
+    let tag_type = tagged.primary_tag_type();
+
+    // Ensure we have a tag to write to
+    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
+    let has_primary = tagged.primary_tag().is_some();
+    let tag = if has_primary {
+        tagged.primary_tag_mut().unwrap()
+    } else {
+        tagged.first_tag_mut().unwrap()
+    };
+
+    let mut count = 0usize;
+    for (key, value) in fields {
+        let Some(item_key) = tune_key_to_lofty(key) else {
+            debug!(key = key.as_str(), "tag_writer_unknown_key_skipped");
+            continue;
+        };
+
+        if value.is_empty() {
+            // Remove the tag item
+            tag.remove_key(item_key);
+        } else {
+            // Insert/replace the tag item
+            tag.insert_text(item_key, value.clone());
+        }
+        count += 1;
+    }
+
+    if count == 0 {
+        return Ok(WriteResult {
+            file_path: file_path.into(),
+            fields_written: 0,
+        });
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+        .map_err(|e| format!("open: {e}"))?;
+    tagged
+        .save_to(&mut file, WriteOptions::default())
+        .map_err(|e| format!("lofty save: {e}"))?;
+
+    info!(file = file_path, fields = count, "extended_tags_written");
+    Ok(WriteResult {
+        file_path: file_path.into(),
+        fields_written: count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +363,74 @@ mod tests {
     #[test]
     fn detect_unknown() {
         assert_eq!(detect_format("/music/song.xyz"), TagFormat::Unknown);
+    }
+
+    #[test]
+    fn tune_key_mapping_covers_all_extended_fields() {
+        // Verify all keys from read_extended_metadata have a mapping
+        let keys = [
+            "composer",
+            "conductor",
+            "lyricist",
+            "performer",
+            "remixer",
+            "label",
+            "producer",
+            "bpm",
+            "mood",
+            "comment",
+            "lyrics",
+            "grouping",
+            "compilation",
+            "isrc",
+            "barcode",
+            "catalog_number",
+            "media_type",
+            "release_date",
+            "original_date",
+            "copyright",
+            "language",
+            "encoder",
+            "sort_artist",
+            "sort_album",
+            "sort_album_artist",
+            "album_artist",
+            "mb_track_id",
+            "mb_release_id",
+            "mb_artist_id",
+            "mb_release_artist_id",
+            "mb_release_group_id",
+            "mb_work_id",
+            "rg_track_gain",
+            "rg_track_peak",
+            "rg_album_gain",
+            "rg_album_peak",
+        ];
+        for key in keys {
+            assert!(
+                tune_key_to_lofty(key).is_some(),
+                "missing mapping for key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_key_mapping_returns_none_for_unknown() {
+        assert!(tune_key_to_lofty("unknown_field").is_none());
+        assert!(tune_key_to_lofty("").is_none());
+    }
+
+    #[test]
+    fn unsupported_format_dff() {
+        assert!(is_unsupported_format("/music/track.dff"));
+        assert!(is_unsupported_format("/music/track.DFF"));
+    }
+
+    #[test]
+    fn supported_formats_not_blocked() {
+        assert!(!is_unsupported_format("/music/track.flac"));
+        assert!(!is_unsupported_format("/music/track.mp3"));
+        assert!(!is_unsupported_format("/music/track.m4a"));
+        assert!(!is_unsupported_format("/music/track.dsf"));
     }
 }

@@ -642,6 +642,7 @@ pub(super) async fn track_metadata_get(
 
 /// PUT /api/v1/library/tracks/{id}/metadata
 /// Batch-sets extended metadata fields from a JSON object body.
+/// After saving to DB, also writes tags to the audio file (best-effort).
 pub(super) async fn track_metadata_put(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -649,17 +650,37 @@ pub(super) async fn track_metadata_put(
 ) -> impl IntoResponse {
     use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 
-    // Verify the track exists
+    // Verify the track exists and get its file_path
     let track_repo = TrackRepo::new(state.db.clone());
-    match track_repo.get(id) {
-        Ok(Some(_)) => {}
+    let file_path = match track_repo.get(id) {
+        Ok(Some(track)) => track.file_path,
         Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Save to DB (source of truth)
+    let repo = TrackMetadataRepo::new(state.db);
+    if let Err(e) = repo.set_batch(id, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    let repo = TrackMetadataRepo::new(state.db);
-    match repo.set_batch(id, &body) {
-        Ok(()) => Json(json!({"status": "ok", "fields": body.len()})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    // Write tags to file (best-effort, don't fail the request)
+    let mut file_write_error: Option<String> = None;
+    if let Some(ref path) = file_path {
+        if let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await {
+            tracing::warn!(
+                track_id = id,
+                path = path.as_str(),
+                error = e.as_str(),
+                "tag_write_to_file_failed"
+            );
+            file_write_error = Some(e);
+        }
     }
+
+    let mut resp = json!({"status": "ok", "fields": body.len()});
+    if let Some(err) = file_write_error {
+        resp["file_write_warning"] = json!(err);
+    }
+    Json(resp).into_response()
 }
