@@ -296,7 +296,7 @@ mod tests {
         let aid = album_repo.create(&Album::new("Test".into())).unwrap();
 
         let profile_repo = crate::db::profile_repo::ProfileRepo::new(db.clone());
-        let pid2 = profile_repo.create("user2", None).unwrap();
+        let pid2 = profile_repo.create("user2", None, None).unwrap();
 
         let repo = RatingRepo::new(db);
         repo.rate_album(aid, 1, 5, None).unwrap();

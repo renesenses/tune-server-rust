@@ -34,6 +34,51 @@ async fn main() {
     #[cfg(target_os = "windows")]
     tune_server::windows_migrate::check_and_migrate();
 
+    // Load .env file if present (compatible with the Python server's .env convention).
+    // dotenvy injects variables from .env into the process environment so that
+    // TuneConfig::load() picks them up via std::env::var().  Missing .env is fine.
+    //
+    // Search order:
+    //   1. CWD and ancestors (dotenvy::dotenv default)
+    //   2. [Windows] %LOCALAPPDATA%\TuneServer\.env
+    //   3. [Windows] directory containing tune-server.exe
+    let mut dotenv_loaded = false;
+    match dotenvy::dotenv() {
+        Ok(path) => {
+            eprintln!("loaded .env from {}", path.display());
+            dotenv_loaded = true;
+        }
+        Err(dotenvy::Error::Io(_)) => {} // no .env file in CWD — try other locations
+        Err(e) => eprintln!("warning: .env parse error: {e}"),
+    }
+    #[cfg(target_os = "windows")]
+    if !dotenv_loaded {
+        let extra_paths: Vec<std::path::PathBuf> = [
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|d| std::path::PathBuf::from(d).join("TuneServer").join(".env")),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join(".env"))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for path in &extra_paths {
+            if path.is_file() {
+                match dotenvy::from_path(path) {
+                    Ok(()) => {
+                        eprintln!("loaded .env from {}", path.display());
+                        dotenv_loaded = true;
+                        break;
+                    }
+                    Err(e) => eprintln!("warning: .env parse error at {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+    let _ = dotenv_loaded; // suppress unused warning on non-Windows
+
     // Install rustls CryptoProvider before any TLS operation (reqwest, etc.)
     rustls::crypto::ring::default_provider()
         .install_default()

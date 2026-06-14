@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_radios).post(create_radio))
         .route("/search", get(search_radios))
         .route("/favorites", get(list_favorites))
+        .route("/add-from-web", get(add_from_web))
         .route(
             "/{id}",
             get(get_radio).put(update_radio).delete(delete_radio),
@@ -176,6 +177,56 @@ async fn list_favorites(State(state): State<AppState>) -> Json<Value> {
 #[derive(Deserialize)]
 struct FavoriteToggle {
     favorite: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AddFromWebQuery {
+    name: String,
+    url: String,
+    genre: Option<String>,
+    country: Option<String>,
+    logo_url: Option<String>,
+}
+
+async fn add_from_web(
+    State(state): State<AppState>,
+    Query(q): Query<AddFromWebQuery>,
+) -> impl IntoResponse {
+    let repo = RadioRepo::new(state.db);
+    let station = RadioStation {
+        id: None,
+        name: q.name.clone(),
+        url: q.url,
+        homepage: None,
+        logo_url: q.logo_url,
+        country: q.country,
+        language: None,
+        genre: q.genre,
+        codec: None,
+        bitrate: None,
+        is_favorite: false,
+        last_played: None,
+        play_count: 0,
+    };
+    let html = match repo.create(&station) {
+        Ok(id) => {
+            repo.set_favorite(id, true).ok();
+            format!(
+                r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
+<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong> a été ajoutée à vos favoris Tune.</p><p style="color:#888;margin-top:2em">Vous pouvez fermer cet onglet.</p></div>
+</body></html>"#,
+                q.name
+            )
+        }
+        Err(e) => format!(
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
+<body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center"><h1 style="color:#f87171">Erreur</h1><p>{e}</p></div>
+</body></html>"#
+        ),
+    };
+    axum::response::Html(html)
 }
 
 async fn toggle_favorite(

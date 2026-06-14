@@ -15,6 +15,10 @@ music_dirs = [
     # "/mnt/nas/music",
 ]
 
+# Discogs token (optional — for artist images & album metadata)
+# Get yours at: https://www.discogs.com/settings/developers
+# discogs_token = ""
+
 # Qobuz credentials (optional)
 # qobuz_app_id = ""
 # qobuz_app_secret = ""

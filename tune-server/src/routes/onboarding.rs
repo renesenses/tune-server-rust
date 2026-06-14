@@ -272,12 +272,8 @@ async fn step_profile(
     let profile_repo = tune_core::db::profile_repo::ProfileRepo::new(state.db.clone());
     let display_name = body.name.clone();
     let avatar_color = body.avatar_color.as_deref().unwrap_or("#6366f1");
-    match profile_repo.create(&display_name, Some(&display_name)) {
+    match profile_repo.create(&display_name, Some(&display_name), Some(avatar_color)) {
         Ok(profile_id) => {
-            // Store avatar color in settings and update profile avatar
-            profile_repo
-                .update(profile_id, None, Some(avatar_color))
-                .ok();
             // Set as active profile
             settings
                 .set("active_profile_id", &profile_id.to_string())

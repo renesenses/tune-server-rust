@@ -25,9 +25,10 @@ pub mod sql {
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO profiles (username, display_name) VALUES ({}, {})",
+            "INSERT INTO profiles (username, display_name, avatar_path) VALUES ({}, {}, {})",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -150,9 +151,14 @@ impl ProfileRepo {
         Ok(rows.iter().map(row_to_profile).collect())
     }
 
-    pub fn create(&self, username: &str, display_name: Option<&str>) -> Result<i64, String> {
+    pub fn create(
+        &self,
+        username: &str,
+        display_name: Option<&str>,
+        avatar_path: Option<&str>,
+    ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
-        let params: [&dyn ToSqlValue; 2] = [&username, &display_name];
+        let params: [&dyn ToSqlValue; 3] = [&username, &display_name, &avatar_path];
         self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
@@ -273,7 +279,7 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "default");
 
-        let id = repo.create("bertrand", Some("Bertrand")).unwrap();
+        let id = repo.create("bertrand", Some("Bertrand"), None).unwrap();
         assert!(id > 1);
 
         repo.add_favorite(1, "track", 42).unwrap();
@@ -298,7 +304,7 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let repo = ProfileRepo::new(db);
-        let id = repo.create("alice", Some("Alice")).unwrap();
+        let id = repo.create("alice", Some("Alice"), None).unwrap();
         repo.update(id, Some("Alice Updated"), Some("/avatars/alice.png"))
             .unwrap();
 
@@ -373,7 +379,7 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let repo = ProfileRepo::new(db);
-        let user2 = repo.create("bob", Some("Bob")).unwrap();
+        let user2 = repo.create("bob", Some("Bob"), None).unwrap();
 
         repo.add_favorite(1, "track", 100).unwrap();
         repo.add_favorite(user2, "track", 200).unwrap();
@@ -391,8 +397,8 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
 
         let repo = ProfileRepo::new(db);
-        repo.create("alice", None).unwrap();
-        repo.create("bob", None).unwrap();
+        repo.create("alice", None, None).unwrap();
+        repo.create("bob", None, None).unwrap();
 
         let all = repo.list().unwrap();
         assert_eq!(all.len(), 3);
@@ -422,7 +428,7 @@ mod tests {
         migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = ProfileRepo::with_backend(backend);
-        let id = repo.create("xx", None).unwrap();
+        let id = repo.create("xx", None, None).unwrap();
         assert_eq!(repo.get(id).unwrap().unwrap().name, "xx");
     }
 }

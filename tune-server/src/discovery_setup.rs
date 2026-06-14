@@ -285,31 +285,85 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
                         } else {
-                            // Check if a zone with the same name exists but different device_id
-                            // (device_id may have changed after a firmware update / re-pairing).
                             let existing = zone_repo.list().unwrap_or_default();
-                            let same_name_zone = existing.iter().find(|z| z.name == dev.name);
-                            if let Some(z) = same_name_zone
+
+                            // When a higher-priority protocol discovers a device at the
+                            // same host as an existing zone (e.g. BluOS vs AirPlay for a
+                            // Bluesound Node), upgrade the zone to the better protocol
+                            // instead of creating a duplicate.
+                            let upgrade_zone = existing.iter().find(|z| {
+                                if let Some(ref old_dev_id) = z.output_device_id {
+                                    // Match by host: device IDs are formatted as
+                                    // "{type}-{host}-{port}", extract the host part
+                                    // from the existing zone's device_id.
+                                    let old_host = old_dev_id.splitn(3, '-').nth(1).unwrap_or("");
+                                    let is_same_host = old_host == dev.host;
+                                    if !is_same_host {
+                                        return false;
+                                    }
+                                    // Only upgrade if new protocol has higher priority
+                                    let old_prio = match z.output_type.as_deref() {
+                                        Some("oaat") => OutputType::Oaat.priority(),
+                                        Some("openhome") => OutputType::Openhome.priority(),
+                                        Some("bluos") => OutputType::Bluos.priority(),
+                                        Some("squeezebox") => OutputType::Squeezebox.priority(),
+                                        Some("dlna") => OutputType::Dlna.priority(),
+                                        Some("chromecast") => OutputType::Chromecast.priority(),
+                                        Some("airplay") => OutputType::Airplay.priority(),
+                                        _ => 0,
+                                    };
+                                    dev.device_type.priority() > old_prio
+                                } else {
+                                    false
+                                }
+                            });
+
+                            if let Some(z) = upgrade_zone
                                 && let Some(zid) = z.id
                             {
+                                // Remove the old lower-priority output
+                                if let Some(ref old_dev_id) = z.output_device_id {
+                                    reg.remove(old_dev_id);
+                                }
                                 let _ = zone_repo.update_output_device(zid, &dev.id);
+                                let _ = zone_repo.update_output_type(zid, output_type_str);
                                 let _ = zone_repo.set_online_by_device(&dev.id, true);
-                                info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+                                info!(
+                                    name = %dev.name,
+                                    id = %dev.id,
+                                    old_id = ?z.output_device_id,
+                                    old_type = ?z.output_type,
+                                    new_type = output_type_str,
+                                    "mdns_zone_upgraded_to_higher_priority"
+                                );
                             } else {
-                                match zone_repo.get_or_create(
-                                    &dev.name,
-                                    Some(output_type_str),
-                                    &dev.id,
-                                ) {
-                                    Ok((zid, true)) => {
-                                        info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
-                                    }
-                                    Ok((zid, false)) => {
-                                        let _ = zone_repo.set_online_by_device(&dev.id, true);
-                                        info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                // Check if a zone with the same name exists but different
+                                // device_id (device_id may have changed after a firmware
+                                // update / re-pairing).
+                                let same_name_zone = existing.iter().find(|z| z.name == dev.name);
+                                if let Some(z) = same_name_zone
+                                    && let Some(zid) = z.id
+                                {
+                                    let _ = zone_repo.update_output_device(zid, &dev.id);
+                                    let _ = zone_repo.update_output_type(zid, output_type_str);
+                                    let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                    info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
+                                } else {
+                                    match zone_repo.get_or_create(
+                                        &dev.name,
+                                        Some(output_type_str),
+                                        &dev.id,
+                                    ) {
+                                        Ok((zid, true)) => {
+                                            info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                        }
+                                        Ok((zid, false)) => {
+                                            let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                            info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                        }
                                     }
                                 }
                             }

@@ -40,6 +40,7 @@ time = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
+dotenvy = { workspace = true }
 
 [dev-dependencies]
 tower = "0.5"

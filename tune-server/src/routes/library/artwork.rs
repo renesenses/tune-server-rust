@@ -206,25 +206,64 @@ pub(super) async fn enrich_album_artwork(
         }
     };
 
-    // Skip if album already has a cover
-    if album.cover_path.is_some() {
+    // Skip if album already has a non-empty cover
+    if album.cover_path.as_ref().is_some_and(|p| !p.is_empty()) {
         return Json(json!({"enriched": false, "reason": "album already has cover art"}))
             .into_response();
     }
 
-    let Some(ref mbid) = album.musicbrainz_release_id else {
-        return Json(json!({"enriched": false, "reason": "no MusicBrainz release ID"}))
-            .into_response();
+    // Step 1: Determine MBID — use existing or search MusicBrainz by artist+title
+    let mbid = match album
+        .musicbrainz_release_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => Some(id.to_string()),
+        None => {
+            let artist = album.artist_name.as_deref().unwrap_or("");
+            if !artist.is_empty() && !album.title.is_empty() {
+                let found =
+                    tune_core::library::artwork::search_musicbrainz_release(artist, &album.title)
+                        .await;
+                if let Some(ref discovered_mbid) = found {
+                    // Store the discovered MBID on the album for future use
+                    state.db.execute(
+                        "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
+                        &[discovered_mbid as &dyn rusqlite::types::ToSql, &id],
+                    ).ok();
+                    tracing::info!(
+                        album_id = id,
+                        mbid = %discovered_mbid,
+                        album = %album.title,
+                        artist = %artist,
+                        "enrich_album_artwork_mbid_discovered"
+                    );
+                }
+                found
+            } else {
+                None
+            }
+        }
     };
 
-    match tune_core::library::artwork::fetch_cover_art(mbid).await {
+    let Some(ref mbid_val) = mbid else {
+        return Json(json!({
+            "enriched": false,
+            "reason": "no MusicBrainz release ID and could not find one by artist/title"
+        }))
+        .into_response();
+    };
+
+    // Step 2: Fetch cover from Cover Art Archive
+    match tune_core::library::artwork::fetch_cover_art(mbid_val).await {
         Some(data) => {
             let cache_dir = artwork_cache_dir();
-            let hash = tune_core::library::artwork::artwork_hash(mbid);
+            let hash = tune_core::library::artwork::artwork_hash(mbid_val);
             if tune_core::library::artwork::save_to_cache(&data, &cache_dir, &hash, "jpg").is_some()
             {
                 repo.update_cover_path(id, &hash).ok();
-                Json(json!({"enriched": true, "hash": hash, "size": data.len()})).into_response()
+                Json(json!({"enriched": true, "hash": hash, "size": data.len(), "mbid": mbid_val}))
+                    .into_response()
             } else {
                 Json(json!({"enriched": false, "reason": "failed to save to cache"}))
                     .into_response()

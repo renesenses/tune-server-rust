@@ -59,6 +59,7 @@ oaat-controller = { version = "0.2.0", default-features = false }
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+dotenvy = "0.15"
 
 [profile.dev]
 opt-level = 0

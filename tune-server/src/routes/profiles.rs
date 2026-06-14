@@ -168,7 +168,7 @@ async fn create_profile(
     Json(body): Json<CreateProfile>,
 ) -> impl IntoResponse {
     let repo = ProfileRepo::new(state.db);
-    match repo.create(&body.name, body.avatar_color.as_deref()) {
+    match repo.create(&body.name, None, body.avatar_color.as_deref()) {
         Ok(id) => {
             // Return the full profile object so the web client can use it directly
             let profile = repo.get(id).ok().flatten();
