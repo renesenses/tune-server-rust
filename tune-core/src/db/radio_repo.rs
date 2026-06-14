@@ -105,7 +105,9 @@ pub mod sql {
 pub struct RadioStation {
     pub id: Option<i64>,
     pub name: String,
+    #[serde(rename = "stream_url", alias = "url")]
     pub url: String,
+    #[serde(rename = "homepage_url", alias = "homepage")]
     pub homepage: Option<String>,
     pub logo_url: Option<String>,
     pub country: Option<String>,
