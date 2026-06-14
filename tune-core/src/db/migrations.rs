@@ -428,6 +428,40 @@ CREATE INDEX IF NOT EXISTS idx_track_source_links_service ON track_source_links(
         name: "add_listen_history_cover_url",
         up: "",
     },
+    Migration {
+        version: 33,
+        name: "seed_default_radios",
+        up: "
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP', 'https://icecast.radiofrance.fr/fip-hifi.aac', 'Éclectique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Rock', 'https://icecast.radiofrance.fr/fiprock-hifi.aac', 'Rock', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Jazz', 'https://icecast.radiofrance.fr/fipjazz-hifi.aac', 'Jazz', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Groove', 'https://icecast.radiofrance.fr/fipgroove-hifi.aac', 'Groove', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Pop', 'https://icecast.radiofrance.fr/fippop-hifi.aac', 'Pop', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Electro', 'https://icecast.radiofrance.fr/fipelectro-hifi.aac', 'Électronique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Monde', 'https://icecast.radiofrance.fr/fipworld-hifi.aac', 'Monde', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Reggae', 'https://icecast.radiofrance.fr/fipreggae-hifi.aac', 'Reggae', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Nouveautés', 'https://icecast.radiofrance.fr/fipnouveautes-hifi.aac', 'Éclectique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Metal', 'https://icecast.radiofrance.fr/fipmetal-hifi.aac', 'Metal', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Hip-Hop', 'https://icecast.radiofrance.fr/fiphiphop-hifi.aac', 'Hip-Hop', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Sacré français', 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac', 'Chanson française', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Latino', 'https://icecast.radiofrance.fr/fiplatino-hifi.aac', 'Latino', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('FIP Tout nouveau', 'https://icecast.radiofrance.fr/fiptoutnouveautoutchaud-hifi.aac', 'Éclectique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique', 'https://icecast.radiofrance.fr/francemusique-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Classique Easy', 'https://icecast.radiofrance.fr/francemusiqueeasyclassique-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Classique Plus', 'https://icecast.radiofrance.fr/francemusiqueclassiqueplus-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Concerts', 'https://icecast.radiofrance.fr/francemusiqueconcertsradiofrance-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Jazz', 'https://icecast.radiofrance.fr/francemusiquelajazz-hifi.aac', 'Jazz', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Contemporaine', 'https://icecast.radiofrance.fr/francemusiquelacontemporaine-hifi.aac', 'Contemporaine', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Baroque', 'https://icecast.radiofrance.fr/francemusiquebaroque-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Opéra', 'https://icecast.radiofrance.fr/francemusiqueopera-hifi.aac', 'Classique', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Musique Musiques du monde', 'https://icecast.radiofrance.fr/francemusiqueocoramondial-hifi.aac', 'Monde', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Culture', 'https://icecast.radiofrance.fr/franceculture-hifi.aac', 'Culture', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('France Inter', 'https://icecast.radiofrance.fr/franceinter-hifi.aac', 'Généraliste', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('Mouv''', 'https://icecast.radiofrance.fr/mouv-hifi.aac', 'Hip-Hop', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('Mouv'' Xtra', 'https://icecast.radiofrance.fr/mouvxtra-hifi.aac', 'Hip-Hop', 'France');
+INSERT OR IGNORE INTO radios (name, url, genre, country) VALUES ('Radio Classique', 'https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3', 'Classique', 'France');
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
