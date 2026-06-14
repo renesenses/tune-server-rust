@@ -179,7 +179,7 @@ struct FavoriteToggle {
 }
 
 #[derive(Deserialize)]
-struct AddFromWebQuery {
+pub struct AddFromWebQuery {
     name: String,
     url: String,
     genre: Option<String>,
