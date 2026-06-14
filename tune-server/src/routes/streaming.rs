@@ -131,6 +131,7 @@ pub fn router() -> Router<AppState> {
         .route("/youtube/moods", get(youtube_moods))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        .route("/tidal/callback", get(tidal_callback))
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +623,73 @@ async fn spotify_callback(
             .into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TidalCallbackQuery {
+    code: Option<String>,
+    error: Option<String>,
+}
+
+async fn tidal_callback(
+    State(state): State<AppState>,
+    Query(q): Query<TidalCallbackQuery>,
+) -> Response {
+    if let Some(ref error) = q.error {
+        return Json(json!({"error": error})).into_response();
+    }
+    let Some(code) = q.code else {
+        return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
+    };
+    let svc = match get_svc(&state, "tidal").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.lock().await;
+    match svc.authenticate(&json!({"code": code})).await {
+        Ok(status) => {
+            drop(svc);
+            state.save_tokens().await;
+            if status.authenticated {
+                state.event_bus.emit(
+                    "streaming.auth.success",
+                    json!({
+                        "service": "tidal",
+                        "username": &status.username,
+                    }),
+                );
+            }
+            // Return a simple HTML page that closes the window / redirects to app
+            let html = format!(
+                r#"<html><body>
+                <h2>Tidal: {}</h2>
+                <p>{}</p>
+                <script>window.close(); setTimeout(function(){{ window.location='/'; }}, 2000);</script>
+                </body></html>"#,
+                if status.authenticated {
+                    "Connected"
+                } else {
+                    "Failed"
+                },
+                if status.authenticated {
+                    format!("Welcome, {}!", status.username.as_deref().unwrap_or("user"))
+                } else {
+                    "Authentication failed. Please try again.".into()
+                }
+            );
+            axum::response::Html(html).into_response()
+        }
+        Err(e) => {
+            let html = format!(
+                r#"<html><body>
+                <h2>Tidal: Error</h2>
+                <p>{e}</p>
+                <script>setTimeout(function(){{ window.location='/'; }}, 5000);</script>
+                </body></html>"#
+            );
+            axum::response::Html(html).into_response()
+        }
     }
 }
 
