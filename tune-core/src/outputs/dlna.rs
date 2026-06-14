@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
@@ -22,6 +24,13 @@ pub struct DlnaOutput {
     /// Short-timeout client used for fire-and-forget Stop before play.
     stop_client: Client,
     play_delay_ms: u64,
+    /// Alternates between false ("1") and true ("2") so that consecutive
+    /// DIDL items sent via SetAVTransportURI / SetNextAVTransportURI use
+    /// different item IDs.  Renderers like Marantz ND8006 cache DIDL
+    /// metadata keyed by item id — using the same id for both current and
+    /// next track causes the renderer to display stale metadata (wrong
+    /// duration, format) on every other track.
+    next_item_id_flip: AtomicBool,
 }
 
 impl DlnaOutput {
@@ -49,6 +58,7 @@ impl DlnaOutput {
                 .build()
                 .unwrap_or_default(),
             play_delay_ms: 0,
+            next_item_id_flip: AtomicBool::new(false),
         }
     }
 
@@ -161,11 +171,11 @@ impl DlnaOutput {
         .await
     }
 
-    fn didl_metadata(media: &PlayMedia<'_>) -> String {
+    fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
             .protocol_style(ProtocolStyle::Dlna)
             .dlna_art_profile(true)
-            .item_id("1")
+            .item_id(item_id)
             .artist_opt(media.artist)
             .album_opt(media.album)
             .album_art_opt(media.cover_url)
@@ -175,6 +185,15 @@ impl DlnaOutput {
             .bit_depth_opt(media.bit_depth)
             .channels_opt(media.channels)
             .build_escaped()
+    }
+
+    /// Return the next item id ("1" or "2") and flip the toggle.
+    /// Alternating ids prevents renderers (Marantz ND8006 etc.) from
+    /// displaying stale cached metadata when the same id is reused for
+    /// consecutive tracks.
+    fn next_item_id(&self) -> &'static str {
+        let prev = self.next_item_id_flip.fetch_xor(true, Ordering::Relaxed);
+        if prev { "2" } else { "1" }
     }
 
     fn parse_time(time_str: &str) -> u64 {
@@ -253,7 +272,8 @@ impl OutputTarget for DlnaOutput {
             }
         }
 
-        let metadata = Self::didl_metadata(media);
+        let item_id = self.next_item_id();
+        let metadata = Self::didl_metadata(media, item_id);
         let set_uri_resp = self.av_action("SetAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{metadata}</CurrentURIMetaData>",
             media.url
@@ -394,7 +414,8 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let metadata = Self::didl_metadata(media);
+        let item_id = self.next_item_id();
+        let metadata = Self::didl_metadata(media, item_id);
         self.av_action("SetNextAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
             media.url
@@ -469,17 +490,20 @@ mod tests {
 
     #[test]
     fn didl_metadata_with_cover_and_album() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://example.com/stream",
-            mime_type: "audio/flac",
-            title: Some("Test Track"),
-            artist: Some("Test Artist"),
-            album: Some("Test Album"),
-            cover_url: Some("http://example.com/cover.jpg"),
-            duration_ms: Some(256_000),
-            file_size: Some(50_000_000),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://example.com/stream",
+                mime_type: "audio/flac",
+                title: Some("Test Track"),
+                artist: Some("Test Artist"),
+                album: Some("Test Album"),
+                cover_url: Some("http://example.com/cover.jpg"),
+                duration_ms: Some(256_000),
+                file_size: Some(50_000_000),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(didl.contains("Test Track"));
         assert!(didl.contains("Test Artist"));
         assert!(didl.contains("Test Album"));
@@ -514,12 +538,15 @@ mod tests {
 
     #[test]
     fn didl_metadata_without_cover() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://example.com/stream",
-            mime_type: "audio/flac",
-            title: Some("Title"),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://example.com/stream",
+                mime_type: "audio/flac",
+                title: Some("Title"),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(didl.contains("Title"));
         assert!(!didl.contains("albumArtURI"));
         assert!(!didl.contains("upnp:album"));
@@ -530,13 +557,16 @@ mod tests {
 
     #[test]
     fn didl_metadata_null_artist_string() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://example.com/stream",
-            mime_type: "audio/flac",
-            title: Some("Title"),
-            artist: Some("null"),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://example.com/stream",
+                mime_type: "audio/flac",
+                title: Some("Title"),
+                artist: Some("null"),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(
             !didl.contains("dc:creator"),
             "literal 'null' artist must be omitted"
@@ -545,25 +575,31 @@ mod tests {
 
     #[test]
     fn didl_metadata_empty_artist() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://example.com/stream",
-            mime_type: "audio/flac",
-            title: Some("Title"),
-            artist: Some(""),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://example.com/stream",
+                mime_type: "audio/flac",
+                title: Some("Title"),
+                artist: Some(""),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(!didl.contains("dc:creator"), "empty artist must be omitted");
     }
 
     #[test]
     fn didl_escapes_special_chars() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://example.com/stream?a=1&b=2",
-            mime_type: "audio/flac",
-            title: Some("Rock & Roll"),
-            artist: Some("AC/DC"),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://example.com/stream?a=1&b=2",
+                mime_type: "audio/flac",
+                title: Some("Rock & Roll"),
+                artist: Some("AC/DC"),
+                ..Default::default()
+            },
+            "1",
+        );
         // build_escaped() double-escapes ampersands: first XML-escape for
         // DIDL content, then partial_escape for SOAP embedding.
         // "&" -> "&amp;" (XML) -> "&amp;amp;" (SOAP partial escape)
@@ -576,12 +612,15 @@ mod tests {
 
     #[test]
     fn didl_dlna_flags_wav() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://x/s",
-            mime_type: "audio/wav",
-            title: Some("T"),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/s",
+                mime_type: "audio/wav",
+                title: Some("T"),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(
             didl.contains("DLNA.ORG_PN=LPCM"),
             "WAV must have LPCM profile"
@@ -590,12 +629,15 @@ mod tests {
 
     #[test]
     fn didl_dlna_flags_mp3() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://x/s",
-            mime_type: "audio/mpeg",
-            title: Some("T"),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/s",
+                mime_type: "audio/mpeg",
+                title: Some("T"),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(
             didl.contains("DLNA.ORG_PN=MP3"),
             "MP3 must have MP3 profile"
@@ -604,15 +646,18 @@ mod tests {
 
     #[test]
     fn didl_metadata_includes_audio_params() {
-        let didl = DlnaOutput::didl_metadata(&PlayMedia {
-            url: "http://x/s.wav",
-            mime_type: "audio/wav",
-            title: Some("DSD Track"),
-            sample_rate: Some(176_400),
-            bit_depth: Some(24),
-            channels: Some(2),
-            ..Default::default()
-        });
+        let didl = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/s.wav",
+                mime_type: "audio/wav",
+                title: Some("DSD Track"),
+                sample_rate: Some(176_400),
+                bit_depth: Some(24),
+                channels: Some(2),
+                ..Default::default()
+            },
+            "1",
+        );
         assert!(
             didl.contains("sampleFrequency=\"176400\""),
             "DIDL must include sampleFrequency for DSD->PCM"
@@ -656,5 +701,33 @@ mod tests {
             let parsed = DlnaOutput::parse_time(&formatted);
             assert_eq!(parsed, ms, "roundtrip failed for {ms}ms -> {formatted}");
         }
+    }
+
+    #[test]
+    fn didl_item_id_alternates() {
+        // Verify that consecutive tracks get different item IDs to prevent
+        // Marantz ND8006 (and similar) from displaying cached metadata.
+        let didl_1 = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/track1",
+                mime_type: "audio/flac",
+                title: Some("Track 1"),
+                ..Default::default()
+            },
+            "1",
+        );
+        let didl_2 = DlnaOutput::didl_metadata(
+            &PlayMedia {
+                url: "http://x/track2",
+                mime_type: "audio/flac",
+                title: Some("Track 2"),
+                ..Default::default()
+            },
+            "2",
+        );
+        assert!(didl_1.contains("id=\"1\""), "first track should have id=1");
+        assert!(didl_2.contains("id=\"2\""), "second track should have id=2");
+        assert!(didl_1.contains("Track 1"));
+        assert!(didl_2.contains("Track 2"));
     }
 }

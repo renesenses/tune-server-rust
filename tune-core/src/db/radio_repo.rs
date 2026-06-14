@@ -115,6 +115,7 @@ pub struct RadioStation {
     pub genre: Option<String>,
     pub codec: Option<String>,
     pub bitrate: Option<i32>,
+    #[serde(rename = "favorite", alias = "is_favorite")]
     pub is_favorite: bool,
     pub last_played: Option<String>,
     pub play_count: i64,

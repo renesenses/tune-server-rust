@@ -68,7 +68,7 @@ async fn create_radio(
     State(state): State<AppState>,
     Json(body): Json<CreateRadio>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::new(state.db.clone());
     let station = RadioStation {
         id: None,
         name: body.name,
@@ -85,31 +85,86 @@ async fn create_radio(
         play_count: 0,
     };
     match repo.create(&station) {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+        Ok(id) => {
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "created", "id": id}),
+            );
+            // Return the full station so the UI can display it immediately
+            let created = repo.get(id).ok().flatten().unwrap_or(RadioStation {
+                id: Some(id),
+                ..station
+            });
+            (StatusCode::CREATED, Json(json!(created))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct UpdateRadioBody {
+    name: Option<String>,
+    #[serde(alias = "stream_url")]
+    url: Option<String>,
+    #[serde(alias = "homepage_url")]
+    homepage: Option<String>,
+    logo_url: Option<String>,
+    country: Option<String>,
+    language: Option<String>,
+    genre: Option<String>,
+    codec: Option<String>,
+    bitrate: Option<i32>,
+    favorite: Option<bool>,
 }
 
 async fn update_radio(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<CreateRadio>,
+    Json(body): Json<UpdateRadioBody>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::new(state.db.clone());
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    station.name = body.name;
-    station.url = body.url;
-    station.homepage = body.homepage;
-    station.logo_url = body.logo_url;
-    station.country = body.country;
-    station.language = body.language;
-    station.genre = body.genre;
-    station.codec = body.codec;
-    station.bitrate = body.bitrate;
+    if let Some(name) = body.name {
+        station.name = name;
+    }
+    if let Some(url) = body.url {
+        station.url = url;
+    }
+    if let Some(homepage) = body.homepage {
+        station.homepage = Some(homepage);
+    }
+    if let Some(logo_url) = body.logo_url {
+        station.logo_url = Some(logo_url);
+    }
+    if let Some(country) = body.country {
+        station.country = Some(country);
+    }
+    if let Some(language) = body.language {
+        station.language = Some(language);
+    }
+    if let Some(genre) = body.genre {
+        station.genre = Some(genre);
+    }
+    if let Some(codec) = body.codec {
+        station.codec = Some(codec);
+    }
+    if let Some(bitrate) = body.bitrate {
+        station.bitrate = Some(bitrate);
+    }
+    if let Some(fav) = body.favorite {
+        station.is_favorite = fav;
+        repo.set_favorite(id, fav).ok();
+    }
     match repo.update(&station) {
-        Ok(()) => Json(json!(station)).into_response(),
+        Ok(()) => {
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "updated", "id": id}),
+            );
+            Json(json!(station)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -117,7 +172,13 @@ async fn update_radio(
 async fn delete_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = RadioRepo::new(state.db);
     match repo.delete(id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "deleted", "id": id}),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -211,6 +272,10 @@ async fn add_from_web(
     let html = match repo.create(&station) {
         Ok(id) => {
             repo.set_favorite(id, true).ok();
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "created", "id": id}),
+            );
             format!(
                 r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
 <body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
@@ -234,7 +299,7 @@ async fn toggle_favorite(
     Path(id): Path<i64>,
     body: Option<Json<FavoriteToggle>>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::new(state.db.clone());
     let current = repo.get(id).ok().flatten();
     let Some(current) = current else {
         return StatusCode::NOT_FOUND.into_response();
@@ -243,7 +308,13 @@ async fn toggle_favorite(
         .and_then(|b| b.favorite)
         .unwrap_or(!current.is_favorite);
     match repo.set_favorite(id, new_state) {
-        Ok(_) => Json(json!({ "is_favorite": new_state })).into_response(),
+        Ok(_) => {
+            state.event_bus.emit(
+                "library.radios_changed",
+                json!({"action": "favorite_toggled", "id": id, "favorite": new_state}),
+            );
+            Json(json!({ "id": id, "favorite": new_state })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -252,23 +323,59 @@ async fn toggle_favorite(
 // Radio artwork / export / import
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct SetArtworkBody {
-    logo_url: String,
-}
-
 async fn set_radio_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<SetArtworkBody>,
+    mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
     let repo = RadioRepo::new(state.db);
     let Some(mut radio) = repo.get(id).ok().flatten() else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "radio not found"})),
+        )
+            .into_response();
     };
-    radio.logo_url = Some(body.logo_url.clone());
+
+    let mut image_data: Option<Vec<u8>> = None;
+    let mut ext = "jpg".to_string();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" || name == "image" || name == "artwork" {
+            if let Some(ct) = field.content_type() {
+                if ct.contains("png") {
+                    ext = "png".to_string();
+                } else if ct.contains("webp") {
+                    ext = "webp".to_string();
+                }
+            }
+            image_data = field.bytes().await.ok().map(|b| b.to_vec());
+        }
+    }
+
+    let Some(data) = image_data else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no image provided"})),
+        )
+            .into_response();
+    };
+
+    let cache_dir = crate::routes::library::artwork_cache_dir();
+    std::fs::create_dir_all(&cache_dir).ok();
+    let hash = tune_core::library::artwork::artwork_hash(&format!("radio-upload-{id}"));
+    let path = cache_dir.join(format!("{hash}.{ext}"));
+    if std::fs::write(&path, &data).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to save image"})),
+        )
+            .into_response();
+    }
+
+    radio.logo_url = Some(hash.clone());
     repo.update(&radio).ok();
-    Json(json!({ "id": id, "logo_url": body.logo_url })).into_response()
+    Json(json!(radio)).into_response()
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
