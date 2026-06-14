@@ -790,7 +790,7 @@ impl StreamingService for TidalService {
     async fn authenticate(
         &mut self,
         credentials: &serde_json::Value,
-    ) -> Result<AuthStatus, String> {
+    ) -> Result<AuthStatus, TuneError> {
         // If already authenticated with valid tokens, return current status
         {
             let ts = self.tokens.lock().await;
@@ -809,7 +809,7 @@ impl StreamingService for TidalService {
                 .get("state")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            return self.handle_oauth_callback(code, state).await;
+            return Ok(self.handle_oauth_callback(code, state).await?);
         }
 
         // --- Device Code flow (legacy fallback, explicitly requested) ---
@@ -829,7 +829,7 @@ impl StreamingService for TidalService {
             let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
             if status_code != 200 {
                 warn!(status = status_code, body = %body, "tidal_device_authorization_failed");
-                return Err(format!("device authorization failed: {status_code} {body}"));
+                return Err(format!("device authorization failed: {status_code} {body}").into());
             }
 
             let device_auth: DeviceAuthResponse =
@@ -1471,7 +1471,8 @@ impl StreamingService for TidalService {
             _ => return Err(format!("unknown favorite type: {fav_type}").into()),
         };
         self.api_delete(&format!("/users/{user_id}/favorites/{path_type}/{item_id}"))
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
@@ -1623,7 +1624,7 @@ impl StreamingService for TidalService {
         }
 
         // Delegate to do_refresh_token which handles the Mutex internally
-        self.do_refresh_token().await
+        Ok(self.do_refresh_token().await?)
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {

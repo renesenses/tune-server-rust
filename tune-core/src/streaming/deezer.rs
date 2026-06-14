@@ -627,7 +627,7 @@ impl StreamingService for DeezerService {
         data["id"]
             .as_u64()
             .map(|id| id.to_string())
-            .ok_or_else(|| format!("deezer: no playlist id in response: {data}"))
+            .ok_or_else(|| format!("deezer: no playlist id in response: {data}").into())
     }
 
     async fn add_tracks_to_playlist(

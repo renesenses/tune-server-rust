@@ -4,6 +4,7 @@ use reqwest::Client;
 use tracing::{debug, info};
 
 use super::traits::*;
+use crate::TuneError;
 
 const API_BASE: &str = "https://www.qobuz.com/api.json/0.2";
 const API_PROXY: &str = "https://mozaiklabs.fr/qobuz-api";
@@ -477,7 +478,7 @@ impl StreamingService for QobuzService {
         self.stored_username = Some(username.to_string());
         self.stored_password = Some(password.to_string());
 
-        self.login_internal(username, password).await
+        Ok(self.login_internal(username, password).await?)
     }
 
     async fn auth_status(&self) -> AuthStatus {
@@ -555,9 +556,9 @@ impl StreamingService for QobuzService {
                         error = %e,
                         "qobuz_format_id_failed_retrying_cd_quality"
                     );
-                    self.fetch_track_url(track_id, "6").await
+                    Ok(self.fetch_track_url(track_id, "6").await?)
                 } else {
-                    Err(e)
+                    Err(e.into())
                 }
             }
         }
