@@ -76,7 +76,7 @@ pub(super) async fn list_tracks(
     State(state): State<AppState>,
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let total = repo.count().unwrap_or(0);
@@ -97,7 +97,9 @@ pub(super) async fn list_tracks(
 }
 
 pub(super) async fn track_count(State(state): State<AppState>) -> Json<Value> {
-    let count = TrackRepo::new(state.db).count().unwrap_or(0);
+    let count = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     Json(json!({ "count": count }))
 }
 
@@ -105,7 +107,7 @@ pub(super) async fn get_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(track)) => Json(json!(track)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -118,7 +120,7 @@ pub(super) async fn stream_track_audio(
     Path(id): Path<i64>,
     _req_headers: HeaderMap,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -172,7 +174,7 @@ pub(super) async fn rescan_track(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let mut track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -216,7 +218,7 @@ pub(super) async fn quick_fav_track(
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
     let profile_id = q.profile_id.unwrap_or(1);
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "track", id).unwrap_or(false);
     if is_fav {
         repo.remove_favorite(profile_id, "track", id).ok();
@@ -230,7 +232,7 @@ pub(super) async fn track_all_tags(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -263,12 +265,12 @@ pub(super) async fn track_lyrics(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let genius_token = settings.get("genius_api_token").ok().flatten();
     let Some(token) = genius_token else {
         return Json(json!({"track_id": id, "lyrics": null, "error": "Genius API not configured"}))
@@ -313,7 +315,7 @@ pub(super) async fn track_synced_lyrics(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
 
     // Check DB cache
     if let Ok(Some(cached)) = repo.get_synced_lyrics(id) {
@@ -348,7 +350,7 @@ pub(super) async fn track_source_links(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<Value> {
-    let repo = tune_core::db::source_link_repo::SourceLinkRepo::new(state.db);
+    let repo = tune_core::db::source_link_repo::SourceLinkRepo::with_backend(state.backend.clone());
     let links = repo.get_by_track(id).unwrap_or_default();
     Json(json!({ "track_id": id, "links": links }))
 }
@@ -386,7 +388,7 @@ pub(super) async fn identify_track(
         }
     };
 
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(track_id) {
         Ok(Some(t)) => t,
         _ => {
@@ -455,7 +457,7 @@ pub(super) async fn track_waveform(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
 
     // Return cached waveform if available
     if let Ok(Some(cached)) = repo.get_waveform(id) {
@@ -607,7 +609,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
 
 /// GET /api/v1/library/rescan-metadata/status
 pub(super) async fn rescan_metadata_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let status = settings
         .get("rescan_metadata_status")
         .ok()
@@ -634,7 +636,7 @@ pub(super) async fn track_metadata_get(
 ) -> impl IntoResponse {
     use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 
-    let repo = TrackMetadataRepo::new(state.db);
+    let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     match repo.get_all(id) {
         Ok(meta) => Json(json!(meta)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -652,7 +654,7 @@ pub(super) async fn track_metadata_put(
     use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 
     // Verify the track exists and get its file_path
-    let track_repo = TrackRepo::new(state.db.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let file_path = match track_repo.get(id) {
         Ok(Some(track)) => track.file_path,
         Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
@@ -660,7 +662,7 @@ pub(super) async fn track_metadata_put(
     };
 
     // Save to DB (source of truth)
-    let repo = TrackMetadataRepo::new(state.db);
+    let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     if let Err(e) = repo.set_batch(id, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }

@@ -40,7 +40,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_tags(State(state): State<AppState>) -> Json<Value> {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     let items = repo.list().unwrap_or_default();
     Json(json!(items))
 }
@@ -49,7 +49,7 @@ async fn create_tag(
     State(state): State<AppState>,
     Json(body): Json<CreateTag>,
 ) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, body.color.as_deref()) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -57,7 +57,7 @@ async fn create_tag(
 }
 
 async fn get_tag(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(tag)) => Json(json!(tag)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -70,7 +70,7 @@ async fn update_tag(
     Path(id): Path<i64>,
     Json(body): Json<UpdateTag>,
 ) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.color.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -78,7 +78,7 @@ async fn update_tag(
 }
 
 async fn delete_tag(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -86,7 +86,7 @@ async fn delete_tag(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
 }
 
 async fn list_tag_items(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     let items = repo.all_items_by_tag(id).unwrap_or_default();
     let items: Vec<Value> = items
         .into_iter()
@@ -100,7 +100,7 @@ async fn add_tag_item(
     Path(id): Path<i64>,
     Json(body): Json<AddTagItem>,
 ) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.tag_item(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::CREATED.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -111,7 +111,7 @@ async fn remove_tag_item(
     State(state): State<AppState>,
     Path((id, item_type, item_id)): Path<(i64, String, i64)>,
 ) -> impl IntoResponse {
-    let repo = TagRepo::new(state.db);
+    let repo = TagRepo::with_backend(state.backend.clone());
     match repo.untag_item(id, &item_type, item_id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

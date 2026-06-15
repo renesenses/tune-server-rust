@@ -50,13 +50,13 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_radios(State(state): State<AppState>) -> Json<Value> {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let items = repo.list().unwrap_or_default();
     Json(json!(items))
 }
 
 async fn get_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -68,7 +68,7 @@ async fn create_radio(
     State(state): State<AppState>,
     Json(body): Json<CreateRadio>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let station = RadioStation {
         id: None,
         name: body.name,
@@ -122,7 +122,7 @@ async fn update_radio(
     Path(id): Path<i64>,
     Json(body): Json<UpdateRadioBody>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(mut station) = repo.get(id).ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -170,7 +170,7 @@ async fn update_radio(
 }
 
 async fn delete_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => {
             state.event_bus.emit(
@@ -187,7 +187,7 @@ async fn play_radio(
     State(state): State<AppState>,
     Path((id, zone_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(radio) = repo.get(id).ok().flatten() else {
         return (StatusCode::NOT_FOUND, "radio not found").into_response();
     };
@@ -224,13 +224,13 @@ async fn play_radio(
 }
 
 async fn search_radios(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let items = repo.search(&q.q).unwrap_or_default();
     Json(json!(items))
 }
 
 async fn list_favorites(State(state): State<AppState>) -> Json<Value> {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let items = repo.favorites().unwrap_or_default();
     Json(json!(items))
 }
@@ -253,7 +253,7 @@ async fn add_from_web(
     State(state): State<AppState>,
     Query(q): Query<AddFromWebQuery>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
@@ -299,7 +299,7 @@ async fn toggle_favorite(
     Path(id): Path<i64>,
     body: Option<Json<FavoriteToggle>>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let current = repo.get(id).ok().flatten();
     let Some(current) = current else {
         return StatusCode::NOT_FOUND.into_response();
@@ -328,7 +328,7 @@ async fn set_radio_artwork(
     Path(id): Path<i64>,
     mut multipart: axum::extract::Multipart,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let Some(mut radio) = repo.get(id).ok().flatten() else {
         return (
             StatusCode::NOT_FOUND,
@@ -379,7 +379,7 @@ async fn set_radio_artwork(
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
 
     let mut m3u = String::from("#EXTM3U\n");
@@ -408,7 +408,7 @@ async fn import_radios(
     State(state): State<AppState>,
     Json(body): Json<ImportRadiosBody>,
 ) -> impl IntoResponse {
-    let repo = RadioRepo::new(state.db);
+    let repo = RadioRepo::with_backend(state.backend.clone());
     let mut imported = 0i64;
     for s in &body.stations {
         let station = RadioStation {
@@ -675,8 +675,8 @@ async fn create_playlist_from_favorites(
         favorites
     };
 
-    let repo = tune_core::db::playlist_repo::PlaylistRepo::new(state.db.clone());
-    let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db);
+    let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let playlist_id = match repo.create(&name, None) {
         Ok(id) => id,
         Err(e) => {

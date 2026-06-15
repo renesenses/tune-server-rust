@@ -21,7 +21,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn snapcast_host(state: &AppState) -> String {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("snapcast_host")
         .ok()

@@ -30,7 +30,7 @@ pub fn router() -> Router<AppState> {
 /// Default CLI port is 9090.
 /// The web client saves this as "lms_host"; legacy key is "squeezebox_host".
 fn parse_lms_host(state: &AppState) -> (String, u16) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     // Try "lms_host" first (what the web client actually saves), then fall back to legacy "squeezebox_host"
     let raw = settings
         .get("lms_host")
@@ -269,7 +269,7 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
     }
 
     let mut registered = Vec::new();
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
 
     for player in &players {
         let player_id = match player.get("playerid").and_then(|v| v.as_str()) {

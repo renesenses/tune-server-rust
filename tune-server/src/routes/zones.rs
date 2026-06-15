@@ -101,7 +101,7 @@ pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
             "zone_id": id,
@@ -120,7 +120,7 @@ async fn set_zone_dsp(
 ) -> impl IntoResponse {
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.update_dsp(id, preset_id, enabled) {
         Ok(()) => Json(json!({"zone_id": id, "dsp_preset_id": preset_id, "dsp_enabled": enabled}))
             .into_response(),
@@ -129,9 +129,9 @@ async fn set_zone_dsp(
 }
 
 async fn sync_status(State(state): State<AppState>) -> Json<Value> {
-    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -448,7 +448,7 @@ fn build_signal_path(
 }
 
 async fn list_zones(State(state): State<AppState>) -> Json<Value> {
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
     let devices = state.scanner.lock().await.devices().await;
     #[cfg(feature = "local-audio")]
@@ -510,7 +510,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     #[cfg(feature = "local-audio")]
     let audio_backend =
         tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
@@ -570,7 +570,7 @@ async fn patch_zone(
     Path(id): Path<i64>,
     Json(body): Json<PatchZone>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     if let Some(ref name) = body.name
         && let Err(e) = repo.update_name(id, name)
     {
@@ -676,7 +676,7 @@ async fn create_zone(
 
     // Check for duplicate device assignment
     if let Some(device_id) = output_device_id {
-        let repo = ZoneRepo::new(state.db.clone());
+        let repo = ZoneRepo::with_backend(state.backend.clone());
         if let Ok(zones) = repo.list()
             && zones
                 .iter()
@@ -690,7 +690,7 @@ async fn create_zone(
         }
     }
 
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, output_type, output_device_id) {
         Ok(id) => {
             info!(zone_id = id, name = %body.name, output_type = ?output_type, "zone_created");
@@ -800,7 +800,7 @@ async fn register_dlna_output_from_device(
 }
 
 async fn delete_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => {
             state.event_bus.emit("zone.deleted", json!({"id": id}));
@@ -824,7 +824,7 @@ async fn update_volume(
     let volume_int = (volume_f * 100.0).round() as i32;
 
     // Persist to DB
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     if let Err(e) = repo.update_volume(id, volume_int) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -845,7 +845,7 @@ async fn update_muted(
     Json(body): Json<UpdateMuted>,
 ) -> impl IntoResponse {
     // Persist to DB
-    let repo = ZoneRepo::new(state.db.clone());
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     if let Err(e) = repo.update_muted(id, body.muted) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -865,7 +865,7 @@ async fn rename_zone(
     Path(id): Path<i64>,
     Json(body): Json<RenameZone>,
 ) -> impl IntoResponse {
-    let repo = ZoneRepo::new(state.db);
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.update_name(id, &body.name) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -879,7 +879,7 @@ struct CreateGroup {
 }
 
 async fn list_groups(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -893,7 +893,7 @@ async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroup>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -931,7 +931,7 @@ async fn patch_group(
     Path(group_id): Path<i64>,
     Json(body): Json<PatchGroup>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -965,7 +965,7 @@ async fn group_volume(
     Path(group_id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -993,7 +993,7 @@ async fn group_volume(
                 .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
 
-            let repo = ZoneRepo::new(state.db.clone());
+            let repo = ZoneRepo::with_backend(state.backend.clone());
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -1016,7 +1016,7 @@ async fn calibrate_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -1038,7 +1038,10 @@ async fn calibrate_group(
             let outputs = state.outputs.lock().await;
             let mut latencies = Vec::new();
             for zid in &zone_ids {
-                let zone = ZoneRepo::new(state.db.clone()).get(*zid).ok().flatten();
+                let zone = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten();
                 if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
                     if let Some(output) = outputs.get(device_id) {
                         let output = output.lock().await;
@@ -1073,7 +1076,7 @@ async fn group_health(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -1090,7 +1093,7 @@ async fn group_health(
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
-            let repo = ZoneRepo::new(state.db);
+            let repo = ZoneRepo::with_backend(state.backend.clone());
             let mut zones_health = Vec::new();
             for zid in &zone_ids {
                 let ps = state.playback.get_state(*zid).await;
@@ -1116,7 +1119,7 @@ async fn delete_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")
         .ok()
@@ -1132,7 +1135,7 @@ async fn delete_group(
 }
 
 async fn list_stereo_pairs(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let pairs: Vec<Value> = settings
         .get("stereo_pairs")
         .ok()
@@ -1153,7 +1156,7 @@ async fn create_stereo_pair(
     State(state): State<AppState>,
     Json(body): Json<CreateStereoPair>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut pairs: Vec<Value> = settings
         .get("stereo_pairs")
         .ok()
@@ -1179,7 +1182,7 @@ async fn delete_stereo_pair(
     State(state): State<AppState>,
     Path(pair_id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut pairs: Vec<Value> = settings
         .get("stereo_pairs")
         .ok()
@@ -1195,7 +1198,7 @@ async fn delete_stereo_pair(
 }
 
 async fn list_group_delays(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let raw = settings
         .get("group_delays")
         .unwrap_or(None)
@@ -1208,7 +1211,7 @@ async fn set_group_delay(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut delays: Vec<Value> = settings
         .get("group_delays")
         .unwrap_or(None)

@@ -40,8 +40,8 @@ pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoRespo
     let artist_db = state.db.clone();
     let album_db = state.db.clone();
 
-    let artist_repo = ArtistRepo::new(state.db.clone());
-    let album_repo = AlbumRepo::new(state.db.clone());
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
 
@@ -64,13 +64,15 @@ pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoRespo
 }
 
 pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let album_repo = AlbumRepo::new(state.db.clone());
-    let artist_repo = ArtistRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
 
     let merged_albums = merge_duplicate_albums(&state.db)?;
     let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
     let orphan_artists = artist_repo.cleanup_orphans().unwrap_or(0);
-    let tracks = TrackRepo::new(state.db.clone()).deduplicate().unwrap_or(0);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .deduplicate()
+        .unwrap_or(0);
 
     let orphan_artwork = cleanup_orphan_artwork(&state.db)?;
 

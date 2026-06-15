@@ -6,7 +6,6 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, interval};
 use tracing::{debug, info, warn};
 
-use crate::db::sqlite::SqliteDb;
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
@@ -130,8 +129,9 @@ pub struct PositionPoller {
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
     outputs: Arc<Mutex<OutputRegistry>>,
-    db: SqliteDb,
+    db: Arc<dyn crate::db::backend::DbBackend>,
     shared_metrics: PollerMetricsMap,
+    event_bus: Option<Arc<crate::event_bus::EventBus>>,
 }
 
 impl PositionPoller {
@@ -139,7 +139,7 @@ impl PositionPoller {
         orchestrator: Arc<PlaybackOrchestrator>,
         playback: Arc<PlaybackManager>,
         outputs: Arc<Mutex<OutputRegistry>>,
-        db: SqliteDb,
+        db: Arc<dyn crate::db::backend::DbBackend>,
         shared_metrics: PollerMetricsMap,
     ) -> Self {
         Self {
@@ -148,7 +148,13 @@ impl PositionPoller {
             outputs,
             db,
             shared_metrics,
+            event_bus: None,
         }
+    }
+
+    pub fn with_event_bus(mut self, bus: Arc<crate::event_bus::EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
@@ -174,7 +180,7 @@ impl PositionPoller {
         });
 
         // Also poll stopped zones to detect externally-started playback and sync volume
-        let all_zones = crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+        let all_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .list()
             .unwrap_or_default();
 
@@ -214,7 +220,7 @@ impl PositionPoller {
             if !zone.fixed_volume && status.volume > 0.001 {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
-                crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+                crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                     .update_volume(zone_id, vol_int)
                     .ok();
             }
@@ -364,7 +370,7 @@ impl PositionPoller {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 let db = self.db.clone();
-                crate::db::zone_repo::ZoneRepo::new(db)
+                crate::db::zone_repo::ZoneRepo::with_backend(db)
                     .update_volume(zone_id, vol_int)
                     .ok();
             }
@@ -377,7 +383,7 @@ impl PositionPoller {
                 let track_id = np.and_then(|n| n.track_id);
                 let source = np.map(|n| n.source.as_str());
                 let source_id = np.and_then(|n| n.source_id.as_deref());
-                ZoneRepo::new(self.db.clone())
+                ZoneRepo::with_backend(self.db.clone())
                     .save_playback_position(
                         zone_id,
                         status.position_ms as i64,
@@ -404,7 +410,7 @@ impl PositionPoller {
                         if let Some(ref source_id) = np.source_id {
                             if let Ok(sid) = source_id.parse::<i64>() {
                                 let radio_repo =
-                                    crate::db::radio_repo::RadioRepo::new(self.db.clone());
+                                    crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
                                 if let Ok(Some(station)) = radio_repo.get(sid) {
                                     if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
                                         &station.name,
@@ -695,7 +701,7 @@ impl PositionPoller {
                         && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
                     {
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
-                        let gapless_enabled = ZoneRepo::new(self.db.clone())
+                        let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
                             .ok()
                             .flatten()
@@ -866,7 +872,7 @@ impl PositionPoller {
     }
 
     fn get_zone_device_id(&self, zone_id: i64) -> Option<String> {
-        ZoneRepo::new(self.db.clone())
+        ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()
             .flatten()

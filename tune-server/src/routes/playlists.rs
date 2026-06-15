@@ -95,7 +95,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_playlists(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let items = repo.list(limit, offset).unwrap_or_default();
@@ -104,7 +104,7 @@ async fn list_playlists(State(state): State<AppState>, Query(p): Query<Paginatio
 }
 
 async fn get_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(pl)) => Json(json!(pl)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -116,7 +116,7 @@ async fn create_playlist(
     State(state): State<AppState>,
     Json(body): Json<CreatePlaylist>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, body.description.as_deref()) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -128,7 +128,7 @@ async fn update_playlist(
     Path(id): Path<i64>,
     Json(body): Json<UpdatePlaylist>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.description.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -136,7 +136,7 @@ async fn update_playlist(
 }
 
 async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -144,9 +144,9 @@ async fn delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> 
 }
 
 async fn get_tracks(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db)
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
         .unwrap_or_default();
     Json(json!(tracks))
@@ -157,7 +157,7 @@ async fn add_tracks(
     Path(id): Path<i64>,
     Json(body): Json<AddTracks>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.add_tracks(id, &body.track_ids, body.position) {
         Ok(ids) => (StatusCode::CREATED, Json(json!({ "added": ids.len() }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -169,7 +169,7 @@ async fn remove_track(
     Path(id): Path<i64>,
     Json(body): Json<RemoveTrack>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.remove_track(id, body.position) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -181,7 +181,7 @@ async fn remove_tracks_batch(
     Path(id): Path<i64>,
     Json(body): Json<RemoveTracksBody>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.remove_tracks_at_positions(id, &body.positions) {
         Ok(removed) => Json(json!({"removed": removed})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -193,7 +193,7 @@ async fn reorder_tracks(
     Path(id): Path<i64>,
     Json(body): Json<ReorderTracksBody>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.reorder_tracks(id, &body.track_ids) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -204,7 +204,7 @@ async fn duplicate_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let original = match repo.get(id) {
         Ok(Some(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -242,14 +242,14 @@ async fn export_m3u(
     if fmt != "m3u" {
         return export_multi_format(State(state.clone()), id, fmt).await;
     }
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let playlist = match repo.get(id) {
         Ok(Some(p)) => p,
         _ => return Err(AppError::not_found("playlist not found")),
     };
 
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db)
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
         .unwrap_or_default();
 
@@ -287,14 +287,14 @@ async fn export_multi_format(
     id: i64,
     format: &str,
 ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, String), AppError> {
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let playlist = repo
         .get(id)
         .ok()
         .flatten()
         .ok_or(AppError::not_found("playlist not found"))?;
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db.clone())
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
         .unwrap_or_default();
 
@@ -435,7 +435,7 @@ async fn import_m3u_file(
     let mut matched = 0u32;
     let mut not_found_paths: Vec<String> = Vec::new();
 
-    let track_repo = TrackRepo::new(state.db.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     for line in file_content.lines() {
         let line = line.trim();
@@ -473,7 +473,7 @@ async fn import_m3u_file(
     }
 
     // Create playlist and add tracks
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.create(&name, None) {
         Ok(playlist_id) => {
             if !track_ids.is_empty() {
@@ -532,13 +532,13 @@ async fn import_m3u_url(
     };
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let playlist_id = match repo.create(&name, None) {
         Ok(id) => id,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
-    let track_repo = TrackRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let mut matched = 0i64;
 
     for line in m3u_content.lines() {
@@ -568,13 +568,13 @@ async fn import_m3u_url(
 // --- Advanced playlist routes ---
 
 async fn list_all_playlists(State(state): State<AppState>) -> Json<Value> {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let items = repo.list(99999, 0).unwrap_or_default();
     Json(json!(items))
 }
 
 async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -587,7 +587,7 @@ async fn share_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> i
         .unwrap_or_default()
         .as_nanos();
     let token = format!("{:032x}", nanos ^ (id as u128 * 0x517cc1b727220a95));
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("playlist_share_{id}");
     if let Err(e) = settings.set(&key, &token) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
@@ -604,7 +604,7 @@ async fn get_shared_playlist(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
 
     let playlist_id = all
@@ -620,14 +620,14 @@ async fn get_shared_playlist(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let playlist = match repo.get(playlist_id) {
         Ok(Some(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
     let track_ids = repo.get_track_ids(playlist_id).unwrap_or_default();
-    let tracks = TrackRepo::new(state.db)
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
         .unwrap_or_default();
 
@@ -639,7 +639,7 @@ async fn get_shared_playlist(
 }
 
 async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(pl)) => Json(json!(pl)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -651,14 +651,14 @@ async fn transfer_playlist(
     State(state): State<AppState>,
     Json(body): Json<TransferPlaylist>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db.clone());
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let track_ids = match repo.get_track_ids(body.playlist_id) {
         Ok(ids) => ids,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
     let zone_id = body.zone_id.unwrap_or(1);
-    let queue = PlayQueueRepo::new(state.db);
+    let queue = PlayQueueRepo::with_backend(state.backend.clone());
     if let Err(e) = queue.add_tracks(zone_id, &track_ids, None) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -670,7 +670,7 @@ async fn diff_playlists(
     State(state): State<AppState>,
     Json(body): Json<DiffPlaylists>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
     let ids_a: HashSet<i64> = repo
         .get_track_ids(body.playlist_id_a)
         .unwrap_or_default()
@@ -702,8 +702,8 @@ async fn diff_playlists(
 // ---------------------------------------------------------------------------
 
 async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db);
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let track_ids = repo.get_track_ids(id).unwrap_or_default();
     let mut recovered = 0i64;
     let mut missing = 0i64;
@@ -736,7 +736,7 @@ async fn apply_recovery(State(state): State<AppState>, Path(id): Path<i64>) -> i
 // ---------------------------------------------------------------------------
 
 async fn list_collaborative(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = settings
         .get("collaborative_playlists")
         .ok()
@@ -756,7 +756,7 @@ async fn create_collaborative(
     State(state): State<AppState>,
     Json(body): Json<CreateCollaborative>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut items: Vec<Value> = settings
         .get("collaborative_playlists")
         .ok()
@@ -791,7 +791,7 @@ async fn get_collaborative(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = settings
         .get("collaborative_playlists")
         .ok()
@@ -814,7 +814,7 @@ async fn add_to_collaborative(
     Path(id): Path<String>,
     Json(body): Json<AddToCollaborative>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut items: Vec<Value> = settings
         .get("collaborative_playlists")
         .ok()
@@ -845,7 +845,7 @@ async fn collaborative_tracks(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = settings
         .get("collaborative_playlists")
         .ok()
@@ -862,7 +862,7 @@ async fn collaborative_tracks(
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default();
 
-    let track_repo = TrackRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.get_multiple(&track_ids).unwrap_or_default();
     Json(json!(tracks)).into_response()
 }
@@ -886,7 +886,7 @@ async fn match_tracks(
     State(state): State<AppState>,
     Json(body): Json<MatchRequest>,
 ) -> impl IntoResponse {
-    let track_repo = TrackRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let mut results: Vec<Value> = Vec::new();
 
     for entry in &body.tracks {

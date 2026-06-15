@@ -28,7 +28,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn load_presets(state: &AppState) -> Vec<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("eq_presets")
         .ok()
@@ -38,7 +38,7 @@ fn load_presets(state: &AppState) -> Vec<Value> {
 }
 
 fn save_presets(state: &AppState, presets: &[Value]) -> Result<(), AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set("eq_presets", &serde_json::to_string(presets)?)
         .ok();
@@ -47,7 +47,7 @@ fn save_presets(state: &AppState, presets: &[Value]) -> Result<(), AppError> {
 
 /// EQ subsystem status.
 async fn eq_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let presets = load_presets(&state);
     let active_id = settings.get("eq_active_preset").ok().flatten();
     let enabled = settings
@@ -74,7 +74,7 @@ async fn eq_status(State(state): State<AppState>) -> Json<Value> {
 /// List all EQ presets.
 async fn list_presets(State(state): State<AppState>) -> Json<Value> {
     let presets = load_presets(&state);
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let active_id = settings.get("eq_active_preset").ok().flatten();
 
     Json(json!({
@@ -211,7 +211,7 @@ async fn delete_preset(
 
     save_presets(&state, &presets)?;
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if settings.get("eq_active_preset").ok().flatten().as_deref() == Some(&id) {
         settings.delete("eq_active_preset").ok();
     }
@@ -229,7 +229,7 @@ async fn activate_preset(
 
     match preset {
         Some(p) => {
-            let settings = SettingsRepo::new(state.db.clone());
+            let settings = SettingsRepo::with_backend(state.backend.clone());
             settings.set("eq_active_preset", &id).ok();
             settings.set("eq_enabled", "true").ok();
             Json(json!({
@@ -249,7 +249,7 @@ async fn activate_preset(
 
 /// Get current active EQ bands.
 async fn get_bands(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let active_id = settings.get("eq_active_preset").ok().flatten();
     let presets = load_presets(&state);
 
@@ -280,7 +280,7 @@ async fn set_bands(
     State(state): State<AppState>,
     Json(body): Json<SetBandsBody>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
 
     // If there's an active preset, update it; otherwise create a transient config
@@ -310,7 +310,7 @@ async fn set_bands(
 
 /// Get parametric EQ state (multi-band with full control).
 async fn get_parametric(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let parametric: Value = settings
         .get("eq_parametric")
         .ok()
@@ -336,7 +336,7 @@ async fn set_parametric(
     State(state): State<AppState>,
     Json(body): Json<ParametricBody>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut current: Value = settings
         .get("eq_parametric")
         .ok()
@@ -362,7 +362,7 @@ async fn set_parametric(
 
 /// Get graphic EQ state (fixed frequency bands).
 async fn get_graphic(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let graphic: Value = settings
         .get("eq_graphic")
         .ok()
@@ -401,7 +401,7 @@ async fn set_graphic(
     State(state): State<AppState>,
     Json(body): Json<GraphicBody>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut current: Value = settings
         .get("eq_graphic")
         .ok()
@@ -438,7 +438,7 @@ async fn apply_room_correction(
     State(state): State<AppState>,
     Json(body): Json<RoomCorrectionBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     let correction = json!({
         "enabled": true,

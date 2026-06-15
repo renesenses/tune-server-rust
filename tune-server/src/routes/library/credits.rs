@@ -77,7 +77,7 @@ pub(super) async fn enrich_track_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return Json(json!({"enriched": false, "reason": "track not found"})).into_response(),
@@ -177,7 +177,7 @@ pub(super) async fn enrich_album_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let track_repo = TrackRepo::new(state.db.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
 
     let mut enriched = 0i32;

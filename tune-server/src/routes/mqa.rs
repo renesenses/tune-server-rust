@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
 
 /// MQA subsystem status.
 async fn mqa_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("mqa_passthrough")
         .ok()
@@ -177,7 +177,7 @@ async fn check_mqa_signaling(path: &str) -> MqaResult {
 
 /// Get MQA configuration.
 async fn mqa_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let passthrough = settings
         .get("mqa_passthrough")
         .ok()
@@ -223,7 +223,7 @@ async fn set_mqa_config(
     State(state): State<AppState>,
     Json(body): Json<MqaConfigBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     if let Some(v) = body.passthrough_enabled {
         settings

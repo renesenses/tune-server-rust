@@ -78,15 +78,21 @@ pub(super) async fn admin_discovery(State(state): State<AppState>) -> Json<Value
 
 pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
     let uptime = state.started_at.elapsed().as_secs();
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let settings = SettingsRepo::new(state.db.clone());
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let scan_status = settings
         .get("scan_status")
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
-    let zone_count = ZoneRepo::new(state.db.clone()).count().unwrap_or(0);
+    let zone_count = ZoneRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     let playback_states = state.playback.all_states().await;
     let playing = playback_states
         .iter()
@@ -120,7 +126,7 @@ pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
-    let repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
     let mut result = Vec::new();
     for z in &zones {
@@ -155,7 +161,7 @@ pub(super) async fn discover_servers() -> Json<Value> {
 }
 
 pub(super) async fn listening_stats(State(state): State<AppState>) -> Json<Value> {
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let history = repo.listening_history(30).unwrap_or_default();
     let total_listens = repo.count().unwrap_or(0);
     let total_hours: f64 = history

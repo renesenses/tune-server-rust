@@ -174,7 +174,7 @@ async fn play_episode(
 ) -> impl IntoResponse {
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
-    let device_id = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    let device_id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
         .flatten()

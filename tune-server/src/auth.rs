@@ -167,7 +167,7 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let auth_enabled = settings
         .get("auth_enabled")
         .ok()
@@ -274,7 +274,7 @@ impl FromRequestParts<AppState> for AuthUser {
         }
 
         // Otherwise, try to extract directly (for routes outside the middleware layer)
-        let settings = SettingsRepo::new(state.db.clone());
+        let settings = SettingsRepo::with_backend(state.backend.clone());
 
         let secret = settings
             .get("jwt_secret")
@@ -412,7 +412,7 @@ async fn register(
     let role = if is_admin { "admin" } else { "user" };
 
     // Generate JWT
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let secret = get_or_create_jwt_secret(&settings);
     let token = match sign_jwt(profile_id, role, &secret) {
         Ok(t) => t,
@@ -458,7 +458,7 @@ struct LoginRequest {
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Look up profile
     let conn = state.db.connection().lock().unwrap();
@@ -642,7 +642,7 @@ async fn create_token(
     State(state): State<AppState>,
     Json(body): Json<CreateTokenRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let name = body.name.as_deref().unwrap_or("api-token");
     let secret = get_or_create_jwt_secret(&settings);
 
@@ -662,7 +662,7 @@ async fn create_token(
 // ---------------------------------------------------------------------------
 
 async fn get_api_key(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = settings.get("api_key").ok().flatten();
     let has_key = key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
     Json(json!({
@@ -674,7 +674,7 @@ async fn get_api_key(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn generate_api_key(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = uuid::Uuid::new_v4().to_string().replace('-', "");
     settings.set("api_key", &key).ok();
     Json(json!({ "key": key }))
@@ -685,7 +685,7 @@ async fn generate_api_key(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 async fn auth_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("auth_enabled")
         .ok()
@@ -721,7 +721,7 @@ async fn set_auth_config(
     State(state): State<AppState>,
     Json(body): Json<SetAuthConfig>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(enabled) = body.auth_enabled {
         settings
             .set("auth_enabled", if enabled { "true" } else { "false" })

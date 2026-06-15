@@ -27,7 +27,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     match repo.dashboard() {
         Ok(s) => Json(json!(s)),
         Err(_) => Json(json!({
@@ -41,7 +41,7 @@ async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
 
 async fn top_artists(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
         .top_artists(limit)
         .unwrap_or_default()
@@ -53,14 +53,14 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<DashParams>)
 
 async fn top_tracks(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items = repo.top_tracks(limit).unwrap_or_default();
     Json(json!(items))
 }
 
 async fn top_albums(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
         .top_albums(limit)
         .unwrap_or_default()
@@ -75,7 +75,7 @@ async fn listening_history(
     Query(p): Query<DashParams>,
 ) -> Json<Value> {
     let days = p.days.unwrap_or(30);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
         .listening_history(days)
         .unwrap_or_default()

@@ -171,7 +171,7 @@ async fn start_rip(
     State(state): State<AppState>,
     Json(body): Json<RipRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     let output_dir = body
         .output_dir
@@ -212,7 +212,7 @@ async fn start_rip(
 
 /// Get current rip progress.
 async fn rip_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let current = settings
         .get("cd_rip_current")
         .ok()
@@ -230,7 +230,7 @@ async fn rip_status(State(state): State<AppState>) -> Json<Value> {
 
 /// Cancel a running rip task.
 async fn cancel_rip(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(current) = settings.get("cd_rip_current").ok().flatten() {
         if let Ok(mut rip) = serde_json::from_str::<Value>(&current) {
             rip["status"] = json!("cancelled");

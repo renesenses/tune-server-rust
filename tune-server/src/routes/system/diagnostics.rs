@@ -12,15 +12,21 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::state::AppState;
 
 pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
+    let artists = ArtistRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
     let music_dirs = super::get_music_dirs_list(&state.db);
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Zone count
-    let zone_count = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    let zone_count = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
 
@@ -64,7 +70,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     };
 
     // Scan status
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let scan_status = settings
         .get("scan_status")
         .ok()
@@ -202,8 +208,10 @@ pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Valu
 
 pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
     let report = state.health_monitor.run_checks().await;
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let settings = SettingsRepo::new(state.db);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let scan_status = settings
         .get("scan_status")
         .ok()
@@ -294,12 +302,18 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let artists = ArtistRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let music_dirs = super::get_music_dirs_list(&state.db);
     let scan_status = settings
         .get("scan_status")
@@ -308,7 +322,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .unwrap_or_else(|| "idle".into());
 
     // Zones
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_count = zone_repo.count().unwrap_or(0);
     let zones: Vec<Value> = zone_repo
         .list()
@@ -537,12 +551,18 @@ pub(super) async fn audio_check() -> Json<Value> {
 /// Anonymous telemetry snapshot — returns what would be sent if telemetry
 /// is enabled. No data leaves the server unless the user explicitly opts in.
 pub(super) async fn telemetry_snapshot(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true");
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
-    let zone_count = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let artists = ArtistRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let zone_count = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
     let uptime = state.started_at.elapsed().as_secs();
@@ -568,7 +588,7 @@ pub(super) async fn telemetry_toggle(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let enabled = body["enabled"].as_bool().unwrap_or(false);
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let _ = settings.set("telemetry_enabled", if enabled { "true" } else { "false" });
     Json(json!({ "enabled": enabled }))
 }

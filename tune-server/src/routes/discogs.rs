@@ -25,7 +25,7 @@ pub fn router() -> Router<AppState> {
 
 fn discogs_token(state: &AppState) -> Option<String> {
     // Check the DB first (set via web UI), then fall back to env/toml config.
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("discogs_token")
         .ok()

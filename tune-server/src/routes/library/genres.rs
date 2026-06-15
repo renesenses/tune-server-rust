@@ -77,7 +77,7 @@ pub(super) async fn update_genre_tree(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("genre_tree", &body.to_string()).ok();
     Json(json!({"updated": true}))
 }
@@ -151,7 +151,7 @@ pub(super) async fn genre_albums(
     Path(name): Path<String>,
 ) -> Json<Value> {
     let decoded = urlencoding::decode(&name).unwrap_or_else(|_| name.clone().into());
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let items = repo.list_by_genre(&decoded).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))

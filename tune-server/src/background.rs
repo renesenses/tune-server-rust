@@ -185,7 +185,7 @@ fn spawn_position_poller(state: &AppState) {
         state.orchestrator.clone(),
         state.playback.clone(),
         state.outputs.clone(),
-        state.db.clone(),
+        state.backend.clone(),
         state.poller_metrics.clone(),
     );
     poller.spawn();
@@ -193,7 +193,7 @@ fn spawn_position_poller(state: &AppState) {
 
 fn spawn_token_refresher(state: &AppState) {
     let services = state.services.clone();
-    let db = state.db.clone();
+    let db = state.backend.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
@@ -206,7 +206,9 @@ fn spawn_token_refresher(state: &AppState) {
                         Ok(true) => {
                             if let Some(tokens) = svc.save_tokens() {
                                 let settings =
-                                    tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+                                    tune_core::db::settings_repo::SettingsRepo::with_backend(
+                                        db.clone(),
+                                    );
                                 settings
                                     .set(&format!("auth_tokens_{name}"), &tokens.to_string())
                                     .ok();
@@ -279,7 +281,7 @@ fn spawn_desktop_notifications(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_telemetry_reporter(state: &AppState) {
-    tune_core::cloud::telemetry::TelemetryReporter::spawn(state.db.clone());
+    tune_core::cloud::telemetry::TelemetryReporter::spawn(state.backend.clone());
 }
 
 fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {

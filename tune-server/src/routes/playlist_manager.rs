@@ -162,9 +162,9 @@ async fn transfer_playlist(
     State(state): State<AppState>,
     Json(body): Json<TransferRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     // Resolve source tracks
     let (source_tracks, source_name) = if body.source_service == "local" {
@@ -451,7 +451,7 @@ async fn batch_transfer(
     State(state): State<AppState>,
     Json(body): Json<BatchTransferRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Get source playlists
     let registry = state.services.lock().await;
@@ -524,7 +524,7 @@ async fn transfer_history(
     State(state): State<AppState>,
     Query(q): Query<HistoryQuery>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let history = load_json_setting(&settings, "playlist_transfer_history");
 
     let limit = q.limit.unwrap_or(50);
@@ -567,7 +567,7 @@ async fn transfer_history_detail(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let history = load_json_setting(&settings, "playlist_transfer_history");
     let entry = history
         .iter()
@@ -592,7 +592,7 @@ struct CreateLinkRequest {
 }
 
 async fn list_links(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let links = load_json_setting(&settings, "playlist_links");
     Json(json!(links))
 }
@@ -601,7 +601,7 @@ async fn create_link(
     State(state): State<AppState>,
     Json(body): Json<CreateLinkRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
     let id = next_id(&links);
     let link = json!({
@@ -620,7 +620,7 @@ async fn create_link(
 }
 
 async fn delete_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
     let before = links.len();
     links.retain(|l| l.get("id").and_then(|v| v.as_i64()) != Some(id));
@@ -632,7 +632,7 @@ async fn delete_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl
 }
 
 async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut links = load_json_setting(&settings, "playlist_links");
 
     let link = links
@@ -684,8 +684,8 @@ async fn sync_link(State(state): State<AppState>, Path(id): Path<i64>) -> impl I
         .unwrap_or_default();
     drop(svc);
 
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let local_track_ids = playlist_repo
         .get_track_ids(local_playlist_id)
         .unwrap_or_default();
@@ -749,9 +749,9 @@ async fn backup_playlists(
     State(state): State<AppState>,
     Json(body): Json<BackupRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     let mut snapshots = load_json_setting(&settings, "playlist_snapshots");
     let mut total_playlists = 0usize;
@@ -883,7 +883,7 @@ struct BackupsQuery {
 }
 
 async fn list_backups(State(state): State<AppState>, Query(q): Query<BackupsQuery>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let snapshots = load_json_setting(&settings, "playlist_snapshots");
     let limit = q.limit.unwrap_or(500);
 
@@ -914,7 +914,7 @@ async fn list_backups(State(state): State<AppState>, Query(q): Query<BackupsQuer
 }
 
 async fn get_backup(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let snapshots = load_json_setting(&settings, "playlist_snapshots");
     let snap = snapshots
         .iter()
@@ -926,7 +926,7 @@ async fn get_backup(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
 }
 
 async fn delete_backup(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut snapshots = load_json_setting(&settings, "playlist_snapshots");
     let before = snapshots.len();
     snapshots.retain(|s| s.get("id").and_then(|v| v.as_i64()) != Some(id));
@@ -949,7 +949,7 @@ async fn restore_backup(
     Path(id): Path<i64>,
     body: Option<Json<RestoreRequest>>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let snapshots = load_json_setting(&settings, "playlist_snapshots");
     let snap = match snapshots
         .iter()
@@ -976,8 +976,8 @@ async fn restore_backup(
         .cloned()
         .unwrap_or_default();
 
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     // Check for existing playlist
     let existing_playlists = playlist_repo.list(99999, 0).unwrap_or_default();
@@ -1081,7 +1081,7 @@ async fn merge_playlists(
     State(state): State<AppState>,
     Json(body): Json<MergeRequest>,
 ) -> impl IntoResponse {
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
     let mut all_track_ids: Vec<i64> = Vec::new();
 
     for source in &body.playlists {
@@ -1137,8 +1137,8 @@ async fn export_playlists(
     Json(body): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let format = body.format.as_deref().unwrap_or("json");
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     let (name, tracks) = if body.service == "local" {
         let playlist_id: i64 = body.playlist_id.parse().unwrap_or(0);
@@ -1298,8 +1298,8 @@ async fn import_playlists(
     State(state): State<AppState>,
     Json(body): Json<ImportRequest>,
 ) -> impl IntoResponse {
-    let playlist_repo = PlaylistRepo::new(state.db.clone());
-    let track_repo = TrackRepo::new(state.db.clone());
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
 

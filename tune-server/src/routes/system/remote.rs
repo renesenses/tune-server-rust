@@ -9,7 +9,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::state::AppState;
 
 pub(super) async fn get_remote_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let url = settings
         .get("remote_server_url")
         .ok()
@@ -36,14 +36,14 @@ pub(super) async fn set_remote_config(
     State(state): State<AppState>,
     Json(body): Json<RemoteConfig>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("remote_server_url", &body.remote_url).ok();
     settings.set("server_mode", "remote").ok();
     Json(json!({"enabled": true, "remote_url": body.remote_url}))
 }
 
 pub(super) async fn remote_status(State(state): State<AppState>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let url = settings
         .get("remote_server_url")
         .ok()

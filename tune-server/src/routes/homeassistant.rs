@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn ha_settings(state: &AppState) -> (Option<String>, Option<String>) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let url = settings.get("ha_url").ok().flatten();
     let token = settings.get("ha_token").ok().flatten();
     (url, token)
@@ -77,7 +77,7 @@ async fn ha_status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn ha_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let url = settings.get("ha_url").ok().flatten().unwrap_or_default();
     let has_token = settings.get("ha_token").ok().flatten().is_some();
     Json(json!({
@@ -96,7 +96,7 @@ async fn set_ha_config(
     State(state): State<AppState>,
     Json(body): Json<HaConfigBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(url) = &body.ha_url {
         settings.set("ha_url", url.trim_end_matches('/')).ok();
     }

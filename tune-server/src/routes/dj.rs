@@ -30,19 +30,19 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn enable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set(&format!("dj_enabled_{zone_id}"), "true").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": true}))
 }
 
 async fn disable_dj(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set(&format!("dj_enabled_{zone_id}"), "false").ok();
     Json(json!({"zone_id": zone_id, "dj_mode": false}))
 }
 
 async fn dj_status(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get(&format!("dj_enabled_{zone_id}"))
         .ok()
@@ -159,7 +159,7 @@ async fn dj_waveform(
     State(state): State<AppState>,
     Path(track_id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
         return (
@@ -220,7 +220,7 @@ async fn dj_waveform(
 }
 
 async fn dj_analyze(State(state): State<AppState>, Path(track_id): Path<i64>) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let track = repo.get(track_id).ok().flatten();
     let Some(track) = track else {
         return (

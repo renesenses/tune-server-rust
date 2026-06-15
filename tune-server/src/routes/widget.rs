@@ -35,7 +35,7 @@ async fn widget_data(
     let all_zones = playback.all_states().await;
 
     // Recent tracks from history
-    let repo = HistoryRepo::new(state.db.clone());
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let recent = repo.top_tracks(5).unwrap_or_default();
 
     Json(json!({
@@ -121,7 +121,7 @@ async fn widget_recent(
     Query(params): Query<RecentParams>,
 ) -> Json<Value> {
     let limit = params.limit.unwrap_or(10);
-    let repo = HistoryRepo::new(state.db.clone());
+    let repo = HistoryRepo::with_backend(state.backend.clone());
 
     let tracks = repo.top_tracks(limit).unwrap_or_default();
 

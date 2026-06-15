@@ -71,7 +71,7 @@ pub(super) async fn import_ratings(
     Json(body): Json<ImportRatingsBody>,
 ) -> Json<Value> {
     let profile_id = body.profile_id.unwrap_or(1);
-    let repo = RatingRepo::new(state.db);
+    let repo = RatingRepo::with_backend(state.backend.clone());
     let mut imported = 0i32;
     let mut failed = 0i32;
     for item in &body.ratings {

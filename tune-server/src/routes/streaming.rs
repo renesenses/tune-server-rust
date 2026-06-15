@@ -534,7 +534,7 @@ async fn service_enable(State(state): State<AppState>, Path(service): Path<Strin
         svc.set_enabled(true);
     }
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(&format!("streaming_{service}_enabled"), "true")
         .ok();
@@ -547,7 +547,7 @@ async fn service_disable(State(state): State<AppState>, Path(service): Path<Stri
         svc.set_enabled(false);
     }
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(&format!("streaming_{service}_enabled"), "false")
         .ok();

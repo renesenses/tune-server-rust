@@ -19,7 +19,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn load_kiosk_settings(state: &AppState) -> Value {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("kiosk_config")
         .ok()
@@ -64,7 +64,7 @@ async fn set_kiosk_config(
     State(state): State<AppState>,
     Json(body): Json<KioskConfigBody>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut config = load_kiosk_settings(&state);
     let obj = config
         .as_object_mut()

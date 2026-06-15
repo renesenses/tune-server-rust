@@ -53,7 +53,7 @@ async fn recognize_audio(
     }
 
     // Check if an API key is configured for an audio recognition service
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let audd_token = settings.get("audd_api_token").ok().flatten();
     let acrcloud_key = settings.get("acrcloud_access_key").ok().flatten();
 
@@ -103,7 +103,7 @@ async fn recognize_audio(
 
 /// Get recognition history.
 async fn recognition_history(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let history: Vec<Value> = settings
         .get("shazam_history")
         .ok()
@@ -118,7 +118,7 @@ async fn recognition_history(State(state): State<AppState>) -> Json<Value> {
 }
 
 fn save_to_history(state: &AppState, result: &Value) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut history: Vec<Value> = settings
         .get("shazam_history")
         .ok()

@@ -40,7 +40,7 @@ async fn recent_history(
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
     Json(json!({
         "items": items,
@@ -52,7 +52,7 @@ async fn recent_history(
 
 async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
         .top_albums(limit)
         .unwrap_or_default()
@@ -66,14 +66,14 @@ async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams
 
 async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items = repo.top_tracks(limit).unwrap_or_default();
     Json(json!(items))
 }
 
 async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
         .top_artists(limit)
         .unwrap_or_default()
@@ -86,7 +86,7 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
 async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParams>) -> Json<Value> {
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     match repo.full_dashboard(period, p.zone_id, p.profile_id, top_n) {
         Ok(data) => Json(json!(data)),
         Err(_) => Json(json!({
@@ -110,7 +110,7 @@ async fn export_csv(
     Query(p): Query<HistoryParams>,
 ) -> impl axum::response::IntoResponse {
     let limit = p.limit.unwrap_or(10000);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let (items, _) = repo.recent_paginated(limit, 0).unwrap_or_default();
 
     let mut csv = String::from("title,artist,album,source,duration_ms,listened_at,zone_id\n");

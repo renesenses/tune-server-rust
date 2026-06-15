@@ -53,7 +53,7 @@ async fn enable_connect(
         return Json(json!({"enabled": false, "error": e}));
     }
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("spotify_connect_enabled", "true").ok();
     settings
         .set("spotify_connect_zone_id", &zone_id.to_string())
@@ -65,7 +65,7 @@ async fn enable_connect(
 async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
     state.spotify_connect.disable().await;
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("spotify_connect_enabled", "false").ok();
 
     Json(json!({"enabled": false}))
@@ -145,7 +145,7 @@ async fn transfer_playback(
 }
 
 pub async fn auto_start(state: &AppState) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("spotify_connect_enabled")
         .ok()

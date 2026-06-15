@@ -31,7 +31,7 @@ async fn upnp_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 /// GET /api/v1/upnp/config — return the current UPnP configuration.
 async fn upnp_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("upnp_enabled")
         .ok()
@@ -55,7 +55,7 @@ async fn set_upnp_config(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     if let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) {
         settings

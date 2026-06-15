@@ -51,7 +51,7 @@ pub(super) async fn list_albums(
     State(state): State<AppState>,
     Query(p): Query<AlbumFilters>,
 ) -> Json<Value> {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
@@ -84,7 +84,9 @@ pub(super) async fn list_albums(
 }
 
 pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
-    let count = AlbumRepo::new(state.db).count().unwrap_or(0);
+    let count = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     Json(json!({ "count": count }))
 }
 
@@ -119,7 +121,7 @@ pub(super) async fn recent_albums(
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let items = repo.list_recent(limit).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
@@ -129,7 +131,7 @@ pub(super) async fn get_album(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(album)) => Json(album.to_json()).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -141,7 +143,7 @@ pub(super) async fn album_tracks(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<Value> {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let items = repo.list_by_album(id).unwrap_or_default();
     Json(json!(items))
 }
@@ -152,7 +154,7 @@ pub(super) async fn quick_fav_album(
     Query(q): Query<QuickFavQuery>,
 ) -> Json<Value> {
     let profile_id = q.profile_id.unwrap_or(1);
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let is_fav = repo.is_favorite(profile_id, "album", id).unwrap_or(false);
     if is_fav {
         repo.remove_favorite(profile_id, "album", id).ok();
@@ -167,7 +169,7 @@ pub(super) async fn rate_album(
     Path(id): Path<i64>,
     Json(body): Json<RateRequest>,
 ) -> impl IntoResponse {
-    let repo = RatingRepo::new(state.db);
+    let repo = RatingRepo::with_backend(state.backend.clone());
     let profile_id = body.profile_id.unwrap_or(1);
     match repo.rate_album(id, profile_id, body.rating, body.note.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -180,7 +182,7 @@ pub(super) async fn get_album_rating(
     Path(id): Path<i64>,
     Query(q): Query<RatingQuery>,
 ) -> impl IntoResponse {
-    let repo = RatingRepo::new(state.db);
+    let repo = RatingRepo::with_backend(state.backend.clone());
     let profile_id = q.profile_id.unwrap_or(1);
     match repo.get_rating(id, profile_id) {
         Ok(Some(r)) => Json(json!(r)).into_response(),
@@ -194,8 +196,8 @@ pub(super) async fn top_rated_albums(
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = RatingRepo::new(state.db.clone());
-    let album_repo = AlbumRepo::new(state.db);
+    let repo = RatingRepo::with_backend(state.backend.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let top = repo.top_rated(limit).unwrap_or_default();
 
     let items: Vec<Value> = top
@@ -219,7 +221,7 @@ pub(super) async fn recommendations(
 ) -> Json<Value> {
     // Return recently added albums the user hasn't listened to
     let limit = p.limit.unwrap_or(20);
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let items = repo.list_recent(limit).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!({ "albums": items }))
@@ -230,14 +232,14 @@ pub(super) async fn album_bio(
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
 ) -> impl IntoResponse {
-    let album_repo = AlbumRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     // Resolve artist MBID for the API call
     let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::new(state.db);
+        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
         artist_repo
             .get(aid)
             .ok()
@@ -271,13 +273,13 @@ pub(super) async fn album_similar(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let album_repo = AlbumRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let mbid = if let Some(aid) = album.artist_id {
-        let artist_repo = ArtistRepo::new(state.db);
+        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
         artist_repo
             .get(aid)
             .ok()
@@ -391,7 +393,7 @@ fn strip_variant_suffix(title: &str) -> String {
 }
 
 pub(super) async fn albums_grouped(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
 
     // Group by MusicBrainz release group ID
     let mbid_groups = repo.list_release_groups().unwrap_or_default();
@@ -451,7 +453,7 @@ pub(super) async fn album_completeness(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let album = repo
         .get(id)
         .ok()
@@ -524,7 +526,7 @@ pub(super) async fn update_album(
     Path(id): Path<i64>,
     Json(body): Json<AlbumUpdate>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let mut album = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),

@@ -424,7 +424,7 @@ pub(super) async fn import_status(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("import_task_{task_id}");
     if let Some(data) = settings.get(&key).ok().flatten() {
         if let Ok(parsed) = serde_json::from_str::<Value>(&data) {

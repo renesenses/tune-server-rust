@@ -429,7 +429,7 @@ async fn radio_picks(State(state): State<AppState>) -> Result<Json<Value>, AppEr
 }
 
 fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
-    let repo = RadioRepo::new(state.db.clone());
+    let repo = RadioRepo::with_backend(state.backend.clone());
 
     let mut items: Vec<Value> = repo
         .favorites()
@@ -474,7 +474,7 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
 }
 
 fn fetch_top_tracks(state: &AppState, limit: i64) -> Vec<Value> {
-    let repo = HistoryRepo::new(state.db.clone());
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     repo.top_tracks(limit).unwrap_or_default()
 }
 
@@ -521,7 +521,7 @@ async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
     }
 
     // If we have authenticated services, also add settings hint
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let preferred_service = settings
         .get("preferred_streaming_service")
         .ok()

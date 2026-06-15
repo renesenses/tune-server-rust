@@ -88,20 +88,20 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let items = repo.list().unwrap_or_default();
     Json(json!(items))
 }
 
 async fn get_active_profile(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let profile_id: i64 = settings
         .get("active_profile_id")
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let profile = repo.get(profile_id).ok().flatten();
     Json(json!({
         "active_profile_id": profile_id,
@@ -113,10 +113,11 @@ async fn switch_profile(
     State(state): State<AppState>,
     Json(body): Json<SwitchProfile>,
 ) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db.clone());
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.get(body.profile_id) {
         Ok(Some(profile)) => {
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
             settings
                 .set("active_profile_id", &body.profile_id.to_string())
                 .ok();
@@ -132,16 +133,17 @@ async fn switch_profile(
 }
 
 async fn deactivate_profile(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("active_profile_id", "1").ok();
     Json(json!({ "active_profile_id": serde_json::Value::Null }))
 }
 
 async fn activate_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db.clone());
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(profile)) => {
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
             settings.set("active_profile_id", &id.to_string()).ok();
             Json(json!({
                 "active_profile_id": id,
@@ -155,7 +157,7 @@ async fn activate_profile(State(state): State<AppState>, Path(id): Path<i64>) ->
 }
 
 async fn get_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(p)) => Json(json!(p)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -167,7 +169,7 @@ async fn create_profile(
     State(state): State<AppState>,
     Json(body): Json<CreateProfile>,
 ) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, None, body.avatar_color.as_deref()) {
         Ok(id) => {
             // Return the full profile object so the web client can use it directly
@@ -186,7 +188,7 @@ async fn update_profile(
     Path(id): Path<i64>,
     Json(body): Json<UpdateProfile>,
 ) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.avatar_color.as_deref()) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -194,7 +196,7 @@ async fn update_profile(
 }
 
 async fn delete_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
@@ -206,7 +208,7 @@ async fn list_favorites(
     Path(id): Path<i64>,
     Query(q): Query<FavoritesQuery>,
 ) -> Json<Value> {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let items = repo
         .list_favorites(id, q.item_type.as_deref())
         .unwrap_or_default();
@@ -218,7 +220,7 @@ async fn add_favorite(
     Path(id): Path<i64>,
     Json(body): Json<FavoriteAction>,
 ) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.add_favorite(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::CREATED.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -230,7 +232,7 @@ async fn remove_favorite(
     Path(id): Path<i64>,
     Json(body): Json<FavoriteAction>,
 ) -> impl IntoResponse {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.remove_favorite(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -240,7 +242,7 @@ async fn remove_favorite(
 // --- Advanced profile routes ---
 
 async fn profile_settings(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("profile_{id}_settings");
     let value = settings
         .get(&key)
@@ -256,7 +258,7 @@ async fn update_profile_settings(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("profile_{id}_settings");
     let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
     match settings.set(&key, &serialized) {
@@ -307,7 +309,7 @@ async fn profile_history(
     Path(_id): Path<i64>,
     Query(q): Query<HistoryQuery>,
 ) -> Json<Value> {
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let limit = q.limit.unwrap_or(50);
     let items = repo.recent(limit).unwrap_or_default();
     Json(json!(items))
@@ -317,7 +319,7 @@ async fn search_profiles(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Json<Value> {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let all = repo.list().unwrap_or_default();
     let query = q.q.unwrap_or_default().to_lowercase();
     if query.is_empty() {
@@ -335,7 +337,7 @@ async fn check_favorites(
     Path(id): Path<i64>,
     Json(body): Json<CheckFavoritesBody>,
 ) -> Json<Value> {
-    let repo = ProfileRepo::new(state.db);
+    let repo = ProfileRepo::with_backend(state.backend.clone());
     let results: Vec<Value> = body
         .item_ids
         .iter()

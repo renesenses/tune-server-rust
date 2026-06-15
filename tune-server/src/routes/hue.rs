@@ -24,7 +24,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn hue_settings(state: &AppState) -> (Option<String>, Option<String>) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let bridge_ip = settings.get("hue_bridge_ip").ok().flatten();
     let username = settings.get("hue_username").ok().flatten();
     (bridge_ip, username)
@@ -74,7 +74,7 @@ async fn hue_status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn hue_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let bridge_ip = settings
         .get("hue_bridge_ip")
         .ok()
@@ -97,7 +97,7 @@ async fn set_hue_config(
     State(state): State<AppState>,
     Json(body): Json<HueConfigBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(ip) = &body.hue_bridge_ip {
         settings.set("hue_bridge_ip", ip).ok();
     }

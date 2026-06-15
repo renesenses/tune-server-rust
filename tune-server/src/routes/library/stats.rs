@@ -179,7 +179,7 @@ pub(super) async fn library_activity(
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::new(state.db);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
     let items = repo.recent(limit).unwrap_or_default();
     Json(json!(items))
 }

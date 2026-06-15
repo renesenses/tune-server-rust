@@ -85,7 +85,7 @@ fn save_queue(settings: &SettingsRepo, queue: &[Value]) {
 }
 
 async fn party_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("party_mode")
         .ok()
@@ -101,14 +101,14 @@ async fn party_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn enable_party(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("party_mode", "true").ok();
     settings.set("party_queue", "[]").ok();
     Json(json!({"enabled": true}))
 }
 
 async fn disable_party(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("party_mode", "false").ok();
     settings.set("party_queue", "[]").ok();
     Json(json!({"enabled": false}))
@@ -126,7 +126,7 @@ async fn party_add(
     State(state): State<AppState>,
     Json(body): Json<PartyAddRequest>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut queue = load_queue(&settings);
     let entry = json!({
         "track_id": body.track_id,
@@ -142,7 +142,7 @@ async fn party_add(
 }
 
 async fn party_queue(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let queue = load_queue(&settings);
     Json(json!({"queue": queue, "total": queue.len()}))
 }
@@ -154,7 +154,7 @@ struct VoteRequest {
 }
 
 async fn party_vote(State(state): State<AppState>, Json(body): Json<VoteRequest>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut queue = load_queue(&settings);
     let mut total_votes = 0;
     for item in &mut queue {
@@ -176,7 +176,7 @@ async fn party_vote(State(state): State<AppState>, Json(body): Json<VoteRequest>
 }
 
 async fn party_vote_reset(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut queue = load_queue(&settings);
     for item in &mut queue {
         item["votes"] = json!(0);

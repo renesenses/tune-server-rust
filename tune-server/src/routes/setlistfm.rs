@@ -21,7 +21,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn setlistfm_api_key(state: &AppState) -> Option<String> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("setlistfm_api_key")
         .ok()

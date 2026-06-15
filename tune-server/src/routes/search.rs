@@ -31,21 +31,21 @@ async fn federated_search(
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
 
-    let artists = ArtistRepo::new(state.db.clone())
+    let artists = ArtistRepo::with_backend(state.backend.clone())
         .search(&p.q, limit)
         .unwrap_or_default();
-    let albums = AlbumRepo::new(state.db.clone())
+    let albums = AlbumRepo::with_backend(state.backend.clone())
         .search(&p.q, limit)
         .unwrap_or_default();
-    let tracks = TrackRepo::new(state.db.clone())
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .search(&p.q, limit)
         .unwrap_or_default();
-    let radios = RadioRepo::new(state.db.clone())
+    let radios = RadioRepo::with_backend(state.backend.clone())
         .search(&p.q)
         .unwrap_or_default();
 
     // --- Extended metadata search ---
-    let meta_repo = TrackMetadataRepo::new(state.db.clone());
+    let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
     let meta_matches = meta_repo.search_by_value(&p.q, limit).unwrap_or_default();
 
     let fts_track_ids: std::collections::HashSet<i64> =
@@ -70,7 +70,7 @@ async fn federated_search(
     let extra_tracks = if extra_ids.is_empty() {
         Vec::new()
     } else {
-        TrackRepo::new(state.db.clone())
+        TrackRepo::with_backend(state.backend.clone())
             .get_multiple(&extra_ids)
             .unwrap_or_default()
     };

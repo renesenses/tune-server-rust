@@ -166,7 +166,7 @@ async fn add_device(
                     drop(outputs);
 
                     // Auto-create zone
-                    let zone_repo = ZoneRepo::new(state.db.clone());
+                    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
                     let zone_id = match zone_repo.get_or_create(&device_name, Some("bluos"), &device_id) {
                         Ok((zid, created)) => {
                             if !created {
@@ -243,7 +243,7 @@ async fn add_device(
                         drop(outputs);
 
                         // Auto-create zone
-                        let zone_repo = ZoneRepo::new(state.db.clone());
+                        let zone_repo = ZoneRepo::with_backend(state.backend.clone());
                         let zone_id = match zone_repo.get_or_create(&device_name, Some("dlna"), &device_id) {
                             Ok((zid, created)) => {
                                 if !created {
@@ -576,7 +576,7 @@ async fn set_device_buffer(
     let new_buf = body.buffer_s.unwrap_or(current_buf);
     let new_auto = body.auto.unwrap_or(current_auto);
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("buffer_{device_id}");
     let val = json!({"buffer_s": new_buf, "auto": new_auto}).to_string();
     if let Err(e) = settings.set(&key, &val) {
@@ -628,7 +628,7 @@ async fn pair_device(
     Path(device_id): Path<String>,
     Json(body): Json<PairRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("device_pair_{device_id}");
     let data = json!({
         "device_id": device_id,
@@ -653,7 +653,7 @@ async fn pair_device_pin(
     Path(device_id): Path<String>,
     Json(body): Json<PairPinRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     // Check if there's a pending pin
     let pending_key = format!("device_pair_pin_{device_id}");
     let expected = settings.get(&pending_key).ok().flatten();

@@ -11,7 +11,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
     let db = state.db.clone();
 
     let http_client = state.http_client.clone();
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(
             "enrich_all_status",
@@ -120,7 +120,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 }
 
 pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let result = settings
         .get("enrich_all_status")
         .ok()

@@ -90,7 +90,7 @@ async fn edit_track(
     Path(id): Path<i64>,
     Json(body): Json<TrackEdit>,
 ) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db.clone());
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let mut track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -157,7 +157,7 @@ async fn edit_album(
     Path(id): Path<i64>,
     Json(body): Json<AlbumEdit>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let mut album = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -186,7 +186,7 @@ async fn edit_artist(
     Path(id): Path<i64>,
     Json(body): Json<ArtistEdit>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let mut artist = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -213,7 +213,7 @@ async fn list_doubtful_metadata(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let track_repo = TrackRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let total = track_repo.count_doubtful().unwrap_or(0);
     let tracks = track_repo.list_doubtful(limit, offset).unwrap_or_default();
     let items: Vec<serde_json::Value> = tracks
@@ -362,13 +362,13 @@ async fn auto_apply_suggestions(
 // ---------------------------------------------------------------------------
 
 async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let api_base = settings
         .get("artist_enrichment_api")
         .ok()
@@ -382,13 +382,13 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
 }
 
 async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let api_base = settings
         .get("artist_enrichment_api")
         .ok()
@@ -1194,7 +1194,7 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
     let svc_mgr = tune_core::services_manager::ServicesManager::new(state.db.clone());
 
     // Prefer DB-stored credentials, fall back to config / settings repo.
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let lastfm_key = svc_mgr
         .get_credential("lastfm", "api_key")
         .or_else(|| settings.get("lastfm_api_key").ok().flatten())
@@ -1444,7 +1444,7 @@ async fn fetch_album_cover(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => {

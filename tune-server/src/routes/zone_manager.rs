@@ -125,8 +125,8 @@ fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
 
 /// Aggregate overview of all zones, groups, stereo pairs, and playing status.
 async fn overview(State(state): State<AppState>) -> Json<Value> {
-    let zone_repo = ZoneRepo::new(state.db.clone());
-    let settings = SettingsRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Zones with playback status
     let zones = zone_repo.list().unwrap_or_default();
@@ -180,7 +180,7 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 async fn list_managed_zones(State(state): State<AppState>) -> Json<Value> {
-    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
     let mut result = Vec::new();
     for z in &zones {
@@ -220,7 +220,7 @@ async fn hot_swap_zone(
     Path(id): Path<i64>,
     Json(body): Json<HotSwapRequest>,
 ) -> impl IntoResponse {
-    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
 
     // Verify zone exists
     let zone = match zone_repo.get(id) {
@@ -278,7 +278,7 @@ async fn mute_zone(
     Path(id): Path<i64>,
     Json(body): Json<MuteRequest>,
 ) -> impl IntoResponse {
-    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
 
     // Persist to DB
     if let Err(e) = zone_repo.update_muted(id, body.muted) {
@@ -310,7 +310,7 @@ struct CreateGroupRequest {
 }
 
 async fn list_groups(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "zone_groups");
     Json(json!(groups))
 }
@@ -319,7 +319,7 @@ async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroupRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
     let id = next_id(&groups);
     let group = json!({
@@ -344,7 +344,7 @@ async fn update_group(
     Path(id): Path<i64>,
     Json(body): Json<UpdateGroupRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
 
     let idx = groups
@@ -367,7 +367,7 @@ async fn update_group(
 }
 
 async fn delete_group(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
     let before = groups.len();
     groups.retain(|g| g.get("id").and_then(|v| v.as_i64()) != Some(id));
@@ -393,7 +393,7 @@ async fn group_volume(
     Path(id): Path<i64>,
     Json(body): Json<GroupVolumeRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "zone_groups");
 
     let idx = groups
@@ -415,7 +415,7 @@ async fn group_volume(
             save_json_setting(&settings, "zone_groups", &groups);
 
             // Apply volume to each zone
-            let repo = ZoneRepo::new(state.db.clone());
+            let repo = ZoneRepo::with_backend(state.backend.clone());
             for zid in &zone_ids {
                 let offset = body
                     .offsets
@@ -443,7 +443,7 @@ async fn calibrate_group(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "zone_groups");
 
     let group = groups
@@ -459,7 +459,10 @@ async fn calibrate_group(
             let outputs = state.outputs.lock().await;
             let mut latencies = Vec::new();
             for zid in &zone_ids {
-                let zone = ZoneRepo::new(state.db.clone()).get(*zid).ok().flatten();
+                let zone = ZoneRepo::with_backend(state.backend.clone())
+                    .get(*zid)
+                    .ok()
+                    .flatten();
                 if let Some(ref device_id) = zone.and_then(|z| z.output_device_id) {
                     if let Some(output) = outputs.get(device_id) {
                         let output = output.lock().await;
@@ -501,7 +504,7 @@ async fn gapless_config(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "zone_groups");
 
     let group = groups
@@ -548,7 +551,7 @@ async fn group_health(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "zone_groups");
 
     let group = groups
@@ -561,7 +564,7 @@ async fn group_health(
                 .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default();
 
-            let repo = ZoneRepo::new(state.db);
+            let repo = ZoneRepo::with_backend(state.backend.clone());
             let mut zones_health = Vec::new();
             for zid in &zone_ids {
                 let ps = state.playback.get_state(*zid).await;
@@ -605,7 +608,7 @@ struct ZoneProfileEntry {
 }
 
 async fn list_zone_profiles(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let profiles = load_json_setting(&settings, "zone_profiles");
     Json(json!(profiles))
 }
@@ -614,7 +617,7 @@ async fn create_zone_profile(
     State(state): State<AppState>,
     Json(body): Json<CreateZoneProfileRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut profiles = load_json_setting(&settings, "zone_profiles");
     let id = next_id(&profiles);
 
@@ -633,7 +636,7 @@ async fn create_zone_profile(
             })
             .collect()
     } else {
-        let zone_repo = ZoneRepo::new(state.db.clone());
+        let zone_repo = ZoneRepo::with_backend(state.backend.clone());
         zone_repo
             .list()
             .unwrap_or_default()
@@ -669,7 +672,7 @@ async fn update_zone_profile(
     Path(id): Path<i64>,
     Json(body): Json<CreateZoneProfileRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut profiles = load_json_setting(&settings, "zone_profiles");
 
     let idx = profiles
@@ -708,7 +711,7 @@ async fn delete_zone_profile(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut profiles = load_json_setting(&settings, "zone_profiles");
     let before = profiles.len();
     profiles.retain(|p| p.get("id").and_then(|v| v.as_i64()) != Some(id));
@@ -724,7 +727,7 @@ async fn activate_zone_profile(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut profiles = load_json_setting(&settings, "zone_profiles");
 
     let idx = profiles
@@ -741,7 +744,7 @@ async fn activate_zone_profile(
         .cloned()
         .unwrap_or_default();
 
-    let zone_repo = ZoneRepo::new(state.db.clone());
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let mut applied = 0usize;
 
     for zc in &zone_configs {
@@ -790,7 +793,7 @@ async fn activate_zone_profile(
 
 /// Return sync timing data from playback states of all zones.
 async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
-    let zone_repo = ZoneRepo::new(state.db);
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
 
     let mut zone_stats = Vec::new();
@@ -840,7 +843,7 @@ async fn sync_stats(State(state): State<AppState>) -> Json<Value> {
 
 /// Measure round-trip time to all zone output devices.
 async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
-    let zone_repo = ZoneRepo::new(state.db);
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
     let outputs = state.outputs.lock().await;
 
@@ -894,7 +897,7 @@ async fn measure_latency(State(state): State<AppState>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 async fn list_oaat_groups(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let groups = load_json_setting(&settings, "oaat_groups");
     Json(json!({ "oaat_groups": groups }))
 }
@@ -937,7 +940,7 @@ async fn create_oaat_group(State(state): State<AppState>, Json(body): Json<Value
     }
 
     // Persist to settings
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "oaat_groups");
     groups.push(json!({
         "id": group_id,
@@ -966,7 +969,7 @@ async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>
     }
 
     // Remove from settings
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut groups = load_json_setting(&settings, "oaat_groups");
     groups.retain(|g| g["id"].as_str() != Some(&id));
     save_json_setting(&settings, "oaat_groups", &groups);

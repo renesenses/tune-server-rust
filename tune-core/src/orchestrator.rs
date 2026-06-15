@@ -903,6 +903,9 @@ impl PlaybackOrchestrator {
         };
 
         let is_https = stream_data.url.starts_with("https://");
+        // file:// URLs come from Tidal DASH multi-segment downloads — the fMP4
+        // has already been assembled on disk by get_track_url().
+        let is_dash_file = stream_data.url.starts_with("file://");
         let is_oaat_stream = req
             .output_device_id
             .as_deref()
@@ -954,6 +957,10 @@ impl PlaybackOrchestrator {
             let ev_bus = self.event_bus.clone();
             let zone_id = req.zone_id;
 
+            // Detect file:// URLs from DASH multi-segment downloads — the fMP4
+            // is already on disk, skip the HTTP download step.
+            let is_dash_local = upstream_url.starts_with("file://");
+
             // Background task: download upstream → temp file → decode → WAV → session
             tokio::spawn(async move {
                 // Audio-levels channel so the web client VU-meter works for
@@ -980,49 +987,68 @@ impl PlaybackOrchestrator {
                     });
                 }
 
-                // Download to temp file on a blocking thread
-                let tmp_path = std::env::temp_dir()
-                    .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
-                    .to_string_lossy()
-                    .to_string();
-                let tmp_path_clone = tmp_path.clone();
-                let upstream = upstream_url.clone();
-                let download_result = tokio::task::spawn_blocking(move || {
-                    let resp = reqwest::blocking::Client::builder()
-                        .timeout(std::time::Duration::from_secs(120))
-                        .build()
-                        .and_then(|c| c.get(&upstream).send());
-                    match resp {
-                        Ok(mut r) if r.status().is_success() => {
-                            let mut file = match std::fs::File::create(&tmp_path_clone) {
-                                Ok(f) => f,
-                                Err(e) => return Err(format!("tmp create: {e}")),
-                            };
-                            match std::io::copy(&mut r, &mut file) {
-                                Ok(bytes) => {
-                                    debug!(bytes, path = %tmp_path_clone, "streaming_download_complete");
-                                    Ok(tmp_path_clone)
+                // For DASH file:// URLs the fMP4 is already on disk — use it
+                // directly instead of downloading via HTTP.
+                let tmp_file = if is_dash_local {
+                    let file_path = upstream_url
+                        .strip_prefix("file://")
+                        .unwrap_or(&upstream_url)
+                        .to_string();
+                    let file_size = std::fs::metadata(&file_path)
+                        .ok()
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    info!(
+                        path = %file_path,
+                        file_size,
+                        "streaming_dash_file_already_on_disk"
+                    );
+                    file_path
+                } else {
+                    // Download to temp file on a blocking thread
+                    let tmp_path = std::env::temp_dir()
+                        .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                        .to_string_lossy()
+                        .to_string();
+                    let tmp_path_clone = tmp_path.clone();
+                    let upstream = upstream_url.clone();
+                    let download_result = tokio::task::spawn_blocking(move || {
+                        let resp = reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(120))
+                            .build()
+                            .and_then(|c| c.get(&upstream).send());
+                        match resp {
+                            Ok(mut r) if r.status().is_success() => {
+                                let mut file = match std::fs::File::create(&tmp_path_clone) {
+                                    Ok(f) => f,
+                                    Err(e) => return Err(format!("tmp create: {e}")),
+                                };
+                                match std::io::copy(&mut r, &mut file) {
+                                    Ok(bytes) => {
+                                        debug!(bytes, path = %tmp_path_clone, "streaming_download_complete");
+                                        Ok(tmp_path_clone)
+                                    }
+                                    Err(e) => Err(format!("download copy: {e}")),
                                 }
-                                Err(e) => Err(format!("download copy: {e}")),
                             }
+                            Ok(r) => Err(format!("upstream HTTP {}", r.status())),
+                            Err(e) => Err(format!("upstream fetch: {e}")),
                         }
-                        Ok(r) => Err(format!("upstream HTTP {}", r.status())),
-                        Err(e) => Err(format!("upstream fetch: {e}")),
-                    }
-                })
-                .await;
+                    })
+                    .await;
 
-                let tmp_file = match download_result {
-                    Ok(Ok(path)) => path,
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_transcode_download_failed");
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "streaming_transcode_task_join_failed");
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return;
+                    match download_result {
+                        Ok(Ok(path)) => path,
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "streaming_transcode_download_failed");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_transcode_task_join_failed");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return;
+                        }
                     }
                 };
 
@@ -1059,6 +1085,81 @@ impl PlaybackOrchestrator {
                     }
                     Err(e) => {
                         warn!(error = %e, "streaming_transcode_decode_task_panic");
+                    }
+                }
+            });
+
+            let server_ip = crate::discovery::ssdp::get_local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+            (url, Some(session_id), "audio/wav".to_string())
+        } else if is_dash_file {
+            // DASH multi-segment fMP4 already assembled on disk by get_track_url().
+            // DLNA renderers can't decode fMP4+FLAC containers directly, so we
+            // decode to WAV (same path as local/OAAT) and serve via HTTP session.
+            let dash_file_path = stream_data
+                .url
+                .strip_prefix("file://")
+                .unwrap_or(&stream_data.url)
+                .to_string();
+            let sr = stream_data.quality.sample_rate;
+            let bd = stream_data.quality.bit_depth.max(16).min(24);
+
+            let wav_info = StreamInfo {
+                format: "wav".into(),
+                mime_type: "audio/wav".into(),
+                sample_rate: sr,
+                bit_depth: bd,
+                channels: 2,
+                file_size: None,
+                duration_ms: None,
+            };
+
+            let (session_id, tx, data_ready) =
+                self.streamer.create_session(wav_info, false, 256).await;
+
+            info!(
+                session_id = %session_id,
+                sample_rate = sr,
+                bit_depth = bd,
+                path = %dash_file_path,
+                "streaming_dash_decode_to_wav_for_dlna"
+            );
+
+            // Background task: decode fMP4 → WAV → session (same as local/OAAT)
+            tokio::spawn(async move {
+                let (levels_tx, _levels_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+                let tmp_file_clone = dash_file_path.clone();
+                let tx_clone = tx;
+
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                        &tmp_file_clone,
+                        Some(sr),
+                        Some(2),
+                        Some(bd),
+                        tx_clone,
+                        32768,
+                        data_ready,
+                        levels_tx,
+                    )
+                })
+                .await;
+
+                // Clean up the DASH temp file after decode
+                let _ = std::fs::remove_file(&dash_file_path);
+
+                match decode_result {
+                    Ok(Ok(bit_depth)) => {
+                        info!(bit_depth, "streaming_dash_decode_to_wav_complete");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "streaming_dash_decode_to_wav_failed");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "streaming_dash_decode_task_panic");
                     }
                 }
             });

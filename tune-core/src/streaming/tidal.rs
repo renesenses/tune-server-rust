@@ -161,6 +161,148 @@ impl TidalService {
         }
     }
 
+    /// Download all DASH segments (init + media) and concatenate them into a
+    /// single fMP4 file on disk. Returns the path to the temp file.
+    ///
+    /// Tidal Hi-Res FLAC (24-bit) is delivered as fMP4 via DASH SegmentTemplate
+    /// with a SegmentTimeline. The init segment contains the MP4 header (ftyp +
+    /// moov boxes) and each media segment contains moof+mdat with FLAC frames.
+    /// All segments must be concatenated in order to form a valid ISO BMFF file
+    /// that symphonia's IsoMp4Reader can decode.
+    async fn download_dash_segments(
+        &self,
+        segments: &DashSegmentInfo,
+        track_id: &str,
+    ) -> Result<String, String> {
+        let start = Instant::now();
+        let total = segments.segment_count;
+        info!(
+            track_id,
+            init_url = segments.init_url.as_str(),
+            segment_count = total,
+            start_number = segments.start_number,
+            "tidal_dash_multi_segment_download_starting"
+        );
+
+        // Download init segment
+        let init_data = self
+            .client
+            .get(&segments.init_url)
+            .send()
+            .await
+            .map_err(|e| format!("dash init download: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| format!("dash init read: {e}"))?;
+
+        if init_data.len() < 8 {
+            return Err(format!(
+                "dash init segment too small: {} bytes",
+                init_data.len()
+            ));
+        }
+        debug!(
+            track_id,
+            init_bytes = init_data.len(),
+            "tidal_dash_init_segment_downloaded"
+        );
+
+        // Create temp file and write init segment
+        let tmp_path = std::env::temp_dir()
+            .join(format!("tune-dash-{}.mp4", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+
+        {
+            use std::io::Write;
+            let mut file =
+                std::fs::File::create(&tmp_path).map_err(|e| format!("tmp create: {e}"))?;
+            file.write_all(&init_data)
+                .map_err(|e| format!("tmp write init: {e}"))?;
+        }
+
+        // Download media segments sequentially and append to file.
+        // Sequential to avoid overwhelming Tidal CDN and to maintain order.
+        // For a typical 3-4 min track at 96kHz/24bit, there are ~54 segments
+        // of ~4s each, total ~30-50MB. Each segment is ~500KB-1MB.
+        let mut total_bytes = init_data.len() as u64;
+        let mut failed_segments = 0u32;
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("tmp reopen: {e}"))?;
+
+            for i in 0..total {
+                let seg_number = segments.start_number + i;
+                let seg_url = segments
+                    .media_template
+                    .replace("$Number$", &seg_number.to_string());
+
+                match self.client.get(&seg_url).send().await {
+                    Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                        Ok(data) => {
+                            file.write_all(&data)
+                                .map_err(|e| format!("tmp write seg {seg_number}: {e}"))?;
+                            total_bytes += data.len() as u64;
+                        }
+                        Err(e) => {
+                            warn!(
+                                track_id,
+                                segment = seg_number,
+                                error = %e,
+                                "tidal_dash_segment_read_failed"
+                            );
+                            failed_segments += 1;
+                        }
+                    },
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        warn!(
+                            track_id,
+                            segment = seg_number,
+                            status,
+                            "tidal_dash_segment_http_error"
+                        );
+                        failed_segments += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            track_id,
+                            segment = seg_number,
+                            error = %e,
+                            "tidal_dash_segment_fetch_error"
+                        );
+                        failed_segments += 1;
+                    }
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        if failed_segments > 0 && failed_segments >= total {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "all {total} DASH segments failed to download for track {track_id}"
+            ));
+        }
+
+        info!(
+            track_id,
+            total_bytes,
+            segment_count = total,
+            failed_segments,
+            elapsed_ms = elapsed.as_millis() as u64,
+            path = tmp_path.as_str(),
+            "tidal_dash_multi_segment_download_complete"
+        );
+
+        Ok(tmp_path)
+    }
+
     /// Create a TidalService with a specific quality setting from config.
     /// Valid values: "HI_RES_LOSSLESS", "HI_RES", "LOSSLESS", "HIGH"
     pub fn with_quality(quality: &str) -> Self {
@@ -1098,26 +1240,6 @@ impl StreamingService for TidalService {
                     );
 
                     if returned_quality == q {
-                        // Skip fMP4 DASH (SegmentTemplate) — we can't decode
-                        // multi-segment fMP4 yet. Fallback to next quality
-                        // (typically LOSSLESS = raw FLAC).
-                        if manifest_mime == "application/dash+xml" {
-                            let manifest_raw = d["manifest"].as_str().unwrap_or("");
-                            if let Ok(decoded) =
-                                String::from_utf8(base64_decode(manifest_raw).unwrap_or_default())
-                            {
-                                if decoded.contains("audio/mp4")
-                                    && decoded.contains("SegmentTemplate")
-                                {
-                                    warn!(
-                                        track_id,
-                                        quality = q,
-                                        "tidal_fmp4_dash_not_supported_skipping"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
                         data = Some(d);
                         break;
                     }
@@ -1217,26 +1339,43 @@ impl StreamingService for TidalService {
                 );
                 format!("tidal: could not parse DASH manifest for track {track_id}")
             })?;
-            // Detect suspicious URLs: too-short URLs or URLs that look like
-            // they might return a manifest instead of audio data
-            let url_len = dash.url.len();
-            if url_len < 30 {
-                warn!(
+
+            // DASH multi-segment (fMP4 container with SegmentTemplate + SegmentTimeline):
+            // Download all segments, concatenate into a single fMP4 file, and return
+            // a file:// URL so the orchestrator can read directly from disk.
+            if let Some(ref seg_info) = dash.segments {
+                info!(
+                    track_id,
+                    segment_count = seg_info.segment_count,
+                    start_number = seg_info.start_number,
+                    dash_codec = dash.codec.as_deref().unwrap_or("none"),
+                    dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
+                    "tidal_dash_multi_segment_detected"
+                );
+                let tmp_path = self.download_dash_segments(seg_info, track_id).await?;
+                let file_url = format!("file://{tmp_path}");
+                (file_url, dash.codec, dash.mime_type)
+            } else {
+                // Single-segment DASH (BaseURL or single SegmentTemplate)
+                let url_len = dash.url.len();
+                if url_len < 30 {
+                    warn!(
+                        track_id,
+                        url = dash.url.as_str(),
+                        url_len,
+                        "tidal_dash_suspicious_short_url"
+                    );
+                }
+                info!(
                     track_id,
                     url = dash.url.as_str(),
                     url_len,
-                    "tidal_dash_suspicious_short_url"
+                    dash_codec = dash.codec.as_deref().unwrap_or("none"),
+                    dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
+                    "tidal_dash_manifest_parsed"
                 );
+                (dash.url, dash.codec, dash.mime_type)
             }
-            info!(
-                track_id,
-                url = dash.url.as_str(),
-                url_len,
-                dash_codec = dash.codec.as_deref().unwrap_or("none"),
-                dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
-                "tidal_dash_manifest_parsed"
-            );
-            (dash.url, dash.codec, dash.mime_type)
         } else if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decoded) {
             // BTS manifest (JSON with urls array)
             let url = manifest_json["urls"]
@@ -1280,8 +1419,14 @@ impl StreamingService for TidalService {
             }
         };
 
-        // Determine MIME type: prefer DASH manifest, then derive from codec
-        let mime_type = if codec == "FLAC" {
+        // Determine MIME type: prefer DASH manifest, then derive from codec.
+        // For DASH multi-segment downloads (file:// URLs), the file on disk is
+        // an fMP4 container — report audio/mp4 so symphonia uses IsoMp4Reader.
+        let is_dash_file = url.starts_with("file://");
+        let mime_type = if is_dash_file {
+            // fMP4 container on disk — always audio/mp4 regardless of inner codec
+            "audio/mp4"
+        } else if codec == "FLAC" {
             // DASH might report "audio/flac" or "audio/mp4" for FLAC-in-fMP4 container.
             // For playback, report what the actual codec is.
             if let Some(ref dm) = dash_mime {
@@ -1309,7 +1454,9 @@ impl StreamingService for TidalService {
             Some(320_000) // AAC HIGH = 320kbps
         };
 
-        {
+        // Do not cache file:// URLs from DASH multi-segment downloads — the temp
+        // file is consumed once and then deleted by the orchestrator.
+        if !is_dash_file {
             let mut cache = self.url_cache.lock().await;
             cache.set(
                 track_id.to_string(),
@@ -1882,6 +2029,24 @@ struct DashManifest {
     codec: Option<String>,
     /// MIME type from `<Representation mimeType="...">` or `<AdaptationSet mimeType="...">`
     mime_type: Option<String>,
+    /// Multi-segment info for DASH SegmentTemplate + SegmentTimeline delivery.
+    /// Present when the manifest uses segmented delivery (fMP4 container).
+    segments: Option<DashSegmentInfo>,
+}
+
+/// Segment information extracted from DASH SegmentTemplate + SegmentTimeline.
+/// Tidal Hi-Res FLAC uses fMP4 with multiple segments that must all be
+/// downloaded and concatenated to reconstruct the full audio file.
+#[derive(Debug, Clone)]
+struct DashSegmentInfo {
+    /// Initialization segment URL (MP4 header / ftyp+moov boxes)
+    init_url: String,
+    /// Media segment URL template (contains `$Number$` placeholder)
+    media_template: String,
+    /// Start number for segment numbering (usually 1)
+    start_number: u32,
+    /// Total number of media segments to download
+    segment_count: u32,
 }
 
 /// Default Tidal CDN base used to resolve relative URLs in DASH manifests.
@@ -1925,7 +2090,13 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
     let mut mime_type: Option<String> = None;
     let mut segment_template_media: Option<String> = None;
     let mut segment_template_init: Option<String> = None;
+    let mut segment_template_start_number: u32 = 1;
     let mut in_base_url = false;
+    let mut in_segment_template = false;
+    // SegmentTimeline: accumulate total segment count from <S> elements.
+    // Each <S d="..." r="N"/> means 1 + N segments (r = repeat count, 0-based).
+    let mut timeline_segment_count: u32 = 0;
+    let mut has_segment_timeline = false;
 
     loop {
         match reader.read_event() {
@@ -1962,6 +2133,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                         }
                     }
                     "SegmentTemplate" => {
+                        in_segment_template = true;
                         for attr in e.attributes().flatten() {
                             let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
                             let val = String::from_utf8_lossy(&attr.value).to_string();
@@ -1972,9 +2144,29 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
                                 "initialization" => {
                                     segment_template_init = Some(val);
                                 }
+                                "startNumber" => {
+                                    segment_template_start_number = val.parse().unwrap_or(1);
+                                }
                                 _ => {}
                             }
                         }
+                    }
+                    "SegmentTimeline" => {
+                        has_segment_timeline = true;
+                    }
+                    "S" if in_segment_template || has_segment_timeline => {
+                        // <S d="380928" r="52"/> means 1 + 52 = 53 segments
+                        // <S t="0" d="380928"/> means 1 segment (r defaults to 0)
+                        let mut repeat: u32 = 0;
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            if key == "r" {
+                                repeat = val.parse().unwrap_or(0);
+                            }
+                        }
+                        // 1 for this <S> element + r repeats
+                        timeline_segment_count += 1 + repeat;
                     }
                     _ => {}
                 }
@@ -1990,8 +2182,11 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             }
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
-                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "BaseURL" {
-                    in_base_url = false;
+                let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                match tag {
+                    "BaseURL" => in_base_url = false,
+                    "SegmentTemplate" => in_segment_template = false,
+                    _ => {}
                 }
             }
             Ok(Event::Eof) => break,
@@ -1999,6 +2194,28 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             _ => {}
         }
     }
+
+    // Build segment info if we have a SegmentTemplate with SegmentTimeline
+    let segments = if has_segment_timeline
+        && timeline_segment_count > 0
+        && segment_template_media.is_some()
+        && segment_template_init.is_some()
+    {
+        let init_url = resolve_tidal_url(segment_template_init.as_ref().unwrap());
+        let media_template = resolve_tidal_url(segment_template_media.as_ref().unwrap());
+        if init_url.starts_with("http") && media_template.starts_with("http") {
+            Some(DashSegmentInfo {
+                init_url,
+                media_template,
+                start_number: segment_template_start_number,
+                segment_count: timeline_segment_count,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Prefer BaseURL (direct stream), fall back to SegmentTemplate media URL
     // (NOT initialization — init is just the MP4 header, media is the actual audio).
@@ -2022,31 +2239,38 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
         }
         resolved
     } else if let Some(ref media) = segment_template_media {
-        // SegmentTemplate: prefer `media` (full audio) over `initialization` (just header).
-        // Replace DASH template variables ($Number$, $RepresentationID$, etc.)
-        // with defaults so we get a usable URL for single-segment streams.
-        let expanded = media
-            .replace("$Number$", "0")
-            .replace("$RepresentationID$", "1")
-            .replace("$Bandwidth$", "0")
-            .replace("$Time$", "0");
-        let resolved = resolve_tidal_url(&expanded);
-        if !resolved.starts_with("http") {
-            warn!(
+        // SegmentTemplate with SegmentTimeline: use the init URL as the
+        // primary URL (the segments field carries the full download info).
+        // Without SegmentTimeline: expand template for single-segment access.
+        if segments.is_some() {
+            // Multi-segment: use init URL as the representative URL.
+            // The actual download is done via DashSegmentInfo.
+            resolve_tidal_url(segment_template_init.as_deref().unwrap_or(media))
+        } else {
+            // Single-segment fallback: replace template variables with defaults.
+            let expanded = media
+                .replace("$Number$", "0")
+                .replace("$RepresentationID$", "1")
+                .replace("$Bandwidth$", "0")
+                .replace("$Time$", "0");
+            let resolved = resolve_tidal_url(&expanded);
+            if !resolved.starts_with("http") {
+                warn!(
+                    media_template = media.as_str(),
+                    expanded = expanded.as_str(),
+                    init_url = segment_template_init.as_deref().unwrap_or("none"),
+                    "tidal_dash_segment_template_unresolvable"
+                );
+                return None;
+            }
+            info!(
                 media_template = media.as_str(),
-                expanded = expanded.as_str(),
+                resolved = resolved.as_str(),
                 init_url = segment_template_init.as_deref().unwrap_or("none"),
-                "tidal_dash_segment_template_unresolvable"
+                "tidal_dash_segment_template_resolved"
             );
-            return None;
+            resolved
         }
-        info!(
-            media_template = media.as_str(),
-            resolved = resolved.as_str(),
-            init_url = segment_template_init.as_deref().unwrap_or("none"),
-            "tidal_dash_segment_template_resolved"
-        );
-        resolved
     } else if let Some(ref init) = segment_template_init {
         // Last resort: initialization-only SegmentTemplate (no media attr).
         // This is typically just the MP4 header — it will be small, but
@@ -2073,6 +2297,7 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
         url,
         codec,
         mime_type,
+        segments,
     })
 }
 
@@ -2455,6 +2680,120 @@ mod tests {
             result.url,
             "https://sp-pr-cf.audio.tidal.com/mediatracks/abc/seg-0.flac"
         );
+    }
+
+    #[test]
+    fn parse_dash_manifest_segment_timeline_basic() {
+        // Real-world Tidal Hi-Res FLAC DASH manifest structure:
+        // SegmentTemplate with SegmentTimeline containing <S> elements.
+        // <S d="380928"/> = 1 segment, <S d="380928" r="52"/> = 53 segments.
+        let mpd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD type="static" mediaPresentationDuration="PT3M33.233S">
+  <Period id="0">
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <Representation codecs="flac" bandwidth="3000000" audioSamplingRate="96000">
+        <SegmentTemplate
+          timescale="96000"
+          media="https://sp-ad-fa.audio.tidal.com/mediatracks/abc123/$Number$.mp4?token=xyz"
+          initialization="https://sp-ad-fa.audio.tidal.com/mediatracks/abc123/0.mp4?token=xyz"
+          startNumber="1">
+          <SegmentTimeline>
+            <S t="0" d="380928"/>
+            <S d="380928" r="52"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        // Should detect multi-segment and populate segments field
+        assert!(result.segments.is_some(), "segments should be Some");
+        let seg = result.segments.unwrap();
+        assert_eq!(seg.start_number, 1);
+        // 1 (first <S>) + 1 + 52 (second <S> with r=52) = 54 total segments
+        assert_eq!(seg.segment_count, 54);
+        assert_eq!(
+            seg.init_url,
+            "https://sp-ad-fa.audio.tidal.com/mediatracks/abc123/0.mp4?token=xyz"
+        );
+        assert!(seg.media_template.contains("$Number$"));
+        assert_eq!(result.codec.as_deref(), Some("flac"));
+        assert_eq!(result.mime_type.as_deref(), Some("audio/mp4"));
+    }
+
+    #[test]
+    fn parse_dash_manifest_segment_timeline_single_s_with_repeat() {
+        // Single <S> with r=99 means 100 segments total
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/mp4">
+          <Representation codecs="flac">
+            <SegmentTemplate
+              media="https://cdn.tidal.com/track/$Number$.mp4"
+              initialization="https://cdn.tidal.com/track/0.mp4"
+              startNumber="1">
+              <SegmentTimeline>
+                <S d="480000" r="99"/>
+              </SegmentTimeline>
+            </SegmentTemplate>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        let seg = result.segments.unwrap();
+        assert_eq!(seg.segment_count, 100);
+        assert_eq!(seg.start_number, 1);
+    }
+
+    #[test]
+    fn parse_dash_manifest_no_segment_timeline_no_segments() {
+        // SegmentTemplate WITHOUT SegmentTimeline should NOT populate segments
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/flac" codecs="flac">
+          <Representation>
+            <SegmentTemplate initialization="https://cdn.tidal.com/init.mp4" media="https://cdn.tidal.com/seg-$Number$.flac"/>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert!(
+            result.segments.is_none(),
+            "segments should be None without SegmentTimeline"
+        );
+        // URL should still be expanded from media template
+        assert_eq!(result.url, "https://cdn.tidal.com/seg-0.flac");
+    }
+
+    #[test]
+    fn parse_dash_manifest_base_url_no_segments() {
+        // BaseURL manifests should never have segments (they're single-file)
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/flac">
+          <Representation codecs="flac">
+            <BaseURL>https://cdn.tidal.com/track.flac</BaseURL>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert!(result.segments.is_none());
+        assert_eq!(result.url, "https://cdn.tidal.com/track.flac");
+    }
+
+    #[test]
+    fn parse_dash_manifest_segment_timeline_url_is_init() {
+        // When multi-segment is detected, the returned url should be the init URL
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/mp4">
+          <Representation codecs="flac">
+            <SegmentTemplate
+              media="https://cdn.tidal.com/$Number$.mp4"
+              initialization="https://cdn.tidal.com/0.mp4"
+              startNumber="1">
+              <SegmentTimeline>
+                <S d="380928" r="5"/>
+              </SegmentTimeline>
+            </SegmentTemplate>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        // When segments are present, url should be the init URL
+        assert_eq!(result.url, "https://cdn.tidal.com/0.mp4");
+        let seg = result.segments.unwrap();
+        assert_eq!(seg.segment_count, 6); // 1 + r=5
+        assert_eq!(seg.media_template, "https://cdn.tidal.com/$Number$.mp4");
     }
 
     #[test]

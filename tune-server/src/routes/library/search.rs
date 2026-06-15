@@ -17,14 +17,14 @@ pub(super) async fn search(
     Query(q): Query<SearchQuery>,
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(20);
-    let artists = ArtistRepo::new(state.db.clone())
+    let artists = ArtistRepo::with_backend(state.backend.clone())
         .search(&q.q, limit)
         .unwrap_or_default();
-    let albums = AlbumRepo::new(state.db.clone())
+    let albums = AlbumRepo::with_backend(state.backend.clone())
         .search(&q.q, limit)
         .unwrap_or_default();
     let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
-    let tracks = TrackRepo::new(state.db.clone())
+    let tracks = TrackRepo::with_backend(state.backend.clone())
         .search(&q.q, limit)
         .unwrap_or_default();
 
@@ -32,7 +32,7 @@ pub(super) async fn search(
     // Search track_metadata for matches in searchable fields (composer,
     // conductor, lyricist, performer, remixer, producer, label, comment,
     // lyrics, isrc, catalog_number). Merge with FTS results.
-    let meta_repo = TrackMetadataRepo::new(state.db.clone());
+    let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
     let meta_matches = meta_repo.search_by_value(&q.q, limit).unwrap_or_default();
 
     // Collect track IDs already returned by FTS
@@ -60,7 +60,7 @@ pub(super) async fn search(
     let extra_tracks = if extra_ids.is_empty() {
         Vec::new()
     } else {
-        TrackRepo::new(state.db)
+        TrackRepo::with_backend(state.backend.clone())
             .get_multiple(&extra_ids)
             .unwrap_or_default()
     };

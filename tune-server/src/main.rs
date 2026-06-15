@@ -116,7 +116,7 @@ async fn main() {
     // Auto-scan music directories at startup
     let scan_done = if config.auto_scan {
         Some(tune_server::auto_scan::spawn_auto_scan(
-            state.db.clone(),
+            state.backend.clone(),
             state.event_bus.clone(),
         ))
     } else {
@@ -125,7 +125,7 @@ async fn main() {
 
     // File watcher for live directory changes (waits for auto-scan to finish
     // before monitoring, to avoid racing with the scanner on macOS FSEvents)
-    tune_server::auto_scan::spawn_file_watcher(state.db.clone(), scan_done);
+    tune_server::auto_scan::spawn_file_watcher(state.backend.clone(), scan_done);
 
     // Register local audio outputs (USB DAC, headphones, speakers)
     #[cfg(feature = "local-audio")]

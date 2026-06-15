@@ -198,7 +198,7 @@ pub(super) async fn database_import(
     let tmp_str = tmp_path.to_string_lossy();
 
     // Store the import path for potential restore
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("last_imported_db", &tmp_str).ok();
 
     Json(json!({
@@ -348,9 +348,15 @@ pub(super) async fn migrate_database(
     }
 
     // Pre-flight: count rows to report in the response
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let artists = ArtistRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
 
     #[cfg(feature = "postgres")]
     {

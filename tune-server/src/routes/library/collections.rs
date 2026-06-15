@@ -24,7 +24,7 @@ pub(super) struct CollectionAlbumPath {
 }
 
 pub(super) async fn list_collections(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let data = settings
         .get("collections")
         .ok()
@@ -38,7 +38,7 @@ pub(super) async fn create_collection(
     State(state): State<AppState>,
     Json(body): Json<CreateCollectionBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut collections: Vec<Value> = settings
         .get("collections")
         .ok()
@@ -72,7 +72,7 @@ pub(super) async fn get_collection(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let collections: Vec<Value> = settings
         .get("collections")
         .ok()
@@ -92,7 +92,7 @@ pub(super) async fn delete_collection(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut collections: Vec<Value> = settings
         .get("collections")
         .ok()
@@ -114,7 +114,7 @@ pub(super) async fn collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let collections: Vec<Value> = settings
         .get("collections")
         .ok()
@@ -132,7 +132,7 @@ pub(super) async fn collection_albums(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default();
-    let album_repo = AlbumRepo::new(state.db);
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let albums: Vec<Value> = album_ids
         .iter()
         .filter_map(|&aid| album_repo.get(aid).ok().flatten().map(|a| a.to_json()))
@@ -144,7 +144,7 @@ pub(super) async fn add_album_to_collection(
     State(state): State<AppState>,
     Path(path): Path<CollectionAlbumPath>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut collections: Vec<Value> = settings
         .get("collections")
         .ok()
@@ -185,7 +185,7 @@ pub(super) async fn remove_album_from_collection(
     State(state): State<AppState>,
     Path(path): Path<CollectionAlbumPath>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut collections: Vec<Value> = settings
         .get("collections")
         .ok()

@@ -26,7 +26,7 @@ pub(super) async fn list_artists(
     State(state): State<AppState>,
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let total = repo.count().unwrap_or(0);
@@ -50,7 +50,7 @@ pub(super) async fn get_artist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(artist)) => Json(json!(artist)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -63,7 +63,7 @@ pub(super) async fn artist_bio(
     Path(id): Path<i64>,
     Query(q): Query<LangQuery>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -96,7 +96,7 @@ pub(super) async fn artist_similar(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -127,7 +127,7 @@ pub(super) async fn artist_metadata(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db.clone());
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = repo.get(id).ok().flatten();
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
@@ -158,7 +158,7 @@ pub(super) async fn artist_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<Value> {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let items = repo.list_by_artist(id).unwrap_or_default();
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
@@ -168,7 +168,7 @@ pub(super) async fn artist_tracks(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Json<Value> {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let items = repo.list_by_artist(id).unwrap_or_default();
     Json(json!(items))
 }
@@ -177,8 +177,8 @@ pub(super) async fn artist_timeline(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db.clone());
-    let artist_repo = ArtistRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = match artist_repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -209,7 +209,7 @@ pub(super) async fn artist_image(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artist = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -238,7 +238,7 @@ pub(super) async fn artist_image_upload(
     Path(id): Path<i64>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let artist_repo = ArtistRepo::new(state.db);
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let mut artist = match artist_repo.get(id) {
         Ok(Some(a)) => a,
         _ => {
@@ -296,7 +296,7 @@ pub(super) async fn artist_image_report(
     Path(id): Path<i64>,
     Json(body): Json<ImageReportBody>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let key = format!("reported_artist_image_{id}");
     let val = json!({
         "artist_id": id,

@@ -54,7 +54,7 @@ pub(super) async fn album_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -73,7 +73,7 @@ pub(super) async fn album_artwork(
             .into_response();
     }
 
-    let track_repo = TrackRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
     if let Some(track) = tracks.first()
         && let Some(ref file_path) = track.file_path
@@ -95,7 +95,7 @@ pub(super) async fn upload_album_artwork(
     Path(id): Path<i64>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let album_repo = AlbumRepo::new(state.db);
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     if album_repo.get(id).ok().flatten().is_none() {
         return (
             StatusCode::NOT_FOUND,
@@ -194,7 +194,7 @@ pub(super) async fn enrich_album_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db.clone());
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match repo.get(id) {
         Ok(Some(a)) => a,
         _ => {
@@ -281,7 +281,7 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
     let db = state.db.clone();
 
     // Check how many albums are missing covers
-    let album_repo = AlbumRepo::new(state.db.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let missing = album_repo.list_without_cover().unwrap_or_default();
 
     if missing.is_empty() {
@@ -294,7 +294,7 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
     }
 
     // Store initial status
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("artwork_enrich_status", "running").ok();
     settings
         .set(
@@ -319,14 +319,14 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
 }
 
 pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let result = settings
         .get("artwork_enrich_result")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
-    let album_repo = AlbumRepo::new(state.db);
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let still_missing = album_repo.list_without_cover().unwrap_or_default().len();
 
     Json(json!({
@@ -342,7 +342,7 @@ pub(super) async fn batch_enrich_artist_artwork(
     let db = state.db.clone();
 
     // Count artists missing MBIDs (Phase 1 candidates)
-    let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(state.db.clone());
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
     let without_mbid = artist_repo.list_without_mbid().unwrap_or_default().len();
 
     // Count artists missing images (Phase 2 candidates)
@@ -358,7 +358,7 @@ pub(super) async fn batch_enrich_artist_artwork(
     }
 
     // Store initial status
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("artist_artwork_enrich_status", "running").ok();
     settings
         .set(
@@ -391,14 +391,14 @@ pub(super) async fn batch_enrich_artist_artwork(
 pub(super) async fn batch_enrich_artist_artwork_status(
     State(state): State<AppState>,
 ) -> Json<Value> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let result = settings
         .get("artist_artwork_enrich_result")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
-    let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(state.db);
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
     let still_missing = artist_repo.list_without_image().unwrap_or_default().len();
 
     Json(json!({
@@ -411,8 +411,8 @@ pub(super) async fn rescan_album_artwork(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let track_repo = TrackRepo::new(state.db.clone());
-    let album_repo = AlbumRepo::new(state.db);
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
     if tracks.is_empty() {
         return (

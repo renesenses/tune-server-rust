@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use tune_core::db::sqlite::SqliteDb;
+use tune_core::db::backend::DbBackend;
 use tune_core::outputs::OutputRegistry;
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
@@ -26,7 +26,7 @@ pub fn spawn_ssdp_handler(
     }
 
     let outputs = state.outputs.clone();
-    let db = state.db.clone();
+    let db = state.backend.clone();
     let config = config.clone();
     let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
@@ -40,7 +40,7 @@ pub fn spawn_ssdp_handler(
                 SsdpEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
                     reg.remove(&id);
-                    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+                    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
                     let _ = zone_repo.set_online_by_device(&id, false);
                     info!(id = %id, "output_removed_zone_offline");
                 }
@@ -52,7 +52,7 @@ pub fn spawn_ssdp_handler(
 async fn handle_ssdp_discovered(
     dev: &tune_core::discovery::device::DiscoveredDevice,
     outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
-    db: &SqliteDb,
+    db: &Arc<dyn DbBackend>,
     config: &TuneConfig,
     event_bus: &Arc<tune_core::event_bus::EventBus>,
     oh_listener: &Option<Arc<OpenHomeEventListener>>,
@@ -128,7 +128,7 @@ async fn handle_ssdp_discovered(
     let name_lower = dev.name.to_lowercase();
     let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
 
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
     if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
         let _ = zone_repo.set_online_by_device(&dev.id, true);
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
@@ -197,7 +197,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
     };
 
     let outputs = state.outputs.clone();
-    let db = state.db.clone();
+    let db = state.backend.clone();
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -251,8 +251,9 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             (None, "oaat")
                         }
                         OutputType::Squeezebox => {
-                            let settings =
-                                tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+                            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(
+                                db.clone(),
+                            );
                             let current = settings
                                 .get("lms_host")
                                 .ok()
@@ -280,7 +281,8 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         reg.register(output);
                         info!(name = %dev.name, host = %dev.host, port = dev.port, r#type = output_type_str, "mdns_output_registered");
 
-                        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+                        let zone_repo =
+                            tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
                         if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
@@ -383,7 +385,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
     // didn't fire (common on Windows when multicast is partially blocked).
     {
         let outputs = state.outputs.clone();
-        let db = state.db.clone();
+        let db = state.backend.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             probe_airplay_for_bluos(&outputs, &db).await;
@@ -395,8 +397,11 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
 
 /// For every AirPlay zone, probe port 11000 to see if the device supports
 /// BluOS.  If so, register a BluOS output and upgrade the zone.
-async fn probe_airplay_for_bluos(outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>, db: &SqliteDb) {
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+async fn probe_airplay_for_bluos(
+    outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
+    db: &Arc<dyn DbBackend>,
+) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
     let zones = zone_repo.list().unwrap_or_default();
 
     let airplay_zones: Vec<_> = zones

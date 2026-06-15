@@ -51,7 +51,8 @@ fn restore_queues(state: &AppState, config: &TuneConfig) {
 /// poller's `next_position()` sees the correct values after a server restart.
 async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
     let snapshots = tune_core::queue_persistence::load_all_snapshots(&config.db_path);
-    let queue_repo = tune_core::db::play_queue_repo::PlayQueueRepo::new(state.db.clone());
+    let queue_repo =
+        tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
 
     for snap in &snapshots {
         let zone_id = snap.zone_id;
@@ -105,7 +106,7 @@ fn warm_sqlite_cache(db: &tune_core::db::sqlite::SqliteDb) {
 
 /// Initialize PlaybackManager volume from DB-stored zone volumes and mark devices offline.
 async fn restore_zone_volumes(state: &AppState) {
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             if let Some(id) = zone.id {
@@ -122,8 +123,8 @@ async fn restore_zone_volumes(state: &AppState) {
 
 /// Restore last playback positions from DB so the UI shows where playback left off.
 async fn restore_playback_positions(state: &AppState) {
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
-    let track_repo = tune_core::db::track_repo::TrackRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             let Some(zone_id) = zone.id else { continue };
@@ -170,7 +171,7 @@ async fn restore_playback_positions(state: &AppState) {
 /// Restore persisted OAAT multiroom groups from the settings DB.
 #[cfg(feature = "oaat")]
 async fn restore_oaat_groups(state: &AppState) {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let groups_json = settings
         .get("oaat_groups")
         .ok()
@@ -244,7 +245,8 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
             .map(|d| tune_core::scanner::walker::normalize_path(d))
             .filter(|d| !d.is_empty())
             .collect();
-        let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
         settings
             .set(
                 "music_dirs",
@@ -254,7 +256,8 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
     }
 
     if let Some(ref token) = config.discogs_token {
-        let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
         let already_set = settings
             .get("discogs_token")
             .ok()
@@ -275,7 +278,7 @@ pub async fn register_local_outputs(state: &AppState) {
     let devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
 
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);

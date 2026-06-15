@@ -11,7 +11,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::state::AppState;
 
 pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "scanning") {
         tracing::warn!(error = %e, "scan_status_set_failed");
     }
@@ -812,7 +812,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 }
 
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let status = settings
         .get("scan_status")
         .ok()
@@ -833,7 +833,7 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "idle") {
         tracing::warn!(error = %e, "scan_cancel_status_reset_failed");
     }
@@ -841,7 +841,7 @@ pub(super) async fn scan_cancel(State(state): State<AppState>) -> impl IntoRespo
 }
 
 pub(super) async fn scan_schedule(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let time = settings
         .get("scan_schedule_time")
         .ok()
@@ -866,7 +866,7 @@ pub(super) async fn set_scan_schedule(
     State(state): State<AppState>,
     Json(body): Json<ScanScheduleReq>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(
             "scan_schedule_enabled",
@@ -880,7 +880,7 @@ pub(super) async fn set_scan_schedule(
 }
 
 pub(super) async fn library_clear(State(state): State<AppState>) -> Json<Value> {
-    let repo = tune_core::db::track_repo::TrackRepo::new(state.db.clone());
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     match repo.delete_all() {
         Ok(count) => {
             tracing::info!(tracks_deleted = count, "library_cleared");

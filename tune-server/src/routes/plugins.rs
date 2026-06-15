@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut plugins: Vec<Value> = settings
         .get("plugins")
         .ok()
@@ -51,7 +51,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     let installed = settings
         .get(&key)
@@ -77,14 +77,14 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
 }
 
 async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
     Json(json!({ "name": name, "enabled": true }))
 }
 
 async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
     Json(json!({ "name": name, "enabled": false }))
@@ -102,7 +102,7 @@ async fn install_plugin(
     Json(_body): Json<InstallRequest>,
 ) -> Json<Value> {
     // Stub: Rust server doesn't use pip. Track state in settings.
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();
     let enabled_key = format!("plugin_{name}_enabled");
@@ -112,7 +112,7 @@ async fn install_plugin(
 
 async fn update_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // Stub: Rust server doesn't use pip. Track state in settings.
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.set(&key, "true").ok();
     Json(json!({ "name": name, "status": "updated" }))
@@ -122,7 +122,7 @@ async fn delete_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");

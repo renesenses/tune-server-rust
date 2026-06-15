@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn hqp_settings(state: &AppState) -> (String, u16, bool) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let host = settings
         .get("hqplayer_host")
         .ok()
@@ -68,7 +68,7 @@ async fn hqp_status(State(state): State<AppState>) -> Json<Value> {
 /// Get HQPlayer configuration.
 async fn hqp_config(State(state): State<AppState>) -> Json<Value> {
     let (host, port, enabled) = hqp_settings(&state);
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let auto_detect = settings
         .get("hqplayer_auto_detect")
         .ok()
@@ -96,7 +96,7 @@ async fn set_hqp_config(
     State(state): State<AppState>,
     Json(body): Json<HqpConfigBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(host) = &body.hqplayer_host {
         settings.set("hqplayer_host", host).ok();
     }
@@ -151,7 +151,7 @@ async fn discover_and_register_inner(
         Some(p) => {
             // If we detected a different port than configured, update the setting
             if p != port {
-                let settings = SettingsRepo::new(state.db.clone());
+                let settings = SettingsRepo::with_backend(state.backend.clone());
                 settings.set("hqplayer_port", &p.to_string()).ok();
                 tracing::info!(
                     configured_port = port,
@@ -186,7 +186,7 @@ async fn discover_and_register_inner(
     tracing::info!(name = %output_name, id = %device_id, host = %host, port = actual_port, "hqplayer_output_registered");
 
     // Auto-create zone if not already present
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let existing = zone_repo.list().unwrap_or_default();
     let name_taken = existing.iter().any(|z| z.name == output_name);
     let zone_name = if name_taken {

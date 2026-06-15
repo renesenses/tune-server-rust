@@ -74,7 +74,7 @@ async fn start_sacd_rip(
     State(state): State<AppState>,
     Json(body): Json<SacdRipRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     let output_dir = body
         .output_dir
@@ -109,7 +109,7 @@ async fn start_sacd_rip(
 
 /// Get current SACD rip status.
 async fn sacd_rip_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let current = settings
         .get("sacd_rip_current")
         .ok()

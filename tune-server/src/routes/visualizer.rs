@@ -18,7 +18,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn load_viz_config(state: &AppState) -> Value {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("visualizer_config")
         .ok()
@@ -57,7 +57,7 @@ async fn set_viz_config(
     State(state): State<AppState>,
     Json(body): Json<VizConfigBody>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut config = load_viz_config(&state);
     let obj = config
         .as_object_mut()

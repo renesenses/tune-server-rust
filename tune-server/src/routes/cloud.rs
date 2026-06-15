@@ -51,7 +51,7 @@ fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
 }
 
 fn redirect_uri(state: &AppState) -> String {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("mozaik_redirect_uri")
         .ok()
@@ -60,7 +60,7 @@ fn redirect_uri(state: &AppState) -> String {
 }
 
 async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -100,7 +100,7 @@ async fn sso_callback(
             .into_response();
     };
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -209,7 +209,7 @@ async fn sso_callback(
 }
 
 async fn sso_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let configured = settings
         .get("mozaik_client_id")
         .ok()
@@ -240,7 +240,7 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = TelemetryReporter::is_enabled(&settings);
     let instance_id = settings.get("instance_id").ok().flatten();
     Json(json!({
@@ -250,7 +250,7 @@ async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("telemetry_enabled", "true").ok();
     TelemetryReporter::get_or_create_instance_id(&settings);
     info!("telemetry_enabled");
@@ -258,7 +258,7 @@ async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("telemetry_enabled", "false").ok();
     info!("telemetry_disabled");
     Json(json!({ "enabled": false }))
@@ -269,7 +269,7 @@ async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
     let plugins = mp.list().await;
@@ -280,7 +280,7 @@ async fn marketplace_install(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
 
@@ -338,7 +338,7 @@ async fn marketplace_vote(
     State(state): State<AppState>,
     Json(body): Json<VoteRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
 
@@ -362,7 +362,7 @@ async fn report_artist_image(
     State(state): State<AppState>,
     Json(body): Json<ArtistImageReport>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
 
     match tune_core::cloud::community::report_artist_image(
@@ -387,7 +387,7 @@ async fn submit_genre_correction(
     State(state): State<AppState>,
     Json(body): Json<GenreCorrectionRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
 
     match tune_core::cloud::community::submit_genre_correction(
@@ -418,7 +418,7 @@ async fn submit_community_cover(
     State(state): State<AppState>,
     Json(body): Json<CoverSubmitRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings
         .get("mozaik_base_url")
         .ok()
@@ -469,7 +469,7 @@ async fn sync_community_covers(
     State(state): State<AppState>,
     Json(body): Json<CoverSyncRequest>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings
         .get("mozaik_base_url")
         .ok()

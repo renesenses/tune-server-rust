@@ -126,7 +126,7 @@ async fn demo_library(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let demo_enabled = settings.get("demo_enabled").ok().flatten().as_deref() == Some("true");
     let demo_token = settings
         .get("demo_token")
@@ -153,10 +153,10 @@ async fn demo_library(
         }
     }
 
-    let albums = tune_core::db::album_repo::AlbumRepo::new(state.db.clone())
+    let albums = tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
         .list(50, 0)
         .unwrap_or_default();
-    let stats = tune_core::db::track_repo::TrackRepo::new(state.db.clone())
+    let stats = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
 

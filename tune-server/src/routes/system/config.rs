@@ -23,8 +23,8 @@ pub(super) async fn version() -> Json<Value> {
 }
 
 pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
-    let tracks_result = TrackRepo::new(state.db.clone()).count();
-    let albums_result = AlbumRepo::new(state.db.clone()).count();
+    let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
+    let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     let db_status = if tracks_result.is_ok() {
@@ -46,11 +46,21 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let artists = ArtistRepo::new(state.db.clone()).count().unwrap_or(0);
-    let albums = AlbumRepo::new(state.db.clone()).count().unwrap_or(0);
-    let tracks = TrackRepo::new(state.db.clone()).count().unwrap_or(0);
-    let listens = HistoryRepo::new(state.db.clone()).count().unwrap_or(0);
-    let zones = ZoneRepo::new(state.db).count().unwrap_or(0);
+    let artists = ArtistRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let tracks = TrackRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let listens = HistoryRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
     // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
     let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         state.scanner.lock().await.devices().await.len()
@@ -77,7 +87,7 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
@@ -142,7 +152,7 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
@@ -179,7 +189,7 @@ pub(super) async fn update_config(
     State(state): State<AppState>,
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     for (key, value) in body.0 {
         let str_val = if value.is_string() {
             value
@@ -205,13 +215,13 @@ pub(super) async fn set_theme(
     State(state): State<AppState>,
     Json(body): Json<ThemeRequest>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("theme", &body.theme).ok();
     Json(json!({ "theme": body.theme }))
 }
 
 pub(super) async fn get_theme(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let theme = settings.get("theme").ok().flatten();
     Json(json!({ "theme": theme }))
 }
@@ -227,7 +237,7 @@ pub(super) async fn get_env() -> Json<Value> {
 }
 
 pub(super) async fn get_mode(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mode = settings
         .get("server_mode")
         .ok()
@@ -245,13 +255,13 @@ pub(super) async fn set_mode(
     State(state): State<AppState>,
     Json(body): Json<SetMode>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("server_mode", &body.mode).ok();
     Json(json!({ "mode": body.mode }))
 }
 
 pub(super) async fn export_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
     for (k, v) in all {
@@ -268,7 +278,7 @@ pub(super) async fn import_config(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut imported = 0;
     for (key, value) in body {
         let str_val = if value.is_string() {
@@ -287,7 +297,7 @@ pub(super) async fn import_config(
 }
 
 pub(super) async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("scan_result", "{}").ok();
     Json(json!({ "cleared": true }))
 }
@@ -419,7 +429,7 @@ pub(super) async fn add_music_dir(
             .into_response());
     }
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
@@ -442,7 +452,7 @@ pub(super) async fn remove_music_dir(
     Json(body): Json<AddMusicDir>,
 ) -> Result<Json<Value>, AppError> {
     let normalized = tune_core::scanner::walker::normalize_path(&body.path);
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
@@ -508,7 +518,7 @@ const METADATA_FIELDS: &[(&str, &str, &str)] = &[
 const DEFAULT_VISIBLE_FIELDS: &[&str] = &["composer", "conductor", "label"];
 
 pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled_keys: Vec<String> = settings
         .get("metadata_visible_fields")
         .ok()
@@ -551,7 +561,7 @@ pub(super) async fn set_metadata_fields(
     State(state): State<AppState>,
     Json(body): Json<MetadataFieldsBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     // Only keep keys that exist in the catalog
     let valid_keys: Vec<&str> = body
         .fields

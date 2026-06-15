@@ -8,7 +8,7 @@ use crate::state::AppState;
 
 pub(super) async fn list_system_plugins(State(state): State<AppState>) -> Json<Value> {
     // Alias for /plugins list
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let plugins: Vec<Value> = settings
         .get("plugins")
         .ok()

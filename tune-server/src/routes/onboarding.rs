@@ -33,7 +33,7 @@ pub fn router() -> Router<AppState> {
 
 /// Check if onboarding is complete.
 async fn onboarding_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let complete = settings
         .get("onboarding_complete")
         .ok()
@@ -70,7 +70,7 @@ async fn onboarding_status(State(state): State<AppState>) -> Json<Value> {
 
 /// Step 1: Welcome - marks step 1 done.
 async fn step_welcome(State(state): State<AppState>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     advance_step(&settings, 1);
     Json(json!({
         "step": "welcome",
@@ -120,7 +120,7 @@ async fn step_music_dirs(
             .into_response();
     }
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let dirs_json = serde_json::to_string(&valid_dirs).unwrap_or_else(|_| "[]".into());
     settings.set("music_dirs", &dirs_json).ok();
     advance_step(&settings, 2);
@@ -160,7 +160,7 @@ async fn step_streaming(
             .into_response();
     }
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Store credentials if provided (for services that use token auth)
     if let Some(creds) = &body.credentials {
@@ -218,7 +218,7 @@ async fn step_zones(
     Json(body): Json<ZonesBody>,
 ) -> impl IntoResponse {
     let auto_discover = body.auto_discover.unwrap_or(true);
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     if auto_discover {
         // Trigger SSDP discovery
@@ -266,10 +266,11 @@ async fn step_profile(
             .into_response();
     }
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Create profile via profile_repo
-    let profile_repo = tune_core::db::profile_repo::ProfileRepo::new(state.db.clone());
+    let profile_repo =
+        tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
     let display_name = body.name.clone();
     let avatar_color = body.avatar_color.as_deref().unwrap_or("#6366f1");
     match profile_repo.create(&display_name, Some(&display_name), Some(avatar_color)) {
@@ -303,7 +304,7 @@ async fn step_profile(
 
 /// Step 6: Mark onboarding complete. Returns summary.
 async fn step_complete(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("onboarding_complete", "true").ok();
     settings
         .set("onboarding_step", &STEPS.len().to_string())
@@ -347,7 +348,7 @@ async fn step_complete(State(state): State<AppState>) -> Json<Value> {
 
 /// Skip all steps, mark onboarding complete.
 async fn skip_onboarding(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("onboarding_complete", "true").ok();
     settings
         .set("onboarding_step", &STEPS.len().to_string())

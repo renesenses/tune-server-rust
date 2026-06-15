@@ -6,8 +6,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::db::backend::DbBackend;
 use tune_core::db::models::Track;
-use tune_core::db::sqlite::SqliteDb;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::event_bus::EventBus;
 use tune_core::scanner::walker::ScannedFile;
@@ -139,12 +139,12 @@ pub fn build_track_from_metadata(
 /// otherwise it may pick up filesystem events triggered by the scan itself
 /// (macOS FSEvents can replay recent events on watcher startup) and race
 /// with the scanner — deleting freshly inserted tracks.
-pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool> {
+pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<AtomicBool> {
     let scan_done = Arc::new(AtomicBool::new(false));
     let scan_done_clone = scan_done.clone();
     tokio::task::spawn_blocking(move || {
         info!("auto_scan_starting");
-        let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
         let raw_dirs: Vec<String> = settings
             .get("music_dirs")
             .ok()
@@ -167,9 +167,9 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
 
-        let track_repo = TrackRepo::new(db.clone());
-        let artist_repo = ArtistRepo::new(db.clone());
-        let album_repo = AlbumRepo::new(db.clone());
+        let track_repo = TrackRepo::with_backend(db.clone());
+        let artist_repo = ArtistRepo::with_backend(db.clone());
+        let album_repo = AlbumRepo::with_backend(db.clone());
 
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
         let mut known_hashes: std::collections::HashSet<(String, i64)> = track_repo
@@ -233,7 +233,11 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
                 let mut to_insert: Vec<Track> = Vec::with_capacity(batch.len());
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
 
-                db.execute_batch("BEGIN IMMEDIATE").ok();
+                // Manual transaction for batch performance (SQLite only;
+                // PG handles transactions at the pool level).
+                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                    db.execute("BEGIN IMMEDIATE", &[]).ok();
+                }
 
                 for sf in &batch {
                     if sf.metadata.is_none() {
@@ -303,7 +307,9 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
                 inserted += track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 updated += track_repo.update_batch(&to_update).unwrap_or(0) as u64;
 
-                db.execute_batch("COMMIT").ok();
+                if db.engine() == tune_core::db::engine::Engine::Sqlite {
+                    db.execute("COMMIT", &[]).ok();
+                }
             },
         );
 
@@ -365,8 +371,8 @@ pub fn spawn_auto_scan(db: SqliteDb, event_bus: Arc<EventBus>) -> Arc<AtomicBool
 /// completes before starting to monitor directories. This prevents the watcher
 /// from picking up stale FSEvents replayed on subscription and racing with the
 /// scanner (deleting tracks that the scanner just inserted).
-pub fn spawn_file_watcher(db: SqliteDb, wait_for_scan: Option<Arc<AtomicBool>>) {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<AtomicBool>>) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
@@ -418,9 +424,9 @@ pub fn spawn_file_watcher(db: SqliteDb, wait_for_scan: Option<Arc<AtomicBool>>) 
                                 let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(
                                     &files, true, None,
                                 );
-                                let track_repo = TrackRepo::new(db.clone());
-                                let artist_repo = ArtistRepo::new(db.clone());
-                                let album_repo = AlbumRepo::new(db.clone());
+                                let track_repo = TrackRepo::with_backend(db.clone());
+                                let artist_repo = ArtistRepo::with_backend(db.clone());
+                                let album_repo = AlbumRepo::with_backend(db.clone());
 
                                 for sf in &scanned {
                                     if sf.metadata.is_none() {
@@ -476,7 +482,7 @@ pub fn spawn_file_watcher(db: SqliteDb, wait_for_scan: Option<Arc<AtomicBool>>) 
                                 }
                             }
                             tune_core::scanner::watcher::ChangeType::Deleted => {
-                                let track_repo = TrackRepo::new(db.clone());
+                                let track_repo = TrackRepo::with_backend(db.clone());
                                 if track_repo.delete_by_path(&change.path).is_ok() {
                                     info!(path = %change.path, "watcher_track_removed");
                                 }

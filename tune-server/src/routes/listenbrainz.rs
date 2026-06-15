@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn lb_token(state: &AppState) -> Option<String> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("listenbrainz_token")
         .ok()
@@ -32,7 +32,7 @@ fn lb_token(state: &AppState) -> Option<String> {
 }
 
 fn lb_username(state: &AppState) -> Option<String> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("listenbrainz_username")
         .ok()

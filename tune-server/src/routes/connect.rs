@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 
 /// Qobuz Connect status — requires Qobuz partner API access.
 async fn qobuz_connect_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("qobuz_connect_enabled")
         .ok()
@@ -48,7 +48,7 @@ async fn qobuz_connect_status(State(state): State<AppState>) -> Json<Value> {
 
 /// Enable Qobuz Connect (stores preference — actual functionality requires partner API).
 async fn qobuz_connect_enable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("qobuz_connect_enabled", "true").ok();
     Json(json!({
         "enabled": true,
@@ -58,7 +58,7 @@ async fn qobuz_connect_enable(State(state): State<AppState>) -> Json<Value> {
 
 /// Disable Qobuz Connect.
 async fn qobuz_connect_disable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("qobuz_connect_enabled", "false").ok();
     Json(json!({
         "enabled": false,
@@ -70,7 +70,7 @@ async fn qobuz_connect_disable(State(state): State<AppState>) -> Json<Value> {
 
 /// Tidal Connect status — requires Tidal partner API access.
 async fn tidal_connect_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("tidal_connect_enabled")
         .ok()
@@ -95,7 +95,7 @@ async fn tidal_connect_status(State(state): State<AppState>) -> Json<Value> {
 
 /// Enable Tidal Connect (stores preference — actual functionality requires partner SDK).
 async fn tidal_connect_enable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("tidal_connect_enabled", "true").ok();
     Json(json!({
         "enabled": true,
@@ -105,7 +105,7 @@ async fn tidal_connect_enable(State(state): State<AppState>) -> Json<Value> {
 
 /// Disable Tidal Connect.
 async fn tidal_connect_disable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("tidal_connect_enabled", "false").ok();
     Json(json!({
         "enabled": false,

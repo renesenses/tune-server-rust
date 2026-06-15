@@ -39,7 +39,7 @@ async fn ai_query(
     State(state): State<AppState>,
     Json(body): Json<AiQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     let api_key = settings
         .get("anthropic_api_key")

@@ -25,7 +25,7 @@ pub fn router() -> Router<AppState> {
 }
 
 fn load_profiles(state: &AppState) -> Vec<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("room_cal_profiles")
         .ok()
@@ -35,7 +35,7 @@ fn load_profiles(state: &AppState) -> Vec<Value> {
 }
 
 fn save_profiles(state: &AppState, profiles: &[Value]) -> Result<(), AppError> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set("room_cal_profiles", &serde_json::to_string(profiles)?)
         .ok();
@@ -44,7 +44,7 @@ fn save_profiles(state: &AppState, profiles: &[Value]) -> Result<(), AppError> {
 
 /// Status of room calibration subsystem.
 async fn cal_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let profiles = load_profiles(&state);
     let active_id = settings.get("room_cal_active_profile").ok().flatten();
 
@@ -65,7 +65,7 @@ async fn cal_status(State(state): State<AppState>) -> Json<Value> {
 /// List all calibration profiles.
 async fn list_cal_profiles(State(state): State<AppState>) -> Json<Value> {
     let profiles = load_profiles(&state);
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let active_id = settings.get("room_cal_active_profile").ok().flatten();
 
     Json(json!({
@@ -145,7 +145,7 @@ async fn delete_cal_profile(
     let _ = save_profiles(&state, &profiles);
 
     // If this was the active profile, clear it
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if settings
         .get("room_cal_active_profile")
         .ok()
@@ -169,7 +169,7 @@ async fn activate_cal_profile(
 
     match profile {
         Some(p) => {
-            let settings = SettingsRepo::new(state.db.clone());
+            let settings = SettingsRepo::with_backend(state.backend.clone());
             settings.set("room_cal_active_profile", &id).ok();
             Json(json!({
                 "active_profile_id": id,
@@ -210,7 +210,7 @@ async fn start_measurement(
         return Err(AppError::not_found("profile not found"));
     }
 
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let measurement = json!({
         "status": "not_available",
         "profile_id": body.profile_id,
@@ -231,7 +231,7 @@ async fn start_measurement(
 
 /// Get current measurement status.
 async fn measurement_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let current = settings
         .get("room_cal_measurement")
         .ok()

@@ -30,7 +30,7 @@ fn persist_queue_async(state: &AppState, zone_id: i64) {
 
 async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     let zone_state = state.playback.get_state(zone_id).await;
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone_db = zone_repo.get(zone_id).ok().flatten();
     let mut v = json!({
         "id": zone_id,
@@ -239,7 +239,7 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
     let zone_state = state.playback.get_state(zone_id).await;
     let mut v = serde_json::to_value(&zone_state).unwrap_or_default();
     if let Some(track_id) = zone_state.now_playing.as_ref().and_then(|np| np.track_id) {
-        let credits = TrackRepo::new(state.db.clone())
+        let credits = TrackRepo::with_backend(state.backend.clone())
             .get_credits(track_id)
             .unwrap_or_default();
         if !credits.is_empty() {
@@ -305,7 +305,7 @@ async fn play(
                     Ok(result) => {
                         // Restore queue_length from DB so the poller can
                         // advance tracks (fixes repeat-all after restart).
-                        let qr = PlayQueueRepo::new(state.db.clone());
+                        let qr = PlayQueueRepo::with_backend(state.backend.clone());
                         let local_c = qr.count(zone_id).unwrap_or(0);
                         let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
                         let q_len = if local_c > 0 { local_c } else { stream_c };
@@ -331,8 +331,8 @@ async fn play(
         }
     };
 
-    let track_repo = TrackRepo::new(state.db.clone());
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     // --- Streaming album: fetch tracks from the service, queue them, play first ---
     if let (Some(source), Some(album_id)) = (&body.source, &body.streaming_album_id) {
@@ -364,7 +364,7 @@ async fn play(
         let first = &tracks[start];
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
-            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             zone_repo
                 .get(zone_id)
                 .ok()
@@ -444,7 +444,7 @@ async fn play(
         let first = &tracks[start];
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
-            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             zone_repo
                 .get(zone_id)
                 .ok()
@@ -509,7 +509,7 @@ async fn play(
         let duration_val = body.duration_ms.unwrap_or(0);
 
         let output_device_id = body.output_device_id.or_else(|| {
-            let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             zone_repo
                 .get(zone_id)
                 .ok()
@@ -561,7 +561,7 @@ async fn play(
             .filter_map(|t| t.id)
             .collect()
     } else if let Some(playlist_id) = body.playlist_id {
-        tune_core::db::playlist_repo::PlaylistRepo::new(state.db.clone())
+        tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone())
             .get_track_ids(playlist_id)
             .unwrap_or_default()
     } else if let Some(ids) = body.track_ids {
@@ -632,7 +632,7 @@ async fn play(
     let track = track_repo.get(target_id).ok().flatten();
 
     let output_device_id = body.output_device_id.or_else(|| {
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
         zone_repo
             .get(zone_id)
             .ok()
@@ -712,7 +712,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 Ok(result) => {
                     // Restore queue_length from DB so the poller can
                     // advance tracks (fixes repeat-all after restart).
-                    let qr = PlayQueueRepo::new(state.db.clone());
+                    let qr = PlayQueueRepo::with_backend(state.backend.clone());
                     let local_c = qr.count(zone_id).unwrap_or(0);
                     let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
                     let q_len = if local_c > 0 { local_c } else { stream_c };
@@ -734,7 +734,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
     // For a normal resume (paused → playing), also ensure queue_length is
     // populated — it may be zero after a server restart.
     {
-        let qr = PlayQueueRepo::new(state.db.clone());
+        let qr = PlayQueueRepo::with_backend(state.backend.clone());
         let local_c = qr.count(zone_id).unwrap_or(0);
         let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
         let q_len = if local_c > 0 { local_c } else { stream_c };
@@ -858,7 +858,7 @@ async fn set_repeat(
 }
 
 async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let queue_repo = PlayQueueRepo::new(state.db);
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if !items.is_empty() {
         let position = items.iter().position(|i| i.is_current).unwrap_or(0);
@@ -877,7 +877,7 @@ async fn queue_add(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueAddRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     // --- Streaming track: add to streaming queue ---
     if let (Some(source), Some(source_id)) = (&body.source, &body.source_id) {
@@ -969,7 +969,7 @@ async fn queue_move(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueMoveRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
     let from = body.from_position as usize;
     let to = body.to_position as usize;
@@ -1005,7 +1005,7 @@ async fn queue_jump(
 }
 
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
@@ -1025,7 +1025,7 @@ async fn queue_remove(
     State(state): State<AppState>,
     Path((zone_id, position)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     // Try the local play_queue first.
     match queue_repo.remove_at(zone_id, position) {
@@ -1087,7 +1087,7 @@ async fn save_queue_as_playlist(
     Path(zone_id): Path<i64>,
     Json(body): Json<SaveAsPlaylistRequest>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if items.is_empty() {
         return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
@@ -1096,7 +1096,7 @@ async fn save_queue_as_playlist(
     let name = body
         .name
         .unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
-    let playlist_repo = PlaylistRepo::new(state.db);
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
     match playlist_repo.create(&name, None) {
         Ok(id) => {
             playlist_repo.add_tracks(id, &track_ids, None).ok();
@@ -1260,7 +1260,7 @@ async fn do_transfer(
             .into_response();
     }
 
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     // Copy local queue (play_queue table)
     let local_items = queue_repo.get_queue(from_zone).unwrap_or_default();
@@ -1322,7 +1322,7 @@ async fn do_transfer(
         .await;
 
     // Start playback on the target device via the orchestrator if a device is assigned
-    let has_output = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    let has_output = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(target_zone)
         .ok()
         .flatten()
@@ -1449,7 +1449,7 @@ async fn delete_alarm(
 }
 
 fn get_zone_device_id(state: &AppState, zone_id: i64) -> Option<String> {
-    tune_core::db::zone_repo::ZoneRepo::new(state.db.clone())
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
         .flatten()
@@ -1476,7 +1476,7 @@ fn pins_key(zone_id: i64) -> String {
 }
 
 fn load_pins(state: &AppState, zone_id: i64) -> Vec<ZonePin> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get(&pins_key(zone_id))
         .ok()
@@ -1486,7 +1486,7 @@ fn load_pins(state: &AppState, zone_id: i64) -> Vec<ZonePin> {
 }
 
 fn save_pins(state: &AppState, zone_id: i64, pins: &[ZonePin]) {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(
             &pins_key(zone_id),
@@ -1562,7 +1562,7 @@ async fn save_queue_as_pin(
     Path(zone_id): Path<i64>,
     Json(body): Json<ZonePin>,
 ) -> impl IntoResponse {
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if items.is_empty() {
         return (StatusCode::BAD_REQUEST, "queue is empty").into_response();
@@ -1588,7 +1588,7 @@ async fn save_queue_as_pin(
 // ---------------------------------------------------------------------------
 
 async fn get_audiophile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
     let val = settings
         .get(&key)
@@ -1604,14 +1604,14 @@ async fn set_audiophile(
     Path(zone_id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audiophile");
     settings.set(&key, &body.to_string()).ok();
     Json(body)
 }
 
 async fn get_quality(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_quality");
     let val = settings
         .get(&key)
@@ -1627,7 +1627,7 @@ async fn set_quality(
     Path(zone_id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_quality");
     settings.set(&key, &body.to_string()).ok();
     Json(body)
@@ -1646,7 +1646,7 @@ async fn share_now_playing(
         .unwrap_or_default()
         .as_nanos();
     let token = format!("{:032x}", nanos ^ (zone_id as u128 * 0x9e3779b97f4a7c15));
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let data = json!({
         "title": np.title,
         "artist_name": np.artist_name,
@@ -1666,7 +1666,7 @@ async fn share_now_playing(
 }
 
 async fn get_audio_profile(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audio_profile");
     let val = settings
         .get(&key)
@@ -1682,7 +1682,7 @@ async fn set_audio_profile(
     Path(zone_id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_audio_profile");
     settings.set(&key, &body.to_string()).ok();
     Json(body)
@@ -1693,8 +1693,8 @@ async fn set_audio_profile(
 // ---------------------------------------------------------------------------
 
 pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
-    let track_repo = TrackRepo::new(state.db.clone());
-    let queue_repo = PlayQueueRepo::new(state.db.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     let all_ids = track_repo.random_ids(100).unwrap_or_default();
     if all_ids.is_empty() {

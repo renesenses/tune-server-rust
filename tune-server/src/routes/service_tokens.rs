@@ -10,7 +10,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::state::AppState;
 
 pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let registry = state.services.lock().await;
     let streaming_status = registry.status_all().await;
     drop(registry);
@@ -118,7 +118,7 @@ pub async fn save(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(obj) = body.as_object() {
         for (key, value) in obj {
             let skey = format!("{}_{}", id, key);
@@ -138,7 +138,7 @@ pub async fn save(
 }
 
 pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let configured = match id.as_str() {
         "lastfm" => settings.get("lastfm_api_key").ok().flatten().is_some(),
         "discogs" => {
@@ -160,7 +160,7 @@ pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl
 }
 
 pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let keys: Vec<String> = settings
         .all()
         .unwrap_or_default()
@@ -188,7 +188,7 @@ pub async fn lastfm_auth(
                 .into_response();
         }
     };
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let api_key = match settings.get("lastfm_api_key").ok().flatten() {
         Some(k) if !k.is_empty() => k,
         _ => {

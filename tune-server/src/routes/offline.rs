@@ -94,7 +94,7 @@ async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, Ap
         .unwrap_or(0);
     drop(conn);
 
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let cache_dir = offline_cache_dir(&settings);
 
     Ok(Json(json!({
@@ -108,7 +108,7 @@ async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, Ap
 }
 
 async fn offline_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let cache_dir = offline_cache_dir(&settings);
     let max_size_mb: i64 = settings
         .get("offline_max_size_mb")
@@ -141,7 +141,7 @@ async fn set_offline_config(
     State(state): State<AppState>,
     Json(body): Json<OfflineConfigReq>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(ref dir) = body.cache_dir {
         settings.set("offline_cache_dir", dir).ok();
     }
@@ -692,7 +692,7 @@ async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoRespons
     state.db.execute_batch("DELETE FROM offline_cache").ok();
 
     // Try to remove empty cache directory
-    let settings = SettingsRepo::new(state.db);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let cache_dir = offline_cache_dir(&settings);
     std::fs::remove_dir_all(&cache_dir).ok();
 

@@ -17,7 +17,7 @@ pub fn router() -> Router<AppState> {
 
 /// Roon Bridge status — Roon uses proprietary RAAT (Roon Advanced Audio Transport) protocol.
 async fn roon_status(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("roon_bridge_enabled")
         .ok()
@@ -44,7 +44,7 @@ async fn roon_status(State(state): State<AppState>) -> Json<Value> {
 
 /// Get Roon Bridge configuration.
 async fn roon_config(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("roon_bridge_enabled")
         .ok()
@@ -81,7 +81,7 @@ async fn set_roon_config(
     State(state): State<AppState>,
     Json(body): Json<RoonConfigBody>,
 ) -> Json<Value> {
-    let settings = SettingsRepo::new(state.db.clone());
+    let settings = SettingsRepo::with_backend(state.backend.clone());
 
     if let Some(v) = body.roon_bridge_enabled {
         settings

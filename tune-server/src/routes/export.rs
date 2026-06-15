@@ -19,7 +19,7 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn export_tracks_csv(State(state): State<AppState>) -> impl IntoResponse {
-    let repo = TrackRepo::new(state.db);
+    let repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = repo.list(999999, 0).unwrap_or_default();
 
     let mut csv = String::from(
@@ -46,7 +46,7 @@ async fn export_tracks_csv(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn export_albums_csv(State(state): State<AppState>) -> impl IntoResponse {
-    let repo = AlbumRepo::new(state.db);
+    let repo = AlbumRepo::with_backend(state.backend.clone());
     let albums = repo.list(999999, 0).unwrap_or_default();
 
     let mut csv =
@@ -70,7 +70,7 @@ async fn export_albums_csv(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn export_artists_csv(State(state): State<AppState>) -> impl IntoResponse {
-    let repo = ArtistRepo::new(state.db);
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let artists = repo.list(999999, 0).unwrap_or_default();
 
     let mut csv = String::from("id,name,sort_name,musicbrainz_id\n");

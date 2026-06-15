@@ -18,7 +18,7 @@ pub(super) struct FolderQuery {
 }
 
 pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()
@@ -65,7 +65,7 @@ pub(super) async fn browse_directory(
     // Verify path is under a configured music dir.
     // Use std::path::Path::starts_with for OS-aware prefix matching
     // (handles both `/` and `\` separators on Windows).
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
         .ok()

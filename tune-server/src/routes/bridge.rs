@@ -61,7 +61,7 @@ async fn ws_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Authenticate via API key
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let stored_key = settings.get("api_key").ok().flatten().unwrap_or_default();
 
     let provided_key = query.api_key.unwrap_or_default();
@@ -175,8 +175,9 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
                             reg.remove(&full_id);
                             registered_devices.lock().await.retain(|d| d != &full_id);
 
-                            let zone_repo =
-                                tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+                            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(
+                                state.backend.clone(),
+                            );
                             let _ = zone_repo.set_online_by_device(&full_id, false);
 
                             info!(device_id = %full_id, "bridge device lost");
@@ -227,7 +228,7 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
 
     let devices = registered_for_cleanup.lock().await;
     let mut reg = state.outputs.lock().await;
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for device_id in devices.iter() {
         reg.remove(device_id);
         let _ = zone_repo.set_online_by_device(device_id, false);
@@ -248,7 +249,7 @@ async fn handle_devices(
     connected: &Arc<AtomicBool>,
     registered: &Arc<Mutex<Vec<String>>>,
 ) {
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
 
     for dev in devices {
         let full_id = format!("bridge:{bridge_id}:{}", dev.id);
