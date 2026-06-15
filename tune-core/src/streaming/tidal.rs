@@ -15,14 +15,13 @@ use crate::TuneError;
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const LOGIN_BASE: &str = "https://login.tidal.com";
-const CLIENT_ID: &str = "n9JALqHugEUxV4MZ";
-const CLIENT_SECRET: &str = "lRVni78WylpAt6kLcqcUi9N0AuAgbDpurjpM33BmUPY=";
+/// tidalapi client — Device Code + refresh token work reliably.
+/// Tidal blocks sandbox apps from streaming (playback scope), so all
+/// open-source players (tidalapi, streamrip, Strawberry, Mopidy) use
+/// this established client ID.
+const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
+const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
-
-/// Legacy Device Code client — kept for backward compatibility with
-/// existing refresh tokens that were issued under this client_id.
-const LEGACY_CLIENT_ID: &str = "zU4XHVVkc2tDPo4t";
-const LEGACY_CLIENT_SECRET: &str = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4=";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TokenResponse {
@@ -817,10 +816,7 @@ impl StreamingService for TidalService {
             let resp = self
                 .client
                 .post(format!("{AUTH_BASE}/device_authorization"))
-                .form(&[
-                    ("client_id", LEGACY_CLIENT_ID),
-                    ("scope", "r_usr w_usr w_sub"),
-                ])
+                .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
                 .send()
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
@@ -883,8 +879,8 @@ impl StreamingService for TidalService {
                     .client
                     .post(format!("{AUTH_BASE}/token"))
                     .form(&[
-                        ("client_id", LEGACY_CLIENT_ID),
-                        ("client_secret", LEGACY_CLIENT_SECRET),
+                        ("client_id", CLIENT_ID),
+                        ("client_secret", CLIENT_SECRET),
                         ("device_code", pending.device_code.as_str()),
                         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                         ("scope", "r_usr w_usr w_sub"),
