@@ -15,10 +15,9 @@ use crate::TuneError;
 const API_BASE: &str = "https://api.tidal.com/v1";
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const LOGIN_BASE: &str = "https://login.tidal.com";
-/// tidalapi client — Device Code + refresh token work reliably.
-/// Tidal blocks sandbox apps from streaming (playback scope), so all
-/// open-source players (tidalapi, streamrip, Strawberry, Mopidy) use
-/// this established client ID.
+/// tidalapi client — Device Code + refresh + playback work.
+/// DEvir confirmed playback works (DASH manifest). Tidal returns
+/// application/dash+xml for Hi-Res which needs XML parsing.
 const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
 const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
@@ -1180,36 +1179,84 @@ impl StreamingService for TidalService {
             String::from_utf8(base64_decode(manifest).map_err(|e| format!("base64: {e}"))?)
                 .map_err(|e| format!("utf8: {e}"))?;
 
-        let url = if manifest_mime == "application/dash+xml" {
-            // DASH manifest (MPD XML) — extract the direct stream URL from <BaseURL>
-            extract_dash_base_url(&decoded).ok_or_else(|| {
-                format!("tidal: could not extract BaseURL from DASH manifest for track {track_id}")
-            })?
+        // Parse the manifest to get URL + optional codec/mime from the manifest itself
+        let (url, dash_codec, dash_mime) = if manifest_mime == "application/dash+xml" {
+            // DASH manifest (MPD XML) — parse to extract URL, codec, and MIME type
+            let dash = parse_dash_manifest(&decoded).ok_or_else(|| {
+                warn!(
+                    track_id,
+                    manifest_len = decoded.len(),
+                    manifest_start = &decoded[..decoded.len().min(200)],
+                    "tidal_dash_parse_failed"
+                );
+                format!("tidal: could not parse DASH manifest for track {track_id}")
+            })?;
+            info!(
+                track_id,
+                url = dash.url.as_str(),
+                dash_codec = dash.codec.as_deref().unwrap_or("none"),
+                dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
+                "tidal_dash_manifest_parsed"
+            );
+            (dash.url, dash.codec, dash.mime_type)
         } else if let Ok(manifest_json) = serde_json::from_str::<serde_json::Value>(&decoded) {
             // BTS manifest (JSON with urls array)
-            manifest_json["urls"]
+            let url = manifest_json["urls"]
                 .as_array()
                 .and_then(|urls| urls.first())
                 .and_then(|u| u.as_str())
                 .ok_or("no url in manifest")?
-                .to_string()
+                .to_string();
+            (url, None, None)
         } else {
-            decoded
+            (decoded, None, None)
         };
 
         let audio_quality = data["audioQuality"].as_str().unwrap_or("LOSSLESS");
         let (sample_rate, bit_depth) = Self::parse_quality_metadata(&data, audio_quality);
 
-        // Determine codec from the audio quality level:
-        // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
-        // Only HIGH and below are AAC
-        let codec = match audio_quality {
-            "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
-            _ => "AAC",
+        // Determine codec: prefer DASH manifest codec, then fall back to audio quality level.
+        // DASH codecs: "flac" → FLAC, "mp4a.40.2" → AAC, "mp4a.40.5" → AAC HE
+        let codec = if let Some(ref dc) = dash_codec {
+            let dc_lower = dc.to_lowercase();
+            if dc_lower == "flac" || dc_lower.starts_with("fla") {
+                "FLAC"
+            } else if dc_lower.starts_with("mp4a") || dc_lower.starts_with("aac") {
+                "AAC"
+            } else if dc_lower.starts_with("mqa") {
+                "FLAC" // MQA is delivered as FLAC container
+            } else {
+                // Unknown DASH codec — fall back to quality-based detection
+                match audio_quality {
+                    "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
+                    _ => "AAC",
+                }
+            }
+        } else {
+            // No DASH codec info — determine from audio quality level:
+            // HI_RES_LOSSLESS = FLAC Hi-Res, HI_RES = MQA/FLAC, LOSSLESS = FLAC CD
+            // Only HIGH and below are AAC
+            match audio_quality {
+                "HI_RES_LOSSLESS" | "HI_RES" | "LOSSLESS" => "FLAC",
+                _ => "AAC",
+            }
         };
 
+        // Determine MIME type: prefer DASH manifest, then derive from codec
         let mime_type = if codec == "FLAC" {
-            "audio/flac"
+            // DASH might report "audio/flac" or "audio/mp4" for FLAC-in-fMP4 container.
+            // For playback, report what the actual codec is.
+            if let Some(ref dm) = dash_mime {
+                if dm == "audio/flac" || dm == "audio/mp4" {
+                    dm.as_str()
+                } else {
+                    "audio/flac"
+                }
+            } else {
+                "audio/flac"
+            }
+        } else if let Some(ref dm) = dash_mime {
+            dm.as_str()
         } else if !manifest_mime.is_empty() && manifest_mime != "application/dash+xml" {
             manifest_mime
         } else {
@@ -1778,19 +1825,146 @@ fn is_refresh_permanently_invalid(status: u16, body: &str) -> bool {
     false
 }
 
-fn extract_dash_base_url(mpd: &str) -> Option<String> {
-    // Look for <BaseURL>...</BaseURL> — simple XML extraction without
-    // pulling in a full XML parser dependency.
-    let start_tag = "<BaseURL>";
-    let end_tag = "</BaseURL>";
-    let start = mpd.find(start_tag)? + start_tag.len();
-    let end = mpd[start..].find(end_tag)? + start;
-    let url = mpd[start..end].trim();
-    if url.starts_with("http") {
-        Some(url.to_string())
-    } else {
-        None
+/// Parsed result from a DASH MPD manifest.
+struct DashManifest {
+    /// Direct stream URL (from `<BaseURL>` or constructed from `<SegmentTemplate>`)
+    url: String,
+    /// Codec string from `<Representation codecs="...">` (e.g. "flac", "mp4a.40.2")
+    codec: Option<String>,
+    /// MIME type from `<Representation mimeType="...">` or `<AdaptationSet mimeType="...">`
+    mime_type: Option<String>,
+}
+
+/// Parse a DASH MPD manifest (XML) to extract stream URL, codec, and MIME type.
+///
+/// Tidal Hi-Res FLAC streams use DASH manifests. The MPD XML typically contains
+/// a single `<Representation>` with either a `<BaseURL>` (direct HTTPS URL to
+/// the FLAC data) or a `<SegmentTemplate>` (URL template for segmented delivery).
+///
+/// Uses `quick_xml` which is already a project dependency.
+fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(mpd);
+
+    let mut base_url: Option<String> = None;
+    let mut codec: Option<String> = None;
+    let mut mime_type: Option<String> = None;
+    let mut segment_template_media: Option<String> = None;
+    let mut segment_template_init: Option<String> = None;
+    let mut in_base_url = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let local = e.local_name();
+                let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
+
+                match tag {
+                    "BaseURL" => {
+                        in_base_url = true;
+                    }
+                    "AdaptationSet" => {
+                        // Pick up mimeType from AdaptationSet if not already set
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            if key == "mimeType" && mime_type.is_none() {
+                                mime_type = Some(val);
+                            } else if key == "codecs" && codec.is_none() {
+                                codec = Some(val);
+                            }
+                        }
+                    }
+                    "Representation" => {
+                        // Representation attributes override AdaptationSet
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            match key.as_str() {
+                                "codecs" => codec = Some(val),
+                                "mimeType" => mime_type = Some(val),
+                                _ => {}
+                            }
+                        }
+                    }
+                    "SegmentTemplate" => {
+                        for attr in e.attributes().flatten() {
+                            let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            match key.as_str() {
+                                "media" => {
+                                    segment_template_media = Some(val);
+                                }
+                                "initialization" => {
+                                    segment_template_init = Some(val);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(ref e)) => {
+                if in_base_url {
+                    let decoded = e.decode().unwrap_or_default();
+                    let url = decoded.trim().to_string();
+                    if !url.is_empty() {
+                        base_url = Some(url);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let local = e.local_name();
+                if std::str::from_utf8(local.as_ref()).unwrap_or("") == "BaseURL" {
+                    in_base_url = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
     }
+
+    // Prefer BaseURL (direct stream), fall back to SegmentTemplate initialization URL
+    let url = if let Some(ref u) = base_url {
+        if u.starts_with("http") {
+            u.clone()
+        } else {
+            // Relative BaseURL — cannot use without a base, skip
+            return None;
+        }
+    } else if let Some(ref init) = segment_template_init {
+        // SegmentTemplate: use the initialization URL if it's absolute
+        if init.starts_with("http") {
+            init.clone()
+        } else {
+            // Relative segment template — log and fail
+            warn!(
+                init_url = init.as_str(),
+                media_template = segment_template_media.as_deref().unwrap_or("none"),
+                "tidal_dash_relative_segment_template"
+            );
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    Some(DashManifest {
+        url,
+        codec,
+        mime_type,
+    })
+}
+
+/// Extract the direct stream URL from a DASH MPD manifest.
+/// Convenience wrapper around `parse_dash_manifest`.
+#[cfg(test)]
+fn extract_dash_base_url(mpd: &str) -> Option<String> {
+    parse_dash_manifest(mpd).map(|m| m.url)
 }
 
 #[cfg(test)]
@@ -2035,6 +2209,95 @@ mod tests {
     fn extract_dash_base_url_non_http() {
         let mpd = "<MPD><BaseURL>relative/path.flac</BaseURL></MPD>";
         assert!(extract_dash_base_url(mpd).is_none());
+    }
+
+    #[test]
+    fn parse_dash_manifest_flac_hires() {
+        let mpd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+  <Period>
+    <AdaptationSet mimeType="audio/flac" codecs="flac">
+      <Representation id="1" bandwidth="2304000" codecs="flac" mimeType="audio/flac">
+        <BaseURL>https://sp-pr-fa.audio.tidal.com/mediatracks/CAEaKgo/0.flac</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(
+            result.url,
+            "https://sp-pr-fa.audio.tidal.com/mediatracks/CAEaKgo/0.flac"
+        );
+        assert_eq!(result.codec.as_deref(), Some("flac"));
+        assert_eq!(result.mime_type.as_deref(), Some("audio/flac"));
+    }
+
+    #[test]
+    fn parse_dash_manifest_aac() {
+        let mpd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4">
+      <Representation codecs="mp4a.40.2" mimeType="audio/mp4" bandwidth="320000">
+        <BaseURL>https://sp-pr-cf.audio.tidal.com/mediatracks/xyz/0.mp4</BaseURL>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(
+            result.url,
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/xyz/0.mp4"
+        );
+        assert_eq!(result.codec.as_deref(), Some("mp4a.40.2"));
+        assert_eq!(result.mime_type.as_deref(), Some("audio/mp4"));
+    }
+
+    #[test]
+    fn parse_dash_manifest_codec_from_adaptation_set() {
+        // When Representation has no codecs attr, fall back to AdaptationSet
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/flac" codecs="flac">
+          <Representation><BaseURL>https://example.com/track.flac</BaseURL></Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(result.codec.as_deref(), Some("flac"));
+        assert_eq!(result.mime_type.as_deref(), Some("audio/flac"));
+    }
+
+    #[test]
+    fn parse_dash_manifest_representation_overrides_adaptation_set() {
+        // Representation codecs should override AdaptationSet codecs
+        let mpd = r#"<MPD><Period>
+          <AdaptationSet mimeType="audio/mp4" codecs="mp4a.40.2">
+            <Representation codecs="flac" mimeType="audio/flac">
+              <BaseURL>https://example.com/track.flac</BaseURL>
+            </Representation>
+          </AdaptationSet>
+        </Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(result.codec.as_deref(), Some("flac"));
+        assert_eq!(result.mime_type.as_deref(), Some("audio/flac"));
+    }
+
+    #[test]
+    fn parse_dash_manifest_no_base_url() {
+        let mpd = r#"<MPD><Period><AdaptationSet><Representation codecs="flac">
+        </Representation></AdaptationSet></Period></MPD>"#;
+        assert!(parse_dash_manifest(mpd).is_none());
+    }
+
+    #[test]
+    fn parse_dash_manifest_relative_base_url() {
+        let mpd = r#"<MPD><Period><AdaptationSet><Representation>
+          <BaseURL>relative/path.flac</BaseURL>
+        </Representation></AdaptationSet></Period></MPD>"#;
+        assert!(parse_dash_manifest(mpd).is_none());
+    }
+
+    #[test]
+    fn parse_dash_manifest_empty() {
+        assert!(parse_dash_manifest("").is_none());
+        assert!(parse_dash_manifest("<MPD></MPD>").is_none());
     }
 
     #[test]

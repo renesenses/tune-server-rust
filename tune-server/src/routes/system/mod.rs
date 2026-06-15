@@ -116,6 +116,7 @@ pub fn router() -> Router<AppState> {
         .route("/update/status", get(update::update_status))
         .route("/bug-report", get(diagnostics::generate_bug_report))
         .route("/audio-check", get(diagnostics::audio_check))
+        .route("/audio/asio-devices", get(diagnostics::asio_devices))
         .route(
             "/telemetry",
             get(diagnostics::telemetry_snapshot).post(diagnostics::telemetry_toggle),

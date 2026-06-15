@@ -220,11 +220,15 @@ pub async fn create_zone_handler(
 
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
+///
+/// `audio_backend` is the active audio backend name ("ASIO", "WASAPI",
+/// "CoreAudio", "ALSA") used for local zones' signal path display.
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
     db: &tune_core::db::sqlite::SqliteDb,
     renderer_label: Option<&str>,
+    audio_backend: &str,
 ) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
@@ -323,7 +327,17 @@ fn build_signal_path(
             }
         }
         "browser" => (true, "Browser", format_name),
-        "local" => (true, "Local", format_name),
+        "local" => {
+            // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
+            let transport = match audio_backend {
+                "ASIO" => "ASIO (exclusive)",
+                "WASAPI" => "WASAPI",
+                "CoreAudio" => "CoreAudio",
+                "ALSA" => "ALSA",
+                other => other,
+            };
+            (true, transport, format_name)
+        }
         other => (false, other, format_name),
     };
 
@@ -437,6 +451,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::new(state.db.clone());
     let zones = repo.list().unwrap_or_default();
     let devices = state.scanner.lock().await.devices().await;
+    #[cfg(feature = "local-audio")]
+    let audio_backend =
+        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+    #[cfg(not(feature = "local-audio"))]
+    let audio_backend = "none";
     let mut result = Vec::new();
     for z in &zones {
         let zone_id = z.id.unwrap_or(0);
@@ -466,7 +485,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-            let signal_path = build_signal_path(&ps, z, &state.db, renderer_label);
+            let signal_path = build_signal_path(&ps, z, &state.db, renderer_label, audio_backend);
             obj.insert("signal_path".into(), json!(signal_path));
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
@@ -492,6 +511,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
 
 async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::new(state.db.clone());
+    #[cfg(feature = "local-audio")]
+    let audio_backend =
+        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+    #[cfg(not(feature = "local-audio"))]
+    let audio_backend = "none";
     match repo.get(id) {
         Ok(Some(zone)) => {
             let ps = state.playback.get_state(id).await;
@@ -514,7 +538,8 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .output_device_id
                     .as_deref()
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-                let signal_path = build_signal_path(&ps, &zone, &state.db, renderer_label);
+                let signal_path =
+                    build_signal_path(&ps, &zone, &state.db, renderer_label, audio_backend);
                 obj.insert("signal_path".into(), json!(signal_path));
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.

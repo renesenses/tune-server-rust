@@ -286,7 +286,7 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
 /// Fetch an artist image from multiple sources (best-effort cascade).
 ///
 /// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
-/// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs.
+/// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs → Last.fm.
 pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
@@ -320,6 +320,14 @@ pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>
     if !artist_name.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name).await {
+            return Some(bytes);
+        }
+    }
+
+    // 7. Last.fm (artist.getinfo → image array, "extralarge" or "mega")
+    if !artist_name.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name).await {
             return Some(bytes);
         }
     }
@@ -496,6 +504,56 @@ async fn fetch_artist_image_discogs(
     download_image(client, cover_url).await
 }
 
+/// Fetch artist image from Last.fm using the `artist.getinfo` endpoint.
+///
+/// The response contains an `image` array with sizes: small, medium, large,
+/// extralarge, mega. We prefer "mega" first, then "extralarge".
+async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) -> Option<Vec<u8>> {
+    let api_key = std::env::var("TUNE_LASTFM_API_KEY")
+        .or_else(|_| std::env::var("LASTFM_API_KEY"))
+        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
+        .ok()?;
+    if api_key.is_empty() {
+        return None;
+    }
+    let resp = client
+        .get("https://ws.audioscrobbler.com/2.0/")
+        .query(&[
+            ("method", "artist.getinfo"),
+            ("artist", artist_name),
+            ("api_key", &api_key),
+            ("format", "json"),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let images = data.pointer("/artist/image").and_then(|v| v.as_array())?;
+
+    // Pick best available size: mega > extralarge > large
+    let image_url = ["mega", "extralarge", "large"].iter().find_map(|&size| {
+        images.iter().find_map(|img| {
+            let s = img.get("size").and_then(|v| v.as_str())?;
+            if s == size {
+                let url = img.get("#text").and_then(|v| v.as_str())?;
+                if !url.is_empty() {
+                    Some(url.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    })?;
+
+    download_image(client, &image_url).await
+}
+
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -664,14 +722,20 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
         enriched, failed, community_applied, "batch_artist_artwork_phase2_complete"
     );
 
-    // --- Phase 3: Try Discogs by name for artists without MBID and without image ---
+    // --- Phase 3: Try Discogs + Last.fm by name for artists without MBID and without image ---
     let mut discogs_enriched = 0u32;
+    let mut lastfm_enriched = 0u32;
     let discogs_available = std::env::var("TUNE_DISCOGS_TOKEN")
         .or_else(|_| std::env::var("DISCOGS_TOKEN"))
         .map(|t| !t.is_empty())
         .unwrap_or(false);
+    let lastfm_available = std::env::var("TUNE_LASTFM_API_KEY")
+        .or_else(|_| std::env::var("LASTFM_API_KEY"))
+        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
 
-    if discogs_available {
+    if discogs_available || lastfm_available {
         let no_mbid_artists = match artist_repo.list_without_image_no_mbid() {
             Ok(a) => a,
             Err(e) => {
@@ -683,7 +747,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
         if !no_mbid_artists.is_empty() {
             info!(
                 count = no_mbid_artists.len(),
-                "batch_artist_artwork_phase3_discogs_started"
+                "batch_artist_artwork_phase3_started"
             );
             let client = reqwest::Client::builder()
                 .user_agent(MB_USER_AGENT)
@@ -692,32 +756,52 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
                 .unwrap_or_default();
 
             for (artist_id, name) in &no_mbid_artists {
-                // Discogs rate limit: 60 req/min → 1s between requests
+                // Rate limit: 1s between requests
                 tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-                if let Some(data) = fetch_artist_image_discogs(&client, name).await {
-                    let hash = artwork_hash(&format!("artist-name-{name}"));
-                    std::fs::create_dir_all(&cache_dir).ok();
-                    if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
-                        artist_repo.update_image(*artist_id, &hash, "discogs").ok();
-                        discogs_enriched += 1;
-                        info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
+                // Try Discogs first
+                if discogs_available {
+                    if let Some(data) = fetch_artist_image_discogs(&client, name).await {
+                        let hash = artwork_hash(&format!("artist-name-{name}"));
+                        std::fs::create_dir_all(&cache_dir).ok();
+                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                            artist_repo.update_image(*artist_id, &hash, "discogs").ok();
+                            discogs_enriched += 1;
+                            info!(artist_id, artist = %name, "batch_artist_artwork_discogs_enriched");
+                            continue;
+                        }
+                    }
+                }
+
+                // Fallback to Last.fm
+                if lastfm_available {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    if let Some(data) = fetch_artist_image_lastfm(&client, name).await {
+                        let hash = artwork_hash(&format!("artist-name-{name}"));
+                        std::fs::create_dir_all(&cache_dir).ok();
+                        if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
+                            artist_repo.update_image(*artist_id, &hash, "lastfm").ok();
+                            lastfm_enriched += 1;
+                            info!(artist_id, artist = %name, "batch_artist_artwork_lastfm_enriched");
+                        }
                     }
                 }
             }
             info!(
                 discogs_enriched,
+                lastfm_enriched,
                 total = no_mbid_artists.len(),
                 "batch_artist_artwork_phase3_complete"
             );
         }
     }
 
-    let total_enriched = enriched + discogs_enriched;
+    let total_enriched = enriched + discogs_enriched + lastfm_enriched;
     info!(
         total_enriched,
         phase2_enriched = enriched,
         phase3_discogs = discogs_enriched,
+        phase3_lastfm = lastfm_enriched,
         community_applied,
         "batch_artist_artwork_enrichment_complete"
     );
@@ -731,6 +815,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
                 "enriched": total_enriched,
                 "phase2_enriched": enriched,
                 "phase3_discogs": discogs_enriched,
+                "phase3_lastfm": lastfm_enriched,
                 "failed": failed,
                 "community_applied": community_applied,
             })

@@ -116,6 +116,115 @@ pub fn asio_available() -> bool {
     cfg!(all(target_os = "windows", feature = "asio"))
 }
 
+/// List ASIO audio output devices specifically.
+///
+/// On Windows with the `asio` feature enabled, this enumerates devices using
+/// the ASIO host (bypassing WASAPI).  On other platforms or without the `asio`
+/// feature, returns an empty list.
+///
+/// Each returned `AsioDeviceInfo` includes the driver name, supported sample
+/// rates, max channels, and whether it's the default ASIO device.
+pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    {
+        let host = match cpal::host_from_id(cpal::HostId::Asio) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(error = %e, "asio_device_enumeration_failed — no ASIO host available");
+                return Vec::new();
+            }
+        };
+
+        let default_name = host
+            .default_output_device()
+            .and_then(|d| d.description().ok())
+            .map(|desc| desc.name().to_string())
+            .unwrap_or_default();
+
+        let mut devices = Vec::new();
+        match host.output_devices() {
+            Ok(output_devices) => {
+                for device in output_devices {
+                    let name = device
+                        .description()
+                        .map(|desc| desc.name().to_string())
+                        .unwrap_or_else(|_| "Unknown ASIO Device".into());
+
+                    let is_default = name == default_name;
+
+                    let (max_channels, sample_rates) = match device.supported_output_configs() {
+                        Ok(configs) => {
+                            let mut max_ch = 0u16;
+                            let mut rates = Vec::new();
+                            for config in configs {
+                                max_ch = max_ch.max(config.channels());
+                                let min = config.min_sample_rate();
+                                let max = config.max_sample_rate();
+                                for &rate in &[
+                                    44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+                                    705600, 768000,
+                                ] {
+                                    if rate >= min && rate <= max && !rates.contains(&rate) {
+                                        rates.push(rate);
+                                    }
+                                }
+                            }
+                            rates.sort();
+                            (max_ch, rates)
+                        }
+                        Err(_) => {
+                            // ASIO drivers usually enumerate correctly, but fall
+                            // back to conservative defaults if they don't.
+                            (2, vec![44100, 48000, 96000, 192000])
+                        }
+                    };
+
+                    info!(
+                        name = %name,
+                        is_default,
+                        max_channels,
+                        sample_rates = ?sample_rates,
+                        "asio_device_found"
+                    );
+
+                    devices.push(AsioDeviceInfo {
+                        name,
+                        is_default,
+                        max_channels,
+                        sample_rates,
+                        exclusive: true, // ASIO is always exclusive
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "asio_output_devices_enumeration_failed");
+            }
+        }
+
+        devices
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Information about an ASIO audio device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsioDeviceInfo {
+    /// ASIO driver name (e.g. "RME Babyface Pro FS ASIO").
+    pub name: String,
+    /// Whether this is the default ASIO output device.
+    pub is_default: bool,
+    /// Maximum number of output channels supported.
+    pub max_channels: u16,
+    /// Supported sample rates (Hz).
+    pub sample_rates: Vec<u32>,
+    /// ASIO devices are always in exclusive mode.
+    pub exclusive: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Device enumeration
 // ---------------------------------------------------------------------------

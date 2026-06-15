@@ -813,3 +813,27 @@ pub(super) async fn api_docs() -> Json<Value> {
         "endpoints": endpoints,
     }))
 }
+
+/// List ASIO audio devices (Windows-only, requires `asio` feature).
+pub(super) async fn asio_devices(State(_state): State<AppState>) -> Json<Value> {
+    #[cfg(feature = "local-audio")]
+    {
+        let devices = tokio::task::spawn_blocking(tune_core::outputs::local::list_asio_devices)
+            .await
+            .unwrap_or_default();
+        let count = devices.len();
+        Json(json!({
+            "devices": devices,
+            "asio_available": tune_core::outputs::local::asio_available(),
+            "count": count,
+        }))
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        Json(json!({
+            "devices": [],
+            "asio_available": false,
+            "count": 0,
+        }))
+    }
+}

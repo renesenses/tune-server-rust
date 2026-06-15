@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/scan", post(scan_devices))
         .route("/rescan", post(rescan_local_devices))
         .route("/audio", get(list_audio_devices))
+        .route("/audio/asio-devices", get(list_asio_devices))
         // buffer-stats/all must be registered before /{device_id} to avoid capture
         .route("/buffer-stats/all", get(all_buffer_stats))
         .route("/{device_id}/status", get(device_status))
@@ -412,6 +413,33 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
             "devices": [],
             "backend": "none",
             "asio_available": false,
+        }))
+    }
+}
+
+/// List ASIO audio devices (Windows-only, requires `asio` feature).
+///
+/// Returns ASIO driver names, supported sample rates, and channel counts.
+/// On non-Windows platforms or without the `asio` feature, returns an empty
+/// list with `asio_available: false`.
+async fn list_asio_devices(State(_state): State<AppState>) -> Json<Value> {
+    #[cfg(feature = "local-audio")]
+    {
+        let devices = tokio::task::spawn_blocking(tune_core::outputs::local::list_asio_devices)
+            .await
+            .unwrap_or_default();
+        Json(json!({
+            "devices": devices,
+            "asio_available": tune_core::outputs::local::asio_available(),
+            "count": devices.len(),
+        }))
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        Json(json!({
+            "devices": [],
+            "asio_available": false,
+            "count": 0,
         }))
     }
 }
