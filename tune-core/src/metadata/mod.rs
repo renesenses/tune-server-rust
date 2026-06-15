@@ -310,11 +310,21 @@ impl Id3v2Tags {
         raw.split('/').nth(1)?.trim().parse().ok()
     }
 
-    /// Parse year from TDRC (recording date) or TYER (legacy year) frame.
+    /// Parse year from TDRC, TYER, TDRL, or TDOR frame (in priority order).
     fn year(&self) -> Option<u32> {
         self.get("TDRC")
             .or_else(|| self.get("TYER"))
+            .or_else(|| self.get("TDRL"))
+            .or_else(|| self.get("TDOR"))
             .and_then(|s| s.get(..4)?.parse().ok())
+    }
+
+    fn disc_subtitle(&self) -> Option<&str> {
+        self.get("TSST")
+    }
+
+    fn release_date(&self) -> Option<&str> {
+        self.get("TDRL")
     }
 
     fn label(&self) -> Option<&str> {
@@ -604,9 +614,11 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         disc_number,
         total_tracks,
         total_discs,
+        disc_subtitle,
         year,
         original_year,
         original_date,
+        release_date,
         genre,
         genres,
         has_cover,
@@ -651,9 +663,11 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
             tags.disc_number(),
             tags.total_tracks(),
             tags.total_discs(),
+            tags.disc_subtitle().map(|s| s.to_string()),
             tags.year(),
             tags.original_year(),
             tags.original_date().map(|s| s.to_string()),
+            tags.release_date().map(|s| s.to_string()),
             genre,
             genres,
             tags.has_picture,
@@ -664,6 +678,8 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         )
     } else {
         (
+            None,
+            None,
             None,
             None,
             None,
@@ -738,10 +754,10 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         disc_number,
         total_tracks,
         total_discs,
-        disc_subtitle: None,
+        disc_subtitle,
         year,
         original_year,
-        release_date: None,
+        release_date,
         original_date,
         genre,
         genres,
@@ -1111,7 +1127,16 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         total_tracks,
         total_discs,
         disc_subtitle: get(ItemKey::SetSubtitle),
-        year: tag.date().map(|d| d.year as u32),
+        year: tag
+            .date()
+            .map(|d| d.year as u32)
+            .or_else(|| {
+                // Fallback: try TDRL (ReleaseDate), then TDOR (OriginalReleaseDate)
+                get(ItemKey::ReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok())
+            })
+            .or_else(|| {
+                get(ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok())
+            }),
         original_year,
         release_date: get(ItemKey::ReleaseDate),
         original_date: get(ItemKey::OriginalReleaseDate),

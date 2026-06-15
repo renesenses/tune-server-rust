@@ -84,6 +84,19 @@ pub fn build_track_from_metadata(
     });
     let album_id = album.as_ref().and_then(|a| a.id);
 
+    // Propagate date metadata from track tags to the album (COALESCE — only
+    // fills in values not already set, so the first track with dates wins).
+    if let Some(aid) = album_id {
+        album_repo
+            .update_dates(
+                aid,
+                meta.original_year.map(|y| y as i32),
+                meta.release_date.as_deref(),
+                meta.original_date.as_deref(),
+            )
+            .ok();
+    }
+
     let title = meta.title.clone().unwrap_or_else(|| {
         std::path::Path::new(&sf.path)
             .file_stem()
@@ -98,6 +111,7 @@ pub fn build_track_from_metadata(
     track.album_artist = meta.album_artist.clone();
     track.album_title = meta.album.clone();
     track.disc_number = meta.disc_number.unwrap_or(1) as i32;
+    track.disc_subtitle = meta.disc_subtitle.clone();
     track.track_number = meta.track_number.unwrap_or(0) as i32;
     track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
     track.file_path = Some(sf.path.clone());

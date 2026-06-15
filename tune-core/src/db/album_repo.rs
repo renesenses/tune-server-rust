@@ -142,6 +142,18 @@ pub mod sql {
         )
     }
 
+    /// Update album date fields using COALESCE so we only fill in
+    /// values that are not already set.
+    pub fn update_dates<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET original_year = COALESCE(original_year, {}), release_date = COALESCE(release_date, {}), original_date = COALESCE(original_date, {}) WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
     pub fn update_cover_path<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET cover_path = COALESCE(cover_path, {}) WHERE id = {}",
@@ -523,6 +535,26 @@ impl AlbumRepo {
             &album.musicbrainz_release_group_id,
             &id,
         ];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Set album date fields (original_year, release_date, original_date)
+    /// using COALESCE — only fills in values not already set.
+    pub fn update_dates(
+        &self,
+        album_id: i64,
+        original_year: Option<i32>,
+        release_date: Option<&str>,
+        original_date: Option<&str>,
+    ) -> Result<(), TuneError> {
+        // Skip if all values are None — nothing to update.
+        if original_year.is_none() && release_date.is_none() && original_date.is_none() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(sql::update_dates, sql::update_dates);
+        let params: [&dyn ToSqlValue; 4] =
+            [&original_year, &release_date, &original_date, &album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }

@@ -8,6 +8,7 @@ mod import;
 mod plugins;
 mod remote;
 mod scan;
+mod tags;
 mod update;
 
 use axum::Router;
@@ -128,6 +129,7 @@ pub fn router() -> Router<AppState> {
         .route("/enrich-bios", post(enrich::enrich_bios))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
+        .route("/supported-tags", get(tags::supported_tags))
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.

@@ -64,6 +64,7 @@ fn apply_metadata_to_track(
     track.format = m.format.clone();
     track.track_number = m.track_number.unwrap_or(0) as i32;
     track.disc_number = m.disc_number.unwrap_or(1) as i32;
+    track.disc_subtitle = m.disc_subtitle.clone();
 }
 
 #[derive(Deserialize)]

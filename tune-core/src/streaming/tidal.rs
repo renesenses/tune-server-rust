@@ -1181,19 +1181,38 @@ impl StreamingService for TidalService {
 
         // Parse the manifest to get URL + optional codec/mime from the manifest itself
         let (url, dash_codec, dash_mime) = if manifest_mime == "application/dash+xml" {
+            // Log raw manifest content for debugging Hi-Res issues
+            debug!(
+                track_id,
+                manifest_len = decoded.len(),
+                manifest_content = &decoded[..decoded.len().min(500)],
+                "tidal_dash_manifest_raw"
+            );
             // DASH manifest (MPD XML) — parse to extract URL, codec, and MIME type
             let dash = parse_dash_manifest(&decoded).ok_or_else(|| {
                 warn!(
                     track_id,
                     manifest_len = decoded.len(),
-                    manifest_start = &decoded[..decoded.len().min(200)],
-                    "tidal_dash_parse_failed"
+                    manifest_content = &decoded[..decoded.len().min(500)],
+                    "tidal_dash_parse_failed — full manifest logged above"
                 );
                 format!("tidal: could not parse DASH manifest for track {track_id}")
             })?;
+            // Detect suspicious URLs: too-short URLs or URLs that look like
+            // they might return a manifest instead of audio data
+            let url_len = dash.url.len();
+            if url_len < 30 {
+                warn!(
+                    track_id,
+                    url = dash.url.as_str(),
+                    url_len,
+                    "tidal_dash_suspicious_short_url"
+                );
+            }
             info!(
                 track_id,
                 url = dash.url.as_str(),
+                url_len,
                 dash_codec = dash.codec.as_deref().unwrap_or("none"),
                 dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
                 "tidal_dash_manifest_parsed"
@@ -1286,6 +1305,17 @@ impl StreamingService for TidalService {
                 },
             );
         }
+
+        // Log the final download URL — essential for diagnosing Hi-Res issues
+        // where the URL might point to the manifest itself instead of audio data.
+        debug!(
+            track_id,
+            final_url = url.as_str(),
+            url_len = url.len(),
+            codec,
+            mime_type,
+            "tidal_final_download_url"
+        );
 
         if codec == "AAC" {
             warn!(
@@ -1835,11 +1865,34 @@ struct DashManifest {
     mime_type: Option<String>,
 }
 
+/// Default Tidal CDN base used to resolve relative URLs in DASH manifests.
+/// Tidal Hi-Res FLAC manifests sometimes use relative `<BaseURL>` paths
+/// (e.g. `mediatracks/CAEaKgo/0.flac`) that need a CDN prefix.
+const TIDAL_CDN_BASE: &str = "https://sp-pr-cf.audio.tidal.com/";
+
+/// Resolve a potentially relative URL against the Tidal CDN base.
+/// Returns the URL unchanged if it's already absolute (starts with `http`).
+fn resolve_tidal_url(url: &str) -> String {
+    if url.starts_with("http") {
+        url.to_string()
+    } else if url.starts_with('/') {
+        // Absolute path — prepend scheme + host
+        format!("https://sp-pr-cf.audio.tidal.com{url}")
+    } else {
+        // Relative path — prepend full CDN base
+        format!("{TIDAL_CDN_BASE}{url}")
+    }
+}
+
 /// Parse a DASH MPD manifest (XML) to extract stream URL, codec, and MIME type.
 ///
 /// Tidal Hi-Res FLAC streams use DASH manifests. The MPD XML typically contains
 /// a single `<Representation>` with either a `<BaseURL>` (direct HTTPS URL to
 /// the FLAC data) or a `<SegmentTemplate>` (URL template for segmented delivery).
+///
+/// Relative BaseURL and SegmentTemplate URLs are resolved against the Tidal CDN
+/// base (`sp-pr-cf.audio.tidal.com`). This is essential for Hi-Res 24-bit tracks
+/// where Tidal sometimes omits the absolute URL prefix.
 ///
 /// Uses `quick_xml` which is already a project dependency.
 fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
@@ -1928,27 +1981,71 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
         }
     }
 
-    // Prefer BaseURL (direct stream), fall back to SegmentTemplate initialization URL
+    // Prefer BaseURL (direct stream), fall back to SegmentTemplate media URL
+    // (NOT initialization — init is just the MP4 header, media is the actual audio).
+    // Resolve relative URLs against the Tidal CDN base.
     let url = if let Some(ref u) = base_url {
-        if u.starts_with("http") {
-            u.clone()
-        } else {
-            // Relative BaseURL — cannot use without a base, skip
-            return None;
-        }
-    } else if let Some(ref init) = segment_template_init {
-        // SegmentTemplate: use the initialization URL if it's absolute
-        if init.starts_with("http") {
-            init.clone()
-        } else {
-            // Relative segment template — log and fail
+        let resolved = resolve_tidal_url(u);
+        if !resolved.starts_with("http") {
             warn!(
-                init_url = init.as_str(),
-                media_template = segment_template_media.as_deref().unwrap_or("none"),
-                "tidal_dash_relative_segment_template"
+                raw_base_url = u.as_str(),
+                resolved = resolved.as_str(),
+                "tidal_dash_base_url_unresolvable"
             );
             return None;
         }
+        if u != &resolved {
+            info!(
+                raw = u.as_str(),
+                resolved = resolved.as_str(),
+                "tidal_dash_relative_base_url_resolved"
+            );
+        }
+        resolved
+    } else if let Some(ref media) = segment_template_media {
+        // SegmentTemplate: prefer `media` (full audio) over `initialization` (just header).
+        // Replace DASH template variables ($Number$, $RepresentationID$, etc.)
+        // with defaults so we get a usable URL for single-segment streams.
+        let expanded = media
+            .replace("$Number$", "0")
+            .replace("$RepresentationID$", "1")
+            .replace("$Bandwidth$", "0")
+            .replace("$Time$", "0");
+        let resolved = resolve_tidal_url(&expanded);
+        if !resolved.starts_with("http") {
+            warn!(
+                media_template = media.as_str(),
+                expanded = expanded.as_str(),
+                init_url = segment_template_init.as_deref().unwrap_or("none"),
+                "tidal_dash_segment_template_unresolvable"
+            );
+            return None;
+        }
+        info!(
+            media_template = media.as_str(),
+            resolved = resolved.as_str(),
+            init_url = segment_template_init.as_deref().unwrap_or("none"),
+            "tidal_dash_segment_template_resolved"
+        );
+        resolved
+    } else if let Some(ref init) = segment_template_init {
+        // Last resort: initialization-only SegmentTemplate (no media attr).
+        // This is typically just the MP4 header — it will be small, but
+        // it's better to try than to fail silently.
+        let resolved = resolve_tidal_url(init);
+        if !resolved.starts_with("http") {
+            warn!(
+                init_url = init.as_str(),
+                "tidal_dash_init_only_segment_template_unresolvable"
+            );
+            return None;
+        }
+        warn!(
+            init_url = init.as_str(),
+            resolved = resolved.as_str(),
+            "tidal_dash_init_only_no_media_template — URL may be header-only"
+        );
+        resolved
     } else {
         return None;
     };
@@ -2206,9 +2303,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_dash_base_url_non_http() {
-        let mpd = "<MPD><BaseURL>relative/path.flac</BaseURL></MPD>";
-        assert!(extract_dash_base_url(mpd).is_none());
+    fn extract_dash_base_url_relative_resolved() {
+        let mpd = "<MPD><BaseURL>mediatracks/abc123/0.flac</BaseURL></MPD>";
+        let url = extract_dash_base_url(mpd);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://sp-pr-cf.audio.tidal.com/mediatracks/abc123/0.flac")
+        );
     }
 
     #[test]
@@ -2287,11 +2388,54 @@ mod tests {
     }
 
     #[test]
-    fn parse_dash_manifest_relative_base_url() {
+    fn parse_dash_manifest_relative_base_url_resolved() {
         let mpd = r#"<MPD><Period><AdaptationSet><Representation>
-          <BaseURL>relative/path.flac</BaseURL>
+          <BaseURL>mediatracks/CAEaKgo/0.flac</BaseURL>
         </Representation></AdaptationSet></Period></MPD>"#;
-        assert!(parse_dash_manifest(mpd).is_none());
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(
+            result.url,
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/CAEaKgo/0.flac"
+        );
+    }
+
+    #[test]
+    fn parse_dash_manifest_absolute_path_base_url() {
+        let mpd = r#"<MPD><Period><AdaptationSet><Representation>
+          <BaseURL>/mediatracks/xyz/0.flac</BaseURL>
+        </Representation></AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(
+            result.url,
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/xyz/0.flac"
+        );
+    }
+
+    #[test]
+    fn parse_dash_manifest_segment_template_media() {
+        // SegmentTemplate with media attribute should be used (not initialization)
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/flac" codecs="flac">
+          <Representation>
+            <SegmentTemplate initialization="https://cdn.tidal.com/init.mp4" media="https://cdn.tidal.com/seg-$Number$.flac"/>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(result.url, "https://cdn.tidal.com/seg-0.flac");
+    }
+
+    #[test]
+    fn parse_dash_manifest_segment_template_relative() {
+        // Relative SegmentTemplate media URL should be resolved against Tidal CDN
+        let mpd = r#"<MPD><Period><AdaptationSet mimeType="audio/flac">
+          <Representation>
+            <SegmentTemplate media="mediatracks/abc/seg-$Number$.flac" initialization="mediatracks/abc/init.mp4"/>
+          </Representation>
+        </AdaptationSet></Period></MPD>"#;
+        let result = parse_dash_manifest(mpd).unwrap();
+        assert_eq!(
+            result.url,
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/abc/seg-0.flac"
+        );
     }
 
     #[test]
@@ -2574,5 +2718,29 @@ mod tests {
         assert_eq!(result, "SGVsbG8");
         // Ensure no padding
         assert!(!result.contains('='));
+    }
+
+    #[test]
+    fn resolve_tidal_url_absolute() {
+        assert_eq!(
+            resolve_tidal_url("https://sp-pr-fa.audio.tidal.com/mediatracks/abc/0.flac"),
+            "https://sp-pr-fa.audio.tidal.com/mediatracks/abc/0.flac"
+        );
+    }
+
+    #[test]
+    fn resolve_tidal_url_relative_path() {
+        assert_eq!(
+            resolve_tidal_url("mediatracks/abc/0.flac"),
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/abc/0.flac"
+        );
+    }
+
+    #[test]
+    fn resolve_tidal_url_absolute_path() {
+        assert_eq!(
+            resolve_tidal_url("/mediatracks/abc/0.flac"),
+            "https://sp-pr-cf.audio.tidal.com/mediatracks/abc/0.flac"
+        );
     }
 }

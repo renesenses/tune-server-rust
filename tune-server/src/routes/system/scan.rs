@@ -292,6 +292,16 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
                     let album_id = album.as_ref().and_then(|a| a.id);
 
+                    // Propagate date metadata from track tags to the album
+                    if let Some(aid) = album_id {
+                        album_repo.update_dates(
+                            aid,
+                            meta.original_year.map(|y| y as i32),
+                            meta.release_date.as_deref(),
+                            meta.original_date.as_deref(),
+                        ).ok();
+                    }
+
                     if let Some(aid) = album_id
                         && !albums_with_cover.contains(&aid)
                         && let Some(hash) = tune_core::library::artwork::get_or_extract(
@@ -359,6 +369,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                         track.album_artist = meta.album_artist.clone();
                         track.album_title = meta.album.clone();
                         track.disc_number = meta.disc_number.unwrap_or(1) as i32;
+                        track.disc_subtitle = meta.disc_subtitle.clone();
                         track.track_number = meta.track_number.unwrap_or(0) as i32;
                         track.duration_ms = meta.duration_ms.unwrap_or(0) as i64;
                         track.file_path = Some(sf.path.clone());
