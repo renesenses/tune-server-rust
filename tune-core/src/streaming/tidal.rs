@@ -1454,9 +1454,10 @@ impl StreamingService for TidalService {
             Some(320_000) // AAC HIGH = 320kbps
         };
 
-        // Do not cache file:// URLs from DASH multi-segment downloads — the temp
-        // file is consumed once and then deleted by the orchestrator.
-        if !is_dash_file {
+        // Cache all URLs including file:// from DASH — prevents double-download
+        // when gapless pre-buffers the same track. The orchestrator should NOT
+        // delete the temp file until the track finishes playing.
+        {
             let mut cache = self.url_cache.lock().await;
             cache.set(
                 track_id.to_string(),
