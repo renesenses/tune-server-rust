@@ -751,11 +751,11 @@ impl PlaybackOrchestrator {
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
             // affect the actual audio stream served to the output device.
-            // Skip DSD/exotic formats that need heavy conversion — they go
-            // through the transcode path which already computes levels inline.
+            // Skip DSD (1-bit at MHz rates, can't decode inline for levels)
+            // and exotic formats that need heavy conversion.
             let skip_passthrough_levels = source_format
                 .as_ref()
-                .is_some_and(|f| f.needs_transcode_for_dlna());
+                .is_some_and(|f| f.needs_transcode_for_dlna() || *f == AudioFormat::Dsd);
             if !skip_passthrough_levels {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();
