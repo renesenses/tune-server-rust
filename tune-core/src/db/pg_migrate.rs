@@ -340,7 +340,7 @@ CREATE TABLE IF NOT EXISTS album_ratings (
     id BIGSERIAL PRIMARY KEY,
     album_id TEXT NOT NULL,
     profile_id TEXT NOT NULL DEFAULT 1,
-    rating TEXT NOT NULL CHECK(rating >= 1 AND rating <= 5),
+    rating TEXT NOT NULL,
     note TEXT,
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     UNIQUE(album_id, profile_id)
