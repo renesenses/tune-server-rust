@@ -1170,6 +1170,17 @@ impl PlaybackOrchestrator {
             let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
             (url, Some(session_id), "audio/wav".to_string())
         } else if is_https {
+            let codec_lower = stream_data.quality.codec.to_lowercase();
+            // AAC/MP4 streams need transcoding for DLNA — most renderers
+            // (DMP-A8, etc.) don't support AAC via DLNA. Proxy as FLAC.
+            let serve_ext = if codec_lower == "aac"
+                || codec_lower == "mp4"
+                || stream_data.mime_type.contains("mp4")
+            {
+                "flac"
+            } else {
+                &codec_lower
+            };
             let session_id = self
                 .streamer
                 .create_proxy_session(info, stream_data.url.clone(), false)
@@ -1177,12 +1188,15 @@ impl PlaybackOrchestrator {
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
-            let url = self.streamer.get_stream_url(
-                &session_id,
-                &server_ip,
-                &stream_data.quality.codec.to_lowercase(),
-            );
-            (url, Some(session_id), stream_data.mime_type.clone())
+            let url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, serve_ext);
+            let out_mime = if serve_ext == "flac" {
+                "audio/flac".to_string()
+            } else {
+                stream_data.mime_type.clone()
+            };
+            (url, Some(session_id), out_mime)
         } else {
             (stream_data.url.clone(), None, stream_data.mime_type.clone())
         };
