@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reqwest::Client;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
@@ -31,6 +33,8 @@ pub struct DlnaOutput {
     /// next track causes the renderer to display stale metadata (wrong
     /// duration, format) on every other track.
     next_item_id_flip: AtomicBool,
+    /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
+    micromega_ip: Option<String>,
 }
 
 impl DlnaOutput {
@@ -41,6 +45,23 @@ impl DlnaOutput {
         av_transport_url: String,
         rendering_control_url: String,
     ) -> Self {
+        let micromega_ip = if name.to_lowercase().contains("micromega") {
+            let ip = host
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !ip.is_empty() {
+                info!(device = %name, ip = %ip, "micromega_device_detected — proprietary volume on port 7000");
+                Some(ip)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Self {
             name,
             device_id,
@@ -59,6 +80,7 @@ impl DlnaOutput {
                 .unwrap_or_default(),
             play_delay_ms: 0,
             next_item_id_flip: AtomicBool::new(false),
+            micromega_ip,
         }
     }
 
@@ -330,6 +352,27 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
+        if let Some(ip) = &self.micromega_ip {
+            let target_vol = volume * 100.0;
+            let msg = format!("GET /volume HTTP/1.0\r\n\r\nvolume={target_vol:.1}\r\n");
+            let addr = format!("{ip}:7000");
+            match tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&addr))
+                .await
+            {
+                Ok(Ok(mut stream)) => {
+                    let _ = stream.write_all(msg.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    debug!(device = %self.name, volume = target_vol, "micromega_volume_set");
+                }
+                Ok(Err(e)) => {
+                    warn!(device = %self.name, volume = target_vol, error = %e, "micromega_volume_error");
+                }
+                Err(_) => {
+                    warn!(device = %self.name, volume = target_vol, "micromega_volume_timeout");
+                }
+            }
+            return Ok(());
+        }
         let level = (volume * 100.0).round() as u32;
         self.rc_action("SetVolume", &format!(
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>"
