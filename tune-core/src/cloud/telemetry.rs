@@ -119,18 +119,19 @@ impl TelemetryReporter {
 mod tests {
     use super::*;
     use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
 
-    fn fresh_db() -> SqliteDb {
+    fn fresh_db() -> std::sync::Arc<dyn crate::db::backend::DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
-        db
+        std::sync::Arc::new(db)
     }
 
     #[test]
     fn instance_id_persists() {
         let db = fresh_db();
-        let settings = SettingsRepo::new(db);
+        let settings = SettingsRepo::with_backend(db);
         let id1 = TelemetryReporter::get_or_create_instance_id(&settings);
         let id2 = TelemetryReporter::get_or_create_instance_id(&settings);
         assert_eq!(id1, id2);
@@ -140,14 +141,14 @@ mod tests {
     #[test]
     fn telemetry_disabled_by_default() {
         let db = fresh_db();
-        let settings = SettingsRepo::new(db);
+        let settings = SettingsRepo::with_backend(db);
         assert!(!TelemetryReporter::is_enabled(&settings));
     }
 
     #[test]
     fn telemetry_opt_in() {
         let db = fresh_db();
-        let settings = SettingsRepo::new(db);
+        let settings = SettingsRepo::with_backend(db);
         settings.set("telemetry_enabled", "true").unwrap();
         assert!(TelemetryReporter::is_enabled(&settings));
     }

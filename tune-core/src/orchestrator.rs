@@ -2136,6 +2136,7 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
         PlaybackOrchestrator::new(
             db,
             Arc::new(PlaybackManager::new()),
@@ -2420,10 +2421,11 @@ mod tests {
             )
             .unwrap();
         for i in 1..=3i64 {
+            let title = format!("Track {i}");
             orch.db
                 .execute(
                     "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) VALUES (?, ?, 1, 1, 180000)",
-                    &[&i, &format!("Track {i}") as &dyn rusqlite::types::ToSql],
+                    &[&i as &dyn crate::db::backend::ToSqlValue, &title as &dyn crate::db::backend::ToSqlValue],
                 )
                 .unwrap();
         }
