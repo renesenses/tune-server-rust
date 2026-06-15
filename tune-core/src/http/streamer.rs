@@ -191,6 +191,9 @@ impl AudioStreamer {
         // from gapless prep or interrupted playback are cleaned up sooner by
         // the orchestrator; this GC is the safety net.
         sessions.retain(|id, s| {
+            if s.is_radio {
+                return true;
+            }
             let age = s.created_at.elapsed();
             if age > std::time::Duration::from_secs(300) {
                 info!(stream_id = %id, age_secs = age.as_secs(), "stale_session_removed");

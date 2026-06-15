@@ -332,7 +332,9 @@ async fn proxy_stream(
     req_headers: &HeaderMap,
 ) -> Response {
     let client = if is_radio {
-        tune_core::http::client::long_timeout()
+        // Radio streams are infinite — use a client with no total timeout
+        // so the connection stays alive until the user stops playback.
+        tune_core::http::client::infinite_stream()
     } else {
         tune_core::http::client::long_timeout()
     };
