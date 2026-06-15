@@ -1,35 +1,58 @@
 use serde_json::{Value, json};
 
-use crate::db::sqlite::SqliteDb;
+use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 
-pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Value> {
-    let conn = db.read_connection().lock().unwrap();
+fn rows_to_json(rows: &[Vec<SqlValue>]) -> Vec<Value> {
+    rows.iter()
+        .map(|r| {
+            json!({
+                "track_id": r[0].as_i64().unwrap_or(0),
+                "title": r[1].as_string().unwrap_or_default(),
+                "artist": r[2].as_string(),
+                "album": r[3].as_string(),
+                "duration_ms": r[4].as_i64().unwrap_or(0),
+                "genre": r[5].as_string(),
+                "year": r[6].as_i64(),
+                "bpm": r[7].as_f64(),
+            })
+        })
+        .collect()
+}
 
+pub fn generate_queue(
+    db: &std::sync::Arc<dyn DbBackend>,
+    seed_track_id: i64,
+    count: usize,
+) -> Vec<Value> {
     // Load seed track metadata
-    let seed = conn
-        .query_row(
+    let seed = db
+        .query_one(
             "SELECT t.genre, t.year, t.bpm FROM tracks t WHERE t.id = ?",
-            rusqlite::params![seed_track_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<i32>>(1)?,
-                    row.get::<_, Option<f64>>(2)?,
-                ))
-            },
+            &[&seed_track_id],
         )
-        .ok();
+        .ok()
+        .flatten();
 
-    let (genre, year, bpm) = seed.unwrap_or((None, None, None));
+    let (genre, year, bpm) = seed
+        .map(|r| {
+            (
+                r[0].as_string(),
+                r[1].as_i64().map(|v| v as i32),
+                r[2].as_f64(),
+            )
+        })
+        .unwrap_or((None, None, None));
 
-    // Build dynamic query based on available seed metadata
+    // Build dynamic query based on available seed metadata.
+    // We use positional params (?1, ?2, ...) and collect owned
+    // SqlValue params so we can pass &dyn ToSqlValue slices.
     let mut conditions = vec!["t.id != ?1".to_string()];
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(seed_track_id)];
+    let mut owned_params: Vec<crate::db::backend::SqlValue> = vec![seed_track_id.to_sql_value()];
     let mut param_idx = 2;
 
     if let Some(ref g) = genre {
         conditions.push(format!("t.genre LIKE ?{param_idx}"));
-        params.push(Box::new(format!("%{g}%")));
+        owned_params.push(format!("%{g}%").to_sql_value());
         param_idx += 1;
     }
 
@@ -38,16 +61,16 @@ pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Va
             "t.year BETWEEN ?{param_idx} AND ?{}",
             param_idx + 1
         ));
-        params.push(Box::new(y - 5));
-        params.push(Box::new(y + 5));
+        owned_params.push((y - 5).to_sql_value());
+        owned_params.push((y + 5).to_sql_value());
         param_idx += 2;
     }
 
     if let Some(b) = bpm {
         if b > 0.0 {
             conditions.push(format!("t.bpm BETWEEN ?{param_idx} AND ?{}", param_idx + 1));
-            params.push(Box::new(b * 0.85));
-            params.push(Box::new(b * 1.15));
+            owned_params.push((b * 0.85).to_sql_value());
+            owned_params.push((b * 1.15).to_sql_value());
         }
     }
 
@@ -61,63 +84,30 @@ pub fn generate_queue(db: &SqliteDb, seed_track_id: i64, count: usize) -> Vec<Va
          ORDER BY RANDOM() LIMIT ?",
     );
 
-    params.push(Box::new(count as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    owned_params.push((count as i64).to_sql_value());
+    let param_refs: Vec<&dyn ToSqlValue> =
+        owned_params.iter().map(|p| p as &dyn ToSqlValue).collect();
 
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(json!({
-                "track_id": row.get::<_, i64>(0)?,
-                "title": row.get::<_, String>(1)?,
-                "artist": row.get::<_, Option<String>>(2)?,
-                "album": row.get::<_, Option<String>>(3)?,
-                "duration_ms": row.get::<_, i64>(4)?,
-                "genre": row.get::<_, Option<String>>(5)?,
-                "year": row.get::<_, Option<i32>>(6)?,
-                "bpm": row.get::<_, Option<f64>>(7)?,
-            }))
-        })
-        .ok();
-
-    let mut results: Vec<Value> = rows
-        .map(|r| r.collect::<Result<Vec<_>, _>>().unwrap_or_default())
+    let mut results = db
+        .query_many(&sql, &param_refs)
+        .map(|r| rows_to_json(&r))
         .unwrap_or_default();
 
     // Fallback to random if no matches
     if results.is_empty() && (genre.is_some() || year.is_some() || bpm.is_some()) {
-        let mut fallback = conn
-            .prepare(
+        let cnt = count as i64;
+        results = db
+            .query_many(
                 "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
-                 FROM tracks t \
-                 LEFT JOIN artists ar ON t.artist_id = ar.id \
-                 LEFT JOIN albums al ON t.album_id = al.id \
-                 WHERE t.id != ? \
-                 ORDER BY RANDOM() LIMIT ?",
+             FROM tracks t \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             WHERE t.id != ? \
+             ORDER BY RANDOM() LIMIT ?",
+                &[&seed_track_id, &cnt],
             )
-            .ok();
-        if let Some(ref mut s) = fallback {
-            results = s
-                .query_map(rusqlite::params![seed_track_id, count as i64], |row| {
-                    Ok(json!({
-                        "track_id": row.get::<_, i64>(0)?,
-                        "title": row.get::<_, String>(1)?,
-                        "artist": row.get::<_, Option<String>>(2)?,
-                        "album": row.get::<_, Option<String>>(3)?,
-                        "duration_ms": row.get::<_, i64>(4)?,
-                        "genre": row.get::<_, Option<String>>(5)?,
-                        "year": row.get::<_, Option<i32>>(6)?,
-                        "bpm": row.get::<_, Option<f64>>(7)?,
-                    }))
-                })
-                .ok()
-                .map(|r| r.collect::<Result<Vec<_>, _>>().unwrap_or_default())
-                .unwrap_or_default();
-        }
+            .map(|r| rows_to_json(&r))
+            .unwrap_or_default();
     }
 
     results
@@ -229,8 +219,11 @@ impl Mood {
     }
 }
 
-pub fn generate_mood_queue(db: &SqliteDb, mood: Mood, count: usize) -> Vec<Value> {
-    let conn = db.read_connection().lock().unwrap();
+pub fn generate_mood_queue(
+    db: &std::sync::Arc<dyn DbBackend>,
+    mood: Mood,
+    count: usize,
+) -> Vec<Value> {
     let (bpm_min, bpm_max) = mood.bpm_range();
     let genres = mood.genres();
 
@@ -254,59 +247,25 @@ pub fn generate_mood_queue(db: &SqliteDb, mood: Mood, count: usize) -> Vec<Value
          ORDER BY RANDOM() LIMIT ?",
     );
 
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = stmt
-        .query_map(rusqlite::params![bpm_min, bpm_max, count as i64], |row| {
-            Ok(json!({
-                "track_id": row.get::<_, i64>(0)?,
-                "title": row.get::<_, String>(1)?,
-                "artist": row.get::<_, Option<String>>(2)?,
-                "album": row.get::<_, Option<String>>(3)?,
-                "duration_ms": row.get::<_, i64>(4)?,
-                "genre": row.get::<_, Option<String>>(5)?,
-                "year": row.get::<_, Option<i32>>(6)?,
-                "bpm": row.get::<_, Option<f64>>(7)?,
-            }))
-        })
-        .ok();
-
-    let mut results: Vec<Value> = rows
-        .map(|r| r.collect::<Result<Vec<_>, _>>().unwrap_or_default())
+    let cnt = count as i64;
+    let mut results = db
+        .query_many(&sql, &[&bpm_min, &bpm_max, &cnt])
+        .map(|r| rows_to_json(&r))
         .unwrap_or_default();
 
     // Fallback to random if mood filter too restrictive
     if results.is_empty() {
-        let mut fallback = conn
-            .prepare(
+        results = db
+            .query_many(
                 "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
-                 FROM tracks t \
-                 LEFT JOIN artists ar ON t.artist_id = ar.id \
-                 LEFT JOIN albums al ON t.album_id = al.id \
-                 ORDER BY RANDOM() LIMIT ?",
+             FROM tracks t \
+             LEFT JOIN artists ar ON t.artist_id = ar.id \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             ORDER BY RANDOM() LIMIT ?",
+                &[&cnt],
             )
-            .ok();
-        if let Some(ref mut s) = fallback {
-            results = s
-                .query_map(rusqlite::params![count as i64], |row| {
-                    Ok(json!({
-                        "track_id": row.get::<_, i64>(0)?,
-                        "title": row.get::<_, String>(1)?,
-                        "artist": row.get::<_, Option<String>>(2)?,
-                        "album": row.get::<_, Option<String>>(3)?,
-                        "duration_ms": row.get::<_, i64>(4)?,
-                        "genre": row.get::<_, Option<String>>(5)?,
-                        "year": row.get::<_, Option<i32>>(6)?,
-                        "bpm": row.get::<_, Option<f64>>(7)?,
-                    }))
-                })
-                .ok()
-                .map(|r| r.collect::<Result<Vec<_>, _>>().unwrap_or_default())
-                .unwrap_or_default();
-        }
+            .map(|r| rows_to_json(&r))
+            .unwrap_or_default();
     }
 
     results

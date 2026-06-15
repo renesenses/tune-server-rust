@@ -278,7 +278,7 @@ pub(super) async fn enrich_album_artwork(
 
 pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
-    let db = state.db.clone();
+    let db = state.backend.clone();
 
     // Check how many albums are missing covers
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -339,7 +339,7 @@ pub(super) async fn batch_enrich_artist_artwork(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
-    let db = state.db.clone();
+    let db = state.backend.clone();
 
     // Count artists missing MBIDs (Phase 1 candidates)
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());

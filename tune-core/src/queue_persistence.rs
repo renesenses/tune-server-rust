@@ -2,12 +2,13 @@
 //! server restarts. Files are stored alongside the database (same parent dir).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::PlayQueueRepo;
-use crate::db::sqlite::SqliteDb;
 use crate::playback::ZoneState;
 
 /// Snapshot of a zone's queue state, serialized to JSON.
@@ -53,14 +54,14 @@ fn queue_file_path(db_path: &str, zone_id: i64) -> PathBuf {
 }
 
 /// Save the current queue state for a zone to a JSON file.
-pub fn save_queue(db: &SqliteDb, db_path: &str, zone_id: i64, zone_state: &ZoneState) {
+pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_state: &ZoneState) {
     let dir = queue_dir(db_path);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(zone_id, error = %e, "queue_persist_mkdir_failed");
         return;
     }
 
-    let repo = PlayQueueRepo::new(db.clone());
+    let repo = PlayQueueRepo::with_backend(db.clone());
 
     // Gather local queue track IDs
     let local_items = repo.get_queue(zone_id).unwrap_or_default();
@@ -117,7 +118,7 @@ pub fn save_queue(db: &SqliteDb, db_path: &str, zone_id: i64, zone_state: &ZoneS
 
 /// Restore all saved queue snapshots from disk and repopulate the DB tables.
 /// Called at server startup.
-pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
+pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
     let dir = queue_dir(db_path);
     if !dir.exists() {
         return;
@@ -131,7 +132,7 @@ pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
         }
     };
 
-    let repo = PlayQueueRepo::new(db.clone());
+    let repo = PlayQueueRepo::with_backend(db.clone());
     let mut restored = 0usize;
 
     for entry in entries.flatten() {
@@ -166,7 +167,7 @@ pub fn restore_all_queues(db: &SqliteDb, db_path: &str) {
 
         // Restore local queue — filter out track IDs that no longer exist in DB
         if !snapshot.local_track_ids.is_empty() {
-            let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+            let track_repo = crate::db::track_repo::TrackRepo::with_backend(db.clone());
             let valid_ids: Vec<i64> = snapshot
                 .local_track_ids
                 .iter()

@@ -9,20 +9,20 @@ use crate::state::AppState;
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
-    deduplicate_zones(&state.db);
+    deduplicate_zones(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
     restore_queues(state, config);
     restore_queue_metadata(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
-    warm_sqlite_cache(&state.db);
+    warm_sqlite_cache(state);
 }
 
 /// Remove duplicate zones (same output_device_id) and add a unique index to
 /// prevent future duplicates.  Must run before any discovery task starts.
-fn deduplicate_zones(db: &tune_core::db::sqlite::SqliteDb) {
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(db.clone());
+fn deduplicate_zones(state: &AppState) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     match zone_repo.deduplicate() {
         Ok(removed) if removed > 0 => {
             info!(removed, "zone_duplicates_removed");
@@ -34,7 +34,7 @@ fn deduplicate_zones(db: &tune_core::db::sqlite::SqliteDb) {
     }
     // Add a unique index on output_device_id (idempotent) so duplicate zones
     // can never be created again at the SQL level.
-    if let Err(e) = db.execute_batch(
+    if let Err(e) = state.backend.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
@@ -43,7 +43,7 @@ fn deduplicate_zones(db: &tune_core::db::sqlite::SqliteDb) {
 
 /// Restore persisted queue snapshots from JSON files on disk.
 fn restore_queues(state: &AppState, config: &TuneConfig) {
-    tune_core::queue_persistence::restore_all_queues(&state.db, &config.db_path);
+    tune_core::queue_persistence::restore_all_queues(&state.backend, &config.db_path);
 }
 
 /// After queues are restored into the DB, load snapshot metadata (repeat_mode,
@@ -96,11 +96,11 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
 }
 
 /// Touch key tables so SQLite page cache is warm for the first UI load.
-fn warm_sqlite_cache(db: &tune_core::db::sqlite::SqliteDb) {
+fn warm_sqlite_cache(state: &AppState) {
     use tune_core::db::{album_repo::AlbumRepo, artist_repo::ArtistRepo, track_repo::TrackRepo};
-    let _ = TrackRepo::new(db.clone()).count();
-    let _ = AlbumRepo::new(db.clone()).count();
-    let _ = ArtistRepo::new(db.clone()).count();
+    let _ = TrackRepo::with_backend(state.backend.clone()).count();
+    let _ = AlbumRepo::with_backend(state.backend.clone()).count();
+    let _ = ArtistRepo::with_backend(state.backend.clone()).count();
     info!("sqlite_cache_warmed");
 }
 

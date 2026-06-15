@@ -170,8 +170,8 @@ fn strip_html(s: &str) -> String {
 
 /// Batch enrich artist bios: Wikipedia FR via Wikidata + Last.fm fallback.
 /// Submits each bio to mozaiklabs.fr community API.
-pub async fn batch_enrich_artist_bios(db: crate::db::sqlite::SqliteDb) {
-    let artist_repo = crate::db::artist_repo::ArtistRepo::new(db.clone());
+pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) {
+    let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
     let artists = match artist_repo.list_without_bio() {
         Ok(a) => a,
         Err(e) => {
@@ -197,7 +197,7 @@ pub async fn batch_enrich_artist_bios(db: crate::db::sqlite::SqliteDb) {
         .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
         .unwrap_or_default();
 
-    let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let instance_id = settings
         .get("instance_id")
         .ok()
@@ -267,7 +267,7 @@ pub async fn batch_enrich_artist_bios(db: crate::db::sqlite::SqliteDb) {
 }
 
 /// Batch enrich album bios via Last.fm album.getInfo.
-pub async fn batch_enrich_album_bios(db: crate::db::sqlite::SqliteDb) {
+pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) {
     let lastfm_key = std::env::var("LASTFM_API_KEY")
         .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
         .unwrap_or_default();
@@ -276,7 +276,7 @@ pub async fn batch_enrich_album_bios(db: crate::db::sqlite::SqliteDb) {
         return;
     }
 
-    let album_repo = crate::db::album_repo::AlbumRepo::new(db.clone());
+    let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let albums = match album_repo.list_without_bio() {
         Ok(a) => a,
         Err(e) => {
@@ -329,7 +329,7 @@ pub async fn batch_enrich_album_bios(db: crate::db::sqlite::SqliteDb) {
         enriched, failed, "batch_album_bio_enrichment_complete"
     );
 
-    let settings = crate::db::settings_repo::SettingsRepo::new(db);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
     settings
         .set(
             "album_bio_enrich_result",

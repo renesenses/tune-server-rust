@@ -270,8 +270,10 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
 
 /// Batch-match artists without MBID by searching MusicBrainz.
 /// Returns the number of artists matched.
-pub async fn batch_match_artist_mbids(db: crate::db::sqlite::SqliteDb) -> usize {
-    let repo = crate::db::artist_repo::ArtistRepo::new(db);
+pub async fn batch_match_artist_mbids(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+) -> usize {
+    let repo = crate::db::artist_repo::ArtistRepo::with_backend(db);
     let artists = repo.list_without_mbid().unwrap_or_default();
 
     if artists.is_empty() {

@@ -133,8 +133,8 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.
-fn get_music_dirs_list(db: &tune_core::db::sqlite::SqliteDb) -> Vec<String> {
-    SettingsRepo::new(db.clone())
+fn get_music_dirs_list(db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Vec<String> {
+    SettingsRepo::with_backend(db.clone())
         .get("music_dirs")
         .ok()
         .flatten()

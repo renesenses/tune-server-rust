@@ -1,5 +1,7 @@
+use crate::db::backend::DbBackend;
 use crate::db::sqlite::SqliteDb;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,19 +19,37 @@ pub struct HistoryEntry {
     pub listened_ms: i64,
 }
 
+fn row_to_entry(r: &[crate::db::backend::SqlValue]) -> HistoryEntry {
+    HistoryEntry {
+        id: r[0].as_i64().unwrap_or(0),
+        track_id: r[1].as_i64(),
+        title: r[2].as_string().unwrap_or_default(),
+        artist_name: r[3].as_string(),
+        album_title: r[4].as_string(),
+        source: r[5].as_string().unwrap_or_else(|| "local".into()),
+        source_id: r[6].as_string(),
+        zone_id: r[7].as_i64().unwrap_or(0),
+        played_at: r[8].as_i64().unwrap_or(0),
+        duration_ms: r[9].as_i64().unwrap_or(0),
+        listened_ms: r[10].as_i64().unwrap_or(0),
+    }
+}
+
 pub struct PlaybackHistory {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl PlaybackHistory {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
     pub fn setup_table(&self) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute_batch(
+        self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS playback_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 track_id INTEGER,
@@ -46,7 +66,6 @@ impl PlaybackHistory {
             CREATE INDEX IF NOT EXISTS idx_ph_played_at ON playback_history(played_at);
             CREATE INDEX IF NOT EXISTS idx_ph_track_id ON playback_history(track_id);",
         )
-        .map_err(|e| e.to_string())
     }
 
     pub fn record(
@@ -66,106 +85,55 @@ impl PlaybackHistory {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute(
+        use crate::db::backend::ToSqlValue;
+        self.db.execute(
             "INSERT INTO playback_history \
              (track_id, title, artist_name, album_title, source, source_id, \
               zone_id, played_at, duration_ms, listened_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                track_id,
-                title,
-                artist_name,
-                album_title,
-                source,
-                source_id,
-                zone_id,
-                played_at,
-                duration_ms,
-                listened_ms,
+            &[
+                &track_id as &dyn ToSqlValue,
+                &title,
+                &artist_name as &dyn ToSqlValue,
+                &album_title as &dyn ToSqlValue,
+                &source,
+                &source_id as &dyn ToSqlValue,
+                &zone_id,
+                &played_at,
+                &duration_ms,
+                &listened_ms,
             ],
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
 
-        Ok(conn.last_insert_rowid())
+        Ok(self.db.last_insert_rowid())
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, title, artist_name, album_title, \
-                 source, source_id, zone_id, played_at, duration_ms, listened_ms \
-                 FROM playback_history ORDER BY played_at DESC LIMIT ?1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let entries = stmt
-            .query_map([limit as i64], |row| {
-                Ok(HistoryEntry {
-                    id: row.get(0)?,
-                    track_id: row.get(1)?,
-                    title: row.get(2)?,
-                    artist_name: row.get(3)?,
-                    album_title: row.get(4)?,
-                    source: row.get(5)?,
-                    source_id: row.get(6)?,
-                    zone_id: row.get(7)?,
-                    played_at: row.get(8)?,
-                    duration_ms: row.get(9)?,
-                    listened_ms: row.get(10)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(entries)
+        let lim = limit as i64;
+        let rows = self.db.query_many(
+            "SELECT id, track_id, title, artist_name, album_title, \
+             source, source_id, zone_id, played_at, duration_ms, listened_ms \
+             FROM playback_history ORDER BY played_at DESC LIMIT ?1",
+            &[&lim],
+        )?;
+        Ok(rows.iter().map(|r| row_to_entry(r)).collect())
     }
 
     pub fn since(&self, timestamp: i64) -> Result<Vec<HistoryEntry>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, title, artist_name, album_title, \
-                 source, source_id, zone_id, played_at, duration_ms, listened_ms \
-                 FROM playback_history WHERE played_at >= ?1 ORDER BY played_at DESC",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let entries = stmt
-            .query_map([timestamp], |row| {
-                Ok(HistoryEntry {
-                    id: row.get(0)?,
-                    track_id: row.get(1)?,
-                    title: row.get(2)?,
-                    artist_name: row.get(3)?,
-                    album_title: row.get(4)?,
-                    source: row.get(5)?,
-                    source_id: row.get(6)?,
-                    zone_id: row.get(7)?,
-                    played_at: row.get(8)?,
-                    duration_ms: row.get(9)?,
-                    listened_ms: row.get(10)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(entries)
+        let rows = self.db.query_many(
+            "SELECT id, track_id, title, artist_name, album_title, \
+             source, source_id, zone_id, played_at, duration_ms, listened_ms \
+             FROM playback_history WHERE played_at >= ?1 ORDER BY played_at DESC",
+            &[&timestamp],
+        )?;
+        Ok(rows.iter().map(|r| row_to_entry(r)).collect())
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM playback_history", [], |row| {
-            row.get(0)
-        })
-        .map_err(|e| e.to_string())
+        let row = self
+            .db
+            .query_one("SELECT COUNT(*) FROM playback_history", &[])?;
+        Ok(row.and_then(|r| r[0].as_i64()).unwrap_or(0))
     }
 
     pub fn top_tracks(
@@ -173,8 +141,6 @@ impl PlaybackHistory {
         limit: usize,
         since: Option<i64>,
     ) -> Result<Vec<(String, Option<String>, i64)>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
         let sql = if let Some(ts) = since {
             format!(
                 "SELECT title, artist_name, COUNT(*) as cnt \
@@ -188,26 +154,21 @@ impl PlaybackHistory {
                  GROUP BY title, artist_name ORDER BY cnt DESC LIMIT {limit}"
             )
         };
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let results = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_string().unwrap_or_default(),
+                    r[1].as_string(),
+                    r[2].as_i64().unwrap_or(0),
+                )
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(results)
+            .collect())
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute("DELETE FROM playback_history", [])
-            .map_err(|e| e.to_string())?;
+        self.db.execute("DELETE FROM playback_history", &[])?;
         Ok(())
     }
 }

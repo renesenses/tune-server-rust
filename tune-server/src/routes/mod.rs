@@ -97,7 +97,7 @@ async fn auto_dj_handler(
         )
             .into_response();
     }
-    let tracks = tune_core::playback::auto_dj::generate_queue(&state.db, seed, count);
+    let tracks = tune_core::playback::auto_dj::generate_queue(&state.backend, seed, count);
     axum::Json(serde_json::json!({
         "seed_track": seed,
         "count": tracks.len(),

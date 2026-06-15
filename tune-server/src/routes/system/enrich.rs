@@ -12,15 +12,14 @@ use crate::error::AppError;
 use crate::state::AppState;
 
 pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoResponse {
-    let db = state.db.clone();
+    let db = state.backend.clone();
     let cache_dir = crate::routes::library::artwork_cache_dir();
-    let artist_db = state.db.clone();
     let artist_cache_dir = cache_dir.clone();
     tokio::spawn(async move {
         tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
-    let mbid_db = state.db.clone();
-    let art_db = artist_db.clone();
+    let mbid_db = state.backend.clone();
+    let art_db = state.backend.clone();
     let art_cache = artist_cache_dir.clone();
     tokio::spawn(async move {
         // 1. Match MusicBrainz IDs for artists without one
@@ -37,8 +36,8 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
 }
 
 pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoResponse {
-    let artist_db = state.db.clone();
-    let album_db = state.db.clone();
+    let artist_db = state.backend.clone();
+    let album_db = state.backend.clone();
 
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -67,14 +66,14 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
 
-    let merged_albums = merge_duplicate_albums(&state.db)?;
+    let merged_albums = merge_duplicate_albums(&state.backend)?;
     let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
     let orphan_artists = artist_repo.cleanup_orphans().unwrap_or(0);
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .deduplicate()
         .unwrap_or(0);
 
-    let orphan_artwork = cleanup_orphan_artwork(&state.db)?;
+    let orphan_artwork = cleanup_orphan_artwork(&state.backend)?;
 
     let db_optimized = state.db.execute_batch("PRAGMA optimize; ANALYZE;").is_ok();
 
@@ -88,20 +87,23 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
     })))
 }
 
-fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, AppError> {
-    let conn = db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    // Case-insensitive grouping: LOWER(title) catches duplicates that differ
-    // only by case (e.g. "The Dark Side of the Moon" vs "The Dark Side Of The Moon").
-    let dupes: Vec<(String, String)> = conn
-        .prepare("SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+fn merge_duplicate_albums(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<i64, AppError> {
+    use tune_core::db::backend::DbBackend;
+    let dupe_rows = db.query_many(
+        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1",
+        &[],
+    ).unwrap_or_default();
+    let dupes: Vec<(String, String)> = dupe_rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_string().unwrap_or_default(),
+                r[1].as_string().unwrap_or_default(),
+            )
         })
-        .unwrap_or_default();
+        .collect();
 
     let mut deleted = 0i64;
     for (_title, ids_str) in &dupes {
@@ -112,12 +114,11 @@ fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, A
         let mut best_id = ids[0];
         let mut best_count = 0i64;
         for &aid in &ids {
-            let cnt: i64 = conn
-                .query_row(
-                    "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                    rusqlite::params![aid],
-                    |r| r.get(0),
-                )
+            let cnt = db
+                .query_one("SELECT COUNT(id) FROM tracks WHERE album_id = ?", &[&aid])
+                .ok()
+                .flatten()
+                .and_then(|r| r[0].as_i64())
                 .unwrap_or(0);
             if cnt > best_count {
                 best_count = cnt;
@@ -126,45 +127,44 @@ fn merge_duplicate_albums(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, A
         }
         for &aid in &ids {
             if aid != best_id {
-                conn.execute(
+                db.execute(
                     "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                    rusqlite::params![best_id, aid],
+                    &[&best_id, &aid],
                 )
                 .ok();
-                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid])
-                    .ok();
+                db.execute("DELETE FROM albums WHERE id = ?", &[&aid]).ok();
                 deleted += 1;
             }
         }
     }
-    conn.execute_batch(
+    db.execute_batch(
         "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
     ).ok();
     Ok(deleted)
 }
 
-fn cleanup_orphan_artwork(db: &tune_core::db::sqlite::SqliteDb) -> Result<i64, AppError> {
+fn cleanup_orphan_artwork(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<i64, AppError> {
+    use tune_core::db::backend::DbBackend;
     let cache_dir = crate::routes::library::artwork_cache_dir();
     if !cache_dir.exists() {
         return Ok(0);
     }
 
-    let conn = db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT cover_path FROM albums WHERE cover_path IS NOT NULL \
+    let rows = db
+        .query_many(
+            "SELECT cover_path FROM albums WHERE cover_path IS NOT NULL \
          UNION SELECT image_path FROM artists WHERE image_path IS NOT NULL",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-            for hash in rows.flatten() {
-                referenced.insert(hash);
-            }
+            &[],
+        )
+        .unwrap_or_default();
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        if let Some(path) = r[0].as_string() {
+            referenced.insert(path);
         }
     }
-    drop(conn);
 
     // Walk artwork cache and delete files whose stem (hash) isn't referenced
     let mut deleted = 0i64;

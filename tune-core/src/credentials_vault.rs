@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::sqlite::SqliteDb;
 
@@ -19,11 +21,15 @@ pub struct ServiceCredential {
 }
 
 pub struct CredentialsVault {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl CredentialsVault {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
@@ -56,7 +62,7 @@ impl CredentialsVault {
     }
 
     fn load_all(&self) -> Result<HashMap<String, ServiceCredential>, String> {
-        let settings = SettingsRepo::new(self.db.clone());
+        let settings = SettingsRepo::with_backend(self.db.clone());
         let json_str = settings.get(VAULT_KEY).map_err(|e| e.to_string())?;
 
         match json_str {
@@ -69,7 +75,7 @@ impl CredentialsVault {
 
     fn save_all(&self, vault: &HashMap<String, ServiceCredential>) -> Result<(), String> {
         let json = serde_json::to_string(vault).map_err(|e| e.to_string())?;
-        let settings = SettingsRepo::new(self.db.clone());
+        let settings = SettingsRepo::with_backend(self.db.clone());
         settings.set(VAULT_KEY, &json).map_err(|e| e.to_string())
     }
 }

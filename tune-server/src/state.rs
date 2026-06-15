@@ -208,11 +208,11 @@ impl AppState {
 
     pub async fn restore_tokens(&self) {
         let registry = self.services.lock().await;
-        registry.restore_all_tokens(&self.db).await;
+        registry.restore_all_tokens(&self.backend).await;
     }
 
     pub async fn save_tokens(&self) {
         let registry = self.services.lock().await;
-        registry.save_all_tokens(&self.db).await;
+        registry.save_all_tokens(&self.backend).await;
     }
 }

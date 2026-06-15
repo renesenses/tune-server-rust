@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::db::sqlite::SqliteDb;
+use crate::db::backend::DbBackend;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GenreNode {
@@ -171,7 +172,7 @@ const GENRE_HIERARCHY: &[(&str, &[&str])] = &[
     ),
 ];
 
-pub fn build_genre_tree(db: &SqliteDb) -> Vec<GenreNode> {
+pub fn build_genre_tree(db: &Arc<dyn DbBackend>) -> Vec<GenreNode> {
     let counts = genre_counts(db);
     let mut tree = Vec::new();
 
@@ -251,27 +252,20 @@ pub fn find_parent_genre(genre: &str) -> Option<&'static str> {
     None
 }
 
-fn genre_counts(db: &SqliteDb) -> HashMap<String, i64> {
-    let conn = db.connection().lock().unwrap();
+fn genre_counts(db: &Arc<dyn DbBackend>) -> HashMap<String, i64> {
     let mut counts = HashMap::new();
 
-    let Ok(mut stmt) = conn.prepare(
+    let raw_rows = match db.query_many(
         "SELECT genre, COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != '' GROUP BY genre",
-    ) else {
-        return counts;
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(_) => return counts,
     };
 
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0).unwrap_or_default(),
-            row.get::<_, i64>(1).unwrap_or(0),
-        ))
-    }) else {
-        return counts;
-    };
-
-    for row in rows.flatten() {
-        let (genres_str, count) = row;
+    for r in &raw_rows {
+        let genres_str = r[0].as_string().unwrap_or_default();
+        let count = r[1].as_i64().unwrap_or(0);
         for g in genres_str.split(&[';', ',', '/'][..]) {
             let g = g.trim();
             if !g.is_empty() {

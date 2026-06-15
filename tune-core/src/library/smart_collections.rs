@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
+use crate::db::backend::DbBackend;
 use crate::db::sqlite::SqliteDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,12 +160,32 @@ fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
     }
 }
 
+fn row_to_collection(r: &[crate::db::backend::SqlValue]) -> SmartCollection {
+    let rules_json = r[2].as_string().unwrap_or_default();
+    let match_mode_json = r[3].as_string().unwrap_or_default();
+    let sort_order_json = r[5].as_string().unwrap_or_default();
+
+    SmartCollection {
+        id: r[0].as_i64(),
+        name: r[1].as_string().unwrap_or_default(),
+        rules: serde_json::from_str(&rules_json).unwrap_or_default(),
+        match_mode: serde_json::from_str(&match_mode_json).unwrap_or(MatchMode::All),
+        sort_by: r[4].as_string(),
+        sort_order: serde_json::from_str(&sort_order_json).unwrap_or(SortOrder::Asc),
+        limit: r[6].as_i64(),
+    }
+}
+
 pub struct SmartCollectionRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl SmartCollectionRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
@@ -173,75 +196,37 @@ impl SmartCollectionRepo {
         let sort_order =
             serde_json::to_string(&collection.sort_order).map_err(|e| e.to_string())?;
 
-        let conn = self.db.connection().lock().unwrap();
+        use crate::db::backend::ToSqlValue;
 
         if let Some(id) = collection.id {
-            conn.execute(
+            self.db.execute(
                 "UPDATE smart_collections SET name=?, rules=?, match_mode=?, sort_by=?, sort_order=?, max_limit=? WHERE id=?",
-                rusqlite::params![collection.name, rules_json, match_mode, collection.sort_by, sort_order, collection.limit, id],
-            ).map_err(|e| e.to_string())?;
+                &[&collection.name as &dyn ToSqlValue, &rules_json, &match_mode, &collection.sort_by as &dyn ToSqlValue, &sort_order, &collection.limit as &dyn ToSqlValue, &id],
+            )?;
             Ok(id)
         } else {
-            conn.execute(
+            self.db.execute(
                 "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order, max_limit) VALUES (?, ?, ?, ?, ?, ?)",
-                rusqlite::params![collection.name, rules_json, match_mode, collection.sort_by, sort_order, collection.limit],
-            ).map_err(|e| e.to_string())?;
-            Ok(conn.last_insert_rowid())
+                &[&collection.name as &dyn ToSqlValue, &rules_json, &match_mode, &collection.sort_by as &dyn ToSqlValue, &sort_order, &collection.limit as &dyn ToSqlValue],
+            )?;
+            Ok(self.db.last_insert_rowid())
         }
     }
 
     pub fn get(&self, id: i64) -> Result<Option<SmartCollection>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections WHERE id = ?")
-            .map_err(|e| e.to_string())?;
-
-        stmt.query_row(rusqlite::params![id], |row| {
-            let rules_json: String = row.get(2)?;
-            let match_mode_json: String = row.get(3)?;
-            let sort_order_json: String = row.get(5)?;
-
-            Ok(SmartCollection {
-                id: row.get(0).ok(),
-                name: row.get(1)?,
-                rules: serde_json::from_str(&rules_json).unwrap_or_default(),
-                match_mode: serde_json::from_str(&match_mode_json).unwrap_or(MatchMode::All),
-                sort_by: row.get(4).ok().flatten(),
-                sort_order: serde_json::from_str(&sort_order_json).unwrap_or(SortOrder::Asc),
-                limit: row.get(6).ok().flatten(),
-            })
-        })
-        .optional()
-        .map_err(|e| e.to_string())
+        let row = self.db.query_one(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections WHERE id = ?",
+            &[&id],
+        )?;
+        Ok(row.as_ref().map(|r| row_to_collection(r)))
     }
 
     pub fn list(&self) -> Result<Vec<SmartCollection>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections ORDER BY name")
-            .map_err(|e| e.to_string())?;
-
-        let collections = stmt
-            .query_map([], |row| {
-                let rules_json: String = row.get(2)?;
-                let match_mode_json: String = row.get(3)?;
-                let sort_order_json: String = row.get(5)?;
-
-                Ok(SmartCollection {
-                    id: row.get(0).ok(),
-                    name: row.get(1)?,
-                    rules: serde_json::from_str(&rules_json).unwrap_or_default(),
-                    match_mode: serde_json::from_str(&match_mode_json).unwrap_or(MatchMode::All),
-                    sort_by: row.get(4).ok().flatten(),
-                    sort_order: serde_json::from_str(&sort_order_json).unwrap_or(SortOrder::Asc),
-                    limit: row.get(6).ok().flatten(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(collections)
+        let rows = self.db.query_many(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections ORDER BY name",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| row_to_collection(r)).collect())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
@@ -252,25 +237,15 @@ impl SmartCollectionRepo {
 
     pub fn execute_query(&self, collection: &SmartCollection) -> Result<Vec<i64>, String> {
         let (sql, params) = collection.compile_sql();
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+        let param_refs: Vec<&dyn crate::db::backend::ToSqlValue> = params
             .iter()
-            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .map(|p| p as &dyn crate::db::backend::ToSqlValue)
             .collect();
 
-        let ids = stmt
-            .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(ids)
+        let rows = self.db.query_many(&sql, &param_refs)?;
+        Ok(rows.iter().filter_map(|r| r[0].as_i64()).collect())
     }
 }
-
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {

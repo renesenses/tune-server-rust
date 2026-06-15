@@ -1,5 +1,7 @@
+use crate::db::backend::DbBackend;
 use crate::db::sqlite::SqliteDb;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,11 +16,15 @@ pub struct RadioFavorite {
 }
 
 pub struct RadioFavoriteRepo {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
 }
 
 impl RadioFavoriteRepo {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
@@ -52,96 +58,83 @@ impl RadioFavoriteRepo {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-
-        let result = conn.execute(
+        let affected = self.db.execute(
             "INSERT OR IGNORE INTO radio_favorites \
              (title, artist, station_name, cover_url, stream_url, saved_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![title, artist, station_name, cover_url, stream_url, now],
-        );
+            &[
+                &title,
+                &artist,
+                &station_name,
+                &cover_url as &dyn crate::db::backend::ToSqlValue,
+                &stream_url as &dyn crate::db::backend::ToSqlValue,
+                &now,
+            ],
+        )?;
 
-        match result {
-            Ok(0) => Ok(None), // already exists
-            Ok(_) => {
-                let id = conn.last_insert_rowid();
-                Ok(Some(RadioFavorite {
-                    id,
-                    title: title.into(),
-                    artist: artist.into(),
-                    station_name: station_name.into(),
-                    cover_url: cover_url.map(String::from),
-                    stream_url: stream_url.map(String::from),
-                    saved_at: now,
-                }))
-            }
-            Err(e) => Err(e.to_string()),
+        if affected == 0 {
+            Ok(None) // already exists
+        } else {
+            let id = self.db.last_insert_rowid();
+            Ok(Some(RadioFavorite {
+                id,
+                title: title.into(),
+                artist: artist.into(),
+                station_name: station_name.into(),
+                cover_url: cover_url.map(String::from),
+                stream_url: stream_url.map(String::from),
+                saved_at: now,
+            }))
         }
     }
 
     pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<RadioFavorite>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at \
-                 FROM radio_favorites ORDER BY saved_at DESC LIMIT ?1 OFFSET ?2",
-            )
-            .map_err(|e| e.to_string())?;
+        let lim = limit as i64;
+        let off = offset as i64;
+        let rows = self.db.query_many(
+            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at \
+             FROM radio_favorites ORDER BY saved_at DESC LIMIT ?1 OFFSET ?2",
+            &[&lim, &off],
+        )?;
 
-        let rows = stmt
-            .query_map(rusqlite::params![limit as i64, offset as i64], |row| {
-                Ok(RadioFavorite {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    artist: row.get(2)?,
-                    station_name: row.get(3)?,
-                    cover_url: row.get(4)?,
-                    stream_url: row.get(5)?,
-                    saved_at: row.get(6)?,
-                })
+        Ok(rows
+            .into_iter()
+            .map(|r| RadioFavorite {
+                id: r[0].as_i64().unwrap_or(0),
+                title: r[1].as_string().unwrap_or_default(),
+                artist: r[2].as_string().unwrap_or_default(),
+                station_name: r[3].as_string().unwrap_or_default(),
+                cover_url: r[4].as_string(),
+                stream_url: r[5].as_string(),
+                saved_at: r[6].as_i64().unwrap_or(0),
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(rows)
+            .collect())
     }
 
     pub fn count(&self) -> Result<i64, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM radio_favorites", [], |row| row.get(0))
-            .map_err(|e| e.to_string())
+        let row = self
+            .db
+            .query_one("SELECT COUNT(*) FROM radio_favorites", &[])?;
+        Ok(row.and_then(|r| r[0].as_i64()).unwrap_or(0))
     }
 
     pub fn is_favorite(&self, title: &str, artist: &str) -> Result<bool, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM radio_favorites WHERE title = ?1 AND artist = ?2",
-                [title, artist],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let row = self.db.query_one(
+            "SELECT COUNT(*) FROM radio_favorites WHERE title = ?1 AND artist = ?2",
+            &[&title, &artist],
+        )?;
+        let count = row.and_then(|r| r[0].as_i64()).unwrap_or(0);
         Ok(count > 0)
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute("DELETE FROM radio_favorites WHERE id = ?1", [id])
-            .map_err(|e| e.to_string())?;
+        self.db
+            .execute("DELETE FROM radio_favorites WHERE id = ?1", &[&id])?;
         Ok(())
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute("DELETE FROM radio_favorites", [])
-            .map_err(|e| e.to_string())?;
+        self.db.execute("DELETE FROM radio_favorites", &[])?;
         Ok(())
     }
 

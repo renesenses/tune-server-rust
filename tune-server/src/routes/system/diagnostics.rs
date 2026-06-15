@@ -22,7 +22,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
-    let music_dirs = super::get_music_dirs_list(&state.db);
+    let music_dirs = super::get_music_dirs_list(&state.backend);
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Zone count
@@ -314,7 +314,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     let uptime_secs = state.started_at.elapsed().as_secs();
     let db_version = migrations::current_version(&state.db).unwrap_or(0);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let music_dirs = super::get_music_dirs_list(&state.db);
+    let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings
         .get("scan_status")
         .ok()

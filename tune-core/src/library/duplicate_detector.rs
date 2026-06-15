@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use md5::{Digest, Md5};
 use tracing::{info, warn};
 
-use crate::db::sqlite::SqliteDb;
+use crate::db::backend::DbBackend;
 
 const HEADER_SKIP: u64 = 8192;
 const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB
@@ -54,9 +55,7 @@ pub struct DuplicateScanResult {
     pub errors: usize,
 }
 
-pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
-    let conn = db.connection().lock().unwrap();
-
+pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanResult {
     let query = if limit > 0 {
         format!(
             "SELECT id, file_path, title, audio_hash FROM tracks \
@@ -69,8 +68,8 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
             .to_string()
     };
 
-    let mut stmt = match conn.prepare(&query) {
-        Ok(s) => s,
+    let raw_rows = match db.query_many(&query, &[]) {
+        Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "duplicate_scan_query_error");
             return DuplicateScanResult {
@@ -82,16 +81,17 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
         }
     };
 
-    let rows: Vec<(i64, String, String, Option<String>)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    let rows: Vec<(i64, String, String, Option<String>)> = raw_rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_i64().unwrap_or(0),
+                r[1].as_string().unwrap_or_default(),
+                r[2].as_string().unwrap_or_default(),
+                r[3].as_string(),
+            )
         })
-        .unwrap_or_else(|_| panic!("query_map failed"))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_default();
-
-    drop(stmt);
-    drop(conn);
+        .collect();
 
     let mut hash_map: HashMap<String, Vec<DuplicateEntry>> = HashMap::new();
     let mut scanned = 0;
@@ -103,10 +103,9 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
         } else {
             let computed = compute_audio_hash(file_path);
             if let Some(ref h) = computed {
-                let conn = db.connection().lock().unwrap();
-                let _ = conn.execute(
+                let _ = db.execute(
                     "UPDATE tracks SET audio_hash = ? WHERE id = ?",
-                    rusqlite::params![h, id],
+                    &[&h.as_str(), id],
                 );
             }
             computed
@@ -149,45 +148,34 @@ pub fn scan_duplicates(db: &SqliteDb, limit: usize) -> DuplicateScanResult {
     }
 }
 
-pub fn scan_fingerprint_duplicates(db: &SqliteDb) -> Vec<DuplicateGroup> {
-    let conn = db.read_connection().lock().unwrap();
-    let mut stmt = match conn.prepare(
+pub fn scan_fingerprint_duplicates(db: &Arc<dyn DbBackend>) -> Vec<DuplicateGroup> {
+    let raw_rows = match db.query_many(
         "SELECT t.id, t.title, ar.name, t.file_path, t.acoustid_fingerprint
          FROM tracks t
          LEFT JOIN artists ar ON t.artist_id = ar.id
          WHERE t.acoustid_fingerprint IS NOT NULL AND t.acoustid_fingerprint != ''
          ORDER BY t.acoustid_fingerprint, t.id",
+        &[],
     ) {
-        Ok(s) => s,
+        Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "fingerprint_duplicate_query_error");
             return Vec::new();
         }
     };
 
-    let rows: Vec<(i64, String, Option<String>, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .unwrap_or_else(|_| panic!("query_map failed"))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_default();
-    drop(stmt);
-    drop(conn);
-
     let mut fp_map: HashMap<String, Vec<DuplicateEntry>> = HashMap::new();
-    for (id, title, artist, path, fp) in &rows {
-        fp_map.entry(fp.clone()).or_default().push(DuplicateEntry {
-            id: *id,
-            title: title.clone(),
-            artist_name: artist.clone(),
-            file_path: path.clone(),
+    for r in &raw_rows {
+        let id = r[0].as_i64().unwrap_or(0);
+        let title = r[1].as_string().unwrap_or_default();
+        let artist = r[2].as_string();
+        let path = r[3].as_string().unwrap_or_default();
+        let fp = r[4].as_string().unwrap_or_default();
+        fp_map.entry(fp).or_default().push(DuplicateEntry {
+            id,
+            title,
+            artist_name: artist,
+            file_path: path,
         });
     }
 

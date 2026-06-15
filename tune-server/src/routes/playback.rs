@@ -17,7 +17,7 @@ use crate::state::AppState;
 
 /// Persist the queue state for a zone to disk (non-blocking).
 fn persist_queue_async(state: &AppState, zone_id: i64) {
-    let db = state.db.clone();
+    let db = state.backend.clone();
     let db_path = state.config.db_path.clone();
     let playback = state.playback.clone();
     tokio::spawn(async move {
@@ -1345,9 +1345,14 @@ async fn do_transfer(
     // Persist queue state for the target zone
     let target_state = state.playback.get_state(target_zone).await;
     let db_path = state.config.db_path.clone();
-    let db_clone = state.db.clone();
+    let backend_clone = state.backend.clone();
     tokio::task::spawn_blocking(move || {
-        tune_core::queue_persistence::save_queue(&db_clone, &db_path, target_zone, &target_state);
+        tune_core::queue_persistence::save_queue(
+            &backend_clone,
+            &db_path,
+            target_zone,
+            &target_state,
+        );
     });
 
     state.event_bus.emit(

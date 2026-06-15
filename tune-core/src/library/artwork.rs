@@ -172,8 +172,11 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
 /// artwork cache, and updates the album's `cover_path` in the database.
 ///
 /// Respects MusicBrainz rate limit: max 1 request/second.
-pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: PathBuf) {
-    let album_repo = crate::db::album_repo::AlbumRepo::new(db.clone());
+pub async fn batch_enrich_artwork(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+) {
+    let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let albums = match album_repo.list_without_cover() {
         Ok(a) => a,
         Err(e) => {
@@ -218,7 +221,7 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
                 // Store the discovered MBID on the album for future use
                 db.execute(
                     "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
-                    &[id as &dyn rusqlite::types::ToSql, album_id],
+                    &[&id.as_str() as &dyn crate::db::backend::ToSqlValue, album_id],
                 ).ok();
                 debug!(album_id, mbid = %id, album = %title, "batch_artwork_mbid_found");
             }
@@ -268,7 +271,7 @@ pub async fn batch_enrich_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: Pa
     );
 
     // Store result in settings for status reporting
-    let settings = crate::db::settings_repo::SettingsRepo::new(db);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
     settings
         .set(
             "artwork_enrich_result",
@@ -573,8 +576,11 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
 /// then submit discovered images back to the community (fire-and-forget).
 ///
 /// Respects rate limit: ~1 request/second.
-pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_dir: PathBuf) {
-    let artist_repo = crate::db::artist_repo::ArtistRepo::new(db.clone());
+pub async fn batch_enrich_artist_artwork(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+) {
+    let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
     let mut community_applied = 0u32;
@@ -633,7 +639,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
         // Store result even when nothing to fetch
-        let settings = crate::db::settings_repo::SettingsRepo::new(db);
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
         settings
             .set(
                 "artist_artwork_enrich_result",
@@ -655,7 +661,7 @@ pub async fn batch_enrich_artist_artwork(db: crate::db::sqlite::SqliteDb, cache_
     );
 
     // Get instance_id for community submissions
-    let settings = crate::db::settings_repo::SettingsRepo::new(db.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
     let instance_id = settings
         .get("instance_id")
         .ok()

@@ -303,7 +303,7 @@ pub(super) async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn get_music_dirs(State(state): State<AppState>) -> Json<Value> {
-    let dirs = super::get_music_dirs_list(&state.db);
+    let dirs = super::get_music_dirs_list(&state.backend);
     Json(json!({ "dirs": dirs }))
 }
 

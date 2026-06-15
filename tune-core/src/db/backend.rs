@@ -78,6 +78,11 @@ pub trait DbBackend: Send + Sync {
         f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
     ) -> Result<(), String>;
 
+    /// Execute a batch of SQL statements (separated by `;`).
+    /// Useful for DDL, PRAGMAs, and multi-statement init.
+    /// Returns `Ok(())` on success.
+    fn execute_batch(&self, sql: &str) -> Result<(), String>;
+
     /// Same as `query_many`, but reads through the write path so the
     /// query sees commits made by the write connection that haven't
     /// yet propagated to the read snapshot.
@@ -422,6 +427,11 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
         self.execute(sql, &refs)
     }
 
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        let conn = self.connection().lock().unwrap();
+        conn.execute_batch(sql).map_err(|e| format!("batch: {e}"))
+    }
+
     fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid()
     }
@@ -736,6 +746,27 @@ fn bind_sqlvalue_scalar<'q>(
 impl DbBackend for PostgresBackend {
     fn engine(&self) -> Engine {
         Engine::Postgres
+    }
+
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        let pool = self.pool.clone();
+        let sql_owned = sql.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                // Split on semicolons and execute each statement individually.
+                for stmt_str in sql_owned.split(';') {
+                    let trimmed = stmt_str.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    sqlx::query(sqlx::AssertSqlSafe(trimmed.to_string()))
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| format!("pg execute_batch: {e}"))?;
+                }
+                Ok(())
+            })
+        })
     }
 
     fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {

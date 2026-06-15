@@ -19,7 +19,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         tracing::warn!(error = %e, "scan_started_at_set_failed");
     }
 
-    let db = state.db.clone();
+    let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
         let db_for_panic = db.clone();
@@ -28,7 +28,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         let raw_dirs = super::get_music_dirs_list(&db);
         if raw_dirs.is_empty() {
             tracing::warn!("scan_aborted_no_dirs — no music directories configured");
-            if let Err(e) = SettingsRepo::new(db).set("scan_status", "idle") {
+            if let Err(e) = SettingsRepo::with_backend(db).set("scan_status", "idle") {
                 tracing::warn!(error = %e, "scan_status_reset_failed");
             }
             return;
@@ -55,9 +55,9 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        let track_repo = tune_core::db::track_repo::TrackRepo::new(db.clone());
-        let artist_repo = tune_core::db::artist_repo::ArtistRepo::new(db.clone());
-        let album_repo = tune_core::db::album_repo::AlbumRepo::new(db.clone());
+        let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(db.clone());
+        let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(db.clone());
+        let album_repo = tune_core::db::album_repo::AlbumRepo::with_backend(db.clone());
 
         // Load existing tracks BEFORE scanning to skip unchanged files
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
@@ -448,7 +448,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 // Store extended metadata (composer, conductor, ReplayGain, MusicBrainz, etc.)
                 // in the track_metadata table. Read extended tags and batch-insert.
                 {
-                    let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::new(db.clone());
+                    let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
                     let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
 
                     for path_str in &extended_meta_paths {
@@ -485,20 +485,18 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             .map(|id| id.to_string())
                             .collect::<Vec<_>>()
                             .join(",");
-                        if let Ok(conn) = db.connection().lock() {
-                            conn.execute_batch(&format!(
-                                "UPDATE albums SET track_count = \
-                                 (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) \
-                                 WHERE id IN ({ids_csv});\
-                                 UPDATE albums SET \
-                                 format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
-                                 sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
-                                 bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
-                                 genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1)), \
-                                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)) \
-                                 WHERE id IN ({ids_csv})"
-                            )).ok();
-                        }
+                        db.execute_batch(&format!(
+                            "UPDATE albums SET track_count = \
+                             (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id) \
+                             WHERE id IN ({ids_csv});\
+                             UPDATE albums SET \
+                             format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
+                             sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
+                             bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
+                             genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1)), \
+                             disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)) \
+                             WHERE id IN ({ids_csv})"
+                        )).ok();
                     }
                 }
 
@@ -567,40 +565,28 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             tracing::warn!(error = %e, "post_scan_begin_failed");
         }
         {
-            let conn = match db.connection().lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("post_scan_lock_failed: {e}");
-                    if let Err(e2) = db.execute_batch("ROLLBACK") {
-                        tracing::warn!(error = %e2, "post_scan_rollback_failed");
-                    }
-                    let settings = SettingsRepo::new(db.clone());
-                    settings.set("scan_status", "idle").ok();
-                    return;
-                }
-            };
-            if let Err(e) = conn.execute(
+            if let Err(e) = db.execute(
                 "UPDATE tracks SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
-                [],
+                &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_track_genres_backfill_failed");
             }
-            if let Err(e) = conn.execute(
+            if let Err(e) = db.execute(
                 "UPDATE albums SET genres = '[\"' || REPLACE(genre, '\"', '\\\"') || '\"]' \
                  WHERE genre IS NOT NULL AND genre != '' AND (genres IS NULL OR genres = '')",
-                [],
+                &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_genres_backfill_failed");
             }
-            if let Err(e) = conn.execute(
+            if let Err(e) = db.execute(
                 "UPDATE albums SET track_count = \
                  (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
-                [],
+                &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
-            if let Err(e) = conn.execute(
+            if let Err(e) = db.execute(
                 "UPDATE albums SET \
                  format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
                  sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
@@ -608,7 +594,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                  genre = COALESCE(albums.genre, (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL LIMIT 1)), \
                  genres = COALESCE(albums.genres, (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL LIMIT 1)), \
                  disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id))",
-                [],
+                &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
             }
@@ -620,17 +606,15 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             // now-empty duplicate. This is the definitive fix for bug #593
             // ("Doublons pochettes albums apres rescan").
             {
-                let dupes: Vec<(String, String)> = conn
-                    .prepare(
-                        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
-                         WHERE source = 'local' \
-                         GROUP BY LOWER(title) HAVING COUNT(id) > 1",
-                    )
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                    })
-                    .unwrap_or_default();
+                let dupe_rows = db.query_many(
+                    "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
+                     WHERE source = 'local' \
+                     GROUP BY LOWER(title) HAVING COUNT(id) > 1",
+                    &[],
+                ).unwrap_or_default();
+                let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
+                    (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
+                }).collect();
                 let mut merged_albums = 0usize;
                 for (_title, ids_str) in &dupes {
                     let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
@@ -641,13 +625,10 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     let mut best_id = ids[0];
                     let mut best_count = 0i64;
                     for &aid in &ids {
-                        let cnt: i64 = conn
-                            .query_row(
-                                "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                                rusqlite::params![aid],
-                                |r| r.get(0),
-                            )
-                            .unwrap_or(0);
+                        let cnt = db.query_one(
+                            "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
+                            &[&aid],
+                        ).ok().flatten().and_then(|r| r[0].as_i64()).unwrap_or(0);
                         if cnt > best_count {
                             best_count = cnt;
                             best_id = aid;
@@ -655,37 +636,34 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     }
                     for &aid in &ids {
                         if aid != best_id {
-                            conn.execute(
+                            db.execute(
                                 "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                                rusqlite::params![best_id, aid],
-                            )
-                            .ok();
-                            conn.execute(
+                                &[&best_id, &aid],
+                            ).ok();
+                            db.execute(
                                 "DELETE FROM albums WHERE id = ?",
-                                rusqlite::params![aid],
-                            )
-                            .ok();
+                                &[&aid],
+                            ).ok();
                             merged_albums += 1;
                         }
                     }
                 }
                 if merged_albums > 0 {
                     // Refresh track_count for albums that received tracks from merged duplicates
-                    conn.execute_batch(
+                    db.execute_batch(
                         "UPDATE albums SET track_count = \
                          (SELECT COUNT(*) FROM tracks WHERE tracks.album_id = albums.id)",
-                    )
-                    .ok();
+                    ).ok();
                     tracing::info!(merged_albums, "post_scan_duplicate_albums_merged");
                 }
             }
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
-            let orphan_albums = conn.execute(
+            let orphan_albums = db.execute(
                 "DELETE FROM albums WHERE id IN (\
                  SELECT a.id FROM albums a \
                  LEFT JOIN tracks t ON t.album_id = a.id \
                  WHERE t.id IS NULL AND a.source = 'local')",
-                [],
+                &[],
             ).unwrap_or(0);
             if orphan_albums > 0 {
                 tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
@@ -696,7 +674,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         }
 
         // Clean up orphan artists left behind after tag corrections
-        let orphan_artists = ArtistRepo::new(db.clone()).cleanup_orphans().unwrap_or(0);
+        let orphan_artists = ArtistRepo::with_backend(db.clone()).cleanup_orphans().unwrap_or(0);
         if orphan_artists > 0 {
             tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
         }
@@ -705,17 +683,24 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
         // A full rebuild after scan guarantees consistency.
-        if let Ok(conn) = db.connection().lock() {
-            match tune_core::library::full_text_search::rebuild_fts_contentless(&conn) {
-                Ok(rows) => tracing::info!(rows, "post_scan_fts_rebuilt"),
-                Err(e) => tracing::warn!(error = %e, "post_scan_fts_rebuild_failed"),
-            }
-            // Checkpoint WAL so read-only connections see all scan results
-            // immediately (prevents "stats show count but browse is empty").
-            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").ok();
+        // FTS rebuild + WAL checkpoint are SQLite-specific operations
+        if db.engine() == tune_core::db::engine::Engine::Sqlite {
+            db.execute_batch(
+                "INSERT INTO tracks_fts(tracks_fts) VALUES('delete-all');\
+                 INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) \
+                 SELECT t.id, t.title, ar.name, al.title, t.genre, t.composer \
+                 FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN albums al ON t.album_id = al.id;\
+                 INSERT INTO albums_fts(albums_fts) VALUES('delete-all');\
+                 INSERT INTO albums_fts(rowid, title, artist_name, genre) \
+                 SELECT a.id, a.title, ar.name, a.genre FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id;\
+                 INSERT INTO artists_fts(artists_fts) VALUES('delete-all');\
+                 INSERT INTO artists_fts(rowid, name, sort_name) SELECT id, name, sort_name FROM artists;\
+                 PRAGMA wal_checkpoint(PASSIVE);",
+            ).ok();
+            tracing::info!("post_scan_fts_rebuilt");
         }
 
-        let settings = SettingsRepo::new(db.clone());
+        let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {
             tracing::warn!(error = %e, "scan_status_idle_failed");
         }
@@ -802,7 +787,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         }).await;
         if let Err(e) = result {
             tracing::error!("scan_task_panicked — {:?}", e);
-            if let Err(e2) = SettingsRepo::new(db_for_panic).set("scan_status", "idle") {
+            if let Err(e2) = SettingsRepo::with_backend(db_for_panic).set("scan_status", "idle") {
                 tracing::warn!(error = %e2, "scan_status_panic_reset_failed");
             }
         }

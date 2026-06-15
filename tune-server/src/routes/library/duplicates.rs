@@ -96,7 +96,8 @@ pub(super) async fn list_duplicates(
         (hash_dups, meta_dups)
     };
 
-    let fp_groups = tune_core::library::duplicate_detector::scan_fingerprint_duplicates(&state.db);
+    let fp_groups =
+        tune_core::library::duplicate_detector::scan_fingerprint_duplicates(&state.backend);
     let fp_dups: Vec<Value> = fp_groups
         .iter()
         .map(|g| {

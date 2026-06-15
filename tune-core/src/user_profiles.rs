@@ -1,8 +1,9 @@
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tracing::info;
 
+use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::sqlite::SqliteDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,71 +65,70 @@ fn rand_salt() -> u64 {
 }
 
 pub struct ProfileManager {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
+}
+
+fn row_to_profile(r: &[crate::db::backend::SqlValue]) -> UserProfile {
+    let pin_hash = r[5].as_string();
+    UserProfile {
+        id: r[0].as_i64().unwrap_or(0),
+        name: r[1].as_string().unwrap_or_default(),
+        avatar_color: r[2].as_string().unwrap_or_else(|| "#FF6B35".into()),
+        avatar_url: r[3].as_string(),
+        is_admin: r[4].as_bool().unwrap_or(false),
+        has_pin: pin_hash.is_some(),
+        eq_settings: r[6].as_string(),
+        quality_preference: r[7].as_string(),
+        created_at: r[8].as_string(),
+    }
 }
 
 impl ProfileManager {
     pub fn new(db: SqliteDb) -> Self {
+        Self { db: Arc::new(db) }
+    }
+
+    pub fn with_backend(db: Arc<dyn DbBackend>) -> Self {
         Self { db }
     }
 
     pub fn seed_admin(&self) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-        let has_admin: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
+        let row = self
+            .db
+            .query_one("SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1", &[])?;
+        let has_admin = row.and_then(|r| r[0].as_i64()).unwrap_or(0) > 0;
 
         if has_admin {
             return Ok(());
         }
 
-        conn.execute(
+        self.db.execute(
             "INSERT INTO user_profiles (name, avatar_color, is_admin) VALUES (?, ?, 1)",
-            params!["Admin", "#FF6B35"],
-        )
-        .map_err(|e| e.to_string())?;
+            &[&"Admin", &"#FF6B35"],
+        )?;
 
         info!("default_admin_profile_created");
         Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<UserProfile>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, avatar_color, avatar_url, is_admin, pin_hash, \
-                 eq_settings, quality_preference, created_at \
-                 FROM user_profiles ORDER BY name",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map([], |row| Ok(row_to_profile(row)))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-
-        Ok(rows)
+        let rows = self.db.query_many(
+            "SELECT id, name, avatar_color, avatar_url, is_admin, pin_hash, \
+             eq_settings, quality_preference, created_at \
+             FROM user_profiles ORDER BY name",
+            &[],
+        )?;
+        Ok(rows.iter().map(|r| row_to_profile(r)).collect())
     }
 
     pub fn get(&self, profile_id: i64) -> Result<Option<UserProfile>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, avatar_color, avatar_url, is_admin, pin_hash, \
-                 eq_settings, quality_preference, created_at \
-                 FROM user_profiles WHERE id = ?",
-            )
-            .map_err(|e| e.to_string())?;
-
-        stmt.query_row(params![profile_id], |row| Ok(row_to_profile(row)))
-            .optional()
-            .map_err(|e| e.to_string())
+        let row = self.db.query_one(
+            "SELECT id, name, avatar_color, avatar_url, is_admin, pin_hash, \
+             eq_settings, quality_preference, created_at \
+             FROM user_profiles WHERE id = ?",
+            &[&profile_id],
+        )?;
+        Ok(row.as_ref().map(|r| row_to_profile(r)))
     }
 
     pub fn create(
@@ -137,64 +137,55 @@ impl ProfileManager {
         avatar_color: &str,
         pin: Option<&str>,
     ) -> Result<UserProfile, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let pin_hash = pin.map(hash_pin);
+        let pin_hash: Option<String> = pin.map(hash_pin);
+        let trimmed = name.trim().to_string();
 
-        conn.execute(
+        self.db.execute(
             "INSERT INTO user_profiles (name, avatar_color, pin_hash) VALUES (?, ?, ?)",
-            params![name.trim(), avatar_color, pin_hash],
-        )
-        .map_err(|e| e.to_string())?;
+            &[
+                &trimmed as &dyn ToSqlValue,
+                &avatar_color.to_string(),
+                &pin_hash,
+            ],
+        )?;
 
-        let id = conn.last_insert_rowid();
-        drop(conn);
+        let id = self.db.last_insert_rowid();
         self.get(id)?
             .ok_or_else(|| "profile not found after create".into())
     }
 
     pub fn delete(&self, profile_id: i64) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-
-        let is_admin: bool = conn
-            .query_row(
-                "SELECT is_admin FROM user_profiles WHERE id = ?",
-                params![profile_id],
-                |r| r.get::<_, bool>(0),
-            )
-            .unwrap_or(false);
+        let row = self.db.query_one(
+            "SELECT is_admin FROM user_profiles WHERE id = ?",
+            &[&profile_id],
+        )?;
+        let is_admin = row.and_then(|r| r[0].as_bool()).unwrap_or(false);
 
         if is_admin {
-            let admin_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
+            let row = self
+                .db
+                .query_one("SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1", &[])?;
+            let admin_count = row.and_then(|r| r[0].as_i64()).unwrap_or(0);
             if admin_count <= 1 {
                 return Err("cannot delete last admin profile".into());
             }
         }
 
-        conn.execute(
-            "DELETE FROM user_profiles WHERE id = ?",
-            params![profile_id],
-        )
-        .map_err(|e| e.to_string())?;
+        self.db
+            .execute("DELETE FROM user_profiles WHERE id = ?", &[&profile_id])?;
 
         Ok(())
     }
 
     pub fn switch(&self, profile_id: i64, pin: Option<&str>) -> Result<UserProfile, String> {
-        let conn = self.db.connection().lock().unwrap();
-
-        let pin_hash: Option<String> = conn
-            .query_row(
+        let row = self
+            .db
+            .query_one(
                 "SELECT pin_hash FROM user_profiles WHERE id = ?",
-                params![profile_id],
-                |r| r.get(0),
-            )
-            .map_err(|_| "profile not found".to_string())?;
+                &[&profile_id],
+            )?
+            .ok_or_else(|| "profile not found".to_string())?;
+        let pin_hash = row[0].as_string();
 
         if let Some(ref stored_hash) = pin_hash {
             let provided = pin.ok_or("pin_required")?;
@@ -203,7 +194,6 @@ impl ProfileManager {
             }
         }
 
-        drop(conn);
         self.get(profile_id)?
             .ok_or_else(|| "profile not found".into())
     }
@@ -215,26 +205,21 @@ impl ProfileManager {
         album_id: Option<i64>,
         artist_id: Option<i64>,
     ) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-
         if let Some(tid) = track_id {
-            conn.execute(
+            self.db.execute(
                 "INSERT OR IGNORE INTO user_favorites (user_id, track_id) VALUES (?, ?)",
-                params![profile_id, tid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &tid],
+            )?;
         } else if let Some(aid) = album_id {
-            conn.execute(
+            self.db.execute(
                 "INSERT OR IGNORE INTO user_favorites (user_id, album_id) VALUES (?, ?)",
-                params![profile_id, aid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &aid],
+            )?;
         } else if let Some(arid) = artist_id {
-            conn.execute(
+            self.db.execute(
                 "INSERT OR IGNORE INTO user_favorites (user_id, artist_id) VALUES (?, ?)",
-                params![profile_id, arid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &arid],
+            )?;
         }
 
         Ok(())
@@ -247,26 +232,21 @@ impl ProfileManager {
         album_id: Option<i64>,
         artist_id: Option<i64>,
     ) -> Result<(), String> {
-        let conn = self.db.connection().lock().unwrap();
-
         if let Some(tid) = track_id {
-            conn.execute(
+            self.db.execute(
                 "DELETE FROM user_favorites WHERE user_id = ? AND track_id = ?",
-                params![profile_id, tid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &tid],
+            )?;
         } else if let Some(aid) = album_id {
-            conn.execute(
+            self.db.execute(
                 "DELETE FROM user_favorites WHERE user_id = ? AND album_id = ?",
-                params![profile_id, aid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &aid],
+            )?;
         } else if let Some(arid) = artist_id {
-            conn.execute(
+            self.db.execute(
                 "DELETE FROM user_favorites WHERE user_id = ? AND artist_id = ?",
-                params![profile_id, arid],
-            )
-            .map_err(|e| e.to_string())?;
+                &[&profile_id, &arid],
+            )?;
         }
 
         Ok(())
@@ -279,29 +259,36 @@ impl ProfileManager {
         album_id: Option<i64>,
         artist_id: Option<i64>,
     ) -> bool {
-        let conn = self.db.connection().lock().unwrap();
-
         let count: i64 = if let Some(tid) = track_id {
-            conn.query_row(
-                "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND track_id = ?",
-                params![profile_id, tid],
-                |r| r.get(0),
-            )
-            .unwrap_or(0)
+            self.db
+                .query_one(
+                    "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND track_id = ?",
+                    &[&profile_id, &tid],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r[0].as_i64())
+                .unwrap_or(0)
         } else if let Some(aid) = album_id {
-            conn.query_row(
-                "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND album_id = ?",
-                params![profile_id, aid],
-                |r| r.get(0),
-            )
-            .unwrap_or(0)
+            self.db
+                .query_one(
+                    "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND album_id = ?",
+                    &[&profile_id, &aid],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r[0].as_i64())
+                .unwrap_or(0)
         } else if let Some(arid) = artist_id {
-            conn.query_row(
-                "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND artist_id = ?",
-                params![profile_id, arid],
-                |r| r.get(0),
-            )
-            .unwrap_or(0)
+            self.db
+                .query_one(
+                    "SELECT COUNT(*) FROM user_favorites WHERE user_id = ? AND artist_id = ?",
+                    &[&profile_id, &arid],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r[0].as_i64())
+                .unwrap_or(0)
         } else {
             0
         };
@@ -309,23 +296,6 @@ impl ProfileManager {
         count > 0
     }
 }
-
-fn row_to_profile(row: &rusqlite::Row) -> UserProfile {
-    let pin_hash: Option<String> = row.get(5).unwrap_or(None);
-    UserProfile {
-        id: row.get(0).unwrap_or(0),
-        name: row.get(1).unwrap_or_default(),
-        avatar_color: row.get(2).unwrap_or_else(|_| "#FF6B35".into()),
-        avatar_url: row.get(3).unwrap_or(None),
-        is_admin: row.get(4).unwrap_or(false),
-        has_pin: pin_hash.is_some(),
-        eq_settings: row.get(6).unwrap_or(None),
-        quality_preference: row.get(7).unwrap_or(None),
-        created_at: row.get(8).unwrap_or(None),
-    }
-}
-
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {

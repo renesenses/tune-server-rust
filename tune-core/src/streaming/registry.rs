@@ -5,8 +5,8 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use super::traits::StreamingService;
+use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
-use crate::db::sqlite::SqliteDb;
 
 pub struct ServiceRegistry {
     services: HashMap<String, Arc<Mutex<Box<dyn StreamingService>>>>,
@@ -54,8 +54,8 @@ impl ServiceRegistry {
         results
     }
 
-    pub async fn save_all_tokens(&self, db: &SqliteDb) {
-        let settings = SettingsRepo::new(db.clone());
+    pub async fn save_all_tokens(&self, db: &Arc<dyn DbBackend>) {
+        let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
             let svc = svc.lock().await;
             if let Some(tokens) = svc.save_tokens() {
@@ -129,8 +129,8 @@ impl ServiceRegistry {
             .collect())
     }
 
-    pub async fn restore_all_tokens(&self, db: &SqliteDb) {
-        let settings = SettingsRepo::new(db.clone());
+    pub async fn restore_all_tokens(&self, db: &Arc<dyn DbBackend>) {
+        let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
             // Restore enabled/disabled state
             let enabled_key = format!("streaming_{name}_enabled");

@@ -178,51 +178,50 @@ pub fn service_catalog() -> Vec<ServiceInfo> {
 }
 
 pub struct ServicesManager {
-    db: crate::db::sqlite::SqliteDb,
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
 }
 
 impl ServicesManager {
     pub fn new(db: crate::db::sqlite::SqliteDb) -> Self {
+        Self {
+            db: std::sync::Arc::new(db),
+        }
+    }
+
+    pub fn with_backend(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) -> Self {
         Self { db }
     }
 
     pub fn load_token(&self, service: &str) -> Result<Option<TokenPayload>, String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT token_data FROM streaming_auth WHERE service = ?1")
-            .map_err(|e| e.to_string())?;
-        let result: Result<String, rusqlite::Error> = stmt.query_row([service], |row| row.get(0));
-        match result {
-            Ok(json_str) => {
+        let row = self.db.query_one(
+            "SELECT token_data FROM streaming_auth WHERE service = ?1",
+            &[&service],
+        )?;
+        match row {
+            Some(cols) => {
+                let json_str = cols[0].as_str().ok_or("token_data not text")?;
                 let payload: TokenPayload =
-                    serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+                    serde_json::from_str(json_str).map_err(|e| e.to_string())?;
                 Ok(Some(payload))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            None => Ok(None),
         }
     }
 
     pub fn save_token(&self, service: &str, payload: &TokenPayload) -> Result<(), String> {
         let blob = serde_json::to_string(payload).map_err(|e| e.to_string())?;
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute("DELETE FROM streaming_auth WHERE service = ?1", [service])
-            .map_err(|e| e.to_string())?;
-        conn.execute(
+        self.db
+            .execute("DELETE FROM streaming_auth WHERE service = ?1", &[&service])?;
+        self.db.execute(
             "INSERT INTO streaming_auth (service, token_data) VALUES (?1, ?2)",
-            rusqlite::params![service, blob],
-        )
-        .map_err(|e| e.to_string())?;
+            &[&service, &blob.as_str()],
+        )?;
         Ok(())
     }
 
     pub fn delete_token(&self, service: &str) -> Result<(), String> {
-        let conn = self.db.connection();
-        let conn = conn.lock().unwrap();
-        conn.execute("DELETE FROM streaming_auth WHERE service = ?1", [service])
-            .map_err(|e| e.to_string())?;
+        self.db
+            .execute("DELETE FROM streaming_auth WHERE service = ?1", &[&service])?;
         Ok(())
     }
 
