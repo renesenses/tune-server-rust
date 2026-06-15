@@ -25,7 +25,7 @@ pub struct ZonePollerMetrics {
 
 const POLL_INTERVAL_MS: u64 = 1000;
 const GAPLESS_WINDOW_MS: u64 = 10_000;
-const STOPPED_TICKS_THRESHOLD: u8 = 3;
+const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
 /// This prevents the progress bar from snapping back to the pre-seek
@@ -48,7 +48,7 @@ const MIN_PLAYED_FRACTION: f64 = 0.80;
 /// Minimum wall-clock seconds a track must have been playing before we accept
 /// a gapless transition. Prevents false skips when a renderer fails to decode
 /// and reports STOPPED after only a few seconds.
-const MIN_TRACK_WALL_SECS: u64 = 15;
+const MIN_TRACK_WALL_SECS: u64 = 30;
 /// Minimum peak position (ms) required before accepting track-end when the
 /// track duration is unknown (0).  Prevents false skips on slow renderers
 /// (e.g. Shanling SCD1.3) that report duration=0 and briefly show Stopped
