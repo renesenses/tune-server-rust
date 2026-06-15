@@ -111,7 +111,7 @@ const MIGRATION_TABLES: &[&str] = &[
 const PG_FULL_SCHEMA: &str = r#"
 -- Core tables
 CREATE TABLE IF NOT EXISTS artists (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     sort_name TEXT,
     musicbrainz_id TEXT,
@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS artists (
 );
 
 CREATE TABLE IF NOT EXISTS albums (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     artist_id TEXT,
     year TEXT,
@@ -148,7 +148,7 @@ CREATE TABLE IF NOT EXISTS albums (
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     album_id TEXT,
     artist_id TEXT,
@@ -184,7 +184,7 @@ CREATE TABLE IF NOT EXISTS tracks (
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     track_id TEXT NOT NULL,
     artist_id TEXT,
     artist_name TEXT NOT NULL,
@@ -201,20 +201,20 @@ CREATE TABLE IF NOT EXISTS track_metadata (
 );
 
 CREATE TABLE IF NOT EXISTS playlists (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT
 );
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     playlist_id TEXT NOT NULL,
     track_id TEXT NOT NULL,
     position TEXT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS zones (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     output_type TEXT,
     output_device_id TEXT,
@@ -235,7 +235,7 @@ CREATE TABLE IF NOT EXISTS zones (
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     zone_id TEXT NOT NULL,
     track_id TEXT NOT NULL,
     position TEXT NOT NULL DEFAULT 0,
@@ -243,7 +243,7 @@ CREATE TABLE IF NOT EXISTS play_queue (
 );
 
 CREATE TABLE IF NOT EXISTS streaming_queue (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     zone_id TEXT NOT NULL,
     position TEXT NOT NULL,
     source TEXT,
@@ -256,7 +256,7 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 );
 
 CREATE TABLE IF NOT EXISTS listen_history (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     track_id TEXT,
     title TEXT NOT NULL,
     artist_name TEXT,
@@ -269,7 +269,7 @@ CREATE TABLE IF NOT EXISTS listen_history (
 );
 
 CREATE TABLE IF NOT EXISTS radio_stations (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     url TEXT NOT NULL,
     homepage TEXT,
@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS radio_stations (
 );
 
 CREATE TABLE IF NOT EXISTS radio_favorites (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     artist TEXT DEFAULT '',
     station_name TEXT DEFAULT '',
@@ -302,7 +302,7 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS profiles (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
     display_name TEXT,
     avatar_path TEXT,
@@ -314,7 +314,7 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 
 CREATE TABLE IF NOT EXISTS favorites (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL DEFAULT 1,
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
@@ -323,13 +323,13 @@ CREATE TABLE IF NOT EXISTS favorites (
 );
 
 CREATE TABLE IF NOT EXISTS tags (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     color TEXT DEFAULT '#808080'
 );
 
 CREATE TABLE IF NOT EXISTS item_tags (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     tag_id TEXT NOT NULL,
     item_type TEXT NOT NULL,
     item_id TEXT NOT NULL,
@@ -337,7 +337,7 @@ CREATE TABLE IF NOT EXISTS item_tags (
 );
 
 CREATE TABLE IF NOT EXISTS album_ratings (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     album_id TEXT NOT NULL,
     profile_id TEXT NOT NULL DEFAULT 1,
     rating TEXT NOT NULL,
@@ -347,7 +347,7 @@ CREATE TABLE IF NOT EXISTS album_ratings (
 );
 
 CREATE TABLE IF NOT EXISTS smart_playlists (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     rules TEXT NOT NULL DEFAULT '[]',
     sort_by TEXT DEFAULT 'title',
@@ -358,7 +358,7 @@ CREATE TABLE IF NOT EXISTS smart_playlists (
 );
 
 CREATE TABLE IF NOT EXISTS smart_collections (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     rules TEXT NOT NULL DEFAULT '[]',
     match_mode TEXT NOT NULL DEFAULT 'all',
@@ -373,7 +373,7 @@ CREATE TABLE IF NOT EXISTS smart_collections (
 );
 
 CREATE TABLE IF NOT EXISTS bookmarks (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     track_id TEXT,
     position_ms TEXT NOT NULL DEFAULT 0,
     label TEXT,
@@ -381,7 +381,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 );
 
 CREATE TABLE IF NOT EXISTS alarms (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     zone_id TEXT,
     time TEXT NOT NULL,
     enabled TEXT DEFAULT 1,
@@ -400,7 +400,7 @@ CREATE TABLE IF NOT EXISTS alarms (
 );
 
 CREATE TABLE IF NOT EXISTS network_mounts (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     mount_type TEXT NOT NULL DEFAULT 'smb',
     server TEXT NOT NULL,
     share TEXT NOT NULL,
@@ -412,7 +412,7 @@ CREATE TABLE IF NOT EXISTS network_mounts (
 );
 
 CREATE TABLE IF NOT EXISTS podcast_subscriptions (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     feed_url TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     author TEXT,
@@ -423,7 +423,7 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
 );
 
 CREATE TABLE IF NOT EXISTS offline_cache (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     source_id TEXT NOT NULL,
     track_title TEXT,
@@ -441,7 +441,7 @@ CREATE TABLE IF NOT EXISTS offline_cache (
 );
 
 CREATE TABLE IF NOT EXISTS sync_links (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     local_playlist_id TEXT NOT NULL,
     service TEXT NOT NULL,
     remote_playlist_id TEXT NOT NULL,
@@ -451,7 +451,7 @@ CREATE TABLE IF NOT EXISTS sync_links (
 );
 
 CREATE TABLE IF NOT EXISTS sync_link_snapshots (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     playlist_link_id TEXT NOT NULL,
     side TEXT NOT NULL,
     tracks_json TEXT NOT NULL,
@@ -459,7 +459,7 @@ CREATE TABLE IF NOT EXISTS sync_link_snapshots (
 );
 
 CREATE TABLE IF NOT EXISTS track_source_links (
-    id BIGSERIAL PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     track_id TEXT NOT NULL,
     service TEXT NOT NULL,
     service_track_id TEXT NOT NULL,
@@ -574,8 +574,7 @@ pub async fn migrate_sqlite_to_pg(
         }
     }
 
-    // Reset sequences so new inserts get IDs after the migrated data
-    reset_sequences(&pool).await.ok();
+    // No sequence reset needed — all PKs are TEXT in migration schema
 
     let elapsed = start.elapsed();
     info!(
@@ -771,7 +770,7 @@ fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String>
 /// After migrating data with explicit IDs, the PG sequences are still
 /// at 1. Reset them to MAX(id)+1 so new inserts don't collide.
 async fn reset_sequences(pool: &PgPool) -> Result<(), String> {
-    // Tables with BIGSERIAL PRIMARY KEY named "id"
+    // Tables with TEXT PRIMARY KEY named "id"
     let tables = [
         "artists",
         "albums",
