@@ -305,6 +305,24 @@ impl PositionPoller {
                 continue;
             }
 
+            // Radio zones: throttle polling to every RADIO_POLL_INTERVAL_SECS.
+            // Polling a DLNA renderer (especially DMP-A8) every second with 4
+            // SOAP calls while it plays an infinite radio stream causes buffer
+            // underruns, noise, and playback cuts.  Radio has no meaningful
+            // position/duration — only transport state and metadata matter,
+            // and those change slowly.
+            let is_radio = zone_state
+                .now_playing
+                .as_ref()
+                .map(|np| np.source == "radio")
+                .unwrap_or(false);
+            if is_radio {
+                let since_last = ps.last_radio_poll.elapsed();
+                if since_last < std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS) {
+                    continue;
+                }
+            }
+
             ps.total_polls += 1;
             let poll_start = Instant::now();
             let status = {
@@ -341,6 +359,96 @@ impl PositionPoller {
                     }
                 }
             };
+
+            // Update last_radio_poll so the throttle gate works on next tick.
+            if is_radio {
+                ps.last_radio_poll = Instant::now();
+            }
+
+            // Radio zones: after the throttled poll, only check transport
+            // state (is it still playing?) and do metadata polling.
+            // Skip position tracking, gapless logic, and track-end detection
+            // — none of that applies to infinite streams.
+            if is_radio {
+                let radio_stopped = status.state == TransportState::Stopped;
+
+                if !radio_stopped {
+                    // Still playing — sync volume only.
+                    let zone_fixed_volume = all_zones
+                        .iter()
+                        .find(|z| z.id == Some(zone_id))
+                        .map(|z| z.fixed_volume)
+                        .unwrap_or(false);
+                    if !zone_fixed_volume && (status.volume - zone_state.volume).abs() > 0.005 {
+                        self.playback.set_volume(zone_id, status.volume).await;
+                        let vol_int = (status.volume * 100.0) as i32;
+                        let db = self.db.clone();
+                        crate::db::zone_repo::ZoneRepo::with_backend(db)
+                            .update_volume(zone_id, vol_int)
+                            .ok();
+                    }
+
+                    // Radio metadata polling (title/artist from ICY or external)
+                    if let Some(ref np) = zone_state.now_playing {
+                        if let Some(ref source_id) = np.source_id {
+                            if let Ok(sid) = source_id.parse::<i64>() {
+                                let radio_repo =
+                                    crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
+                                if let Ok(Some(station)) = radio_repo.get(sid) {
+                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
+                                        &station.name,
+                                        &station.url,
+                                    )
+                                    .await
+                                    {
+                                        let title_changed =
+                                            np.title != meta.title || np.artist_name != meta.artist;
+                                        if title_changed {
+                                            let new_np = crate::playback::NowPlaying {
+                                                track_id: None,
+                                                title: meta.title,
+                                                artist_name: meta.artist,
+                                                album_title: Some(station.name.clone()),
+                                                cover_path: np.cover_path.clone(),
+                                                duration_ms: 0,
+                                                source: "radio".into(),
+                                                source_id: np.source_id.clone(),
+                                                stream_id: np.stream_id.clone(),
+                                            };
+                                            self.playback.update_now_playing(zone_id, new_np).await;
+                                            debug!(zone_id, station = %station.name, "radio_metadata_updated");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sync metrics and skip the rest of the loop (no gapless/track-end).
+                self.shared_metrics.lock().await.insert(
+                    zone_id,
+                    ZonePollerMetrics {
+                        total_polls: ps.total_polls,
+                        total_errors: ps.total_errors,
+                        consecutive_errors: ps.consecutive_errors,
+                        last_latency_ms: ps.last_latency_ms,
+                        max_latency_ms: ps.max_latency_ms,
+                    },
+                );
+
+                if radio_stopped {
+                    // Radio stopped on the renderer — stop the zone.
+                    // Done after metrics sync so `ps` borrow is released.
+                    info!(zone_id, "radio_renderer_stopped");
+                    poll_states.remove(&zone_id);
+                    let device_id_ref = self.get_zone_device_id(zone_id);
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                }
+                continue;
+            }
 
             // Check whether we're in the seek grace period: after a seek the
             // in-memory position is authoritative and the output may still
@@ -392,57 +500,6 @@ impl PositionPoller {
                         source_id,
                     )
                     .ok();
-            }
-
-            // --- Radio metadata polling ---
-            let is_radio = zone_state
-                .now_playing
-                .as_ref()
-                .map(|np| np.source == "radio")
-                .unwrap_or(false);
-            if is_radio {
-                let should_poll = ps.last_radio_poll.elapsed()
-                    > std::time::Duration::from_secs(RADIO_POLL_INTERVAL_SECS);
-
-                #[allow(clippy::collapsible_if)]
-                if should_poll {
-                    if let Some(ref np) = zone_state.now_playing {
-                        if let Some(ref source_id) = np.source_id {
-                            if let Ok(sid) = source_id.parse::<i64>() {
-                                let radio_repo =
-                                    crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
-                                if let Ok(Some(station)) = radio_repo.get(sid) {
-                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
-                                        &station.name,
-                                        &station.url,
-                                    )
-                                    .await
-                                    {
-                                        // Only update if the metadata actually changed
-                                        let title_changed =
-                                            np.title != meta.title || np.artist_name != meta.artist;
-                                        if title_changed {
-                                            let new_np = crate::playback::NowPlaying {
-                                                track_id: None,
-                                                title: meta.title,
-                                                artist_name: meta.artist,
-                                                album_title: Some(station.name.clone()),
-                                                cover_path: np.cover_path.clone(),
-                                                duration_ms: 0,
-                                                source: "radio".into(),
-                                                source_id: np.source_id.clone(),
-                                                stream_id: np.stream_id.clone(),
-                                            };
-                                            self.playback.update_now_playing(zone_id, new_np).await;
-                                            debug!(zone_id, station = %station.name, "radio_metadata_updated");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    ps.last_radio_poll = Instant::now();
-                }
             }
 
             // Track the high-water mark for position — used to verify that

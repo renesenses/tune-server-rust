@@ -5,7 +5,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::db::sqlite::SqliteDb;
+use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::orchestrator::PlaybackOrchestrator;
 
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -160,13 +160,13 @@ async fn fade_in_volume(
 // ─── Scheduler ─────────────────────────────────────────────────
 
 pub struct AlarmScheduler {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
     orchestrator: Arc<PlaybackOrchestrator>,
     snooze: Mutex<SnoozeState>,
 }
 
 impl AlarmScheduler {
-    pub fn new(db: SqliteDb, orchestrator: Arc<PlaybackOrchestrator>) -> Self {
+    pub fn with_backend(db: Arc<dyn DbBackend>, orchestrator: Arc<PlaybackOrchestrator>) -> Self {
         Self {
             db,
             orchestrator,
@@ -307,7 +307,7 @@ impl AlarmScheduler {
         );
 
         let target_zone = zone_id.unwrap_or_else(|| {
-            crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+            crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                 .list()
                 .unwrap_or_default()
                 .first()
@@ -315,7 +315,7 @@ impl AlarmScheduler {
                 .unwrap_or(1)
         });
 
-        let device_id = crate::db::zone_repo::ZoneRepo::new(self.db.clone())
+        let device_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .get(target_zone)
             .ok()
             .flatten()
@@ -348,73 +348,73 @@ impl AlarmScheduler {
         self.db
             .execute(
                 "UPDATE alarms SET last_fired_at = ? WHERE id = ?",
-                &[&now_str as &dyn rusqlite::types::ToSql, &alarm_id],
+                &[&now_str as &dyn ToSqlValue, &alarm_id],
             )
             .ok();
 
         // One-shot: disable after firing
         if alarm["one_shot"].as_i64().unwrap_or(0) != 0 {
             self.db
-                .execute("UPDATE alarms SET enabled = 0 WHERE id = ?", &[&alarm_id])
+                .execute(
+                    "UPDATE alarms SET enabled = 0 WHERE id = ?",
+                    &[&alarm_id as &dyn ToSqlValue],
+                )
                 .ok();
             info!(alarm_id, "alarm_one_shot_disabled");
         }
     }
 
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE enabled = 1")
-            .map_err(|e| format!("alarm query: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    "time": row.get::<_, String>(2)?,
-                    "days": row.get::<_, Option<String>>(3)?,
-                    "zone_id": row.get::<_, Option<i64>>(4)?,
-                    "source_type": row.get::<_, Option<String>>(5)?,
-                    "source_id": row.get::<_, Option<String>>(6)?,
-                    "volume": row.get::<_, Option<f64>>(7)?,
-                    "fade_duration_s": row.get::<_, Option<i64>>(8)?,
-                    "fade_in_seconds": row.get::<_, Option<i64>>(9)?,
-                    "one_shot": row.get::<_, Option<i64>>(10)?,
-                    "skip_holidays": row.get::<_, Option<i64>>(11)?,
-                    "enabled": row.get::<_, i64>(12)?,
-                }))
-            })
-            .map_err(|e| format!("alarm rows: {e}"))?;
+        use crate::db::backend::SqlValue;
+        let rows = self.db.query_many(
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE enabled = 1",
+            &[],
+        )?;
         Ok(rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?)
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get(0).and_then(SqlValue::as_i64).unwrap_or(0),
+                    "name": r.get(1).and_then(SqlValue::as_str).unwrap_or(""),
+                    "time": r.get(2).and_then(SqlValue::as_str).unwrap_or(""),
+                    "days": r.get(3).and_then(SqlValue::as_str),
+                    "zone_id": r.get(4).and_then(SqlValue::as_i64),
+                    "source_type": r.get(5).and_then(SqlValue::as_str),
+                    "source_id": r.get(6).and_then(SqlValue::as_str),
+                    "volume": r.get(7).and_then(SqlValue::as_f64),
+                    "fade_duration_s": r.get(8).and_then(SqlValue::as_i64),
+                    "fade_in_seconds": r.get(9).and_then(SqlValue::as_i64),
+                    "one_shot": r.get(10).and_then(SqlValue::as_i64),
+                    "skip_holidays": r.get(11).and_then(SqlValue::as_i64),
+                    "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
+                })
+            })
+            .collect())
     }
 
     fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.db.connection().lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE id = ?")
-            .map_err(|e| format!("alarm get: {e}"))?;
-        let result = stmt
-            .query_row([id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    "time": row.get::<_, String>(2)?,
-                    "days": row.get::<_, Option<String>>(3)?,
-                    "zone_id": row.get::<_, Option<i64>>(4)?,
-                    "source_type": row.get::<_, Option<String>>(5)?,
-                    "source_id": row.get::<_, Option<String>>(6)?,
-                    "volume": row.get::<_, Option<f64>>(7)?,
-                    "fade_duration_s": row.get::<_, Option<i64>>(8)?,
-                    "fade_in_seconds": row.get::<_, Option<i64>>(9)?,
-                    "one_shot": row.get::<_, Option<i64>>(10)?,
-                    "skip_holidays": row.get::<_, Option<i64>>(11)?,
-                    "enabled": row.get::<_, i64>(12)?,
-                }))
+        use crate::db::backend::SqlValue;
+        let row = self.db.query_one(
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE id = ?",
+            &[&id as &dyn ToSqlValue],
+        )?;
+        Ok(row.map(|r| {
+            serde_json::json!({
+                "id": r.get(0).and_then(SqlValue::as_i64).unwrap_or(0),
+                "name": r.get(1).and_then(SqlValue::as_str).unwrap_or(""),
+                "time": r.get(2).and_then(SqlValue::as_str).unwrap_or(""),
+                "days": r.get(3).and_then(SqlValue::as_str),
+                "zone_id": r.get(4).and_then(SqlValue::as_i64),
+                "source_type": r.get(5).and_then(SqlValue::as_str),
+                "source_id": r.get(6).and_then(SqlValue::as_str),
+                "volume": r.get(7).and_then(SqlValue::as_f64),
+                "fade_duration_s": r.get(8).and_then(SqlValue::as_i64),
+                "fade_in_seconds": r.get(9).and_then(SqlValue::as_i64),
+                "one_shot": r.get(10).and_then(SqlValue::as_i64),
+                "skip_holidays": r.get(11).and_then(SqlValue::as_i64),
+                "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
             })
-            .ok();
-        Ok(result)
+        }))
     }
 }
 

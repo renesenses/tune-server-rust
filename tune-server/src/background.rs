@@ -260,8 +260,8 @@ async fn configure_deezer_proxy(state: &AppState, config: &TuneConfig) {
 }
 
 fn spawn_alarm_scheduler(state: &AppState) {
-    let alarm_sched = Arc::new(tune_core::alarms::AlarmScheduler::new(
-        state.db.clone(),
+    let alarm_sched = Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
+        state.backend.clone(),
         state.orchestrator.clone(),
     ));
     alarm_sched.spawn();

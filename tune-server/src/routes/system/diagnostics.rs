@@ -21,7 +21,11 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .count()
         .unwrap_or(0);
-    let db_version = migrations::current_version(&state.db).unwrap_or(0);
+    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        migrations::current_version(&state.db).unwrap_or(0)
+    } else {
+        0
+    };
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let uptime_secs = state.started_at.elapsed().as_secs();
 
@@ -312,7 +316,11 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         .count()
         .unwrap_or(0);
     let uptime_secs = state.started_at.elapsed().as_secs();
-    let db_version = migrations::current_version(&state.db).unwrap_or(0);
+    let db_version = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        migrations::current_version(&state.db).unwrap_or(0)
+    } else {
+        0
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let music_dirs = super::get_music_dirs_list(&state.backend);
     let scan_status = settings

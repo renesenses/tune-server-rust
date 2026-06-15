@@ -37,10 +37,13 @@ pub async fn handle_head(
         }
     };
 
+    let is_radio = session.is_radio;
+
     info!(
         stream_id,
         format = %session.info.format,
         file_size = ?file_size,
+        is_radio,
         "stream_head_request"
     );
 
@@ -49,15 +52,23 @@ pub async fn handle_head(
         "Content-Type",
         HeaderValue::from_str(&session.info.mime_type).unwrap(),
     );
-    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
     headers.insert(
         "transferMode.dlna.org",
         HeaderValue::from_static("Streaming"),
     );
 
-    if let Some(size) = file_size {
-        headers.insert("Content-Length", HeaderValue::from(size));
+    if is_radio {
+        // Radio streams are infinite — do not advertise Accept-Ranges or
+        // Content-Length, which would mislead the renderer into thinking
+        // the stream has a finite size.  Use Transfer-Encoding: chunked
+        // so the DMP-A8 (and similar) knows to consume indefinitely.
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+    } else {
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        if let Some(size) = file_size {
+            headers.insert("Content-Length", HeaderValue::from(size));
+        }
     }
 
     (StatusCode::OK, headers).into_response()
@@ -378,6 +389,34 @@ async fn proxy_stream(
         .get("Range")
         .and_then(|v| v.to_str().ok())
         .filter(|r| r.starts_with("bytes=0-"));
+
+    // Radio streams are infinite — no Content-Length is possible.
+    // When the DMP-A8 sends Range: bytes=0-, we must still reply 206 with
+    // an open-ended Content-Range so the renderer keeps consuming the
+    // stream instead of aborting after ~31 seconds.
+    if is_radio && range_requested.is_some() {
+        headers.remove("Accept-Ranges");
+        headers.insert("Content-Range", HeaderValue::from_static("bytes 0-*/*"));
+        headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
+
+        info!(url = upstream_url, "proxy_radio_206_open_ended");
+
+        let body = Body::from_stream(async_stream::stream! {
+            let mut stream = upstream_resp.bytes_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
+                    Err(e) => {
+                        warn!(error = %e, "proxy_radio_chunk_error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
 
     if let (Some(_), Some(cl)) = (range_requested, content_length) {
         headers.insert("Content-Length", HeaderValue::from(cl));

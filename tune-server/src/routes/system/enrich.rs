@@ -75,7 +75,14 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
 
     let orphan_artwork = cleanup_orphan_artwork(&state.backend)?;
 
-    let db_optimized = state.db.execute_batch("PRAGMA optimize; ANALYZE;").is_ok();
+    let db_optimized = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        state
+            .backend
+            .execute_batch("PRAGMA optimize; ANALYZE;")
+            .is_ok()
+    } else {
+        state.backend.execute_batch("ANALYZE;").is_ok()
+    };
 
     Ok(Json(json!({
         "duplicate_albums_merged": merged_albums,
@@ -90,7 +97,6 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
 fn merge_duplicate_albums(
     db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<i64, AppError> {
-    use tune_core::db::backend::DbBackend;
     let dupe_rows = db.query_many(
         "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1",
         &[],
@@ -146,7 +152,6 @@ fn merge_duplicate_albums(
 fn cleanup_orphan_artwork(
     db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<i64, AppError> {
-    use tune_core::db::backend::DbBackend;
     let cache_dir = crate::routes::library::artwork_cache_dir();
     if !cache_dir.exists() {
         return Ok(0);

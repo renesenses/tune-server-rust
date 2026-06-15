@@ -358,25 +358,25 @@ async fn register(
     }
 
     // Check if username already exists
-    let conn = state.db.connection().lock().unwrap();
-    let exists: bool = conn
-        .query_row(
+    let exists = state
+        .backend
+        .query_one(
             "SELECT COUNT(*) FROM profiles WHERE username = ?",
-            rusqlite::params![username],
-            |row| row.get::<_, i64>(0),
+            &[&username as &dyn tune_core::db::backend::ToSqlValue],
         )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
         .unwrap_or(0)
         > 0;
 
     if exists {
-        drop(conn);
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "username already exists"})),
         )
             .into_response();
     }
-    drop(conn);
 
     // Hash password with argon2
     let password_hash = match hash_password(&body.password) {
@@ -391,13 +391,12 @@ async fn register(
     };
 
     // Create profile
-    let conn = state.db.connection().lock().unwrap();
-    let result = conn.execute(
+    use tune_core::db::backend::ToSqlValue;
+    let result = state.backend.execute(
         "INSERT INTO profiles (username, display_name, password_hash_v2, email) VALUES (?, ?, ?, ?)",
-        rusqlite::params![username, username, password_hash, body.email],
+        &[&username as &dyn ToSqlValue, &username as &dyn ToSqlValue, &password_hash as &dyn ToSqlValue, &body.email as &dyn ToSqlValue],
     );
-    let profile_id = conn.last_insert_rowid();
-    drop(conn);
+    let profile_id = state.backend.last_insert_rowid();
 
     if let Err(e) = result {
         return (
@@ -461,22 +460,23 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Look up profile
-    let conn = state.db.connection().lock().unwrap();
-    let row: Option<(i64, Option<String>, Option<String>, bool)> = conn
-        .query_row(
+    use tune_core::db::backend::ToSqlValue;
+    let row: Option<(i64, Option<String>, Option<String>, bool)> = state
+        .backend
+        .query_one(
             "SELECT id, password_hash, password_hash_v2, is_admin FROM profiles WHERE username = ?",
-            rusqlite::params![body.username],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            },
+            &[&body.username as &dyn ToSqlValue],
         )
-        .ok();
-    drop(conn);
+        .ok()
+        .flatten()
+        .map(|r| {
+            (
+                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.get(1).and_then(|v| v.as_string()),
+                r.get(2).and_then(|v| v.as_string()),
+                r.get(3).and_then(|v| v.as_bool()).unwrap_or(false),
+            )
+        });
 
     let (profile_id, old_hash, new_hash, is_admin) = match row {
         Some(r) => r,
@@ -527,13 +527,13 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     // If logged in with old SHA-256 hash, upgrade to argon2
     if !valid_v2 && valid {
         if let Ok(upgraded) = hash_password(&body.password) {
-            let conn = state.db.connection().lock().unwrap();
-            conn.execute(
-                "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
-                rusqlite::params![upgraded, profile_id],
-            )
-            .ok();
-            drop(conn);
+            state
+                .backend
+                .execute(
+                    "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
+                    &[&upgraded as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
+                )
+                .ok();
         }
     }
 
@@ -587,40 +587,28 @@ async fn logout() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 async fn me(State(state): State<AppState>, auth: AuthUser) -> impl IntoResponse {
-    let conn = state.db.connection().lock().unwrap();
-    let row: Option<(i64, String, Option<String>, Option<String>, bool, Option<String>, Option<String>)> = conn
-        .query_row(
+    use tune_core::db::backend::ToSqlValue;
+    let row = state
+        .backend
+        .query_one(
             "SELECT id, username, display_name, avatar_path, is_admin, email, created_at FROM profiles WHERE id = ?",
-            rusqlite::params![auth.user_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
+            &[&auth.user_id as &dyn ToSqlValue],
         )
-        .ok();
-    drop(conn);
+        .ok()
+        .flatten();
 
     match row {
-        Some((id, username, display_name, avatar_path, is_admin, email, created_at)) => {
-            Json(json!({
-                "id": id,
-                "username": username,
-                "display_name": display_name,
-                "avatar_path": avatar_path,
-                "is_admin": is_admin,
-                "email": email,
-                "created_at": created_at,
-                "role": auth.role,
-            }))
-            .into_response()
-        }
+        Some(r) => Json(json!({
+            "id": r.get(0).and_then(|v| v.as_i64()),
+            "username": r.get(1).and_then(|v| v.as_string()),
+            "display_name": r.get(2).and_then(|v| v.as_string()),
+            "avatar_path": r.get(3).and_then(|v| v.as_string()),
+            "is_admin": r.get(4).and_then(|v| v.as_bool()),
+            "email": r.get(5).and_then(|v| v.as_string()),
+            "created_at": r.get(6).and_then(|v| v.as_string()),
+            "role": auth.role,
+        }))
+        .into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "profile not found"})),

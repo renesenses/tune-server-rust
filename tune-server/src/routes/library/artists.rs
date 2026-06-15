@@ -74,7 +74,7 @@ pub(super) async fn artist_bio(
     };
     let lang = q.lang.as_deref().unwrap_or("fr");
     let cache_key = format!("cache:bio:{mbid}:{lang}");
-    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
     }
     match state
@@ -85,7 +85,7 @@ pub(super) async fn artist_bio(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.db, &cache_key, &data);
+            api_cache_set(&state.backend, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!({"mbid": mbid, "bio": null})).into_response(),
@@ -105,7 +105,7 @@ pub(super) async fn artist_similar(
         return Json(json!({"artist": artist.name, "artists": []})).into_response();
     };
     let cache_key = format!("cache:similar:{mbid}");
-    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
     }
     match state
@@ -116,7 +116,7 @@ pub(super) async fn artist_similar(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.db, &cache_key, &data);
+            api_cache_set(&state.backend, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!({"mbid": mbid, "artists": []})).into_response(),
@@ -136,7 +136,7 @@ pub(super) async fn artist_metadata(
         return Json(json!(artist)).into_response();
     };
     let cache_key = format!("cache:meta:{mbid}");
-    if let Some(cached) = api_cache_get(&state.db, &cache_key) {
+    if let Some(cached) = api_cache_get(&state.backend, &cache_key) {
         return Json(cached).into_response();
     }
     match state
@@ -147,7 +147,7 @@ pub(super) async fn artist_metadata(
     {
         Ok(resp) if resp.status().is_success() => {
             let data: Value = resp.json().await.unwrap_or(json!({}));
-            api_cache_set(&state.db, &cache_key, &data);
+            api_cache_set(&state.backend, &cache_key, &data);
             Json(data).into_response()
         }
         _ => Json(json!(artist)).into_response(),

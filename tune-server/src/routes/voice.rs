@@ -93,8 +93,7 @@ pub async fn voice_search(
     }
 
     // Search library with transcribed text
-    let db = state.db.clone();
-    let track_repo = tune_core::db::track_repo::TrackRepo::new(db);
+    let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.search(&transcription, 10).unwrap_or_default();
 
     Json(json!({

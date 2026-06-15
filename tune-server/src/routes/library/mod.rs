@@ -33,20 +33,28 @@ pub(super) struct SearchQuery {
 
 pub(super) const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours
 
-pub(super) fn api_cache_get(db: &tune_core::db::sqlite::SqliteDb, key: &str) -> Option<Value> {
-    let conn = db.connection().lock().ok()?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = ? AND \
-         CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
-        rusqlite::params![key, API_CACHE_TTL_SECS],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|s| serde_json::from_str(&s).ok())
+pub(super) fn api_cache_get(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    key: &str,
+) -> Option<Value> {
+    use tune_core::db::backend::ToSqlValue;
+    let row = backend
+        .query_one(
+            "SELECT value FROM settings WHERE key = ? AND \
+             CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
+            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+        )
+        .ok()?
+        .and_then(|r| r.first().and_then(|v| v.as_string()))?;
+    serde_json::from_str(&row).ok()
 }
 
-pub(super) fn api_cache_set(db: &tune_core::db::sqlite::SqliteDb, key: &str, data: &Value) {
-    let settings = tune_core::db::settings_repo::SettingsRepo::new(db.clone());
+pub(super) fn api_cache_set(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    key: &str,
+    data: &Value,
+) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
     settings.set(key, &data.to_string()).ok();
 }
 

@@ -149,33 +149,42 @@ async fn sso_callback(
         .ok();
 
     // Create or link local profile, then issue a local JWT session
-    let conn = state.db.connection().lock().unwrap();
-    let existing_id: Option<i64> = conn
-        .query_row(
+    use tune_core::db::backend::ToSqlValue;
+    let existing_id: Option<i64> = state
+        .backend
+        .query_one(
             "SELECT id FROM profiles WHERE email = ?",
-            rusqlite::params![user.email],
-            |row| row.get(0),
+            &[&user.email as &dyn ToSqlValue],
         )
-        .ok();
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()));
 
     let profile_id = if let Some(id) = existing_id {
         // Update display name / avatar from cloud profile
-        conn.execute(
-            "UPDATE profiles SET display_name = ?, avatar_path = ? WHERE id = ?",
-            rusqlite::params![user.display_name, user.avatar_url, id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE profiles SET display_name = ?, avatar_path = ? WHERE id = ?",
+                &[
+                    &user.display_name as &dyn ToSqlValue,
+                    &user.avatar_url as &dyn ToSqlValue,
+                    &id as &dyn ToSqlValue,
+                ],
+            )
+            .ok();
         id
     } else {
         // Create new local profile from cloud user
-        conn.execute(
-            "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-            rusqlite::params![user.email, user.display_name, user.email, user.avatar_url, user.is_admin],
-        )
-        .ok();
-        conn.last_insert_rowid()
+        state
+            .backend
+            .execute(
+                "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
+                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &user.avatar_url as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
+            )
+            .ok();
+        state.backend.last_insert_rowid()
     };
-    drop(conn);
 
     let role = if user.is_admin { "admin" } else { "user" };
     let jwt_secret = match settings.get("jwt_secret").ok().flatten() {
@@ -469,6 +478,7 @@ async fn sync_community_covers(
     State(state): State<AppState>,
     Json(body): Json<CoverSyncRequest>,
 ) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings
         .get("mozaik_base_url")
@@ -524,16 +534,14 @@ async fn sync_community_covers(
 
         // Update album cover_path in DB for matching mbid
         let dest_str = dest.to_string_lossy().to_string();
-        let db = state.db.clone();
         let mbid = cover.mbid_release.clone();
-        let conn = db.connection();
-        if let Ok(lock) = conn.lock() {
-            lock.execute(
+        state
+            .backend
+            .execute(
                 "UPDATE albums SET cover_path = ? WHERE mbid = ? AND (cover_path IS NULL OR cover_path = '')",
-                rusqlite::params![dest_str, mbid],
+                &[&dest_str as &dyn ToSqlValue, &mbid as &dyn ToSqlValue],
             )
             .ok();
-        }
         synced += 1;
     }
 

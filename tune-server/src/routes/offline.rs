@@ -29,7 +29,7 @@ pub fn router() -> Router<AppState> {
 
 fn ensure_offline_table(state: &AppState) {
     state
-        .db
+        .backend
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS offline_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,37 +62,43 @@ fn offline_cache_dir(settings: &SettingsRepo) -> String {
 
 async fn offline_status(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM offline_cache", [], |r| r.get(0))
+    let total: i64 = state
+        .backend
+        .query_one("SELECT COUNT(*) FROM offline_cache", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    let completed: i64 = conn
-        .query_row(
+    let completed: i64 = state
+        .backend
+        .query_one(
             "SELECT COUNT(*) FROM offline_cache WHERE status = 'completed'",
-            [],
-            |r| r.get(0),
+            &[],
         )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    let pending: i64 = conn
-        .query_row(
+    let pending: i64 = state
+        .backend
+        .query_one(
             "SELECT COUNT(*) FROM offline_cache WHERE status = 'pending' OR status = 'downloading'",
-            [],
-            |r| r.get(0),
+            &[],
         )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    let total_size: i64 = conn
-        .query_row(
+    let total_size: i64 = state
+        .backend
+        .query_one(
             "SELECT COALESCE(SUM(file_size), 0) FROM offline_cache WHERE status = 'completed'",
-            [],
-            |r| r.get(0),
+            &[],
         )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    drop(conn);
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let cache_dir = offline_cache_dir(&settings);
@@ -197,24 +203,21 @@ async fn download_single_track(
     quality: &str,
 ) -> Response {
     // Insert or update the offline_cache entry
-    let result = state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    let result = state.backend.execute(
         "INSERT INTO offline_cache (source, source_id, quality, status) VALUES (?, ?, ?, 'pending') \
          ON CONFLICT(source, source_id) DO UPDATE SET status = 'pending', quality = excluded.quality",
-        &[
-            &source as &dyn rusqlite::types::ToSql,
-            &source_id,
-            &quality,
-        ],
+        &[&source as &dyn ToSqlValue, &source_id as &dyn ToSqlValue, &quality as &dyn ToSqlValue],
     );
 
     if let Err(e) = result {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
 
-    let id = state.db.last_insert_rowid();
+    let id = state.backend.last_insert_rowid();
 
     // Spawn background download task
-    let db = state.db.clone();
+    let backend = state.backend.clone();
     let services = state.services.clone();
     let http_client = state.http_client.clone();
     let source_owned = source.to_string();
@@ -222,18 +225,19 @@ async fn download_single_track(
     let quality_owned = quality.to_string();
 
     tokio::spawn(async move {
-        let settings = SettingsRepo::new(db.clone());
+        let settings = SettingsRepo::with_backend(backend.clone());
         let cache_dir = offline_cache_dir(&settings);
 
         // Create cache directory
         std::fs::create_dir_all(format!("{cache_dir}/{source_owned}")).ok();
 
         // Update status to downloading
-        db.execute(
-            "UPDATE offline_cache SET status = 'downloading' WHERE id = ?",
-            &[&id as &dyn rusqlite::types::ToSql],
-        )
-        .ok();
+        backend
+            .execute(
+                "UPDATE offline_cache SET status = 'downloading' WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .ok();
 
         // Get stream URL from service
         let registry = services.lock().await;
@@ -244,7 +248,6 @@ async fn download_single_track(
 
         match stream_result {
             Ok(url) => {
-                // Download the file (use longer timeout for large audio files)
                 match http_client
                     .get(&url)
                     .timeout(std::time::Duration::from_secs(300))
@@ -274,53 +277,55 @@ async fn download_single_track(
                             Ok(bytes) => {
                                 let file_size = bytes.len() as i64;
                                 if std::fs::write(&file_path, &bytes).is_ok() {
-                                    db.execute(
+                                    backend.execute(
                                         "UPDATE offline_cache SET status = 'completed', file_path = ?, file_size = ?, downloaded_at = CURRENT_TIMESTAMP WHERE id = ?",
-                                        &[&file_path as &dyn rusqlite::types::ToSql, &file_size, &id],
+                                        &[&file_path as &dyn ToSqlValue, &file_size as &dyn ToSqlValue, &id as &dyn ToSqlValue],
                                     ).ok();
                                     tracing::info!(id, source = %source_owned, source_id = %source_id_owned, "offline_download_complete");
                                 } else {
-                                    db.execute(
+                                    backend.execute(
                                         "UPDATE offline_cache SET status = 'error', error = 'write failed' WHERE id = ?",
-                                        &[&id as &dyn rusqlite::types::ToSql],
+                                        &[&id as &dyn ToSqlValue],
                                     ).ok();
                                 }
                             }
                             Err(e) => {
                                 let err_msg = format!("download body failed: {e}");
-                                db.execute(
+                                backend.execute(
                                     "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
-                                    &[&err_msg as &dyn rusqlite::types::ToSql, &id],
-                                )
-                                .ok();
+                                    &[&err_msg as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+                                ).ok();
                             }
                         }
                     }
                     Ok(resp) => {
                         let err_msg = format!("HTTP {}", resp.status());
-                        db.execute(
-                            "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
-                            &[&err_msg as &dyn rusqlite::types::ToSql, &id],
-                        )
-                        .ok();
+                        backend
+                            .execute(
+                                "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
+                                &[&err_msg as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+                            )
+                            .ok();
                     }
                     Err(e) => {
                         let err_msg = format!("request failed: {e}");
-                        db.execute(
-                            "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
-                            &[&err_msg as &dyn rusqlite::types::ToSql, &id],
-                        )
-                        .ok();
+                        backend
+                            .execute(
+                                "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
+                                &[&err_msg as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+                            )
+                            .ok();
                     }
                 }
             }
             Err(e) => {
                 let err_msg = e.to_string();
-                db.execute(
-                    "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
-                    &[&err_msg as &dyn rusqlite::types::ToSql, &id],
-                )
-                .ok();
+                backend
+                    .execute(
+                        "UPDATE offline_cache SET status = 'error', error = ? WHERE id = ?",
+                        &[&err_msg as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+                    )
+                    .ok();
             }
         }
     });
@@ -354,17 +359,20 @@ async fn download_album_tracks(
             for track in &tracks {
                 let track_id = track["id"].as_str().unwrap_or("");
                 if !track_id.is_empty() {
-                    state.db.execute(
-                        "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                        &[
-                            &source as &dyn rusqlite::types::ToSql,
-                            &track_id,
-                            &track["title"].as_str().unwrap_or(""),
-                            &track["artist"].as_str().unwrap_or(""),
-                            &track["album"].as_str().unwrap_or(""),
-                            &quality,
-                        ],
-                    ).ok();
+                    {
+                        use tune_core::db::backend::ToSqlValue;
+                        state.backend.execute(
+                            "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                            &[
+                                &source as &dyn ToSqlValue,
+                                &track_id as &dyn ToSqlValue,
+                                &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &quality as &dyn ToSqlValue,
+                            ],
+                        ).ok();
+                    }
                     queued += 1;
                 }
             }
@@ -401,17 +409,20 @@ async fn download_playlist_tracks(
             for track in &tracks {
                 let track_id = track["id"].as_str().unwrap_or("");
                 if !track_id.is_empty() {
-                    state.db.execute(
-                        "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                        &[
-                            &source as &dyn rusqlite::types::ToSql,
-                            &track_id,
-                            &track["title"].as_str().unwrap_or(""),
-                            &track["artist"].as_str().unwrap_or(""),
-                            &track["album"].as_str().unwrap_or(""),
-                            &quality,
-                        ],
-                    ).ok();
+                    {
+                        use tune_core::db::backend::ToSqlValue;
+                        state.backend.execute(
+                            "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                            &[
+                                &source as &dyn ToSqlValue,
+                                &track_id as &dyn ToSqlValue,
+                                &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                &quality as &dyn ToSqlValue,
+                            ],
+                        ).ok();
+                    }
                     queued += 1;
                 }
             }
@@ -433,37 +444,29 @@ async fn download_playlist_tracks(
 
 async fn list_downloads(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, source, source_id, track_title, artist_name, album_title, file_size, quality, status, error, downloaded_at \
-             FROM offline_cache ORDER BY downloaded_at DESC LIMIT 200",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "source": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "source_id": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "track_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "album_title": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "file_size": row.get::<_, Option<i64>>(6).ok().flatten(),
-                    "quality": row.get::<_, Option<String>>(7).ok().flatten(),
-                    "status": row.get::<_, Option<String>>(8).ok().flatten(),
-                    "error": row.get::<_, Option<String>>(9).ok().flatten(),
-                    "downloaded_at": row.get::<_, Option<String>>(10).ok().flatten(),
-                }))
+    let rows = state.backend.query_many(
+        "SELECT id, source, source_id, track_title, artist_name, album_title, file_size, quality, status, error, downloaded_at \
+         FROM offline_cache ORDER BY downloaded_at DESC LIMIT 200",
+        &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "source": r.get(1).and_then(|v| v.as_string()),
+                "source_id": r.get(2).and_then(|v| v.as_string()),
+                "track_title": r.get(3).and_then(|v| v.as_string()),
+                "artist_name": r.get(4).and_then(|v| v.as_string()),
+                "album_title": r.get(5).and_then(|v| v.as_string()),
+                "file_size": r.get(6).and_then(|v| v.as_i64()),
+                "quality": r.get(7).and_then(|v| v.as_string()),
+                "status": r.get(8).and_then(|v| v.as_string()),
+                "error": r.get(9).and_then(|v| v.as_string()),
+                "downloaded_at": r.get(10).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
-
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -471,39 +474,32 @@ async fn download_status(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
+    use tune_core::db::backend::ToSqlValue;
     ensure_offline_table(&state);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
+    let row = state.backend.query_one(
         "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, quality, status, error, downloaded_at, expires_at \
          FROM offline_cache WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "source": row.get::<_, Option<String>>(1).ok().flatten(),
-                "source_id": row.get::<_, Option<String>>(2).ok().flatten(),
-                "track_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                "artist_name": row.get::<_, Option<String>>(4).ok().flatten(),
-                "album_title": row.get::<_, Option<String>>(5).ok().flatten(),
-                "file_path": row.get::<_, Option<String>>(6).ok().flatten(),
-                "file_size": row.get::<_, Option<i64>>(7).ok().flatten(),
-                "quality": row.get::<_, Option<String>>(8).ok().flatten(),
-                "status": row.get::<_, Option<String>>(9).ok().flatten(),
-                "error": row.get::<_, Option<String>>(10).ok().flatten(),
-                "downloaded_at": row.get::<_, Option<String>>(11).ok().flatten(),
-                "expires_at": row.get::<_, Option<String>>(12).ok().flatten(),
-            }))
-        },
-    );
-    drop(conn);
+        &[&id as &dyn ToSqlValue],
+    ).map_err(|e| AppError::internal(e))?;
 
-    match result {
-        Ok(v) => Ok(Json(v).into_response()),
-        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    match row {
+        Some(r) => Ok(Json(json!({
+            "id": r.get(0).and_then(|v| v.as_i64()),
+            "source": r.get(1).and_then(|v| v.as_string()),
+            "source_id": r.get(2).and_then(|v| v.as_string()),
+            "track_title": r.get(3).and_then(|v| v.as_string()),
+            "artist_name": r.get(4).and_then(|v| v.as_string()),
+            "album_title": r.get(5).and_then(|v| v.as_string()),
+            "file_path": r.get(6).and_then(|v| v.as_string()),
+            "file_size": r.get(7).and_then(|v| v.as_i64()),
+            "quality": r.get(8).and_then(|v| v.as_string()),
+            "status": r.get(9).and_then(|v| v.as_string()),
+            "error": r.get(10).and_then(|v| v.as_string()),
+            "downloaded_at": r.get(11).and_then(|v| v.as_string()),
+            "expires_at": r.get(12).and_then(|v| v.as_string()),
+        }))
+        .into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -511,150 +507,116 @@ async fn delete_download(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
+    use tune_core::db::backend::ToSqlValue;
     ensure_offline_table(&state);
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let file_path: Option<String> = conn
-        .query_row(
+    let file_path: Option<String> = state
+        .backend
+        .query_one(
             "SELECT file_path FROM offline_cache WHERE id = ?",
-            rusqlite::params![id],
-            |row| row.get(0),
+            &[&id as &dyn ToSqlValue],
         )
         .ok()
-        .flatten();
-    drop(conn);
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_string()));
 
-    // Delete the cached file
     if let Some(ref path) = file_path {
         std::fs::remove_file(path).ok();
     }
 
-    // Delete the DB record
     state
-        .db
+        .backend
         .execute(
             "DELETE FROM offline_cache WHERE id = ?",
-            &[&id as &dyn rusqlite::types::ToSql],
+            &[&id as &dyn ToSqlValue],
         )
         .ok();
-
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_offline_albums(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT album_title, artist_name, COUNT(*) as track_count, COALESCE(SUM(file_size), 0), source \
-             FROM offline_cache \
-             WHERE status = 'completed' AND album_title IS NOT NULL \
-             GROUP BY album_title, artist_name, source \
-             ORDER BY album_title",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "album_title": row.get::<_, Option<String>>(0).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "track_count": row.get::<_, i64>(2).unwrap_or(0),
-                    "total_size": row.get::<_, i64>(3).unwrap_or(0),
-                    "source": row.get::<_, Option<String>>(4).ok().flatten(),
-                }))
+    let rows = state.backend.query_many(
+        "SELECT album_title, artist_name, COUNT(*) as track_count, COALESCE(SUM(file_size), 0), source \
+         FROM offline_cache \
+         WHERE status = 'completed' AND album_title IS NOT NULL \
+         GROUP BY album_title, artist_name, source \
+         ORDER BY album_title",
+        &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "album_title": r.get(0).and_then(|v| v.as_string()),
+                "artist_name": r.get(1).and_then(|v| v.as_string()),
+                "track_count": r.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                "total_size": r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                "source": r.get(4).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
-
+        .collect();
     Ok(Json(json!({"albums": items, "total": items.len()})))
 }
 
 async fn list_offline_tracks(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     ensure_offline_table(&state);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, duration_ms, quality, downloaded_at \
-             FROM offline_cache \
-             WHERE status = 'completed' \
-             ORDER BY track_title",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "source": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "source_id": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "track_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "album_title": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "file_path": row.get::<_, Option<String>>(6).ok().flatten(),
-                    "file_size": row.get::<_, Option<i64>>(7).ok().flatten(),
-                    "duration_ms": row.get::<_, Option<i64>>(8).ok().flatten(),
-                    "quality": row.get::<_, Option<String>>(9).ok().flatten(),
-                    "downloaded_at": row.get::<_, Option<String>>(10).ok().flatten(),
-                }))
+    let rows = state.backend.query_many(
+        "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, duration_ms, quality, downloaded_at \
+         FROM offline_cache \
+         WHERE status = 'completed' \
+         ORDER BY track_title",
+        &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "source": r.get(1).and_then(|v| v.as_string()),
+                "source_id": r.get(2).and_then(|v| v.as_string()),
+                "track_title": r.get(3).and_then(|v| v.as_string()),
+                "artist_name": r.get(4).and_then(|v| v.as_string()),
+                "album_title": r.get(5).and_then(|v| v.as_string()),
+                "file_path": r.get(6).and_then(|v| v.as_string()),
+                "file_size": r.get(7).and_then(|v| v.as_i64()),
+                "duration_ms": r.get(8).and_then(|v| v.as_i64()),
+                "quality": r.get(9).and_then(|v| v.as_string()),
+                "downloaded_at": r.get(10).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
-
+        .collect();
     Ok(Json(json!({"tracks": items, "total": items.len()})))
 }
 
 async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    use tune_core::db::backend::ToSqlValue;
     ensure_offline_table(&state);
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let completed: Vec<(i64, String)> = conn
-        .prepare("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0).unwrap_or(0),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    let completed: Vec<(i64, String)> = state.backend
+        .query_many("SELECT id, file_path FROM offline_cache WHERE status = 'completed' AND file_path IS NOT NULL", &[])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let path = r.get(1).and_then(|v| v.as_string())?;
+            Some((id, path))
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     let mut cleaned = 0i64;
     for (id, path) in &completed {
         if !std::path::Path::new(path).exists() {
-            state
-                .db
-                .execute(
-                    "UPDATE offline_cache SET status = 'missing', file_path = NULL, file_size = NULL WHERE id = ?",
-                    &[id as &dyn rusqlite::types::ToSql],
-                )
-                .ok();
+            state.backend.execute(
+                "UPDATE offline_cache SET status = 'missing', file_path = NULL, file_size = NULL WHERE id = ?",
+                &[id as &dyn ToSqlValue],
+            ).ok();
             cleaned += 1;
         }
     }
 
-    // Reset errored entries to pending for retry
     let retried = state
-        .db
+        .backend
         .execute(
             "UPDATE offline_cache SET status = 'pending', error = NULL WHERE status = 'error'",
             &[],
@@ -671,25 +633,25 @@ async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse
 async fn clear_offline(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     ensure_offline_table(&state);
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let paths: Vec<String> = conn
-        .prepare("SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .unwrap_or_default();
-    drop(conn);
+    let paths: Vec<String> = state
+        .backend
+        .query_many(
+            "SELECT file_path FROM offline_cache WHERE file_path IS NOT NULL",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
+        .collect();
 
     for path in &paths {
         std::fs::remove_file(path).ok();
     }
 
-    state.db.execute_batch("DELETE FROM offline_cache").ok();
+    state
+        .backend
+        .execute_batch("DELETE FROM offline_cache")
+        .ok();
 
     // Try to remove empty cache directory
     let settings = SettingsRepo::with_backend(state.backend.clone());

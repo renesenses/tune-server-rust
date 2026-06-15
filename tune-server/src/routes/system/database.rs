@@ -19,27 +19,29 @@ use crate::state::AppState;
 pub(super) async fn database_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // migration check uses SqliteDb directly (sqlite-specific)
     let version = migrations::current_version(&state.db).unwrap_or(0);
     let latest = migrations::latest_version();
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let (artists, albums, tracks): (i64, i64, i64) = conn
-        .query_row(
-            "SELECT \
-             (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
-             (SELECT COUNT(*) FROM albums), \
-             (SELECT COUNT(*) FROM tracks)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+    let row = state.backend.query_one(
+        "SELECT \
+         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+         (SELECT COUNT(*) FROM albums), \
+         (SELECT COUNT(*) FROM tracks)",
+        &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let (artists, albums, tracks) = row
+        .map(|r| {
+            (
+                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            )
+        })
         .unwrap_or((0, 0, 0));
-    drop(conn);
 
+    let engine_name = format!("{:?}", state.backend.engine()).to_lowercase();
     Ok(Json(json!({
-        "engine": "sqlite",
+        "engine": engine_name,
         "migration_version": version,
         "latest_version": latest,
         "up_to_date": version >= latest,
@@ -51,7 +53,12 @@ pub(super) async fn database_status(
 
 pub(super) async fn database_optimize(State(state): State<AppState>) -> impl IntoResponse {
     let start = Instant::now();
-    match state.db.execute_batch("PRAGMA optimize; VACUUM; ANALYZE;") {
+    let sql = if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        "PRAGMA optimize; VACUUM; ANALYZE;"
+    } else {
+        "ANALYZE;"
+    };
+    match state.backend.execute_batch(sql) {
         Ok(_) => {
             let ms = start.elapsed().as_millis();
             Json(json!({ "status": "ok", "duration_ms": ms })).into_response()
@@ -111,10 +118,13 @@ pub(super) async fn export_database(
         return Ok((StatusCode::BAD_REQUEST, "cannot export in-memory database").into_response());
     }
 
-    state
-        .db
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .ok();
+    // SQLite-specific WAL checkpoint before exporting the DB file
+    if state.backend.engine() == tune_core::db::engine::Engine::Sqlite {
+        state
+            .db
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .ok();
+    }
 
     match tokio::fs::read(&db_path).await {
         Ok(bytes) => {

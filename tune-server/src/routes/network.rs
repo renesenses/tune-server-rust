@@ -62,29 +62,23 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts ORDER BY id")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "mount_type": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "server": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "share": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "mount_path": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "username": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "active": row.get::<_, i32>(6).unwrap_or(1) != 0,
-                }))
+    let rows = state.backend.query_many(
+        "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts ORDER BY id", &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "mount_type": r.get(1).and_then(|v| v.as_string()),
+                "server": r.get(2).and_then(|v| v.as_string()),
+                "share": r.get(3).and_then(|v| v.as_string()),
+                "mount_path": r.get(4).and_then(|v| v.as_string()),
+                "username": r.get(5).and_then(|v| v.as_string()),
+                "active": r.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -92,19 +86,14 @@ async fn create_mount(
     State(state): State<AppState>,
     Json(body): Json<CreateMount>,
 ) -> impl IntoResponse {
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    let mount_type = body.mount_type.unwrap_or_else(|| "smb".into());
+    match state.backend.execute(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username, password) VALUES (?, ?, ?, ?, ?, ?)",
-        &[
-            &body.mount_type.unwrap_or_else(|| "smb".into()) as &dyn rusqlite::types::ToSql,
-            &body.server,
-            &body.share,
-            &body.mount_path,
-            &body.username,
-            &body.password,
-        ],
+        &[&mount_type as &dyn ToSqlValue, &body.server as &dyn ToSqlValue, &body.share as &dyn ToSqlValue, &body.mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue, &body.password as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -498,18 +487,13 @@ async fn mount_smb_share(
     };
 
     // Persist to database
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    match state.backend.execute(
         "INSERT INTO network_mounts (mount_type, server, share, mount_path, username) VALUES (?, ?, ?, ?, ?)",
-        &[
-            &"smb" as &dyn rusqlite::types::ToSql,
-            &body.host,
-            &body.share_name,
-            &mount_path,
-            &body.username,
-        ],
+        &[&"smb" as &dyn ToSqlValue, &body.host as &dyn ToSqlValue, &body.share_name as &dyn ToSqlValue, &mount_path as &dyn ToSqlValue, &body.username as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (
                 StatusCode::CREATED,
                 Json(json!({

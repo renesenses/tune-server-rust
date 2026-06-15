@@ -1422,20 +1422,17 @@ async fn create_alarm(
     Path(zone_id): Path<i64>,
     Json(body): Json<CreateAlarm>,
 ) -> impl IntoResponse {
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    let days = body.days.unwrap_or_else(|| "1,2,3,4,5,6,7".into());
+    let source_type = body.source_type.unwrap_or_else(|| "playlist".into());
+    let volume = body.volume.unwrap_or(0.3);
+    let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    match state.backend.execute(
         "INSERT INTO alarms (zone_id, time, days, source_type, source_id, volume, fade_in_seconds) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        &[
-            &zone_id as &dyn rusqlite::types::ToSql,
-            &body.time,
-            &body.days.unwrap_or_else(|| "1,2,3,4,5,6,7".into()),
-            &body.source_type.unwrap_or_else(|| "playlist".into()),
-            &body.source_id,
-            &body.volume.unwrap_or(0.3),
-            &body.fade_in_seconds.unwrap_or(30),
-        ],
+        &[&zone_id as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

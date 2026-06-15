@@ -64,8 +64,8 @@ async fn ai_query(
 
     let client = AnthropicClient::new(api_key, model);
     let tools = all_tools();
-    let mut executor = ToolExecutor::new(
-        state.db.clone(),
+    let mut executor = ToolExecutor::with_backend(
+        state.backend.clone(),
         state.orchestrator.clone(),
         state.playback.clone(),
         zone_id,

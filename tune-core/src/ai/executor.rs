@@ -5,8 +5,8 @@ use tracing::{info, warn};
 
 use crate::db::album_repo::AlbumRepo;
 use crate::db::artist_repo::ArtistRepo;
+use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::PlayQueueRepo;
-use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
@@ -14,7 +14,7 @@ use crate::playback::PlaybackManager;
 
 /// Executes tool calls from the AI assistant against the real server state.
 pub struct ToolExecutor {
-    db: SqliteDb,
+    db: Arc<dyn DbBackend>,
     orchestrator: Arc<PlaybackOrchestrator>,
     playback: Arc<PlaybackManager>,
     /// The zone_id targeted by the current conversation turn.
@@ -22,8 +22,8 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
-    pub fn new(
-        db: SqliteDb,
+    pub fn with_backend(
+        db: Arc<dyn DbBackend>,
         orchestrator: Arc<PlaybackOrchestrator>,
         playback: Arc<PlaybackManager>,
         zone_id: i64,
@@ -71,7 +71,7 @@ impl ToolExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let album_repo = AlbumRepo::new(self.db.clone());
+        let album_repo = AlbumRepo::with_backend(self.db.clone());
         let albums = album_repo.search(album_name, 5).unwrap_or_default();
 
         if albums.is_empty() {
@@ -85,7 +85,7 @@ impl ToolExecutor {
         };
 
         // Get first track of the album to start playback
-        let track_repo = TrackRepo::new(self.db.clone());
+        let track_repo = TrackRepo::with_backend(self.db.clone());
         let tracks = track_repo.list_by_album(album_id).unwrap_or_default();
         if tracks.is_empty() {
             return json!({
@@ -112,7 +112,7 @@ impl ToolExecutor {
 
         // Queue remaining tracks
         if tracks.len() > 1 {
-            let queue_repo = PlayQueueRepo::new(self.db.clone());
+            let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
             let track_ids: Vec<i64> = tracks.iter().filter_map(|t| t.id).collect();
             queue_repo.add_tracks(self.zone_id, &track_ids, None).ok();
         }
@@ -135,7 +135,7 @@ impl ToolExecutor {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let track_repo = TrackRepo::new(self.db.clone());
+        let track_repo = TrackRepo::with_backend(self.db.clone());
         let tracks = track_repo.search(track_name, 5).unwrap_or_default();
 
         if tracks.is_empty() {
@@ -175,9 +175,9 @@ impl ToolExecutor {
 
         let limit = 10;
 
-        let artist_repo = ArtistRepo::new(self.db.clone());
-        let album_repo = AlbumRepo::new(self.db.clone());
-        let track_repo = TrackRepo::new(self.db.clone());
+        let artist_repo = ArtistRepo::with_backend(self.db.clone());
+        let album_repo = AlbumRepo::with_backend(self.db.clone());
+        let track_repo = TrackRepo::with_backend(self.db.clone());
 
         let artists = artist_repo.search(query, limit).unwrap_or_default();
         let albums = album_repo.search(query, limit).unwrap_or_default();
@@ -232,14 +232,14 @@ impl ToolExecutor {
             None => return json!({ "error": "track_id is required" }),
         };
 
-        let track_repo = TrackRepo::new(self.db.clone());
+        let track_repo = TrackRepo::with_backend(self.db.clone());
         let track = match track_repo.get(track_id) {
             Ok(Some(t)) => t,
             Ok(None) => return json!({ "error": "track not found", "track_id": track_id }),
             Err(e) => return json!({ "error": format!("db error: {e}") }),
         };
 
-        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
         match queue_repo.add_tracks(self.zone_id, &[track_id], None) {
             Ok(_) => json!({
                 "status": "added",
@@ -328,7 +328,7 @@ impl ToolExecutor {
     }
 
     fn list_zones(&self) -> Value {
-        let zone_repo = ZoneRepo::new(self.db.clone());
+        let zone_repo = ZoneRepo::with_backend(self.db.clone());
         let zones = zone_repo.list().unwrap_or_default();
         let zone_list: Vec<Value> = zones
             .iter()
@@ -351,7 +351,7 @@ impl ToolExecutor {
         };
 
         // Verify zone exists
-        let zone_repo = ZoneRepo::new(self.db.clone());
+        let zone_repo = ZoneRepo::with_backend(self.db.clone());
         match zone_repo.get(zone_id) {
             Ok(Some(z)) => {
                 self.zone_id = zone_id;
@@ -367,7 +367,7 @@ impl ToolExecutor {
     }
 
     fn get_zone_device_id(&self) -> Option<String> {
-        ZoneRepo::new(self.db.clone())
+        ZoneRepo::with_backend(self.db.clone())
             .get(self.zone_id)
             .ok()
             .flatten()

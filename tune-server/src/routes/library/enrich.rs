@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 
 pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     let task_id = uuid::Uuid::new_v4().to_string();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
 
     let http_client = state.http_client.clone();
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -19,18 +20,23 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
         )
         .ok();
 
-    let db2 = db.clone();
+    let backend2 = backend.clone();
     let task_id_clone = task_id.clone();
     tokio::spawn(async move {
-        let track_ids: Vec<(i64, Option<String>)> = {
-            let conn = db2.connection().lock().unwrap();
-            conn.prepare("SELECT id, file_path FROM tracks WHERE (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '') AND file_path IS NOT NULL")
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                })
-                .unwrap_or_default()
-        };
+        let track_ids: Vec<(i64, Option<String>)> = backend2
+            .query_many(
+                "SELECT id, file_path FROM tracks WHERE (musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '') AND file_path IS NOT NULL",
+                &[],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                    r.get(1).and_then(|v| v.as_string()),
+                )
+            })
+            .collect();
 
         let total = track_ids.len();
 
@@ -40,11 +46,12 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 let meta = tune_core::metadata::read_metadata(std::path::Path::new(fp));
                 if let Some(m) = meta {
                     if let Some(ref mbid) = m.musicbrainz_recording_id {
-                        db2.execute(
-                            "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
-                            &[mbid as &dyn rusqlite::types::ToSql, track_id],
-                        )
-                        .ok();
+                        backend2
+                            .execute(
+                                "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
+                                &[mbid as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
+                            )
+                            .ok();
                         enriched += 1;
                     } else {
                         // Try MusicBrainz lookup by title+artist
@@ -63,9 +70,9 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                                             .pointer("/recordings/0/id")
                                             .and_then(|v| v.as_str())
                                         {
-                                            db2.execute(
+                                            backend2.execute(
                                                 "UPDATE tracks SET musicbrainz_recording_id = ? WHERE id = ?",
-                                                &[&mbid as &dyn rusqlite::types::ToSql, track_id],
+                                                &[&mbid as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
                                             ).ok();
                                             enriched += 1;
                                         }
@@ -81,7 +88,8 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
             // Update status periodically
             if enriched % 50 == 0 {
-                let settings = tune_core::db::settings_repo::SettingsRepo::new(db2.clone());
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend2.clone());
                 settings
                     .set(
                         "enrich_all_status",
@@ -97,7 +105,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
             }
         }
 
-        let settings = tune_core::db::settings_repo::SettingsRepo::new(db2);
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend2);
         settings
             .set(
                 "enrich_all_status",

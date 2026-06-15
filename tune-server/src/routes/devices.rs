@@ -488,8 +488,11 @@ async fn device_status(
 
 // --- Device buffer stats ---
 
-fn buffer_settings_for(db: &tune_core::db::sqlite::SqliteDb, device_id: &str) -> (f64, bool) {
-    let settings = SettingsRepo::new(db.clone());
+fn buffer_settings_for(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    device_id: &str,
+) -> (f64, bool) {
+    let settings = SettingsRepo::with_backend(backend.clone());
     let key = format!("buffer_{device_id}");
     if let Ok(Some(val)) = settings.get(&key) {
         if let Ok(obj) = serde_json::from_str::<Value>(&val) {
@@ -508,7 +511,7 @@ async fn all_buffer_stats(State(state): State<AppState>) -> Json<Value> {
     for device_id in &device_ids {
         if let Some(output) = outputs.get(device_id) {
             let output = output.lock().await;
-            let (buffer_s, auto) = buffer_settings_for(&state.db, device_id);
+            let (buffer_s, auto) = buffer_settings_for(&state.backend, device_id);
             stats.push(json!({
                 "device_id": device_id,
                 "device_name": output.name(),
@@ -536,7 +539,7 @@ async fn device_buffer_stats(
             .into_response();
     };
     let output = output.lock().await;
-    let (buffer_s, auto) = buffer_settings_for(&state.db, &device_id);
+    let (buffer_s, auto) = buffer_settings_for(&state.backend, &device_id);
     Json(json!({
         "device_id": device_id,
         "device_name": output.name(),
@@ -572,7 +575,7 @@ async fn set_device_buffer(
         }
     }
 
-    let (current_buf, current_auto) = buffer_settings_for(&state.db, &device_id);
+    let (current_buf, current_auto) = buffer_settings_for(&state.backend, &device_id);
     let new_buf = body.buffer_s.unwrap_or(current_buf);
     let new_auto = body.auto.unwrap_or(current_auto);
 

@@ -435,12 +435,11 @@ pub(super) async fn identify_track(
 
     if let Some(m) = best {
         if m.score >= 0.8 && !m.title.is_empty() {
-            let conn = state.db.connection().lock().unwrap();
-            conn.execute(
+            use tune_core::db::backend::ToSqlValue;
+            state.backend.execute(
                 "UPDATE tracks SET title = ?, musicbrainz_recording_id = ? WHERE id = ? AND (title LIKE 'Track %' OR title LIKE 'Unknown%')",
-                rusqlite::params![m.title, m.recording_id, track_id],
+                &[&m.title as &dyn ToSqlValue, &m.recording_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
             ).ok();
-            drop(conn);
         }
     }
 
@@ -497,18 +496,18 @@ pub(super) async fn track_waveform(
 /// it only refreshes metadata (genre, year, artist, etc.) for tracks already in
 /// the library. This is what users need after editing tags externally.
 pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoResponse {
-    let db = state.db.clone();
+    let backend = state.backend.clone();
     let event_bus = state.event_bus.clone();
 
     tokio::spawn(async move {
-        let db_inner = db.clone();
+        let backend_inner = backend.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(db_inner.clone());
+            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend_inner.clone());
             if let Err(e) = settings.set("rescan_metadata_status", "running") {
                 tracing::warn!(error = %e, "rescan_metadata_status_set_failed");
             }
 
-            let track_repo = TrackRepo::new(db_inner.clone());
+            let track_repo = TrackRepo::with_backend(backend_inner.clone());
             let tracks = match track_repo.list_all_local() {
                 Ok(t) => t,
                 Err(e) => {
@@ -553,18 +552,16 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             }
 
             // Refresh album genre/quality from their tracks
-            if let Ok(conn) = db_inner.connection().lock() {
-                conn.execute_batch(
-                    "UPDATE albums SET \
-                     genre = (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1), \
-                     genres = (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1), \
-                     format = (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1), \
-                     sample_rate = (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id), \
-                     bit_depth = (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id) \
-                     WHERE source = 'local' OR source IS NULL",
-                )
-                .ok();
-            }
+            backend_inner.execute_batch(
+                "UPDATE albums SET \
+                 genre = (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1), \
+                 genres = (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1), \
+                 format = (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1), \
+                 sample_rate = (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id), \
+                 bit_depth = (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id) \
+                 WHERE source = 'local' OR source IS NULL",
+            )
+            .ok();
 
             settings.set("rescan_metadata_status", "idle").ok();
             settings
@@ -596,7 +593,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
 
         if let Err(e) = result {
             tracing::error!("rescan_metadata_task_panicked: {:?}", e);
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(db);
+            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend);
             settings.set("rescan_metadata_status", "idle").ok();
         }
     });

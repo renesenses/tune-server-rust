@@ -751,34 +751,28 @@ struct CoherenceParams {
 
 /// Helper: fetch all albums with artist info for genre propagation.
 fn fetch_albums_with_artists(
-    db: &tune_core::db::sqlite::SqliteDb,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<Vec<(i64, String, Option<String>, Option<i64>, Option<String>)>, String> {
-    let conn = db.read_connection();
-    let conn = conn.lock().unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT al.id, al.title, al.genre, al.artist_id, ar.name as artist_name \
-             FROM albums al \
-             LEFT JOIN artists ar ON al.artist_id = ar.id \
-             WHERE al.artist_id IS NOT NULL",
-        )
-        .map_err(|e| format!("prepare: {e}"))?;
+    let rows = backend.query_many(
+        "SELECT al.id, al.title, al.genre, al.artist_id, ar.name as artist_name \
+         FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         WHERE al.artist_id IS NOT NULL",
+        &[],
+    )?;
 
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.get(2).and_then(|v| v.as_string()),
+                r.get(3).and_then(|v| v.as_i64()),
+                r.get(4).and_then(|v| v.as_string()),
+            )
         })
-        .map_err(|e| format!("query: {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("collect: {e}"))?;
-
-    Ok(rows)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +785,7 @@ async fn fix_genres_by_artist(
 ) -> impl IntoResponse {
     let min_coherence = params.min_coherence.unwrap_or(0.7);
 
-    let rows = match fetch_albums_with_artists(&state.db) {
+    let rows = match fetch_albums_with_artists(&state.backend) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -908,7 +902,7 @@ async fn fix_genres_by_artist_fuzzy(
 ) -> impl IntoResponse {
     let min_coherence = params.min_coherence.unwrap_or(0.7);
 
-    let rows = match fetch_albums_with_artists(&state.db) {
+    let rows = match fetch_albums_with_artists(&state.backend) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1033,7 +1027,7 @@ async fn fix_genres_by_family(
 ) -> impl IntoResponse {
     let min_coherence = params.min_coherence.unwrap_or(0.7);
 
-    let rows = match fetch_albums_with_artists(&state.db) {
+    let rows = match fetch_albums_with_artists(&state.backend) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -1191,7 +1185,7 @@ async fn fix_genres_by_family(
 // ---------------------------------------------------------------------------
 
 async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
-    let svc_mgr = tune_core::services_manager::ServicesManager::new(state.db.clone());
+    let svc_mgr = tune_core::services_manager::ServicesManager::with_backend(state.backend.clone());
 
     // Prefer DB-stored credentials, fall back to config / settings repo.
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1214,37 +1208,28 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
 
     // Fetch albums with no genre.
     let rows = {
-        let conn = state.db.read_connection();
-        let conn = conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT al.id, al.title, ar.name as artist_name \
+        let result: Result<Vec<(i64, String, Option<String>)>, String> = state
+            .backend
+            .query_many(
+                "SELECT al.id, al.title, ar.name as artist_name \
              FROM albums al \
              LEFT JOIN artists ar ON al.artist_id = ar.id \
              WHERE al.genre IS NULL OR al.genre = '' \
              ORDER BY al.title",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"ok": false, "error": format!("prepare: {e}")})),
-                )
-                    .into_response();
-            }
-        };
-        let result: Result<Vec<(i64, String, Option<String>)>, _> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|e| format!("query: {e}"))
-            .and_then(|iter| {
-                iter.collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("row: {e}"))
+                &[],
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| {
+                        (
+                            r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                            r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                            r.get(2).and_then(|v| v.as_string()),
+                        )
+                    })
+                    .collect()
             });
+        // result is already Result<Vec<...>, String> from the backend query above.
         match result {
             Ok(r) => r,
             Err(e) => {
@@ -1270,21 +1255,22 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(false);
 
     let allowed_genres: Option<HashMap<String, String>> = if respect_vocab {
-        let conn = state.db.read_connection();
-        let conn = conn.lock().unwrap();
-        let map = conn
-            .prepare("SELECT DISTINCT genre FROM albums WHERE genre IS NOT NULL AND genre <> ''")
+        state
+            .backend
+            .query_many(
+                "SELECT DISTINCT genre FROM albums WHERE genre IS NOT NULL AND genre <> ''",
+                &[],
+            )
             .ok()
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get::<_, String>(0))
-                    .ok()
-                    .map(|iter| {
-                        iter.filter_map(|r| r.ok())
-                            .map(|g| (g.to_lowercase(), g))
-                            .collect::<HashMap<String, String>>()
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|r| r.first().and_then(|v| v.as_string()))
+                    .map(|g| {
+                        let lower = g.to_lowercase();
+                        (lower, g)
                     })
-            });
-        map
+                    .collect::<HashMap<String, String>>()
+            })
     } else {
         None
     };

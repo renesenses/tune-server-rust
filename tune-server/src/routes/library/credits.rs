@@ -12,29 +12,28 @@ pub(super) async fn track_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position")
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![id], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "track_id": row.get::<_, Option<i64>>(1).ok().flatten(),
-                    "artist_id": row.get::<_, Option<i64>>(2).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "role": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "instrument": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "position": row.get::<_, Option<i32>>(6).ok().flatten(),
-                }))
+    use tune_core::db::backend::ToSqlValue;
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "track_id": r.get(1).and_then(|v| v.as_i64()),
+                "artist_id": r.get(2).and_then(|v| v.as_i64()),
+                "artist_name": r.get(3).and_then(|v| v.as_string()),
+                "role": r.get(4).and_then(|v| v.as_string()),
+                "instrument": r.get(5).and_then(|v| v.as_string()),
+                "position": r.get(6).and_then(|v| v.as_i64()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -42,34 +41,31 @@ pub(super) async fn artist_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
+    use tune_core::db::backend::ToSqlValue;
+    let rows = state
+        .backend
+        .query_many(
             "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
              FROM track_credits tc \
              WHERE tc.artist_id = ? OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
-             ORDER BY tc.track_id, tc.position"
+             ORDER BY tc.track_id, tc.position",
+            &[&id as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![id, id], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "track_id": row.get::<_, Option<i64>>(1).ok().flatten(),
-                    "artist_id": row.get::<_, Option<i64>>(2).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "role": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "instrument": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "position": row.get::<_, Option<i32>>(6).ok().flatten(),
-                }))
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "track_id": r.get(1).and_then(|v| v.as_i64()),
+                "artist_id": r.get(2).and_then(|v| v.as_i64()),
+                "artist_name": r.get(3).and_then(|v| v.as_string()),
+                "role": r.get(4).and_then(|v| v.as_string()),
+                "instrument": r.get(5).and_then(|v| v.as_string()),
+                "position": r.get(6).and_then(|v| v.as_i64()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -114,11 +110,12 @@ pub(super) async fn enrich_track_credits(
         };
 
     // Clear existing credits for this track
+    use tune_core::db::backend::ToSqlValue;
     state
-        .db
+        .backend
         .execute(
             "DELETE FROM track_credits WHERE track_id = ?",
-            &[&id as &dyn rusqlite::types::ToSql],
+            &[&id as &dyn ToSqlValue],
         )
         .ok();
 
@@ -132,9 +129,9 @@ pub(super) async fn enrich_track_credits(
                 .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown");
-            state.db.execute(
+            state.backend.execute(
                 "INSERT INTO track_credits (track_id, artist_name, role, position) VALUES (?, ?, 'artist', ?)",
-                &[&id as &dyn rusqlite::types::ToSql, &artist_name, &(pos as i32)],
+                &[&id as &dyn ToSqlValue, &artist_name as &dyn ToSqlValue, &(pos as i32) as &dyn ToSqlValue],
             ).ok();
             count += 1;
         }
@@ -155,14 +152,14 @@ pub(super) async fn enrich_track_credits(
                     .and_then(|arr| arr.first())
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                state.db.execute(
+                state.backend.execute(
                     "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) VALUES (?, ?, ?, ?, ?)",
                     &[
-                        &id as &dyn rusqlite::types::ToSql,
-                        &name,
-                        &rel_type,
-                        &instrument,
-                        &count,
+                        &id as &dyn ToSqlValue,
+                        &name as &dyn ToSqlValue,
+                        &rel_type as &dyn ToSqlValue,
+                        &instrument as &dyn ToSqlValue,
+                        &count as &dyn ToSqlValue,
                     ],
                 ).ok();
                 count += 1;
@@ -177,6 +174,7 @@ pub(super) async fn enrich_album_credits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(id).unwrap_or_default();
 
@@ -218,10 +216,10 @@ pub(super) async fn enrich_album_credits(
         };
 
         state
-            .db
+            .backend
             .execute(
                 "DELETE FROM track_credits WHERE track_id = ?",
-                &[&track_id as &dyn rusqlite::types::ToSql],
+                &[&track_id as &dyn ToSqlValue],
             )
             .ok();
 
@@ -232,9 +230,9 @@ pub(super) async fn enrich_album_credits(
                     .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
-                state.db.execute(
+                state.backend.execute(
                     "INSERT INTO track_credits (track_id, artist_name, role, position) VALUES (?, ?, 'artist', ?)",
-                    &[&track_id as &dyn rusqlite::types::ToSql, &artist_name, &(pos as i32)],
+                    &[&track_id as &dyn ToSqlValue, &artist_name as &dyn ToSqlValue, &(pos as i32) as &dyn ToSqlValue],
                 ).ok();
             }
         }
@@ -253,9 +251,9 @@ pub(super) async fn enrich_album_credits(
                         .and_then(|arr| arr.first())
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    state.db.execute(
+                    state.backend.execute(
                         "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) VALUES (?, ?, ?, ?, 0)",
-                        &[&track_id as &dyn rusqlite::types::ToSql, &name, &rel_type, &instrument],
+                        &[&track_id as &dyn ToSqlValue, &name as &dyn ToSqlValue, &rel_type as &dyn ToSqlValue, &instrument as &dyn ToSqlValue],
                     ).ok();
                 }
             }
@@ -277,23 +275,25 @@ pub(super) async fn enrich_album_credits(
 }
 
 pub(super) async fn enrich_all_credits(State(state): State<AppState>) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     let task_id = uuid::Uuid::new_v4().to_string();
     let task_id_clone = task_id.clone();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
 
     tokio::spawn(async move {
-        let track_ids: Vec<(i64, String)> = {
-            let conn = db.connection().lock().unwrap();
-            conn
-                .prepare("SELECT id, musicbrainz_recording_id FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''")
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                })
-                .unwrap_or_default()
-        };
+        let track_ids: Vec<(i64, String)> = backend
+            .query_many(
+                "SELECT id, musicbrainz_recording_id FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''",
+                &[],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let id = r.get(0).and_then(|v| v.as_i64())?;
+                let mbid = r.get(1).and_then(|v| v.as_string())?;
+                Some((id, mbid))
+            })
+            .collect();
 
         let mut enriched = 0i32;
         for (track_id, mbid) in &track_ids {
@@ -304,11 +304,12 @@ pub(super) async fn enrich_all_credits(State(state): State<AppState>) -> impl In
             if let Ok(r) = state.http_client.get(&url).send().await {
                 if r.status().is_success() {
                     if let Ok(data) = r.json::<Value>().await {
-                        db.execute(
-                            "DELETE FROM track_credits WHERE track_id = ?",
-                            &[track_id as &dyn rusqlite::types::ToSql],
-                        )
-                        .ok();
+                        backend
+                            .execute(
+                                "DELETE FROM track_credits WHERE track_id = ?",
+                                &[track_id as &dyn ToSqlValue],
+                            )
+                            .ok();
 
                         if let Some(credits) = data.get("artist-credit").and_then(|v| v.as_array())
                         {
@@ -318,9 +319,9 @@ pub(super) async fn enrich_all_credits(State(state): State<AppState>) -> impl In
                                     .or_else(|| credit.get("artist").and_then(|a| a.get("name")))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Unknown");
-                                db.execute(
+                                backend.execute(
                                     "INSERT INTO track_credits (track_id, artist_name, role, position) VALUES (?, ?, 'artist', ?)",
-                                    &[track_id as &dyn rusqlite::types::ToSql, &artist_name, &(pos as i32)],
+                                    &[track_id as &dyn ToSqlValue, &artist_name as &dyn ToSqlValue, &(pos as i32) as &dyn ToSqlValue],
                                 ).ok();
                             }
                         }
@@ -340,9 +341,9 @@ pub(super) async fn enrich_all_credits(State(state): State<AppState>) -> impl In
                                         .and_then(|arr| arr.first())
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
-                                    db.execute(
+                                    backend.execute(
                                         "INSERT INTO track_credits (track_id, artist_name, role, instrument, position) VALUES (?, ?, ?, ?, 0)",
-                                        &[track_id as &dyn rusqlite::types::ToSql, &name, &rel_type, &instrument],
+                                        &[track_id as &dyn ToSqlValue, &name as &dyn ToSqlValue, &rel_type as &dyn ToSqlValue, &instrument as &dyn ToSqlValue],
                                     ).ok();
                                 }
                             }

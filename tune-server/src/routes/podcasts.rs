@@ -70,28 +70,28 @@ async fn search_podcasts(
     }
 }
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn.prepare("SELECT id, feed_url, title, author, image_url, description FROM podcast_subscriptions ORDER BY title").and_then(|mut stmt| { stmt.query_map([], |row| { Ok(json!({"id": row.get::<_, Option<i64>>(0).ok().flatten(), "feed_url": row.get::<_, Option<String>>(1).ok().flatten(), "title": row.get::<_, Option<String>>(2).ok().flatten(), "author": row.get::<_, Option<String>>(3).ok().flatten(), "image_url": row.get::<_, Option<String>>(4).ok().flatten(), "description": row.get::<_, Option<String>>(5).ok().flatten()})) }).and_then(|rows| rows.collect::<Result<Vec<_>, _>>()) }).unwrap_or_default();
-    drop(conn);
+    let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description FROM podcast_subscriptions ORDER BY title", &[]).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.get(0).and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string())})).collect();
     Ok(Json(json!(items)))
 }
 async fn subscribe(
     State(state): State<AppState>,
     Json(body): Json<Subscribe>,
 ) -> impl IntoResponse {
-    match state.db.execute("INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES (?, ?, ?, ?, ?)", &[&body.feed_url as &dyn rusqlite::types::ToSql, &body.title, &body.author, &body.image_url, &body.description]) {
-        Ok(_) => { let id = state.db.last_insert_rowid(); info!(title = %body.title, feed_url = %body.feed_url, "podcast_subscribed"); (StatusCode::CREATED, Json(json!({"id": id, "title": body.title}))).into_response() }
+    use tune_core::db::backend::ToSqlValue;
+    match state.backend.execute("INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES (?, ?, ?, ?, ?)", &[&body.feed_url as &dyn ToSqlValue, &body.title as &dyn ToSqlValue, &body.author as &dyn ToSqlValue, &body.image_url as &dyn ToSqlValue, &body.description as &dyn ToSqlValue]) {
+        Ok(_) => { let id = state.backend.last_insert_rowid(); info!(title = %body.title, feed_url = %body.feed_url, "podcast_subscribed"); (StatusCode::CREATED, Json(json!({"id": id, "title": body.title}))).into_response() }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 async fn unsubscribe(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     state
-        .db
-        .execute("DELETE FROM podcast_subscriptions WHERE id = ?", &[&id])
+        .backend
+        .execute(
+            "DELETE FROM podcast_subscriptions WHERE id = ?",
+            &[&id as &dyn ToSqlValue],
+        )
         .ok();
     StatusCode::NO_CONTENT
 }
@@ -131,25 +131,28 @@ async fn podcast_episodes(
         };
     }
     let feed_url = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
+        use tune_core::db::backend::ToSqlValue;
         if let Ok(id) = podcast_id.parse::<i64>() {
-            conn.query_row(
-                "SELECT feed_url FROM podcast_subscriptions WHERE id = ?",
-                rusqlite::params![id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
+            state
+                .backend
+                .query_one(
+                    "SELECT feed_url FROM podcast_subscriptions WHERE id = ?",
+                    &[&id as &dyn ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r.first().and_then(|v| v.as_string()))
         } else {
-            conn.query_row(
-                "SELECT feed_url FROM podcast_subscriptions WHERE title LIKE ?",
-                rusqlite::params![format!("%{}%", podcast_id.replace('-', " "))],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
+            let like = format!("%{}%", podcast_id.replace('-', " "));
+            state
+                .backend
+                .query_one(
+                    "SELECT feed_url FROM podcast_subscriptions WHERE title LIKE ?",
+                    &[&like as &dyn ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| r.first().and_then(|v| v.as_string()))
         }
     };
     let Some(feed_url) = feed_url else {

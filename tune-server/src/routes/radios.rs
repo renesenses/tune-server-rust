@@ -538,19 +538,15 @@ async fn save_radio_favorite(
     State(state): State<AppState>,
     Json(body): Json<SaveRadioFavorite>,
 ) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     let artist = body.artist.unwrap_or_default();
-    match state.db.execute(
+    let station = body.station_name.unwrap_or_default();
+    match state.backend.execute(
         "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url, stream_url) VALUES (?, ?, ?, ?, ?)",
-        &[
-            &body.title as &dyn rusqlite::types::ToSql,
-            &artist,
-            &body.station_name.unwrap_or_default(),
-            &body.cover_url,
-            &body.stream_url,
-        ],
+        &[&body.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station as &dyn ToSqlValue, &body.cover_url as &dyn ToSqlValue, &body.stream_url as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -561,9 +557,13 @@ async fn delete_radio_favorite(
     State(state): State<AppState>,
     Path(fav_id): Path<i64>,
 ) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
     state
-        .db
-        .execute("DELETE FROM radio_favorites WHERE id = ?", &[&fav_id])
+        .backend
+        .execute(
+            "DELETE FROM radio_favorites WHERE id = ?",
+            &[&fav_id as &dyn ToSqlValue],
+        )
         .ok();
     StatusCode::NO_CONTENT
 }
@@ -595,17 +595,13 @@ async fn save_current_as_favorite(
     };
     let cover_url = np.cover_path.clone();
 
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    match state.backend.execute(
         "INSERT OR IGNORE INTO radio_favorites (title, artist, station_name, cover_url) VALUES (?, ?, ?, ?)",
-        &[
-            &title as &dyn rusqlite::types::ToSql,
-            &artist,
-            &station_name,
-            &cover_url,
-        ],
+        &[&title as &dyn ToSqlValue, &artist as &dyn ToSqlValue, &station_name as &dyn ToSqlValue, &cover_url as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id, "title": title, "artist": artist }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
@@ -629,24 +625,21 @@ async fn create_playlist_from_favorites(
     State(state): State<AppState>,
     body: Option<Json<CreatePlaylistFromFavBody>>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let favorites: Vec<(String, String)> = conn
-        .prepare("SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, String>(1).unwrap_or_default(),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    let favorites: Vec<(String, String)> = state
+        .backend
+        .query_many(
+            "SELECT title, artist FROM radio_favorites ORDER BY saved_at DESC",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            (
+                r.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+            )
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     if favorites.is_empty() {
         return Ok((
@@ -730,40 +723,33 @@ pub fn alarms_router() -> Router<AppState> {
 }
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time"
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "name": row.get::<_, Option<String>>(1).ok().flatten().unwrap_or_else(|| "Alarm".into()),
-                    "time": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "days": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "one_shot": row.get::<_, i32>(4).unwrap_or(0) != 0,
-                    "skip_holidays": row.get::<_, i32>(5).unwrap_or(0) != 0,
-                    "zone_id": row.get::<_, Option<i64>>(6).ok().flatten(),
-                    "source_type": row.get::<_, Option<String>>(7).ok().flatten(),
-                    "source_id": row.get::<_, Option<String>>(8).ok().flatten(),
-                    "source_name": row.get::<_, Option<String>>(9).ok().flatten(),
-                    "volume": row.get::<_, Option<i32>>(10).ok().flatten(),
-                    "fade_duration_s": row.get::<_, Option<i32>>(11).ok().flatten(),
-                    "enabled": row.get::<_, i32>(12).unwrap_or(1) != 0,
-                    "last_fired_at": row.get::<_, Option<String>>(13).ok().flatten(),
-                    "created_at": row.get::<_, Option<String>>(14).ok().flatten(),
-                    "fade_in_seconds": row.get::<_, Option<i32>>(15).ok().flatten(),
-                }))
+    let rows = state.backend.query_many(
+        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time",
+        &[],
+    ).map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "name": r.get(1).and_then(|v| v.as_string()).unwrap_or_else(|| "Alarm".into()),
+                "time": r.get(2).and_then(|v| v.as_string()),
+                "days": r.get(3).and_then(|v| v.as_string()),
+                "one_shot": r.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                "skip_holidays": r.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+                "zone_id": r.get(6).and_then(|v| v.as_i64()),
+                "source_type": r.get(7).and_then(|v| v.as_string()),
+                "source_id": r.get(8).and_then(|v| v.as_string()),
+                "source_name": r.get(9).and_then(|v| v.as_string()),
+                "volume": r.get(10).and_then(|v| v.as_i64()),
+                "fade_duration_s": r.get(11).and_then(|v| v.as_i64()),
+                "enabled": r.get(12).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+                "last_fired_at": r.get(13).and_then(|v| v.as_string()),
+                "created_at": r.get(14).and_then(|v| v.as_string()),
+                "fade_in_seconds": r.get(15).and_then(|v| v.as_i64()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -796,26 +782,18 @@ async fn create_alarm_global(
         0
     };
 
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    let name = body.name.unwrap_or_else(|| "Alarm".into());
+    let days = body.days.unwrap_or_else(|| "0,1,2,3,4".into());
+    let volume = body.volume.unwrap_or(0.3);
+    let fade_duration_s = body.fade_duration_s.unwrap_or(60);
+    let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    match state.backend.execute(
         "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[
-            &body.name.unwrap_or_else(|| "Alarm".into()) as &dyn rusqlite::types::ToSql,
-            &body.time,
-            &body.days.unwrap_or_else(|| "0,1,2,3,4".into()),
-            &one_shot_int,
-            &skip_holidays_int,
-            &body.zone_id,
-            &body.source_type,
-            &body.source_id,
-            &body.source_name,
-            &body.volume.unwrap_or(0.3),
-            &body.fade_duration_s.unwrap_or(60),
-            &body.fade_in_seconds.unwrap_or(30),
-            &enabled_int,
-        ],
+        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue],
     ) {
         Ok(_) => {
-            let id = state.db.last_insert_rowid();
+            let id = state.backend.last_insert_rowid();
             (StatusCode::CREATED, Json(json!({ "id": id }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -844,61 +822,62 @@ async fn update_alarm(
     Path(id): Path<i64>,
     Json(body): Json<UpdateAlarm>,
 ) -> Result<impl IntoResponse, AppError> {
+    use tune_core::db::backend::{SqlValue, ToSqlValue};
     // Build SET clause dynamically from provided fields
     let mut sets: Vec<String> = Vec::new();
-    let mut values: Vec<Box<dyn rusqlite::types::ToSql + Send>> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
 
     if let Some(ref name) = body.name {
         sets.push("name = ?".into());
-        values.push(Box::new(name.clone()));
+        values.push(name.to_sql_value());
     }
     if let Some(ref time) = body.time {
         sets.push("time = ?".into());
-        values.push(Box::new(time.clone()));
+        values.push(time.to_sql_value());
     }
     if let Some(ref days) = body.days {
         sets.push("days = ?".into());
-        values.push(Box::new(days.clone()));
+        values.push(days.to_sql_value());
     }
     if let Some(one_shot) = body.one_shot {
         sets.push("one_shot = ?".into());
-        values.push(Box::new(one_shot as i32));
+        values.push((one_shot as i32).to_sql_value());
     }
     if let Some(skip_holidays) = body.skip_holidays {
         sets.push("skip_holidays = ?".into());
-        values.push(Box::new(skip_holidays as i32));
+        values.push((skip_holidays as i32).to_sql_value());
     }
     if let Some(zone_id) = body.zone_id {
         sets.push("zone_id = ?".into());
-        values.push(Box::new(zone_id));
+        values.push(zone_id.to_sql_value());
     }
     if let Some(ref source_type) = body.source_type {
         sets.push("source_type = ?".into());
-        values.push(Box::new(source_type.clone()));
+        values.push(source_type.to_sql_value());
     }
     if let Some(ref source_id) = body.source_id {
         sets.push("source_id = ?".into());
-        values.push(Box::new(source_id.clone()));
+        values.push(source_id.to_sql_value());
     }
     if let Some(ref source_name) = body.source_name {
         sets.push("source_name = ?".into());
-        values.push(Box::new(source_name.clone()));
+        values.push(source_name.to_sql_value());
     }
     if let Some(volume) = body.volume {
         sets.push("volume = ?".into());
-        values.push(Box::new(volume));
+        values.push(volume.to_sql_value());
     }
     if let Some(fade_duration_s) = body.fade_duration_s {
         sets.push("fade_duration_s = ?".into());
-        values.push(Box::new(fade_duration_s));
+        values.push(fade_duration_s.to_sql_value());
     }
     if let Some(fade_in_seconds) = body.fade_in_seconds {
         sets.push("fade_in_seconds = ?".into());
-        values.push(Box::new(fade_in_seconds));
+        values.push(fade_in_seconds.to_sql_value());
     }
     if let Some(enabled) = body.enabled {
         sets.push("enabled = ?".into());
-        values.push(Box::new(enabled as i32));
+        values.push((enabled as i32).to_sql_value());
     }
 
     if sets.is_empty() {
@@ -906,30 +885,13 @@ async fn update_alarm(
     }
 
     let sql = format!("UPDATE alarms SET {} WHERE id = ?", sets.join(", "));
-    values.push(Box::new(id));
+    values.push(id.to_sql_value());
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values
-        .iter()
-        .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql)
-        .collect();
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    match conn.execute(&sql, params_ref.as_slice()) {
-        Ok(0) => {
-            drop(conn);
-            Ok(StatusCode::NOT_FOUND.into_response())
-        }
-        Ok(_) => {
-            drop(conn);
-            Ok(Json(json!({ "id": id, "updated": true })).into_response())
-        }
-        Err(e) => {
-            drop(conn);
-            Ok((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
-        }
+    let params_ref: Vec<&dyn ToSqlValue> = values.iter().map(|v| v as &dyn ToSqlValue).collect();
+    match state.backend.execute(&sql, &params_ref) {
+        Ok(0) => Ok(StatusCode::NOT_FOUND.into_response()),
+        Ok(_) => Ok(Json(json!({ "id": id, "updated": true })).into_response()),
+        Err(e) => Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response()),
     }
 }
 
@@ -937,7 +899,11 @@ async fn delete_alarm_global(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    match state.db.execute("DELETE FROM alarms WHERE id = ?", &[&id]) {
+    use tune_core::db::backend::ToSqlValue;
+    match state
+        .backend
+        .execute("DELETE FROM alarms WHERE id = ?", &[&id as &dyn ToSqlValue])
+    {
         Ok(0) => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -945,9 +911,10 @@ async fn delete_alarm_global(
 }
 
 async fn snooze_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    match state.db.execute(
+    use tune_core::db::backend::ToSqlValue;
+    match state.backend.execute(
         "UPDATE alarms SET last_fired_at = NULL WHERE id = ?",
-        &[&id],
+        &[&id as &dyn ToSqlValue],
     ) {
         Ok(0) => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => Json(json!({ "id": id, "snoozed": true })).into_response(),

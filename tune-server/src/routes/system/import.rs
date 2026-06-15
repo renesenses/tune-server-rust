@@ -34,11 +34,11 @@ pub(super) async fn import_roon(
     Json(body): Json<ImportRoonRequest>,
 ) -> impl IntoResponse {
     let task_id = uuid_v4();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
     let tid = task_id.clone();
 
     // Store initial task status
-    let settings = SettingsRepo::new(db.clone());
+    let settings = SettingsRepo::with_backend(backend.clone());
     settings
         .set(
             &format!("import_task_{tid}"),
@@ -47,10 +47,10 @@ pub(super) async fn import_roon(
         .ok();
 
     tokio::spawn(async move {
-        let track_repo = TrackRepo::new(db.clone());
-        let artist_repo = ArtistRepo::new(db.clone());
-        let album_repo = AlbumRepo::new(db.clone());
-        let settings = SettingsRepo::new(db.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+        let artist_repo = ArtistRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        let settings = SettingsRepo::with_backend(backend.clone());
 
         let mut imported = 0i32;
         let mut skipped = 0i32;
@@ -234,13 +234,13 @@ pub(super) async fn import_plex(
     Json(body): Json<ImportPlexRequest>,
 ) -> impl IntoResponse {
     let task_id = uuid_v4();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
     let plex_url = body.plex_url.trim_end_matches('/').to_string();
     let token = body.plex_token.clone();
     let library_id = body.library_id.clone();
     let tid = task_id.clone();
 
-    let settings = SettingsRepo::new(db.clone());
+    let settings = SettingsRepo::with_backend(backend.clone());
     settings
         .set(
             &format!("import_task_{tid}"),
@@ -250,10 +250,10 @@ pub(super) async fn import_plex(
 
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let settings = SettingsRepo::new(db.clone());
-        let track_repo = TrackRepo::new(db.clone());
-        let artist_repo = ArtistRepo::new(db.clone());
-        let album_repo = AlbumRepo::new(db.clone());
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+        let artist_repo = ArtistRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend.clone());
 
         let mut imported = 0i32;
         let mut skipped = 0i32;
@@ -470,17 +470,17 @@ pub(super) async fn import_jriver(
     Json(body): Json<ImportJriverRequest>,
 ) -> impl IntoResponse {
     let task_id = uuid_v4();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
     let xml_path = body.xml_path.clone();
     let event_bus = state.event_bus.clone();
 
-    let settings = SettingsRepo::new(db.clone());
+    let settings = SettingsRepo::with_backend(backend.clone());
     let key = format!("import_task_{task_id}");
     settings.set(&key, "running").ok();
 
     tokio::spawn(async move {
-        let result = parse_jriver_xml(&xml_path, &db);
-        let settings = SettingsRepo::new(db);
+        let result = parse_jriver_xml(&xml_path, &backend);
+        let settings = SettingsRepo::with_backend(backend);
         match result {
             Ok((imported, skipped)) => {
                 settings
@@ -512,13 +512,13 @@ pub(super) async fn import_jriver(
 
 fn parse_jriver_xml(
     xml_path: &str,
-    db: &tune_core::db::sqlite::SqliteDb,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<(usize, usize), String> {
     let content = std::fs::read_to_string(xml_path).map_err(|e| format!("read {xml_path}: {e}"))?;
 
-    let artist_repo = ArtistRepo::new(db.clone());
-    let album_repo = AlbumRepo::new(db.clone());
-    let track_repo = TrackRepo::new(db.clone());
+    let artist_repo = ArtistRepo::with_backend(backend.clone());
+    let album_repo = AlbumRepo::with_backend(backend.clone());
+    let track_repo = TrackRepo::with_backend(backend.clone());
 
     let mut imported = 0;
     let mut skipped = 0;

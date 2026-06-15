@@ -226,7 +226,7 @@ pub async fn create_zone_handler(
 fn build_signal_path(
     ps: &ZoneState,
     zone: &Zone,
-    db: &tune_core::db::sqlite::SqliteDb,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     renderer_label: Option<&str>,
     audio_backend: &str,
 ) -> Option<Value> {
@@ -237,9 +237,12 @@ fn build_signal_path(
     let np = ps.now_playing.as_ref()?;
 
     // Look up track details for format/sample_rate/bit_depth
-    let track = np
-        .track_id
-        .and_then(|tid| TrackRepo::new(db.clone()).get(tid).ok().flatten());
+    let track = np.track_id.and_then(|tid| {
+        TrackRepo::with_backend(backend.clone())
+            .get(tid)
+            .ok()
+            .flatten()
+    });
 
     let fmt_str = track
         .as_ref()
@@ -258,7 +261,7 @@ fn build_signal_path(
     let output_type = zone.output_type.as_deref().unwrap_or("local");
 
     // Determine if DSP is active
-    let dsp_enabled = ZoneRepo::new(db.clone())
+    let dsp_enabled = ZoneRepo::with_backend(backend.clone())
         .get_dsp_config(zone.id.unwrap_or(0))
         .map(|(preset_id, enabled)| enabled && preset_id.is_some())
         .unwrap_or(false);
@@ -485,7 +488,8 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .output_device_id
                 .as_deref()
                 .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
-            let signal_path = build_signal_path(&ps, z, &state.db, renderer_label, audio_backend);
+            let signal_path =
+                build_signal_path(&ps, z, &state.backend, renderer_label, audio_backend);
             obj.insert("signal_path".into(), json!(signal_path));
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
@@ -539,7 +543,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     .as_deref()
                     .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
                 let signal_path =
-                    build_signal_path(&ps, &zone, &state.db, renderer_label, audio_backend);
+                    build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
                 obj.insert("signal_path".into(), json!(signal_path));
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.

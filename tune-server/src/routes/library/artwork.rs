@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
-use tune_core::db::backend::DbBackend;
 use tune_core::db::track_repo::TrackRepo;
 
 use super::artwork_cache_dir;
@@ -227,9 +226,9 @@ pub(super) async fn enrich_album_artwork(
                         .await;
                 if let Some(ref discovered_mbid) = found {
                     // Store the discovered MBID on the album for future use
-                    state.db.execute(
+                    state.backend.execute(
                         "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
-                        &[discovered_mbid as &dyn rusqlite::types::ToSql, &id],
+                        &[discovered_mbid as &dyn tune_core::db::backend::ToSqlValue, &id as &dyn tune_core::db::backend::ToSqlValue],
                     ).ok();
                     tracing::info!(
                         album_id = id,
@@ -448,18 +447,18 @@ pub(super) async fn rescan_album_artwork(
 
 pub(super) async fn rescan_all_artwork(State(state): State<AppState>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
-    let db = state.db.clone();
+    let backend = state.backend.clone();
 
     tokio::spawn(async move {
-        let albums: Vec<i64> = db
+        let albums: Vec<i64> = backend
             .query_many("SELECT id FROM albums", &[])
             .unwrap_or_default()
             .into_iter()
             .filter_map(|row| row.first().and_then(|v| v.as_i64()))
             .collect();
 
-        let track_repo = TrackRepo::new(db.clone());
-        let album_repo = AlbumRepo::new(db);
+        let track_repo = TrackRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend);
         let mut updated = 0i32;
         for album_id in &albums {
             let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();

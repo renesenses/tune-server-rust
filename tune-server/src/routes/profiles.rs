@@ -268,25 +268,23 @@ async fn update_profile_settings(
 }
 
 async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let result: Result<Vec<(String, i64)>, String> = (|| {
-        let conn = state.db.connection().lock().map_err(|e| format!("{e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![id], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(rows)
-    })();
+    use tune_core::db::backend::ToSqlValue;
+    let result: Result<Vec<(String, i64)>, String> = state
+        .backend
+        .query_many(
+            "SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type",
+            &[&id as &dyn ToSqlValue],
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| {
+                    (
+                        r.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                        r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                    )
+                })
+                .collect()
+        });
 
     match result {
         Ok(rows) => {
