@@ -70,7 +70,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
         drop(outputs);
 
         // Auto-create zones for discovered devices (skip if zone already exists)
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
         for d in &devices {
             match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                 Ok((zid, true)) => {
@@ -98,7 +98,8 @@ fn spawn_squeezebox_poller(state: &AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         loop {
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
             let enabled = settings
                 .get("squeezebox_enabled")
                 .ok()
@@ -135,7 +136,8 @@ fn spawn_hqplayer_poller(state: &AppState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         loop {
-            let settings = tune_core::db::settings_repo::SettingsRepo::new(state.db.clone());
+            let settings =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
             let enabled = settings
                 .get("hqplayer_enabled")
                 .ok()
@@ -417,7 +419,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
     // Phase 2: Create zones and emit events (no lock held)
     if !new_devices_to_zone.is_empty() {
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::new(state.db.clone());
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
             let zone_name = if *is_default {

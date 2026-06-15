@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use serde::Serialize;
 use tracing::{debug, info};
 
+use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
-use crate::db::sqlite::SqliteDb;
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
@@ -41,8 +43,8 @@ impl TelemetryReporter {
 
     /// Send a telemetry report to mozaiklabs.fr.
     /// Only sends if `telemetry_enabled` is "true" in settings.
-    pub async fn report(db: &SqliteDb, base_url: Option<&str>, uptime_hours: u64) {
-        let settings = SettingsRepo::new(db.clone());
+    pub async fn report(db: &Arc<dyn DbBackend>, base_url: Option<&str>, uptime_hours: u64) {
+        let settings = SettingsRepo::with_backend(db.clone());
 
         if !Self::is_enabled(&settings) {
             return;
@@ -51,13 +53,13 @@ impl TelemetryReporter {
         let instance_id = Self::get_or_create_instance_id(&settings);
         let base = base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/');
 
-        let tracks = crate::db::track_repo::TrackRepo::new(db.clone())
+        let tracks = crate::db::track_repo::TrackRepo::with_backend(db.clone())
             .count()
             .unwrap_or(0);
-        let albums = crate::db::album_repo::AlbumRepo::new(db.clone())
+        let albums = crate::db::album_repo::AlbumRepo::with_backend(db.clone())
             .count()
             .unwrap_or(0);
-        let zones = crate::db::zone_repo::ZoneRepo::new(db.clone())
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
             .list()
             .map(|z| z.len() as i64)
             .unwrap_or(0);
@@ -93,7 +95,7 @@ impl TelemetryReporter {
 
     /// Spawn a background task that reports telemetry after 5 min (post-scan),
     /// again after 1 hour, then every 24 hours.
-    pub fn spawn(db: SqliteDb) {
+    pub fn spawn(db: Arc<dyn DbBackend>) {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 

@@ -8,7 +8,6 @@ use crate::audio::formats::AudioFormat;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
 use crate::db::play_queue_repo::PlayQueueRepo;
 use crate::db::settings_repo::SettingsRepo;
-use crate::db::sqlite::SqliteDb;
 use crate::db::track_repo::TrackRepo;
 use crate::db::zone_repo::ZoneRepo;
 use crate::event_bus::EventBus;
@@ -18,7 +17,7 @@ use crate::playback::{NowPlaying, PlaybackManager};
 use crate::streaming::registry::ServiceRegistry;
 
 pub struct PlaybackOrchestrator {
-    pub db: SqliteDb,
+    pub db: Arc<dyn crate::db::backend::DbBackend>,
     pub playback: Arc<PlaybackManager>,
     pub streamer: Arc<AudioStreamer>,
     pub services: Arc<Mutex<ServiceRegistry>>,
@@ -90,7 +89,7 @@ pub struct ResolvedQueueItem {
 
 impl PlaybackOrchestrator {
     pub fn new(
-        db: SqliteDb,
+        db: Arc<dyn crate::db::backend::DbBackend>,
         playback: Arc<PlaybackManager>,
         streamer: Arc<AudioStreamer>,
         services: Arc<Mutex<ServiceRegistry>>,
@@ -134,7 +133,7 @@ impl PlaybackOrchestrator {
         // the zone's DB record.  This is the primary gate for send_to_output —
         // without it, the stream is created but never sent to the output device.
         if req.output_device_id.is_none() {
-            let looked_up = ZoneRepo::new(self.db.clone())
+            let looked_up = ZoneRepo::with_backend(self.db.clone())
                 .get(req.zone_id)
                 .ok()
                 .flatten()
@@ -197,7 +196,7 @@ impl PlaybackOrchestrator {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
             let local_file_path = if resolved.source == "local" {
                 req.track_id.and_then(|tid| {
-                    TrackRepo::new(self.db.clone())
+                    TrackRepo::with_backend(self.db.clone())
                         .get(tid)
                         .ok()
                         .flatten()
@@ -409,7 +408,7 @@ impl PlaybackOrchestrator {
 
     async fn resolve_local_track(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let track_id = req.track_id.ok_or("no track_id for local playback")?;
-        let repo = TrackRepo::new(self.db.clone());
+        let repo = TrackRepo::with_backend(self.db.clone());
         let track = repo
             .get(track_id)
             .map_err(|e| e.to_string())?
@@ -423,7 +422,7 @@ impl PlaybackOrchestrator {
         let channels = track.channels as u16;
 
         // Determine the output type and max_sample_rate for this zone.
-        let zone = ZoneRepo::new(self.db.clone())
+        let zone = ZoneRepo::with_backend(self.db.clone())
             .get(req.zone_id)
             .ok()
             .flatten();
@@ -1224,7 +1223,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
     ) {
-        let repo = HistoryRepo::new(self.db.clone());
+        let repo = HistoryRepo::with_backend(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
             track_id: None,
@@ -1247,7 +1246,7 @@ impl PlaybackOrchestrator {
     }
 
     fn lastfm_keys(&self) -> Option<(String, String, String)> {
-        let settings = SettingsRepo::new(self.db.clone());
+        let settings = SettingsRepo::with_backend(self.db.clone());
         let api_key = settings.get("lastfm_api_key").ok().flatten()?;
         let api_secret = settings.get("lastfm_api_secret").ok().flatten()?;
         let session_key = settings.get("lastfm_session_key").ok().flatten()?;
@@ -1311,7 +1310,7 @@ impl PlaybackOrchestrator {
     }
 
     fn listenbrainz_token(&self) -> Option<String> {
-        let settings = SettingsRepo::new(self.db.clone());
+        let settings = SettingsRepo::with_backend(self.db.clone());
         settings
             .get("listenbrainz_token")
             .ok()
@@ -1449,7 +1448,7 @@ impl PlaybackOrchestrator {
         self.playback.seek(zone_id, position_ms as i64).await;
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
-            if let Err(e) = ZoneRepo::new(self.db.clone()).save_playback_position(
+            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
                 zone_id,
                 position_ms as i64,
                 np.track_id,
@@ -1472,7 +1471,10 @@ impl PlaybackOrchestrator {
     pub async fn set_volume(&self, zone_id: i64, volume: f64, device_id: Option<&str>) {
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
-        let zone = ZoneRepo::new(self.db.clone()).get(zone_id).ok().flatten();
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten();
         if zone.as_ref().is_some_and(|z| z.fixed_volume) {
             self.playback.set_volume(zone_id, 1.0).await;
             return;
@@ -1504,7 +1506,7 @@ impl PlaybackOrchestrator {
     /// Persist the play_queue table for a zone with the given local track IDs.
     /// Called after queue mutations to keep the DB in sync with in-memory state.
     pub fn persist_local_queue(&self, zone_id: i64, track_ids: &[i64], current_position: i64) {
-        let repo = PlayQueueRepo::new(self.db.clone());
+        let repo = PlayQueueRepo::with_backend(self.db.clone());
         if let Err(e) = repo.set_queue(zone_id, track_ids) {
             warn!(zone_id, error = %e, "persist_local_queue_failed");
             return;
@@ -1528,16 +1530,16 @@ impl PlaybackOrchestrator {
             Option<String>,
         )],
     ) {
-        let repo = PlayQueueRepo::new(self.db.clone());
+        let repo = PlayQueueRepo::with_backend(self.db.clone());
         if let Err(e) = repo.set_streaming_queue(zone_id, tracks) {
             warn!(zone_id, error = %e, "persist_streaming_queue_failed");
         }
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
-        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
-        let output_device_id = ZoneRepo::new(self.db.clone())
+        let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()
             .flatten()
@@ -1613,12 +1615,12 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
-        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
         queue_repo.set_current(zone_id, position).ok();
 
         let queue = queue_repo.get_queue(zone_id)?;
         if let Some(item) = queue.iter().find(|i| i.is_current) {
-            let track_repo = crate::db::track_repo::TrackRepo::new(self.db.clone());
+            let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
             let track = track_repo.get(item.track_id).ok().flatten();
             let cover_path = track.as_ref().and_then(|t| t.cover_path.clone());
             let np = crate::playback::NowPlaying {
@@ -1699,7 +1701,7 @@ impl PlaybackOrchestrator {
         // before creating a new one.
         self.cleanup_gapless_session(zone_id).await;
 
-        let queue_repo = PlayQueueRepo::new(self.db.clone());
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
         // Try local queue first
         let queue = queue_repo.get_queue(zone_id)?;
@@ -1762,7 +1764,7 @@ impl PlaybackOrchestrator {
                 .map(|np| np.source.clone())
                 .unwrap_or_else(|| "tidal".into())
         };
-        let output_device_id = ZoneRepo::new(self.db.clone())
+        let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
             .ok()
             .flatten()
@@ -1810,7 +1812,7 @@ impl PlaybackOrchestrator {
     async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
-            ZoneRepo::new(self.db.clone())
+            ZoneRepo::with_backend(self.db.clone())
                 .save_playback_position(
                     zone_id,
                     state.position_ms,
@@ -2083,7 +2085,7 @@ mod tests {
         let orch = test_orchestrator();
 
         // Create a zone in the DB so save_playback_position has a row to UPDATE
-        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo.create("Test Zone", None, None).unwrap();
 
         // Set up NowPlaying (seek persists position only when now_playing exists)
@@ -2186,7 +2188,7 @@ mod tests {
         let orch = test_orchestrator();
 
         // Create a zone in DB
-        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo.create("Pause Zone", None, None).unwrap();
 
         // Set up playback at a known position
@@ -2217,7 +2219,7 @@ mod tests {
     async fn test_persist_position_on_stop() {
         let orch = test_orchestrator();
 
-        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo.create("Stop Zone", None, None).unwrap();
 
         let np = NowPlaying {
@@ -2249,7 +2251,7 @@ mod tests {
         let orch = test_orchestrator();
 
         // Create a zone so the FK constraint on zone_id is satisfied
-        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo.create("Listen Zone", None, None).unwrap();
 
         orch.record_listen(
@@ -2262,7 +2264,7 @@ mod tests {
             None,
         );
 
-        let repo = HistoryRepo::new(orch.db.clone());
+        let repo = HistoryRepo::with_backend(orch.db.clone());
         let history = repo.recent(10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].title, "Test Song");
@@ -2303,7 +2305,7 @@ mod tests {
         use crate::db::play_queue_repo::PlayQueueRepo;
 
         let orch = test_orchestrator();
-        let zone_repo = ZoneRepo::new(orch.db.clone());
+        let zone_repo = ZoneRepo::with_backend(orch.db.clone());
         let zone_id = zone_repo.create("Queue Zone", None, None).unwrap();
 
         // Insert some tracks so FK constraints are satisfied
@@ -2327,7 +2329,7 @@ mod tests {
 
         orch.persist_local_queue(zone_id, &[1, 2, 3], 0);
 
-        let queue_repo = PlayQueueRepo::new(orch.db.clone());
+        let queue_repo = PlayQueueRepo::with_backend(orch.db.clone());
         let queue = queue_repo.get_queue(zone_id).unwrap();
         assert_eq!(queue.len(), 3);
     }

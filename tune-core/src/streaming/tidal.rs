@@ -1098,7 +1098,26 @@ impl StreamingService for TidalService {
                     );
 
                     if returned_quality == q {
-                        // Got exactly what we requested — use it
+                        // Skip fMP4 DASH (SegmentTemplate) — we can't decode
+                        // multi-segment fMP4 yet. Fallback to next quality
+                        // (typically LOSSLESS = raw FLAC).
+                        if manifest_mime == "application/dash+xml" {
+                            let manifest_raw = d["manifest"].as_str().unwrap_or("");
+                            if let Ok(decoded) =
+                                String::from_utf8(base64_decode(manifest_raw).unwrap_or_default())
+                            {
+                                if decoded.contains("audio/mp4")
+                                    && decoded.contains("SegmentTemplate")
+                                {
+                                    warn!(
+                                        track_id,
+                                        quality = q,
+                                        "tidal_fmp4_dash_not_supported_skipping"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         data = Some(d);
                         break;
                     }

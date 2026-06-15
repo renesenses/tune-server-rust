@@ -54,7 +54,7 @@ pub mod sql {
         format!(
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
              COALESCE(t.id, h.track_id) as track_id, \
-             COALESCE(al.cover_path, al2.cover_path, h.cover_url) as cover_path, \
+             COALESCE(al.cover_path, al2.cover_path, MAX(h.cover_url)) as cover_path, \
              COALESCE(al.title, h.album_title) as album_title, \
              h.source \
              FROM listen_history h \

@@ -100,7 +100,7 @@ impl AppState {
         let event_bus = Arc::new(EventBus::new());
 
         let mut orch = PlaybackOrchestrator::new(
-            db.clone(),
+            backend.clone(),
             playback.clone(),
             streamer.clone(),
             services.clone(),
