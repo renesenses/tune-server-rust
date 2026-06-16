@@ -64,7 +64,7 @@ pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoRespo
 
 pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.backend.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let meta_repo =
             tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
         let tracks: Vec<(i64, String)> = db
@@ -89,18 +89,23 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
             if !path.exists() {
                 continue;
             }
-            let ext = tune_core::metadata::read_extended_metadata(path);
+            let ext =
+                tokio::task::block_in_place(|| tune_core::metadata::read_extended_metadata(path));
             if !ext.is_empty() {
                 batch.push((*track_id, ext));
                 enriched += 1;
             }
             if batch.len() >= 500 {
-                meta_repo.set_batch_multi(&batch).ok();
+                if let Err(e) = meta_repo.set_batch_multi(&batch) {
+                    tracing::error!(error = %e, "enrich_metadata_batch_failed");
+                }
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            meta_repo.set_batch_multi(&batch).ok();
+            if let Err(e) = meta_repo.set_batch_multi(&batch) {
+                tracing::error!(error = %e, "enrich_metadata_batch_failed");
+            }
         }
         tracing::info!(total, enriched, "enrich_extended_metadata_complete");
     });
