@@ -62,6 +62,54 @@ pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoRespo
     )
 }
 
+pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> impl IntoResponse {
+    let db = state.backend.clone();
+    tokio::task::spawn_blocking(move || {
+        let meta_repo =
+            tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
+        let tracks: Vec<(i64, String)> = db
+            .query_many(
+                "SELECT id, file_path FROM tracks WHERE file_path IS NOT NULL AND source = 'local'",
+                &[],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|cols| {
+                let id = cols.first()?.as_i64()?;
+                let path = cols.get(1)?.as_string()?;
+                Some((id, path))
+            })
+            .collect();
+        let total = tracks.len();
+        tracing::info!(total, "enrich_extended_metadata_started");
+        let mut enriched = 0u64;
+        let mut batch: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
+        for (track_id, file_path) in &tracks {
+            let path = std::path::Path::new(file_path);
+            if !path.exists() {
+                continue;
+            }
+            let ext = tune_core::metadata::read_extended_metadata(path);
+            if !ext.is_empty() {
+                batch.push((*track_id, ext));
+                enriched += 1;
+            }
+            if batch.len() >= 500 {
+                meta_repo.set_batch_multi(&batch).ok();
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            meta_repo.set_batch_multi(&batch).ok();
+        }
+        tracing::info!(total, enriched, "enrich_extended_metadata_complete");
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "extended_metadata_enrichment_started"})),
+    )
+}
+
 pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());

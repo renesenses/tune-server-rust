@@ -131,6 +131,7 @@ pub fn router() -> Router<AppState> {
         .route("/api-insights", get(diagnostics::api_insights))
         .route("/enrich", post(enrich::system_enrich))
         .route("/enrich-bios", post(enrich::enrich_bios))
+        .route("/enrich-metadata", post(enrich::enrich_extended_metadata))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
