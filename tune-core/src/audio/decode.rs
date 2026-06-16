@@ -398,6 +398,8 @@ fn decode_to_pcm_streaming_inner(
             .map_err(|_| "no tokio runtime for streaming decode")?;
         let ch = target_channels.unwrap_or(decoded.channels as u32) as u16;
         for chunk in pcm_bytes.chunks(chunk_size) {
+            // Send PCM data first, compute levels after (same rationale
+            // as the symphonia path: avoid delaying the audio stream).
             if rt.block_on(tx.send(chunk.to_vec())).is_err() {
                 debug!("streaming_decode_consumer_dropped (fallback)");
                 return Ok(output_bd);
@@ -554,14 +556,11 @@ fn decode_to_pcm_streaming_inner(
 
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
-            if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(
-                    &chunk,
-                    output_bd,
-                    source_channels as u16,
-                ));
-            }
-            if rt.block_on(tx.send(chunk)).is_err() {
+            // Send PCM data FIRST to avoid delaying the audio stream.
+            // compute_levels() is CPU-intensive (iterates all frames with
+            // floating-point math) and was previously called before send(),
+            // introducing micro-pauses that caused Squeezebox/LMS stuttering.
+            if rt.block_on(tx.send(chunk.clone())).is_err() {
                 debug!("streaming_decode_consumer_dropped");
                 return Ok(output_bd);
             }
@@ -570,6 +569,16 @@ fn decode_to_pcm_streaming_inner(
                 if let Some(ref n) = data_ready {
                     n.notify_one();
                 }
+            }
+            // Compute and send audio levels AFTER the PCM chunk is dispatched.
+            // The unbounded channel never blocks; the clone above is cheap
+            // compared to the latency savings for network outputs.
+            if let Some(ref ltx) = levels_tx {
+                let _ = ltx.send(super::levels::compute_levels(
+                    &chunk,
+                    output_bd,
+                    source_channels as u16,
+                ));
             }
         }
     }
@@ -933,10 +942,9 @@ fn decode_dsd_streaming(
             pcm_buf.extend_from_slice(&converted);
             while pcm_buf.len() >= chunk_size {
                 let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
-                if let Some(ltx) = levels_tx {
-                    let _ = ltx.send(super::levels::compute_levels(&chunk, output_bd, ch));
-                }
-                if rt.block_on(tx.send(chunk)).is_err() {
+                // Send PCM data first, compute levels after (same rationale
+                // as the symphonia path: avoid delaying the audio stream).
+                if rt.block_on(tx.send(chunk.clone())).is_err() {
                     debug!("dsd_streaming_consumer_dropped");
                     return Ok(true); // consumer gone
                 }
@@ -945,6 +953,9 @@ fn decode_dsd_streaming(
                     if let Some(n) = data_ready {
                         n.notify_one();
                     }
+                }
+                if let Some(ltx) = levels_tx {
+                    let _ = ltx.send(super::levels::compute_levels(&chunk, output_bd, ch));
                 }
             }
             Ok(false)
@@ -980,13 +991,12 @@ fn decode_dsd_streaming(
         pcm_buf.extend_from_slice(&converted);
     }
 
-    // Send any remaining bytes
+    // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
-        if let Some(ltx) = levels_tx {
-            let _ = ltx.send(super::levels::compute_levels(&pcm_buf, output_bd, ch));
-        }
-        if rt.block_on(tx.send(pcm_buf)).is_err() {
+        if rt.block_on(tx.send(pcm_buf.clone())).is_err() {
             debug!("dsd_streaming_consumer_dropped (final)");
+        } else if let Some(ltx) = levels_tx {
+            let _ = ltx.send(super::levels::compute_levels(&pcm_buf, output_bd, ch));
         }
     }
 

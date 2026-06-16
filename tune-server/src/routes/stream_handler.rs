@@ -209,8 +209,25 @@ pub async fn handle_stream(
                 }
             }
         } else {
+            // Coalesce small chunks into larger HTTP writes (target >=64 KB).
+            // Network outputs like Squeezebox/LMS fetch audio from this HTTP
+            // stream.  Yielding many small chunks (~32 KB each from the decoder)
+            // causes per-write overhead and can trigger micro-pauses that manifest
+            // as audible stuttering/crackling on the player.  Buffering to >=64 KB
+            // gives the network renderer more data per TCP segment, reducing the
+            // chance of buffer underrun.
+            const MIN_HTTP_CHUNK: usize = 65536;
+            let mut coalesce_buf = Vec::with_capacity(MIN_HTTP_CHUNK * 2);
             while let Some(chunk) = session.recv_chunk().await {
-                yield Ok(bytes::Bytes::from(chunk));
+                coalesce_buf.extend_from_slice(&chunk);
+                while coalesce_buf.len() >= MIN_HTTP_CHUNK {
+                    let flushed: Vec<u8> = coalesce_buf.drain(..MIN_HTTP_CHUNK).collect();
+                    yield Ok(bytes::Bytes::from(flushed));
+                }
+            }
+            // Flush any remaining bytes at end of stream
+            if !coalesce_buf.is_empty() {
+                yield Ok(bytes::Bytes::from(coalesce_buf));
             }
         }
     });
