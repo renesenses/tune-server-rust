@@ -213,8 +213,9 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     position TEXT NOT NULL DEFAULT 0
 );
 
+CREATE SEQUENCE IF NOT EXISTS zones_id_seq;
 CREATE TABLE IF NOT EXISTS zones (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY DEFAULT nextval('zones_id_seq')::text,
     name TEXT NOT NULL,
     output_type TEXT,
     output_device_id TEXT,

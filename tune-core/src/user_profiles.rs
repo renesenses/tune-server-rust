@@ -93,9 +93,10 @@ impl ProfileManager {
     }
 
     pub fn seed_admin(&self) -> Result<(), String> {
-        let row = self
-            .db
-            .query_one("SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1", &[])?;
+        let row = self.db.query_one(
+            "SELECT COUNT(*) FROM user_profiles WHERE is_admin = '1'",
+            &[],
+        )?;
         let has_admin = row.and_then(|r| r[0].as_i64()).unwrap_or(0) > 0;
 
         if has_admin {
@@ -162,9 +163,10 @@ impl ProfileManager {
         let is_admin = row.and_then(|r| r[0].as_bool()).unwrap_or(false);
 
         if is_admin {
-            let row = self
-                .db
-                .query_one("SELECT COUNT(*) FROM user_profiles WHERE is_admin = 1", &[])?;
+            let row = self.db.query_one(
+                "SELECT COUNT(*) FROM user_profiles WHERE is_admin = '1'",
+                &[],
+            )?;
             let admin_count = row.and_then(|r| r[0].as_i64()).unwrap_or(0);
             if admin_count <= 1 {
                 return Err("cannot delete last admin profile".into());

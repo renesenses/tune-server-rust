@@ -29,7 +29,7 @@ pub mod sql {
     }
 
     pub fn favorites() -> String {
-        format!("SELECT {COLS} FROM radio_stations WHERE is_favorite = 1 ORDER BY LOWER(name)")
+        format!("SELECT {COLS} FROM radio_stations WHERE is_favorite = '1' ORDER BY LOWER(name)")
     }
 
     pub fn create<D: SqlDialect>(d: &D) -> String {

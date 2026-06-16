@@ -29,7 +29,7 @@ pub mod sql {
 
     pub fn get_current<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE pq.zone_id = {} AND pq.is_current = 1",
+            "{} WHERE pq.zone_id = {} AND pq.is_current = '1'",
             queue_select_base(),
             d.placeholder(1)
         )

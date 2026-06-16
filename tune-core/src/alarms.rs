@@ -356,7 +356,7 @@ impl AlarmScheduler {
         if alarm["one_shot"].as_i64().unwrap_or(0) != 0 {
             self.db
                 .execute(
-                    "UPDATE alarms SET enabled = 0 WHERE id = ?",
+                    "UPDATE alarms SET enabled = '0' WHERE id = ?",
                     &[&alarm_id as &dyn ToSqlValue],
                 )
                 .ok();
@@ -367,7 +367,7 @@ impl AlarmScheduler {
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE enabled = 1",
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE enabled = '1'",
             &[],
         )?;
         Ok(rows
