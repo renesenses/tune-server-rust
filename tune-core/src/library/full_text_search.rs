@@ -21,46 +21,48 @@
 use rusqlite::Connection;
 use tracing::{info, warn};
 
-const FTS_TABLES: &[(&str, &str)] = &[
-    ("tracks", "title"),
-    ("albums", "title"),
-    ("artists", "name"),
+const FTS_TABLES: &[(&str, &[&str])] = &[
+    (
+        "tracks",
+        &["title", "artist_name", "album_title", "genre", "composer"],
+    ),
+    ("albums", &["title", "artist_name", "genre"]),
+    ("artists", &["name", "sort_name"]),
 ];
 
 pub fn setup_fts(conn: &Connection) {
-    for &(table, column) in FTS_TABLES {
+    for &(table, columns) in FTS_TABLES {
         let fts_name = format!("{table}_fts");
+        let cols_csv = columns.join(", ");
+
+        // Check if the FTS table exists with the wrong number of columns
+        // and drop it so we can recreate with the correct schema.
+        let needs_recreate = conn
+            .query_row(
+                &format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{fts_name}'"),
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .map(|sql| columns.iter().skip(1).any(|c| !sql.contains(c)))
+            .unwrap_or(false);
+
+        if needs_recreate {
+            info!(table = %fts_name, "fts_recreating_multi_column");
+            let _ = conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_ai"));
+            let _ = conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_ad"));
+            let _ = conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_au"));
+            let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {fts_name}"));
+        }
 
         let create = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS {fts_name} USING fts5(\
-             {column}, content={table}, content_rowid=id, \
+             {cols_csv}, content='', \
              tokenize='unicode61 remove_diacritics 2')"
         );
         if let Err(e) = conn.execute_batch(&create) {
             warn!(table = fts_name, error = %e, "fts_create_error");
             continue;
-        }
-
-        let triggers = [
-            format!(
-                "CREATE TRIGGER IF NOT EXISTS {table}_ai AFTER INSERT ON {table} BEGIN \
-                 INSERT INTO {fts_name}(rowid, {column}) VALUES (new.id, new.{column}); END"
-            ),
-            format!(
-                "CREATE TRIGGER IF NOT EXISTS {table}_ad AFTER DELETE ON {table} BEGIN \
-                 INSERT INTO {fts_name}({fts_name}, rowid, {column}) VALUES ('delete', old.id, old.{column}); END"
-            ),
-            format!(
-                "CREATE TRIGGER IF NOT EXISTS {table}_au AFTER UPDATE OF {column} ON {table} BEGIN \
-                 INSERT INTO {fts_name}({fts_name}, rowid, {column}) VALUES ('delete', old.id, old.{column}); \
-                 INSERT INTO {fts_name}(rowid, {column}) VALUES (new.id, new.{column}); END"
-            ),
-        ];
-
-        for trigger in &triggers {
-            if let Err(e) = conn.execute_batch(trigger) {
-                warn!(table = fts_name, error = %e, "fts_trigger_error");
-            }
         }
 
         // Rebuild FTS if content table has rows but FTS is empty
@@ -74,10 +76,11 @@ pub fn setup_fts(conn: &Connection) {
             .unwrap_or(0);
 
         if source_count > 0 && fts_count == 0 {
-            info!(table = fts_name, rows = source_count, "fts_rebuild_content");
-            let _ = conn.execute_batch(&format!(
-                "INSERT INTO {fts_name}({fts_name}) VALUES ('rebuild')"
-            ));
+            info!(
+                table = fts_name,
+                rows = source_count,
+                "fts_rebuild_on_setup"
+            );
         }
     }
 
@@ -85,15 +88,12 @@ pub fn setup_fts(conn: &Connection) {
 }
 
 pub fn rebuild_fts(conn: &Connection) {
-    for &(table, _) in FTS_TABLES {
-        let fts_name = format!("{table}_fts");
-        if let Err(e) = conn.execute_batch(&format!(
-            "INSERT INTO {fts_name}({fts_name}) VALUES ('rebuild')"
-        )) {
-            warn!(table = fts_name, error = %e, "fts_rebuild_error");
-        }
+    // For contentless FTS5 tables, 'rebuild' command doesn't work.
+    // Delegate to rebuild_fts_contentless which does delete-all + re-insert.
+    match rebuild_fts_contentless(conn) {
+        Ok(n) => info!(rows = n, "fts_rebuilt_all"),
+        Err(e) => warn!(error = %e, "fts_rebuild_error"),
     }
-    info!("fts_rebuilt_all");
 }
 
 /// Rebuild FTS5 contentless tables by deleting all FTS rows and

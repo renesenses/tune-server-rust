@@ -151,6 +151,33 @@ impl TuneConfig {
             config.db_path = format!("{data_dir}\\{}", config.db_path);
             config.artwork_dir = format!("{data_dir}\\{}", config.artwork_dir);
         }
+
+        // On macOS, resolve a relative db_path to an absolute location so Tune
+        // works correctly regardless of the working directory (e.g. LaunchAgent
+        // starts with CWD = "/").  Backward-compat: if tune.db already exists
+        // in the CWD, keep using it so existing installs are not affected.
+        #[cfg(target_os = "macos")]
+        if !std::path::Path::new(&config.db_path).is_absolute() {
+            let cwd_db = std::path::Path::new(&config.db_path);
+            if !cwd_db.exists() {
+                // Resolve to ~/Library/Application Support/Tune/tune.db
+                if let Ok(home) = std::env::var("HOME") {
+                    let app_support =
+                        std::path::PathBuf::from(&home).join("Library/Application Support/Tune");
+                    if std::fs::create_dir_all(&app_support).is_ok() {
+                        let abs_path = app_support.join(&config.db_path);
+                        info!(
+                            path = %abs_path.display(),
+                            "db_path_resolved_to_app_support"
+                        );
+                        config.db_path = abs_path.to_string_lossy().into_owned();
+                    }
+                }
+            } else {
+                info!(path = %cwd_db.display(), "db_path_using_existing_local_db");
+            }
+        }
+
         if let Ok(v) = std::env::var("TUNE_WEB_DIR") {
             config.web_dir = v;
         }

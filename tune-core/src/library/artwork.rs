@@ -543,7 +543,10 @@ async fn fetch_artist_image_lastfm(client: &reqwest::Client, artist_name: &str) 
             let s = img.get("size").and_then(|v| v.as_str())?;
             if s == size {
                 let url = img.get("#text").and_then(|v| v.as_str())?;
-                if !url.is_empty() {
+                if !url.is_empty()
+                    && !url.contains("/noimage/")
+                    && !url.contains("2a96cbd8b46e442fc41c2b86b821562f")
+                {
                     Some(url.to_string())
                 } else {
                     None

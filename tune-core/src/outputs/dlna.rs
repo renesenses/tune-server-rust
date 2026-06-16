@@ -197,6 +197,7 @@ impl DlnaOutput {
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
             .protocol_style(ProtocolStyle::Dlna)
             .dlna_art_profile(true)
+            .include_upnp_artist(true)
             .item_id(item_id)
             .artist_opt(media.artist)
             .album_opt(media.album)
