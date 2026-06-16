@@ -307,6 +307,32 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 inserted += track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 updated += track_repo.update_batch(&to_update).unwrap_or(0) as u64;
 
+                // Extract extended metadata (ISRC, ReplayGain, MusicBrainz, lyrics, etc.)
+                {
+                    let meta_repo =
+                        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(
+                            db.clone(),
+                        );
+                    let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> =
+                        Vec::new();
+                    for sf in &batch {
+                        if sf.metadata.is_some() {
+                            let path = std::path::Path::new(&sf.path);
+                            if let Ok(Some(track)) = track_repo.get_by_path(&sf.path) {
+                                if let Some(track_id) = track.id {
+                                    let ext = tune_core::metadata::read_extended_metadata(path);
+                                    if !ext.is_empty() {
+                                        meta_entries.push((track_id, ext));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !meta_entries.is_empty() {
+                        meta_repo.set_batch_multi(&meta_entries).ok();
+                    }
+                }
+
                 if db.engine() == tune_core::db::engine::Engine::Sqlite {
                     db.execute("COMMIT", &[]).ok();
                 }
