@@ -187,15 +187,16 @@ impl AudioStreamer {
     pub async fn cleanup_stale_sessions(&self) -> usize {
         let mut sessions = self.sessions.lock().await;
         let before = sessions.len();
-        // 5 minutes is generous for any legitimate stream.  Orphaned sessions
-        // from gapless prep or interrupted playback are cleaned up sooner by
+        // 30 minutes for streaming sessions — Hi-Res tracks can be large
+        // and DLNA renderers may buffer slowly.  Orphaned sessions from
+        // gapless prep or interrupted playback are cleaned up sooner by
         // the orchestrator; this GC is the safety net.
         sessions.retain(|id, s| {
             if s.is_radio {
                 return true;
             }
             let age = s.created_at.elapsed();
-            if age > std::time::Duration::from_secs(300) {
+            if age > std::time::Duration::from_secs(1800) {
                 info!(stream_id = %id, age_secs = age.as_secs(), "stale_session_removed");
                 false
             } else {
