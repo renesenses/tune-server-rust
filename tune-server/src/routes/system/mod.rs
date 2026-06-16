@@ -36,6 +36,10 @@ pub fn router() -> Router<AppState> {
             "/settings/metadata-fields",
             get(config::get_metadata_fields).put(config::set_metadata_fields),
         )
+        .route(
+            "/settings/default-zone",
+            get(config::get_default_zone).put(config::set_default_zone),
+        )
         .route("/library/clear", post(scan::library_clear))
         .route("/scan", post(scan::trigger_scan))
         .route("/scan/status", get(scan::scan_status))

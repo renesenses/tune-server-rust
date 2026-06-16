@@ -454,6 +454,12 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
     let devices = state.scanner.lock().await.devices().await;
+    let default_zone_id: Option<i64> =
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get("default_zone_id")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok());
     #[cfg(feature = "local-audio")]
     let audio_backend =
         tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
@@ -491,6 +497,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             let signal_path =
                 build_signal_path(&ps, z, &state.backend, renderer_label, audio_backend);
             obj.insert("signal_path".into(), json!(signal_path));
+            obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {

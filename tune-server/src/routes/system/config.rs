@@ -296,6 +296,42 @@ pub(super) async fn import_config(
     Ok(Json(json!({ "imported": imported })))
 }
 
+// ---------------------------------------------------------------------------
+// Default zone
+// ---------------------------------------------------------------------------
+
+pub(super) async fn get_default_zone(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let zone_id: Option<i64> = settings
+        .get("default_zone_id")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok());
+    Json(json!({ "zone_id": zone_id }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct DefaultZoneBody {
+    zone_id: Option<i64>,
+}
+
+pub(super) async fn set_default_zone(
+    State(state): State<AppState>,
+    Json(body): Json<DefaultZoneBody>,
+) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match body.zone_id {
+        Some(id) => {
+            settings.set("default_zone_id", &id.to_string()).ok();
+            Json(json!({ "zone_id": id }))
+        }
+        None => {
+            settings.delete("default_zone_id").ok();
+            Json(json!({ "zone_id": null }))
+        }
+    }
+}
+
 pub(super) async fn clear_cache(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("scan_result", "{}").ok();
