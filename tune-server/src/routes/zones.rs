@@ -298,11 +298,12 @@ fn build_signal_path(
             }
         }
         "oaat" => {
-            if oaat_transcodes {
-                (false, "OAAT", "WAV")
-            } else {
-                (true, "OAAT", "WAV")
-            }
+            // FLAC/WAV/DSD → WAV is lossless; only lossy sources lose quality
+            (
+                is_lossless || !oaat_transcodes,
+                "OAAT",
+                if oaat_transcodes { "WAV" } else { format_name },
+            )
         }
         "airplay" => (false, "AirPlay", "ALAC"),
         "chromecast" => {
@@ -380,10 +381,12 @@ fn build_signal_path(
     let transcode_active =
         needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
     if transcode_active {
+        // OAAT lossless→WAV preserves all audio data
+        let transcode_lossless = is_oaat && is_lossless;
         steps.push(json!({
             "name": "Transcoder",
             "description": format!("{format_name} \u{2192} {output_format_name}"),
-            "bit_perfect": false,
+            "bit_perfect": transcode_lossless,
         }));
     }
 

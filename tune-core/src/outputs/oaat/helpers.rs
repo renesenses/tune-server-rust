@@ -207,14 +207,19 @@ pub(super) fn format_rate_display(rate: u32, bits: u16, format: AudioFormat) -> 
     }
 }
 
-/// Convert a FLAC file to WAV using ffmpeg, return WAV bytes.
-pub(super) fn decode_flac_to_pcm(flac_path: &str) -> Option<Vec<u8>> {
+/// Convert a FLAC file to WAV using ffmpeg, preserving source bit depth.
+pub(super) fn decode_flac_to_pcm(flac_path: &str, source_bits: u16) -> Option<Vec<u8>> {
+    let codec = if source_bits > 16 {
+        "pcm_s24le"
+    } else {
+        "pcm_s16le"
+    };
     let tmp = std::env::temp_dir()
         .join(format!("oaat-{}.wav", std::process::id()))
         .to_string_lossy()
         .to_string();
     let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i", flac_path, "-acodec", "pcm_s24le", &tmp])
+        .args(["-y", "-i", flac_path, "-acodec", codec, &tmp])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -194,6 +194,7 @@ impl DlnaOutput {
     }
 
     fn didl_metadata(media: &PlayMedia<'_>, item_id: &str) -> String {
+        let is_dsd = media.mime_type.contains("dsd") || media.mime_type.contains("dsf");
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
             .protocol_style(ProtocolStyle::Dlna)
             .dlna_art_profile(true)
@@ -204,9 +205,9 @@ impl DlnaOutput {
             .album_art_opt(media.cover_url)
             .duration_ms_opt(media.duration_ms)
             .file_size_opt(media.file_size)
-            .sample_rate_opt(media.sample_rate)
-            .bit_depth_opt(media.bit_depth)
-            .channels_opt(media.channels)
+            .sample_rate_opt(if is_dsd { None } else { media.sample_rate })
+            .bit_depth_opt(if is_dsd { None } else { media.bit_depth })
+            .channels_opt(if is_dsd { None } else { media.channels })
             .build_escaped()
     }
 
