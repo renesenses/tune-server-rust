@@ -282,6 +282,7 @@ pub fn delete_queue_file(db_path: &str, zone_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::sqlite::SqliteDb;
     use crate::playback::{RepeatMode, ZoneState};
 
     #[test]
@@ -323,9 +324,10 @@ mod tests {
         let db_path_str = db_path.to_str().unwrap();
 
         // Create in-memory DB with schema
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
-        crate::db::migrations::run_migrations(&db).unwrap();
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let db: std::sync::Arc<dyn crate::db::backend::DbBackend> = std::sync::Arc::new(sqlite);
 
         // Insert a zone + tracks
         db.execute(
@@ -341,15 +343,16 @@ mod tests {
         )
         .unwrap();
         for i in 1..=3i64 {
+            let title = format!("Track {i}");
             db.execute(
                 "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) VALUES (?, ?, 1, 1, 180000)",
-                &[&i, &format!("Track {i}") as &dyn rusqlite::types::ToSql],
+                &[&i as &dyn crate::db::backend::ToSqlValue, &title.as_str()],
             )
             .unwrap();
         }
 
         // Set up a queue in the DB
-        let repo = PlayQueueRepo::new(db.clone());
+        let repo = PlayQueueRepo::with_backend(db.clone());
         repo.set_queue(1, &[1, 2, 3]).unwrap();
         repo.set_current(1, 1).unwrap();
 

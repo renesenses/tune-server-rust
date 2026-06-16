@@ -98,12 +98,18 @@ jobs:
         if: "!matrix.cross && runner.os == 'Linux'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
 
-      - name: Build (native, Windows with local-audio)
+      - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
-        # NOTE: To build with ASIO support, use --features oaat,local-audio,asio
-        # and set CPAL_ASIO_DIR to the ASIO SDK path. The ASIO SDK must be
-        # downloaded from Steinberg (https://www.steinberg.net/asiosdk).
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.steinberg.net/asiosdk" -OutFile asiosdk.zip
+          Expand-Archive -Path asiosdk.zip -DestinationPath asiosdk -Force
+          $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
+          echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+
+      - name: Build (native, Windows with local-audio + ASIO)
+        if: "!matrix.cross && runner.os == 'Windows'"
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"

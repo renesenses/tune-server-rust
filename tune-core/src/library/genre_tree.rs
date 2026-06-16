@@ -315,8 +315,14 @@ mod tests {
 
     #[test]
     fn genre_tree_empty_db() {
-        let db = SqliteDb::open_in_memory().unwrap();
-        db.init_schema().unwrap();
+        use crate::db::sqlite::SqliteDb;
+        let db: std::sync::Arc<dyn crate::db::backend::DbBackend> =
+            std::sync::Arc::new(SqliteDb::open_in_memory().unwrap());
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS tracks (id INTEGER PRIMARY KEY, genre TEXT)",
+            &[],
+        )
+        .ok();
         let tree = build_genre_tree(&db);
         assert!(tree.is_empty());
     }

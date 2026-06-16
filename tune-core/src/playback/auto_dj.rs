@@ -118,11 +118,11 @@ mod tests {
     use super::*;
     use crate::db::sqlite::SqliteDb;
 
-    fn test_db() -> SqliteDb {
+    fn test_db() -> std::sync::Arc<dyn crate::db::backend::DbBackend> {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
-        db
+        std::sync::Arc::new(db)
     }
 
     #[test]
@@ -135,21 +135,20 @@ mod tests {
     #[test]
     fn generates_queue_from_seed() {
         let db = test_db();
-        let conn = db.connection().lock().unwrap();
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", [])
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", &[])
             .unwrap();
-        conn.execute(
+        db.execute(
             "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
-            [],
+            &[],
         )
         .unwrap();
-        for i in 1..=10 {
-            conn.execute(
+        for i in 1..=10i64 {
+            let title = format!("Track {i}");
+            db.execute(
                 "INSERT INTO tracks (id, title, artist_id, album_id, genre, year, duration_ms) VALUES (?, ?, 1, 1, 'Jazz', 2000, 240000)",
-                rusqlite::params![i, format!("Track {i}")],
+                &[&i, &title.as_str()],
             ).unwrap();
         }
-        drop(conn);
 
         let result = generate_queue(&db, 1, 5);
         assert_eq!(result.len(), 5);
