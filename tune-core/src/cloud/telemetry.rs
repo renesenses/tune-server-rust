@@ -9,6 +9,35 @@ use crate::db::settings_repo::SettingsRepo;
 use crate::streaming::ServiceRegistry;
 
 const HEARTBEAT_URL: &str = "https://mozaiklabs.fr/api/v1/telemetry/heartbeat";
+const PING_URL: &str = "https://mozaiklabs.fr/api/v1/ping";
+
+/// Fire-and-forget startup ping: sends version + OS + arch + services once after 10 seconds.
+/// Always runs regardless of TUNE_TELEMETRY setting (anonymous, no personal data).
+pub fn spawn_startup_ping(
+    services: std::sync::Arc<tokio::sync::Mutex<crate::streaming::registry::ServiceRegistry>>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+            .build()
+        else {
+            return;
+        };
+        let svc_list: Vec<String> = {
+            let reg = services.lock().await;
+            reg.list()
+        };
+        let payload = serde_json::json!({
+            "v": crate::version(),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "services": svc_list,
+        });
+        let _ = client.post(PING_URL).json(&payload).send().await;
+    });
+}
 
 #[derive(Debug, Serialize)]
 struct HeartbeatPayload {
