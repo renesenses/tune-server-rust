@@ -133,11 +133,32 @@ impl PlaybackOrchestrator {
         // the zone's DB record.  This is the primary gate for send_to_output —
         // without it, the stream is created but never sent to the output device.
         if req.output_device_id.is_none() {
-            let looked_up = ZoneRepo::with_backend(self.db.clone())
+            let zone_db = ZoneRepo::with_backend(self.db.clone())
                 .get(req.zone_id)
                 .ok()
-                .flatten()
-                .and_then(|z| z.output_device_id);
+                .flatten();
+
+            // Bug 1 fix: refuse to start playback on an offline zone.
+            // The device is disconnected — sending a stream would silently
+            // succeed on the server side but produce no audio.
+            if let Some(ref zone) = zone_db {
+                if !zone.online {
+                    let msg = format!("Output device offline: {}", zone.name);
+                    warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": req.zone_id,
+                                "error": msg,
+                            }),
+                        );
+                    }
+                    return Err(msg);
+                }
+            }
+
+            let looked_up = zone_db.and_then(|z| z.output_device_id);
             if looked_up.is_some() {
                 debug!(
                     zone_id = req.zone_id,
@@ -151,6 +172,28 @@ impl PlaybackOrchestrator {
                 );
             }
             req.output_device_id = looked_up;
+        } else {
+            // output_device_id was provided by the caller — still check online status.
+            let zone_db = ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten();
+            if let Some(ref zone) = zone_db {
+                if !zone.online {
+                    let msg = format!("Output device offline: {}", zone.name);
+                    warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": req.zone_id,
+                                "error": msg,
+                            }),
+                        );
+                    }
+                    return Err(msg);
+                }
+            }
         }
 
         // Clean up any gapless-prepared session for this zone before
@@ -1276,30 +1319,11 @@ impl PlaybackOrchestrator {
                     "send_to_output_lock_contention"
                 );
             }
+            // Bug 2 fix: never fall back to another zone/device.
+            // If the exact requested device is not found, return an error so
+            // audio never comes out of an unexpected speaker.
             match outputs.get(device_id) {
                 Some(arc) => (Some(arc), device_id.to_string()),
-                None if device_id.starts_with("local:") => {
-                    // The stored local device is no longer registered (e.g. USB
-                    // DAC unplugged, macOS renamed the device after update).
-                    // Fall back to any other registered local output — the user's
-                    // zone should still produce audio rather than silently failing.
-                    let fallback = outputs
-                        .list()
-                        .into_iter()
-                        .find(|id| id.starts_with("local:"));
-                    if let Some(ref fallback_id) = fallback {
-                        warn!(
-                            requested = device_id,
-                            fallback = %fallback_id,
-                            "output_not_found_falling_back_to_other_local — \
-                             the configured local output device is no longer available; \
-                             using another registered local output"
-                        );
-                        (outputs.get(fallback_id), fallback_id.clone())
-                    } else {
-                        (None, device_id.to_string())
-                    }
-                }
                 None => (None, device_id.to_string()),
             }
         };

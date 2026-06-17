@@ -53,6 +53,8 @@ struct PatchZone {
     max_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
+    /// When enabled, automatically generates and queues similar tracks when the queue ends.
+    autoplay_enabled: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -634,6 +636,11 @@ async fn patch_zone(
             repo.update_volume(id, 100).ok();
             state.playback.set_volume(id, 1.0).await;
         }
+    }
+    if let Some(autoplay) = body.autoplay_enabled
+        && let Err(e) = repo.update_autoplay_enabled(id, autoplay)
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     get_zone(State(state), Path(id)).await.into_response()
 }

@@ -280,6 +280,12 @@ impl PlayQueueRepo {
         })
     }
 
+    /// Append tracks at the end of the local play queue for a zone.
+    /// Convenience wrapper over add_tracks(zone_id, track_ids, None).
+    pub fn append_tracks(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        self.add_tracks(zone_id, track_ids, None)
+    }
+
     pub fn set_current(&self, zone_id: i64, position: i64) -> Result<(), String> {
         // unset-all-then-set-one needs to be atomic — between the two
         // UPDATEs, the zone would have zero "current" entries, which a
