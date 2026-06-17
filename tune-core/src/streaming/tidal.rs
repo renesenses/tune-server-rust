@@ -630,7 +630,25 @@ impl TidalService {
                 .as_str()
                 .and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
-            quality: None,
+            quality: {
+                let tags = item["mediaMetadata"]["tags"].as_array();
+                let is_hires = tags.map_or(false, |t| {
+                    t.iter()
+                        .any(|v| v.as_str().map_or(false, |s| s.contains("HIRES")))
+                });
+                let aq = item["audioQuality"].as_str().unwrap_or("");
+                if !aq.is_empty() || is_hires {
+                    Some(StreamQuality {
+                        codec: "FLAC".into(),
+                        sample_rate: if is_hires { 96000 } else { 44100 },
+                        bit_depth: if is_hires { 24 } else { 16 },
+                        bitrate: None,
+                        channels: 2,
+                    })
+                } else {
+                    None
+                }
+            },
         }
     }
 

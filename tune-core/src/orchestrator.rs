@@ -1164,6 +1164,19 @@ impl PlaybackOrchestrator {
                 .strip_prefix("file://")
                 .unwrap_or(&stream_data.url)
                 .to_string();
+
+            if !std::path::Path::new(&dash_file_path).exists() {
+                warn!(path = %dash_file_path, "streaming_dash_file_missing_skipping_decode");
+                return Err("DASH file missing (already consumed by prior decode)".into());
+            }
+
+            // Move the file to a unique path to prevent concurrent decodes
+            let unique_path = format!("{}.decoding", &dash_file_path);
+            if std::fs::rename(&dash_file_path, &unique_path).is_err() {
+                warn!(path = %dash_file_path, "streaming_dash_file_already_being_decoded");
+                return Err("DASH file already being decoded".into());
+            }
+
             let sr = stream_data.quality.sample_rate;
             let bd = stream_data.quality.bit_depth.max(16).min(24);
 
@@ -1184,7 +1197,7 @@ impl PlaybackOrchestrator {
                 session_id = %session_id,
                 sample_rate = sr,
                 bit_depth = bd,
-                path = %dash_file_path,
+                path = %unique_path,
                 "streaming_dash_decode_to_wav_for_dlna"
             );
 
@@ -1192,7 +1205,7 @@ impl PlaybackOrchestrator {
             tokio::spawn(async move {
                 let (levels_tx, _levels_rx) =
                     tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
-                let tmp_file_clone = dash_file_path.clone();
+                let tmp_file_clone = unique_path.clone();
                 let tx_clone = tx;
 
                 let decode_result = tokio::task::spawn_blocking(move || {
@@ -1209,8 +1222,7 @@ impl PlaybackOrchestrator {
                 })
                 .await;
 
-                // Clean up the DASH temp file after decode
-                let _ = std::fs::remove_file(&dash_file_path);
+                let _ = std::fs::remove_file(&unique_path);
 
                 match decode_result {
                     Ok(Ok(bit_depth)) => {

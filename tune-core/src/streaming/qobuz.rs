@@ -254,7 +254,16 @@ impl QobuzService {
                         .and_then(|d| d.get(..4)?.parse().ok())
                 }),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
-            quality: None,
+            quality: item["maximum_bit_depth"].as_u64().map(|bd| StreamQuality {
+                codec: "FLAC".into(),
+                sample_rate: item["maximum_sampling_rate"]
+                    .as_f64()
+                    .map(|r| (r * 1000.0) as u32)
+                    .unwrap_or(44100),
+                bit_depth: bd as u16,
+                bitrate: None,
+                channels: 2,
+            }),
         }
     }
 
