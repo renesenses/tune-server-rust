@@ -11,8 +11,6 @@ use crate::state::AppState;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::track_repo::TrackRepo;
 
-use super::Pagination;
-
 /// Build a JSON array string for the `genres` column from parsed metadata.
 fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
     if !genres.is_empty() {
@@ -72,28 +70,80 @@ pub(super) struct QuickFavQuery {
     profile_id: Option<i64>,
 }
 
+/// Query parameters for GET /library/tracks — supports pagination + metadata filters.
+/// All filters combine with AND logic.
+#[derive(Deserialize)]
+pub(super) struct TrackFilterQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
+    pub format: Option<String>,
+    pub sample_rate: Option<i32>,
+    pub bit_depth: Option<i32>,
+    pub source: Option<String>,
+    pub label: Option<String>,
+    pub composer: Option<String>,
+    pub q: Option<String>,
+}
+
 pub(super) async fn list_tracks(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<TrackFilterQuery>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let total = repo.count().unwrap_or(0);
-    let items = match repo.list(limit, offset) {
-        Ok(tracks) => tracks,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                limit,
-                offset,
-                total,
-                "list_tracks_query_failed — stats show {total} tracks but query returned error"
-            );
-            Vec::new()
+
+    let has_filters = p.genre.is_some()
+        || p.year.is_some()
+        || p.format.is_some()
+        || p.sample_rate.is_some()
+        || p.bit_depth.is_some()
+        || p.source.is_some()
+        || p.label.is_some()
+        || p.composer.is_some()
+        || p.q.is_some();
+
+    if has_filters {
+        match repo.list_filtered(
+            p.genre.as_deref(),
+            p.year,
+            p.format.as_deref(),
+            p.sample_rate,
+            p.bit_depth,
+            p.source.as_deref(),
+            p.label.as_deref(),
+            p.composer.as_deref(),
+            p.q.as_deref(),
+            limit,
+            offset,
+        ) {
+            Ok((items, total)) => {
+                Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "list_tracks_filtered_query_failed");
+                Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+            }
         }
-    };
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    } else {
+        let total = repo.count().unwrap_or(0);
+        let items = match repo.list(limit, offset) {
+            Ok(tracks) => tracks,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    limit,
+                    offset,
+                    total,
+                    "list_tracks_query_failed — stats show {total} tracks but query returned error"
+                );
+                Vec::new()
+            }
+        };
+        Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    }
 }
 
 pub(super) async fn track_count(State(state): State<AppState>) -> Json<Value> {

@@ -190,7 +190,16 @@ async fn update_profile(
 ) -> impl IntoResponse {
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.avatar_color.as_deref()) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // Return the updated profile so the client can use it directly
+            match repo.get(id) {
+                Ok(Some(profile)) => Json(json!(profile)).into_response(),
+                Ok(None) => {
+                    (StatusCode::NOT_FOUND, "profile not found after update").into_response()
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

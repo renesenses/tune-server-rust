@@ -429,6 +429,136 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Filtered track listing with optional WHERE clauses (AND logic).
+    /// Returns (items, total_matching_count).
+    pub fn list_filtered(
+        &self,
+        genre: Option<&str>,
+        year: Option<i32>,
+        format: Option<&str>,
+        sample_rate: Option<i32>,
+        bit_depth: Option<i32>,
+        source: Option<&str>,
+        label: Option<&str>,
+        composer: Option<&str>,
+        q: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Track>, i64), TuneError> {
+        let make_ph = |i: usize| match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(i),
+            Engine::Postgres => PostgresDialect.placeholder(i),
+        };
+
+        let mut conditions: Vec<String> = Vec::new();
+        let mut owned_params: Vec<SqlValue> = Vec::new();
+        let mut idx = 1usize;
+
+        if let Some(g) = genre {
+            // Match genre column or JSON genres array containing the value
+            conditions.push(format!(
+                "(LOWER(t.genre) = LOWER({p}) OR t.genres LIKE {p2})",
+                p = make_ph(idx),
+                p2 = make_ph(idx + 1)
+            ));
+            owned_params.push(SqlValue::Text(g.to_string()));
+            owned_params.push(SqlValue::Text(format!("%\"{}\"%", g)));
+            idx += 2;
+        }
+
+        if let Some(y) = year {
+            conditions.push(format!("t.year = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Int(y as i64));
+            idx += 1;
+        }
+
+        if let Some(f) = format {
+            conditions.push(format!("LOWER(t.format) = LOWER({})", make_ph(idx)));
+            owned_params.push(SqlValue::Text(f.to_string()));
+            idx += 1;
+        }
+
+        if let Some(sr) = sample_rate {
+            conditions.push(format!("t.sample_rate = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Int(sr as i64));
+            idx += 1;
+        }
+
+        if let Some(bd) = bit_depth {
+            conditions.push(format!("t.bit_depth = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Int(bd as i64));
+            idx += 1;
+        }
+
+        if let Some(src) = source {
+            conditions.push(format!("t.source = {}", make_ph(idx)));
+            owned_params.push(SqlValue::Text(src.to_string()));
+            idx += 1;
+        }
+
+        if let Some(lbl) = label {
+            conditions.push(format!("LOWER(t.label) LIKE LOWER({})", make_ph(idx)));
+            owned_params.push(SqlValue::Text(format!("%{}%", lbl)));
+            idx += 1;
+        }
+
+        if let Some(cmp) = composer {
+            conditions.push(format!("LOWER(t.composer) LIKE LOWER({})", make_ph(idx)));
+            owned_params.push(SqlValue::Text(format!("%{}%", cmp)));
+            idx += 1;
+        }
+
+        if let Some(query) = q {
+            let like = format!("%{}%", query);
+            conditions.push(format!(
+                "(LOWER(t.title) LIKE LOWER({p}) OR LOWER(ar.name) LIKE LOWER({p}))",
+                p = make_ph(idx)
+            ));
+            owned_params.push(SqlValue::Text(like));
+            idx += 1;
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+
+        // Count total matching
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM tracks t \
+             LEFT JOIN albums al ON t.album_id = al.id \
+             LEFT JOIN artists ar ON t.artist_id = ar.id{}",
+            where_clause
+        );
+        let refs: Vec<&dyn ToSqlValue> =
+            owned_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let total = self
+            .db
+            .query_one(&count_sql, &refs)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+
+        // Fetch paginated results
+        let limit_ph = make_ph(idx);
+        let offset_ph = make_ph(idx + 1);
+        let data_sql = format!(
+            "{}{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT {} OFFSET {}",
+            sql::select_track(),
+            where_clause,
+            limit_ph,
+            offset_ph
+        );
+        let mut all_params = owned_params.clone();
+        all_params.push(SqlValue::Int(limit));
+        all_params.push(SqlValue::Int(offset));
+        let all_refs: Vec<&dyn ToSqlValue> =
+            all_params.iter().map(|v| v as &dyn ToSqlValue).collect();
+        let rows = self.db.query_many(&data_sql, &all_refs)?;
+        Ok((rows.iter().map(row_to_track).collect(), total))
+    }
+
     pub fn update_mtime_and_size(
         &self,
         file_path: &str,

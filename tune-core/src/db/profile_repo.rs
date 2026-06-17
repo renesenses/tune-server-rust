@@ -34,10 +34,11 @@ pub mod sql {
 
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE profiles SET display_name = COALESCE({}, display_name), avatar_path = COALESCE({}, avatar_path) WHERE id = {}",
+            "UPDATE profiles SET username = COALESCE({}, username), display_name = COALESCE({}, display_name), avatar_path = COALESCE({}, avatar_path) WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
-            d.placeholder(3)
+            d.placeholder(3),
+            d.placeholder(4)
         )
     }
 
@@ -170,7 +171,8 @@ impl ProfileRepo {
         avatar_path: Option<&str>,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::update, sql::update);
-        let params: [&dyn ToSqlValue; 3] = [&display_name, &avatar_path, &id];
+        // Pass display_name twice: once for username, once for display_name column
+        let params: [&dyn ToSqlValue; 4] = [&display_name, &display_name, &avatar_path, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
