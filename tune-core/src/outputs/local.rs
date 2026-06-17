@@ -30,8 +30,19 @@ pub fn select_host(backend: &str) -> cpal::Host {
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
-                    info!(backend = "asio", "local_audio_host_selected");
-                    return host;
+                    let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
+                    if device_count > 0 {
+                        info!(
+                            backend = "asio",
+                            devices = device_count,
+                            "local_audio_host_selected"
+                        );
+                        return host;
+                    }
+                    warn!(
+                        "local_audio_asio_no_devices — ASIO host OK but no output devices found, falling back to WASAPI"
+                    );
+                    return cpal::default_host();
                 }
                 Err(e) => {
                     warn!(
@@ -44,8 +55,17 @@ pub fn select_host(backend: &str) -> cpal::Host {
             },
             "auto" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
-                    info!(backend = "asio", "local_audio_host_selected_auto");
-                    return host;
+                    let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
+                    if device_count > 0 {
+                        info!(
+                            backend = "asio",
+                            devices = device_count,
+                            "local_audio_host_selected_auto"
+                        );
+                        return host;
+                    }
+                    warn!("local_audio_asio_no_devices — falling back to WASAPI");
+                    return cpal::default_host();
                 }
                 Err(_) => {
                     debug!("local_audio_asio_not_available_using_wasapi");
@@ -80,8 +100,12 @@ pub fn active_backend_name(backend: &str) -> &'static str {
             "asio" => "ASIO",
             "wasapi" => "WASAPI",
             "auto" => {
-                if cpal::host_from_id(cpal::HostId::Asio).is_ok() {
-                    "ASIO"
+                if let Ok(host) = cpal::host_from_id(cpal::HostId::Asio) {
+                    if host.output_devices().map(|d| d.count()).unwrap_or(0) > 0 {
+                        "ASIO"
+                    } else {
+                        "WASAPI"
+                    }
                 } else {
                     "WASAPI"
                 }
