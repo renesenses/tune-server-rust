@@ -125,23 +125,129 @@ async fn fetch_bio_lastfm(
     Some(clean)
 }
 
-/// Last.fm album.getInfo → wiki summary.
+/// Fetch album bio: Wikipedia FR → Wikipedia EN → Last.fm fallback.
 pub async fn fetch_album_bio(
     client: &reqwest::Client,
     artist_name: &str,
     album_title: &str,
     lastfm_key: &str,
 ) -> Option<String> {
-    if lastfm_key.is_empty() {
+    // 1. Wikipedia FR search
+    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "fr").await {
+        if bio.len() > 50 {
+            return Some(bio);
+        }
+    }
+
+    // 2. Wikipedia EN fallback
+    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await {
+        if bio.len() > 50 {
+            return Some(bio);
+        }
+    }
+
+    // 3. Last.fm fallback
+    if !lastfm_key.is_empty() {
+        if let Some(bio) =
+            fetch_album_bio_lastfm(client, artist_name, album_title, lastfm_key).await
+        {
+            if bio.len() > 50 {
+                return Some(bio);
+            }
+        }
+    }
+
+    None
+}
+
+/// Search Wikipedia for an album page and extract the intro.
+async fn fetch_album_bio_wikipedia(
+    client: &reqwest::Client,
+    album_title: &str,
+    artist_name: &str,
+    lang: &str,
+) -> Option<String> {
+    // Search for "{album_title} {artist_name} album"
+    let query = format!("{album_title} {artist_name} album");
+    let search_url = format!(
+        "https://{lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srnamespace=0&srlimit=3&format=json",
+        urlencoding::encode(&query)
+    );
+    let resp = client
+        .get(&search_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
         return None;
     }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let results = data.pointer("/query/search")?.as_array()?;
+    if results.is_empty() {
+        return None;
+    }
+
+    // Try first few search results — pick the best match
+    let album_lower = album_title.to_lowercase();
+    let title = results
+        .iter()
+        .find_map(|r| {
+            let t = r["title"].as_str()?;
+            if t.to_lowercase().contains(&album_lower) {
+                Some(t.to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            results
+                .first()?
+                .get("title")?
+                .as_str()
+                .map(|s| s.to_string())
+        })?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Fetch the extract
+    let extract_url = format!(
+        "https://{lang}.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&titles={}&format=json",
+        urlencoding::encode(&title)
+    );
+    let wp_resp = client
+        .get(&extract_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !wp_resp.status().is_success() {
+        return None;
+    }
+    let wp_data: serde_json::Value = wp_resp.json().await.ok()?;
+    let pages = wp_data.pointer("/query/pages")?;
+    let page = pages.as_object()?.values().next()?;
+    let extract = page.get("extract")?.as_str()?;
+    if extract.len() < 50 {
+        return None;
+    }
+    Some(extract.trim().to_string())
+}
+
+/// Last.fm album.getInfo → wiki summary.
+async fn fetch_album_bio_lastfm(
+    client: &reqwest::Client,
+    artist_name: &str,
+    album_title: &str,
+    api_key: &str,
+) -> Option<String> {
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
         .query(&[
             ("method", "album.getInfo"),
             ("artist", artist_name),
             ("album", album_title),
-            ("api_key", lastfm_key),
+            ("api_key", api_key),
             ("format", "json"),
             ("lang", "fr"),
         ])
@@ -266,16 +372,9 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
         .ok();
 }
 
-/// Batch enrich album bios via Last.fm album.getInfo.
+/// Batch enrich album bios: Wikipedia FR → Wikipedia EN → Last.fm fallback.
+/// Processes 4 albums concurrently for speed.
 pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) {
-    let lastfm_key = std::env::var("LASTFM_API_KEY")
-        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
-        .unwrap_or_default();
-    if lastfm_key.is_empty() {
-        info!("batch_album_bio_skip_no_lastfm_key");
-        return;
-    }
-
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let albums = match album_repo.list_without_bio() {
         Ok(a) => a,
@@ -292,37 +391,74 @@ pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::
 
     info!(count = albums.len(), "batch_album_bio_enrichment_started");
 
+    let lastfm_key = std::env::var("LASTFM_API_KEY")
+        .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
+        .unwrap_or_default();
+
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .unwrap_or_default();
 
-    let mut enriched = 0u32;
-    let mut failed = 0u32;
+    let enriched = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    for (album_id, title, artist_name) in &albums {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Process 4 albums concurrently via semaphore
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
 
-        let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
-        match fetch_album_bio(&client, artist, title, &lastfm_key).await {
-            Some(bio) => {
-                album_repo.update_bio(*album_id, &bio).ok();
-                enriched += 1;
-                info!(
-                    album_id,
-                    album = %title,
-                    artist = %artist,
-                    bio_len = bio.len(),
-                    "batch_album_bio_enriched"
-                );
-            }
-            None => {
-                failed += 1;
-                debug!(album_id, album = %title, "batch_album_bio_not_found");
-            }
+    let mut handles = Vec::new();
+    for (album_id, title, artist_name) in albums.iter().cloned() {
+        let permit = semaphore.clone().acquire_owned().await;
+        if permit.is_err() {
+            break;
         }
+        let permit = permit.unwrap();
+        let client = client.clone();
+        let lastfm_key = lastfm_key.clone();
+        let db = db.clone();
+        let enriched = enriched.clone();
+        let failed = failed.clone();
+
+        let handle = tokio::spawn(async move {
+            let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
+            let result = fetch_album_bio(&client, artist, &title, &lastfm_key).await;
+
+            // Small stagger to avoid hammering Wikipedia
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            match result {
+                Some(bio) => {
+                    let repo = crate::db::album_repo::AlbumRepo::with_backend(db);
+                    repo.update_bio(album_id, &bio).ok();
+                    enriched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        album_id,
+                        album = %title,
+                        artist = %artist,
+                        bio_len = bio.len(),
+                        "batch_album_bio_enriched"
+                    );
+                }
+                None => {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!(album_id, album = %title, "batch_album_bio_not_found");
+                }
+            }
+
+            drop(permit);
+        });
+
+        handles.push(handle);
     }
+
+    // Await all tasks
+    for h in handles {
+        h.await.ok();
+    }
+
+    let enriched = enriched.load(std::sync::atomic::Ordering::Relaxed);
+    let failed = failed.load(std::sync::atomic::Ordering::Relaxed);
 
     info!(
         total = albums.len(),
