@@ -205,9 +205,9 @@ async fn play_radio(
         duration_ms: None,
     };
 
-    let (output_sent, output_error) = match state.orchestrator.play(play_req).await {
-        Ok(result) => (result.output_sent, result.error),
-        Err(e) => (false, Some(e)),
+    let (output_sent, output_error, stream_url) = match state.orchestrator.play(play_req).await {
+        Ok(result) => (result.output_sent, result.error, result.stream_url),
+        Err(e) => (false, Some(e), None),
     };
 
     repo.record_play(id).ok();
@@ -219,6 +219,7 @@ async fn play_radio(
         "output_sent": output_sent,
         "error": output_error,
         "state": zone_state,
+        "stream_url": stream_url,
     }))
     .into_response()
 }

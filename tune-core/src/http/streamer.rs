@@ -153,6 +153,31 @@ impl AudioStreamer {
         id
     }
 
+    /// Create a streaming session for a decoded radio stream (infinite,
+    /// exempt from GC).  Same as `create_session` but sets `is_radio = true`
+    /// so the stream handler skips coalescing and the GC retains the session.
+    pub async fn create_radio_session(
+        &self,
+        info: StreamInfo,
+        buffer_size: usize,
+    ) -> (
+        String,
+        mpsc::Sender<Vec<u8>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut session = StreamSession::new(id.clone(), info, false, buffer_size);
+        session.is_radio = true;
+        let tx = session.tx.clone();
+        let data_ready = session.data_ready.clone();
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), Arc::new(session));
+        info!(stream_id = %id, "radio_stream_session_created");
+        (id, tx, data_ready)
+    }
+
     pub async fn create_proxy_session(
         &self,
         info: StreamInfo,

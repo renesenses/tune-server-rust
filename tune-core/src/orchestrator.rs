@@ -355,7 +355,7 @@ impl PlaybackOrchestrator {
                 };
 
                 let (session_id, tx, data_ready) =
-                    self.streamer.create_session(wav_info, false, 256).await;
+                    self.streamer.create_radio_session(wav_info, 256).await;
 
                 info!(
                     source = "radio",

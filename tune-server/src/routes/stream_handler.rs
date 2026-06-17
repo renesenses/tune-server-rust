@@ -133,6 +133,7 @@ pub async fn handle_stream(
     // When we know the WAV content length, send it so DLNA renderers
     // (DMP-A6/A8) don't need to probe the stream end with seek requests.
     let is_wav = session.info.format == "wav";
+    let is_radio = session.is_radio;
     let wav_length = if is_wav {
         session.info.wav_content_length()
     } else {
@@ -207,6 +208,16 @@ pub async fn handle_stream(
                         bytes_since_meta = 0;
                     }
                 }
+            }
+        } else if is_radio {
+            // Radio streams are infinite — yield chunks immediately for
+            // real-time playback.  The coalescing buffer used for finite
+            // tracks adds latency that is acceptable for Squeezebox/LMS
+            // but can cause the browser's <audio> element (or the local
+            // output's HTTP reader) to stall waiting for the first data
+            // after the WAV header, resulting in silence.
+            while let Some(chunk) = session.recv_chunk().await {
+                yield Ok(bytes::Bytes::from(chunk));
             }
         } else {
             // Coalesce small chunks into larger HTTP writes (target >=64 KB).
@@ -393,7 +404,12 @@ async fn proxy_stream(
         "Content-Type",
         HeaderValue::from_str(&upstream_content_type).unwrap(),
     );
-    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    if !is_radio {
+        // Only advertise Accept-Ranges for finite streams.  Radio streams
+        // are infinite — advertising seekability causes some browsers to
+        // attempt byte-range requests that will never succeed.
+        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    }
     headers.insert(
         "transferMode.dlna.org",
         HeaderValue::from_static("Streaming"),
