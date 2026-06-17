@@ -205,6 +205,45 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         ).into_response();
     }
 
+    // 4b. Guard: refuse update if current binary has postgres but new one doesn't
+    if cfg!(feature = "postgres") {
+        let new_has_pg = std::fs::read(&new_binary)
+            .map(|bytes| {
+                let s = String::from_utf8_lossy(&bytes);
+                s.contains("postgresql://") || s.contains("PostgreSQL engine requested")
+            })
+            .unwrap_or(false);
+        if !new_has_pg {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            warn!("update_blocked_missing_postgres_feature");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "blocked",
+                    "message": "Update blocked: current binary has PostgreSQL support but the downloaded release does not. Build with --features postgres or use a PG-enabled release."
+                })),
+            ).into_response();
+        }
+    }
+
+    // 4c. Guard: refuse update if .no-auto-update flag file exists
+    let working_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(ref dir) = working_dir {
+        if dir.join(".no-auto-update").exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            warn!("update_blocked_no_auto_update_flag");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "blocked",
+                    "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
+                })),
+            ).into_response();
+        }
+    }
+
     // 5. Replace binary and web/ directory
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
