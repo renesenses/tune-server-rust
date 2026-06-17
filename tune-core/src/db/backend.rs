@@ -784,16 +784,16 @@ impl DbBackend for PostgresBackend {
         let trimmed = upper.trim_end_matches(';').trim_end();
         let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
         let has_returning = trimmed.contains("RETURNING");
-        if is_insert && !has_returning {
+        let has_on_conflict = trimmed.contains("ON CONFLICT");
+        if is_insert && !has_returning && !has_on_conflict {
             let trailing_semi = sql_owned.ends_with(';');
-            // Strip trailing whitespace + ';' before adding the clause.
             sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
             sql_owned.push_str(" RETURNING id");
             if trailing_semi {
                 sql_owned.push(';');
             }
         }
-        let returning = is_insert || trimmed.ends_with("RETURNING ID");
+        let returning = (is_insert && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
@@ -951,7 +951,8 @@ impl DbTxHandle for PgTxHandle<'_> {
         let trimmed = upper.trim_end_matches(';').trim_end();
         let is_insert = trimmed.trim_start().starts_with("INSERT INTO");
         let has_returning = trimmed.contains("RETURNING");
-        if is_insert && !has_returning {
+        let has_on_conflict = trimmed.contains("ON CONFLICT");
+        if is_insert && !has_returning && !has_on_conflict {
             let trailing_semi = sql_owned.ends_with(';');
             sql_owned = sql_owned.trim_end().trim_end_matches(';').to_string();
             sql_owned.push_str(" RETURNING id");
@@ -959,7 +960,7 @@ impl DbTxHandle for PgTxHandle<'_> {
                 sql_owned.push(';');
             }
         }
-        let returning = is_insert || trimmed.ends_with("RETURNING ID");
+        let returning = (is_insert && !has_on_conflict) || trimmed.ends_with("RETURNING ID");
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
