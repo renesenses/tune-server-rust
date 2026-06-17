@@ -83,94 +83,31 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
         let total = tracks.len();
         tracing::info!(total, "enrich_extended_metadata_started");
         let mut enriched = 0u64;
-        let mut empty_count = 0u64;
-        let mut not_exist_count = 0u64;
         let mut batch: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
-        let mut batch_num = 0u64;
-        let mut total_fields = 0u64;
         for (track_id, file_path) in &tracks {
             let path = std::path::Path::new(file_path);
             if !path.exists() {
-                not_exist_count += 1;
                 continue;
             }
             let ext =
                 tokio::task::block_in_place(|| tune_core::metadata::read_extended_metadata(path));
-            if ext.is_empty() {
-                empty_count += 1;
-                // TEMP DEBUG: log first few empty results to see if it's a pattern
-                if empty_count <= 3 {
-                    tracing::warn!(
-                        track_id,
-                        file_path = %file_path,
-                        "enrich_debug_read_extended_metadata_empty"
-                    );
-                }
-            } else {
-                // TEMP DEBUG: log first enriched entry details
-                if enriched == 0 {
-                    let keys: Vec<&str> = ext.keys().map(|k| k.as_str()).collect();
-                    tracing::warn!(
-                        track_id,
-                        file_path = %file_path,
-                        field_count = ext.len(),
-                        keys = ?keys,
-                        "enrich_debug_first_enriched_entry"
-                    );
-                }
-                total_fields += ext.len() as u64;
+            if !ext.is_empty() {
                 batch.push((*track_id, ext));
                 enriched += 1;
             }
             if batch.len() >= 500 {
-                batch_num += 1;
-                let batch_size = batch.len();
-                tracing::warn!(batch_num, batch_size, "enrich_debug_flushing_batch");
                 if let Err(e) = meta_repo.set_batch_multi(&batch) {
-                    tracing::error!(error = %e, batch_num, "enrich_metadata_batch_failed");
-                }
-                // TEMP DEBUG: verify data was actually written by reading back the first entry
-                if batch_num == 1 {
-                    if let Some((first_id, _)) = batch.first() {
-                        match meta_repo.get_all(*first_id) {
-                            Ok(readback) => {
-                                tracing::warn!(
-                                    track_id = first_id,
-                                    readback_count = readback.len(),
-                                    readback_keys = ?readback.keys().collect::<Vec<_>>(),
-                                    "enrich_debug_readback_after_first_batch"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    track_id = first_id,
-                                    error = %e,
-                                    "enrich_debug_readback_failed"
-                                );
-                            }
-                        }
-                    }
+                    tracing::error!(error = %e, "enrich_metadata_batch_failed");
                 }
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            batch_num += 1;
-            let batch_size = batch.len();
-            tracing::warn!(batch_num, batch_size, "enrich_debug_flushing_final_batch");
             if let Err(e) = meta_repo.set_batch_multi(&batch) {
-                tracing::error!(error = %e, batch_num, "enrich_metadata_batch_failed");
+                tracing::error!(error = %e, "enrich_metadata_batch_failed");
             }
         }
-        tracing::info!(
-            total,
-            enriched,
-            empty_count,
-            not_exist_count,
-            total_fields,
-            batch_num,
-            "enrich_extended_metadata_complete"
-        );
+        tracing::info!(total, enriched, "enrich_extended_metadata_complete");
     });
     (
         StatusCode::ACCEPTED,

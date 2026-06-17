@@ -116,6 +116,14 @@ pub mod sql {
         "SELECT COUNT(*) FROM artists WHERE bio IS NOT NULL AND bio != ''"
     }
 
+    pub fn list_with_bio_and_mbid() -> &'static str {
+        "SELECT id, name, musicbrainz_id, bio FROM artists WHERE bio IS NOT NULL AND bio != '' AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
+    pub fn list_without_bio_with_mbid() -> &'static str {
+        "SELECT id, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
@@ -285,6 +293,38 @@ impl ArtistRepo {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
+    }
+
+    /// Return all artists that have both a bio and a MusicBrainz ID.
+    /// Each entry is (name, musicbrainz_id, bio).
+    pub fn artists_with_bio_and_mbid(&self) -> Result<Vec<(String, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_bio_and_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Return all artists that have a MusicBrainz ID but no local bio.
+    /// Used by the community bio download to find candidates for enrichment.
+    /// Each entry is (artist_id, musicbrainz_id).
+    pub fn artists_without_bio_with_mbid(&self) -> Result<Vec<(i64, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_without_bio_with_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Artist>, TuneError> {

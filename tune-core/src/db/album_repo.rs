@@ -227,6 +227,14 @@ pub mod sql {
         "SELECT COUNT(*) FROM albums WHERE bio IS NOT NULL AND bio != ''"
     }
 
+    pub fn list_with_bio_and_mbid() -> &'static str {
+        "SELECT a.id, a.title, ar.name, a.musicbrainz_release_group_id, a.bio FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE a.bio IS NOT NULL AND a.bio != '' AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
+    }
+
+    pub fn list_without_bio_with_mbid() -> &'static str {
+        "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.bio IS NULL OR a.bio = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
+    }
+
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
@@ -615,6 +623,41 @@ impl AlbumRepo {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
+    }
+
+    /// Return all albums that have both a bio and a MusicBrainz release group ID.
+    /// Each entry is (title, artist_name, musicbrainz_release_group_id, bio).
+    pub fn albums_with_bio_and_mbid(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_bio_and_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                    cols.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Return all albums that have a MusicBrainz release group ID but no local bio.
+    /// Used by the community bio download to find candidates for enrichment.
+    /// Each entry is (album_id, musicbrainz_release_group_id).
+    pub fn albums_without_bio_with_mbid(&self) -> Result<Vec<(i64, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_without_bio_with_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {

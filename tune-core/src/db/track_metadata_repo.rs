@@ -167,49 +167,15 @@ impl TrackMetadataRepo {
             return Ok(());
         }
         let sql = self.dialect_sql(sql::upsert, sql::upsert);
-        // TEMP DEBUG: log the generated SQL and engine once
-        tracing::warn!(
-            engine = ?self.db.engine(),
-            sql = %sql,
-            entry_count = entries.len(),
-            "set_batch_multi_debug_start"
-        );
-        let mut total_rows = 0usize;
-        let mut first_logged = false;
         for (track_id, fields) in entries {
-            if fields.is_empty() {
-                tracing::warn!(track_id, "set_batch_multi_debug_empty_fields");
-                continue;
-            }
             for (key, value) in fields {
                 let params: [&dyn ToSqlValue; 3] = [track_id, &key.as_str(), &value.as_str()];
-                match self.db.execute(&sql, &params) {
-                    Ok(rows_affected) => {
-                        total_rows += rows_affected;
-                        if !first_logged {
-                            tracing::warn!(
-                                track_id,
-                                key = %key,
-                                value_len = value.len(),
-                                rows_affected,
-                                "set_batch_multi_debug_first_insert_ok"
-                            );
-                            first_logged = true;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            track_id,
-                            key = %key,
-                            error = %e,
-                            "set_batch_multi_debug_insert_failed"
-                        );
-                        return Err(e);
-                    }
+                if let Err(e) = self.db.execute(&sql, &params) {
+                    tracing::error!(error = %e, "track_metadata_upsert_failed");
+                    return Err(e);
                 }
             }
         }
-        tracing::warn!(total_rows, first_logged, "set_batch_multi_debug_complete");
         Ok(())
     }
 }

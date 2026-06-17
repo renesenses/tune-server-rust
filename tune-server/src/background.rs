@@ -22,6 +22,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_desktop_notifications(state, config);
     spawn_memory_diagnostics(state.outputs.clone());
     spawn_telemetry_reporter(state);
+    spawn_bio_sync(state);
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
 }
@@ -285,6 +286,10 @@ fn spawn_telemetry_reporter(state: &AppState) {
         state.backend.clone(),
         state.services.clone(),
     );
+}
+
+fn spawn_bio_sync(state: &AppState) {
+    tune_core::cloud::bio_sync::spawn(state.backend.clone(), state.event_bus.subscribe());
 }
 
 fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {
