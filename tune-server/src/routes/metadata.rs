@@ -378,16 +378,86 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let api_base = settings
-        .get("artist_enrichment_api")
+    let lastfm_key = settings
+        .get("lastfm_api_key")
         .ok()
         .flatten()
-        .unwrap_or_else(|| "https://api.mozaiklabs.fr".into());
+        .or_else(|| std::env::var("LASTFM_API_KEY").ok())
+        .unwrap_or_default();
 
-    let mut client =
-        tune_core::metadata::artist_enrichment::ArtistEnrichmentClient::new(Some(&api_base), 10);
-    let data = client.get_artist(&artist.name).await;
-    Json(json!(data)).into_response()
+    if lastfm_key.is_empty() {
+        return Json(json!({"error": "no lastfm api key configured"})).into_response();
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("http://ws.audioscrobbler.com/2.0/")
+        .query(&[
+            ("method", "artist.getinfo"),
+            ("artist", &artist.name),
+            ("api_key", &lastfm_key),
+            ("format", "json"),
+            ("lang", "fr"),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(data) = r.json::<serde_json::Value>().await {
+                let bio_obj = &data["artist"]["bio"];
+                let summary = bio_obj["summary"].as_str().unwrap_or("");
+                let content = bio_obj["content"].as_str().unwrap_or("");
+                let tags: Vec<String> = data["artist"]["tags"]["tag"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| t["name"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let similar: Vec<serde_json::Value> = data["artist"]["similar"]["artist"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let listeners = data["artist"]["stats"]["listeners"].as_str().unwrap_or("0");
+                let playcount = data["artist"]["stats"]["playcount"].as_str().unwrap_or("0");
+
+                // Clean HTML tags from Last.fm bio
+                let clean = |s: &str| -> String {
+                    s.replace("<a href=", "")
+                        .replace("</a>", "")
+                        .split("Read more on Last.fm")
+                        .next()
+                        .unwrap_or(s)
+                        .trim()
+                        .to_string()
+                };
+
+                // Update artist bio in DB if content is richer
+                if content.len() > artist.bio.as_deref().unwrap_or("").len() {
+                    let cleaned = clean(content);
+                    let _ = repo.update_bio(id, &cleaned);
+                }
+
+                return Json(json!({
+                    "data": {
+                        "bio": clean(content),
+                        "bio_summary": clean(summary),
+                        "tags": tags,
+                        "similar_artists": similar,
+                        "listeners": listeners,
+                        "playcount": playcount,
+                        "enrichment_status": "complete"
+                    }
+                }))
+                .into_response();
+            }
+            Json(json!(null)).into_response()
+        }
+        _ => Json(json!(null)).into_response(),
+    }
 }
 
 async fn similar_artists(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
