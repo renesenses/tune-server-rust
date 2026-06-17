@@ -188,6 +188,9 @@ CREATE TABLE IF NOT EXISTS podcast_subscriptions (
     Migration {
         version: 8,
         name: "add_radio_favorites_and_alarm_extras",
+        // radio_favorites table is safe (IF NOT EXISTS); alarm columns are applied
+        // programmatically via add_column_if_missing to survive re-runs on DBs
+        // where the columns were already added by a previous partial migration.
         up: "
 CREATE TABLE IF NOT EXISTS radio_favorites (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,13 +202,6 @@ CREATE TABLE IF NOT EXISTS radio_favorites (
     saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(title, artist)
 );
-
-ALTER TABLE alarms ADD COLUMN name TEXT DEFAULT 'Alarm';
-ALTER TABLE alarms ADD COLUMN one_shot INTEGER DEFAULT 0;
-ALTER TABLE alarms ADD COLUMN skip_holidays INTEGER DEFAULT 0;
-ALTER TABLE alarms ADD COLUMN source_name TEXT;
-ALTER TABLE alarms ADD COLUMN fade_duration_s INTEGER DEFAULT 60;
-ALTER TABLE alarms ADD COLUMN last_fired_at DATETIME;
 ",
     },
     Migration {
@@ -691,6 +687,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
 
         // Programmatic migrations for column additions (safe if column already exists)
+        if migration.version == 8 {
+            // These were originally bare ALTER TABLE statements that would crash
+            // on re-run if the columns already existed (e.g. partial migration).
+            add_column_if_missing(db, "alarms", "name", "TEXT DEFAULT 'Alarm'");
+            add_column_if_missing(db, "alarms", "one_shot", "INTEGER DEFAULT 0");
+            add_column_if_missing(db, "alarms", "skip_holidays", "INTEGER DEFAULT 0");
+            add_column_if_missing(db, "alarms", "source_name", "TEXT");
+            add_column_if_missing(db, "alarms", "fade_duration_s", "INTEGER DEFAULT 60");
+            add_column_if_missing(db, "alarms", "last_fired_at", "DATETIME");
+        }
         if migration.version == 10 {
             add_column_if_missing(db, "tracks", "album_artist", "TEXT");
         }
@@ -778,6 +784,29 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             "migration_applied"
         );
     }
+
+    // Post-migration safety pass: ensure critical columns always exist regardless
+    // of what migration version the DB came from. This guards against:
+    //  - DBs where migrations were partially applied (e.g. power loss mid-migration)
+    //  - DBs migrated from very old versions that skipped intermediate steps
+    //  - Any discrepancy between CORE_SCHEMA and programmatic migration columns
+    add_column_if_missing(db, "zones", "gapless_enabled", "INTEGER DEFAULT 1");
+    add_column_if_missing(db, "zones", "group_id", "TEXT");
+    add_column_if_missing(db, "zones", "sync_delay_ms", "INTEGER NOT NULL DEFAULT 0");
+    add_column_if_missing(
+        db,
+        "zones",
+        "last_position_ms",
+        "INTEGER NOT NULL DEFAULT 0",
+    );
+    add_column_if_missing(db, "zones", "last_track_id", "INTEGER");
+    add_column_if_missing(db, "zones", "last_track_source", "TEXT");
+    add_column_if_missing(db, "zones", "last_track_source_id", "TEXT");
+    add_column_if_missing(db, "zones", "max_sample_rate", "INTEGER");
+    add_column_if_missing(db, "zones", "dsp_preset_id", "INTEGER");
+    add_column_if_missing(db, "zones", "dsp_enabled", "INTEGER DEFAULT 0");
+    add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
+    add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");

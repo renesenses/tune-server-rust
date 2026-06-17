@@ -10,7 +10,7 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume";
+    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume, COALESCE(autoplay_enabled, 1)";
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("SELECT {COLS} FROM zones WHERE id = {}", d.placeholder(1))
