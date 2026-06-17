@@ -404,6 +404,13 @@ impl OutputTarget for OaatOutput {
                     let is_flac = si.format == AudioFormat::Flac;
                     let is_dsd = si.format.is_dsd();
 
+                    // DSD needs conversion to PCM — let the orchestrator handle
+                    // it via HTTP streaming rather than sending raw DSD bits
+                    if is_dsd {
+                        debug!("DSD file, falling back to HTTP stream for PCM conversion");
+                        break 'direct false;
+                    }
+
                     // For FLAC files, convert to WAV via ffmpeg preserving bit depth
                     let (pcm_data, cur_format, cur_sample_rate, cur_bits, ch) = if is_flac {
                         debug!("converting FLAC to WAV via ffmpeg...");
@@ -440,14 +447,6 @@ impl OutputTarget for OaatOutput {
                                 return;
                             }
                         }
-                    } else if is_dsd {
-                        (
-                            buf,
-                            si.format,
-                            si.sample_rate,
-                            si.bits_per_sample,
-                            si.channels.min(8) as u8,
-                        )
                     } else {
                         (
                             buf,
@@ -459,13 +458,8 @@ impl OutputTarget for OaatOutput {
                     };
                     let layout = ChannelLayout::Stereo;
 
-                    let (bytes_per_frame, packet_size) = if is_dsd {
-                        let bpf = si.channels as usize;
-                        (bpf, DSD_CHUNK_SIZE)
-                    } else {
-                        let bpf = (cur_bits as usize / 8) * si.channels as usize;
-                        (bpf, PCM_SAMPLES_PER_PACKET * bpf)
-                    };
+                    let bytes_per_frame = (cur_bits as usize / 8) * si.channels as usize;
+                    let packet_size = PCM_SAMPLES_PER_PACKET * bytes_per_frame;
 
                     if packet_size == 0 || bytes_per_frame == 0 {
                         error!(device = %device_name, "oaat: zero packet size, cannot stream");
@@ -513,7 +507,6 @@ impl OutputTarget for OaatOutput {
 
                     let mut offset = 0usize;
                     let mut sample_offset: u64 = 0;
-                    let mut byte_offset: u64 = 0;
                     let start = std::time::Instant::now();
 
                     while offset < pcm_data.len() && playing.load(Ordering::Relaxed) {
@@ -528,13 +521,9 @@ impl OutputTarget for OaatOutput {
                         }
 
                         let chunk_bytes = packet_size.min(pcm_data.len() - offset);
+                        let chunk_samples = chunk_bytes / bytes_per_frame;
                         let payload = &pcm_data[offset..offset + chunk_bytes];
-                        let pts_ns = if is_dsd {
-                            (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64)
-                                * 1e9) as u64
-                        } else {
-                            (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
-                        };
+                        let pts_ns = (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
                         let flags = if offset == 0 {
                             PacketFlags::FIRST_PACKET
                         } else {
@@ -557,36 +546,18 @@ impl OutputTarget for OaatOutput {
                         }
 
                         offset += chunk_bytes;
-                        if is_dsd {
-                            byte_offset += chunk_bytes as u64;
-                            position_ms.store(
-                                byte_offset * 1000
-                                    / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1),
-                                Ordering::Relaxed,
-                            );
-                        } else {
-                            let chunk_samples = chunk_bytes / bytes_per_frame;
-                            sample_offset += chunk_samples as u64;
-                            position_ms.store(
-                                sample_offset * 1000 / cur_sample_rate as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
+                        sample_offset += chunk_samples as u64;
                         diag.packets_sent.fetch_add(1, Ordering::Relaxed);
                         diag.bytes_sent
                             .fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+                        position_ms.store(
+                            sample_offset * 1000 / cur_sample_rate as u64,
+                            Ordering::Relaxed,
+                        );
 
-                        let expected = if is_dsd {
-                            std::time::Duration::from_nanos(
-                                (byte_offset as f64
-                                    / (cur_sample_rate as f64 * bytes_per_frame as f64)
-                                    * 1e9) as u64,
-                            )
-                        } else {
-                            std::time::Duration::from_nanos(
-                                (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
-                            )
-                        };
+                        let expected = std::time::Duration::from_nanos(
+                            (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64,
+                        );
                         let elapsed = start.elapsed();
                         if expected > elapsed {
                             tokio::time::sleep(expected - elapsed).await;
