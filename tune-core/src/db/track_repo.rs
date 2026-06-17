@@ -451,14 +451,14 @@ impl TrackRepo {
     pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
-        let rows = self.db.query_many(&sql, &params)?;
+        let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
-        let rows = self.db.query_many(&sql, &params)?;
+        let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }
 
