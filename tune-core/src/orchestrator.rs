@@ -138,23 +138,32 @@ impl PlaybackOrchestrator {
                 .ok()
                 .flatten();
 
-            // Bug 1 fix: refuse to start playback on an offline zone.
-            // The device is disconnected — sending a stream would silently
-            // succeed on the server side but produce no audio.
+            // Refuse to start playback on a zone whose device is confirmed gone.
+            // Guards: skip local: zones (always available), skip zones with no
+            // device yet (being configured), and allow a grace window for SSDP
+            // polling gaps by checking the live OutputRegistry — if the device is
+            // still registered it is reachable even if the DB says offline.
             if let Some(ref zone) = zone_db {
                 if !zone.online {
-                    let msg = format!("Output device offline: {}", zone.name);
-                    warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
-                    if let Some(ref bus) = self.event_bus {
-                        bus.emit(
-                            "zone.playback_error",
-                            serde_json::json!({
-                                "zone_id": req.zone_id,
-                                "error": msg,
-                            }),
-                        );
+                    let dev_id = zone.output_device_id.as_deref().unwrap_or("");
+                    let is_local = dev_id.starts_with("local:");
+                    let has_device = !dev_id.is_empty();
+                    let in_registry =
+                        has_device && !is_local && self.outputs.lock().await.contains(dev_id);
+                    if has_device && !is_local && !in_registry {
+                        let msg = format!("Output device offline: {}", zone.name);
+                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
+                        if let Some(ref bus) = self.event_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": req.zone_id,
+                                    "error": msg,
+                                }),
+                            );
+                        }
+                        return Err(msg);
                     }
-                    return Err(msg);
                 }
             }
 
@@ -173,25 +182,34 @@ impl PlaybackOrchestrator {
             }
             req.output_device_id = looked_up;
         } else {
-            // output_device_id was provided by the caller — still check online status.
+            // output_device_id was provided by the caller — still check online status
+            // with the same guards: skip local: zones, skip zones without a device,
+            // and allow if device is still present in the live OutputRegistry.
             let zone_db = ZoneRepo::with_backend(self.db.clone())
                 .get(req.zone_id)
                 .ok()
                 .flatten();
             if let Some(ref zone) = zone_db {
                 if !zone.online {
-                    let msg = format!("Output device offline: {}", zone.name);
-                    warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
-                    if let Some(ref bus) = self.event_bus {
-                        bus.emit(
-                            "zone.playback_error",
-                            serde_json::json!({
-                                "zone_id": req.zone_id,
-                                "error": msg,
-                            }),
-                        );
+                    let dev_id = zone.output_device_id.as_deref().unwrap_or("");
+                    let is_local = dev_id.starts_with("local:");
+                    let has_device = !dev_id.is_empty();
+                    let in_registry =
+                        has_device && !is_local && self.outputs.lock().await.contains(dev_id);
+                    if has_device && !is_local && !in_registry {
+                        let msg = format!("Output device offline: {}", zone.name);
+                        warn!(zone_id = req.zone_id, zone_name = %zone.name, "play_rejected_zone_offline");
+                        if let Some(ref bus) = self.event_bus {
+                            bus.emit(
+                                "zone.playback_error",
+                                serde_json::json!({
+                                    "zone_id": req.zone_id,
+                                    "error": msg,
+                                }),
+                            );
+                        }
+                        return Err(msg);
                     }
-                    return Err(msg);
                 }
             }
         }
