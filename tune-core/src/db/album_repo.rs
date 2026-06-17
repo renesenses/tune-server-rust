@@ -233,6 +233,10 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND a.source = 'local' ORDER BY a.id"
     }
 
+    pub fn count_with_bio() -> &'static str {
+        "SELECT COUNT(*) FROM albums WHERE bio IS NOT NULL AND bio != ''"
+    }
+
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
@@ -645,6 +649,13 @@ impl AlbumRepo {
 
     pub fn count(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
+    pub fn count_with_bio(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }

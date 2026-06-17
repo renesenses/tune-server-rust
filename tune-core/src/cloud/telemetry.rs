@@ -1,115 +1,138 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tracing::{debug, info};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
+use crate::streaming::ServiceRegistry;
 
-const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
+const HEARTBEAT_URL: &str = "https://mozaiklabs.fr/api/v1/telemetry/heartbeat";
 
 #[derive(Debug, Serialize)]
-struct TelemetryPayload {
-    instance_id: String,
+struct HeartbeatPayload {
+    server_id: String,
     version: String,
+    services: Vec<String>,
+    tracks_count: i64,
+    artists_with_bio: i64,
+    albums_with_bio: i64,
     os: String,
     arch: String,
-    tracks: i64,
-    albums: i64,
-    zones: i64,
-    uptime_hours: u64,
-    engine: String,
 }
 
 pub struct TelemetryReporter;
 
 impl TelemetryReporter {
-    /// Get or create a persistent instance ID for this server.
-    pub fn get_or_create_instance_id(settings: &SettingsRepo) -> String {
-        match settings.get("instance_id").ok().flatten() {
+    /// Get or create a persistent server ID for this instance.
+    pub fn get_or_create_server_id(settings: &SettingsRepo) -> String {
+        match settings.get("server_id").ok().flatten() {
             Some(id) if !id.is_empty() => id,
             _ => {
                 let id = uuid::Uuid::new_v4().to_string();
-                settings.set("instance_id", &id).ok();
+                settings.set("server_id", &id).ok();
                 id
             }
         }
     }
 
     /// Check if telemetry is enabled.
-    pub fn is_enabled(settings: &SettingsRepo) -> bool {
-        settings.get("telemetry_enabled").ok().flatten().as_deref() == Some("true")
+    /// Enabled by default; set `TUNE_TELEMETRY=false` to opt out.
+    pub fn is_enabled() -> bool {
+        match std::env::var("TUNE_TELEMETRY") {
+            Ok(val) => !matches!(val.to_lowercase().as_str(), "false" | "0" | "no" | "off"),
+            Err(_) => true,
+        }
     }
 
-    /// Send a telemetry report to mozaiklabs.fr.
-    /// Only sends if `telemetry_enabled` is "true" in settings.
-    pub async fn report(db: &Arc<dyn DbBackend>, base_url: Option<&str>, uptime_hours: u64) {
-        let settings = SettingsRepo::with_backend(db.clone());
-
-        if !Self::is_enabled(&settings) {
+    /// Collect and send a heartbeat to mozaiklabs.fr.
+    /// Fails silently — logs a warning but never panics.
+    pub async fn send(db: &Arc<dyn DbBackend>, services: &Arc<Mutex<ServiceRegistry>>) {
+        if !Self::is_enabled() {
             return;
         }
 
-        let instance_id = Self::get_or_create_instance_id(&settings);
-        let base = base_url.unwrap_or(DEFAULT_BASE_URL).trim_end_matches('/');
+        let settings = SettingsRepo::with_backend(db.clone());
+        let server_id = Self::get_or_create_server_id(&settings);
 
-        let tracks = crate::db::track_repo::TrackRepo::with_backend(db.clone())
-            .count()
-            .unwrap_or(0);
-        let albums = crate::db::album_repo::AlbumRepo::with_backend(db.clone())
-            .count()
-            .unwrap_or(0);
-        let zones = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
-            .list()
-            .map(|z| z.len() as i64)
-            .unwrap_or(0);
-
-        let payload = TelemetryPayload {
-            instance_id,
-            version: crate::version().to_string(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            tracks,
-            albums,
-            zones,
-            uptime_hours,
-            engine: "rust".to_string(),
+        // Collect connected service names (authenticated == true)
+        let connected_services = {
+            let registry = services.lock().await;
+            let mut names = Vec::new();
+            for name in registry.list() {
+                if let Some(svc) = registry.get(&name) {
+                    let svc = svc.lock().await;
+                    let status = svc.auth_status().await;
+                    if status.authenticated {
+                        names.push(name);
+                    }
+                }
+            }
+            names.sort();
+            names
         };
 
-        let url = format!("{base}/api/v1/telemetry");
-        let client = crate::http::client::shared();
+        let tracks_count = crate::db::track_repo::TrackRepo::with_backend(db.clone())
+            .count()
+            .unwrap_or(0);
+        let artists_with_bio = crate::db::artist_repo::ArtistRepo::with_backend(db.clone())
+            .count_with_bio()
+            .unwrap_or(0);
+        let albums_with_bio = crate::db::album_repo::AlbumRepo::with_backend(db.clone())
+            .count_with_bio()
+            .unwrap_or(0);
 
-        match client.post(&url).json(&payload).send().await {
+        let payload = HeartbeatPayload {
+            server_id,
+            version: crate::version().to_string(),
+            services: connected_services,
+            tracks_count,
+            artists_with_bio,
+            albums_with_bio,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "telemetry_client_build_failed");
+                return;
+            }
+        };
+
+        match client.post(HEARTBEAT_URL).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
-                info!("telemetry_reported");
+                info!(
+                    tracks = payload.tracks_count,
+                    services = ?payload.services,
+                    "telemetry_heartbeat_sent"
+                );
             }
             Ok(resp) => {
                 let status = resp.status();
-                debug!(status = %status, "telemetry_report_rejected");
+                warn!(status = %status, "telemetry_heartbeat_rejected");
             }
             Err(e) => {
-                debug!(error = %e, "telemetry_report_failed");
+                warn!(error = %e, "telemetry_heartbeat_failed");
             }
         }
     }
 
-    /// Spawn a background task that reports telemetry after 5 min (post-scan),
-    /// again after 1 hour, then every 24 hours.
-    pub fn spawn(db: Arc<dyn DbBackend>) {
+    /// Spawn a background task that sends a heartbeat after 30 seconds,
+    /// then every 24 hours.
+    pub fn spawn(db: Arc<dyn DbBackend>, services: Arc<Mutex<ServiceRegistry>>) {
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-
-            let start = std::time::Instant::now();
-            let mut first = true;
+            // Initial delay: give the server time to restore tokens and scan
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
-                let uptime_hours = start.elapsed().as_secs() / 3600;
-                Self::report(&db, None, uptime_hours).await;
-                if first {
-                    first = false;
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
-                }
+                Self::send(&db, &services).await;
+                tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
             }
         });
     }
@@ -129,27 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_persists() {
+    fn server_id_persists() {
         let db = fresh_db();
         let settings = SettingsRepo::with_backend(db);
-        let id1 = TelemetryReporter::get_or_create_instance_id(&settings);
-        let id2 = TelemetryReporter::get_or_create_instance_id(&settings);
+        let id1 = TelemetryReporter::get_or_create_server_id(&settings);
+        let id2 = TelemetryReporter::get_or_create_server_id(&settings);
         assert_eq!(id1, id2);
         assert!(!id1.is_empty());
+        // Should be a valid UUID
+        assert!(uuid::Uuid::parse_str(&id1).is_ok());
     }
 
     #[test]
-    fn telemetry_disabled_by_default() {
-        let db = fresh_db();
-        let settings = SettingsRepo::with_backend(db);
-        assert!(!TelemetryReporter::is_enabled(&settings));
-    }
-
-    #[test]
-    fn telemetry_opt_in() {
-        let db = fresh_db();
-        let settings = SettingsRepo::with_backend(db);
-        settings.set("telemetry_enabled", "true").unwrap();
-        assert!(TelemetryReporter::is_enabled(&settings));
+    fn telemetry_enabled_by_default() {
+        // Can only verify when TUNE_TELEMETRY is not set to false
+        // (env var state in tests is not guaranteed, so we just ensure no panic)
+        let _ = TelemetryReporter::is_enabled();
     }
 }

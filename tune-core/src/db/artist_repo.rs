@@ -112,6 +112,10 @@ pub mod sql {
         "SELECT id, name, musicbrainz_id FROM artists WHERE (bio IS NULL OR bio = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    pub fn count_with_bio() -> &'static str {
+        "SELECT COUNT(*) FROM artists WHERE bio IS NOT NULL AND bio != ''"
+    }
+
     pub fn update_mbid<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE artists SET musicbrainz_id = {} WHERE id = {}",
@@ -271,6 +275,13 @@ impl ArtistRepo {
 
     pub fn count(&self) -> Result<i64, TuneError> {
         match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
+    pub fn count_with_bio(&self) -> Result<i64, TuneError> {
+        match self.db.query_one(sql::count_with_bio(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }

@@ -256,7 +256,7 @@ impl ZoneRepo {
     }
 
     pub fn update_muted(&self, id: i64, muted: bool) -> Result<(), String> {
-        let val = if muted { 1i64 } else { 0i64 };
+        let val: String = if muted { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("muted");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -285,7 +285,7 @@ impl ZoneRepo {
     }
 
     pub fn update_online(&self, id: i64, online: bool) -> Result<(), String> {
-        let val = if online { 1i64 } else { 0i64 };
+        let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("online");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -293,7 +293,7 @@ impl ZoneRepo {
     }
 
     pub fn update_gapless_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val = if enabled { 1i64 } else { 0i64 };
+        let val: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("gapless_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -301,7 +301,7 @@ impl ZoneRepo {
     }
 
     pub fn update_fixed_volume(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val = if enabled { 1i64 } else { 0i64 };
+        let val: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("fixed_volume");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
@@ -309,7 +309,7 @@ impl ZoneRepo {
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
-        let val = if online { 1i64 } else { 0i64 };
+        let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
         let params: [&dyn ToSqlValue; 2] = [&val, &device_id];
         self.db.execute(&sql, &params)
@@ -366,9 +366,10 @@ impl ZoneRepo {
     }
 
     pub fn update_dsp(&self, id: i64, preset_id: Option<i64>, enabled: bool) -> Result<(), String> {
-        let en = if enabled { 1i64 } else { 0i64 };
+        let preset_str: Option<String> = preset_id.map(|v| v.to_string());
+        let en: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::update_dsp, sql::update_dsp);
-        let params: [&dyn ToSqlValue; 3] = [&preset_id, &en, &id];
+        let params: [&dyn ToSqlValue; 3] = [&preset_str, &en, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }

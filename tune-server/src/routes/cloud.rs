@@ -250,27 +250,29 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 
 async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled = TelemetryReporter::is_enabled(&settings);
-    let instance_id = settings.get("instance_id").ok().flatten();
+    let enabled = TelemetryReporter::is_enabled();
+    let server_id = settings.get("server_id").ok().flatten();
     Json(json!({
         "enabled": enabled,
-        "instance_id": instance_id,
+        "server_id": server_id,
     }))
 }
 
 async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
+    // Telemetry is now env-var-driven (TUNE_TELEMETRY=false to disable).
+    // This endpoint creates/returns the server_id for informational purposes.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings.set("telemetry_enabled", "true").ok();
-    TelemetryReporter::get_or_create_instance_id(&settings);
+    TelemetryReporter::get_or_create_server_id(&settings);
     info!("telemetry_enabled");
-    Json(json!({ "enabled": true }))
+    Json(json!({ "enabled": TelemetryReporter::is_enabled() }))
 }
 
-async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings.set("telemetry_enabled", "false").ok();
-    info!("telemetry_disabled");
-    Json(json!({ "enabled": false }))
+async fn telemetry_disable(State(_state): State<AppState>) -> Json<Value> {
+    // Telemetry is now disabled via TUNE_TELEMETRY=false env var.
+    info!("telemetry_disable_requested_use_env_var");
+    Json(
+        json!({ "enabled": TelemetryReporter::is_enabled(), "note": "Set TUNE_TELEMETRY=false to disable telemetry" }),
+    )
 }
 
 // ---------------------------------------------------------------------------
