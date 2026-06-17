@@ -73,6 +73,7 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16) -> AudioLevels 
         rms_right: (sum_sq_r / frames as f64).sqrt(),
         peak_left: peak_l,
         peak_right: peak_r,
+        spectrum: compute_spectrum(pcm, bit_depth, channels, 32),
     }
 }
 

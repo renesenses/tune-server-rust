@@ -658,6 +658,7 @@ impl PlaybackOrchestrator {
                                     "peak_right_db": lvl.peak_right_db(),
                                     "rms_left": lvl.rms_left,
                                     "rms_right": lvl.rms_right,
+                                    "spectrum": lvl.spectrum,
                                 }),
                             );
                         }
@@ -1042,6 +1043,7 @@ impl PlaybackOrchestrator {
                                     "peak_right_db": lvl.peak_right_db(),
                                     "rms_left": lvl.rms_left,
                                     "rms_right": lvl.rms_right,
+                                    "spectrum": lvl.spectrum,
                                 }),
                             );
                         }
