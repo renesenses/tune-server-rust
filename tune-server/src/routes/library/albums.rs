@@ -512,9 +512,9 @@ pub(super) async fn album_completeness(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub(super) struct AlbumUpdate {
     title: Option<String>,
+    artist_id: Option<i64>,
     artist_name: Option<String>,
     genre: Option<String>,
     year: Option<i32>,
@@ -543,6 +543,19 @@ pub(super) async fn update_album(
     }
     if let Some(ref v) = body.label {
         album.label = Some(v.clone());
+    }
+    // artist_id takes priority; fall back to artist_name resolution
+    if let Some(aid) = body.artist_id {
+        album.artist_id = Some(aid);
+        // Refresh artist_name for the JSON response
+        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+        album.artist_name = artist_repo.get(aid).ok().flatten().map(|a| a.name);
+    } else if let Some(ref name) = body.artist_name {
+        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+        if let Ok(Some(artist)) = artist_repo.get_by_name(name) {
+            album.artist_id = artist.id;
+            album.artist_name = Some(artist.name);
+        }
     }
 
     repo.update(&album).ok();

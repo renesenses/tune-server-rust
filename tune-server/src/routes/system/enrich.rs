@@ -150,8 +150,11 @@ pub(super) async fn cleanup(State(state): State<AppState>) -> Result<Json<Value>
 fn merge_duplicate_albums(
     db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
 ) -> Result<i64, AppError> {
+    // Group by (LOWER(title), artist_id) so that albums with the same title
+    // but different artists are NOT merged (e.g. "One by One" by Grey Reverend
+    // vs "One by One" by Robert Francis).
     let dupe_rows = db.query_many(
-        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1",
+        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
         &[],
     ).unwrap_or_default();
     let dupes: Vec<(String, String)> = dupe_rows

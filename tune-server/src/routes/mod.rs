@@ -320,6 +320,22 @@ pub fn router(state: AppState) -> Router {
             "/services/lastfm/auth",
             axum::routing::post(service_tokens::lastfm_auth),
         )
+        .route(
+            "/services/lastfm/auth/token",
+            axum::routing::post(service_tokens::lastfm_auth_token),
+        )
+        .route(
+            "/services/lastfm/auth/session",
+            axum::routing::post(service_tokens::lastfm_auth_session),
+        )
+        .route(
+            "/services/lastfm/scrobble/toggle",
+            axum::routing::post(service_tokens::lastfm_scrobble_toggle),
+        )
+        .route(
+            "/services/lastfm/disconnect",
+            axum::routing::post(service_tokens::lastfm_disconnect),
+        )
         .fallback(api_fallback)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

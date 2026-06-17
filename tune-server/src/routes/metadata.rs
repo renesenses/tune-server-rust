@@ -31,9 +31,9 @@ struct TrackEdit {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct AlbumEdit {
     title: Option<String>,
+    artist_id: Option<i64>,
     artist_name: Option<String>,
     genre: Option<String>,
     year: Option<i32>,
@@ -174,6 +174,15 @@ async fn edit_album(
     }
     if let Some(ref v) = body.label {
         album.label = Some(v.clone());
+    }
+    // artist_id takes priority; fall back to artist_name resolution
+    if let Some(aid) = body.artist_id {
+        album.artist_id = Some(aid);
+    } else if let Some(ref name) = body.artist_name {
+        let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+        if let Ok(Some(artist)) = artist_repo.get_by_name(name) {
+            album.artist_id = artist.id;
+        }
     }
 
     repo.update(&album).ok();

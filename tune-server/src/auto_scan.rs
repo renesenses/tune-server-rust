@@ -66,14 +66,11 @@ pub fn build_track_from_metadata(
     };
     let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
-    let has_explicit_album_artist = meta.album_artist.is_some();
     let album = meta.album.as_ref().and_then(|title| {
         let aid = album_artist_id.unwrap_or(0);
         // Compilations: group by title only (ignore per-track artist) to prevent
         // splitting a VA album into N albums for N different track artists.
-        // Non-compilations without explicit album_artist: also try title-only first
-        // to avoid duplicates when tracks share an album but have different artists.
-        if is_compilation || !has_explicit_album_artist {
+        if is_compilation {
             if let Ok(Some(existing)) = album_repo.get_by_title_only_strong(title) {
                 return Some(existing);
             }

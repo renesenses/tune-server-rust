@@ -36,6 +36,26 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
         .and_then(|s| s["authenticated"].as_bool())
         .unwrap_or(false);
 
+    // Last.fm scrobbling state
+    let lastfm_configured = settings.get("lastfm_api_key").ok().flatten().is_some();
+    let lastfm_session_key = settings
+        .get("lastfm_session_key")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let lastfm_authenticated = lastfm_session_key.is_some();
+    let lastfm_username = settings
+        .get("lastfm_username")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let lastfm_scrobble_enabled = settings
+        .get("lastfm_scrobble_enabled")
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false"); // default to true when authenticated
+
     let services = vec![
         json!({
             "id": "musicbrainz", "name": "MusicBrainz", "kind": "no_auth",
@@ -59,7 +79,10 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             "id": "lastfm", "name": "Last.fm", "kind": "api_key",
             "purpose": "Genres + scrobbling.",
             "pricing": "free", "pricing_note": "API gratuite pour usage non commercial.",
-            "configured": settings.get("lastfm_api_key").ok().flatten().is_some(),
+            "configured": lastfm_configured,
+            "scrobble_authenticated": lastfm_authenticated,
+            "scrobble_enabled": lastfm_authenticated && lastfm_scrobble_enabled,
+            "lastfm_username": lastfm_username,
             "fields": [
                 {"key": "api_key", "label": "API Key", "type": "text"},
                 {"key": "api_secret", "label": "API Secret (pour scrobbling)", "type": "password"},
@@ -174,7 +197,41 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> im
     StatusCode::NO_CONTENT
 }
 
-pub async fn lastfm_auth(
+/// Step 1: generate a Last.fm auth token and return the auth URL.
+pub async fn lastfm_auth_token(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let api_key = match settings.get("lastfm_api_key").ok().flatten() {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "lastfm_api_key not configured"})),
+            )
+                .into_response();
+        }
+    };
+    let api_secret = match settings.get("lastfm_api_secret").ok().flatten() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "lastfm_api_secret not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match tune_core::scrobble::get_auth_token(&api_key, &api_secret).await {
+        Ok(token) => {
+            let auth_url = tune_core::scrobble::auth_url(&api_key, &token);
+            Json(json!({ "token": token, "auth_url": auth_url })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+/// Step 2: exchange the token for a session key after user authorized on Last.fm.
+pub async fn lastfm_auth_session(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -209,11 +266,55 @@ pub async fn lastfm_auth(
                 .into_response();
         }
     };
-    match tune_core::scrobble::get_session(&api_key, &api_secret, &token).await {
-        Ok(session_key) => {
-            settings.set("lastfm_session_key", &session_key).ok();
-            Json(json!({"session_key": session_key})).into_response()
+    match tune_core::scrobble::get_session_full(&api_key, &api_secret, &token).await {
+        Ok(session) => {
+            settings.set("lastfm_session_key", &session.key).ok();
+            if !session.name.is_empty() {
+                settings.set("lastfm_username", &session.name).ok();
+            }
+            // Enable scrobbling by default on successful auth
+            settings.set("lastfm_scrobble_enabled", "true").ok();
+            Json(json!({
+                "ok": true,
+                "session_key": session.key,
+                "username": session.name,
+                "scrobble_enabled": true,
+            }))
+            .into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response(),
     }
+}
+
+/// Legacy endpoint kept for backward compatibility.
+pub async fn lastfm_auth(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    lastfm_auth_session(State(state), Json(body)).await
+}
+
+/// Toggle scrobbling on/off.
+pub async fn lastfm_scrobble_toggle(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let enabled = body["enabled"].as_bool().unwrap_or(false);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(
+            "lastfm_scrobble_enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .ok();
+    Json(json!({ "ok": true, "scrobble_enabled": enabled }))
+}
+
+/// Disconnect Last.fm: remove session key, username, and disable scrobbling.
+pub async fn lastfm_disconnect(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.delete("lastfm_session_key").ok();
+    settings.delete("lastfm_username").ok();
+    settings.set("lastfm_scrobble_enabled", "false").ok();
+    Json(json!({ "ok": true }))
 }

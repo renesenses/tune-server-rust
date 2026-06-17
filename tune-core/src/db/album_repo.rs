@@ -34,16 +34,6 @@ pub mod sql {
         )
     }
 
-    /// Case-insensitive title match, restricted to local albums.
-    /// Used as a last-resort dedup check before creating a new album.
-    pub fn get_by_title_only_local<D: SqlDialect>(d: &D) -> String {
-        format!(
-            "{} WHERE LOWER(a.title) = LOWER({}) AND a.source = 'local' LIMIT 1",
-            select_album(),
-            d.placeholder(1)
-        )
-    }
-
     pub fn get_by_title_artist_year<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE LOWER(a.title) = LOWER({}) AND a.artist_id = {} AND a.year = {}",
@@ -406,10 +396,6 @@ impl AlbumRepo {
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
             return Ok(found);
         }
-        // Title-only fallback: same rationale as get_or_create_with_mbid.
-        if let Some(found) = self.find_by_title_only_local_strong(title)? {
-            return Ok(found);
-        }
         let create_sql = self.dialect_sql(sql::create_minimal, sql::create_minimal);
         let params: [&dyn ToSqlValue; 3] = [&title, &artist_id, &year];
         self.db.execute(&create_sql, &params)?;
@@ -427,10 +413,6 @@ impl AlbumRepo {
     /// Lookup cascade:
     /// 1. MusicBrainz release ID (exact match)
     /// 2. Title + artist_id (+ year if present) — case-insensitive title
-    /// 3. Title only (case-insensitive) — catches albums whose artist_id
-    ///    changed between scans (e.g. tag corrections, compilations tagged
-    ///    without album_artist). Without this fallback, a rescan after a
-    ///    tag change would create a ghost duplicate album (bug #593).
     pub fn get_or_create_with_mbid(
         &self,
         title: &str,
@@ -449,14 +431,6 @@ impl AlbumRepo {
             }
         }
         if let Some(found) = self.find_by_title_and_artist_strong(title, artist_id, year)? {
-            return Ok(found);
-        }
-        // Fallback: title-only lookup (case-insensitive, local source only).
-        // This prevents duplicates when the album exists but its artist_id
-        // differs from the one resolved during this scan — e.g. the user
-        // corrected album_artist tags, or the album was previously assigned
-        // to a track artist instead of the album artist.
-        if let Some(found) = self.find_by_title_only_local_strong(title)? {
             return Ok(found);
         }
         let create_sql = self.dialect_sql(sql::create_with_mbid, sql::create_with_mbid);
@@ -491,24 +465,6 @@ impl AlbumRepo {
         }
         let sql = self.dialect_sql(sql::get_by_title_artist, sql::get_by_title_artist);
         let params: [&dyn ToSqlValue; 2] = [&title, &artist_id];
-        Ok(self
-            .db
-            .query_one_strong(&sql, &params)?
-            .as_ref()
-            .map(row_to_album))
-    }
-
-    /// Title-only fallback lookup (case-insensitive, local source only).
-    /// Uses the write connection for visibility within `BEGIN IMMEDIATE`.
-    ///
-    /// This is the last-resort dedup check in `get_or_create` /
-    /// `get_or_create_with_mbid`: if the album exists under a different
-    /// `artist_id` (e.g. the user fixed album_artist tags between scans),
-    /// we still reuse the existing album instead of creating a ghost
-    /// duplicate.
-    fn find_by_title_only_local_strong(&self, title: &str) -> Result<Option<Album>, TuneError> {
-        let sql = self.dialect_sql(sql::get_by_title_only_local, sql::get_by_title_only_local);
-        let params: [&dyn ToSqlValue; 1] = [&title];
         Ok(self
             .db
             .query_one_strong(&sql, &params)?
@@ -1261,6 +1217,58 @@ mod tests {
         let a1 = repo.get_or_create("Album", aid, None).unwrap();
         let a2 = repo.get_or_create("Album", aid, None).unwrap();
         assert_eq!(a1.id, a2.id);
+    }
+
+    #[test]
+    fn get_or_create_same_title_different_artists() {
+        // Regression test: "One by One" by Grey Reverend must NOT be merged
+        // with "One by One" by Robert Francis.
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid1 = artist_repo
+            .create(&Artist::new("Grey Reverend".into()))
+            .unwrap();
+        let aid2 = artist_repo
+            .create(&Artist::new("Robert Francis".into()))
+            .unwrap();
+
+        let a1 = repo.get_or_create("One by One", aid1, Some(2010)).unwrap();
+        let a2 = repo.get_or_create("One by One", aid2, Some(2013)).unwrap();
+
+        // Must be two different albums
+        assert_ne!(a1.id, a2.id);
+        assert_eq!(repo.count().unwrap(), 2);
+
+        // Same artist + same title => same album
+        let a3 = repo.get_or_create("One by One", aid1, Some(2010)).unwrap();
+        assert_eq!(a1.id, a3.id);
+        assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn get_or_create_with_mbid_same_title_different_artists() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+
+        let aid1 = artist_repo
+            .create(&Artist::new("Grey Reverend".into()))
+            .unwrap();
+        let aid2 = artist_repo
+            .create(&Artist::new("Robert Francis".into()))
+            .unwrap();
+
+        let a1 = repo
+            .get_or_create_with_mbid("One by One", aid1, Some(2010), None)
+            .unwrap();
+        let a2 = repo
+            .get_or_create_with_mbid("One by One", aid2, Some(2013), None)
+            .unwrap();
+
+        assert_ne!(a1.id, a2.id);
+        assert_eq!(repo.count().unwrap(), 2);
     }
 
     #[test]

@@ -201,8 +201,25 @@ pub async fn update_now_playing_full(
     Ok(())
 }
 
+/// Session info returned by `auth.getSession`.
+pub struct SessionInfo {
+    pub key: String,
+    pub name: String,
+}
+
 /// Exchange a Last.fm web auth token for a session key via `auth.getSession`.
 pub async fn get_session(api_key: &str, api_secret: &str, token: &str) -> Result<String, String> {
+    get_session_full(api_key, api_secret, token)
+        .await
+        .map(|s| s.key)
+}
+
+/// Exchange a Last.fm web auth token for session key + username via `auth.getSession`.
+pub async fn get_session_full(
+    api_key: &str,
+    api_secret: &str,
+    token: &str,
+) -> Result<SessionInfo, String> {
     let mut params = vec![
         ("api_key", api_key.to_string()),
         ("method", "auth.getSession".to_string()),
@@ -231,10 +248,16 @@ pub async fn get_session(api_key: &str, api_secret: &str, token: &str) -> Result
     let json: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("auth.getSession parse: {e}"))?;
 
-    json["session"]["key"]
+    let key = json["session"]["key"]
         .as_str()
         .map(String::from)
-        .ok_or_else(|| format!("auth.getSession: no session key in response: {body}"))
+        .ok_or_else(|| format!("auth.getSession: no session key in response: {body}"))?;
+    let name = json["session"]["name"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_default();
+
+    Ok(SessionInfo { key, name })
 }
 
 #[cfg(test)]
