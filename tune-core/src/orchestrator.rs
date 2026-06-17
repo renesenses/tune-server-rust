@@ -1214,32 +1214,142 @@ impl PlaybackOrchestrator {
             (url, Some(session_id), "audio/wav".to_string())
         } else if is_https {
             let codec_lower = stream_data.quality.codec.to_lowercase();
-            // AAC/MP4 streams need transcoding for DLNA — most renderers
-            // (DMP-A8, etc.) don't support AAC via DLNA. Proxy as FLAC.
-            let serve_ext = if codec_lower == "aac"
+            let is_aac = codec_lower == "aac"
                 || codec_lower == "mp4"
-                || stream_data.mime_type.contains("mp4")
-            {
-                "flac"
+                || stream_data.mime_type.contains("mp4");
+
+            if is_aac {
+                // AAC/MP4 streams need transcoding for DLNA — most renderers
+                // (DMP-A8, etc.) don't support AAC via DLNA.  Download → decode
+                // → WAV, same as the DASH path, instead of proxying raw AAC
+                // bytes mislabelled as FLAC.
+                let sr = stream_data.quality.sample_rate;
+                let bd = stream_data.quality.bit_depth.max(16).min(24);
+
+                let wav_info = StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: sr,
+                    bit_depth: bd,
+                    channels: 2,
+                    file_size: None,
+                    duration_ms: None,
+                };
+
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(wav_info, false, 256).await;
+
+                info!(
+                    service = service_name,
+                    codec = %codec_lower,
+                    sample_rate = sr,
+                    bit_depth = bd,
+                    "streaming_aac_transcode_to_wav_for_dlna"
+                );
+
+                let upstream_url = stream_data.url.clone();
+                let codec = codec_lower.clone();
+                tokio::spawn(async move {
+                    let (levels_tx, _levels_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+
+                    // Download to temp file
+                    let tmp_path = std::env::temp_dir()
+                        .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                        .to_string_lossy()
+                        .to_string();
+                    let tmp_path_clone = tmp_path.clone();
+                    let upstream = upstream_url.clone();
+                    let download_result = tokio::task::spawn_blocking(move || {
+                        let resp = reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(120))
+                            .build()
+                            .and_then(|c| c.get(&upstream).send());
+                        match resp {
+                            Ok(mut r) if r.status().is_success() => {
+                                let mut file = match std::fs::File::create(&tmp_path_clone) {
+                                    Ok(f) => f,
+                                    Err(e) => return Err(format!("tmp create: {e}")),
+                                };
+                                match std::io::copy(&mut r, &mut file) {
+                                    Ok(bytes) => {
+                                        debug!(bytes, path = %tmp_path_clone, "aac_download_complete");
+                                        Ok(tmp_path_clone)
+                                    }
+                                    Err(e) => Err(format!("download copy: {e}")),
+                                }
+                            }
+                            Ok(r) => Err(format!("upstream HTTP {}", r.status())),
+                            Err(e) => Err(format!("upstream fetch: {e}")),
+                        }
+                    })
+                    .await;
+
+                    let tmp_file = match download_result {
+                        Ok(Ok(path)) => path,
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "aac_transcode_download_failed");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "aac_transcode_task_join_failed");
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return;
+                        }
+                    };
+
+                    let tmp_file_clone = tmp_file.clone();
+                    let tx_clone = tx.clone();
+                    drop(tx);
+                    let decode_result = tokio::task::spawn_blocking(move || {
+                        crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                            &tmp_file_clone,
+                            Some(sr),
+                            Some(2),
+                            Some(bd),
+                            tx_clone,
+                            32768,
+                            data_ready,
+                            levels_tx,
+                        )
+                    })
+                    .await;
+
+                    let _ = std::fs::remove_file(&tmp_file);
+
+                    match decode_result {
+                        Ok(Ok(bit_depth)) => {
+                            info!(bit_depth, "aac_transcode_to_wav_complete");
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "aac_transcode_decode_failed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "aac_transcode_task_panic");
+                        }
+                    }
+                });
+
+                let server_ip = crate::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into());
+                let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                (url, Some(session_id), "audio/wav".to_string())
             } else {
-                &codec_lower
-            };
-            let session_id = self
-                .streamer
-                .create_proxy_session(info, stream_data.url.clone(), false)
-                .await;
-            let server_ip = crate::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
-            let url = self
-                .streamer
-                .get_stream_url(&session_id, &server_ip, serve_ext);
-            let out_mime = if serve_ext == "flac" {
-                "audio/flac".to_string()
-            } else {
-                stream_data.mime_type.clone()
-            };
-            (url, Some(session_id), out_mime)
+                // Non-AAC codecs (FLAC, etc.) — proxy directly
+                let session_id = self
+                    .streamer
+                    .create_proxy_session(info, stream_data.url.clone(), false)
+                    .await;
+                let server_ip = crate::discovery::ssdp::get_local_ip()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".into());
+                let url = self
+                    .streamer
+                    .get_stream_url(&session_id, &server_ip, &codec_lower);
+                (url, Some(session_id), stream_data.mime_type.clone())
+            }
         } else {
             (stream_data.url.clone(), None, stream_data.mime_type.clone())
         };
@@ -1597,11 +1707,105 @@ impl PlaybackOrchestrator {
                 warn!(zone_id, error = %e, "persist_seek_position_failed");
             }
         }
+
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
-                if let Err(e) = output.lock().await.seek(position_ms).await {
-                    warn!(zone_id, error = %e, "device_seek_failed");
+            // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
+            // a simple Seek SOAP command won't work because the audio is served
+            // through a one-shot proxy/transcoded session that doesn't support
+            // byte-range seeks.  The renderer's position freezes, the poller
+            // sees stopped_early_waiting, and eventually skips to the next track.
+            //
+            // Fix: re-create the stream session, send a new SetAVTransportURI,
+            // then issue the Seek command on the fresh stream so the renderer
+            // can buffer from the beginning and seek within it.
+            let is_streaming_source = state
+                .now_playing
+                .as_ref()
+                .map(|np| {
+                    np.source != "local"
+                        && np.source != "radio"
+                        && np.source != "podcast"
+                        && np.stream_id.is_some()
+                })
+                .unwrap_or(false);
+
+            // Determine output type from zone DB (avoids locking the output)
+            let zone_output_type = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_type);
+            let is_network = matches!(
+                zone_output_type.as_deref(),
+                Some("dlna")
+                    | Some("openhome")
+                    | Some("chromecast")
+                    | Some("bluos")
+                    | Some("squeezebox")
+            );
+
+            if is_streaming_source && is_network {
+                info!(
+                    zone_id,
+                    position_ms,
+                    source = ?state.now_playing.as_ref().map(|np| &np.source),
+                    "seek_streaming_on_network_output_recreating_stream"
+                );
+
+                // Re-create the stream: build a PlayRequest from the current NowPlaying
+                let np = state.now_playing.as_ref().unwrap();
+                let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                    .get(zone_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|z| z.output_device_id);
+                let req = PlayRequest {
+                    zone_id,
+                    output_device_id,
+                    track_id: np.track_id,
+                    source: Some(np.source.clone()),
+                    source_id: np.source_id.clone(),
+                    title: Some(np.title.clone()),
+                    artist_name: np.artist_name.clone(),
+                    album_title: np.album_title.clone(),
+                    cover_url: np.cover_path.clone(),
+                    duration_ms: Some(np.duration_ms),
+                };
+
+                match self.play(req).await {
+                    Ok(_) => {
+                        // Stream is now fresh — issue the seek on the output.
+                        // Small delay to let the renderer start buffering.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let outputs = self.outputs.lock().await;
+                        if let Some(output) = outputs.get(did) {
+                            if let Err(e) = output.lock().await.seek(position_ms).await {
+                                warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
+                            }
+                        }
+                        // Re-set the seek timestamp so the poller grace period
+                        // starts from after the seek, not from the play() call.
+                        self.playback.seek(zone_id, position_ms as i64).await;
+                        info!(zone_id, position_ms, "seek_streaming_complete");
+                    }
+                    Err(e) => {
+                        warn!(zone_id, error = %e, "seek_streaming_play_recreate_failed");
+                        // Fall back to direct seek (best effort)
+                        let outputs = self.outputs.lock().await;
+                        if let Some(output) = outputs.get(did) {
+                            if let Err(e) = output.lock().await.seek(position_ms).await {
+                                warn!(zone_id, error = %e, "device_seek_fallback_failed");
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Local tracks or non-network outputs: direct seek works fine
+                let outputs = self.outputs.lock().await;
+                if let Some(output) = outputs.get(did) {
+                    if let Err(e) = output.lock().await.seek(position_ms).await {
+                        warn!(zone_id, error = %e, "device_seek_failed");
+                    }
                 }
             }
         }
