@@ -135,6 +135,10 @@ pub fn router() -> Router<AppState> {
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
+        .route(
+            "/settings/prefetch",
+            get(config::get_prefetch).put(config::set_prefetch),
+        )
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.
