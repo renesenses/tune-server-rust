@@ -424,13 +424,23 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 let listeners = data["artist"]["stats"]["listeners"].as_str().unwrap_or("0");
                 let playcount = data["artist"]["stats"]["playcount"].as_str().unwrap_or("0");
 
-                // Clean HTML tags from Last.fm bio
+                // Strip all HTML tags from Last.fm bio
                 let clean = |s: &str| -> String {
-                    s.replace("<a href=", "")
-                        .replace("</a>", "")
+                    let mut result = String::with_capacity(s.len());
+                    let mut in_tag = false;
+                    for c in s.chars() {
+                        if c == '<' {
+                            in_tag = true;
+                        } else if c == '>' {
+                            in_tag = false;
+                        } else if !in_tag {
+                            result.push(c);
+                        }
+                    }
+                    result
                         .split("Read more on Last.fm")
                         .next()
-                        .unwrap_or(s)
+                        .unwrap_or(&result)
                         .trim()
                         .to_string()
                 };
