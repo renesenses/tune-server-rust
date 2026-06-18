@@ -445,16 +445,59 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                         .to_string()
                 };
 
+                let mut bio = clean(content);
+                let bio_summary = clean(summary);
+
+                // Fallback to Wikipedia if Last.fm bio is empty
+                if bio.is_empty() || bio.len() < 20 {
+                    if let Ok(wiki) = client
+                        .get(&format!(
+                            "https://en.wikipedia.org/api/rest_v1/page/summary/{}",
+                            urlencoding::encode(&artist.name)
+                        ))
+                        .timeout(std::time::Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        if let Ok(wd) = wiki.json::<serde_json::Value>().await {
+                            if let Some(extract) = wd["extract"].as_str() {
+                                if extract.len() > bio.len() {
+                                    bio = extract.to_string();
+                                }
+                            }
+                        }
+                    }
+                    // Try French Wikipedia too
+                    if bio.is_empty() || bio.len() < 50 {
+                        if let Ok(wiki_fr) = client
+                            .get(&format!(
+                                "https://fr.wikipedia.org/api/rest_v1/page/summary/{}",
+                                urlencoding::encode(&artist.name)
+                            ))
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await
+                        {
+                            if let Ok(wd) = wiki_fr.json::<serde_json::Value>().await {
+                                if let Some(extract) = wd["extract"].as_str() {
+                                    if extract.len() > bio.len() {
+                                        bio = extract.to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Update artist bio in DB if content is richer
-                if content.len() > artist.bio.as_deref().unwrap_or("").len() {
-                    let cleaned = clean(content);
-                    let _ = repo.update_bio(id, &cleaned);
+                if bio.len() > artist.bio.as_deref().unwrap_or("").len() {
+                    let _ = repo.update_bio(id, &bio);
                 }
 
                 return Json(json!({
                     "data": {
-                        "bio": clean(content),
-                        "bio_summary": clean(summary),
+                        "bio": bio,
+                        "bio_summary": bio_summary,
                         "tags": tags,
                         "similar_artists": similar,
                         "listeners": listeners,
