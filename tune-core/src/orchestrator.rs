@@ -614,6 +614,10 @@ impl PlaybackOrchestrator {
                 24
             } else if oaat_needs_wav {
                 bit_depth.max(16).min(24)
+            } else if src_fmt == AudioFormat::Alac {
+                // ALAC: Symphonia decodes to i32 left-justified. FLAC encoder
+                // may misalign 24-bit samples. Use WAV 32-bit like local output.
+                32
             } else {
                 bit_depth.max(16)
             };
