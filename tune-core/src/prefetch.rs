@@ -22,6 +22,7 @@ use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::PlayQueueRepo;
 use crate::db::settings_repo::SettingsRepo;
 use crate::playback::PlaybackManager;
+use crate::poller::PositionPoller;
 use crate::streaming::registry::ServiceRegistry;
 
 /// Maximum PCM buffer size (~100 MB) — safety valve to prevent OOM on
@@ -79,6 +80,9 @@ pub struct PrefetchEngine {
     buffer: Mutex<Option<PrefetchedTrack>>,
     /// Cancellation token: set to true to abort an in-progress prefetch.
     cancel: Mutex<bool>,
+    /// The queue position that was prefetched, so callers can detect
+    /// mismatches (e.g. queue reorder, shuffle toggle) and clear.
+    prefetched_position: Mutex<Option<i64>>,
 }
 
 impl Default for PrefetchEngine {
@@ -92,6 +96,7 @@ impl PrefetchEngine {
         Self {
             buffer: Mutex::new(None),
             cancel: Mutex::new(false),
+            prefetched_position: Mutex::new(None),
         }
     }
 
@@ -140,23 +145,35 @@ impl PrefetchEngine {
             *cancel = false;
         }
 
-        // Find the next track in the queue
+        // Find the next track in the queue, respecting repeat/shuffle mode.
         let zone_state = playback.get_state(zone_id).await;
-        let current_pos = zone_state.queue_position;
-        let queue_len = zone_state.queue_length;
 
-        if queue_len == 0 {
+        if zone_state.queue_length == 0 {
             debug!(zone_id, "prefetch_no_queue");
             return;
         }
 
-        // Compute next position (respecting repeat/shuffle is not needed
-        // for prefetch — the poller/orchestrator handle that; we just
-        // prefetch position+1 as a best guess)
-        let next_pos = current_pos + 1;
-        if next_pos >= queue_len {
-            debug!(zone_id, "prefetch_end_of_queue");
-            return;
+        // Use the same next_position() logic as the poller so that Repeat
+        // All correctly wraps from the last track back to position 0, and
+        // Repeat One re-prefetches the same track.
+        let next_pos = match PositionPoller::next_position(&zone_state) {
+            Some(pos) => pos,
+            None => {
+                debug!(zone_id, "prefetch_end_of_queue");
+                return;
+            }
+        };
+
+        // If we already prefetched this position, skip.
+        {
+            let stored_pos = self.prefetched_position.lock().await;
+            if *stored_pos == Some(next_pos) {
+                let buf = self.buffer.lock().await;
+                if buf.is_some() {
+                    debug!(zone_id, next_pos, "prefetch_already_buffered");
+                    return;
+                }
+            }
         }
 
         let queue_repo = PlayQueueRepo::with_backend(db.clone());
@@ -209,6 +226,12 @@ impl PrefetchEngine {
                 duration_ms,
             )
             .await;
+
+            // Record the position we prefetched so callers can detect
+            // mismatches (e.g. queue changed, shuffle toggled).
+            if self.buffer.lock().await.is_some() {
+                *self.prefetched_position.lock().await = Some(next_pos);
+            }
         } else {
             // Local queue — no prefetch needed for local files
             debug!(zone_id, next_pos, "prefetch_skip_local_track");
@@ -463,6 +486,7 @@ impl PrefetchEngine {
                     buffer_bytes = prefetched.pcm_data.len(),
                     "prefetch_consumed"
                 );
+                *self.prefetched_position.lock().await = None;
                 return buf.take();
             }
             debug!(
@@ -495,14 +519,34 @@ impl PrefetchEngine {
             info!("prefetch_buffer_cleared");
         }
         *buf = None;
+
+        *self.prefetched_position.lock().await = None;
+    }
+
+    /// Clear the prefetch buffer if the expected next position doesn't
+    /// match what was prefetched.  Called when the queue mutates (shuffle
+    /// toggle, queue reorder, repeat mode change) to ensure stale data
+    /// is discarded.
+    pub async fn clear_if_position_mismatch(&self, expected_next: Option<i64>) {
+        let stored = *self.prefetched_position.lock().await;
+        if stored.is_some() && stored != expected_next {
+            info!(
+                stored_pos = ?stored,
+                expected_pos = ?expected_next,
+                "prefetch_position_mismatch_clearing"
+            );
+            self.clear().await;
+        }
     }
 
     /// Return diagnostic info about the current prefetch state.
     pub async fn status(&self) -> serde_json::Value {
         let buf = self.buffer.lock().await;
+        let pos = *self.prefetched_position.lock().await;
         match buf.as_ref() {
             Some(p) => serde_json::json!({
                 "buffered": true,
+                "position": pos,
                 "source": p.source,
                 "source_id": p.source_id,
                 "title": p.title,
@@ -515,6 +559,7 @@ impl PrefetchEngine {
             }),
             None => serde_json::json!({
                 "buffered": false,
+                "position": pos,
             }),
         }
     }
@@ -656,5 +701,67 @@ mod tests {
         assert_eq!(status["source_id"], "42");
         assert_eq!(status["buffer_bytes"], 2048);
         assert_eq!(status["sample_rate"], 96000);
+    }
+
+    #[tokio::test]
+    async fn clear_if_position_mismatch_clears_on_mismatch() {
+        let engine = PrefetchEngine::new();
+
+        // Insert a buffer and mark position
+        *engine.buffer.lock().await = Some(PrefetchedTrack {
+            source: "tidal".into(),
+            source_id: "999".into(),
+            stream_id: None,
+            pcm_data: vec![0u8; 512],
+            format: "wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            duration_ms: 120_000,
+            title: "Track 5".into(),
+            artist: None,
+            album: None,
+            cover_url: None,
+            mime_type: "audio/wav".into(),
+        });
+        *engine.prefetched_position.lock().await = Some(5);
+
+        // Position matches — should not clear
+        engine.clear_if_position_mismatch(Some(5)).await;
+        assert!(engine.buffer.lock().await.is_some());
+
+        // Position doesn't match — should clear
+        engine.clear_if_position_mismatch(Some(0)).await;
+        assert!(engine.buffer.lock().await.is_none());
+        assert_eq!(*engine.prefetched_position.lock().await, None);
+    }
+
+    #[tokio::test]
+    async fn take_prefetched_clears_position() {
+        let engine = PrefetchEngine::new();
+
+        *engine.buffer.lock().await = Some(PrefetchedTrack {
+            source: "tidal".into(),
+            source_id: "abc".into(),
+            stream_id: None,
+            pcm_data: vec![0u8; 256],
+            format: "wav".into(),
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            duration_ms: 60_000,
+            title: "T".into(),
+            artist: None,
+            album: None,
+            cover_url: None,
+            mime_type: "audio/wav".into(),
+        });
+        *engine.prefetched_position.lock().await = Some(3);
+
+        // Consume the buffer
+        let taken = engine.take_prefetched("tidal", "abc").await;
+        assert!(taken.is_some());
+        // Position should be cleared
+        assert_eq!(*engine.prefetched_position.lock().await, None);
     }
 }

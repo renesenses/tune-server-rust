@@ -10,7 +10,14 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume, COALESCE(autoplay_enabled, 1)";
+    // NOTE: autoplay_enabled intentionally omitted from COLS.
+    // The column is added by migration v36, but on Windows the migration
+    // can fail silently (file locking).  COALESCE(autoplay_enabled, 1)
+    // still crashes with "no such column" when the column doesn't exist.
+    // row_to_zone reads cols.get(16) → None → defaults to true, which is
+    // the correct fallback.  The separate get_autoplay_enabled() method
+    // handles reading the actual value safely.
+    const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume";
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("SELECT {COLS} FROM zones WHERE id = {}", d.placeholder(1))
@@ -313,8 +320,38 @@ impl ZoneRepo {
         let val: String = if enabled { "1".into() } else { "0".into() };
         let sql = self.update_field_sql("autoplay_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
-        self.db.execute(&sql, &params)?;
-        Ok(())
+        // Column may not exist on pre-v36 databases (Windows migration
+        // failure).  Swallow the error — the feature degrades gracefully
+        // to always-enabled.
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "autoplay_enabled_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Safely read autoplay_enabled for a zone.  Returns true (the default)
+    /// if the column doesn't exist (pre-v36 database).
+    pub fn get_autoplay_enabled(&self, id: i64) -> bool {
+        // Try reading the column directly.  If the column doesn't exist,
+        // the query fails and we return the default (true).
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql =
+            format!("SELECT COALESCE(autoplay_enabled, 1) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .map(|v| v != 0)
+            .unwrap_or(true)
     }
 
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
