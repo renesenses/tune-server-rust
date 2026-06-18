@@ -866,11 +866,7 @@ impl PositionPoller {
         let Some(next_pos) = Self::next_position(zone_state) else {
             // Queue ended — check if autoplay is enabled for this zone
             let autoplay_enabled = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-                .get(zone_id)
-                .ok()
-                .flatten()
-                .map(|z| z.autoplay_enabled)
-                .unwrap_or(true);
+                .get_autoplay_enabled(zone_id);
 
             if autoplay_enabled {
                 // Try to generate similar tracks based on the last played track

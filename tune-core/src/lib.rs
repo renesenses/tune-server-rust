@@ -38,6 +38,7 @@ pub mod playlist_transfer;
 pub mod plugin_sdk;
 pub mod plugins;
 pub mod poller;
+pub mod prefetch;
 pub mod queue_persistence;
 pub mod radio_favorites;
 pub mod radio_metadata;

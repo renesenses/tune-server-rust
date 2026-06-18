@@ -969,6 +969,8 @@ async fn queue_move(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueMoveRequest>,
 ) -> impl IntoResponse {
+    // Queue order changed — invalidate prefetched track
+    state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let mut items = queue_repo.get_queue(zone_id).unwrap_or_default();
     let from = body.from_position as usize;
@@ -1007,6 +1009,7 @@ async fn queue_jump(
 async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     queue_repo.clear(zone_id).ok();
+    state.orchestrator.clear_prefetch().await;
     state.playback.stop_and_clear(zone_id).await;
     state.playback.update_queue_info(zone_id, 0, 0).await;
     // Delete the persisted queue file
@@ -1025,6 +1028,8 @@ async fn queue_remove(
     State(state): State<AppState>,
     Path((zone_id, position)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
+    // Queue shape changed — invalidate prefetched track
+    state.orchestrator.clear_prefetch().await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
     // Try the local play_queue first.

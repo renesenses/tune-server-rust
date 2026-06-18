@@ -115,6 +115,7 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
+        ("prefetch_mode", json!("30s")),
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);
@@ -612,4 +613,39 @@ pub(super) async fn set_metadata_fields(
     let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
     settings.set("metadata_visible_fields", &json_val).ok();
     Json(json!({ "fields": valid_keys }))
+}
+
+// --- Prefetch settings ---
+
+pub(super) async fn get_prefetch(State(state): State<AppState>) -> Json<Value> {
+    let mode = tune_core::prefetch::PrefetchEngine::read_mode(&state.backend);
+    let status = state.orchestrator.prefetch.status().await;
+    Json(json!({
+        "mode": mode.as_str(),
+        "buffer": status,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct PrefetchModeBody {
+    mode: String,
+}
+
+pub(super) async fn set_prefetch(
+    State(state): State<AppState>,
+    Json(body): Json<PrefetchModeBody>,
+) -> Json<Value> {
+    let mode = tune_core::prefetch::PrefetchMode::from_str_setting(&body.mode);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("prefetch_mode", mode.as_str()).ok();
+
+    // If switching to Off, clear any buffered data
+    if mode == tune_core::prefetch::PrefetchMode::Off {
+        state.orchestrator.prefetch.clear().await;
+    }
+
+    Json(json!({
+        "mode": mode.as_str(),
+        "ok": true,
+    }))
 }

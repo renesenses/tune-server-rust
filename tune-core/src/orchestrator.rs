@@ -14,6 +14,7 @@ use crate::event_bus::EventBus;
 use crate::http::streamer::{AudioStreamer, StreamInfo};
 use crate::outputs::registry::OutputRegistry;
 use crate::playback::{NowPlaying, PlaybackManager};
+use crate::prefetch::PrefetchEngine;
 use crate::streaming::registry::ServiceRegistry;
 
 pub struct PlaybackOrchestrator {
@@ -25,6 +26,7 @@ pub struct PlaybackOrchestrator {
     pub advertised_ip: Option<String>,
     pub event_bus: Option<Arc<EventBus>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    pub prefetch: Arc<PrefetchEngine>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +107,7 @@ impl PlaybackOrchestrator {
             advertised_ip,
             event_bus: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            prefetch: Arc::new(PrefetchEngine::new()),
         }
     }
 
@@ -319,6 +322,22 @@ impl PlaybackOrchestrator {
             output_sent,
             "orchestrator_play"
         );
+
+        // Trigger prefetch of the next track in the background.
+        // This runs concurrently with the current playback so the next
+        // streaming track is already decoded in memory when needed.
+        {
+            let prefetch = self.prefetch.clone();
+            let db = self.db.clone();
+            let services = self.services.clone();
+            let playback = self.playback.clone();
+            let zone_id = req.zone_id;
+            tokio::spawn(async move {
+                prefetch
+                    .prefetch_next(db, services, playback, zone_id)
+                    .await;
+            });
+        }
 
         Ok(PlayResult {
             stream_url: Some(resolved.url),
@@ -929,6 +948,20 @@ impl PlaybackOrchestrator {
             .as_deref()
             .ok_or("source_id required for streaming")?;
 
+        // Check for prefetched PCM data before downloading.
+        // If the prefetch engine has already decoded this track, serve
+        // the PCM directly via a streaming session — zero download delay.
+        if let Some(prefetched) = self.prefetch.take_prefetched(service_name, source_id).await {
+            info!(
+                service = service_name,
+                source_id = %source_id,
+                title = %prefetched.title,
+                buffer_bytes = prefetched.pcm_data.len(),
+                "prefetch_hit_serving_buffered_pcm"
+            );
+            return self.serve_prefetched_pcm(prefetched, req).await;
+        }
+
         let registry = self.services.lock().await;
         let svc = registry
             .get(service_name)
@@ -1439,6 +1472,85 @@ impl PlaybackOrchestrator {
         })
     }
 
+    /// Serve prefetched PCM data as a WAV stream session.
+    ///
+    /// Creates a streaming session and feeds the already-decoded PCM into it,
+    /// bypassing the download+decode pipeline entirely.
+    async fn serve_prefetched_pcm(
+        &self,
+        prefetched: crate::prefetch::PrefetchedTrack,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
+        let sr = prefetched.sample_rate;
+        let bd = prefetched.bit_depth;
+        let ch = prefetched.channels;
+
+        // Determine output bit depth based on output type
+        let is_local_stream = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
+        let out_bd = if is_local_stream {
+            32
+        } else {
+            bd.max(16).min(24)
+        };
+
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: out_bd,
+            channels: ch,
+            file_size: None,
+            duration_ms: Some(prefetched.duration_ms),
+        };
+
+        let (session_id, tx, data_ready) = self.streamer.create_session(wav_info, false, 256).await;
+
+        // Feed the prefetched PCM data into the session in chunks.
+        // This happens nearly instantly since the data is already in memory.
+        let pcm_data = prefetched.pcm_data;
+        tokio::spawn(async move {
+            let chunk_size = 32768;
+            let mut first = true;
+            for chunk in pcm_data.chunks(chunk_size) {
+                if tx.send(chunk.to_vec()).await.is_err() {
+                    debug!("prefetch_session_consumer_dropped");
+                    return;
+                }
+                if first {
+                    first = false;
+                    data_ready.notify_one();
+                }
+            }
+            if first {
+                // No data was sent (empty buffer)
+                data_ready.notify_one();
+            }
+            debug!("prefetch_pcm_feed_complete");
+        });
+
+        let server_ip = self.server_ip();
+        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+
+        Ok(ResolvedStream {
+            url: stream_url,
+            mime_type: "audio/wav".into(),
+            title: prefetched.title,
+            artist: prefetched.artist,
+            album: prefetched.album,
+            duration_ms: Some(prefetched.duration_ms as i64),
+            source: prefetched.source,
+            cover_url: prefetched.cover_url,
+            stream_id: Some(session_id),
+            file_size: None,
+            sample_rate: Some(sr),
+            bit_depth: Some(out_bd as u32),
+            channels: Some(ch as u32),
+        })
+    }
+
     /// Convert a cover_path (which may be a short hash or a full URL) into an
     /// absolute HTTP URL accessible by network renderers (DLNA/OpenHome).
     /// Hash-only values like `"abc123def"` become `http://IP:PORT/api/v1/artwork/abc123def`.
@@ -1724,6 +1836,7 @@ impl PlaybackOrchestrator {
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
+        self.prefetch.clear().await;
         let state = self.playback.get_state(zone_id).await;
         let old_stream_id = state
             .now_playing
@@ -1895,6 +2008,12 @@ impl PlaybackOrchestrator {
                 }
             }
         }
+    }
+
+    /// Clear the prefetch buffer. Should be called when the queue changes
+    /// (add/remove/reorder) so stale prefetched data is discarded.
+    pub async fn clear_prefetch(&self) {
+        self.prefetch.clear().await;
     }
 
     /// Persist the play_queue table for a zone with the given local track IDs.
