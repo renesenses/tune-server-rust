@@ -499,6 +499,18 @@ pub struct LocalOutput {
     /// accidentally un-silence the old stream's callback (which keeps its
     /// own clone of the previous Arc).
     force_silent: std::sync::Mutex<Arc<AtomicBool>>,
+    play_generation: Arc<AtomicU64>,
+    /// Set by the playback thread when it reaches end-of-stream naturally
+    /// (i.e. the HTTP source was fully consumed, not stopped by stop()).
+    ///
+    /// When true, `get_status()` reports the track as still Playing but
+    /// with position_ms past the track end, so the poller's
+    /// `position_past_end` path fires and triggers auto_next — bypassing
+    /// the gapless-guard window that would otherwise delay (or swallow)
+    /// the track-end signal when the thread is detached before draining.
+    ///
+    /// Cleared on every `play_url()` and `stop()` call.
+    track_ended_naturally: Arc<AtomicBool>,
 }
 
 impl LocalOutput {
@@ -532,7 +544,9 @@ impl LocalOutput {
             play_thread: std::sync::Mutex::new(None),
             exclusive_mode,
             audio_backend: audio_backend.to_string(),
+            play_generation: Arc::new(AtomicU64::new(0)),
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+            track_ended_naturally: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -942,6 +956,13 @@ impl OutputTarget for LocalOutput {
         *self.force_silent.lock().unwrap() = new_force_silent.clone();
         let force_silent = new_force_silent;
 
+        let my_generation = self.play_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let play_generation = self.play_generation.clone();
+
+        // Clear the natural-end flag for the new track.
+        self.track_ended_naturally.store(false, Ordering::SeqCst);
+        let track_ended_naturally = self.track_ended_naturally.clone();
+
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
         let url = url.to_string();
@@ -1244,13 +1265,21 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        // Ring fully drained — signal natural track end before
+                        // thread exits so the orchestrator can advance the queue
+                        // independently of the thread join (500ms detach path).
+                        if !force_silent.load(Ordering::Relaxed) {
+                            track_ended_naturally.store(true, Ordering::SeqCst);
+                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
                 drop(stream);
-                playing.store(false, Ordering::SeqCst);
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
                 info!(device = %device_name, "local_audio_compressed_stopped");
                 return;
             };
@@ -1337,6 +1366,7 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
+                let mut http_eof_excl = false;
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1347,7 +1377,10 @@ impl OutputTarget for LocalOutput {
                     }
 
                     let n = match reader.read(&mut read_buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            http_eof_excl = true;
+                            break;
+                        }
                         Ok(n) => n,
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::TimedOut
@@ -1390,6 +1423,9 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        if http_eof_excl && !force_silent.load(Ordering::Relaxed) {
+                            track_ended_naturally.store(true, Ordering::SeqCst);
+                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1397,7 +1433,9 @@ impl OutputTarget for LocalOutput {
 
                 // ExclusiveOutput::drop() restores sample rate and releases hog mode
                 drop(exclusive);
-                playing.store(false, Ordering::SeqCst);
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
                 info!(
                     device = %device_name,
                     frames = total_frames_fed,
@@ -1476,6 +1514,7 @@ impl OutputTarget for LocalOutput {
                     }
                 }
 
+                let mut http_eof_asio = false;
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1486,7 +1525,10 @@ impl OutputTarget for LocalOutput {
                     }
 
                     let n = match reader.read(&mut read_buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            http_eof_asio = true;
+                            break;
+                        }
                         Ok(n) => n,
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::TimedOut
@@ -1528,6 +1570,9 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
+                        if http_eof_asio && !force_silent.load(Ordering::Relaxed) {
+                            track_ended_naturally.store(true, Ordering::SeqCst);
+                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1535,7 +1580,9 @@ impl OutputTarget for LocalOutput {
 
                 // AsioExclusiveOutput::drop() releases the ASIO device
                 drop(exclusive);
-                playing.store(false, Ordering::SeqCst);
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
                 info!(
                     device = %device_name,
                     frames = total_frames_fed,
@@ -1908,6 +1955,11 @@ impl OutputTarget for LocalOutput {
                 );
             }
 
+            // Tracks whether the HTTP read loop exited because the source
+            // reached EOF (true) vs. a stop signal or read error (false).
+            // Only when http_eof=true do we signal track_ended_naturally.
+            let mut http_eof = false;
+
             loop {
                 // Check for stop signal (non-blocking)
                 if stop_rx.try_recv().is_ok() {
@@ -1935,6 +1987,7 @@ impl OutputTarget for LocalOutput {
                             elapsed_ms = stream_start.elapsed().as_millis() as u64,
                             "local_audio_stream_eof"
                         );
+                        http_eof = true;
                         break; // EOF
                     }
                     Ok(n) => n,
@@ -2074,13 +2127,28 @@ impl OutputTarget for LocalOutput {
                     break;
                 }
                 if ring.available() == 0 {
+                    // Ring fully drained — if the HTTP stream also ended
+                    // naturally (http_eof=true, not a stop/error), signal
+                    // track_ended_naturally so the orchestrator can detect
+                    // end-of-track via get_status() independently of the
+                    // thread join.  This is critical on WASAPI where
+                    // drop(stream) can block longer than the 500ms detach
+                    // window, preventing the old thread from setting
+                    // playing=false in time for the poller to act on it.
+                    if http_eof && !force_silent.load(Ordering::Relaxed) {
+                        track_ended_naturally.store(true, Ordering::SeqCst);
+                    }
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
             drop(stream);
-            playing.store(false, Ordering::SeqCst);
+            if play_generation.load(Ordering::SeqCst) == my_generation {
+                playing.store(false, Ordering::SeqCst);
+            } else {
+                debug!("local_audio_stale_thread_skipping_playing_false");
+            }
             info!(
                 device = %device_name,
                 frames = total_frames_fed,
@@ -2154,6 +2222,9 @@ impl OutputTarget for LocalOutput {
         self.playing.store(false, Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
         self.duration_ms.store(0, Ordering::SeqCst);
+        // Clear the natural-end flag so stale signals from the previous track
+        // do not affect the next track's end-detection cycle.
+        self.track_ended_naturally.store(false, Ordering::SeqCst);
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
         *self.track_artist.lock().unwrap() = None;
@@ -2197,6 +2268,40 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
+        let duration_ms = self.duration_ms.load(Ordering::Relaxed);
+
+        // When the playback thread has signalled natural end-of-stream
+        // (track_ended_naturally=true) but is still alive (playing=true,
+        // typically blocked in WASAPI's drop(stream)), report the track as
+        // Playing with position past the end.  This causes the poller's
+        // position_past_end path (TransportState::Playing branch) to fire
+        // after POSITION_PAST_END_TICKS, triggering auto_next without
+        // waiting for the thread to fully exit.
+        //
+        // Once the thread finishes and sets playing=false, this branch no
+        // longer fires and the normal Stopped state is reported — allowing
+        // the is_short_track fast-path in the poller's Stopped branch to
+        // handle short tracks correctly.
+        //
+        // The flag is cleared by stop() and play_url() so it only applies
+        // to the current track.
+        if self.track_ended_naturally.load(Ordering::Relaxed)
+            && self.playing.load(Ordering::Relaxed)
+            && duration_ms > 0
+        {
+            return Ok(OutputStatus {
+                state: TransportState::Playing,
+                // Report 5 s past the end so the poller's 3 s margin is met.
+                position_ms: duration_ms.saturating_add(5000),
+                duration_ms,
+                volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
+                muted: self.muted.load(Ordering::Relaxed),
+                current_uri: self.current_uri.lock().unwrap().clone(),
+                track_title: self.track_title.lock().unwrap().clone(),
+                track_artist: self.track_artist.lock().unwrap().clone(),
+            });
+        }
+
         let state = if self.playing.load(Ordering::Relaxed) {
             if self.paused.load(Ordering::Relaxed) {
                 TransportState::Paused
@@ -2210,7 +2315,7 @@ impl OutputTarget for LocalOutput {
         Ok(OutputStatus {
             state,
             position_ms: self.position_ms.load(Ordering::Relaxed),
-            duration_ms: self.duration_ms.load(Ordering::Relaxed),
+            duration_ms,
             volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
             muted: self.muted.load(Ordering::Relaxed),
             current_uri: self.current_uri.lock().unwrap().clone(),

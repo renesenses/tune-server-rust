@@ -1105,7 +1105,7 @@ impl PlaybackOrchestrator {
         // which LocalOutput cannot decode — it would interpret compressed
         // bytes as raw PCM samples, producing white noise.
         // Fix: download → decode → WAV transcode, same as local files.
-        let (stream_url, sid, out_mime) = if is_local_stream || is_oaat_stream {
+        let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
             let sr = stream_data.quality.sample_rate;
@@ -1279,11 +1279,12 @@ impl PlaybackOrchestrator {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
             let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-            (url, Some(session_id), "audio/wav".to_string())
+            (url, Some(session_id), "audio/wav".to_string(), None)
         } else if is_dash_file {
             // DASH multi-segment fMP4 already assembled on disk by get_track_url().
-            // DLNA renderers can't decode fMP4+FLAC containers directly, so we
-            // decode to WAV (same path as local/OAAT) and serve via HTTP session.
+            // DLNA renderers can't decode fMP4+FLAC directly, and chunked WAV
+            // causes noise on many renderers (darTZeel, Eversolo, etc.).
+            // Pre-transcode to a FLAC temp file so we can serve with Content-Length.
             let dash_file_path = stream_data
                 .url
                 .strip_prefix("file://")
@@ -1295,7 +1296,6 @@ impl PlaybackOrchestrator {
                 return Err("DASH file missing (already consumed by prior decode)".into());
             }
 
-            // Move the file to a unique path to prevent concurrent decodes
             let unique_path = format!("{}.decoding", &dash_file_path);
             if std::fs::rename(&dash_file_path, &unique_path).is_err() {
                 warn!(path = %dash_file_path, "streaming_dash_file_already_being_decoded");
@@ -1305,75 +1305,104 @@ impl PlaybackOrchestrator {
             let sr = stream_data.quality.sample_rate;
             let bd = stream_data.quality.bit_depth.max(16).min(24);
 
-            let wav_info = StreamInfo {
-                format: "wav".into(),
-                mime_type: "audio/wav".into(),
-                sample_rate: sr,
-                bit_depth: bd,
-                channels: 2,
-                file_size: None,
-                duration_ms: None,
-            };
-
-            let (session_id, tx, data_ready) =
-                self.streamer.create_session(wav_info, false, 256).await;
+            let tmp_path = std::env::temp_dir()
+                .join(format!("tune-dash-transcode-{}.flac", uuid::Uuid::new_v4()))
+                .to_string_lossy()
+                .to_string();
 
             info!(
-                session_id = %session_id,
+                path = %unique_path,
+                tmp = %tmp_path,
                 sample_rate = sr,
                 bit_depth = bd,
-                path = %unique_path,
-                "streaming_dash_decode_to_wav_for_dlna"
+                "streaming_dash_pre_transcode_to_flac"
             );
 
-            // Background task: decode fMP4 → WAV → session (same as local/OAAT)
-            tokio::spawn(async move {
-                let (levels_tx, _levels_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
-                let tmp_file_clone = unique_path.clone();
-                let tx_clone = tx;
+            let tmp_path_clone = tmp_path.clone();
+            let unique_path_clone = unique_path.clone();
+            let transcode_result = tokio::task::spawn_blocking(move || {
+                let decoded = crate::audio::decode::decode_to_pcm(
+                    &unique_path_clone,
+                    Some(sr),
+                    Some(2),
+                    0.0,
+                    0.0,
+                )?;
 
-                let decode_result = tokio::task::spawn_blocking(move || {
-                    crate::audio::decode::decode_to_pcm_streaming_with_levels(
-                        &tmp_file_clone,
-                        Some(sr),
-                        Some(2),
-                        Some(bd),
-                        tx_clone,
-                        32768,
-                        data_ready,
-                        levels_tx,
+                let pcm_bytes = decoded.pcm_bytes();
+                let actual_bd = decoded.bit_depth;
+
+                let rt = tokio::runtime::Handle::try_current()
+                    .map_err(|e| format!("no tokio runtime: {e}"))?;
+                let encoded_data = rt.block_on(async {
+                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                        "flac",
+                        decoded.sample_rate,
+                        actual_bd as u32,
+                        decoded.channels,
+                    );
+                    encoder.start().await?;
+                    encoder.write(&pcm_bytes).await?;
+                    encoder.finish().await
+                })?;
+
+                std::fs::write(&tmp_path_clone, &encoded_data)
+                    .map_err(|e| format!("write temp file: {e}"))?;
+
+                let file_size = encoded_data.len() as u64;
+                Ok::<(u64, u16), String>((file_size, actual_bd))
+            })
+            .await;
+
+            let _ = std::fs::remove_file(&unique_path);
+
+            match transcode_result {
+                Ok(Ok((file_size, actual_bd))) => {
+                    info!(
+                        tmp = %tmp_path,
+                        file_size,
+                        bit_depth = actual_bd,
+                        "streaming_dash_pre_transcode_complete"
+                    );
+
+                    let file_info = StreamInfo {
+                        format: "flac".into(),
+                        mime_type: "audio/flac".into(),
+                        sample_rate: sr,
+                        bit_depth: bd,
+                        channels: 2,
+                        file_size: Some(file_size),
+                        duration_ms: None,
+                    };
+                    let session_id = self
+                        .streamer
+                        .create_file_session(file_info, tmp_path, false)
+                        .await;
+
+                    let server_ip = crate::discovery::ssdp::get_local_ip()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "127.0.0.1".into());
+                    let url = self
+                        .streamer
+                        .get_stream_url(&session_id, &server_ip, "flac");
+                    (
+                        url,
+                        Some(session_id),
+                        "audio/flac".to_string(),
+                        Some(file_size),
                     )
-                })
-                .await;
-
-                let _ = std::fs::remove_file(&unique_path);
-
-                match decode_result {
-                    Ok(Ok(bit_depth)) => {
-                        info!(bit_depth, "streaming_dash_decode_to_wav_complete");
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_dash_decode_to_wav_failed");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "streaming_dash_decode_task_panic");
-                    }
                 }
-            });
-
-            // Wait for first decoded data before sending URL to DLNA renderer.
-            // Without this, the renderer fetches an empty stream and gives up.
-            let ready = self.streamer.wait_data_ready(&session_id, 30_000).await;
-            if !ready {
-                warn!("streaming_dash_data_ready_timeout");
+                Ok(Err(e)) => {
+                    warn!(error = %e, "streaming_dash_pre_transcode_failed");
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(format!("DASH transcode failed: {e}"));
+                }
+                Err(e) => {
+                    warn!(error = %e, "streaming_dash_pre_transcode_task_panic");
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(format!("DASH transcode task panic: {e}"));
+                }
             }
-
-            let server_ip = crate::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
-            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-            (url, Some(session_id), "audio/wav".to_string())
         } else if is_https {
             let codec_lower = stream_data.quality.codec.to_lowercase();
             let is_aac = codec_lower == "aac"
@@ -1382,122 +1411,130 @@ impl PlaybackOrchestrator {
 
             if is_aac {
                 // AAC/MP4 streams need transcoding for DLNA — most renderers
-                // (DMP-A8, etc.) don't support AAC via DLNA.  Download → decode
-                // → WAV, same as the DASH path, instead of proxying raw AAC
-                // bytes mislabelled as FLAC.
+                // (DMP-A8, etc.) don't support AAC via DLNA.  Pre-transcode to
+                // FLAC temp file so we serve with Content-Length (chunked WAV
+                // causes noise on many renderers).
                 let sr = stream_data.quality.sample_rate;
                 let bd = stream_data.quality.bit_depth.max(16).min(24);
-
-                let wav_info = StreamInfo {
-                    format: "wav".into(),
-                    mime_type: "audio/wav".into(),
-                    sample_rate: sr,
-                    bit_depth: bd,
-                    channels: 2,
-                    file_size: None,
-                    duration_ms: None,
-                };
-
-                let (session_id, tx, data_ready) =
-                    self.streamer.create_session(wav_info, false, 256).await;
 
                 info!(
                     service = service_name,
                     codec = %codec_lower,
                     sample_rate = sr,
                     bit_depth = bd,
-                    "streaming_aac_transcode_to_wav_for_dlna"
+                    "streaming_aac_pre_transcode_to_flac_for_dlna"
                 );
 
                 let upstream_url = stream_data.url.clone();
                 let codec = codec_lower.clone();
-                tokio::spawn(async move {
-                    let (levels_tx, _levels_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+                let tmp_dl = std::env::temp_dir()
+                    .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                    .to_string_lossy()
+                    .to_string();
+                let tmp_flac = std::env::temp_dir()
+                    .join(format!("tune-aac-transcode-{}.flac", uuid::Uuid::new_v4()))
+                    .to_string_lossy()
+                    .to_string();
 
-                    // Download to temp file
-                    let tmp_path = std::env::temp_dir()
-                        .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
-                        .to_string_lossy()
-                        .to_string();
-                    let tmp_path_clone = tmp_path.clone();
-                    let upstream = upstream_url.clone();
-                    let download_result = tokio::task::spawn_blocking(move || {
-                        let resp = reqwest::blocking::Client::builder()
-                            .timeout(std::time::Duration::from_secs(120))
-                            .build()
-                            .and_then(|c| c.get(&upstream).send());
-                        match resp {
-                            Ok(mut r) if r.status().is_success() => {
-                                let mut file = match std::fs::File::create(&tmp_path_clone) {
-                                    Ok(f) => f,
-                                    Err(e) => return Err(format!("tmp create: {e}")),
-                                };
-                                match std::io::copy(&mut r, &mut file) {
-                                    Ok(bytes) => {
-                                        debug!(bytes, path = %tmp_path_clone, "aac_download_complete");
-                                        Ok(tmp_path_clone)
-                                    }
-                                    Err(e) => Err(format!("download copy: {e}")),
-                                }
-                            }
-                            Ok(r) => Err(format!("upstream HTTP {}", r.status())),
-                            Err(e) => Err(format!("upstream fetch: {e}")),
-                        }
-                    })
-                    .await;
-
-                    let tmp_file = match download_result {
-                        Ok(Ok(path)) => path,
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "aac_transcode_download_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "aac_transcode_task_join_failed");
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return;
-                        }
-                    };
-
-                    let tmp_file_clone = tmp_file.clone();
-                    let tx_clone = tx.clone();
-                    drop(tx);
-                    let decode_result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_with_levels(
-                            &tmp_file_clone,
-                            Some(sr),
-                            Some(2),
-                            Some(bd),
-                            tx_clone,
-                            32768,
-                            data_ready,
-                            levels_tx,
-                        )
-                    })
-                    .await;
-
-                    let _ = std::fs::remove_file(&tmp_file);
-
-                    match decode_result {
-                        Ok(Ok(bit_depth)) => {
-                            info!(bit_depth, "aac_transcode_to_wav_complete");
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "aac_transcode_decode_failed");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "aac_transcode_task_panic");
-                        }
+                let tmp_dl_clone = tmp_dl.clone();
+                let tmp_flac_clone = tmp_flac.clone();
+                let transcode_result = tokio::task::spawn_blocking(move || {
+                    // 1. Download
+                    let resp = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(120))
+                        .build()
+                        .and_then(|c| c.get(&upstream_url).send())
+                        .map_err(|e| format!("upstream fetch: {e}"))?;
+                    if !resp.status().is_success() {
+                        return Err(format!("upstream HTTP {}", resp.status()));
                     }
-                });
+                    let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
+                    std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
 
-                let server_ip = crate::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into());
-                let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
-                (url, Some(session_id), "audio/wav".to_string())
+                    // 2. Decode to PCM
+                    let decoded = crate::audio::decode::decode_to_pcm(
+                        &tmp_dl_clone,
+                        Some(sr),
+                        Some(2),
+                        0.0,
+                        0.0,
+                    )?;
+                    let pcm_bytes = decoded.pcm_bytes();
+                    let actual_bd = decoded.bit_depth;
+
+                    // 3. Encode to FLAC
+                    let rt = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no tokio runtime: {e}"))?;
+                    let encoded_data = rt.block_on(async {
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            "flac",
+                            decoded.sample_rate,
+                            actual_bd as u32,
+                            decoded.channels,
+                        );
+                        encoder.start().await?;
+                        encoder.write(&pcm_bytes).await?;
+                        encoder.finish().await
+                    })?;
+
+                    std::fs::write(&tmp_flac_clone, &encoded_data)
+                        .map_err(|e| format!("write flac: {e}"))?;
+
+                    let _ = std::fs::remove_file(&tmp_dl_clone);
+                    let file_size = encoded_data.len() as u64;
+                    Ok::<(u64, u16), String>((file_size, actual_bd))
+                })
+                .await;
+
+                match transcode_result {
+                    Ok(Ok((file_size, actual_bd))) => {
+                        info!(
+                            tmp = %tmp_flac,
+                            file_size,
+                            bit_depth = actual_bd,
+                            "streaming_aac_pre_transcode_complete"
+                        );
+
+                        let file_info = StreamInfo {
+                            format: "flac".into(),
+                            mime_type: "audio/flac".into(),
+                            sample_rate: sr,
+                            bit_depth: bd,
+                            channels: 2,
+                            file_size: Some(file_size),
+                            duration_ms: None,
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, tmp_flac, false)
+                            .await;
+
+                        let server_ip = crate::discovery::ssdp::get_local_ip()
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|| "127.0.0.1".into());
+                        let url = self
+                            .streamer
+                            .get_stream_url(&session_id, &server_ip, "flac");
+                        (
+                            url,
+                            Some(session_id),
+                            "audio/flac".to_string(),
+                            Some(file_size),
+                        )
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "streaming_aac_pre_transcode_failed");
+                        let _ = std::fs::remove_file(&tmp_dl);
+                        let _ = std::fs::remove_file(&tmp_flac);
+                        return Err(format!("AAC transcode failed: {e}"));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "streaming_aac_pre_transcode_task_panic");
+                        let _ = std::fs::remove_file(&tmp_dl);
+                        let _ = std::fs::remove_file(&tmp_flac);
+                        return Err(format!("AAC transcode task panic: {e}"));
+                    }
+                }
             } else {
                 // Non-AAC codecs (FLAC, etc.) — proxy directly
                 let session_id = self
@@ -1510,10 +1547,15 @@ impl PlaybackOrchestrator {
                 let url = self
                     .streamer
                     .get_stream_url(&session_id, &server_ip, &codec_lower);
-                (url, Some(session_id), stream_data.mime_type.clone())
+                (url, Some(session_id), stream_data.mime_type.clone(), None)
             }
         } else {
-            (stream_data.url.clone(), None, stream_data.mime_type.clone())
+            (
+                stream_data.url.clone(),
+                None,
+                stream_data.mime_type.clone(),
+                None,
+            )
         };
 
         let (title, artist, album, duration_ms, cover_path) = if req.title.is_some() {
@@ -1547,7 +1589,7 @@ impl PlaybackOrchestrator {
             source: service_name.into(),
             cover_url: cover_path,
             stream_id: sid,
-            file_size: None,
+            file_size: stream_file_size,
             sample_rate: Some(stream_data.quality.sample_rate),
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
