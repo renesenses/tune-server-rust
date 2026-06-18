@@ -481,6 +481,11 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
         name: "add_zone_autoplay_enabled",
         up: "", // Applied programmatically via add_column_if_missing
     },
+    Migration {
+        version: 37,
+        name: "add_listen_history_source_id_album_id",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -768,6 +773,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 36 {
             add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
+        }
+        if migration.version == 37 {
+            add_column_if_missing(db, "listen_history", "source_id", "TEXT");
+            add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
         }
 
         db.execute(

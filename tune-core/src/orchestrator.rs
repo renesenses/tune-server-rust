@@ -299,6 +299,14 @@ impl PlaybackOrchestrator {
             resolved.artist.as_deref(),
             album.as_deref(),
             &resolved.source,
+            req.source_id.as_deref(),
+            req.track_id.and_then(|tid| {
+                TrackRepo::with_backend(self.db.clone())
+                    .get(tid)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.album_id)
+            }),
             resolved.duration_ms.unwrap_or(0),
             req.zone_id,
             cover_path.as_deref(),
@@ -1507,6 +1515,8 @@ impl PlaybackOrchestrator {
         artist: Option<&str>,
         album: Option<&str>,
         source: &str,
+        source_id: Option<&str>,
+        album_id: Option<i64>,
         duration_ms: i64,
         zone_id: i64,
         cover_url: Option<&str>,
@@ -1519,6 +1529,8 @@ impl PlaybackOrchestrator {
             artist_name: artist.map(Into::into),
             album_title: album.map(Into::into),
             source: source.into(),
+            source_id: source_id.map(Into::into),
+            album_id,
             duration_ms,
             listened_at: None,
             zone_id: Some(zone_id),
@@ -2642,6 +2654,8 @@ mod tests {
             Some("Artist"),
             Some("Album"),
             "local",
+            None,
+            None,
             180_000,
             zone_id,
             None,

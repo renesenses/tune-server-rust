@@ -208,6 +208,8 @@ async fn pg_history_round_trip() {
         artist_name: Some("Miles".into()),
         album_title: Some("Kind of Blue".into()),
         source: "local".into(),
+        source_id: None,
+        album_id: None,
         duration_ms: 560_000,
         listened_at: None,
         zone_id: None,

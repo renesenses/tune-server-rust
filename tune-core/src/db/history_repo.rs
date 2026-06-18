@@ -14,12 +14,11 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
-    const RECORD_COLS: &str =
-        "id, track_id, title, artist_name, album_title, source, duration_ms, listened_at, zone_id";
+    const RECORD_COLS: &str = "id, track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, listened_at, zone_id";
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, duration_ms, zone_id, cover_url) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -27,7 +26,9 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             d.placeholder(7),
-            d.placeholder(8)
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10)
         )
     }
 
@@ -114,6 +115,8 @@ pub struct ListenRecord {
     pub artist_name: Option<String>,
     pub album_title: Option<String>,
     pub source: String,
+    pub source_id: Option<String>,
+    pub album_id: Option<i64>,
     pub duration_ms: i64,
     pub listened_at: Option<String>,
     pub zone_id: Option<i64>,
@@ -146,12 +149,14 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 8] = [
+        let params: [&dyn ToSqlValue; 10] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
             &rec.album_title,
             &rec.source,
+            &rec.source_id,
+            &rec.album_id,
             &rec.duration_ms,
             &rec.zone_id,
             &rec.cover_url,
@@ -722,9 +727,11 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
             .get(5)
             .and_then(|v| v.as_string())
             .unwrap_or_else(|| "local".into()),
-        duration_ms: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
-        listened_at: cols.get(7).and_then(|v| v.as_string()),
-        zone_id: cols.get(8).and_then(|v| v.as_i64()),
+        source_id: cols.get(6).and_then(|v| v.as_string()),
+        album_id: cols.get(7).and_then(|v| v.as_i64()),
+        duration_ms: cols.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+        listened_at: cols.get(9).and_then(|v| v.as_string()),
+        zone_id: cols.get(10).and_then(|v| v.as_i64()),
         cover_url: None,
     }
 }
@@ -751,6 +758,8 @@ mod tests {
             artist_name: Some("Miles Davis".into()),
             album_title: Some("Kind of Blue".into()),
             source: "local".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 562_000,
             listened_at: None,
             zone_id: None,
@@ -851,6 +860,8 @@ mod tests {
             artist_name: None,
             album_title: None,
             source: "local".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 0,
             listened_at: None,
             zone_id: None,
@@ -870,6 +881,8 @@ mod tests {
             artist_name: Some("X".into()),
             album_title: None,
             source: "local".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 300_000,
             listened_at: None,
             zone_id: None,
@@ -883,6 +896,8 @@ mod tests {
             artist_name: Some("Y".into()),
             album_title: None,
             source: "tidal".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 200_000,
             listened_at: None,
             zone_id: None,
@@ -947,6 +962,8 @@ mod tests {
             artist_name: None,
             album_title: None,
             source: "local".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 100_000,
             listened_at: None,
             zone_id: Some(1),
@@ -975,6 +992,8 @@ mod tests {
             artist_name: Some("X".into()),
             album_title: None,
             source: "local".into(),
+            source_id: None,
+            album_id: None,
             duration_ms: 0,
             listened_at: None,
             zone_id: None,
