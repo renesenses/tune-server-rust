@@ -274,7 +274,8 @@ impl AudioFormat {
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
             Self::Aiff => AudioFormat::Flac,
-            Self::Alac | Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
+            Self::Alac => AudioFormat::Flac,
+            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
             other => *other,
         }
     }
