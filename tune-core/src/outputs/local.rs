@@ -2128,22 +2128,25 @@ impl OutputTarget for LocalOutput {
         let old_handle = self.play_thread.lock().unwrap().take();
         if let Some(handle) = old_handle {
             let _ = tokio::task::spawn_blocking(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                // 500 ms is enough for the thread to notice force_silent and
+                // exit its read loop. On Windows WASAPI the old thread may be
+                // blocked on a reqwest read(); force_silent is already set so
+                // the cpal callback is silent. We detach instead of waiting up
+                // to 4 s, keeping track transitions snappy.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
                 loop {
                     if handle.is_finished() {
                         let _ = handle.join();
                         return;
                     }
                     if std::time::Instant::now() >= deadline {
-                        warn!(
-                            "local_audio_stop_thread_join_timeout — old stream may overlap briefly"
-                        );
-                        // Thread is still running but force_silent ensures
-                        // the cpal callback outputs silence, so no audible
-                        // overlap. The thread will clean up on its own.
+                        // Detach — force_silent keeps the old callback silent
+                        // so there is no audible overlap; the thread will exit
+                        // on its own once the blocking read returns.
+                        debug!("local_audio_stop_thread_detached — old stream exits in background");
                         return;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             })
             .await;
