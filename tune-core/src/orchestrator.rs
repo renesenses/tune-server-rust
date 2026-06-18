@@ -1272,6 +1272,13 @@ impl PlaybackOrchestrator {
                 }
             });
 
+            // Wait for first decoded data before sending URL to DLNA renderer.
+            // Without this, the renderer fetches an empty stream and gives up.
+            let ready = self.streamer.wait_data_ready(&session_id, 30_000).await;
+            if !ready {
+                warn!("streaming_dash_data_ready_timeout");
+            }
+
             let server_ip = crate::discovery::ssdp::get_local_ip()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "127.0.0.1".into());
