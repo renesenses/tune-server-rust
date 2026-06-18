@@ -335,11 +335,16 @@ fn spawn_local_audio_rescan(_state: &AppState) {}
 /// Removes devices that have disappeared (unless actively playing).
 #[cfg(feature = "local-audio")]
 pub async fn rescan_local_audio_devices(state: &AppState) {
+    // On Windows, use WASAPI for the periodic rescan instead of re-probing
+    // ASIO every cycle.  Re-probing ASIO can crash the process when the ASIO
+    // driver is in a bad state (e.g. SOtM Diretta via RDP — the ASIO SDK
+    // calls abort() internally, killing the process with no panic/error).
+    // ASIO devices are detected at startup; the hotplug rescan only needs to
+    // track WASAPI device changes (USB DACs plugged/unplugged).
+    #[cfg(target_os = "windows")]
+    let audio_backend = "wasapi".to_string();
+    #[cfg(not(target_os = "windows"))]
     let audio_backend = state.config.local_audio_backend.clone();
-    // Enumerate devices on a blocking thread — CoreAudio/ALSA device
-    // enumeration can block for hundreds of milliseconds (or longer if a
-    // USB DAC is misbehaving), which starves the async runtime and delays
-    // play requests that need the outputs lock.
     let backend_clone = audio_backend.clone();
     let devices = match tokio::task::spawn_blocking(move || {
         tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
@@ -347,7 +352,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     .await
     {
         Ok(d) => d,
-        Err(_) => return, // task panicked — skip this cycle
+        Err(_) => return,
     };
 
     // Collect new device IDs first (no lock needed)
