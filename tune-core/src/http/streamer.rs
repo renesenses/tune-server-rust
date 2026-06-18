@@ -197,7 +197,22 @@ impl AudioStreamer {
     }
 
     pub async fn remove_session(&self, stream_id: &str) {
-        self.sessions.lock().await.remove(stream_id);
+        let removed = self.sessions.lock().await.remove(stream_id);
+        // Clean up temp transcode files created by the pre-transcode pipeline.
+        // Only delete files under the system temp dir with the tune-transcode prefix
+        // to avoid accidentally removing actual music files.
+        if let Some(session) = removed {
+            let fp = session.file_path.lock().await;
+            if let Some(ref path) = *fp {
+                if is_temp_transcode_file(path) {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        info!(stream_id, path, error = %e, "temp_transcode_file_cleanup_failed");
+                    } else {
+                        info!(stream_id, path, "temp_transcode_file_cleaned_up");
+                    }
+                }
+            }
+        }
         info!(stream_id, "stream_session_removed");
     }
 
@@ -212,6 +227,8 @@ impl AudioStreamer {
     pub async fn cleanup_stale_sessions(&self) -> usize {
         let mut sessions = self.sessions.lock().await;
         let before = sessions.len();
+        // Collect temp files to clean up from stale sessions
+        let mut temp_files_to_remove: Vec<String> = Vec::new();
         // 30 minutes for streaming sessions — Hi-Res tracks can be large
         // and DLNA renderers may buffer slowly.  Orphaned sessions from
         // gapless prep or interrupted playback are cleaned up sooner by
@@ -222,13 +239,56 @@ impl AudioStreamer {
             }
             let age = s.created_at.elapsed();
             if age > std::time::Duration::from_secs(1800) {
+                // Check for temp transcode file to clean up.
+                // We can't .await inside retain, so use try_lock.
+                if let Ok(fp) = s.file_path.try_lock() {
+                    if let Some(ref path) = *fp {
+                        if is_temp_transcode_file(path) {
+                            temp_files_to_remove.push(path.clone());
+                        }
+                    }
+                }
                 info!(stream_id = %id, age_secs = age.as_secs(), "stale_session_removed");
                 false
             } else {
                 true
             }
         });
-        before - sessions.len()
+        let after = sessions.len();
+        drop(sessions);
+        // Clean up temp files outside the sessions lock
+        for path in &temp_files_to_remove {
+            if let Err(e) = std::fs::remove_file(path) {
+                info!(path, error = %e, "stale_temp_transcode_file_cleanup_failed");
+            } else {
+                info!(path, "stale_temp_transcode_file_cleaned_up");
+            }
+        }
+        before - after
+    }
+}
+
+/// Remove leftover temp transcode files from /tmp on startup.
+/// Called once when the server starts to clean up files from a previous
+/// crash or unclean shutdown.
+pub fn cleanup_leftover_transcode_files() {
+    let tmp_dir = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&tmp_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("tune-transcode-") {
+                if std::fs::remove_file(entry.path()).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count > 0 {
+        info!(count, "leftover_transcode_files_cleaned_up");
     }
 }
 
@@ -245,6 +305,17 @@ pub fn build_wav_header(
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
     build_wav_header_with_duration(channels, sample_rate, bit_depth, duration_ms)
+}
+
+/// Check if a file path is a temporary transcode file created by the
+/// pre-transcode pipeline.  Only these files should be auto-deleted
+/// when a session is removed — never actual music files.
+fn is_temp_transcode_file(path: &str) -> bool {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    file_name.starts_with("tune-transcode-")
 }
 
 pub fn build_icy_metadata(

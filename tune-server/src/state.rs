@@ -73,6 +73,9 @@ impl AppState {
         let backend: Arc<dyn DbBackend> =
             Self::create_backend(selected_engine, &tune_config, &db, db_path)?;
 
+        // Clean up any leftover temp transcode files from a previous crash.
+        tune_core::http::streamer::cleanup_leftover_transcode_files();
+
         let streamer = Arc::new(AudioStreamer::new(port));
         let playback = Arc::new(PlaybackManager::new());
 

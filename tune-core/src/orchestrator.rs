@@ -637,6 +637,21 @@ impl PlaybackOrchestrator {
                 "transcode_required"
             );
 
+            // For network outputs (DLNA, OpenHome, etc.) with non-WAV targets
+            // (e.g. FLAC), pre-transcode to a temp file on disk so the HTTP
+            // handler can serve it with Content-Length and Accept-Ranges.
+            // Renderers like the darTZeel LHC-208 reject chunked transfer
+            // (no Content-Length) and require a known file size.
+            //
+            // For local/OAAT outputs (WAV target), keep using streaming
+            // sessions — those outputs don't need Content-Length.
+            let target_format_str = if target_fmt == AudioFormat::Wav {
+                "wav".to_string()
+            } else {
+                target_fmt.container_format().to_string()
+            };
+            let use_file_transcode = is_network_output && target_format_str != "wav";
+
             let info = StreamInfo {
                 format: out_ext.clone(),
                 mime_type: out_mime.clone(),
@@ -646,53 +661,200 @@ impl PlaybackOrchestrator {
                 file_size: None,
                 duration_ms: Some(track.duration_ms as u64),
             };
-            // Use the computed WAV/FLAC content length for the DIDL size
-            // attribute so DLNA renderers know the correct stream size.
-            let transcode_file_size = info.wav_content_length();
 
-            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+            if use_file_transcode {
+                // ── Pre-transcode to temp file (FLAC) ──────────────────
+                // Decode → encode → write to /tmp, then create a file session.
+                // The HTTP handler serves file sessions with Content-Length
+                // and Range support, which DLNA renderers require.
+                let fp = file_path.clone();
+                let ev_bus = self.event_bus.clone();
+                let zone_id = req.zone_id;
+                let tmp_path = std::env::temp_dir()
+                    .join(format!(
+                        "tune-transcode-{}.{}",
+                        uuid::Uuid::new_v4(),
+                        &out_ext
+                    ))
+                    .to_string_lossy()
+                    .to_string();
 
-            // Native transcoding pipeline: decode with native decoders, encode to target format
-            let fp = file_path.clone();
-            let target_format_str = if target_fmt == AudioFormat::Wav {
-                "wav".to_string()
-            } else {
-                target_fmt.container_format().to_string()
-            };
-            let ev_bus = self.event_bus.clone();
-            let zone_id = req.zone_id;
-            tokio::spawn(async move {
-                debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
+                info!(
+                    file = %fp,
+                    tmp = %tmp_path,
+                    target = %target_format_str,
+                    sample_rate = out_sr,
+                    bit_depth = out_bd,
+                    "transcode_to_temp_file_start"
+                );
 
-                // Create audio-levels channel for ALL transcode paths so the
-                // web client VU-meter works regardless of output type.
-                // Uses tokio unbounded channel: the sender is sync-safe (works
-                // inside spawn_blocking), the receiver is async (does not block
-                // a tokio worker thread — the old std::sync::mpsc::recv() did).
-                let (levels_tx, mut levels_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
-                if let Some(ref bus) = ev_bus {
-                    let bus = bus.clone();
-                    tokio::spawn(async move {
-                        while let Some(lvl) = levels_rx.recv().await {
-                            bus.emit(
-                                "playback.audio_levels",
-                                serde_json::json!({
-                                    "zone_id": zone_id,
-                                    "rms_left_db": lvl.rms_left_db(),
-                                    "rms_right_db": lvl.rms_right_db(),
-                                    "peak_left_db": lvl.peak_left_db(),
-                                    "peak_right_db": lvl.peak_right_db(),
-                                    "rms_left": lvl.rms_left,
-                                    "rms_right": lvl.rms_right,
-                                    "spectrum": lvl.spectrum,
-                                }),
-                            );
+                let tmp_path_clone = tmp_path.clone();
+                let target_fmt_str = target_format_str.clone();
+                let transcode_result = tokio::task::spawn_blocking(move || {
+                    // 1. Decode source to PCM
+                    let decoded = crate::audio::decode::decode_to_pcm(
+                        &fp,
+                        Some(out_sr),
+                        Some(channels as u32),
+                        0.0,
+                        0.0,
+                    )?;
+
+                    let pcm_bytes = decoded.pcm_bytes();
+                    let actual_bd = decoded.bit_depth;
+
+                    // 2. Encode to target format
+                    let rt = tokio::runtime::Handle::try_current()
+                        .map_err(|e| format!("no tokio runtime: {e}"))?;
+                    let encoded_data = rt.block_on(async {
+                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                            &target_fmt_str,
+                            decoded.sample_rate,
+                            actual_bd as u32,
+                            decoded.channels,
+                        );
+                        encoder.start().await?;
+                        encoder.write(&pcm_bytes).await?;
+                        encoder.finish().await
+                    })?;
+
+                    // 3. Write to temp file
+                    std::fs::write(&tmp_path_clone, &encoded_data)
+                        .map_err(|e| format!("write temp file: {e}"))?;
+
+                    let file_size = encoded_data.len() as u64;
+                    Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
+                })
+                .await;
+
+                match transcode_result {
+                    Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
+                        info!(
+                            file = %file_path,
+                            tmp = %tmp_path,
+                            file_size,
+                            "transcode_to_temp_file_complete"
+                        );
+
+                        // Emit audio levels in the background
+                        if let Some(ref bus) = ev_bus {
+                            let bus = bus.clone();
+                            let actual_ch = channels;
+                            tokio::spawn(async move {
+                                let (levels_tx, mut levels_rx) =
+                                    tokio::sync::mpsc::unbounded_channel::<
+                                        crate::audio::levels::AudioLevels,
+                                    >();
+                                let bus_clone = bus.clone();
+                                tokio::spawn(async move {
+                                    while let Some(lvl) = levels_rx.recv().await {
+                                        bus_clone.emit(
+                                            "playback.audio_levels",
+                                            serde_json::json!({
+                                                "zone_id": zone_id,
+                                                "rms_left_db": lvl.rms_left_db(),
+                                                "rms_right_db": lvl.rms_right_db(),
+                                                "peak_left_db": lvl.peak_left_db(),
+                                                "peak_right_db": lvl.peak_right_db(),
+                                                "rms_left": lvl.rms_left,
+                                                "rms_right": lvl.rms_right,
+                                                "spectrum": lvl.spectrum,
+                                            }),
+                                        );
+                                    }
+                                });
+                                tokio::task::spawn_blocking(move || {
+                                    for chunk in pcm_bytes.chunks(32768) {
+                                        if levels_tx
+                                            .send(crate::audio::levels::compute_levels(
+                                                chunk, actual_bd, actual_ch,
+                                            ))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                })
+                                .await
+                                .ok();
+                            });
                         }
-                    });
-                }
 
-                if target_format_str == "wav" {
+                        // Create a file session — HTTP handler serves with
+                        // Content-Length and Range support.
+                        let file_info = StreamInfo {
+                            format: out_ext.clone(),
+                            mime_type: out_mime.clone(),
+                            sample_rate: out_sr,
+                            bit_depth: out_bd,
+                            channels,
+                            file_size: Some(file_size),
+                            duration_ms: Some(track.duration_ms as u64),
+                        };
+                        let session_id = self
+                            .streamer
+                            .create_file_session(file_info, tmp_path, false)
+                            .await;
+
+                        (
+                            session_id,
+                            out_mime,
+                            out_ext,
+                            Some(file_size),
+                            Some(out_sr),
+                            Some(out_bd as u32),
+                            Some(channels as u32),
+                        )
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(format!("transcode failed: {e}"));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, file = %file_path, "transcode_to_temp_file_task_panic");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(format!("transcode task panic: {e}"));
+                    }
+                }
+            } else {
+                // ── Streaming transcode (WAV for local/OAAT) ──────────
+                // Use the computed WAV content length for the DIDL size
+                // attribute so DLNA renderers know the correct stream size.
+                let transcode_file_size = info.wav_content_length();
+
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(info, false, 256).await;
+
+                let fp = file_path.clone();
+                let ev_bus = self.event_bus.clone();
+                let zone_id = req.zone_id;
+                tokio::spawn(async move {
+                    debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
+
+                    let (levels_tx, mut levels_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<crate::audio::levels::AudioLevels>();
+                    if let Some(ref bus) = ev_bus {
+                        let bus = bus.clone();
+                        tokio::spawn(async move {
+                            while let Some(lvl) = levels_rx.recv().await {
+                                bus.emit(
+                                    "playback.audio_levels",
+                                    serde_json::json!({
+                                        "zone_id": zone_id,
+                                        "rms_left_db": lvl.rms_left_db(),
+                                        "rms_right_db": lvl.rms_right_db(),
+                                        "peak_left_db": lvl.peak_left_db(),
+                                        "peak_right_db": lvl.peak_right_db(),
+                                        "rms_left": lvl.rms_left,
+                                        "rms_right": lvl.rms_right,
+                                        "spectrum": lvl.spectrum,
+                                    }),
+                                );
+                            }
+                        });
+                    }
+
                     let fp_clone = fp.clone();
                     let tx_clone = tx.clone();
                     drop(tx);
@@ -722,98 +884,18 @@ impl PlaybackOrchestrator {
                             warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
                         }
                     }
-                } else {
-                    // Non-WAV target (e.g. FLAC encoding): must buffer all PCM
-                    // first because the encoder needs the full input to produce
-                    // a valid container. Still uses spawn_blocking for I/O.
-                    let fp_clone = fp.clone();
-                    let decode_result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm(
-                            &fp_clone,
-                            Some(out_sr),
-                            Some(channels as u32),
-                            0.0,
-                            0.0,
-                        )
-                    })
-                    .await;
+                });
 
-                    let decode_result = match decode_result {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(error = %e, file = %fp, "transcode_decode_task_panic");
-                            return;
-                        }
-                    };
-
-                    match decode_result {
-                        Ok(decoded) => {
-                            debug!(
-                                samples = decoded.samples_i32.len(),
-                                sample_rate = decoded.sample_rate,
-                                channels = decoded.channels,
-                                bit_depth = decoded.bit_depth,
-                                "transcode_decoded"
-                            );
-                            let pcm_bytes = decoded.pcm_bytes();
-                            let actual_bd = decoded.bit_depth;
-                            let actual_ch = decoded.channels as u16;
-
-                            // Compute and emit audio levels from PCM before encoding
-                            for chunk in pcm_bytes.chunks(32768) {
-                                let _ = levels_tx.send(crate::audio::levels::compute_levels(
-                                    chunk, actual_bd, actual_ch,
-                                ));
-                            }
-                            drop(levels_tx);
-
-                            // Encode to target format using native bit depth
-                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                                &target_format_str,
-                                decoded.sample_rate,
-                                actual_bd as u32,
-                                decoded.channels,
-                            );
-                            if let Err(e) = encoder.start().await {
-                                warn!(error = %e, file = %fp, "transcode_encoder_start_failed");
-                                return;
-                            }
-                            if let Err(e) = encoder.write(&pcm_bytes).await {
-                                warn!(error = %e, file = %fp, "transcode_encoder_write_failed");
-                                return;
-                            }
-                            match encoder.finish().await {
-                                Ok(encoded_data) => {
-                                    // Send in chunks
-                                    for chunk in encoded_data.chunks(32768) {
-                                        if tx.send(chunk.to_vec()).await.is_err() {
-                                            debug!("transcode_consumer_dropped");
-                                            return;
-                                        }
-                                    }
-                                    debug!(file = %fp, "transcode_complete");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, file = %fp, "transcode_encode_failed");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, file = %fp, "transcode_decode_failed");
-                        }
-                    }
-                }
-            });
-
-            (
-                session_id,
-                out_mime,
-                out_ext,
-                transcode_file_size,
-                Some(out_sr),
-                Some(out_bd as u32),
-                Some(channels as u32),
-            )
+                (
+                    session_id,
+                    out_mime,
+                    out_ext,
+                    transcode_file_size,
+                    Some(out_sr),
+                    Some(out_bd as u32),
+                    Some(channels as u32),
+                )
+            }
         } else {
             // Standard passthrough: serve the raw file
             let mime = source_format
