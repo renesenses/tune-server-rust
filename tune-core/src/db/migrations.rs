@@ -817,6 +817,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
 
+    add_column_if_missing(db, "listen_history", "source_id", "TEXT");
+    add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
+
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
 

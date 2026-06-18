@@ -18,17 +18,39 @@ async fn main() {
     {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let msg = format!("PANIC: {info}");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let msg = format!("PANIC: {info}\n\nBacktrace:\n{bt}");
             eprintln!("{msg}");
-            let log_path = std::env::current_dir()
-                .unwrap_or_default()
-                .join("tune-crash.log");
+            let log_dir = std::env::var("LOCALAPPDATA")
+                .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = log_dir.join("tune-crash.log");
             let _ = std::fs::write(&log_path, &msg);
             default_hook(info);
         }));
     }
 
     eprintln!("tune-server starting (pid {})", std::process::id());
+
+    #[cfg(windows)]
+    {
+        let log_dir = std::env::var("LOCALAPPDATA")
+            .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+        let _ = std::fs::create_dir_all(&log_dir);
+        let startup_log = log_dir.join("tune-startup.log");
+        let _ = std::fs::write(
+            &startup_log,
+            format!(
+                "tune-server {} starting\npid: {}\nexe: {:?}\ncwd: {:?}\n",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                std::env::current_exe().ok(),
+                std::env::current_dir().ok(),
+            ),
+        );
+    }
 
     // On Windows, detect Program Files installs and migrate data to %LOCALAPPDATA%
     #[cfg(target_os = "windows")]
@@ -222,10 +244,20 @@ async fn main() {
         });
     }
 
-    axum::serve(listener, app)
+    if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+    {
+        tracing::error!(error = %e, "server_fatal_error");
+        #[cfg(windows)]
+        {
+            let log_dir = std::env::var("LOCALAPPDATA")
+                .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+            let _ = std::fs::create_dir_all(&log_dir);
+            let _ = std::fs::write(log_dir.join("tune-crash.log"), format!("SERVER ERROR: {e}"));
+        }
+    }
 }
 
 async fn shutdown_signal() {

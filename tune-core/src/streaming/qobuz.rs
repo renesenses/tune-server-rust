@@ -541,10 +541,12 @@ impl StreamingService for QobuzService {
         track_id: &str,
         quality: Option<&str>,
     ) -> Result<StreamUrl, TuneError> {
-        // Determine the best format_id based on quality request and subscription level.
-        // Qobuz format_id values: 5=MP3, 6=FLAC 16/44, 7=FLAC 24/96, 27=FLAC 24/192.
-        // "Studio" (formerly "HiFi") subscribers max out at format_id 6.
-        // "Sublime"/"Sublime+" subscribers can access 7 and 27.
+        if self.user_auth_token.is_none() {
+            return Err(TuneError::Streaming(
+                "Qobuz session expired — please reconnect in Settings → Streaming Services".into(),
+            ));
+        }
+
         let format_id = match quality {
             Some("hires") => "27",
             Some("cd") => "6",
@@ -555,9 +557,6 @@ impl StreamingService for QobuzService {
         match self.fetch_track_url(track_id, format_id).await {
             Ok(stream_url) => Ok(stream_url),
             Err(e) => {
-                // If Hi-Res failed (likely subscription-level mismatch), retry with CD quality.
-                // Qobuz returns 401/403 or specific error when the format is not
-                // available for the user's subscription.
                 if format_id != "6" {
                     info!(
                         track_id,
