@@ -352,9 +352,9 @@ fn build_signal_path(
         .max_sample_rate
         .is_some_and(|max| (sample_rate as u32) > max);
 
-    // Overall bit-perfect: lossless source + no transcoding + full volume + no DSP + no resampling
-    let bit_perfect =
-        is_lossless && transport_bit_perfect && volume_full && !dsp_enabled && !resampling_active;
+    // Overall bit-perfect: lossless source + no transcoding + no DSP + no resampling.
+    // Volume is excluded — it's a user preference, not a signal degradation.
+    let bit_perfect = is_lossless && transport_bit_perfect && !dsp_enabled && !resampling_active;
 
     // Build steps
     let source_desc = if sample_rate >= 1000 {
@@ -404,12 +404,12 @@ fn build_signal_path(
         }));
     }
 
-    // Volume step
+    // Volume step (informational — does not affect bit-perfect status)
     if !volume_full {
         steps.push(json!({
             "name": "Volume",
             "description": format!("{}%", (ps.volume * 100.0).round() as i32),
-            "bit_perfect": false,
+            "bit_perfect": true,
         }));
     }
 
