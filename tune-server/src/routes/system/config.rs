@@ -116,6 +116,14 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),
         ("prefetch_mode", json!("30s")),
+        (
+            "local_audio_backend",
+            json!(state.config.local_audio_backend),
+        ),
+        (
+            "local_exclusive_mode",
+            json!(state.config.local_exclusive_mode),
+        ),
     ];
     for (k, v) in defaults {
         config.entry(k.to_string()).or_insert(v);

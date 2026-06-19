@@ -41,7 +41,13 @@ const SEEK_STREAMING_GRACE_SECS: u64 = 10;
 /// treat as playback failure and stop the zone (don't advance).
 /// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
 /// MPlayer-based) that report Stopped/position=0 while buffering.
-const STOPPED_FAILURE_THRESHOLD: u8 = 15;
+const STOPPED_FAILURE_THRESHOLD: u8 = 30;
+/// Grace period (seconds) after a new track is loaded (track_generation
+/// changes).  During this window the poller suppresses stopped_ticks to
+/// let the renderer buffer — especially important for streaming sources
+/// that require transcoding (e.g. Tidal AAC→FLAC for DLNA) which can
+/// take 5-15 seconds before the renderer receives any audio data.
+const TRACK_LOAD_GRACE_SECS: u64 = 20;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
@@ -122,6 +128,10 @@ struct ZonePollState {
     /// we reset all per-track state so stale values from the previous
     /// track cannot trigger false gapless advances or premature track ends.
     track_generation: u64,
+    /// When the orchestrator loaded the current track (track_generation changed).
+    /// Used for the startup grace period — DLNA renderers report Stopped while
+    /// buffering a new stream, especially after transcoding delays.
+    track_loaded_at: Instant,
     /// Counts ticks where the output reports Playing but position_ms has
     /// reached or exceeded the known track duration.  After
     /// POSITION_PAST_END_TICKS consecutive ticks in this state, the poller
@@ -280,6 +290,7 @@ impl PositionPoller {
                 ticks_since_db_save: 0,
                 track_started_at: None,
                 track_generation: zone_state.track_generation,
+                track_loaded_at: Instant::now(),
                 past_end_ticks: 0,
             });
 
@@ -303,6 +314,7 @@ impl PositionPoller {
                 ps.peak_position_ms = 0;
                 ps.track_started_at = None;
                 ps.track_generation = zone_state.track_generation;
+                ps.track_loaded_at = Instant::now();
                 ps.past_end_ticks = 0;
             }
 
@@ -627,12 +639,23 @@ impl PositionPoller {
                     // Stopped while it buffers the new stream (especially for
                     // streaming seeks that recreate the session).  Suppress
                     // stopped_ticks to prevent false track-end detection.
+                    let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
+                        < TRACK_LOAD_GRACE_SECS
+                        && ps.track_started_at.is_none();
                     if in_seek_grace {
                         ps.stopped_ticks = 0;
                         debug!(
                             zone_id,
                             seek_grace_secs = seek_grace_secs,
                             "seek_grace_suppressing_stopped_ticks"
+                        );
+                    } else if in_track_load_grace {
+                        ps.stopped_ticks = 0;
+                        debug!(
+                            zone_id,
+                            elapsed = ps.track_loaded_at.elapsed().as_secs(),
+                            grace = TRACK_LOAD_GRACE_SECS,
+                            "track_load_grace_suppressing_stopped_ticks"
                         );
                     } else if ps.gapless_cooldown > 0 {
                         ps.gapless_cooldown -= 1;
@@ -1074,6 +1097,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            track_loaded_at: Instant::now(),
             past_end_ticks: 0,
         };
 
@@ -1115,6 +1139,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            track_loaded_at: Instant::now(),
             past_end_ticks: 0,
         };
 
@@ -1208,6 +1233,7 @@ mod tests {
             ticks_since_db_save: 0,
             track_started_at: None,
             track_generation: 0,
+            track_loaded_at: Instant::now(),
             past_end_ticks: 0,
         };
 
