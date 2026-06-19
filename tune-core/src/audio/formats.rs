@@ -269,12 +269,12 @@ impl AudioFormat {
     }
 
     /// Returns the target output format for DLNA transcoding.
-    /// AIFF -> FLAC (lossless PCM container widely supported by DLNA renderers)
-    /// DSD/WavPack/APE -> WAV (universal PCM, avoids re-encoding overhead)
+    /// AIFF/ALAC -> FLAC (lossless, universally supported by DLNA renderers)
+    /// DSD/WavPack/APE/WMA -> WAV (universal PCM, avoids re-encoding overhead)
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
-            Self::Aiff => AudioFormat::Flac,
-            Self::Alac | Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
+            Self::Aiff | Self::Alac => AudioFormat::Flac,
+            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
             other => *other,
         }
     }
@@ -403,6 +403,13 @@ mod tests {
     #[test]
     fn wma_transcodes_to_wav() {
         assert_eq!(AudioFormat::Wma.dlna_transcode_target(), AudioFormat::Wav);
+    }
+
+    #[test]
+    fn alac_transcodes_to_flac() {
+        // ALAC must transcode to FLAC (not WAV 32-bit) for DLNA.
+        // WAV 32-bit is rejected by many renderers including Eversolo.
+        assert_eq!(AudioFormat::Alac.dlna_transcode_target(), AudioFormat::Flac);
     }
 
     #[test]
