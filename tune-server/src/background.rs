@@ -295,6 +295,7 @@ fn spawn_telemetry_reporter(state: &AppState) {
 /// can see all running instances in real-time.
 fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
+    let services = state.services.clone();
     let started_at = state.started_at;
     tokio::spawn(async move {
         // Let startup finish before the first heartbeat
@@ -332,6 +333,27 @@ fn spawn_heartbeat(state: &AppState) {
                 .unwrap_or(0);
             let uptime_s = started_at.elapsed().as_secs();
 
+            // Collect authenticated streaming services
+            let authenticated_services: Vec<String> = {
+                let registry = services.lock().await;
+                let names = registry.list();
+                let svc_handles: Vec<_> = names
+                    .iter()
+                    .filter_map(|n| registry.get(n).map(|h| (n.clone(), h)))
+                    .collect();
+                drop(registry); // release registry lock before checking auth
+
+                let mut authed = Vec::new();
+                for (name, handle) in svc_handles {
+                    let svc = handle.lock().await;
+                    let status = svc.auth_status().await;
+                    if status.authenticated {
+                        authed.push(name);
+                    }
+                }
+                authed
+            };
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
@@ -340,6 +362,7 @@ fn spawn_heartbeat(state: &AppState) {
                 "tracks": tracks,
                 "uptime_s": uptime_s,
                 "hostname": hostname,
+                "services": authenticated_services,
             });
 
             match client
