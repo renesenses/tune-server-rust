@@ -104,14 +104,27 @@ pub async fn list_zones_handler(State(state): State<AppState>) -> Json<Value> {
 
 async fn get_zone_dsp(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = ZoneRepo::with_backend(state.backend.clone());
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let eq_key = format!("zone_{id}_eq_profile");
+    let eq_profile: Option<tune_core::audio::eq::EqProfile> = settings
+        .get(&eq_key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
             "zone_id": id,
             "dsp_preset_id": preset_id,
             "dsp_enabled": enabled,
+            "eq_profile": eq_profile.unwrap_or_default(),
         }))
         .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => Json(json!({
+            "zone_id": id,
+            "eq_profile": eq_profile.unwrap_or_default(),
+        }))
+        .into_response(),
     }
 }
 
@@ -120,14 +133,30 @@ async fn set_zone_dsp(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+    // Handle eq_profile if present
+    if let Some(eq_val) = body.get("eq_profile") {
+        if let Ok(profile) =
+            serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
+        {
+            let key = format!("zone_{id}_eq_profile");
+            let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+        }
+    }
+
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    match repo.update_dsp(id, preset_id, enabled) {
-        Ok(()) => Json(json!({"zone_id": id, "dsp_preset_id": preset_id, "dsp_enabled": enabled}))
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
+    let _ = repo.update_dsp(id, preset_id, enabled);
+
+    Json(json!({
+        "zone_id": id,
+        "dsp_preset_id": preset_id,
+        "dsp_enabled": enabled,
+        "eq_profile": body.get("eq_profile"),
+    }))
+    .into_response()
 }
 
 async fn sync_status(State(state): State<AppState>) -> Json<Value> {

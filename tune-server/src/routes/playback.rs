@@ -202,7 +202,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
-        .route("/{id}/dsp", get(get_dsp).post(set_dsp))
+        // DSP route is in zones.rs (/{id}/dsp GET+PUT)
         .route("/{id}/crossfade", post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
