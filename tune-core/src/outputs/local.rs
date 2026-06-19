@@ -53,25 +53,13 @@ pub fn select_host(backend: &str) -> cpal::Host {
                     return cpal::default_host();
                 }
             },
-            "auto" => match cpal::host_from_id(cpal::HostId::Asio) {
-                Ok(host) => {
-                    let device_count = host.output_devices().map(|d| d.count()).unwrap_or(0);
-                    if device_count > 0 {
-                        info!(
-                            backend = "asio",
-                            devices = device_count,
-                            "local_audio_host_selected_auto"
-                        );
-                        return host;
-                    }
-                    warn!("local_audio_asio_no_devices — falling back to WASAPI");
-                    return cpal::default_host();
-                }
-                Err(_) => {
-                    debug!("local_audio_asio_not_available_using_wasapi");
-                    return cpal::default_host();
-                }
-            },
+            "auto" => {
+                // Auto mode uses WASAPI directly — ASIO drivers can call
+                // abort() when probed, crashing the process silently.
+                // Users who want ASIO must set TUNE_AUDIO_BACKEND=asio.
+                info!(backend = "wasapi", "local_audio_host_selected_auto");
+                return cpal::default_host();
+            }
             _ => {
                 info!(backend = "wasapi", "local_audio_host_selected");
                 return cpal::default_host();
@@ -99,17 +87,7 @@ pub fn active_backend_name(backend: &str) -> &'static str {
         match backend.to_lowercase().as_str() {
             "asio" => "ASIO",
             "wasapi" => "WASAPI",
-            "auto" => {
-                if let Ok(host) = cpal::host_from_id(cpal::HostId::Asio) {
-                    if host.output_devices().map(|d| d.count()).unwrap_or(0) > 0 {
-                        "ASIO"
-                    } else {
-                        "WASAPI"
-                    }
-                } else {
-                    "WASAPI"
-                }
-            }
+            "auto" => "WASAPI",
             _ => "WASAPI",
         }
     }
