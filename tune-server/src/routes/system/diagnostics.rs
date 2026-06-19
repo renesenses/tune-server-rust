@@ -268,28 +268,50 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         }));
     }
 
-    // Try journalctl on Linux
+    // Try journalctl on Linux (multiple service names)
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("journalctl")
-            .args([
-                "-u",
-                "tune-server",
-                "-n",
-                &max_lines.to_string(),
-                "--no-pager",
-                "-o",
-                "short-iso",
-            ])
-            .output()
-        {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                let count = text.lines().count();
+        for service in &["tune-server", "tune-rust"] {
+            if let Ok(output) = std::process::Command::new("journalctl")
+                .args([
+                    "-u",
+                    service,
+                    "-n",
+                    &max_lines.to_string(),
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    let count = text.lines().count();
+                    if count > 1 {
+                        return Json(json!({
+                            "logs": text,
+                            "lines": count,
+                            "source": "journalctl",
+                            "service": service,
+                        }));
+                    }
+                }
+            }
+        }
+        // Fallback: read from /var/log/syslog
+        if let Ok(content) = std::fs::read_to_string("/var/log/syslog") {
+            let lines: Vec<&str> = content
+                .lines()
+                .filter(|l| l.contains("tune-server") || l.contains("tune_"))
+                .rev()
+                .take(max_lines)
+                .collect();
+            if !lines.is_empty() {
+                let lines: Vec<&str> = lines.into_iter().rev().collect();
                 return Json(json!({
-                    "logs": text,
-                    "lines": count,
-                    "source": "journalctl",
+                    "logs": lines.join("\n"),
+                    "lines": lines.len(),
+                    "source": "syslog",
                 }));
             }
         }
@@ -300,6 +322,53 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         "logs": "No log file found. Launch Tune from a terminal to see logs in real-time.\nChecked: ".to_owned() + &log_path,
         "lines": 0,
         "source": "none",
+    }))
+}
+
+// --- Log level management ---
+
+#[derive(Deserialize)]
+pub(super) struct LogLevelBody {
+    level: String,
+}
+
+pub(super) async fn get_log_level(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let level = settings
+        .get("log_level")
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("TUNE_LOG").ok())
+        .unwrap_or_else(|| "info".into());
+    Json(json!({
+        "level": level,
+        "available": ["error", "warn", "info", "debug", "trace"],
+    }))
+}
+
+pub(super) async fn set_log_level(
+    State(state): State<AppState>,
+    Json(body): Json<LogLevelBody>,
+) -> Json<Value> {
+    let valid = ["error", "warn", "info", "debug", "trace"];
+    let level = body.level.to_lowercase();
+    if !valid.contains(&level.as_str()) {
+        return Json(json!({ "error": format!("Invalid level: {}. Use: {:?}", level, valid) }));
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let _ = settings.set("log_level", &level);
+
+    // Also update the TUNE_LOG env var for the current process
+    // SAFETY: single-threaded env access at this point
+    unsafe {
+        std::env::set_var("TUNE_LOG", &level);
+    }
+
+    Json(json!({
+        "status": "ok",
+        "level": level,
+        "note": "Log level saved. Full effect after server restart.",
     }))
 }
 

@@ -61,6 +61,10 @@ pub fn router() -> Router<AppState> {
         .route("/cleanup", post(enrich::cleanup))
         .route("/logs", get(diagnostics::logs))
         .route(
+            "/log-level",
+            get(diagnostics::get_log_level).post(diagnostics::set_log_level),
+        )
+        .route(
             "/backups",
             get(backup::list_backups).post(backup::create_backup),
         )

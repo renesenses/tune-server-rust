@@ -22,6 +22,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_desktop_notifications(state, config);
     spawn_memory_diagnostics(state.outputs.clone());
     spawn_telemetry_reporter(state);
+    spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
@@ -287,6 +288,94 @@ fn spawn_telemetry_reporter(state: &AppState) {
         state.backend.clone(),
         state.services.clone(),
     );
+}
+
+/// Lightweight heartbeat — runs ALWAYS regardless of TUNE_TELEMETRY.
+/// Sends a minimal ping every 5 minutes to mozaiklabs.fr so the admin
+/// can see all running instances in real-time.
+fn spawn_heartbeat(state: &AppState) {
+    let backend = state.backend.clone();
+    let started_at = state.started_at;
+    tokio::spawn(async move {
+        // Let startup finish before the first heartbeat
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        let instance_id = match settings.get("instance_id").ok().flatten() {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                let id = uuid::Uuid::new_v4().to_string();
+                settings.set("instance_id", &id).ok();
+                id
+            }
+        };
+
+        let hostname = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| gethostname().unwrap_or_else(|| "unknown".into()));
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(error = %e, "heartbeat_client_build_failed");
+                return;
+            }
+        };
+
+        loop {
+            let tracks = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+                .count()
+                .unwrap_or(0);
+            let uptime_s = started_at.elapsed().as_secs();
+
+            let payload = serde_json::json!({
+                "instance_id": instance_id,
+                "version": tune_core::version(),
+                "platform": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "tracks": tracks,
+                "uptime_s": uptime_s,
+                "hostname": hostname,
+            });
+
+            match client
+                .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
+                }
+                Ok(resp) => {
+                    debug!(status = %resp.status(), "heartbeat_rejected");
+                }
+                Err(e) => {
+                    debug!(error = %e, "heartbeat_failed");
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        }
+    });
+}
+
+/// Resolve the machine hostname via the `hostname` command.
+fn gethostname() -> Option<String> {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
 }
 
 fn spawn_bio_sync(state: &AppState) {
