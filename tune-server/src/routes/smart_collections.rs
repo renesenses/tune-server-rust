@@ -376,10 +376,11 @@ fn execute_album_query(
          LEFT JOIN artists ar ON al.artist_id = ar.id \
          LEFT JOIN tracks t ON t.album_id = al.id \
          {} \
-         GROUP BY al.id \
+         GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre \
          {} {}",
         where_clause, order, limit_clause
     );
+    tracing::debug!(sql = %sql, "smart_collection_album_query");
 
     let rows = state
         .backend

@@ -1082,6 +1082,9 @@ impl OutputTarget for OaatOutput {
                                     );
                                 }
 
+                                // Signal end of current track
+                                endpoint.send_audio(stream_num, cur_format, 0, sample_offset, &[], PacketFlags::LAST_PACKET).await.ok();
+
                                 // Gapless transition
                                 if let Some(next) = next_track.take() {
                                     info!(device = %device_name, title = %next.title, "oaat: gapless transition");
