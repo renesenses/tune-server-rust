@@ -155,6 +155,14 @@ jobs:
           !insertmacro MUI_LANGUAGE "French"
 
           Section "Install"
+            ; Kill any running tune-server.exe so Windows releases the file lock
+            nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
+            Sleep 1500
+
+            ; Remove stale web client files from previous version
+            RMDir /r "`$INSTDIR\web"
+
+            SetOverwrite on
             SetOutPath "`$INSTDIR"
             File "target\${{ matrix.target }}\release\tune-server.exe"
             SetOutPath "`$INSTDIR\web"
@@ -188,6 +196,9 @@ jobs:
           SectionEnd
 
           Section "Uninstall"
+            ; Kill running process before removing files
+            nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
+            Sleep 1000
             RMDir /r "`$INSTDIR"
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
