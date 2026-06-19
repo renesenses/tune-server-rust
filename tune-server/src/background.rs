@@ -296,6 +296,7 @@ fn spawn_telemetry_reporter(state: &AppState) {
 fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
     let services = state.services.clone();
+    let outputs = state.outputs.clone();
     let started_at = state.started_at;
     tokio::spawn(async move {
         // Let startup finish before the first heartbeat
@@ -354,6 +355,22 @@ fn spawn_heartbeat(state: &AppState) {
                 authed
             };
 
+            // Collect registered audio devices/renderers
+            let devices: Vec<serde_json::Value> = {
+                let registry = outputs.lock().await;
+                registry
+                    .info_all()
+                    .await
+                    .into_iter()
+                    .map(|info| {
+                        serde_json::json!({
+                            "name": info["name"],
+                            "type": info["type"],
+                        })
+                    })
+                    .collect()
+            };
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
@@ -363,6 +380,7 @@ fn spawn_heartbeat(state: &AppState) {
                 "uptime_s": uptime_s,
                 "hostname": hostname,
                 "services": authenticated_services,
+                "devices": devices,
             });
 
             match client
