@@ -68,13 +68,6 @@ pub fn build_track_from_metadata(
 
     let album = meta.album.as_ref().and_then(|title| {
         let aid = album_artist_id.unwrap_or(0);
-        // Compilations: group by title only (ignore per-track artist) to prevent
-        // splitting a VA album into N albums for N different track artists.
-        if is_compilation {
-            if let Ok(Some(existing)) = album_repo.get_by_title_only_strong(title) {
-                return Some(existing);
-            }
-        }
         // Quality-based album splitting: append suffix when sample_rate or
         // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
         // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
@@ -84,6 +77,9 @@ pub fn build_track_from_metadata(
         } else {
             format!("{title} ({suffix})")
         };
+        // get_or_create uses (title, artist_id, year) to disambiguate albums.
+        // Compilations use the "Various Artists" artist_id, so same-title albums
+        // by different artists are correctly kept separate.
         album_repo
             .get_or_create(&album_title, aid, meta.year.map(|y| y as i32))
             .ok()

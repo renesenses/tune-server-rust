@@ -283,7 +283,48 @@ impl PlaybackOrchestrator {
                 bit_depth: resolved.bit_depth,
                 channels: resolved.channels,
             };
-            self.send_to_output(device_id, &media).await
+            let result = self.send_to_output(device_id, &media).await;
+
+            // After play_media succeeds, send the zone's stored volume to the
+            // renderer.  Without this, DLNA renderers (Sonos, etc.) start at
+            // whatever volume they had previously (often 100%), ignoring the
+            // zone's volume setting.  The small delay lets the renderer finish
+            // processing the Play command before accepting SetVolume.
+            if result.0 {
+                let zone_db = ZoneRepo::with_backend(self.db.clone())
+                    .get(req.zone_id)
+                    .ok()
+                    .flatten();
+                let zone_volume = if zone_db.as_ref().is_some_and(|z| z.fixed_volume) {
+                    1.0
+                } else {
+                    let ps = self.playback.get_state(req.zone_id).await;
+                    if ps.volume > 0.0 {
+                        ps.volume
+                    } else {
+                        zone_db.map(|z| z.volume as f64 / 100.0).unwrap_or(0.5)
+                    }
+                };
+                let did = device_id.clone();
+                let outputs = self.outputs.clone();
+                let zone_id = req.zone_id;
+                tokio::spawn(async move {
+                    // Brief delay: some renderers (Sonos) reject SetVolume if
+                    // sent immediately after Play.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let outputs = outputs.lock().await;
+                    if let Some(output) = outputs.get(&did) {
+                        let vol_clamped = zone_volume.clamp(0.0, 1.0);
+                        if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
+                            warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
+                        } else {
+                            info!(zone_id, volume = %vol_clamped, "play_initial_volume_sent");
+                        }
+                    }
+                });
+            }
+
+            result
         } else {
             warn!(
                 zone_id = req.zone_id,

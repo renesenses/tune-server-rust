@@ -5,6 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -58,40 +59,42 @@ pub fn router() -> Router<AppState> {
         .route("/preview", post(preview_albums))
 }
 
+/// Decode a row from `smart_collections` into a JSON object.
+/// Column order: id(0), name(1), rules(2), match_mode(3), sort_by(4),
+/// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10).
+fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
+    let rules_str = r
+        .get(2)
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "[]".into());
+    let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+    json!({
+        "id": r.get(0).and_then(|v| v.as_i64()),
+        "name": r.get(1).and_then(|v| v.as_string()),
+        "rules": rules,
+        "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
+        "sort_by": r.get(4).and_then(|v| v.as_string()),
+        "sort_order": r.get(5).and_then(|v| v.as_string()).unwrap_or_else(|| "asc".into()),
+        "max_limit": r.get(6).and_then(|v| v.as_i64()),
+        "description": r.get(7).and_then(|v| v.as_string()),
+        "icon": r.get(8).and_then(|v| v.as_string()),
+        "color": r.get(9).and_then(|v| v.as_string()),
+        "created_at": r.get(10).and_then(|v| v.as_string()),
+    })
+}
+
 async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
+    let rows = state
+        .backend
+        .query_many(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
-             description, icon, color, created_at \
-             FROM smart_collections ORDER BY name",
+         description, icon, color, created_at \
+         FROM smart_collections ORDER BY name",
+            &[],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-                let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "rules": rules,
-                    "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
-                    "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
-                    "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
-                    "description": row.get::<_, Option<String>>(7).ok().flatten(),
-                    "icon": row.get::<_, Option<String>>(8).ok().flatten(),
-                    "color": row.get::<_, Option<String>>(9).ok().flatten(),
-                    "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
-                }))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .unwrap_or_default();
-    drop(conn);
+        .map_err(AppError::internal)?;
+
+    let items: Vec<Value> = rows.iter().map(|r| decode_collection_row(r)).collect();
     Ok(Json(json!(items)))
 }
 
@@ -104,81 +107,60 @@ async fn create_collection(
     let sort_by = body.sort_by.clone();
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
-    let result = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        conn.execute(
-            "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                body.name, rules_json, match_mode, sort_by, sort_order,
-                body.max_limit, body.description, body.icon, body.color
+    state
+        .backend
+        .execute(
+            "INSERT INTO smart_collections \
+         (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                &body.name as &dyn ToSqlValue,
+                &rules_json as &dyn ToSqlValue,
+                &match_mode as &dyn ToSqlValue,
+                &sort_by as &dyn ToSqlValue,
+                &sort_order as &dyn ToSqlValue,
+                &body.max_limit as &dyn ToSqlValue,
+                &body.description as &dyn ToSqlValue,
+                &body.icon as &dyn ToSqlValue,
+                &body.color as &dyn ToSqlValue,
             ],
         )
-        .map(|_| conn.last_insert_rowid())
-        .map_err(|e| e.to_string())
-    };
+        .map_err(AppError::internal)?;
 
-    match result {
-        Ok(id) => {
-            let created = json!({
-                "id": id,
-                "name": body.name,
-                "rules": body.rules,
-                "match_mode": match_mode,
-                "sort_by": sort_by,
-                "sort_order": sort_order,
-                "max_limit": body.max_limit,
-                "description": body.description,
-                "icon": body.icon,
-                "color": body.color,
-            });
-            Ok((StatusCode::CREATED, Json(created)).into_response())
-        }
-        Err(e) => Err(AppError::internal(e)),
-    }
+    let id = state.backend.last_insert_rowid();
+
+    let created = json!({
+        "id": id,
+        "name": body.name,
+        "rules": body.rules,
+        "match_mode": match_mode,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+        "max_limit": body.max_limit,
+        "description": body.description,
+        "icon": body.icon,
+        "color": body.color,
+    });
+    Ok((StatusCode::CREATED, Json(created)).into_response())
 }
 
 async fn get_collection(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
-        "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+    let row = state
+        .backend
+        .query_one(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
          description, icon, color, created_at \
          FROM smart_collections WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                "rules": rules,
-                "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
-                "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
-                "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
-                "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
-                "description": row.get::<_, Option<String>>(7).ok().flatten(),
-                "icon": row.get::<_, Option<String>>(8).ok().flatten(),
-                "color": row.get::<_, Option<String>>(9).ok().flatten(),
-                "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
-            }))
-        },
-    );
-    drop(conn);
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(AppError::internal)?;
 
-    match result {
-        Ok(v) => Ok(Json(v).into_response()),
-        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    match row {
+        Some(r) => Ok(Json(decode_collection_row(&r)).into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -188,121 +170,75 @@ async fn update_collection(
     Json(body): Json<UpdateCollection>,
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(ref name) = body.name {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[name as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref rules) = body.rules {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET rules = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[&rules.to_string() as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        let rules_json = rules.to_string();
+        state.backend.execute(
+            "UPDATE smart_collections SET rules = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[&rules_json as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref match_mode) = body.match_mode {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET match_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[match_mode as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET match_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[match_mode as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref sort_by) = body.sort_by {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET sort_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[sort_by as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET sort_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[sort_by as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref sort_order) = body.sort_order {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[sort_order as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[sort_order as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref max_limit) = body.max_limit {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET max_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[max_limit as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET max_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[max_limit as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref description) = body.description {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[description as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[description as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref icon) = body.icon {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET icon = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[icon as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET icon = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[icon as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
     if let Some(ref color) = body.color {
-        state
-            .db
-            .execute(
-                "UPDATE smart_collections SET color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                &[color as &dyn rusqlite::types::ToSql, &id],
-            )
-            .ok();
+        state.backend.execute(
+            "UPDATE smart_collections SET color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            &[color as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ).ok();
     }
 
     // Return the updated collection as JSON
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
-        "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+    let row = state
+        .backend
+        .query_one(
+            "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
          description, icon, color, created_at \
          FROM smart_collections WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                "rules": rules,
-                "match_mode": row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_else(|| "all".into()),
-                "sort_by": row.get::<_, Option<String>>(4).ok().flatten(),
-                "sort_order": row.get::<_, Option<String>>(5).ok().flatten().unwrap_or_else(|| "asc".into()),
-                "max_limit": row.get::<_, Option<i64>>(6).ok().flatten(),
-                "description": row.get::<_, Option<String>>(7).ok().flatten(),
-                "icon": row.get::<_, Option<String>>(8).ok().flatten(),
-                "color": row.get::<_, Option<String>>(9).ok().flatten(),
-                "created_at": row.get::<_, Option<String>>(10).ok().flatten(),
-            }))
-        },
-    );
-    drop(conn);
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(AppError::internal)?;
 
-    match result {
-        Ok(v) => Ok(Json(v).into_response()),
-        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+    match row {
+        Some(r) => Ok(Json(decode_collection_row(&r)).into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -311,8 +247,11 @@ async fn delete_collection(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     state
-        .db
-        .execute("DELETE FROM smart_collections WHERE id = ?", &[&id])
+        .backend
+        .execute(
+            "DELETE FROM smart_collections WHERE id = ?",
+            &[&id as &dyn ToSqlValue],
+        )
         .ok();
     Json(json!({"deleted": true, "id": id}))
 }
@@ -421,28 +360,25 @@ fn execute_album_query(
         where_clause, order, limit_clause
     );
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn
-        .prepare(&sql)
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "year": row.get::<_, Option<i32>>(3).ok().flatten(),
-                    "cover_path": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "genre": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "track_count": row.get::<_, i64>(6).unwrap_or(0),
-                }))
+    let rows = state
+        .backend
+        .query_many(&sql, &[])
+        .map_err(AppError::internal)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "year": r.get(3).and_then(|v| v.as_i64()),
+                "cover_path": r.get(4).and_then(|v| v.as_string()),
+                "genre": r.get(5).and_then(|v| v.as_string()),
+                "track_count": r.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default())
+        .collect())
 }
 
 /// Load a smart collection's criteria from the DB.
@@ -450,26 +386,32 @@ fn load_collection_criteria(
     state: &AppState,
     id: i64,
 ) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn
-        .query_row(
-            "SELECT rules, match_mode, sort_by, sort_order, max_limit FROM smart_collections WHERE id = ?",
-            rusqlite::params![id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
-                    row.get::<_, String>(1).unwrap_or_else(|_| "all".into()),
-                    row.get::<_, String>(2).unwrap_or_else(|_| "title".into()),
-                    row.get::<_, String>(3).unwrap_or_else(|_| "asc".into()),
-                    row.get::<_, Option<i64>>(4).ok().flatten(),
-                ))
-            },
+    let row = state
+        .backend
+        .query_one(
+            "SELECT rules, match_mode, sort_by, sort_order, max_limit \
+         FROM smart_collections WHERE id = ?",
+            &[&id as &dyn ToSqlValue],
         )
-        .ok())
+        .map_err(AppError::internal)?;
+
+    Ok(row.map(|r| {
+        (
+            r.get(0)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into()),
+            r.get(1)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "all".into()),
+            r.get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "title".into()),
+            r.get(3)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "asc".into()),
+            r.get(4).and_then(|v| v.as_i64()),
+        )
+    }))
 }
 
 async fn resolve_albums(
