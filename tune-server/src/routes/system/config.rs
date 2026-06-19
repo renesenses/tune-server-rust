@@ -523,9 +523,17 @@ pub(super) async fn restart() -> impl IntoResponse {
 /// Full catalog of available extended metadata fields.
 /// (key, label_fr, category)
 const METADATA_FIELDS: &[(&str, &str, &str)] = &[
+    // Identification
     ("album_artist", "Artiste de l'album", "Identification"),
     ("sort_artist", "Tri artiste", "Identification"),
     ("sort_album", "Tri album", "Identification"),
+    ("disc_number", "N° disque", "Identification"),
+    ("disc_subtitle", "Sous-titre disque", "Identification"),
+    ("track_number", "N° piste", "Identification"),
+    ("genre", "Genre", "Identification"),
+    ("genres", "Genres (multi)", "Identification"),
+    ("year", "Année", "Identification"),
+    // Crédits
     ("composer", "Compositeur", "Crédits"),
     ("conductor", "Chef d'orchestre", "Crédits"),
     ("lyricist", "Parolier", "Crédits"),
@@ -533,26 +541,64 @@ const METADATA_FIELDS: &[(&str, &str, &str)] = &[
     ("remixer", "Remixeur", "Crédits"),
     ("label", "Label", "Crédits"),
     ("producer", "Producteur", "Crédits"),
+    // Classification
     ("bpm", "BPM", "Classification"),
     ("mood", "Ambiance", "Classification"),
     ("grouping", "Regroupement", "Classification"),
     ("compilation", "Compilation", "Classification"),
+    // Texte
     ("comment", "Commentaire", "Texte"),
     ("lyrics", "Paroles", "Texte"),
+    // Identifiants
     ("isrc", "ISRC", "Identifiants"),
     ("barcode", "Code-barres", "Identifiants"),
     ("catalog_number", "Réf. catalogue", "Identifiants"),
     ("media_type", "Support", "Identifiants"),
+    (
+        "musicbrainz_recording_id",
+        "MusicBrainz Recording ID",
+        "Identifiants",
+    ),
+    (
+        "musicbrainz_release_id",
+        "MusicBrainz Release ID",
+        "Identifiants",
+    ),
+    (
+        "musicbrainz_release_group_id",
+        "MusicBrainz Release Group ID",
+        "Identifiants",
+    ),
+    // Dates
     ("release_date", "Date de sortie", "Dates"),
     ("original_date", "Date originale", "Dates"),
+    ("original_year", "Année originale", "Dates"),
+    // Technique
+    ("format", "Format audio", "Technique"),
+    ("sample_rate", "Fréquence d'échantillonnage", "Technique"),
+    ("bit_depth", "Profondeur de bits", "Technique"),
+    ("channels", "Canaux", "Technique"),
+    ("duration_ms", "Durée", "Technique"),
+    ("file_size", "Taille du fichier", "Technique"),
+    ("file_path", "Chemin du fichier", "Technique"),
     ("encoder", "Encodeur", "Technique"),
     ("copyright", "Copyright", "Technique"),
     ("language", "Langue", "Technique"),
+    // ReplayGain
     ("rg_track_gain", "ReplayGain piste", "ReplayGain"),
     ("rg_album_gain", "ReplayGain album", "ReplayGain"),
 ];
 
-const DEFAULT_VISIBLE_FIELDS: &[&str] = &["composer", "conductor", "label"];
+const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
+    "composer",
+    "conductor",
+    "label",
+    "genre",
+    "year",
+    "format",
+    "sample_rate",
+    "bit_depth",
+];
 
 pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());

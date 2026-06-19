@@ -31,6 +31,12 @@ const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// This prevents the progress bar from snapping back to the pre-seek
 /// position while the local/cpal output restarts its stream.
 const SEEK_GRACE_SECS: u64 = 3;
+/// Extended grace period (seconds) for streaming seeks on network outputs
+/// (Qobuz/Tidal via DLNA).  Seeking on a proxied stream recreates the
+/// stream session and re-sends SetAVTransportURI+Play+Seek — the renderer
+/// may report Stopped for several seconds while buffering the new stream.
+/// During this window the poller must not accumulate stopped_ticks.
+const SEEK_STREAMING_GRACE_SECS: u64 = 10;
 /// After this many consecutive Stopped ticks without enough playback,
 /// treat as playback failure and stop the zone (don't advance).
 /// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
@@ -455,9 +461,35 @@ impl PositionPoller {
             // report the old (pre-seek) position until the stream restarts.
             // During this window we skip overwriting position to prevent the
             // progress bar from snapping back.
+            //
+            // For streaming sources (Qobuz/Tidal) on network outputs (DLNA),
+            // seeking recreates the entire stream session — the renderer may
+            // report Stopped for several seconds while it buffers the new
+            // stream.  Use a longer grace period to prevent the poller from
+            // accumulating stopped_ticks and false-skipping to the next track.
+            let is_streaming_seek = zone_state.now_playing.as_ref().is_some_and(|np| {
+                np.source != "local"
+                    && np.source != "radio"
+                    && np.source != "podcast"
+                    && np.stream_id.is_some()
+            }) && all_zones
+                .iter()
+                .find(|z| z.id == Some(zone_id))
+                .and_then(|z| z.output_type.as_deref())
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
+                    )
+                });
+            let seek_grace_secs = if is_streaming_seek {
+                SEEK_STREAMING_GRACE_SECS
+            } else {
+                SEEK_GRACE_SECS
+            };
             let in_seek_grace = zone_state
                 .last_seek_at
-                .map(|t| t.elapsed().as_secs() < SEEK_GRACE_SECS)
+                .map(|t| t.elapsed().as_secs() < seek_grace_secs)
                 .unwrap_or(false);
 
             if !in_seek_grace {
@@ -591,7 +623,18 @@ impl PositionPoller {
             let mut force_stop = false;
             match status.state {
                 TransportState::Stopped => {
-                    if ps.gapless_cooldown > 0 {
+                    // During the seek grace period, the renderer may report
+                    // Stopped while it buffers the new stream (especially for
+                    // streaming seeks that recreate the session).  Suppress
+                    // stopped_ticks to prevent false track-end detection.
+                    if in_seek_grace {
+                        ps.stopped_ticks = 0;
+                        debug!(
+                            zone_id,
+                            seek_grace_secs = seek_grace_secs,
+                            "seek_grace_suppressing_stopped_ticks"
+                        );
+                    } else if ps.gapless_cooldown > 0 {
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
                     } else if in_gapless_guard {
