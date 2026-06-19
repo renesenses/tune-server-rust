@@ -392,6 +392,31 @@ impl YouTubeService {
             .map(|s| s.to_string())
     }
 
+    fn extract_video_id(item: &serde_json::Value) -> Option<String> {
+        item["playlistItemData"]["videoId"]
+            .as_str()
+            .or_else(|| item["overlay"]["musicItemThumbnailOverlayRenderer"]["content"]["musicPlayButtonRenderer"]["playNavigationEndpoint"]["watchEndpoint"]["videoId"].as_str())
+            .or_else(|| item["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["navigationEndpoint"]["watchEndpoint"]["videoId"].as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn extract_flex_columns(item: &serde_json::Value) -> (String, String) {
+        let flex = &item["flexColumns"];
+        let title = flex[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"]
+            .as_array()
+            .and_then(|runs| runs.first())
+            .and_then(|r| r["text"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let artist = flex[1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"]
+            .as_array()
+            .and_then(|runs| runs.first())
+            .and_then(|r| r["text"].as_str())
+            .unwrap_or("")
+            .to_string();
+        (title, artist)
+    }
+
     // ------------------------------------------------------------------
     // Mapping: YouTube Data API v3 → StreamTrack/StreamAlbum/StreamArtist
     // ------------------------------------------------------------------
@@ -673,8 +698,103 @@ impl YouTubeService {
         };
 
         for section in sections {
-            let shelf = &section["musicShelfRenderer"];
-            if shelf.is_null() {
+            // Support both musicShelfRenderer and musicCardShelfRenderer
+            let (shelf, is_card) = if !section["musicShelfRenderer"].is_null() {
+                (&section["musicShelfRenderer"], false)
+            } else if !section["musicCardShelfRenderer"].is_null() {
+                (&section["musicCardShelfRenderer"], true)
+            } else {
+                continue;
+            };
+
+            // For musicCardShelfRenderer, extract the single top result
+            if is_card {
+                let title_text = shelf["title"]["runs"]
+                    .as_array()
+                    .and_then(|runs| runs.first())
+                    .and_then(|r| r["text"].as_str())
+                    .unwrap_or("");
+                let subtitle = shelf["subtitle"]["runs"]
+                    .as_array()
+                    .map(|runs| {
+                        runs.iter()
+                            .filter_map(|r| r["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                let thumb = Self::best_ytm_thumbnail(
+                    &shelf["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"],
+                );
+                let nav = &shelf["title"]["runs"][0]["navigationEndpoint"];
+                let browse_id = nav["browseEndpoint"]["browseId"].as_str().unwrap_or("");
+                let video_id = nav["watchEndpoint"]["videoId"].as_str().unwrap_or("");
+                let page_type = nav["browseEndpoint"]["browseEndpointContextSupportedConfigs"]
+                    ["browseEndpointContextMusicConfig"]["pageType"]
+                    .as_str()
+                    .unwrap_or("");
+
+                if page_type.contains("ARTIST") || subtitle.to_lowercase().contains("artist") {
+                    artists.push(StreamArtist {
+                        id: browse_id.to_string(),
+                        name: title_text.to_string(),
+                        image_path: thumb,
+                    });
+                } else if page_type.contains("ALBUM") || subtitle.to_lowercase().contains("album") {
+                    albums.push(StreamAlbum {
+                        id: browse_id.to_string(),
+                        title: title_text.to_string(),
+                        artist: subtitle.clone(),
+                        artist_id: None,
+                        cover_path: thumb,
+                        year: None,
+                        track_count: 0,
+                        quality: None,
+                    });
+                } else if !video_id.is_empty() {
+                    tracks.push(StreamTrack {
+                        id: video_id.to_string(),
+                        title: title_text.to_string(),
+                        artist: subtitle.clone(),
+                        album: None,
+                        album_id: None,
+                        duration_ms: 0,
+                        cover_path: thumb,
+                        track_number: None,
+                        disc_number: None,
+                        explicit: false,
+                        quality: None,
+                    });
+                }
+
+                // Also parse contents inside the card (related items)
+                if let Some(card_contents) = shelf["contents"].as_array() {
+                    for item_wrapper in card_contents {
+                        let item = &item_wrapper["musicResponsiveListItemRenderer"];
+                        if item.is_null() {
+                            continue;
+                        }
+                        if let Some(vid) = Self::extract_video_id(item) {
+                            let (title, artist) = Self::extract_flex_columns(item);
+                            let thumb = Self::best_ytm_thumbnail(
+                                &item["thumbnail"]["musicThumbnailRenderer"]["thumbnail"]["thumbnails"],
+                            );
+                            tracks.push(StreamTrack {
+                                id: vid,
+                                title,
+                                artist,
+                                album: None,
+                                album_id: None,
+                                duration_ms: 0,
+                                cover_path: thumb,
+                                track_number: None,
+                                disc_number: None,
+                                explicit: false,
+                                quality: None,
+                            });
+                        }
+                    }
+                }
                 continue;
             }
 
