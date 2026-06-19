@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{debug, info};
 
 use tune_core::outputs::OutputRegistry;
 
@@ -401,11 +401,29 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             new_devices_to_zone.push((device_id, dev.name.clone(), dev.is_default));
         }
 
-        // Remove devices that have disappeared, but only if not actively playing
+        // Remove WASAPI devices that have disappeared (USB DAC unplugged),
+        // but only if not actively playing.
+        // On Windows, only remove devices that were found in the current
+        // scan backend (WASAPI). Devices registered by ASIO at startup
+        // won't appear in WASAPI scans — don't remove them, as dropping
+        // ASIO outputs can crash the process via the driver FFI.
         for old_id in &existing_ids {
             if new_device_ids.contains(old_id) {
                 continue;
             }
+
+            // Only remove if the device name matches one we could have
+            // discovered with the current scan backend.  If the scan used
+            // WASAPI but this device was registered by ASIO at startup,
+            // it won't be in new_device_ids but we must NOT remove it.
+            let old_name = old_id.strip_prefix("local:").unwrap_or(old_id);
+            let was_in_scan_scope =
+                devices.iter().any(|d| d.name == old_name) || devices.is_empty();
+            if !was_in_scan_scope {
+                debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
+                continue;
+            }
+
             let is_playing = if let Some(output) = outputs.get(old_id) {
                 let output = output.lock().await;
                 match output.get_status().await {
