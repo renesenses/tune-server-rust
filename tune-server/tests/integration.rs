@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -26,6 +26,84 @@ async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap_or(json!(null));
     (status, json)
+}
+
+/// Returns (status, content_type, raw_bytes) for content-type assertions.
+async fn get_raw(app: &axum::Router, path: &str) -> (StatusCode, String, bytes::Bytes) {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, content_type, body)
+}
+
+/// Returns (status, content_type, raw_bytes) with a custom Accept header.
+async fn get_with_accept(
+    app: &axum::Router,
+    path: &str,
+    accept: &str,
+) -> (StatusCode, String, bytes::Bytes) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header(header::ACCEPT, accept)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, content_type, body)
+}
+
+/// Asserts a content-type header contains "application/json".
+fn assert_json_content_type(content_type: &str, endpoint: &str) {
+    assert!(
+        content_type.contains("application/json"),
+        "{endpoint} returned content-type '{content_type}' instead of application/json"
+    );
+}
+
+/// Asserts raw bytes are valid JSON (not HTML).
+fn assert_not_html(bytes: &[u8], endpoint: &str) {
+    let text = String::from_utf8_lossy(bytes);
+    assert!(
+        !text.trim_start().starts_with("<!"),
+        "{endpoint} returned HTML instead of JSON: {}",
+        &text[..text.len().min(200)]
+    );
+    assert!(
+        !text.trim_start().starts_with("<html"),
+        "{endpoint} returned HTML instead of JSON: {}",
+        &text[..text.len().min(200)]
+    );
+    // Must parse as valid JSON
+    assert!(
+        serde_json::from_slice::<Value>(bytes).is_ok(),
+        "{endpoint} response is not valid JSON: {}",
+        &text[..text.len().min(200)]
+    );
 }
 
 async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -652,4 +730,135 @@ async fn playback_manager_state_transitions() {
     state.playback.stop(zone_id).await;
     let zs = state.playback.get_state(zone_id).await;
     assert_eq!(zs.state, tune_core::playback::PlayState::Stopped);
+}
+
+// ── API JSON response guard tests ─────────────────────────────────
+// Prevents the bug class where API routes return HTML (web client
+// fallback) instead of JSON.
+
+#[tokio::test]
+async fn system_endpoints_return_json_content_type() {
+    let app = make_app();
+
+    let endpoints = [
+        "/api/v1/system/health",
+        "/api/v1/system/stats",
+        "/api/v1/system/diagnostics",
+        "/api/v1/system/config",
+        "/api/v1/system/database/status",
+        "/api/v1/system/version",
+    ];
+
+    for endpoint in endpoints {
+        let (status, content_type, body) = get_raw(&app, endpoint).await;
+        assert!(status.is_success(), "{endpoint} returned status {status}");
+        assert_json_content_type(&content_type, endpoint);
+        assert_not_html(&body, endpoint);
+    }
+}
+
+#[tokio::test]
+async fn unknown_api_route_returns_json_not_html() {
+    let app = make_app();
+
+    let bogus_paths = [
+        "/api/v1/nonexistent",
+        "/api/v1/does/not/exist",
+        "/api/v1/system/nope",
+        "/api/v1/library/fake-endpoint",
+    ];
+
+    for path in bogus_paths {
+        let (status, content_type, body) = get_raw(&app, path).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} should return 404, got {status}"
+        );
+        assert_json_content_type(&content_type, path);
+        assert_not_html(&body, path);
+
+        // Body must contain an error field
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "{path} 404 response missing 'error' field: {json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn api_404_body_is_json_object() {
+    let app = make_app();
+    let (status, _, body) = get_raw(&app, "/api/v1/nonexistent").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let json: Value =
+        serde_json::from_slice(&body).expect("404 response must be valid JSON, not HTML");
+    assert!(json.is_object(), "404 body must be a JSON object");
+    assert_eq!(json["error"], "not found");
+}
+
+#[tokio::test]
+async fn accept_json_header_gets_json_from_api() {
+    let app = make_app();
+
+    let endpoints = [
+        "/api/v1/system/health",
+        "/api/v1/system/stats",
+        "/api/v1/system/version",
+    ];
+
+    for endpoint in endpoints {
+        let (status, content_type, body) =
+            get_with_accept(&app, endpoint, "application/json").await;
+        assert!(
+            status.is_success(),
+            "{endpoint} with Accept:json returned {status}"
+        );
+        assert_json_content_type(&content_type, endpoint);
+        assert_not_html(&body, endpoint);
+    }
+}
+
+#[tokio::test]
+async fn accept_json_on_unknown_api_returns_json_404() {
+    let app = make_app();
+
+    let (status, content_type, body) =
+        get_with_accept(&app, "/api/v1/nonexistent", "application/json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_json_content_type(&content_type, "/api/v1/nonexistent");
+    assert_not_html(&body, "/api/v1/nonexistent");
+}
+
+#[tokio::test]
+async fn api_path_never_serves_html_fallback() {
+    let app = make_app();
+
+    // Even with Accept: text/html, /api/* must NOT return HTML
+    let (status, content_type, body) =
+        get_with_accept(&app, "/api/v1/nonexistent", "text/html").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_json_content_type(&content_type, "/api/v1/nonexistent (Accept: text/html)");
+    assert_not_html(&body, "/api/v1/nonexistent (Accept: text/html)");
+}
+
+#[tokio::test]
+async fn api_trailing_slash_does_not_serve_html() {
+    let app = make_app();
+
+    // Trailing-slash API paths should redirect or return JSON, never HTML
+    let (status, content_type, body) = get_raw(&app, "/api/v1/nonexistent/").await;
+    // The api_fallback redirects trailing slashes (301/308), or returns JSON 404
+    if status == StatusCode::NOT_FOUND {
+        assert_json_content_type(&content_type, "/api/v1/nonexistent/");
+        assert_not_html(&body, "/api/v1/nonexistent/");
+    } else {
+        // Must be a redirect, not HTML
+        assert!(
+            status.is_redirection(),
+            "/api/v1/nonexistent/ should redirect or 404, got {status}"
+        );
+    }
 }
