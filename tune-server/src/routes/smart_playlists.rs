@@ -374,31 +374,27 @@ fn execute_smart_track_query(
         play_count_join, where_clause, order, limit_clause
     );
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
+    let rows = state
+        .backend
+        .query_many(&sql, &[])
         .map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn
-        .prepare(&sql)
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "album_title": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                    "format": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "genre": row.get::<_, Option<String>>(6).ok().flatten(),
-                    "year": row.get::<_, Option<i32>>(7).ok().flatten(),
-                    "album_id": row.get::<_, Option<i64>>(8).ok().flatten(),
-                    "cover_path": row.get::<_, Option<String>>(9).ok().flatten(),
-                }))
+    Ok(rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "title": cols.get(1).and_then(|v| v.as_string()),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "format": cols.get(5).and_then(|v| v.as_string()),
+                "genre": cols.get(6).and_then(|v| v.as_string()),
+                "year": cols.get(7).and_then(|v| v.as_i64()).map(|y| y as i32),
+                "album_id": cols.get(8).and_then(|v| v.as_i64()),
+                "cover_path": cols.get(9).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default())
+        .collect())
 }
 
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).

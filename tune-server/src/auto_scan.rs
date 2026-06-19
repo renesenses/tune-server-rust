@@ -75,8 +75,17 @@ pub fn build_track_from_metadata(
                 return Some(existing);
             }
         }
+        // Quality-based album splitting: append suffix when sample_rate or
+        // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
+        // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
+        let suffix = tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth);
+        let album_title = if suffix.is_empty() {
+            title.clone()
+        } else {
+            format!("{title} ({suffix})")
+        };
         album_repo
-            .get_or_create(title, aid, meta.year.map(|y| y as i32))
+            .get_or_create(&album_title, aid, meta.year.map(|y| y as i32))
             .ok()
     });
     let album_id = album.as_ref().and_then(|a| a.id);
