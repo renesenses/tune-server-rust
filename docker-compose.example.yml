@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   tune:
-    image: renesenses/tune:v0.8.0
+    image: renesenses/tune:latest
     container_name: tune
     network_mode: host
     restart: unless-stopped
@@ -14,6 +14,11 @@ services:
       - TUNE_PORT=8888
       - TUNE_AUTO_SCAN=true
       - TUNE_LOG=info
+      # Spotify Connect (librespot)
+      # - LIBRESPOT_NAME=Tune
+      # - LIBRESPOT_BITRATE=320
+      # YouTube Music (yt-dlp inclus dans l'image)
+      # - TUNE_YOUTUBE_API_KEY=your_key_here
 
 volumes:
   tune-data:

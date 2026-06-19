@@ -1,6 +1,11 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
 
+# Install librespot build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libasound2-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 
 # Cache dependencies: copy manifests and build with dummy sources
@@ -16,6 +21,9 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
     rm -rf tune-core/src tune-pyo3/src tune-server/src tune-cli/src
 
+# Build librespot (Spotify Connect) in parallel with deps cache
+RUN cargo install librespot --no-default-features --features "alsa-backend" || true
+
 # Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
 COPY tune-pyo3/ tune-pyo3/
@@ -29,7 +37,9 @@ RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/
 FROM debian:bookworm-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl libasound2 python3-pip && \
+    pip3 install --break-system-packages yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -39,6 +49,7 @@ RUN groupadd -g 1000 tune && \
 WORKDIR /app
 
 COPY --from=builder /build/target/release/tune-server /app/tune-server
+COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
 COPY web/ /app/web/
 
 # Ensure tune user can read the app but not write
@@ -53,7 +64,9 @@ ENV TUNE_PORT=8888 \
     TUNE_WEB_DIR=/app/web \
     TUNE_MUSIC_DIRS='["/music"]' \
     TUNE_LOG_LEVEL=info \
-    TUNE_AUTO_SCAN=true
+    TUNE_AUTO_SCAN=true \
+    LIBRESPOT_NAME=Tune \
+    LIBRESPOT_BITRATE=320
 
 EXPOSE 8888
 
