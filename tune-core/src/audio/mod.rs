@@ -7,6 +7,7 @@ pub mod dff;
 pub mod dsd_to_pcm;
 pub mod dsf;
 pub mod encoder;
+pub mod eq;
 pub mod formats;
 pub mod iso_sacd;
 pub mod levels;

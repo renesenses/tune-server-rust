@@ -202,7 +202,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/queue/save-as-playlist", post(save_queue_as_playlist))
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
-        .route("/{id}/dsp", post(set_dsp))
+        .route("/{id}/dsp", get(get_dsp).post(set_dsp))
         .route("/{id}/crossfade", post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
@@ -1181,16 +1181,37 @@ async fn set_eq(
 #[derive(Deserialize)]
 struct DspSettings {
     crossfeed: Option<String>,
+    eq_profile: Option<tune_core::audio::eq::EqProfile>,
 }
 
 async fn set_dsp(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<DspSettings>,
 ) -> Json<Value> {
+    if let Some(ref profile) = body.eq_profile {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{zone_id}_eq_profile");
+        let _ = settings.set(&key, &serde_json::to_string(profile).unwrap_or_default());
+    }
     Json(json!({
         "zone_id": zone_id,
         "crossfeed": body.crossfeed,
+        "eq_profile": body.eq_profile,
+    }))
+}
+
+async fn get_dsp(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let key = format!("zone_{zone_id}_eq_profile");
+    let eq_profile: Option<tune_core::audio::eq::EqProfile> = settings
+        .get(&key)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    Json(json!({
+        "zone_id": zone_id,
+        "eq_profile": eq_profile.unwrap_or_default(),
     }))
 }
 
