@@ -492,8 +492,112 @@ pub(super) async fn update_apply() -> impl IntoResponse {
     }))
 }
 
-/// GET /system/changelog
+/// GET /system/changelog — fetch from GitHub releases, cache 1 hour.
 pub(super) async fn changelog() -> Json<Value> {
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Value)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new((
+            std::time::Instant::now() - std::time::Duration::from_secs(7200),
+            json!([]),
+        ))
+    });
+    let mut guard = cache.lock().await;
+
+    if guard.0.elapsed() < std::time::Duration::from_secs(3600)
+        && guard.1.as_array().is_some_and(|a| !a.is_empty())
+    {
+        return Json(json!({ "version": tune_core::version(), "entries": guard.1 }));
+    }
+
+    let entries = match fetch_github_changelog().await {
+        Ok(e) => {
+            *guard = (std::time::Instant::now(), e.clone());
+            e
+        }
+        Err(_) => guard.1.clone(),
+    };
+    drop(guard);
+    Json(json!({ "version": tune_core::version(), "entries": entries }))
+}
+
+async fn fetch_github_changelog() -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Tune/2.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=20")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API {}", resp.status()));
+    }
+    let releases: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
+    let entries: Vec<Value> = releases
+        .iter()
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let date = r["published_at"]
+                .as_str()
+                .unwrap_or("")
+                .split('T')
+                .next()
+                .unwrap_or("");
+            let body = r["body"].as_str().unwrap_or("");
+            let mut features = Vec::new();
+            let mut fixes = Vec::new();
+            let mut improvements = Vec::new();
+            for line in body.lines() {
+                let trimmed = line
+                    .trim()
+                    .trim_start_matches("- ")
+                    .trim_start_matches("* ");
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let lower = line.to_lowercase();
+                if lower.contains("fix") || lower.contains("correction") || lower.contains("bug") {
+                    fixes.push(trimmed.to_string());
+                } else if lower.contains("feat")
+                    || lower.contains("nouveaut")
+                    || lower.contains("add")
+                {
+                    features.push(trimmed.to_string());
+                } else if lower.contains("improv")
+                    || lower.contains("amélio")
+                    || lower.contains("perf")
+                    || lower.contains("optim")
+                {
+                    improvements.push(trimmed.to_string());
+                } else if trimmed.starts_with("**") || trimmed.starts_with("##") {
+                    continue;
+                } else {
+                    features.push(trimmed.to_string());
+                }
+            }
+            if features.is_empty() && fixes.is_empty() && improvements.is_empty() {
+                features.push(format!("Release {version}"));
+            }
+            Some(json!({
+                "version": version,
+                "date": date,
+                "features": features,
+                "fixes": fixes,
+                "improvements": improvements,
+            }))
+        })
+        .collect();
+    Ok(json!(entries))
+}
+
+#[allow(dead_code)]
+fn changelog_hardcoded() -> Json<Value> {
     Json(json!({
         "version": tune_core::version(),
         "entries": [
