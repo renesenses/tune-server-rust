@@ -1246,16 +1246,26 @@ impl StreamingService for TidalService {
                     let bit_depth = d["bitDepth"].as_u64();
                     let sample_rate = d["sampleRate"].as_u64();
 
-                    debug!(
-                        track_id,
-                        requested = q,
-                        returned = returned_quality,
-                        returned_codec,
-                        manifest_mime,
-                        ?bit_depth,
-                        ?sample_rate,
-                        "tidal_playback_info_response"
-                    );
+                    if returned_quality != q {
+                        warn!(
+                            track_id,
+                            requested = q,
+                            returned = returned_quality,
+                            returned_codec,
+                            manifest_mime,
+                            ?bit_depth,
+                            ?sample_rate,
+                            subscription = ?self.subscription,
+                            "tidal_quality_mismatch"
+                        );
+                    } else {
+                        debug!(
+                            track_id,
+                            requested = q,
+                            returned = returned_quality,
+                            "tidal_playback_info_ok"
+                        );
+                    }
 
                     if returned_quality == q {
                         data = Some(d);

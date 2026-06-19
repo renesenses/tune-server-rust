@@ -28,6 +28,18 @@ const SSDP_ALL: &str = "ssdp:all";
 pub enum SsdpEvent {
     DeviceDiscovered(Box<DiscoveredDevice>),
     DeviceLost(String),
+    MediaServerDiscovered(MediaServerInfo),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MediaServerInfo {
+    pub id: String,
+    pub name: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub location: String,
+    pub content_directory_url: String,
+    pub host: String,
 }
 
 #[derive(Debug)]
@@ -358,6 +370,17 @@ fn host_from_location(location: &str) -> Option<String> {
     Some(host_port.split(':').next()?.to_string())
 }
 
+fn base_url_from_location(location: &str) -> String {
+    let scheme = if location.starts_with("https://") {
+        "https://"
+    } else {
+        "http://"
+    };
+    let after_scheme = location.strip_prefix(scheme).unwrap_or(location);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    format!("{scheme}{host_port}")
+}
+
 fn port_from_location(location: &str) -> u16 {
     let after_scheme = location
         .strip_prefix("http://")
@@ -421,12 +444,45 @@ async fn process_responses(
                         "ssdp_non_standard_renderer_accepted"
                     );
                     OutputType::Dlna
+                } else if desc.is_media_server() {
+                    let cd_url = desc
+                        .services
+                        .iter()
+                        .find(|s| s.service_type.contains("ContentDirectory"))
+                        .map(|s| s.control_url.clone())
+                        .unwrap_or_default();
+                    if !cd_url.is_empty() {
+                        let host = host_from_location(&resp.location).unwrap_or_default();
+                        let base = base_url_from_location(&resp.location);
+                        let full_cd_url = if cd_url.starts_with("http") {
+                            cd_url
+                        } else {
+                            format!("{base}{cd_url}")
+                        };
+                        let ms = MediaServerInfo {
+                            id: dev_id.clone(),
+                            name: desc.friendly_name.clone(),
+                            manufacturer: desc.manufacturer.clone(),
+                            model: desc.model_name.clone(),
+                            location: resp.location.clone(),
+                            content_directory_url: full_cd_url,
+                            host,
+                        };
+                        info!(
+                            id = %dev_id,
+                            name = %ms.name,
+                            cd_url = %ms.content_directory_url,
+                            "ssdp_media_server_discovered"
+                        );
+                        let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+                    }
+                    continue;
                 } else {
                     debug!(
                         id = %dev_id,
                         name = %desc.friendly_name,
                         device_type = %desc.device_type,
-                        "ssdp_device_skipped_no_renderer"
+                        "ssdp_device_skipped"
                     );
                     continue;
                 };

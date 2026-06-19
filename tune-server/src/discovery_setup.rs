@@ -29,6 +29,7 @@ pub fn spawn_ssdp_handler(
     let db = state.backend.clone();
     let config = config.clone();
     let event_bus = state.event_bus.clone();
+    let media_servers = state.media_servers.clone();
     tokio::spawn(async move {
         use tune_core::discovery::ssdp::SsdpEvent;
         while let Some(event) = ssdp_rx.recv().await {
@@ -43,6 +44,11 @@ pub fn spawn_ssdp_handler(
                     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
                     let _ = zone_repo.set_online_by_device(&id, false);
                     info!(id = %id, "output_removed_zone_offline");
+                }
+                SsdpEvent::MediaServerDiscovered(ms) => {
+                    let id = ms.id.clone();
+                    media_servers.lock().await.insert(id.clone(), ms);
+                    info!(id = %id, "media_server_registered");
                 }
             }
         }

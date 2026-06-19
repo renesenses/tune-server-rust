@@ -108,11 +108,25 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     StatusCode::NO_CONTENT
 }
 
-async fn list_media_servers() -> Json<Value> {
+async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
+    let servers = state.media_servers.lock().await;
+    let items: Vec<Value> = servers
+        .values()
+        .map(|ms| {
+            json!({
+                "id": ms.id,
+                "name": ms.name,
+                "manufacturer": ms.manufacturer,
+                "model": ms.model,
+                "host": ms.host,
+                "location": ms.location,
+            })
+        })
+        .collect();
+    let total = items.len();
     Json(json!({
-        "items": [],
-        "total": 0,
-        "message": "UPnP media server discovery pending",
+        "items": items,
+        "total": total,
     }))
 }
 
@@ -516,15 +530,154 @@ async fn mount_smb_share(
 // Media Server browsing / streaming
 // ---------------------------------------------------------------------------
 
-async fn browse_media_server(Path(id): Path<String>, Query(q): Query<BrowseQuery>) -> Json<Value> {
+async fn browse_media_server(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<BrowseQuery>,
+) -> Json<Value> {
     let object_id = q.object_id.as_deref().unwrap_or("0");
+    let servers = state.media_servers.lock().await;
+    let ms = match servers.get(&id) {
+        Some(ms) => ms.clone(),
+        None => {
+            return Json(json!({
+                "server_id": id,
+                "object_id": object_id,
+                "items": [],
+                "error": "media server not found",
+            }));
+        }
+    };
+    drop(servers);
+
+    let soap_body = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body>
+<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<ObjectID>{object_id}</ObjectID>
+<BrowseFlag>BrowseDirectChildren</BrowseFlag>
+<Filter>*</Filter>
+<StartingIndex>0</StartingIndex>
+<RequestedCount>200</RequestedCount>
+<SortCriteria></SortCriteria>
+</u:Browse>
+</s:Body>
+</s:Envelope>"#
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .post(&ms.content_directory_url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header(
+            "SOAPAction",
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
+        )
+        .body(soap_body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(json!({
+                "server_id": id,
+                "object_id": object_id,
+                "items": [],
+                "error": format!("SOAP request failed: {e}"),
+            }));
+        }
+    };
+
+    let body = resp.text().await.unwrap_or_default();
+    let items = parse_didl_from_browse_response(&body);
+    let total = items.len();
+
     Json(json!({
         "server_id": id,
         "object_id": object_id,
-        "items": [],
-        "total": 0,
-        "message": "UPnP ContentDirectory Browse not yet implemented",
+        "items": items,
+        "total": total,
     }))
+}
+
+fn parse_didl_from_browse_response(xml: &str) -> Vec<Value> {
+    let result_start = xml.find("<Result>").or_else(|| xml.find("<Result "));
+    let result_end = xml.find("</Result>");
+    let didl = match (result_start, result_end) {
+        (Some(s), Some(e)) => {
+            let after = &xml[s..];
+            let content_start = after.find('>').map(|i| s + i + 1).unwrap_or(s);
+            &xml[content_start..e]
+        }
+        _ => return vec![],
+    };
+    let decoded = didl
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'");
+
+    let mut items = Vec::new();
+    for tag in ["container", "item"] {
+        let open = format!("<{tag} ");
+        let close = format!("</{tag}>");
+        let mut pos = 0;
+        while let Some(start) = decoded[pos..].find(&open) {
+            let abs_start = pos + start;
+            if let Some(end) = decoded[abs_start..].find(&close) {
+                let element = &decoded[abs_start..abs_start + end + close.len()];
+                let id = extract_attr(element, "id").unwrap_or_default();
+                let parent_id = extract_attr(element, "parentID").unwrap_or_default();
+                let title = extract_xml_tag(element, "dc:title").unwrap_or_default();
+                let class = extract_xml_tag(element, "upnp:class").unwrap_or_default();
+                let res_url = extract_xml_tag(element, "res").unwrap_or_default();
+                let album_art = extract_xml_tag(element, "upnp:albumArtURI").unwrap_or_default();
+                let artist = extract_xml_tag(element, "upnp:artist")
+                    .or_else(|| extract_xml_tag(element, "dc:creator"))
+                    .unwrap_or_default();
+                items.push(json!({
+                    "id": id,
+                    "parent_id": parent_id,
+                    "title": title,
+                    "class": class,
+                    "type": if tag == "container" { "container" } else { "item" },
+                    "url": res_url,
+                    "album_art": album_art,
+                    "artist": artist,
+                }));
+                pos = abs_start + end + close.len();
+            } else {
+                break;
+            }
+        }
+    }
+    items
+}
+
+fn extract_attr(element: &str, name: &str) -> Option<String> {
+    let pattern = format!("{name}=\"");
+    let start = element.find(&pattern)? + pattern.len();
+    let end = element[start..].find('"')? + start;
+    Some(element[start..end].to_string())
+}
+
+fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
+    let open_full = format!("<{tag}>");
+    let open_attr = format!("<{tag} ");
+    let close = format!("</{tag}>");
+    let content_start = if let Some(s) = element.find(&open_full) {
+        s + open_full.len()
+    } else if let Some(s) = element.find(&open_attr) {
+        let after = &element[s..];
+        after.find('>')? + s + 1
+    } else {
+        return None;
+    };
+    let content_end = element[content_start..].find(&close)? + content_start;
+    Some(element[content_start..content_end].to_string())
 }
 
 #[derive(Deserialize)]

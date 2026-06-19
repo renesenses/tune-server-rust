@@ -50,6 +50,7 @@ pub struct AppState {
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
+    pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
 }
 
 impl AppState {
@@ -157,6 +158,7 @@ impl AppState {
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
+            media_servers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
