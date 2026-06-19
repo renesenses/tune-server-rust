@@ -256,6 +256,12 @@ impl PlaybackOrchestrator {
             album.as_deref(),
         );
 
+        // Close old stream BEFORE sending new play to avoid audio glitch
+        // (DMP-A8 can receive stale bytes from the old stream during transition)
+        if let Some(ref old_sid) = old_stream_id {
+            self.streamer.remove_session(old_sid).await;
+        }
+
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
             let resolved_cover_url = self.resolve_cover_url(cover_path.as_deref());
             let local_file_path = if resolved.source == "local" {
@@ -333,10 +339,7 @@ impl PlaybackOrchestrator {
             (false, None)
         };
 
-        // Clean up old session now that the output has been stopped by play_media
-        if let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
-        }
+        // Old session already removed above (before play_media)
 
         self.record_listen(
             &resolved.title,
@@ -2043,13 +2046,32 @@ impl PlaybackOrchestrator {
             .as_ref()
             .and_then(|np| np.stream_id.clone());
         self.playback.stop(zone_id).await;
-        if let Some(did) = device_id {
+
+        // Resolve device_id: prefer explicit, fall back to zone DB
+        let resolved_did = match device_id {
+            Some(d) => Some(d.to_string()),
+            None => crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id),
+        };
+        if let Some(ref did) = resolved_did {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
                 if let Err(e) = output.lock().await.stop().await {
                     warn!(zone_id, error = %e, "device_stop_failed");
                 }
             }
+        } else {
+            // No device_id found — stop ALL registered outputs as fallback
+            let outputs = self.outputs.lock().await;
+            for did in outputs.list() {
+                if let Some(output) = outputs.get(&did) {
+                    let _ = output.lock().await.stop().await;
+                }
+            }
+            warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
         }
         // Remove session AFTER the output has been stopped
         if let Some(ref sid) = old_stream_id {
