@@ -506,9 +506,15 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             // discovered with the current scan backend.  If the scan used
             // WASAPI but this device was registered by ASIO at startup,
             // it won't be in new_device_ids but we must NOT remove it.
+            // If the scan returned nothing, skip all removals — an empty
+            // result means the backend couldn't enumerate (e.g. WASAPI held
+            // exclusively by foobar2000), not that everything disappeared.
+            if devices.is_empty() {
+                debug!("local_audio_rescan_empty_skipping_all_removals");
+                break;
+            }
             let old_name = old_id.strip_prefix("local:").unwrap_or(old_id);
-            let was_in_scan_scope =
-                devices.iter().any(|d| d.name == old_name) || devices.is_empty();
+            let was_in_scan_scope = devices.iter().any(|d| d.name == old_name);
             if !was_in_scan_scope {
                 debug!(device_id = %old_id, "local_audio_skipping_removal_different_backend");
                 continue;
