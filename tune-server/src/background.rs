@@ -355,18 +355,31 @@ fn spawn_heartbeat(state: &AppState) {
                 authed
             };
 
-            // Collect registered audio devices/renderers
+            // Collect registered device IDs (no async lock per-output)
             let devices: Vec<serde_json::Value> = {
                 let registry = outputs.lock().await;
                 registry
-                    .info_all()
-                    .await
+                    .list()
                     .into_iter()
-                    .map(|info| {
-                        serde_json::json!({
-                            "name": info["name"],
-                            "type": info["type"],
-                        })
+                    .map(|id| {
+                        let dev_type = if id.starts_with("local:") {
+                            "local"
+                        } else if id.starts_with("airplay-") {
+                            "airplay"
+                        } else if id.starts_with("chromecast-") {
+                            "chromecast"
+                        } else if id.starts_with("oaat:") {
+                            "oaat"
+                        } else if id.starts_with("uuid:") {
+                            "dlna"
+                        } else {
+                            "other"
+                        };
+                        let name = id
+                            .strip_prefix("local:")
+                            .or_else(|| id.strip_prefix("uuid:"))
+                            .unwrap_or(&id);
+                        serde_json::json!({ "name": name, "type": dev_type })
                     })
                     .collect()
             };

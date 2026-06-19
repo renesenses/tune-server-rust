@@ -253,17 +253,15 @@ async fn handle_devices(
 
     for dev in devices {
         let full_id = format!("bridge:{bridge_id}:{}", dev.id);
-        let output = BridgeOutput::new(
+        let output = BridgeOutput::with_shared_pending(
             dev.name.clone(),
             full_id.clone(),
             dev.device_type.clone(),
             bridge_id.to_owned(),
             command_tx.clone(),
             connected.clone(),
+            state.bridge_responses.clone(),
         );
-
-        // Register the pending responses map in AppState for response routing
-        // (BridgeOutput's pending map is internal — we route via bridge_responses)
 
         let mut reg = state.outputs.lock().await;
         reg.register(Box::new(output));

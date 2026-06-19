@@ -30,7 +30,7 @@ fn to_db(linear: f64) -> f32 {
     }
 }
 
-pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16) -> AudioLevels {
+pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u32) -> AudioLevels {
     if pcm.is_empty() || channels == 0 {
         return AudioLevels::default();
     }
@@ -73,7 +73,7 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16) -> AudioLevels 
         rms_right: (sum_sq_r / frames as f64).sqrt(),
         peak_left: peak_l,
         peak_right: peak_r,
-        spectrum: compute_spectrum(pcm, bit_depth, channels, 32),
+        spectrum: compute_spectrum(pcm, bit_depth, channels, 32, sample_rate),
     }
 }
 
@@ -106,7 +106,13 @@ fn read_sample(frame: &[u8], offset: usize, bytes: usize, bit_depth: u16) -> f64
 
 /// Compute spectrum bins from PCM data using a simple FFT.
 /// Returns `bins` magnitude values (0.0..1.0) spread across the frequency range.
-pub fn compute_spectrum(pcm: &[u8], bit_depth: u16, channels: u16, bins: usize) -> Vec<f32> {
+pub fn compute_spectrum(
+    pcm: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    bins: usize,
+    sample_rate: u32,
+) -> Vec<f32> {
     if pcm.is_empty() || channels == 0 || bins == 0 {
         return vec![0.0; bins];
     }
@@ -190,12 +196,19 @@ pub fn compute_spectrum(pcm: &[u8], bit_depth: u16, channels: u16, bins: usize) 
         mags.push(mag);
     }
 
-    // Map FFT bins to output bins (log-scale for perceptual frequency distribution)
+    // Map FFT bins to output bins using true logarithmic frequency scale.
+    // Each output bin covers one equal fraction of the audible range on a
+    // log axis (20 Hz – 20 kHz), matching human pitch perception.
+    let nyquist = sample_rate as f64 / 2.0;
+    let freq_min = 20.0_f64;
+    let freq_max = nyquist.min(20000.0);
+    let log_ratio = freq_max / freq_min;
     let mut result = vec![0.0f32; bins];
     for b in 0..bins {
-        // Log-scale mapping: low bins get more FFT resolution (bass), high bins less (treble)
-        let f_low = ((b as f64 / bins as f64).powf(2.0) * half as f64) as usize;
-        let f_high = (((b + 1) as f64 / bins as f64).powf(2.0) * half as f64) as usize;
+        let hz_low = freq_min * log_ratio.powf(b as f64 / bins as f64);
+        let hz_high = freq_min * log_ratio.powf((b + 1) as f64 / bins as f64);
+        let f_low = ((hz_low / nyquist) * half as f64) as usize;
+        let f_high = ((hz_high / nyquist) * half as f64) as usize;
         let f_low = f_low.min(half - 1);
         let f_high = f_high.max(f_low + 1).min(half);
 
@@ -220,7 +233,7 @@ mod tests {
     #[test]
     fn silence_returns_low_db() {
         let pcm = vec![0u8; 1024];
-        let levels = compute_levels(&pcm, 16, 2);
+        let levels = compute_levels(&pcm, 16, 2, 44100);
         assert!(levels.rms_left_db() <= -96.0);
         assert!(levels.peak_left_db() <= -96.0);
     }
@@ -232,8 +245,34 @@ mod tests {
             pcm.extend_from_slice(&i16::MAX.to_le_bytes()); // left
             pcm.extend_from_slice(&i16::MAX.to_le_bytes()); // right
         }
-        let levels = compute_levels(&pcm, 16, 2);
+        let levels = compute_levels(&pcm, 16, 2, 44100);
         assert!(levels.peak_left_db() > -1.0);
         assert!(levels.peak_right_db() > -1.0);
+    }
+
+    #[test]
+    fn spectrum_440hz_peak_in_correct_bin() {
+        let sr = 44100u32;
+        let freq = 440.0f64;
+        let mut pcm = Vec::new();
+        for i in 0..2048 {
+            let t = i as f64 / sr as f64;
+            let sample = (2.0 * std::f64::consts::PI * freq * t).sin();
+            let val = (sample * i16::MAX as f64) as i16;
+            pcm.extend_from_slice(&val.to_le_bytes()); // left
+            pcm.extend_from_slice(&val.to_le_bytes()); // right
+        }
+        let spectrum = compute_spectrum(&pcm, 16, 2, 32, sr);
+        let peak_bin = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        // 440 Hz in 32 log-scale bins (20–20000 Hz) should be around bin 10-12
+        assert!(
+            peak_bin >= 8 && peak_bin <= 14,
+            "440Hz peak at bin {peak_bin}"
+        );
     }
 }

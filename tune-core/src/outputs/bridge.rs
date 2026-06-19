@@ -53,6 +53,26 @@ impl BridgeOutput {
         }
     }
 
+    pub fn with_shared_pending(
+        name: String,
+        device_id: String,
+        output_type_str: String,
+        bridge_id: String,
+        command_tx: mpsc::Sender<BridgeCommand>,
+        connected: Arc<AtomicBool>,
+        pending: Arc<Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>>,
+    ) -> Self {
+        Self {
+            name,
+            device_id,
+            output_type_str,
+            _bridge_id: bridge_id,
+            command_tx,
+            pending,
+            connected,
+        }
+    }
+
     pub fn pending_responses(
         &self,
     ) -> Arc<Mutex<HashMap<String, oneshot::Sender<BridgeResponse>>>> {

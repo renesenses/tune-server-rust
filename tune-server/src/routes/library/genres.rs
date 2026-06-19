@@ -60,10 +60,35 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
     }
 
     let genres: Vec<String> = genre_set.into_iter().collect();
-    let mut tree: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for genre in &genres {
-        tree.entry(genre.clone()).or_default();
+
+    // Load saved tree from settings (persisted by PUT /genre-tree).
+    // If a saved tree exists, use it as the base and add any new genres
+    // found in the library that aren't already in any branch.
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let mut tree: std::collections::BTreeMap<String, Vec<String>> = settings
+        .get("genre_tree")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if tree.is_empty() {
+        for genre in &genres {
+            tree.entry(genre.clone()).or_default();
+        }
+    } else {
+        let mut classified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (parent, children) in &tree {
+            classified.insert(parent.clone());
+            for child in children {
+                classified.insert(child.clone());
+            }
+        }
+        for genre in &genres {
+            if !classified.contains(genre) {
+                tree.entry(genre.clone()).or_default();
+            }
+        }
     }
 
     Ok(Json(json!({

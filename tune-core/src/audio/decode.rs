@@ -411,7 +411,8 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch));
+                let sr = target_sample_rate.unwrap_or(decoded.sample_rate);
+                let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch, sr));
             }
         }
         return Ok(output_bd);
@@ -454,6 +455,7 @@ fn decode_to_pcm_streaming_inner(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
+    let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_bd = resolve_bit_depth(&audio_params);
     let shift = 32u16.saturating_sub(source_bd);
 
@@ -578,6 +580,7 @@ fn decode_to_pcm_streaming_inner(
                     &chunk,
                     output_bd,
                     source_channels as u16,
+                    source_rate,
                 ));
             }
         }
@@ -590,7 +593,6 @@ fn decode_to_pcm_streaming_inner(
         }
     }
 
-    let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let total_frames = total_samples as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
 
@@ -955,7 +957,12 @@ fn decode_dsd_streaming(
                     }
                 }
                 if let Some(ltx) = levels_tx {
-                    let _ = ltx.send(super::levels::compute_levels(&chunk, output_bd, ch));
+                    let _ = ltx.send(super::levels::compute_levels(
+                        &chunk,
+                        output_bd,
+                        ch,
+                        output_rate,
+                    ));
                 }
             }
             Ok(false)
@@ -996,7 +1003,12 @@ fn decode_dsd_streaming(
         if rt.block_on(tx.send(pcm_buf.clone())).is_err() {
             debug!("dsd_streaming_consumer_dropped (final)");
         } else if let Some(ltx) = levels_tx {
-            let _ = ltx.send(super::levels::compute_levels(&pcm_buf, output_bd, ch));
+            let _ = ltx.send(super::levels::compute_levels(
+                &pcm_buf,
+                output_bd,
+                ch,
+                output_rate,
+            ));
         }
     }
 

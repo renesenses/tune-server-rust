@@ -794,6 +794,7 @@ impl PlaybackOrchestrator {
                         if let Some(ref bus) = ev_bus {
                             let bus = bus.clone();
                             let actual_ch = channels;
+                            let sr = out_sr;
                             tokio::spawn(async move {
                                 let (levels_tx, mut levels_rx) =
                                     tokio::sync::mpsc::unbounded_channel::<
@@ -821,7 +822,7 @@ impl PlaybackOrchestrator {
                                     for chunk in pcm_bytes.chunks(32768) {
                                         if levels_tx
                                             .send(crate::audio::levels::compute_levels(
-                                                chunk, actual_bd, actual_ch,
+                                                chunk, actual_bd, actual_ch, sr,
                                             ))
                                             .is_err()
                                         {
@@ -1025,7 +1026,9 @@ impl PlaybackOrchestrator {
                                 let c = dec.channels as u16;
                                 for chunk in pcm.chunks(32768) {
                                     if levels_tx
-                                        .send(crate::audio::levels::compute_levels(chunk, bd, c))
+                                        .send(crate::audio::levels::compute_levels(
+                                            chunk, bd, c, sr,
+                                        ))
                                         .is_err()
                                     {
                                         break;
