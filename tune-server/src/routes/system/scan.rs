@@ -147,10 +147,13 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 let mut to_update: Vec<tune_core::db::models::Track> =
                     Vec::with_capacity(batch.len() / 4);
 
-                // BEGIN transaction for this batch
-                let begin_sql = if db.engine() == tune_core::db::engine::Engine::Postgres { "BEGIN" } else { "BEGIN IMMEDIATE" };
-                if let Err(e) = db.execute_batch(begin_sql) {
-                    tracing::warn!(error = %e, batch = batch_idx, "scan_batch_begin_failed");
+                // BEGIN transaction for this batch (SQLite only — PG uses autocommit
+                // to avoid "current transaction is aborted" cascading failures)
+                let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+                if !is_pg {
+                    if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+                        tracing::warn!(error = %e, batch = batch_idx, "scan_batch_begin_failed");
+                    }
                 }
 
                 for sf in &batch {
@@ -502,8 +505,10 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 }
 
                 // COMMIT this batch -- tracks + album stats are now queryable
-                if let Err(e) = db.execute_batch("COMMIT") {
-                    tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
+                if !is_pg {
+                    if let Err(e) = db.execute_batch("COMMIT") {
+                        tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
+                    }
                 }
 
                 // Emit progress after each batch
@@ -561,10 +566,12 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             }
         }
 
-        // Backfill + album stats in a single transaction
-        let post_begin = if db.engine() == tune_core::db::engine::Engine::Postgres { "BEGIN" } else { "BEGIN IMMEDIATE" };
-        if let Err(e) = db.execute_batch(post_begin) {
-            tracing::warn!(error = %e, "post_scan_begin_failed");
+        // Backfill + album stats in a single transaction (SQLite only)
+        let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
+        if !is_pg {
+            if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+                tracing::warn!(error = %e, "post_scan_begin_failed");
+            }
         }
         {
             if let Err(e) = db.execute(
@@ -671,8 +678,10 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
             }
         }
-        if let Err(e) = db.execute_batch("COMMIT") {
-            tracing::warn!(error = %e, "post_scan_commit_failed");
+        if !is_pg {
+            if let Err(e) = db.execute_batch("COMMIT") {
+                tracing::warn!(error = %e, "post_scan_commit_failed");
+            }
         }
 
         // Clean up orphan artists left behind after tag corrections
