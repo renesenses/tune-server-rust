@@ -162,8 +162,32 @@ async fn local_ai_query(
     let msg = message.to_lowercase();
     let mut actions: Vec<Value> = Vec::new();
 
-    // --- Transport controls ---
-    if matches_any(&msg, &["pause", "stop", "arrête", "arrete", "stoppe"]) {
+    // --- Transport controls (en/fr/de/es/it/zh/ko/ja) ---
+    if matches_any(
+        &msg,
+        &[
+            "pause",
+            "stop",
+            "arrête",
+            "arrete",
+            "stoppe", // fr
+            "anhalten",
+            "stopp", // de
+            "parar",
+            "detener",
+            "para ", // es
+            "ferma",
+            "fermati", // it
+            "暂停",
+            "停止", // zh
+            "일시정지",
+            "멈춰",
+            "정지", // ko
+            "一時停止",
+            "止めて",
+            "ストップ", // ja
+        ],
+    ) {
         let result = executor.execute("pause", json!({})).await;
         actions.push(json!({ "tool": "pause", "result": result }));
         return Ok(Json(json!({
@@ -172,10 +196,31 @@ async fn local_ai_query(
             "zone_id": executor.zone_id(),
         })));
     }
-    if matches_any(&msg, &["resume", "reprend", "play", "lecture", "continue"])
-        && !msg.contains(' ')
+    let resume_words = [
+        "resume",
+        "reprend",
+        "play",
+        "lecture",
+        "continue",
+        "fortsetzen",
+        "weiter", // de
+        "reanudar",
+        "continuar", // es
+        "riprendi",
+        "continua", // it
+        "继续",
+        "播放", // zh
+        "재생",
+        "계속", // ko
+        "再生",
+        "再開", // ja
+    ];
+    if matches_any(&msg, &resume_words) && !msg.contains(' ')
         || msg == "play"
         || msg == "lecture"
+        || msg == "播放"
+        || msg == "再生"
+        || msg == "재생"
     {
         let result = executor.execute("resume", json!({})).await;
         actions.push(json!({ "tool": "resume", "result": result }));
@@ -187,7 +232,30 @@ async fn local_ai_query(
     }
     if matches_any(
         &msg,
-        &["next", "suivant", "suivante", "piste suivante", "skip"],
+        &[
+            "next",
+            "suivant",
+            "suivante",
+            "piste suivante",
+            "skip",
+            "nächster",
+            "nächstes",
+            "weiter",
+            "überspringen", // de
+            "siguiente",
+            "saltar", // es
+            "prossimo",
+            "prossima",
+            "salta", // it
+            "下一首",
+            "跳过", // zh
+            "다음",
+            "다음곡",
+            "건너뛰기", // ko
+            "次の曲",
+            "スキップ",
+            "次へ", // ja
+        ],
     ) {
         let result = executor.execute("next_track", json!({})).await;
         actions.push(json!({ "tool": "next_track", "result": result }));
@@ -218,14 +286,32 @@ async fn local_ai_query(
         &[
             "qu'est-ce qui joue",
             "qu'est ce qui joue",
-            "what's playing",
-            "now playing",
-            "c'est quoi",
+            "c'est quoi", // fr
             "en cours",
-            "what is playing",
             "quel morceau",
             "quelle chanson",
             "quoi joue",
+            "what's playing",
+            "now playing",
+            "what is playing", // en
+            "was läuft",
+            "was spielt",
+            "welcher song", // de
+            "qué suena",
+            "qué está sonando",
+            "qué canción", // es
+            "cosa suona",
+            "cosa sta suonando",
+            "che canzone", // it
+            "现在播放",
+            "在放什么",
+            "什么歌", // zh
+            "지금 뭐 재생",
+            "무슨 노래",
+            "지금 곡", // ko
+            "今何を再生",
+            "何の曲",
+            "今流れてる", // ja
         ],
     ) {
         let result = executor.execute("now_playing", json!({})).await;
@@ -336,7 +422,20 @@ async fn local_ai_query(
     }
 
     // --- Zone selection ---
-    if matches_any(&msg, &["zone", "zones", "list zones", "les zones"]) {
+    if matches_any(
+        &msg,
+        &[
+            "zone",
+            "zones",
+            "list zones",
+            "les zones",
+            "zonen",  // de
+            "zonas",  // es
+            "ゾーン", // ja
+            "영역",   // ko
+            "区域",   // zh
+        ],
+    ) {
         let result = executor.execute("list_zones", json!({})).await;
         actions.push(json!({ "tool": "list_zones", "result": result }));
         let zones = result["zones"].as_array();
@@ -411,6 +510,10 @@ fn matches_any(msg: &str, patterns: &[&str]) -> bool {
 
 fn extract_play_query(msg: &str) -> Option<&str> {
     let prefixes = [
+        // en
+        "play ",
+        "listen to ",
+        // fr
         "joue ",
         "jouer ",
         "joue-moi ",
@@ -421,11 +524,40 @@ fn extract_play_query(msg: &str) -> Option<&str> {
         "mettre ",
         "lance ",
         "lancer ",
-        "play ",
         "écouter ",
         "ecouter ",
         "fais tourner ",
         "balance ",
+        // de
+        "spiele ",
+        "spiel ",
+        "höre ",
+        "hör ",
+        "abspielen ",
+        "starte ",
+        // es
+        "pon ",
+        "reproduce ",
+        "escucha ",
+        "ponme ",
+        // it
+        "riproduci ",
+        "ascolta ",
+        "metti ",
+        "suona ",
+        // zh
+        "播放 ",
+        "听 ",
+        "放 ",
+        // ko
+        "재생 ",
+        "틀어 ",
+        "들려줘 ",
+        // ja
+        "再生 ",
+        "かけて ",
+        "聴かせて ",
+        "流して ",
     ];
     for prefix in &prefixes {
         if let Some(rest) = msg.strip_prefix(prefix) {
@@ -442,10 +574,14 @@ fn extract_play_query(msg: &str) -> Option<&str> {
 
 fn extract_search_query(msg: &str) -> Option<&str> {
     let prefixes = [
-        "cherche ",
-        "recherche ",
+        // en
         "search ",
         "find ",
+        "look for ",
+        "search for ",
+        // fr
+        "cherche ",
+        "recherche ",
         "trouve ",
         "trouver ",
         "ai-je ",
@@ -453,6 +589,29 @@ fn extract_search_query(msg: &str) -> Option<&str> {
         "quels ",
         "quelles ",
         "combien ",
+        // de
+        "suche ",
+        "finde ",
+        "such ",
+        // es
+        "busca ",
+        "buscar ",
+        "encuentra ",
+        // it
+        "cerca ",
+        "cercare ",
+        "trova ",
+        // zh
+        "搜索 ",
+        "查找 ",
+        "找 ",
+        // ko
+        "검색 ",
+        "찾아 ",
+        // ja
+        "検索 ",
+        "探して ",
+        "調べて ",
     ];
     for prefix in &prefixes {
         if let Some(rest) = msg.strip_prefix(prefix) {
@@ -467,11 +626,15 @@ fn extract_search_query(msg: &str) -> Option<&str> {
 
 fn strip_service_suffix(s: &str) -> &str {
     let suffixes = [
+        // fr
         " sur qobuz",
         " sur tidal",
         " sur deezer",
         " sur spotify",
         " sur youtube",
+        " de qobuz",
+        " de tidal",
+        // en
         " on qobuz",
         " on tidal",
         " on deezer",
@@ -479,8 +642,29 @@ fn strip_service_suffix(s: &str) -> &str {
         " on youtube",
         " from qobuz",
         " from tidal",
-        " de qobuz",
-        " de tidal",
+        // de
+        " auf qobuz",
+        " auf tidal",
+        " auf deezer",
+        " auf spotify",
+        " auf youtube",
+        " von qobuz",
+        " von tidal",
+        // es
+        " en qobuz",
+        " en tidal",
+        " en deezer",
+        " en spotify",
+        " en youtube",
+        // it
+        " su qobuz",
+        " su tidal",
+        " su deezer",
+        " su spotify",
+        " su youtube",
+        // zh/ko/ja — service names stay latin
+        " qobuz",
+        " tidal",
     ];
     for suffix in &suffixes {
         if let Some(stripped) = s.strip_suffix(suffix) {
@@ -491,8 +675,13 @@ fn strip_service_suffix(s: &str) -> &str {
 }
 
 fn parse_volume(msg: &str) -> Option<f64> {
-    // "volume 80", "volume à 80%", "volume 80%", "monte le volume a 50"
-    if !msg.contains("volume") && !msg.contains("vol ") {
+    if !msg.contains("volume") && !msg.contains("vol ")
+        && !msg.contains("lautstärke") && !msg.contains("lautstarke")   // de
+        && !msg.contains("volumen")                                      // es
+        && !msg.contains("音量")                                          // zh/ja
+        && !msg.contains("볼륨")
+    // ko
+    {
         return None;
     }
     for word in msg.split(|c: char| !c.is_ascii_digit() && c != '.') {
