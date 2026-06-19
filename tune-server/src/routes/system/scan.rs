@@ -148,7 +148,8 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     Vec::with_capacity(batch.len() / 4);
 
                 // BEGIN transaction for this batch
-                if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+                let begin_sql = if db.engine() == tune_core::db::engine::Engine::Postgres { "BEGIN" } else { "BEGIN IMMEDIATE" };
+                if let Err(e) = db.execute_batch(begin_sql) {
                     tracing::warn!(error = %e, batch = batch_idx, "scan_batch_begin_failed");
                 }
 
@@ -561,7 +562,8 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         }
 
         // Backfill + album stats in a single transaction
-        if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+        let post_begin = if db.engine() == tune_core::db::engine::Engine::Postgres { "BEGIN" } else { "BEGIN IMMEDIATE" };
+        if let Err(e) = db.execute_batch(post_begin) {
             tracing::warn!(error = %e, "post_scan_begin_failed");
         }
         {
