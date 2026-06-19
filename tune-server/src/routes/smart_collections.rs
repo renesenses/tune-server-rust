@@ -270,21 +270,37 @@ fn build_album_query(
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
         let op = rule
-            .get("op")
+            .get("operator")
+            .or_else(|| rule.get("op"))
             .and_then(|v| v.as_str())
             .unwrap_or("contains");
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
         let cond = match (field, op) {
-            ("genre", "eq") => format!("t.genre = '{}'", value.replace('\'', "''")),
-            ("genre", "contains") => format!("t.genre LIKE '%{}%'", value.replace('\'', "''")),
-            ("artist", "eq") => format!("ar.name = '{}'", value.replace('\'', "''")),
-            ("artist", "contains") => format!("ar.name LIKE '%{}%'", value.replace('\'', "''")),
-            ("album", "eq") => format!("al.title = '{}'", value.replace('\'', "''")),
-            ("album", "contains") => format!("al.title LIKE '%{}%'", value.replace('\'', "''")),
-            ("year", "eq") => format!("al.year = {}", value.parse::<i32>().unwrap_or(0)),
-            ("year", "gte") => format!("al.year >= {}", value.parse::<i32>().unwrap_or(0)),
-            ("year", "lte") => format!("al.year <= {}", value.parse::<i32>().unwrap_or(0)),
+            ("genre", "eq" | "equals") => format!("t.genre = '{}'", value.replace('\'', "''")),
+            ("genre", "contains") => format!(
+                "LOWER(t.genre) LIKE LOWER('%{}%')",
+                value.replace('\'', "''")
+            ),
+            ("artist", "eq" | "equals") => format!("ar.name = '{}'", value.replace('\'', "''")),
+            ("artist", "contains") => format!(
+                "LOWER(ar.name) LIKE LOWER('%{}%')",
+                value.replace('\'', "''")
+            ),
+            ("album" | "album_title", "eq" | "equals") => {
+                format!("al.title = '{}'", value.replace('\'', "''"))
+            }
+            ("album" | "album_title", "contains") => format!(
+                "LOWER(al.title) LIKE LOWER('%{}%')",
+                value.replace('\'', "''")
+            ),
+            ("year", "eq" | "equals") => format!("al.year = {}", value.parse::<i32>().unwrap_or(0)),
+            ("year", "gte" | "greater_than") => {
+                format!("al.year >= {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("year", "lte" | "less_than") => {
+                format!("al.year <= {}", value.parse::<i32>().unwrap_or(0))
+            }
             ("year", "between") => {
                 let parts: Vec<&str> = value.splitn(2, ',').collect();
                 if parts.len() == 2 {
@@ -297,15 +313,20 @@ fn build_album_query(
                     format!("al.year = {}", value.parse::<i32>().unwrap_or(0))
                 }
             }
-            ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
-            ("sample_rate", "gte") => {
+            ("format", "eq" | "equals") => {
+                format!("LOWER(t.format) = LOWER('{}')", value.replace('\'', "''"))
+            }
+            ("sample_rate", "gte" | "greater_than") => {
                 format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0))
             }
-            ("bit_depth", "gte") => {
+            ("bit_depth", "gte" | "greater_than") => {
                 format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0))
             }
-            ("label", "eq") => format!("al.label = '{}'", value.replace('\'', "''")),
-            ("label", "contains") => format!("al.label LIKE '%{}%'", value.replace('\'', "''")),
+            ("label", "eq" | "equals") => format!("al.label = '{}'", value.replace('\'', "''")),
+            ("label", "contains") => format!(
+                "LOWER(al.label) LIKE LOWER('%{}%')",
+                value.replace('\'', "''")
+            ),
             _ => continue,
         };
         conditions.push(cond);
