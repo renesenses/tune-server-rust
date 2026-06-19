@@ -72,6 +72,21 @@ impl AsioExclusiveOutput {
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        // -- 0. Initialize COM for this thread (required for ASIO SDK) ------
+        // tokio::task::spawn_blocking worker threads don't have COM initialized.
+        // Without this, cpal::host_from_id(Asio) fails to enumerate drivers
+        // because the ASIO SDK uses COM internally.
+        #[cfg(target_os = "windows")]
+        {
+            extern "system" {
+                fn CoInitializeEx(pvreserved: *const std::ffi::c_void, dwcoinit: u32) -> i32;
+            }
+            const COINIT_MULTITHREADED: u32 = 0x0;
+            unsafe {
+                CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED);
+            }
+        }
+
         // -- 1. Get the ASIO host -------------------------------------------
         let host = cpal::host_from_id(cpal::HostId::Asio)
             .map_err(|e| format!("Failed to get ASIO host: {e}"))?;
