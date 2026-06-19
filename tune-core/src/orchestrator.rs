@@ -694,6 +694,7 @@ impl PlaybackOrchestrator {
 
                 let tmp_path_clone = tmp_path.clone();
                 let target_fmt_str = target_format_str.clone();
+                let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
                 let transcode_result = tokio::task::spawn_blocking(move || {
                     // 1. Decode source to PCM
                     let decoded = crate::audio::decode::decode_to_pcm(
@@ -704,8 +705,13 @@ impl PlaybackOrchestrator {
                         0.0,
                     )?;
 
-                    let pcm_bytes = decoded.pcm_bytes();
+                    let mut pcm_bytes = decoded.pcm_bytes();
                     let actual_bd = decoded.bit_depth;
+
+                    // 1b. Apply EQ if enabled for this zone
+                    if let Some(mut eq) = eq_profile {
+                        eq.process_pcm(&mut pcm_bytes, actual_bd);
+                    }
 
                     // 2. Encode to target format
                     let rt = tokio::runtime::Handle::try_current()
@@ -1324,6 +1330,7 @@ impl PlaybackOrchestrator {
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
+            let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
             let transcode_result = tokio::task::spawn_blocking(move || {
                 let decoded = crate::audio::decode::decode_to_pcm(
                     &unique_path_clone,
@@ -1333,8 +1340,12 @@ impl PlaybackOrchestrator {
                     0.0,
                 )?;
 
-                let pcm_bytes = decoded.pcm_bytes();
+                let mut pcm_bytes = decoded.pcm_bytes();
                 let actual_bd = decoded.bit_depth;
+
+                if let Some(mut eq) = eq_profile_pretranscode {
+                    eq.process_pcm(&mut pcm_bytes, actual_bd);
+                }
 
                 let rt = tokio::runtime::Handle::try_current()
                     .map_err(|e| format!("no tokio runtime: {e}"))?;
@@ -1747,6 +1758,26 @@ impl PlaybackOrchestrator {
                 )),
             )
         }
+    }
+
+    fn load_eq_processor(
+        &self,
+        zone_id: i64,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Option<crate::audio::eq::EqProcessor> {
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        let key = format!("zone_{zone_id}_eq_profile");
+        let profile: crate::audio::eq::EqProfile = settings
+            .get(&key)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())?;
+        if !profile.enabled {
+            return None;
+        }
+        let eq = crate::audio::eq::EqProcessor::new(&profile, sample_rate, channels);
+        if eq.is_enabled() { Some(eq) } else { None }
     }
 
     fn record_listen(
