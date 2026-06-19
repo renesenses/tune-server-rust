@@ -335,30 +335,33 @@ fn spawn_heartbeat(state: &AppState) {
             let uptime_s = started_at.elapsed().as_secs();
 
             // Collect authenticated streaming services
-            let authenticated_services: Vec<String> = {
-                let registry = services.lock().await;
-                let names = registry.list();
-                let svc_handles: Vec<_> = names
-                    .iter()
-                    .filter_map(|n| registry.get(n).map(|h| (n.clone(), h)))
-                    .collect();
-                drop(registry); // release registry lock before checking auth
+            // Use try_lock to avoid blocking the heartbeat if another
+            // task holds the services or outputs lock.
+            let authenticated_services: Vec<String> = match services.try_lock() {
+                Ok(registry) => {
+                    let names = registry.list();
+                    let svc_handles: Vec<_> = names
+                        .iter()
+                        .filter_map(|n| registry.get(n).map(|h| (n.clone(), h)))
+                        .collect();
+                    drop(registry);
 
-                let mut authed = Vec::new();
-                for (name, handle) in svc_handles {
-                    let svc = handle.lock().await;
-                    let status = svc.auth_status().await;
-                    if status.authenticated {
-                        authed.push(name);
+                    let mut authed = Vec::new();
+                    for (name, handle) in svc_handles {
+                        if let Ok(svc) = handle.try_lock() {
+                            let status = svc.auth_status().await;
+                            if status.authenticated {
+                                authed.push(name);
+                            }
+                        }
                     }
+                    authed
                 }
-                authed
+                Err(_) => Vec::new(),
             };
 
-            // Collect registered device IDs (no async lock per-output)
-            let devices: Vec<serde_json::Value> = {
-                let registry = outputs.lock().await;
-                registry
+            let devices: Vec<serde_json::Value> = match outputs.try_lock() {
+                Ok(registry) => registry
                     .list()
                     .into_iter()
                     .map(|id| {
@@ -381,7 +384,8 @@ fn spawn_heartbeat(state: &AppState) {
                             .unwrap_or(&id);
                         serde_json::json!({ "name": name, "type": dev_type })
                     })
-                    .collect()
+                    .collect(),
+                Err(_) => Vec::new(),
             };
 
             let payload = serde_json::json!({
