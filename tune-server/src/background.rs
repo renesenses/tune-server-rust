@@ -344,6 +344,7 @@ fn spawn_heartbeat(state: &AppState) {
 
             match client
                 .post("https://mozaiklabs.fr/api/v1/heartbeat")
+                .header("Accept", "application/json")
                 .json(&payload)
                 .send()
                 .await
