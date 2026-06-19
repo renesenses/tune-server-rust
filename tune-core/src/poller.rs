@@ -1091,7 +1091,8 @@ mod tests {
         assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
         ps.stopped_ticks = 2;
         assert!(ps.stopped_ticks < STOPPED_TICKS_THRESHOLD);
-        ps.stopped_ticks = 3;
+        // STOPPED_TICKS_THRESHOLD is 5, so it takes 5 ticks to trigger
+        ps.stopped_ticks = STOPPED_TICKS_THRESHOLD;
         assert!(ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD);
     }
 

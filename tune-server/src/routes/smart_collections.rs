@@ -112,7 +112,7 @@ async fn create_collection(
         .execute(
             "INSERT INTO smart_collections \
          (name, rules, match_mode, sort_by, sort_order, max_limit, description, icon, color) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
                 &body.name as &dyn ToSqlValue,
                 &rules_json as &dyn ToSqlValue,
@@ -153,7 +153,7 @@ async fn get_collection(
         .query_one(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
          description, icon, color, created_at \
-         FROM smart_collections WHERE id = ?",
+         FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -171,56 +171,56 @@ async fn update_collection(
 ) -> Result<impl IntoResponse, AppError> {
     if let Some(ref name) = body.name {
         state.backend.execute(
-            "UPDATE smart_collections SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref rules) = body.rules {
         let rules_json = rules.to_string();
         state.backend.execute(
-            "UPDATE smart_collections SET rules = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET rules = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[&rules_json as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref match_mode) = body.match_mode {
         state.backend.execute(
-            "UPDATE smart_collections SET match_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET match_mode = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[match_mode as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref sort_by) = body.sort_by {
         state.backend.execute(
-            "UPDATE smart_collections SET sort_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET sort_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[sort_by as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref sort_order) = body.sort_order {
         state.backend.execute(
-            "UPDATE smart_collections SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET sort_order = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[sort_order as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref max_limit) = body.max_limit {
         state.backend.execute(
-            "UPDATE smart_collections SET max_limit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET max_limit = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[max_limit as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref description) = body.description {
         state.backend.execute(
-            "UPDATE smart_collections SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET description = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[description as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref icon) = body.icon {
         state.backend.execute(
-            "UPDATE smart_collections SET icon = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET icon = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[icon as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
     if let Some(ref color) = body.color {
         state.backend.execute(
-            "UPDATE smart_collections SET color = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE smart_collections SET color = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             &[color as &dyn ToSqlValue, &id as &dyn ToSqlValue],
         ).ok();
     }
@@ -231,7 +231,7 @@ async fn update_collection(
         .query_one(
             "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
          description, icon, color, created_at \
-         FROM smart_collections WHERE id = ?",
+         FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
@@ -249,7 +249,7 @@ async fn delete_collection(
     state
         .backend
         .execute(
-            "DELETE FROM smart_collections WHERE id = ?",
+            "DELETE FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
         .ok();
@@ -390,7 +390,7 @@ fn load_collection_criteria(
         .backend
         .query_one(
             "SELECT rules, match_mode, sort_by, sort_order, max_limit \
-         FROM smart_collections WHERE id = ?",
+         FROM smart_collections WHERE id = $1",
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
