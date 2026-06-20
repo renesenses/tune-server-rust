@@ -317,7 +317,60 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         }
     }
 
-    // Fallback: return in-memory ring buffer if available, or empty
+    // macOS: try `log show` for unified logging
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("log")
+            .args([
+                "show",
+                "--predicate",
+                "process == \"tune-server\"",
+                "--last",
+                "5m",
+                "--style",
+                "compact",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let lines: Vec<&str> = text.lines().rev().take(max_lines).collect();
+                let lines: Vec<&str> = lines.into_iter().rev().collect();
+                if lines.len() > 1 {
+                    return Json(json!({
+                        "logs": lines.join("\n"),
+                        "lines": lines.len(),
+                        "source": "macos_log",
+                    }));
+                }
+            }
+        }
+    }
+
+    // Fallback: check stderr capture file (homebrew launchd)
+    let stderr_paths = [
+        format!(
+            "{}/Library/Logs/tune-server.log",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+        ),
+        "/usr/local/var/log/tune-server.log".into(),
+        "/opt/homebrew/var/log/tune-server.log".into(),
+    ];
+    for p in &stderr_paths {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
+            let lines: Vec<&str> = lines.into_iter().rev().collect();
+            if !lines.is_empty() {
+                return Json(json!({
+                    "logs": lines.join("\n"),
+                    "lines": lines.len(),
+                    "source": "file",
+                    "path": p,
+                }));
+            }
+        }
+    }
+
     Json(json!({
         "logs": "No log file found. Launch Tune from a terminal to see logs in real-time.\nChecked: ".to_owned() + &log_path,
         "lines": 0,
