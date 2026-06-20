@@ -78,7 +78,7 @@ impl AsioExclusiveOutput {
         // because the ASIO SDK uses COM internally.
         #[cfg(target_os = "windows")]
         {
-            extern "system" {
+            unsafe extern "system" {
                 fn CoInitializeEx(pvreserved: *const std::ffi::c_void, dwcoinit: u32) -> i32;
             }
             const COINIT_MULTITHREADED: u32 = 0x0;
