@@ -360,6 +360,15 @@ fn spawn_heartbeat(state: &AppState) {
                 Err(_) => Vec::new(),
             };
 
+            // Look up friendly names from zones DB
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+            let zone_names: std::collections::HashMap<String, String> = zone_repo
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|z| z.output_device_id.map(|did| (did, z.name)))
+                .collect();
+
             let devices: Vec<serde_json::Value> = match outputs.try_lock() {
                 Ok(registry) => registry
                     .list()
@@ -378,10 +387,11 @@ fn spawn_heartbeat(state: &AppState) {
                         } else {
                             "other"
                         };
-                        let name = id
-                            .strip_prefix("local:")
-                            .or_else(|| id.strip_prefix("uuid:"))
-                            .unwrap_or(&id);
+                        let name = zone_names.get(&id).map(|n| n.as_str()).unwrap_or_else(|| {
+                            id.strip_prefix("local:")
+                                .or_else(|| id.strip_prefix("uuid:"))
+                                .unwrap_or(&id)
+                        });
                         serde_json::json!({ "name": name, "type": dev_type })
                     })
                     .collect(),
