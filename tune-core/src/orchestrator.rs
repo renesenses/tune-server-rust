@@ -739,50 +739,53 @@ impl PlaybackOrchestrator {
                 let tmp_path_clone = tmp_path.clone();
                 let target_fmt_str = target_format_str.clone();
                 let eq_profile = self.load_eq_processor(req.zone_id, out_sr, channels);
-                let transcode_result = tokio::task::spawn_blocking(move || {
-                    // 1. Decode source to PCM
-                    let decoded = crate::audio::decode::decode_to_pcm(
-                        &fp,
-                        Some(out_sr),
-                        Some(channels as u32),
-                        0.0,
-                        0.0,
-                    )?;
+                let transcode_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        // 1. Decode source to PCM
+                        let decoded = crate::audio::decode::decode_to_pcm(
+                            &fp,
+                            Some(out_sr),
+                            Some(channels as u32),
+                            0.0,
+                            0.0,
+                        )?;
 
-                    let mut pcm_bytes = decoded.pcm_bytes();
-                    let actual_bd = decoded.bit_depth;
+                        let mut pcm_bytes = decoded.pcm_bytes();
+                        let actual_bd = decoded.bit_depth;
 
-                    // 1b. Apply EQ if enabled for this zone
-                    if let Some(mut eq) = eq_profile {
-                        eq.process_pcm(&mut pcm_bytes, actual_bd);
-                    }
+                        // 1b. Apply EQ if enabled for this zone
+                        if let Some(mut eq) = eq_profile {
+                            eq.process_pcm(&mut pcm_bytes, actual_bd);
+                        }
 
-                    // 2. Encode to target format
-                    let rt = tokio::runtime::Handle::try_current()
-                        .map_err(|e| format!("no tokio runtime: {e}"))?;
-                    let encoded_data = rt.block_on(async {
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            &target_fmt_str,
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        encoder.finish().await
-                    })?;
+                        // 2. Encode to target format
+                        let rt = tokio::runtime::Handle::try_current()
+                            .map_err(|e| format!("no tokio runtime: {e}"))?;
+                        let encoded_data = rt.block_on(async {
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                &target_fmt_str,
+                                decoded.sample_rate,
+                                actual_bd as u32,
+                                decoded.channels,
+                            );
+                            encoder.start().await?;
+                            encoder.write(&pcm_bytes).await?;
+                            encoder.finish().await
+                        })?;
 
-                    // 3. Write to temp file
-                    std::fs::write(&tmp_path_clone, &encoded_data)
-                        .map_err(|e| format!("write temp file: {e}"))?;
+                        // 3. Write to temp file
+                        std::fs::write(&tmp_path_clone, &encoded_data)
+                            .map_err(|e| format!("write temp file: {e}"))?;
 
-                    let file_size = encoded_data.len() as u64;
-                    Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
-                })
+                        let file_size = encoded_data.len() as u64;
+                        Ok::<(u64, Vec<u8>, u16), String>((file_size, pcm_bytes, actual_bd))
+                    }),
+                )
                 .await;
 
                 match transcode_result {
-                    Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
+                    Ok(Ok(Ok((file_size, pcm_bytes, actual_bd)))) => {
                         if file_size < 1024 {
                             warn!(
                                 file = %file_path,
@@ -870,15 +873,22 @@ impl PlaybackOrchestrator {
                             Some(channels as u32),
                         )
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         warn!(error = %e, file = %file_path, "transcode_to_temp_file_failed");
                         let _ = std::fs::remove_file(&tmp_path);
                         return Err(format!("transcode failed: {e}"));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(error = %e, file = %file_path, "transcode_to_temp_file_task_panic");
                         let _ = std::fs::remove_file(&tmp_path);
                         return Err(format!("transcode task panic: {e}"));
+                    }
+                    Err(_) => {
+                        warn!(file = %file_path, "transcode_timeout_30s");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(
+                            "transcode timeout (30s) — file too large or I/O stalled".into()
+                        );
                     }
                 }
             } else {
