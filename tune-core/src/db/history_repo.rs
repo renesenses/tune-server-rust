@@ -947,8 +947,8 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?)"));
-        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"));
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));

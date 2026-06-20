@@ -3021,7 +3021,7 @@ mod tests {
     #[test]
     fn pkce_client_id_is_correct() {
         // Regression test: ensure we're using our own registered Tidal app
-        assert_eq!(CLIENT_ID, "n9JALqHugEUxV4MZ");
+        assert_eq!(CLIENT_ID, "fX2JxdmntZWK0ixT");
     }
 
     #[test]
@@ -3077,7 +3077,7 @@ mod tests {
         let url = TidalService::build_authorize_url(challenge, state);
 
         assert!(url.starts_with("https://login.tidal.com/authorize?"));
-        assert!(url.contains("client_id=n9JALqHugEUxV4MZ"));
+        assert!(url.contains("client_id=fX2JxdmntZWK0ixT"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("redirect_uri="));
         assert!(url.contains("localhost%3A8888"));
@@ -3085,9 +3085,8 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state=test_state_xyz"));
         assert!(url.contains("scope="));
-        assert!(url.contains("r_usr"));
-        assert!(url.contains("w_usr"));
-        assert!(url.contains("w_sub"));
+        assert!(url.contains("user.read"));
+        assert!(url.contains("playback"));
     }
 
     #[test]
