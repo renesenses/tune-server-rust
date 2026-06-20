@@ -1576,15 +1576,117 @@ impl OutputTarget for LocalOutput {
                 return;
             }
 
-            // Warn if exclusive_mode was requested but not available on this path
+            // ------- WASAPI Exclusive mode path (Windows, non-ASIO) -------
             #[cfg(target_os = "windows")]
             if exclusive_mode && audio_backend != "asio" {
-                warn!(
-                    "wasapi_exclusive_not_implemented — \
-                    WASAPI Exclusive mode is not yet available. \
-                    Set TUNE_LOCAL_AUDIO_BACKEND=asio for bit-perfect output. \
-                    Falling back to WASAPI Shared mode."
+                use super::wasapi_exclusive::WasapiExclusiveOutput;
+
+                info!(
+                    device = %device_name,
+                    sample_rate,
+                    bit_depth,
+                    channels,
+                    "local_audio_wasapi_exclusive_mode_active"
                 );
+
+                let ring_cap = (sample_rate as usize) * (channels as usize) * 2;
+                let ring = Arc::new(RingBuf::new(ring_cap));
+                ring.clear();
+
+                match WasapiExclusiveOutput::new(
+                    &device_name,
+                    sample_rate,
+                    bit_depth as u32,
+                    channels as u32,
+                    ring.clone(),
+                    volume.clone(),
+                    paused.clone(),
+                ) {
+                    Ok(mut wasapi) => {
+                        if let Err(e) = wasapi.start() {
+                            warn!(error = %e, "wasapi_exclusive_start_failed_falling_back");
+                        } else {
+                            info!(
+                                device = %device_name,
+                                info = %wasapi.format_info(),
+                                "wasapi_exclusive_playing"
+                            );
+
+                            let pcm_data = if data_offset < header_buf.len() {
+                                header_buf[data_offset..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let mut total_frames_fed: u64 = 0;
+                            let mut read_buf = vec![0u8; 65536];
+                            let mut leftover: Vec<u8> = Vec::new();
+
+                            if !pcm_data.is_empty() {
+                                let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
+                                if aligned_len > 0 {
+                                    let samples =
+                                        pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+                                    feed_ring_abortable(
+                                        &ring,
+                                        &samples,
+                                        &stop_rx,
+                                        &paused,
+                                        Some(&force_silent),
+                                    );
+                                    total_frames_fed += (aligned_len / frame_bytes) as u64;
+                                }
+                                if aligned_len < pcm_data.len() {
+                                    leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                                }
+                            }
+
+                            loop {
+                                if stop_rx.try_recv().is_ok() {
+                                    break;
+                                }
+                                match reader.read(&mut read_buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        leftover.extend_from_slice(&read_buf[..n]);
+                                        let aligned = (leftover.len() / frame_bytes) * frame_bytes;
+                                        if aligned > 0 {
+                                            let samples =
+                                                pcm_bytes_to_f32(&leftover[..aligned], bit_depth);
+                                            feed_ring_abortable(
+                                                &ring,
+                                                &samples,
+                                                &stop_rx,
+                                                &paused,
+                                                Some(&force_silent),
+                                            );
+                                            total_frames_fed += (aligned / frame_bytes) as u64;
+                                            leftover.drain(..aligned);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            wasapi.stop();
+                            if play_generation.load(Ordering::SeqCst) == my_generation {
+                                playing.store(false, Ordering::SeqCst);
+                            }
+                            info!(
+                                device = %device_name,
+                                frames = total_frames_fed,
+                                "local_audio_wasapi_exclusive_stopped"
+                            );
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "wasapi_exclusive_init_failed_falling_back_to_shared"
+                        );
+                    }
+                }
             }
             #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "asio"))))]
             let _ = exclusive_mode;

@@ -22,6 +22,8 @@ pub mod openhome;
 pub mod registry;
 pub mod squeezebox;
 pub mod traits;
+#[cfg(all(target_os = "windows", feature = "local-audio"))]
+pub mod wasapi_exclusive;
 
 pub use registry::OutputRegistry;
 pub use traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
