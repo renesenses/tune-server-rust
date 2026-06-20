@@ -632,11 +632,12 @@ impl WasapiExclusiveOutput {
     /// Stop and release all WASAPI resources.
     #[cfg(target_os = "windows")]
     pub fn stop(&mut self) {
+        use ffi::*;
         self.running.store(false, Ordering::SeqCst);
 
         // Stop the audio client
         unsafe {
-            type StopFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> HRESULT;
+            type StopFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
             let vtable = *(self.audio_client as *const *const *const std::ffi::c_void);
             let stop: StopFn = std::mem::transmute(*vtable.add(11));
             stop(self.audio_client);
