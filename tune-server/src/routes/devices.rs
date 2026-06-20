@@ -37,6 +37,10 @@ pub fn router() -> Router<AppState> {
         .route("/{device_id}", axum::routing::delete(delete_device))
         .route("/{device_id}/pair", post(pair_device))
         .route("/{device_id}/pair/pin", post(pair_device_pin))
+        .route(
+            "/{device_id}/airplay2/pair-pin-start",
+            post(airplay2_pair_pin_start),
+        )
 }
 
 async fn list_devices(State(state): State<AppState>) -> Json<Value> {
@@ -631,6 +635,62 @@ async fn pair_device(
     Path(device_id): Path<String>,
     Json(body): Json<PairRequest>,
 ) -> impl IntoResponse {
+    // Check if this is an AirPlay 2 device — trigger PIN display
+    let is_airplay2 = device_id.starts_with("airplay2:");
+    let host = if is_airplay2 {
+        let outputs = state.outputs.lock().await;
+        if let Some(arc) = outputs.get(&device_id) {
+            let o = arc.lock().await;
+            o.host().map(|h| h.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if is_airplay2 {
+        if let Some(host) = host {
+            let url = format!("http://{}:7000/pair-pin-start", host);
+            let client = tune_core::http::client::shared();
+            match client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!(device = %device_id, "airplay2_pair_pin_start_triggered");
+                    return Json(json!({
+                        "status": "awaiting_pin",
+                        "device_id": device_id,
+                        "message": "Enter the 4-digit PIN shown on the device screen",
+                    }))
+                    .into_response();
+                }
+                Ok(resp) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!("device returned HTTP {}", resp.status()),
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!("failed to reach device: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    // Non-AirPlay 2: simple pair registration
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("device_pair_{device_id}");
     let data = json!({
@@ -679,4 +739,67 @@ async fn pair_device_pin(
     settings.set(&key, &data.to_string()).ok();
     settings.delete(&pending_key).ok();
     Json(data).into_response()
+}
+
+/// Trigger AirPlay 2 PIN display on an Apple TV.
+/// The device shows a 4-digit PIN that the user enters via POST /pair/pin.
+async fn airplay2_pair_pin_start(
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    // Find the device's host from the output registry
+    let host = {
+        let outputs = state.outputs.lock().await;
+        if let Some(arc) = outputs.get(&device_id) {
+            let o = arc.lock().await;
+            o.host().map(|h| h.to_string())
+        } else {
+            None
+        }
+    };
+    let host = match host {
+        Some(h) => h,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "device not found or not connected"})),
+            )
+                .into_response();
+        }
+    };
+    let port = 7000u16;
+
+    // POST /pair-pin-start to the Apple TV
+    let url = format!("http://{}:{}/pair-pin-start", host, port);
+    let client = tune_core::http::client::shared();
+    match client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(device = %device_id, host = %host, "airplay2_pair_pin_start_sent");
+            Json(json!({
+                "status": "pin_requested",
+                "device_id": device_id,
+                "message": "Check the device screen for a 4-digit PIN",
+            }))
+            .into_response()
+        }
+        Ok(resp) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!("device returned HTTP {}", resp.status()),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!("failed to reach device: {e}"),
+            })),
+        )
+            .into_response(),
+    }
 }
