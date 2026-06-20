@@ -76,14 +76,16 @@ impl AsioExclusiveOutput {
         // tokio::task::spawn_blocking worker threads don't have COM initialized.
         // Without this, cpal::host_from_id(Asio) fails to enumerate drivers
         // because the ASIO SDK uses COM internally.
+        // ASIO drivers are old-school COM objects that require STA (Single-Threaded
+        // Apartment) mode — MTA causes registry reads and driver instantiation to fail.
         #[cfg(target_os = "windows")]
         {
             unsafe extern "system" {
                 fn CoInitializeEx(pvreserved: *const std::ffi::c_void, dwcoinit: u32) -> i32;
             }
-            const COINIT_MULTITHREADED: u32 = 0x0;
+            const COINIT_APARTMENTTHREADED: u32 = 0x2;
             unsafe {
-                CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED);
+                CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
             }
         }
 

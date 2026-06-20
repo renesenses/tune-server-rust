@@ -33,7 +33,7 @@ pub fn select_host(backend: &str) -> cpal::Host {
             unsafe extern "system" {
                 fn CoInitializeEx(pv: *const std::ffi::c_void, dw: u32) -> i32;
             }
-            CoInitializeEx(std::ptr::null(), 0x0); // COINIT_MULTITHREADED
+            CoInitializeEx(std::ptr::null(), 0x2); // COINIT_APARTMENTTHREADED (STA required by ASIO drivers)
         }
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
