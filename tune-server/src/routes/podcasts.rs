@@ -79,8 +79,29 @@ async fn subscribe(
     Json(body): Json<Subscribe>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
-    match state.backend.execute("INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES (?, ?, ?, ?, ?)", &[&body.feed_url as &dyn ToSqlValue, &body.title as &dyn ToSqlValue, &body.author as &dyn ToSqlValue, &body.image_url as &dyn ToSqlValue, &body.description as &dyn ToSqlValue]) {
-        Ok(_) => { let id = state.backend.last_insert_rowid(); info!(title = %body.title, feed_url = %body.feed_url, "podcast_subscribed"); (StatusCode::CREATED, Json(json!({"id": id, "title": body.title}))).into_response() }
+    let sql = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (feed_url) DO NOTHING"
+    } else {
+        "INSERT OR IGNORE INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES (?, ?, ?, ?, ?)"
+    };
+    match state.backend.execute(
+        sql,
+        &[
+            &body.feed_url as &dyn ToSqlValue,
+            &body.title as &dyn ToSqlValue,
+            &body.author as &dyn ToSqlValue,
+            &body.image_url as &dyn ToSqlValue,
+            &body.description as &dyn ToSqlValue,
+        ],
+    ) {
+        Ok(_) => {
+            info!(title = %body.title, feed_url = %body.feed_url, "podcast_subscribed");
+            (
+                StatusCode::CREATED,
+                Json(json!({"title": body.title, "feed_url": body.feed_url})),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
