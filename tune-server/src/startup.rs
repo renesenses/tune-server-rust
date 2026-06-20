@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
@@ -275,7 +275,13 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
     let audio_backend = &state.config.local_audio_backend;
-    let devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
+    let mut devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
+    // When ASIO is selected but returns no devices, also enumerate WASAPI
+    // so the user still has fallback outputs available.
+    if devices.is_empty() && audio_backend.to_lowercase() == "asio" {
+        warn!("asio_returned_no_devices — also enumerating WASAPI as fallback");
+        devices = tune_core::outputs::local::list_audio_devices_with_backend("wasapi");
+    }
     if !devices.is_empty() {
         let mut outputs = state.outputs.lock().await;
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
