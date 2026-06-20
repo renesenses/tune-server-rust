@@ -483,16 +483,21 @@ impl WasapiExclusiveOutput {
         let frame_bytes = channels * bytes_per_sample;
 
         let handle = std::thread::spawn(move || {
-            use super::wasapi_exclusive::ffi::*;
+            const S_OK_LOCAL: i32 = 0;
+            const WAIT_OBJECT_0_LOCAL: u32 = 0;
+
+            unsafe extern "system" {
+                fn WaitForSingleObject(h: *mut std::ffi::c_void, ms: u32) -> u32;
+            }
+
             let render_client = render_client as *mut std::ffi::c_void;
             let event_handle = event_handle as *mut std::ffi::c_void;
 
             info!("wasapi_exclusive_render_thread_started");
 
             while running.load(Ordering::SeqCst) {
-                // Wait for the event signal from WASAPI
                 let wait_result = unsafe { WaitForSingleObject(event_handle, 2000) };
-                if wait_result != WAIT_OBJECT_0 {
+                if wait_result != WAIT_OBJECT_0_LOCAL {
                     if running.load(Ordering::SeqCst) {
                         debug!("wasapi_exclusive_wait_timeout");
                     }
@@ -500,7 +505,6 @@ impl WasapiExclusiveOutput {
                 }
 
                 if paused.load(Ordering::SeqCst) {
-                    // Fill with silence when paused
                     unsafe {
                         let mut buf: *mut u8 = std::ptr::null_mut();
                         type GetBufferFn = unsafe extern "system" fn(
@@ -508,21 +512,17 @@ impl WasapiExclusiveOutput {
                             u32,
                             *mut *mut u8,
                         )
-                            -> HRESULT;
+                            -> i32;
                         let vtable = *(render_client as *const *const *const std::ffi::c_void);
                         let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
-                        if get_buf(render_client, buffer_frame_count, &mut buf) == S_OK {
+                        if get_buf(render_client, buffer_frame_count, &mut buf) == S_OK_LOCAL {
                             std::ptr::write_bytes(
                                 buf,
                                 0,
                                 (buffer_frame_count * frame_bytes) as usize,
                             );
-                            type RelBufFn = unsafe extern "system" fn(
-                                *mut std::ffi::c_void,
-                                u32,
-                                u32,
-                            )
-                                -> HRESULT;
+                            type RelBufFn =
+                                unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
                             let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
                             rel_buf(render_client, buffer_frame_count, 0);
                         }
@@ -530,19 +530,15 @@ impl WasapiExclusiveOutput {
                     continue;
                 }
 
-                // Get the WASAPI buffer
                 let needed_samples = (buffer_frame_count * channels) as usize;
                 unsafe {
                     let mut buf: *mut u8 = std::ptr::null_mut();
-                    type GetBufferFn = unsafe extern "system" fn(
-                        *mut std::ffi::c_void,
-                        u32,
-                        *mut *mut u8,
-                    ) -> HRESULT;
+                    type GetBufferFn =
+                        unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut *mut u8) -> i32;
                     let vtable = *(render_client as *const *const *const std::ffi::c_void);
                     let get_buf: GetBufferFn = std::mem::transmute(*vtable.add(3));
                     let hr = get_buf(render_client, buffer_frame_count, &mut buf);
-                    if hr != S_OK {
+                    if hr != S_OK_LOCAL {
                         debug!(
                             hr = format!("0x{hr:08X}"),
                             "wasapi_exclusive_getbuffer_failed"
@@ -614,7 +610,7 @@ impl WasapiExclusiveOutput {
                     }
 
                     type RelBufFn =
-                        unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> HRESULT;
+                        unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32) -> i32;
                     let rel_buf: RelBufFn = std::mem::transmute(*vtable.add(4));
                     rel_buf(render_client, buffer_frame_count, 0);
                 }
