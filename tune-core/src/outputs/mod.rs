@@ -23,6 +23,7 @@ pub mod registry;
 pub mod squeezebox;
 pub mod traits;
 #[cfg(all(target_os = "windows", feature = "local-audio"))]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub mod wasapi_exclusive;
 
 pub use registry::OutputRegistry;

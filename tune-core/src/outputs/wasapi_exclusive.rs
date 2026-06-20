@@ -158,12 +158,15 @@ mod ffi {
     }
 
     /// Call IUnknown::Release on a COM object.
+    #[allow(unused_unsafe)]
     pub unsafe fn release(obj: *mut c_void) {
         if !obj.is_null() {
             type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
-            let vtable = *(obj as *const *const *const c_void);
-            let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
-            release(obj);
+            unsafe {
+                let vtable = *(obj as *const *const *const c_void);
+                let release: ReleaseFn = std::mem::transmute(*vtable.add(2));
+                release(obj);
+            }
         }
     }
 }
@@ -480,6 +483,7 @@ impl WasapiExclusiveOutput {
         let frame_bytes = channels * bytes_per_sample;
 
         let handle = std::thread::spawn(move || {
+            use super::wasapi_exclusive::ffi::*;
             let render_client = render_client as *mut std::ffi::c_void;
             let event_handle = event_handle as *mut std::ffi::c_void;
 
