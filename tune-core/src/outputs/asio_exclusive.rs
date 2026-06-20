@@ -105,15 +105,26 @@ impl AsioExclusiveOutput {
                 .ok_or_else(|| "No default ASIO output device found".to_string())?
         } else {
             let mut found = None;
+            let search = device_name.to_lowercase();
             if let Ok(devices) = host.output_devices() {
+                let mut available_names = Vec::new();
                 for dev in devices {
                     if let Ok(desc) = dev.description() {
                         let name = desc.name().to_string();
-                        if name == device_name || name.contains(device_name) {
+                        let lower = name.to_lowercase();
+                        available_names.push(name.clone());
+                        if lower == search || lower.contains(&search) || search.contains(&lower) {
                             found = Some(dev);
                             break;
                         }
                     }
+                }
+                if found.is_none() {
+                    warn!(
+                        requested = %device_name,
+                        available = ?available_names,
+                        "asio_device_not_found_listing_available"
+                    );
                 }
             }
             match found {

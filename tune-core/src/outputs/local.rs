@@ -1576,7 +1576,16 @@ impl OutputTarget for LocalOutput {
                 return;
             }
 
-            // Suppress unused-variable warning on platforms without exclusive mode
+            // Warn if exclusive_mode was requested but not available on this path
+            #[cfg(target_os = "windows")]
+            if exclusive_mode && audio_backend != "asio" {
+                warn!(
+                    "wasapi_exclusive_not_implemented — \
+                    WASAPI Exclusive mode is not yet available. \
+                    Set TUNE_LOCAL_AUDIO_BACKEND=asio for bit-perfect output. \
+                    Falling back to WASAPI Shared mode."
+                );
+            }
             #[cfg(not(any(target_os = "macos", all(target_os = "windows", feature = "asio"))))]
             let _ = exclusive_mode;
 
@@ -2391,13 +2400,15 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
         return host.default_output_device().map(|d| (d, false));
     }
 
-    // Try exact or substring match first
+    // Try exact or substring match first (case-insensitive, bidirectional)
+    let search = device_name.to_lowercase();
     let found = host.output_devices().ok().and_then(|mut devs| {
         devs.find(|d| {
             d.description()
                 .map(|desc| {
                     let n = desc.name().to_string();
-                    n == device_name || n.contains(device_name)
+                    let lower = n.to_lowercase();
+                    lower == search || lower.contains(&search) || search.contains(&lower)
                 })
                 .unwrap_or(false)
         })
