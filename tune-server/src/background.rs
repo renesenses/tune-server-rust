@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use tune_core::outputs::OutputRegistry;
 
@@ -26,6 +26,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_bio_sync(state);
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
+    spawn_slimproto_server(state);
 }
 
 fn spawn_ssdp_startup_scan(state: &AppState) {
@@ -445,6 +446,16 @@ fn gethostname() -> Option<String> {
                 None
             }
         })
+}
+
+fn spawn_slimproto_server(state: &AppState) {
+    let _state = state.clone();
+    tokio::spawn(async move {
+        let server = Arc::new(tune_core::slimproto::SlimProtoServer::new());
+        if let Err(e) = server.spawn().await {
+            error!(error = %e, "slimproto_server_failed");
+        }
+    });
 }
 
 fn spawn_bio_sync(state: &AppState) {

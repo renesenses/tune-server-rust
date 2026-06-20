@@ -49,6 +49,7 @@ pub mod scanner;
 pub mod scrobble;
 pub mod services_manager;
 pub mod sleep_timer;
+pub mod slimproto;
 pub mod smb_discovery;
 pub mod stream_cache;
 pub mod streaming;
