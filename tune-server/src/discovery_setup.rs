@@ -224,13 +224,32 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                             (Some(Box::new(cast)), "chromecast")
                         }
                         OutputType::Airplay => {
-                            let ap = tune_core::outputs::airplay::AirplayOutput::new(
-                                dev.name.clone(),
-                                dev.id.clone(),
-                                dev.host.clone(),
-                                dev.port,
-                            );
-                            (Some(Box::new(ap)), "airplay")
+                            let is_v2 = dev.airplay_version.as_deref() == Some("2");
+                            if is_v2 && tune_core::outputs::airplay2::daemon_available() {
+                                let ap_dev_id = dev
+                                    .capabilities
+                                    .get("deviceid")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let ap2 = tune_core::outputs::airplay2::Airplay2Output::new(
+                                    dev.name.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                    dev.id.clone(),
+                                    ap_dev_id,
+                                );
+                                info!(name = %dev.name, "airplay2_output_registered");
+                                (Some(Box::new(ap2)), "airplay2")
+                            } else {
+                                let ap = tune_core::outputs::airplay::AirplayOutput::new(
+                                    dev.name.clone(),
+                                    dev.id.clone(),
+                                    dev.host.clone(),
+                                    dev.port,
+                                );
+                                (Some(Box::new(ap)), "airplay")
+                            }
                         }
                         OutputType::Bluos => {
                             let bluos = tune_core::outputs::bluos::BluosOutput::new(

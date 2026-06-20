@@ -1,4 +1,5 @@
 pub mod airplay;
+pub mod airplay2;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
 pub mod bluos;
