@@ -1203,7 +1203,7 @@ impl OutputTarget for LocalOutput {
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
                 // push as much as fits (~200ms or more) before calling play().
-                let prefill_target = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
+                let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
                 let prefill_count = samples.len().min(prefill_target.max(ring.capacity() / 2));
                 let initial_written = ring.push(&samples[..prefill_count]);
 
@@ -1696,11 +1696,9 @@ impl OutputTarget for LocalOutput {
             let ring_buf = Arc::new(RingBuf::new(ring_cap));
             ring_buf.clear(); // Defensive: zero-fill before callback can read
             // Minimum buffer: ~200ms of audio before the callback starts reading.
-            // (v0.8.97 used 20ms which was too low — macOS CoreAudio can
-            // request large buffers and underrun immediately after the gate
-            // opens, producing audible artifacts.)
+            // sr * ch / 5 = 200ms of interleaved samples.
             let min_buffer =
-                (output_config.sample_rate as usize) * (output_config.channels as usize) / 2;
+                (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
             let stream_result = build_stream(
                 &output_config,
                 ring_buf.clone(),
@@ -1915,7 +1913,7 @@ impl OutputTarget for LocalOutput {
 
             // Pre-fill the ring buffer before starting the cpal stream.
             // Target: ~500ms of audio so the first callback has enough data.
-            let prefill_target = (output_sr as usize) * (output_ch as usize) / 2; // ~500ms
+            let prefill_target = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms
             let mut stream_started = false;
 
             // Check if initial header data was enough to meet the prefill target
