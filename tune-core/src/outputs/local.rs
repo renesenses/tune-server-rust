@@ -30,10 +30,10 @@ pub fn select_host(backend: &str) -> cpal::Host {
         // ASIO SDK requires COM to be initialized on the calling thread
         #[cfg(target_os = "windows")]
         unsafe {
-            windows_sys::Win32::System::Com::CoInitializeEx(
-                std::ptr::null(),
-                windows_sys::Win32::System::Com::COINIT_MULTITHREADED,
-            );
+            unsafe extern "system" {
+                fn CoInitializeEx(pv: *const std::ffi::c_void, dw: u32) -> i32;
+            }
+            CoInitializeEx(std::ptr::null(), 0x0); // COINIT_MULTITHREADED
         }
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
