@@ -783,6 +783,15 @@ impl PlaybackOrchestrator {
 
                 match transcode_result {
                     Ok(Ok((file_size, pcm_bytes, actual_bd))) => {
+                        if file_size < 1024 {
+                            warn!(
+                                file = %file_path,
+                                file_size,
+                                "transcode_produced_empty_file — source may be corrupted or encrypted"
+                            );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err("transcode produced empty file (corrupted source?)".into());
+                        }
                         info!(
                             file = %file_path,
                             tmp = %tmp_path,
