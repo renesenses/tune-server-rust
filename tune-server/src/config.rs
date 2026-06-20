@@ -264,6 +264,7 @@ impl TuneConfig {
             }
         }
         if let Ok(v) = std::env::var("TUNE_LOCAL_AUDIO_BACKEND")
+            .or_else(|_| std::env::var("TUNE_AUDIO_BACKEND"))
             && !v.is_empty()
         {
             config.local_audio_backend = v;
