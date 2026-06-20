@@ -698,7 +698,18 @@ impl PositionPoller {
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             let is_short_track = track_duration_ms > 0
                                 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
+                            // When repeat mode is active (One or All) on DLNA,
+                            // be more lenient about accepting track-end: if the
+                            // renderer has reported Stopped and we've seen any
+                            // meaningful playback (peak > 5s), treat it as a
+                            // natural end so the poller re-triggers play instead
+                            // of accumulating stopped_ticks until force_stop.
+                            // (DEvir QA B-05: repeat mode doesn't work on DLNA)
+                            let repeat_active =
+                                matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All);
+                            let repeat_end = repeat_active && ps.peak_position_ms > 5_000;
                             let natural_end = played_enough
+                                || repeat_end
                                 || (is_short_track
                                     && ps.peak_position_ms as f64
                                         >= track_duration_ms as f64 * 0.5);
@@ -1006,7 +1017,14 @@ impl PositionPoller {
             return;
         };
 
-        info!(zone_id, next_pos, "auto_next");
+        let is_repeat = matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All);
+        info!(
+            zone_id,
+            next_pos,
+            repeat = ?zone_state.repeat,
+            is_repeat,
+            "auto_next"
+        );
         if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
             warn!(zone_id, error = %e, "auto_next_failed");
             self.orchestrator.stop(zone_id, device_id.as_deref()).await;

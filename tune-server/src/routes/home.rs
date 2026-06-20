@@ -15,6 +15,10 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 struct HomeParams {
     limit: Option<i64>,
+    /// Optional zone filter: when provided, continue-listening only shows
+    /// albums listened on this zone.  Clients should send the CURRENT active
+    /// zone so the response is relevant (DEvir QA B-09: zone mismatch).
+    zone_id: Option<i64>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -31,7 +35,8 @@ pub fn router() -> Router<AppState> {
 
 /// Aggregated home page: returns all sections in a single response.
 async fn home_page(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let continue_items = fetch_continue_listening(&state, 10)?;
+    // No zone filter for the aggregated home page — show all zones.
+    let continue_items = fetch_continue_listening(&state, 10, None)?;
     let recent_items = fetch_recently_added(&state, 20)?;
     let top_tracks = fetch_top_tracks(&state, 20);
     let radios = fetch_radio_picks(&state)?;
@@ -94,28 +99,45 @@ async fn continue_listening(
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(10);
-    let items = fetch_continue_listening(&state, limit)?;
+    // When zone_id is provided, filter continue-listening items to albums
+    // that were played on that specific zone. This prevents zone mismatch:
+    // the client sends the CURRENT active zone, not a stored zone from
+    // history (DEvir QA B-09).
+    let items = fetch_continue_listening(&state, limit, p.zone_id)?;
     Ok(Json(json!(items)))
 }
 
-fn fetch_continue_listening(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
+fn fetch_continue_listening(
+    state: &AppState,
+    limit: i64,
+    zone_id: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
     let conn = state
         .db
         .connection()
         .lock()
         .map_err(|e| AppError::internal(format!("{e}")))?;
-    let sql = "\
-        SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
+    // When a zone_id filter is provided, only show albums that were listened
+    // to on that zone.  This ensures the "continue listening" section matches
+    // the user's currently selected zone (B-09 fix).
+    let zone_filter = match zone_id {
+        Some(zid) => format!("AND lh.zone_id = {zid} "),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
         FROM listen_history lh \
         JOIN albums a ON lh.album_title = a.title \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
         WHERE a.track_count IS NOT NULL AND a.track_count > 0 \
+        {zone_filter}\
         GROUP BY a.id \
         HAVING listened_tracks < a.track_count \
         ORDER BY MAX(lh.listened_at) DESC \
-        LIMIT ?";
-    let mut stmt = match conn.prepare(sql) {
+        LIMIT ?"
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Ok(Vec::new()),
     };

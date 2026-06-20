@@ -659,11 +659,24 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
     // --- Step 1: UDP connect probe (follows the OS default route → real LAN) ---
     let probe_ip = udp_probe_ip();
     if let Some(ip) = probe_ip {
-        if !is_virtual_ip(ip) {
-            debug!(ip = %ip, method = "udp_probe", "local_ip_detected");
-            return Some(ip);
+        if is_virtual_ip(ip) {
+            debug!(ip = %ip, "udp_probe_returned_virtual_ip_skipping");
+        } else {
+            let o = ip.octets();
+            // If probe returned a 10.x.x.x address, check whether a 192.168.x.x
+            // interface exists — if so, prefer the LAN address since 10.x.x.x is
+            // often a VPN tunnel that DLNA renderers cannot reach (B-06).
+            let prefer_interface_enum = o[0] == 10 && has_192_168_interface();
+            if prefer_interface_enum {
+                debug!(
+                    ip = %ip,
+                    "udp_probe_returned_10x_but_192168_available_deferring"
+                );
+            } else {
+                debug!(ip = %ip, method = "udp_probe", "local_ip_detected");
+                return Some(ip);
+            }
         }
-        debug!(ip = %ip, "udp_probe_returned_virtual_ip_skipping");
     }
 
     // --- Step 2: enumerate interfaces, skip virtual adapters ---
@@ -713,6 +726,24 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
     None
 }
 
+/// Returns true if any non-loopback, non-virtual interface has a 192.168.x.x address.
+fn has_192_168_interface() -> bool {
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V4(ip) = iface.ip() {
+                let o = ip.octets();
+                if o[0] == 192 && o[1] == 168 && !is_virtual_interface(&iface.name, ip) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// UDP connect probe: the OS picks the interface for the default route.
 fn udp_probe_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
@@ -757,6 +788,12 @@ fn is_virtual_interface(name: &str, ip: Ipv4Addr) -> bool {
 /// Returns true if the IP falls in a well-known virtual adapter subnet.
 fn is_virtual_ip(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
+    // Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 – 100.127.255.255)
+    // DEvir QA B-06: DLNA fails when get_local_ip() returns a Tailscale IP
+    // because DLNA renderers on the LAN cannot reach 100.x.x.x addresses.
+    if o[0] == 100 && (o[1] & 0xC0) == 64 {
+        return true;
+    }
     // VirtualBox Host-Only default: 192.168.56.x
     if o[0] == 192 && o[1] == 168 && o[2] == 56 {
         return true;
@@ -825,6 +862,13 @@ mod tests {
 
     #[test]
     fn virtual_ip_detection() {
+        // Tailscale CGNAT range: 100.64.0.0/10
+        assert!(is_virtual_ip(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_virtual_ip(Ipv4Addr::new(100, 100, 50, 2)));
+        assert!(is_virtual_ip(Ipv4Addr::new(100, 127, 255, 255)));
+        // 100.x outside CGNAT range must NOT be flagged
+        assert!(!is_virtual_ip(Ipv4Addr::new(100, 0, 0, 1)));
+        assert!(!is_virtual_ip(Ipv4Addr::new(100, 128, 0, 1)));
         // VirtualBox Host-Only default
         assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 56, 1)));
         assert!(is_virtual_ip(Ipv4Addr::new(192, 168, 56, 100)));

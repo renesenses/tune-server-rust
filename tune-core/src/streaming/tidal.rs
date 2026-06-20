@@ -665,14 +665,45 @@ impl TidalService {
             ("assetpresentation", "FULL"),
             ("countryCode", self.country_code.as_str()),
         ];
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| format!("stream url: {e}"))?;
+
+        // Use a per-request timeout of 15 seconds (longer than the default
+        // client timeout of 30s for the overall request including redirects).
+        // Retry once on timeout — Tidal CDN can be slow to resolve stream
+        // URLs, especially for Hi-Res DASH manifests (DEvir QA B-07).
+        let mut last_err = String::new();
+        let mut resp = None;
+        for attempt in 0..2u8 {
+            match self
+                .client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .query(&params)
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_timeout = e.is_timeout() || e.is_connect();
+                    last_err = format!("stream url: {e}");
+                    if is_timeout && attempt == 0 {
+                        warn!(
+                            track_id,
+                            quality,
+                            attempt,
+                            error = %e,
+                            "tidal_playback_info_timeout_retrying"
+                        );
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            }
+        }
+        let resp = resp.ok_or(last_err)?;
 
         if resp.status() == 429 {
             return Err("tidal rate limited".into());

@@ -923,6 +923,13 @@ impl OutputTarget for LocalOutput {
         // Without this, reopening the device immediately can cause the first
         // few hundred milliseconds of the new stream to contain stale data
         // from the previous session, perceived as white noise / static.
+        //
+        // On Windows, WASAPI needs a longer delay (200ms) to fully release
+        // the device — 50ms causes 0x800700AA "resource busy" errors when
+        // switching tracks rapidly (reported by DEvir QA, B-01).
+        #[cfg(target_os = "windows")]
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        #[cfg(not(target_os = "windows"))]
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Create a FRESH force_silent flag for the new stream.
