@@ -895,6 +895,57 @@ impl StreamingService for QobuzService {
         Ok(added)
     }
 
+    async fn delete_playlist(&self, playlist_id: &str) -> Result<(), TuneError> {
+        self.api_post("/playlist/delete", &[("playlist_id", playlist_id)])
+            .await?;
+        Ok(())
+    }
+
+    /// Qobuz deletes by `playlist_track_id` (the per-position id), not the
+    /// source track id — so resolve them from the playlist first.
+    async fn remove_tracks_from_playlist(
+        &self,
+        playlist_id: &str,
+        track_ids: &[String],
+    ) -> Result<usize, TuneError> {
+        let data = self
+            .api_get(
+                "/playlist/get",
+                &[
+                    ("playlist_id", playlist_id),
+                    ("extra", "tracks"),
+                    ("limit", "500"),
+                ],
+            )
+            .await?;
+        let wanted: std::collections::HashSet<&str> =
+            track_ids.iter().map(|s| s.as_str()).collect();
+        let mut ptids: Vec<String> = Vec::new();
+        if let Some(items) = data["tracks"]["items"].as_array() {
+            for item in items {
+                let sid = item["id"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                if wanted.contains(sid.as_str()) {
+                    if let Some(ptid) = item["playlist_track_id"].as_u64() {
+                        ptids.push(ptid.to_string());
+                    }
+                }
+            }
+        }
+        if ptids.is_empty() {
+            return Ok(0);
+        }
+        let csv = ptids.join(",");
+        self.api_post(
+            "/playlist/deleteTracks",
+            &[("playlist_id", playlist_id), ("playlist_track_ids", &csv)],
+        )
+        .await?;
+        Ok(ptids.len())
+    }
+
     fn supports_write(&self) -> bool {
         self.user_auth_token.is_some()
     }

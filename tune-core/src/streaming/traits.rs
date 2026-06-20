@@ -160,6 +160,16 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<usize, TuneError> {
         Err("add_tracks_to_playlist not supported by this service".into())
     }
+    async fn delete_playlist(&self, _playlist_id: &str) -> Result<(), TuneError> {
+        Err("delete_playlist not supported by this service".into())
+    }
+    async fn remove_tracks_from_playlist(
+        &self,
+        _playlist_id: &str,
+        _track_ids: &[String],
+    ) -> Result<usize, TuneError> {
+        Err("remove_tracks_from_playlist not supported by this service".into())
+    }
     fn supports_write(&self) -> bool {
         false
     }
