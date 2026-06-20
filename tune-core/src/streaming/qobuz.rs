@@ -326,13 +326,19 @@ impl QobuzService {
         let base = self.api_base();
         let url = format!("{base}{path}");
         let app_id = self.app_id.as_str();
-        let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("app_id", app_id));
+        // Qobuz's Akamai edge rejects a body-less POST with HTTP 411 (Length
+        // Required). Send the parameters as an `application/x-www-form-urlencoded`
+        // body instead of a query string so the request carries a Content-Length.
+        let mut form: Vec<(&str, &str)> = params.to_vec();
+        form.push(("app_id", app_id));
+        if let Some(ref token) = self.user_auth_token {
+            form.push(("user_auth_token", token.as_str()));
+        }
 
         let mut req = self
             .client
             .post(&url)
-            .query(&query)
+            .form(&form)
             .header("X-App-Id", app_id);
 
         if let Some(ref token) = self.user_auth_token {
