@@ -632,7 +632,6 @@ impl WasapiExclusiveOutput {
     /// Stop and release all WASAPI resources.
     #[cfg(target_os = "windows")]
     pub fn stop(&mut self) {
-        use ffi::*;
         self.running.store(false, Ordering::SeqCst);
 
         // Stop the audio client
