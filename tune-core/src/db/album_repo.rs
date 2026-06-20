@@ -231,8 +231,16 @@ pub mod sql {
         "SELECT a.id, a.title, ar.name, a.musicbrainz_release_group_id, a.bio FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE a.bio IS NOT NULL AND a.bio != '' AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
     }
 
+    pub fn list_with_bio() -> &'static str {
+        "SELECT a.id, a.title, ar.name, a.musicbrainz_release_group_id, a.bio FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE a.bio IS NOT NULL AND a.bio != '' ORDER BY a.id"
+    }
+
     pub fn list_without_bio_with_mbid() -> &'static str {
         "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.bio IS NULL OR a.bio = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
+    }
+
+    pub fn list_without_bio_without_mbid() -> &'static str {
+        "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND (a.musicbrainz_release_group_id IS NULL OR a.musicbrainz_release_group_id = '') AND a.source = 'local' ORDER BY a.id"
     }
 
     pub fn search<D: SqlDialect>(d: &D) -> String {
@@ -644,6 +652,26 @@ impl AlbumRepo {
             .collect())
     }
 
+    /// Return all albums that have a non-empty bio, regardless of MBID.
+    /// Each entry is (title, artist_name, musicbrainz_release_group_id, bio).
+    /// The MBID may be None for albums without a MusicBrainz ID.
+    pub fn albums_with_bio(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Option<String>, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_bio(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
+                    cols.get(3).and_then(|v| v.as_string()),
+                    cols.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
     /// Return all albums that have a MusicBrainz release group ID but no local bio.
     /// Used by the community bio download to find candidates for enrichment.
     /// Each entry is (album_id, musicbrainz_release_group_id).
@@ -655,6 +683,27 @@ impl AlbumRepo {
                 (
                     cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                     cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Return all local albums without bio and without MBID.
+    /// Used by the community bio download to find candidates for title+artist lookup.
+    /// Each entry is (album_id, title, artist_name).
+    pub fn albums_without_bio_without_mbid(
+        &self,
+    ) -> Result<Vec<(i64, String, Option<String>)>, TuneError> {
+        let rows = self
+            .db
+            .query_many(sql::list_without_bio_without_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()),
                 )
             })
             .collect())

@@ -28,7 +28,8 @@ struct AlbumBioEntry {
     title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     artist_name: Option<String>,
-    musicbrainz_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    musicbrainz_id: Option<String>,
     bio: String,
 }
 
@@ -65,6 +66,19 @@ struct AlbumBiosWrapper {
     albums: Vec<AlbumBioResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AlbumByTitleBioResponse {
+    title: String,
+    artist_name: Option<String>,
+    bio: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumByTitleBiosWrapper {
+    #[serde(default)]
+    albums: Vec<AlbumByTitleBioResponse>,
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Upload local bios to mozaiklabs.fr in batches of 100.
@@ -89,7 +103,7 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
         }
     };
 
-    let albums = match album_repo.albums_with_bio_and_mbid() {
+    let albums = match album_repo.albums_with_bio() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_sync_album_query_failed");
@@ -132,7 +146,7 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
 
         let album_batch: Vec<AlbumBioEntry> = album_chunks
             .get(i)
-            .unwrap_or(&(&[] as &[(String, Option<String>, String, String)]))
+            .unwrap_or(&(&[] as &[(String, Option<String>, Option<String>, String)]))
             .iter()
             .map(|(title, artist_name, mbid, bio)| AlbumBioEntry {
                 title: title.clone(),
@@ -268,19 +282,16 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client)
 async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) {
     let album_repo = AlbumRepo::with_backend(db.clone());
 
-    let candidates = match album_repo.albums_without_bio_with_mbid() {
+    // Phase 1: download by MBID (existing path, for albums that have one)
+    let mbid_candidates = match album_repo.albums_without_bio_with_mbid() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "bio_download_album_candidates_failed");
-            return;
+            Vec::new()
         }
     };
 
-    if candidates.is_empty() {
-        return;
-    }
-
-    for chunk in candidates.chunks(BATCH_SIZE) {
+    for chunk in mbid_candidates.chunks(BATCH_SIZE) {
         let ids: Vec<&str> = chunk.iter().map(|(_, mbid)| mbid.as_str()).collect();
         let query = ids.join(",");
 
@@ -311,7 +322,6 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
             }
         };
 
-        // Build a lookup map from mbid -> album_id
         let id_map: std::collections::HashMap<&str, i64> = chunk
             .iter()
             .map(|(id, mbid)| (mbid.as_str(), *id))
@@ -329,7 +339,83 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         }
 
         if applied > 0 {
-            info!(applied, "bio_download_albums_applied");
+            info!(applied, "bio_download_albums_by_mbid_applied");
+        }
+    }
+
+    // Phase 2: download by title+artist (for albums without MBID)
+    let title_candidates = match album_repo.albums_without_bio_without_mbid() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "bio_download_album_title_candidates_failed");
+            return;
+        }
+    };
+
+    if title_candidates.is_empty() {
+        return;
+    }
+
+    for chunk in title_candidates.chunks(BATCH_SIZE) {
+        // Build JSON array of {title, artist_name} for the VPS endpoint
+        let titles_json: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|(_, title, artist)| {
+                serde_json::json!({
+                    "title": title,
+                    "artist_name": artist,
+                })
+            })
+            .collect();
+
+        let titles_param = serde_json::to_string(&titles_json).unwrap_or_default();
+        let url = format!(
+            "{DOWNLOAD_ALBUM_URL}?titles={}",
+            urlencoding::encode(&titles_param)
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "bio_download_albums_by_title_request_failed");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(status = %status, "bio_download_albums_by_title_rejected");
+            continue;
+        }
+
+        let wrapper: AlbumByTitleBiosWrapper = match resp.json().await {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "bio_download_albums_by_title_parse_failed");
+                continue;
+            }
+        };
+
+        // Build a lookup map from (title, artist_name) -> album_id
+        let id_map: std::collections::HashMap<(&str, Option<&str>), i64> = chunk
+            .iter()
+            .map(|(id, title, artist)| ((title.as_str(), artist.as_deref()), *id))
+            .collect();
+
+        let mut applied = 0usize;
+        for entry in &wrapper.albums {
+            let key = (entry.title.as_str(), entry.artist_name.as_deref());
+            if let Some(&album_id) = id_map.get(&key) {
+                if let Err(e) = album_repo.update_bio(album_id, &entry.bio) {
+                    warn!(album_id, error = %e, "bio_download_album_by_title_update_failed");
+                } else {
+                    applied += 1;
+                }
+            }
+        }
+
+        if applied > 0 {
+            info!(applied, "bio_download_albums_by_title_applied");
         }
     }
 }
@@ -464,5 +550,41 @@ mod tests {
         let without = repo.albums_without_bio_with_mbid().unwrap();
         assert_eq!(without.len(), 1);
         assert_eq!(without[0].1, "rg-3");
+    }
+
+    #[test]
+    fn albums_with_bio_returns_all_regardless_of_mbid() {
+        use crate::db::models::Album;
+
+        let db = fresh_db();
+        let repo = AlbumRepo::with_backend(db);
+
+        // Album with bio + MBID
+        let mut a1 = Album::new("Kind of Blue".into());
+        a1.musicbrainz_release_group_id = Some("rg-1".into());
+        a1.bio = Some("Classic album".into());
+        repo.create(&a1).unwrap();
+
+        // Album with bio but NO MBID → should also appear
+        let mut a2 = Album::new("No MBID Album".into());
+        a2.bio = Some("Bio without MBID".into());
+        repo.create(&a2).unwrap();
+
+        // Album without bio → should NOT appear
+        let _a3 = Album::new("No Bio".into());
+        repo.create(&_a3).unwrap();
+
+        let result = repo.albums_with_bio().unwrap();
+        assert_eq!(result.len(), 2);
+
+        // First album has MBID
+        assert_eq!(result[0].0, "Kind of Blue");
+        assert_eq!(result[0].2, Some("rg-1".to_string()));
+        assert_eq!(result[0].3, "Classic album");
+
+        // Second album has no MBID
+        assert_eq!(result[1].0, "No MBID Album");
+        assert_eq!(result[1].2, None);
+        assert_eq!(result[1].3, "Bio without MBID");
     }
 }
