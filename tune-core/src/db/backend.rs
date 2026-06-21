@@ -1075,7 +1075,7 @@ fn pgrow_to_sqlvalues(row: &sqlx::postgres::PgRow) -> Result<Vec<SqlValue>, Stri
                 .try_get::<Option<f32>, _>(i)
                 .map(|o| o.map_or(SqlValue::Null, |v| SqlValue::Real(v as f64)))
                 .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
-            "FLOAT8" | "DOUBLE PRECISION" => row
+            "FLOAT8" | "DOUBLE PRECISION" | "NUMERIC" => row
                 .try_get::<Option<f64>, _>(i)
                 .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
                 .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,

@@ -694,11 +694,15 @@ impl HistoryRepo {
         // ── On this day ──
         let today_md = to.get(5..10).unwrap_or("01-01");
         let otd_like = format!("%-{today_md}%");
+        let ph = match self.db.engine() {
+            Engine::Sqlite => "?".to_string(),
+            Engine::Postgres => "$1".to_string(),
+        };
         let otd_sql = format!(
             "SELECT title, artist_name, album_title, NULL, listened_at,
                     {} as yr
              FROM listen_history
-             WHERE listened_at LIKE ?
+             WHERE listened_at LIKE {ph}
              ORDER BY listened_at DESC LIMIT 10",
             match self.db.engine() {
                 Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
