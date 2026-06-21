@@ -89,19 +89,22 @@ async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParam
     let repo = HistoryRepo::with_backend(state.backend.clone());
     match repo.full_dashboard(period, p.zone_id, p.profile_id, top_n) {
         Ok(data) => Json(json!(data)),
-        Err(_) => Json(json!({
-            "period": period,
-            "range": { "from": null, "to": "" },
-            "totals": { "plays": 0, "listening_ms": 0, "unique_tracks": 0, "unique_artists": 0 },
-            "top_artists": [],
-            "top_albums": [],
-            "top_tracks": [],
-            "trend": [],
-            "hourly": [],
-            "by_zone": [],
-            "by_source": [],
-            "completion": { "completed": 0, "skipped": 0, "avg_listened_ms": 0, "avg_track_duration_ms": 0 }
-        })),
+        Err(e) => {
+            tracing::error!(error = %e, period, "full_dashboard_failed");
+            Json(json!({
+                "period": period,
+                "range": { "from": null, "to": "" },
+                "totals": { "plays": 0, "listening_ms": 0, "unique_tracks": 0, "unique_artists": 0 },
+                "top_artists": [],
+                "top_albums": [],
+                "top_tracks": [],
+                "trend": [],
+                "hourly": [],
+                "by_zone": [],
+                "by_source": [],
+                "completion": { "completed": 0, "skipped": 0, "avg_listened_ms": 0, "avg_track_duration_ms": 0 }
+            }))
+        }
     }
 }
 
