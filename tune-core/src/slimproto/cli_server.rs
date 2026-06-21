@@ -103,8 +103,10 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
         "login" => format!("{full} ******"),
         "listen" => format!("{full}"),
         "can" => handle_can(full),
+        "player" => handle_player_query(full, state).await,
         "players" => handle_players(full, state).await,
         "serverstatus" => handle_serverstatus(full, state).await,
+        "status" => handle_global_status(full, state).await,
         "pref" => handle_pref(full),
         "version" => format!("version {}", state.server_version),
         "connected" => "connected 1".to_string(),
@@ -114,6 +116,77 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
             format!("{full}")
         }
     }
+}
+
+/// Handle "player count ?" and "player id/name N ?" queries.
+async fn handle_player_query(line: &str, state: &Arc<CliState>) -> String {
+    let players = state.players.lock().await;
+    let count = players.len().max(1);
+
+    if line.contains("count") {
+        return format!("player count {count}");
+    }
+    // "player id 0 ?" → return MAC of player at index 0
+    if line.contains(" id ") {
+        let mac = players
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "00:11:22:33:44:55".to_string());
+        let idx = line
+            .split_whitespace()
+            .find_map(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+        return format!("player id {idx} {mac}");
+    }
+    // "player name 0 ?" → return name of player at index 0
+    if line.contains(" name ") {
+        let name = players
+            .values()
+            .next()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Tune".to_string());
+        let idx = line
+            .split_whitespace()
+            .find_map(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+        return format!("player name {idx} {}", cli_encode(&name));
+    }
+
+    format!("{line}")
+}
+
+/// Handle global "status - 1 subscribe:-" command.
+async fn handle_global_status(line: &str, state: &Arc<CliState>) -> String {
+    let players = state.players.lock().await;
+    let mac = players
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "00:11:22:33:44:55".to_string());
+    let name = players
+        .values()
+        .next()
+        .map(|p| cli_encode(&p.name))
+        .unwrap_or_else(|| "Tune".to_string());
+    let elapsed = players
+        .values()
+        .next()
+        .map(|p| p.elapsed_ms / 1000)
+        .unwrap_or(0);
+    drop(players);
+
+    // Return a status response that satisfies Squeeze-LX's subscription handshake
+    format!(
+        "{line} player_name:{name} player_connected:1 \
+         player_ip:{ip}:3483 power:1 signalstrength:0 mode:play \
+         time:{elapsed} duration:300 \
+         playlist%20repeat:0 playlist%20shuffle:0 \
+         playlist%20mode:off playlist_cur_index:0 \
+         playlist_timestamp:0 playlist_tracks:1 \
+         mixer%20volume:80 playerid:{mac}",
+        ip = state.local_ip,
+    )
 }
 
 fn handle_can(line: &str) -> String {
