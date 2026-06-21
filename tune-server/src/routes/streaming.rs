@@ -95,11 +95,21 @@ pub fn router() -> Router<AppState> {
             "/{service}/artists/{artist_id}/top-tracks",
             get(service_artist_top_tracks),
         )
-        .route("/{service}/playlists", get(service_playlists))
-        .route("/{service}/playlists/{playlist_id}", get(service_playlist))
+        .route(
+            "/{service}/playlists",
+            get(service_playlists).post(service_create_playlist),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}",
+            get(service_playlist).delete(service_delete_playlist),
+        )
         .route(
             "/{service}/playlists/{playlist_id}/tracks",
-            get(service_playlist_tracks),
+            get(service_playlist_tracks).post(service_add_tracks),
+        )
+        .route(
+            "/{service}/playlists/{playlist_id}/tracks/remove",
+            post(service_remove_tracks),
         )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
@@ -211,6 +221,60 @@ async fn service_playlist_tracks(
     with_svc!(&state, &service, |svc| svc
         .get_playlist_tracks(&playlist_id)
         .await)
+}
+
+#[derive(Deserialize)]
+struct CreatePlaylistBody {
+    name: String,
+    description: Option<String>,
+}
+
+async fn service_create_playlist(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Json(body): Json<CreatePlaylistBody>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .create_playlist(&body.name, body.description.as_deref())
+        .await
+        .map(|id| json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct AddTracksBody {
+    track_ids: Vec<String>,
+}
+
+async fn service_add_tracks(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+    Json(body): Json<AddTracksBody>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .add_tracks_to_playlist(&playlist_id, &body.track_ids)
+        .await
+        .map(|n| json!({ "added": n })))
+}
+
+async fn service_delete_playlist(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .delete_playlist(&playlist_id)
+        .await
+        .map(|_| json!({ "ok": true })))
+}
+
+async fn service_remove_tracks(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+    Json(body): Json<AddTracksBody>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .remove_tracks_from_playlist(&playlist_id, &body.track_ids)
+        .await
+        .map(|n| json!({ "removed": n })))
 }
 
 async fn service_track(
