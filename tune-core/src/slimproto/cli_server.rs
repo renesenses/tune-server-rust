@@ -107,7 +107,7 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
         "players" => handle_players(full, state).await,
         "serverstatus" => handle_serverstatus(full, state).await,
         "status" => handle_global_status(full, state).await,
-        "pref" => handle_pref(full),
+        "pref" => handle_pref(full, state),
         "version" => format!("version {}", state.server_version),
         "connected" => "connected 1".to_string(),
         "subscribe" => format!("{full}"),
@@ -121,7 +121,7 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
 /// Handle "player count ?" and "player id/name N ?" queries.
 async fn handle_player_query(line: &str, state: &Arc<CliState>) -> String {
     let players = state.players.lock().await;
-    let count = players.len().max(1);
+    let count = players.len();
 
     if line.contains("count") {
         return format!("player count {count}");
@@ -198,17 +198,13 @@ fn handle_can(line: &str) -> String {
 
 async fn handle_players(line: &str, state: &Arc<CliState>) -> String {
     let players = state.players.lock().await;
-    let count = players.len().max(1); // At least 1 virtual player
+    let count = players.len();
 
     if players.is_empty() {
-        // Expose a virtual player representing the Tune server itself
-        let mac = "00:11:22:33:44:55";
-        return format!(
-            "{line} count:{count} playerindex:0 playerid:{mac} \
-             uuid:tune-bridge ip:{ip}:3483 name:Tune model:squeezelite \
-             modelname:Tune power:1 isplaying:1 connected:1 firmware:tune",
-            ip = state.local_ip,
-        );
+        // No real players connected — return count:0.
+        // Do NOT expose a virtual player or the squeezebox poller
+        // will auto-create a ghost zone that steals playback.
+        return format!("{line} count:0");
     }
 
     let mut resp = format!("{line} count:{count}");
@@ -235,11 +231,19 @@ async fn handle_serverstatus(line: &str, state: &Arc<CliState>) -> String {
     )
 }
 
-fn handle_pref(line: &str) -> String {
-    // Return empty/default for all preferences
+fn handle_pref(line: &str, state: &Arc<CliState>) -> String {
     if line.contains('?') {
         let key = line.split_whitespace().nth(1).unwrap_or("unknown");
-        format!("pref {key} ")
+        let value = match key {
+            "httpport" => {
+                let port = std::env::var("TUNE_PORT").unwrap_or_else(|_| "8888".into());
+                port
+            }
+            "language" => "en".to_string(),
+            "skin" => "Default".to_string(),
+            _ => String::new(),
+        };
+        format!("pref {key} {value}")
     } else {
         line.to_string()
     }
