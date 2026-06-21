@@ -317,9 +317,36 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         }
     }
 
-    // macOS: try `log show` for unified logging
+    // macOS: try stderr log files FIRST (Homebrew launchd captures tracing
+    // output here), then fall back to `log show`.  The tracing logs contain
+    // the actual application events (auto_next, track_ended, etc.) while
+    // `log show` only captures CoreAudio/system noise.
     #[cfg(target_os = "macos")]
     {
+        let stderr_paths = [
+            format!(
+                "{}/Library/Logs/tune-server.log",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+            ),
+            "/usr/local/var/log/tune-server.log".into(),
+            "/opt/homebrew/var/log/tune-server.log".into(),
+        ];
+        for p in &stderr_paths {
+            if let Ok(content) = std::fs::read_to_string(p) {
+                let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
+                let lines: Vec<&str> = lines.into_iter().rev().collect();
+                if !lines.is_empty() {
+                    return Json(json!({
+                        "logs": lines.join("\n"),
+                        "lines": lines.len(),
+                        "source": "file",
+                        "path": p,
+                    }));
+                }
+            }
+        }
+
+        // Fallback: macOS unified log — filter to Tune tracing lines only
         if let Ok(output) = std::process::Command::new("log")
             .args([
                 "show",
@@ -334,9 +361,18 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);
-                let lines: Vec<&str> = text.lines().rev().take(max_lines).collect();
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|l| {
+                        l.contains("tune_")
+                            || l.contains("INFO")
+                            || l.contains("WARN")
+                            || l.contains("ERROR")
+                    })
+                    .collect();
+                let lines: Vec<&str> = lines.into_iter().rev().take(max_lines).collect();
                 let lines: Vec<&str> = lines.into_iter().rev().collect();
-                if lines.len() > 1 {
+                if !lines.is_empty() {
                     return Json(json!({
                         "logs": lines.join("\n"),
                         "lines": lines.len(),
@@ -347,26 +383,29 @@ pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
         }
     }
 
-    // Fallback: check stderr capture file (homebrew launchd)
-    let stderr_paths = [
-        format!(
-            "{}/Library/Logs/tune-server.log",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-        ),
-        "/usr/local/var/log/tune-server.log".into(),
-        "/opt/homebrew/var/log/tune-server.log".into(),
-    ];
-    for p in &stderr_paths {
-        if let Ok(content) = std::fs::read_to_string(p) {
-            let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
-            let lines: Vec<&str> = lines.into_iter().rev().collect();
-            if !lines.is_empty() {
-                return Json(json!({
-                    "logs": lines.join("\n"),
-                    "lines": lines.len(),
-                    "source": "file",
-                    "path": p,
-                }));
+    // Fallback: check stderr capture file (Linux / non-macOS)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let stderr_paths: [String; 3] = [
+            format!(
+                "{}/Library/Logs/tune-server.log",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+            ),
+            "/usr/local/var/log/tune-server.log".into(),
+            "/opt/homebrew/var/log/tune-server.log".into(),
+        ];
+        for p in &stderr_paths {
+            if let Ok(content) = std::fs::read_to_string(p) {
+                let lines: Vec<&str> = content.lines().rev().take(max_lines).collect();
+                let lines: Vec<&str> = lines.into_iter().rev().collect();
+                if !lines.is_empty() {
+                    return Json(json!({
+                        "logs": lines.join("\n"),
+                        "lines": lines.len(),
+                        "source": "file",
+                        "path": p,
+                    }));
+                }
             }
         }
     }

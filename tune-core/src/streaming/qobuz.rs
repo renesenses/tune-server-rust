@@ -281,7 +281,12 @@ impl QobuzService {
                 .as_array()
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
-                .or_else(|| item["images150"].as_array().and_then(|a| a.first())?.as_str())
+                .or_else(|| {
+                    item["images150"]
+                        .as_array()
+                        .and_then(|a| a.first())?
+                        .as_str()
+                })
                 .or_else(|| item["images"].as_array().and_then(|a| a.first())?.as_str())
                 .map(Into::into),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
@@ -887,8 +892,7 @@ impl StreamingService for QobuzService {
         tag: Option<&str>,
         genre: Option<&str>,
     ) -> Result<Vec<StreamPlaylist>, TuneError> {
-        let mut params: Vec<(&str, &str)> =
-            vec![("type", "editor-picks"), ("limit", "50")];
+        let mut params: Vec<(&str, &str)> = vec![("type", "editor-picks"), ("limit", "50")];
         if let Some(t) = tag {
             params.push(("tags", t));
         }
