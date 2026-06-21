@@ -228,6 +228,11 @@ impl PlaybackOrchestrator {
             .as_ref()
             .and_then(|np| np.stream_id.clone());
 
+        // Bump track_generation NOW so the poller resets its wall-clock
+        // timer immediately. Without this, a long DASH transcode (20-30s)
+        // can run into the 300s timeout from the previous track.
+        self.playback.bump_generation(req.zone_id).await;
+
         let resolved = self.resolve_stream(&req).await?;
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());

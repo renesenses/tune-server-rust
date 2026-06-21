@@ -142,6 +142,15 @@ impl PlaybackManager {
         zones.values().cloned().collect()
     }
 
+    pub async fn bump_generation(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.track_generation = state.track_generation.wrapping_add(1);
+    }
+
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
