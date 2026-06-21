@@ -576,14 +576,18 @@ impl HistoryRepo {
         } else {
             "AND"
         };
+        let cast_dur = match self.db.engine() {
+            Engine::Sqlite => "t.duration_ms",
+            Engine::Postgres => "CAST(t.duration_ms AS bigint)",
+        };
         let completion_sql = format!(
             "SELECT
                 COUNT(CASE WHEN duration_ms >= 30000 THEN 1 END),
                 COUNT(CASE WHEN duration_ms < 30000 THEN 1 END),
                 COALESCE(AVG(duration_ms), 0),
-                COALESCE((SELECT AVG(t.duration_ms) FROM listen_history lh
+                COALESCE((SELECT AVG({cast_dur}) FROM listen_history lh
                           LEFT JOIN tracks t ON t.id = lh.track_id
-                          {inner_where} {inner_and_or} t.duration_ms IS NOT NULL), 0)
+                          {inner_where} {inner_and_or} {cast_dur} IS NOT NULL), 0)
              FROM listen_history
              {simple_where}"
         );
