@@ -96,6 +96,37 @@ pub struct FeaturedSection {
     pub name: String,
 }
 
+/// A record label with (a page of) its albums. Qobuz `label/get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelInfo {
+    pub id: String,
+    pub name: String,
+    pub albums: Vec<StreamAlbum>,
+}
+
+/// An editorial playlist tag/category (Qobuz `playlist/getTags`): moods,
+/// "Focus", genres… Used to browse curated playlists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistTag {
+    pub id: String,
+    pub name: String,
+}
+
+/// Discovery context of an album/track: its genre and record label. Lets a
+/// client jump from the now-playing track to the genre's expert playlists or
+/// the label's catalogue, without bloating the shared `StreamAlbum` model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AlbumContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthStatus {
     pub authenticated: bool,
@@ -199,6 +230,29 @@ pub trait StreamingService: Send + Sync {
         let _ = section_id;
         Ok(vec![])
     }
+    /// Browse the record label of an album: resolves the album's label and
+    /// returns it with its full catalogue. Album-based so the shared
+    /// `StreamAlbum` model need not carry a label id.
+    async fn get_album_label(&self, _album_id: &str) -> Result<LabelInfo, TuneError> {
+        Err("labels not supported for this service".into())
+    }
+    /// Editorial playlist tags/categories (moods, "Focus", genres…).
+    async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
+        Ok(vec![])
+    }
+    /// Curated/editorial ("expert") playlists, optionally filtered by a tag id
+    /// and/or a genre id.
+    async fn get_featured_playlists(
+        &self,
+        _tag: Option<&str>,
+        _genre: Option<&str>,
+    ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        Ok(vec![])
+    }
+    /// Discovery context (genre + label) of an album, resolved from the album.
+    async fn get_album_context(&self, _album_id: &str) -> Result<AlbumContext, TuneError> {
+        Err("album context not supported for this service".into())
+    }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Ok(vec![])
     }
@@ -287,6 +341,7 @@ mod tests {
             year: Some(1959),
             track_count: 5,
             quality: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["source_id"], "789");

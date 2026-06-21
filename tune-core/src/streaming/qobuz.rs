@@ -267,6 +267,28 @@ impl QobuzService {
         }
     }
 
+    /// Map a Qobuz featured/editorial playlist item to StreamPlaylist.
+    fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
+        StreamPlaylist {
+            id: item["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| item["id"].as_str().map(Into::into))
+                .unwrap_or_default(),
+            name: item["name"].as_str().unwrap_or("").into(),
+            description: item["description"].as_str().map(Into::into),
+            cover_path: item["image_rectangle"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| item["images150"].as_array().and_then(|a| a.first())?.as_str())
+                .or_else(|| item["images"].as_array().and_then(|a| a.first())?.as_str())
+                .map(Into::into),
+            track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
+            owner: item["owner"]["name"].as_str().map(Into::into),
+        }
+    }
+
     async fn login_internal(
         &mut self,
         username: &str,
@@ -765,6 +787,138 @@ impl StreamingService for QobuzService {
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
+    }
+
+    async fn get_album_label(&self, album_id: &str) -> Result<LabelInfo, TuneError> {
+        // Resolve the album's label (id + name come straight from album/get).
+        let album = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
+        let label_id = album["label"]["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .or_else(|| album["label"]["id"].as_str().map(Into::into))
+            .ok_or_else(|| TuneError::NotFound("album has no label".into()))?;
+        let name = album["label"]["name"].as_str().unwrap_or("").into();
+        // Bounded pagination: big majors (e.g. Columbia) expose 10k+ albums.
+        // We cap at MAX and the app offers a text filter over the loaded set.
+        const MAX: usize = 500;
+        const PAGE: usize = 50;
+        let mut albums: Vec<StreamAlbum> = Vec::new();
+        let mut offset: usize = 0;
+        loop {
+            let off = offset.to_string();
+            let lim = PAGE.to_string();
+            let data = self
+                .api_get(
+                    "/label/get",
+                    &[
+                        ("label_id", &label_id),
+                        ("extra", "albums"),
+                        ("limit", &lim),
+                        ("offset", &off),
+                    ],
+                )
+                .await?;
+            let items = data["albums"]["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let n = items.len();
+            // Skip albums Qobuz marks as non-streamable — a label's full
+            // catalogue includes purchase-only / region-locked releases whose
+            // tracks resolve to "no url" (502) on playback.
+            albums.extend(
+                items
+                    .iter()
+                    .filter(|it| it["streamable"].as_bool() != Some(false))
+                    .map(Self::map_album),
+            );
+            let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
+            offset += n;
+            if n < PAGE || offset >= total || albums.len() >= MAX {
+                break;
+            }
+        }
+        albums.truncate(MAX);
+        Ok(LabelInfo {
+            id: label_id,
+            name,
+            albums,
+        })
+    }
+
+    async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, TuneError> {
+        let data = self.api_get("/playlist/getTags", &[]).await?;
+        let tags = data["tags"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let id = item["id"]
+                            .as_str()
+                            .map(Into::into)
+                            .or_else(|| item["id"].as_u64().map(|i| i.to_string()))
+                            .or_else(|| item["slug"].as_str().map(Into::into))?;
+                        // name is a localized object {en, fr, ...} or a plain string.
+                        let name = item["name"]
+                            .as_str()
+                            .map(String::from)
+                            .or_else(|| item["name"]["en"].as_str().map(String::from))
+                            .or_else(|| {
+                                item["name"]
+                                    .as_object()
+                                    .and_then(|m| m.values().next())
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                            })
+                            .unwrap_or_else(|| id.clone());
+                        Some(PlaylistTag { id, name })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(tags)
+    }
+
+    async fn get_featured_playlists(
+        &self,
+        tag: Option<&str>,
+        genre: Option<&str>,
+    ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        let mut params: Vec<(&str, &str)> =
+            vec![("type", "editor-picks"), ("limit", "50")];
+        if let Some(t) = tag {
+            params.push(("tags", t));
+        }
+        if let Some(g) = genre {
+            params.push(("genre_ids", g));
+        }
+        let data = self.api_get("/playlist/getFeatured", &params).await?;
+        let playlists = data["playlists"]["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+            .unwrap_or_default();
+        Ok(playlists)
+    }
+
+    async fn get_album_context(&self, album_id: &str) -> Result<AlbumContext, TuneError> {
+        let album = self
+            .api_get("/album/get", &[("album_id", album_id)])
+            .await?;
+        Ok(AlbumContext {
+            genre_id: album["genre"]["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| album["genre"]["id"].as_str().map(Into::into)),
+            genre_name: album["genre"]["name"].as_str().map(Into::into),
+            label_id: album["label"]["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| album["label"]["id"].as_str().map(Into::into)),
+            label_name: album["label"]["name"].as_str().map(Into::into),
+        })
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
