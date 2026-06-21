@@ -317,8 +317,8 @@ pub async fn register_local_outputs(state: &AppState) {
                         "local_audio_zone_auto_created"
                     );
                 }
-                Ok((_, false)) => {
-                    // Zone already exists for this device
+                Ok((_zid, false)) => {
+                    let _ = zone_repo.set_online_by_device(&device_id, true);
                 }
                 Err(e) => {
                     tracing::warn!(

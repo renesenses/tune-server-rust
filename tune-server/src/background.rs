@@ -559,8 +559,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         for dev in &devices {
             let device_id = format!("local:{}", dev.name);
 
-            // Skip if already registered
+            // Already registered — still ensure a zone exists (may have been deleted)
             if existing_ids.contains(&device_id) || outputs.contains(&device_id) {
+                new_devices_to_zone.push((device_id, dev.name.clone(), dev.is_default));
                 continue;
             }
 
@@ -659,8 +660,9 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
                         "local_audio_hotplug_zone_created"
                     );
                 }
-                Ok((_, false)) => {
-                    // Zone already exists — nothing to do
+                Ok((zid, false)) => {
+                    let _ = zone_repo.set_online_by_device(device_id, true);
+                    debug!(zone_id = zid, device_id = %device_id, "local_audio_zone_set_online");
                 }
                 Err(e) => {
                     tracing::warn!(name = %zone_name, device_id = %device_id, error = %e, "local_audio_hotplug_zone_create_failed");
