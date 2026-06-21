@@ -139,9 +139,23 @@ struct QueueAddRequest {
     #[serde(default)]
     track_ids: Vec<i64>,
     position: Option<i64>,
-    // Streaming track fields
+    // Streaming track fields (single)
     source: Option<String>,
     source_id: Option<String>,
+    title: Option<String>,
+    artist_name: Option<String>,
+    album_title: Option<String>,
+    cover_path: Option<String>,
+    duration_ms: Option<i64>,
+    // Batch streaming tracks: [{source, source_id, title?, artist_name?, ...}]
+    #[serde(default)]
+    tracks: Vec<StreamingTrackItem>,
+}
+
+#[derive(Deserialize)]
+struct StreamingTrackItem {
+    source: String,
+    source_id: String,
     title: Option<String>,
     artist_name: Option<String>,
     album_title: Option<String>,
@@ -937,11 +951,70 @@ async fn queue_add(
             .into_response();
     }
 
+    // --- Batch streaming tracks: [{source, source_id, ...}] ---
+    if !body.tracks.is_empty() {
+        let mut queue_items = Vec::with_capacity(body.tracks.len());
+        for item in &body.tracks {
+            let (title, artist, album, cover, duration) = if item.title.is_some() {
+                (
+                    item.title.clone().unwrap_or_default(),
+                    item.artist_name.clone().unwrap_or_default(),
+                    item.album_title.clone(),
+                    item.cover_path.clone(),
+                    item.duration_ms.unwrap_or(0),
+                )
+            } else {
+                let registry = state.services.lock().await;
+                if let Some(svc) = registry.get(&item.source) {
+                    let svc = svc.lock().await;
+                    match svc.get_track(&item.source_id).await {
+                        Ok(t) => (
+                            t.title,
+                            t.artist,
+                            t.album,
+                            t.cover_path,
+                            t.duration_ms as i64,
+                        ),
+                        Err(_) => ("Unknown".into(), String::new(), None, None, 0),
+                    }
+                } else {
+                    ("Unknown".into(), String::new(), None, None, 0)
+                }
+            };
+            queue_items.push((
+                item.source_id.clone(),
+                title,
+                artist,
+                album,
+                cover,
+                duration,
+                Some(item.source.clone()),
+            ));
+        }
+        let count = queue_items.len();
+        if let Err(e) = queue_repo.append_streaming_queue(zone_id, &queue_items) {
+            warn!(zone_id, error = %e, "batch_append_streaming_queue_failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
+        let current_pos = state.playback.get_state(zone_id).await.queue_position;
+        state
+            .playback
+            .update_queue_info(zone_id, current_pos, new_length)
+            .await;
+        persist_queue_async(&state, zone_id);
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "added": count, "queue_length": new_length })),
+        )
+            .into_response();
+    }
+
     // --- Local tracks ---
     if body.track_ids.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            "track_ids or source+source_id required".to_string(),
+            "track_ids, source+source_id, or tracks[] required".to_string(),
         )
             .into_response();
     }
