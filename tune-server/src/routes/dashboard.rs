@@ -4,6 +4,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 
 use crate::error::AppError;
@@ -93,31 +94,21 @@ async fn listening_history(
 }
 
 async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    // Collect raw genre + genres columns from tracks
-    let raw: Vec<(Option<String>, Option<String>)> = conn
-        .prepare("SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0).unwrap_or(None),
-                    row.get::<_, Option<String>>(1).unwrap_or(None),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .unwrap_or_default();
-    drop(conn);
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')",
+            &[],
+        )
+        .map_err(|e| AppError::internal(e))?;
 
-    // Split multi-genre values and count individual genres
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (genre_col, genres_col) in &raw {
+    for cols in &rows {
+        let genre_col = cols.first().and_then(|v| v.as_string());
+        let genres_col = cols.get(1).and_then(|v| v.as_string());
+
         let mut genres_for_track: Vec<String> = Vec::new();
-        if let Some(json_str) = genres_col {
+        if let Some(json_str) = &genres_col {
             if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
                 genres_for_track = arr
                     .into_iter()
@@ -127,7 +118,7 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
             }
         }
         if genres_for_track.is_empty() {
-            if let Some(raw_genre) = genre_col {
+            if let Some(raw_genre) = &genre_col {
                 genres_for_track = tune_core::metadata::split_genre_tag(raw_genre);
             }
         }
@@ -136,17 +127,16 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
         }
     }
 
-    // Sort by count descending, limit to 30
     let mut sorted: Vec<(String, i64)> = counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     sorted.truncate(30);
 
-    let items: Vec<serde_json::Value> = sorted
+    let items: Vec<Value> = sorted
         .iter()
-        .map(|(genre, count)| serde_json::json!({ "genre": genre, "count": count }))
+        .map(|(genre, count)| json!({ "genre": genre, "count": count }))
         .collect();
 
-    Ok(Json(serde_json::json!(items)))
+    Ok(Json(json!(items)))
 }
 
 fn is_consecutive_days(a: &str, b: &str) -> bool {
@@ -176,80 +166,89 @@ async fn wrapped(
     Query(p): Query<WrappedParams>,
 ) -> Result<Json<Value>, AppError> {
     let year = p.year.unwrap_or(2026);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-
     let year_start = format!("{year}-01-01");
     let year_end = format!("{}-01-01", year + 1);
+    let b = &state.backend;
 
-    let total_listens: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
-            rusqlite::params![year_start, year_end],
-            |row| row.get(0),
+    let date_trunc_day = |col: &str| match b.engine() {
+        Engine::Sqlite => SqliteDialect.date_trunc_day(col),
+        Engine::Postgres => PostgresDialect.date_trunc_day(col),
+    };
+
+    let row = b
+        .query_one(
+            "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
-        .unwrap_or(0);
-
-    let total_ms: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
-            rusqlite::params![year_start, year_end],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
+        .map_err(|e| AppError::internal(e))?
+        .unwrap_or_default();
+    let total_listens = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+    let total_ms = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
     let total_hours = (total_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0;
 
-    let top_artists: Vec<Value> = conn
-        .prepare(
+    let top_artists: Vec<Value> = b
+        .query_many(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history \
              WHERE listened_at >= ? AND listened_at < ? AND artist_name IS NOT NULL \
              GROUP BY artist_name ORDER BY plays DESC LIMIT 10",
+            &[
+                &year_start as &dyn tune_core::db::backend::ToSqlValue,
+                &year_end,
+            ],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![year_start, year_end], |row| {
-                Ok(json!({"artist": row.get::<_, String>(0)?, "plays": row.get::<_, i64>(1)?}))
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|cols| {
+            json!({
+                "artist": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "plays": cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
-    let top_tracks: Vec<Value> = conn
-        .prepare(
+    let top_tracks: Vec<Value> = b
+        .query_many(
             "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
              WHERE listened_at >= ? AND listened_at < ? \
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10",
+            &[
+                &year_start as &dyn tune_core::db::backend::ToSqlValue,
+                &year_end,
+            ],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![year_start, year_end], |row| {
-                Ok(json!({"title": row.get::<_, String>(0)?, "artist": row.get::<_, Option<String>>(1)?, "plays": row.get::<_, i64>(2)?}))
-            })?
-            .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|cols| {
+            json!({
+                "title": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist": cols.get(1).and_then(|v| v.as_string()),
+                "plays": cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
-    // Listening streak (consecutive days)
-    let days: Vec<String> = conn
-        .prepare(
-            "SELECT DISTINCT DATE(listened_at) as d FROM listen_history \
-             WHERE listened_at >= ? AND listened_at < ? ORDER BY d",
+    let day_expr = date_trunc_day("listened_at");
+    let days_sql = format!(
+        "SELECT DISTINCT {day_expr} as d FROM listen_history \
+         WHERE listened_at >= ? AND listened_at < ? ORDER BY 1"
+    );
+    let days: Vec<String> = b
+        .query_many(
+            &days_sql,
+            &[
+                &year_start as &dyn tune_core::db::backend::ToSqlValue,
+                &year_end,
+            ],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![year_start, year_end], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+        .collect();
 
     let mut max_streak = if days.is_empty() { 0u32 } else { 1u32 };
     let mut current_streak = 1u32;
     for w in days.windows(2) {
-        // Compare YYYY-MM-DD strings — consecutive days differ by 1 in the DD part
-        // Simple heuristic: if both dates parse to day-of-year and differ by 1
-        let consecutive = is_consecutive_days(&w[0], &w[1]);
-        if consecutive {
+        if is_consecutive_days(&w[0], &w[1]) {
             current_streak += 1;
         } else {
             max_streak = max_streak.max(current_streak);
@@ -258,23 +257,16 @@ async fn wrapped(
     }
     max_streak = max_streak.max(current_streak);
 
-    let unique_artists: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT artist_name) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
-            rusqlite::params![year_start, year_end],
-            |row| row.get(0),
+    let stats_row = b
+        .query_one(
+            "SELECT COUNT(DISTINCT artist_name), COUNT(DISTINCT COALESCE(title, '') || COALESCE(artist_name, '')) \
+             FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
+            &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
-        .unwrap_or(0);
-
-    let unique_tracks: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT title || COALESCE(artist_name, '')) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
-            rusqlite::params![year_start, year_end],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    drop(conn);
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let unique_artists = stats_row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+    let unique_tracks = stats_row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
 
     Ok(Json(json!({
         "year": year,

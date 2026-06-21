@@ -102,7 +102,7 @@ pub mod sql {
         format!(
             "SELECT {day_col} as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms \
              FROM listen_history WHERE {since} \
-             GROUP BY day ORDER BY day"
+             GROUP BY 1 ORDER BY 1"
         )
     }
 }
@@ -431,7 +431,7 @@ impl HistoryRepo {
              FROM listen_history h
              LEFT JOIN albums a ON a.title = h.album_title
              {where_clause} {and_or} h.album_title IS NOT NULL
-             GROUP BY h.album_title, h.artist_name, cover_path
+             GROUP BY h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url)
              ORDER BY plays DESC LIMIT {top_n}",
             and_or = if where_clause.is_empty() {
                 "WHERE"
@@ -481,7 +481,7 @@ impl HistoryRepo {
             "SELECT {} as day, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
              FROM listen_history
              WHERE {} {trend_zone_and}
-             GROUP BY day ORDER BY day",
+             GROUP BY 1 ORDER BY 1",
             dialect_day("listened_at"),
             dialect_since("listened_at", trend_days)
         );
@@ -501,7 +501,7 @@ impl HistoryRepo {
             "SELECT {} as hour, COUNT(*) as plays
              FROM listen_history
              {simple_where}
-             GROUP BY hour ORDER BY hour",
+             GROUP BY 1 ORDER BY 1",
             dialect_hour("listened_at")
         );
         let hourly: Vec<HourlyEntry> = self
