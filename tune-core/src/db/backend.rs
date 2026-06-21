@@ -1080,13 +1080,13 @@ fn pgrow_to_sqlvalues(row: &sqlx::postgres::PgRow) -> Result<Vec<SqlValue>, Stri
                 .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
                 .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
             "NUMERIC" => row
-                .try_get::<Option<String>, _>(i)
-                .map(|o| {
-                    o.map_or(SqlValue::Null, |s| {
-                        s.parse::<f64>().map_or(SqlValue::Text(s), SqlValue::Real)
-                    })
+                .try_get_unchecked::<Option<f64>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
+                .or_else(|_| {
+                    row.try_get_unchecked::<Option<i64>, _>(i)
+                        .map(|o| o.map_or(SqlValue::Null, SqlValue::Int))
                 })
-                .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
+                .unwrap_or(SqlValue::Null),
             "BOOL" => row
                 .try_get::<Option<bool>, _>(i)
                 .map(|o| o.map_or(SqlValue::Null, SqlValue::Bool))
