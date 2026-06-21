@@ -294,33 +294,57 @@ fn build_album_query(
                 "LOWER(al.title) LIKE LOWER('%{}%')",
                 value.replace('\'', "''")
             ),
-            ("year", "eq" | "equals") => format!("al.year = {}", value.parse::<i32>().unwrap_or(0)),
+            ("year", "eq" | "equals") => format!(
+                "CAST(al.year AS INTEGER) = {}",
+                value.parse::<i32>().unwrap_or(0)
+            ),
             ("year", "gte" | "greater_than") => {
-                format!("al.year >= {}", value.parse::<i32>().unwrap_or(0))
+                format!(
+                    "CAST(al.year AS INTEGER) >= {}",
+                    value.parse::<i32>().unwrap_or(0)
+                )
             }
             ("year", "lte" | "less_than") => {
-                format!("al.year <= {}", value.parse::<i32>().unwrap_or(0))
+                format!(
+                    "CAST(al.year AS INTEGER) <= {}",
+                    value.parse::<i32>().unwrap_or(0)
+                )
             }
             ("year", "between") => {
                 let parts: Vec<&str> = value.splitn(2, ',').collect();
                 if parts.len() == 2 {
                     format!(
-                        "al.year BETWEEN {} AND {}",
+                        "CAST(al.year AS INTEGER) BETWEEN {} AND {}",
                         parts[0].trim().parse::<i32>().unwrap_or(0),
                         parts[1].trim().parse::<i32>().unwrap_or(9999)
                     )
                 } else {
-                    format!("al.year = {}", value.parse::<i32>().unwrap_or(0))
+                    format!(
+                        "CAST(al.year AS INTEGER) = {}",
+                        value.parse::<i32>().unwrap_or(0)
+                    )
                 }
             }
             ("format", "eq" | "equals") => {
                 format!("LOWER(t.format) = LOWER('{}')", value.replace('\'', "''"))
             }
             ("sample_rate", "gte" | "greater_than") => {
-                format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0))
+                format!(
+                    "CAST(t.sample_rate AS INTEGER) >= {}",
+                    value.parse::<i32>().unwrap_or(0)
+                )
+            }
+            ("sample_rate", "eq" | "equals") => {
+                format!(
+                    "CAST(t.sample_rate AS INTEGER) = {}",
+                    value.parse::<i32>().unwrap_or(0)
+                )
             }
             ("bit_depth", "gte" | "greater_than") => {
-                format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0))
+                format!(
+                    "CAST(t.bit_depth AS INTEGER) >= {}",
+                    value.parse::<i32>().unwrap_or(0)
+                )
             }
             ("label", "eq" | "equals") => format!("al.label = '{}'", value.replace('\'', "''")),
             ("label", "contains") => format!(
