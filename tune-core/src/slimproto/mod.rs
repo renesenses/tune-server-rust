@@ -9,6 +9,8 @@
 //! **Server → Client** (2-byte length + 4-byte tag + payload):
 //!   `strm`, `audg`, `setd`, `serv`
 
+pub mod cli_server;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -207,7 +209,14 @@ fn parse_client_message(tag: [u8; 4], payload: Vec<u8>) -> Result<ClientMessage,
             };
 
             let elapsed_ms = if payload.len() >= 39 {
-                u32::from_be_bytes([payload[35], payload[36], payload[37], payload[38]])
+                let be = u32::from_be_bytes([payload[35], payload[36], payload[37], payload[38]]);
+                // Some Windows Squeezelite builds send elapsed in LE.
+                // Heuristic: if BE value is absurd (>24h), try LE.
+                if be > 86_400_000 {
+                    u32::from_le_bytes([payload[35], payload[36], payload[37], payload[38]])
+                } else {
+                    be
+                }
             } else {
                 0
             };

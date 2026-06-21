@@ -456,6 +456,20 @@ fn spawn_slimproto_server(state: &AppState) {
             error!(error = %e, "slimproto_server_failed");
         }
     });
+
+    // Start the LMS CLI telnet bridge (port 9090) for Squeeze-LX compatibility
+    let local_ip = tune_core::discovery::ssdp::get_local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let cli_state = Arc::new(tune_core::slimproto::cli_server::CliState {
+        players: tune_core::slimproto::new_player_registry(),
+        server_name: "Tune".to_string(),
+        server_version: tune_core::version().to_string(),
+        local_ip,
+    });
+    tokio::spawn(tune_core::slimproto::cli_server::start_cli_server(
+        cli_state,
+    ));
 }
 
 fn spawn_bio_sync(state: &AppState) {
