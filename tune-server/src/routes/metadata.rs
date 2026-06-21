@@ -83,6 +83,8 @@ pub fn router() -> Router<AppState> {
             post(fix_genres_by_artist_fuzzy),
         )
         .route("/fix-genres-by-family", post(fix_genres_by_family))
+        // Album merge (targeted, by IDs)
+        .route("/albums/merge", post(merge_albums))
 }
 
 async fn edit_track(
@@ -1714,4 +1716,88 @@ async fn search_covers(
         .collect();
 
     Json(json!({"results": results_json}))
+}
+
+// ---------------------------------------------------------------------------
+// POST /albums/merge — merge specific albums by IDs
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MergeAlbumsRequest {
+    album_ids: Vec<i64>,
+}
+
+async fn merge_albums(
+    State(state): State<AppState>,
+    Json(body): Json<MergeAlbumsRequest>,
+) -> impl IntoResponse {
+    if body.album_ids.len() < 2 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "need at least 2 album_ids"})),
+        )
+            .into_response();
+    }
+
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+
+    let mut best_id = body.album_ids[0];
+    let mut best_count = 0i64;
+    for &aid in &body.album_ids {
+        let cnt = track_repo
+            .list_by_album(aid)
+            .map(|t| t.len() as i64)
+            .unwrap_or(0);
+        if cnt > best_count {
+            best_count = cnt;
+            best_id = aid;
+        }
+    }
+
+    let mut tracks_moved = 0i64;
+    let mut merged_ids = Vec::new();
+    for &aid in &body.album_ids {
+        if aid == best_id {
+            continue;
+        }
+        let moved = state
+            .db
+            .execute(
+                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
+                &[
+                    &best_id as &dyn rusqlite::types::ToSql,
+                    &aid as &dyn rusqlite::types::ToSql,
+                ],
+            )
+            .unwrap_or(0) as i64;
+        tracks_moved += moved;
+        state
+            .db
+            .execute(
+                "DELETE FROM albums WHERE id = ?",
+                &[&aid as &dyn rusqlite::types::ToSql],
+            )
+            .ok();
+        merged_ids.push(aid);
+    }
+
+    state
+        .db
+        .execute_batch(
+            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)",
+        )
+        .ok();
+
+    let total_tracks = track_repo
+        .list_by_album(best_id)
+        .map(|t| t.len() as i64)
+        .unwrap_or(0);
+
+    Json(json!({
+        "master_id": best_id,
+        "tracks_moved": tracks_moved,
+        "total_tracks": total_tracks,
+        "merged_ids": merged_ids,
+    }))
+    .into_response()
 }

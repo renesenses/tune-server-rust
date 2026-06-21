@@ -598,6 +598,127 @@ impl HistoryRepo {
             avg_track_duration_ms: comp_row.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
         };
 
+        // ── By genre (via tracks join) ──
+        let genre_sql = format!(
+            "SELECT t.genre, COUNT(*) as plays, COALESCE(SUM(h.duration_ms), 0) as ms
+             FROM listen_history h
+             INNER JOIN tracks t ON t.id = h.track_id
+             {where_clause} {and_or} t.genre IS NOT NULL AND t.genre != ''
+             GROUP BY t.genre ORDER BY plays DESC LIMIT 50",
+            and_or = if where_clause.is_empty() {
+                "WHERE"
+            } else {
+                "AND"
+            },
+        );
+        let by_genre: Vec<ByGenreEntry> = self
+            .db
+            .query_many(&genre_sql, &[])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cols| ByGenreEntry {
+                genre: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+            .collect();
+
+        // ── Weekday × hour heatmap ──
+        let extract_dow = match self.db.engine() {
+            Engine::Sqlite => "CAST(strftime('%w', listened_at) AS INTEGER)".to_string(),
+            Engine::Postgres => "EXTRACT(DOW FROM listened_at::timestamp)::int".to_string(),
+        };
+        let wh_sql = format!(
+            "SELECT CASE WHEN {extract_dow} = 0 THEN 7 ELSE {extract_dow} END as wd,
+                    {hour_expr} as hr, COUNT(*) as plays
+             FROM listen_history
+             {simple_where}
+             GROUP BY 1, 2 ORDER BY 1, 2",
+            hour_expr = dialect_hour("listened_at"),
+        );
+        let weekday_hourly: Vec<WeekdayHourlyEntry> = self
+            .db
+            .query_many(&wh_sql, &[])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cols| WeekdayHourlyEntry {
+                weekday: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                hour: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                plays: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+            .collect();
+
+        // ── Streak ──
+        let streak_day_expr = dialect_day("listened_at");
+        let streak_sql =
+            format!("SELECT DISTINCT {streak_day_expr} as d FROM listen_history ORDER BY 1");
+        let all_days: Vec<String> = self
+            .db
+            .query_many(&streak_sql, &[])
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+            .collect();
+        let streak = if !all_days.is_empty() {
+            let today = to.split('T').next().unwrap_or("");
+            let mut best = 1i64;
+            let mut current = 1i64;
+            for w in all_days.windows(2) {
+                if is_consecutive_days_str(&w[0], &w[1]) {
+                    current += 1;
+                } else {
+                    best = best.max(current);
+                    current = 1;
+                }
+            }
+            best = best.max(current);
+            let last_day = all_days.last().cloned();
+            let current_streak = if last_day.as_deref() == Some(today) {
+                current
+            } else {
+                0
+            };
+            Some(StreakInfo {
+                current: current_streak,
+                best,
+                last_day,
+            })
+        } else {
+            None
+        };
+
+        // ── On this day ──
+        let today_md = to.get(5..10).unwrap_or("01-01");
+        let otd_like = format!("%-{today_md}%");
+        let otd_sql = format!(
+            "SELECT title, artist_name, album_title, NULL, listened_at,
+                    {} as yr
+             FROM listen_history
+             WHERE listened_at LIKE ?
+             ORDER BY listened_at DESC LIMIT 10",
+            match self.db.engine() {
+                Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
+                Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
+            }
+        );
+        let on_this_day: Vec<OnThisDayEntry> = self
+            .db
+            .query_many(
+                &otd_sql,
+                &[&otd_like as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cols| OnThisDayEntry {
+                track_title: cols.first().and_then(|v| v.as_string()),
+                artist_name: cols.get(1).and_then(|v| v.as_string()),
+                album_title: cols.get(2).and_then(|v| v.as_string()),
+                cover_path: cols.get(3).and_then(|v| v.as_string()),
+                played_at: cols.get(4).and_then(|v| v.as_string()),
+                year: cols.get(5).and_then(|v| v.as_i64()),
+            })
+            .collect();
+
         Ok(DashboardData {
             period: period.to_string(),
             range: DashboardRange { from, to },
@@ -615,7 +736,29 @@ impl HistoryRepo {
             by_zone,
             by_source,
             completion,
+            by_genre,
+            weekday_hourly,
+            streak,
+            on_this_day,
         })
+    }
+}
+
+fn is_consecutive_days_str(a: &str, b: &str) -> bool {
+    fn to_days(s: &str) -> Option<i64> {
+        let s = s.split('T').next().unwrap_or(s);
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let y: i64 = parts[0].parse().ok()?;
+        let m: i64 = parts[1].parse().ok()?;
+        let d: i64 = parts[2].parse().ok()?;
+        Some(y * 366 + m * 31 + d)
+    }
+    match (to_days(a), to_days(b)) {
+        (Some(da), Some(db)) => db - da == 1,
+        _ => false,
     }
 }
 
@@ -702,6 +845,37 @@ pub struct CompletionStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ByGenreEntry {
+    pub genre: String,
+    pub plays: i64,
+    pub listening_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeekdayHourlyEntry {
+    pub weekday: i64,
+    pub hour: i64,
+    pub plays: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreakInfo {
+    pub current: i64,
+    pub best: i64,
+    pub last_day: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnThisDayEntry {
+    pub track_title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub cover_path: Option<String>,
+    pub played_at: Option<String>,
+    pub year: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardData {
     pub period: String,
     pub range: DashboardRange,
@@ -714,6 +888,14 @@ pub struct DashboardData {
     pub by_zone: Vec<ByZoneEntry>,
     pub by_source: Vec<BySourceEntry>,
     pub completion: CompletionStats,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_genre: Vec<ByGenreEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub weekday_hourly: Vec<WeekdayHourlyEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streak: Option<StreakInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub on_this_day: Vec<OnThisDayEntry>,
 }
 
 fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {

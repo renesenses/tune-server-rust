@@ -714,7 +714,31 @@ impl PositionPoller {
                                     && ps.peak_position_ms as f64
                                         >= track_duration_ms as f64 * 0.5);
                             if natural_end {
-                                track_ended = true;
+                                if ps.gapless_sent {
+                                    // Gapless was prepared via SetNextAVTransportURI.
+                                    // The renderer already transitioned — just advance
+                                    // metadata without sending a new play command
+                                    // (which would cause noise/glitch on DMP-A8).
+                                    info!(zone_id, "gapless_natural_end_advancing_metadata");
+                                    ps.gapless_sent = false;
+                                    ps.gapless_sent_at = None;
+                                    ps.stopped_ticks = 0;
+                                    ps.peak_position_ms = 0;
+                                    ps.last_position_ms = 0;
+                                    ps.track_started_at = None;
+                                    if let Some(next_pos) = Self::next_position(zone_state) {
+                                        if let Err(e) = self
+                                            .orchestrator
+                                            .advance_queue_metadata(zone_id, next_pos)
+                                            .await
+                                        {
+                                            warn!(zone_id, error = %e, "gapless_natural_advance_failed");
+                                        }
+                                        ps.gapless_cooldown = 4;
+                                    }
+                                } else {
+                                    track_ended = true;
+                                }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
                                 // Check if the stream is still being consumed
                                 // (renderer actively fetching audio data). If so,
