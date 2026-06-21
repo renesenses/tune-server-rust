@@ -122,6 +122,19 @@ pub fn router() -> Router<AppState> {
             "/{service}/featured/{section}",
             get(service_featured_section),
         )
+        .route(
+            "/{service}/albums/{album_id}/label",
+            get(service_album_label),
+        )
+        .route(
+            "/{service}/albums/{album_id}/context",
+            get(service_album_context),
+        )
+        .route("/{service}/playlist-tags", get(service_playlist_tags))
+        .route(
+            "/{service}/featured-playlists",
+            get(service_featured_playlists),
+        )
         .route("/{service}/new-releases", get(service_new_releases))
         .route("/{service}/genres", get(service_genres))
         .route(
@@ -323,6 +336,45 @@ async fn service_featured_section(
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
         .get_featured_section(&section)
+        .await)
+}
+
+async fn service_album_label(
+    State(state): State<AppState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_album_label(&album_id).await)
+}
+
+async fn service_playlist_tags(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_playlist_tags().await)
+}
+
+#[derive(Deserialize)]
+struct FeaturedPlaylistsQuery {
+    tag: Option<String>,
+    genre: Option<String>,
+}
+
+async fn service_featured_playlists(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Query(q): Query<FeaturedPlaylistsQuery>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_featured_playlists(q.tag.as_deref(), q.genre.as_deref())
+        .await)
+}
+
+async fn service_album_context(
+    State(state): State<AppState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_context(&album_id)
         .await)
 }
 
