@@ -1,0 +1,41 @@
+# Tune Bridge relay — lightweight cloud proxy
+FROM rust:1-bookworm AS builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p tune-core/src tune-bridge/src tune-server/src tune-cli/src tune-pyo3/src
+COPY tune-core/Cargo.toml tune-core/
+COPY tune-bridge/Cargo.toml tune-bridge/
+COPY tune-server/Cargo.toml tune-server/
+COPY tune-cli/Cargo.toml tune-cli/
+COPY tune-pyo3/Cargo.toml tune-pyo3/
+RUN echo 'fn main() {}' > tune-bridge/src/main.rs && \
+    echo 'fn main() {}' > tune-server/src/main.rs && \
+    echo 'fn main() {}' > tune-cli/src/main.rs && \
+    touch tune-core/src/lib.rs tune-pyo3/src/lib.rs tune-server/src/lib.rs && \
+    cargo build --release -p tune-bridge 2>/dev/null || true && \
+    rm -rf tune-core/src tune-bridge/src
+
+COPY tune-core/ tune-core/
+COPY tune-bridge/ tune-bridge/
+RUN rm -rf target/release/.fingerprint/tune-* target/release/deps/tune_* target/release/deps/libtune_* target/release/tune-bridge && \
+    cargo build --release -p tune-bridge && \
+    strip target/release/tune-bridge
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -r -s /bin/false tune
+USER tune
+
+COPY --from=builder /build/target/release/tune-bridge /app/tune-bridge
+
+EXPOSE 9090
+ENV BRIDGE_PORT=9090
+ENV RUST_LOG=tune_bridge=info
+
+CMD ["/app/tune-bridge"]

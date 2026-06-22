@@ -1,0 +1,3 @@
+bridge.mozaiklabs.fr {
+    reverse_proxy localhost:9090
+}
