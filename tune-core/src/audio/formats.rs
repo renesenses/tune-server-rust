@@ -256,15 +256,14 @@ impl AudioFormat {
     }
 
     /// Returns true if this format needs transcoding before DLNA streaming.
-    /// FLAC, WAV, MP3, AAC, DSD (DSF/DFF) can be served as raw files;
-    /// everything else must be transcoded.
-    /// DSD is passed through natively — capable renderers (Denon, Marantz, etc.)
-    /// play it directly; others will fail and the user can enable PCM fallback
-    /// via the zone's max_sample_rate setting.
+    /// FLAC, WAV, MP3, AAC pass through as-is.
+    /// DSD (DSF/DFF) MUST be transcoded to PCM: most DLNA renderers cannot
+    /// decode raw DSD bitstreams, and serving raw DSD corrupts the renderer
+    /// buffer state causing subsequent tracks to fail too (BUG-006).
     pub fn needs_transcode_for_dlna(&self) -> bool {
         matches!(
             self,
-            Self::Aiff | Self::WavPack | Self::Ape | Self::Alac | Self::Wma
+            Self::Aiff | Self::WavPack | Self::Ape | Self::Alac | Self::Wma | Self::Dsd
         )
     }
 
@@ -343,8 +342,10 @@ mod tests {
     }
 
     #[test]
-    fn dsd_native_passthrough() {
-        assert!(!AudioFormat::Dsd.needs_transcode_for_dlna());
+    fn dsd_needs_transcode_for_dlna() {
+        // DSD must be transcoded to PCM for DLNA: raw DSD data corrupts
+        // renderer buffer state and causes subsequent tracks to fail (BUG-006).
+        assert!(AudioFormat::Dsd.needs_transcode_for_dlna());
     }
 
     #[test]

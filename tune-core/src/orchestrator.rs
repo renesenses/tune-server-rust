@@ -1010,7 +1010,7 @@ impl PlaybackOrchestrator {
             // and exotic formats that need heavy conversion.
             let skip_passthrough_levels = source_format
                 .as_ref()
-                .is_some_and(|f| f.needs_transcode_for_dlna() || *f == AudioFormat::Dsd);
+                .is_some_and(|f| f.needs_transcode_for_dlna());
             if !skip_passthrough_levels {
                 if let Some(ref bus) = self.event_bus {
                     let bus = bus.clone();

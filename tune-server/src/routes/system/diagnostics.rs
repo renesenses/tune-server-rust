@@ -243,7 +243,7 @@ pub(super) struct LogsQuery {
 }
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    let max_lines = q.lines.unwrap_or(100);
+    let max_lines = q.lines.unwrap_or(1000);
 
     // Try log file first
     let log_path = std::env::var("TUNE_LOG_FILE").unwrap_or_else(|_| {

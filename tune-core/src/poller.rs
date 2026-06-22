@@ -74,6 +74,12 @@ const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 /// the output time to drain its buffer and report Stopped naturally.
 /// If it doesn't, this threshold forces the advance.
 const POSITION_PAST_END_TICKS: u8 = 3;
+/// After a gapless metadata advance (the poller called advance_queue_metadata
+/// expecting the renderer to auto-transition), if the renderer stays Stopped
+/// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
+/// This handles renderers that accept SetNextAVTransportURI but don't actually
+/// auto-transition — the poller would otherwise get stuck forever.
+const GAPLESS_STUCK_THRESHOLD: u8 = 5;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -139,6 +145,16 @@ struct ZonePollState {
     /// Stopped.  This handles local/cpal outputs where the playback thread
     /// may be slow to set `playing = false`.
     past_end_ticks: u8,
+    /// Set to true after `gapless_natural_end_advancing_metadata` — the poller
+    /// advanced metadata expecting the renderer to auto-transition.  If the
+    /// renderer stays Stopped after gapless_cooldown expires, this flag lets
+    /// the poller detect the stuck state and force a play_from_queue.
+    gapless_advance_pending: bool,
+    /// Counts Stopped ticks after gapless_cooldown expires while
+    /// gapless_advance_pending is true.  When this reaches
+    /// GAPLESS_STUCK_THRESHOLD, the poller gives up on the gapless
+    /// transition and forces play_from_queue.
+    gapless_stuck_ticks: u8,
 }
 
 pub struct PositionPoller {
@@ -296,6 +312,8 @@ impl PositionPoller {
                 track_generation: zone_state.track_generation,
                 track_loaded_at: Instant::now(),
                 past_end_ticks: 0,
+                gapless_advance_pending: false,
+                gapless_stuck_ticks: 0,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -320,6 +338,8 @@ impl PositionPoller {
                 ps.track_generation = zone_state.track_generation;
                 ps.track_loaded_at = Instant::now();
                 ps.past_end_ticks = 0;
+                ps.gapless_advance_pending = false;
+                ps.gapless_stuck_ticks = 0;
             }
 
             if ps.backoff_remaining > 0 {
@@ -698,6 +718,8 @@ impl PositionPoller {
                             ps.peak_position_ms = 0;
                             ps.last_position_ms = 0;
                             ps.track_started_at = None;
+                            ps.gapless_advance_pending = true;
+                            ps.gapless_stuck_ticks = 0;
                             if let Some(next_pos) = Self::next_position(zone_state) {
                                 if let Err(e) = self
                                     .orchestrator
@@ -708,6 +730,31 @@ impl PositionPoller {
                                 }
                                 ps.gapless_cooldown = 4;
                             }
+                        }
+                    } else if ps.gapless_advance_pending {
+                        // The poller advanced metadata expecting the renderer
+                        // to auto-transition via gapless, but the renderer is
+                        // still Stopped after the cooldown expired.  Count
+                        // stuck ticks and force play_from_queue if the renderer
+                        // doesn't pick up within GAPLESS_STUCK_THRESHOLD.
+                        ps.gapless_stuck_ticks += 1;
+                        if ps.gapless_stuck_ticks >= GAPLESS_STUCK_THRESHOLD {
+                            warn!(
+                                zone_id,
+                                stuck_ticks = ps.gapless_stuck_ticks,
+                                "gapless_advance_stuck_forcing_play"
+                            );
+                            ps.gapless_advance_pending = false;
+                            ps.gapless_stuck_ticks = 0;
+                            ps.stopped_ticks = 0;
+                            track_ended = true;
+                        } else {
+                            debug!(
+                                zone_id,
+                                stuck_ticks = ps.gapless_stuck_ticks,
+                                threshold = GAPLESS_STUCK_THRESHOLD,
+                                "gapless_advance_waiting_for_renderer"
+                            );
                         }
                     } else {
                         ps.stopped_ticks += 1;
@@ -742,6 +789,8 @@ impl PositionPoller {
                                     ps.peak_position_ms = 0;
                                     ps.last_position_ms = 0;
                                     ps.track_started_at = None;
+                                    ps.gapless_advance_pending = true;
+                                    ps.gapless_stuck_ticks = 0;
                                     if let Some(next_pos) = Self::next_position(zone_state) {
                                         if let Err(e) = self
                                             .orchestrator
@@ -816,6 +865,12 @@ impl PositionPoller {
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
+                    // Renderer started playing — gapless transition succeeded,
+                    // clear the stuck-detection state.
+                    if ps.gapless_advance_pending {
+                        ps.gapless_advance_pending = false;
+                        ps.gapless_stuck_ticks = 0;
+                    }
                     if ps.track_started_at.is_none() {
                         ps.track_started_at = Some(Instant::now());
                     }
@@ -1157,6 +1212,8 @@ mod tests {
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
+            gapless_advance_pending: false,
+            gapless_stuck_ticks: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1199,6 +1256,8 @@ mod tests {
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
+            gapless_advance_pending: false,
+            gapless_stuck_ticks: 0,
         };
 
         // Simulates entering Playing state
