@@ -9,35 +9,40 @@ use tune_core::db::history_repo::HistoryRepo;
 use super::Pagination;
 
 pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let (artists, albums, tracks, zones, total_duration_ms, total_size_bytes): (
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = conn
-        .query_row(
-            "SELECT \
-             (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
-             (SELECT COUNT(*) FROM albums), \
-             (SELECT COUNT(*) FROM tracks), \
-             (SELECT COUNT(*) FROM zones), \
-             COALESCE((SELECT SUM(duration_ms) FROM tracks), 0), \
-             COALESCE((SELECT SUM(file_size) FROM tracks WHERE file_size IS NOT NULL), 0)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        )
-        .unwrap_or((0, 0, 0, 0, 0, 0));
-    let listens: i64 = conn
-        .query_row("SELECT COUNT(*) FROM listen_history", [], |row| row.get(0))
+    let b = &state.backend;
+    let (dur_col, size_col) = match b.engine() {
+        tune_core::db::engine::Engine::Sqlite => ("duration_ms", "file_size"),
+        tune_core::db::engine::Engine::Postgres => {
+            ("CAST(duration_ms AS bigint)", "CAST(file_size AS bigint)")
+        }
+    };
+    let sql = format!(
+        "SELECT \
+         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+         (SELECT COUNT(*) FROM albums), \
+         (SELECT COUNT(*) FROM tracks), \
+         (SELECT COUNT(*) FROM zones), \
+         COALESCE((SELECT SUM({dur_col}) FROM tracks), 0), \
+         COALESCE((SELECT SUM({size_col}) FROM tracks WHERE file_size IS NOT NULL), 0)"
+    );
+    let row = b
+        .query_one(&sql, &[])
+        .map_err(|e| AppError::internal(e))?
+        .unwrap_or_default();
+
+    let artists = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+    let albums = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+    let tracks = row.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
+    let zones = row.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
+    let total_duration_ms = row.get(4).and_then(|v| v.as_i64()).unwrap_or(0);
+    let total_size_bytes = row.get(5).and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let listens = b
+        .query_one("SELECT COUNT(*) FROM listen_history", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    drop(conn);
 
     Ok(Json(json!({
         "artists": artists,
