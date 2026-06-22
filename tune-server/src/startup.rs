@@ -152,9 +152,6 @@ async fn restore_zone_volumes(state: &AppState) {
             if let Some(id) = zone.id {
                 let vol = (zone.volume as f64) / 100.0;
                 state.playback.set_volume(id, vol).await;
-                if zone.output_device_id.is_some() {
-                    let _ = zone_repo.update_online(id, false);
-                }
                 info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
             }
         }
