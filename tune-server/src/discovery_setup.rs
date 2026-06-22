@@ -204,6 +204,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
 
     let outputs = state.outputs.clone();
     let db = state.backend.clone();
+    let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -311,6 +312,13 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
+                            event_bus.emit(
+                                "device.reconnected",
+                                serde_json::json!({
+                                    "device_id": &dev.id,
+                                    "name": &dev.name,
+                                }),
+                            );
                         } else {
                             let existing = zone_repo.list().unwrap_or_default();
 

@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["local-audio", "oaat"]
+default = ["local-audio", "oaat", "cloud-relay"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
+cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
 
 [dependencies]

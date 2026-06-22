@@ -1649,12 +1649,21 @@ impl OutputTarget for LocalOutput {
                                 }
                             }
 
+                            let mut http_eof_wasapi = false;
                             loop {
                                 if stop_rx.try_recv().is_ok() {
                                     break;
                                 }
+                                if force_silent.load(Ordering::Relaxed) {
+                                    debug!("local_audio_wasapi_exclusive_aborted_by_stop");
+                                    break;
+                                }
+
                                 match reader.read(&mut read_buf) {
-                                    Ok(0) => break,
+                                    Ok(0) => {
+                                        http_eof_wasapi = true;
+                                        break;
+                                    }
                                     Ok(n) => {
                                         leftover.extend_from_slice(&read_buf[..n]);
                                         let aligned = (leftover.len() / frame_bytes) * frame_bytes;
@@ -1671,9 +1680,40 @@ impl OutputTarget for LocalOutput {
                                             total_frames_fed += (aligned / frame_bytes) as u64;
                                             leftover.drain(..aligned);
                                         }
+
+                                        let pos = (total_frames_fed as f64 / sample_rate as f64
+                                            * 1000.0)
+                                            as u64;
+                                        position_ms.store(pos, Ordering::Relaxed);
                                     }
-                                    Err(_) => break,
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::TimedOut
+                                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "local_audio_wasapi_exclusive_read_error");
+                                        break;
+                                    }
                                 }
+                            }
+
+                            // Wait for ring buffer to drain
+                            loop {
+                                if stop_rx.try_recv().is_ok() {
+                                    break;
+                                }
+                                if force_silent.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if ring.available() == 0 {
+                                    if http_eof_wasapi && !force_silent.load(Ordering::Relaxed) {
+                                        track_ended_naturally.store(true, Ordering::SeqCst);
+                                    }
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
                             }
 
                             wasapi.stop();

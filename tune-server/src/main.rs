@@ -176,6 +176,17 @@ async fn main() {
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     tune_server::startup::init_state(&state, &config).await;
 
+    // Record initial server_last_alive_at for auto-resume crash detection
+    {
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        settings.set("server_last_alive_at", &now.to_string()).ok();
+    }
+
     // Auto-scan music directories at startup
     let scan_done = if config.auto_scan {
         Some(tune_server::auto_scan::spawn_auto_scan(
@@ -194,6 +205,10 @@ async fn main() {
     #[cfg(feature = "local-audio")]
     tune_server::startup::register_local_outputs(&state).await;
 
+    // Auto-resume local zones (local: devices are already registered)
+    #[cfg(feature = "local-audio")]
+    tune_server::auto_resume::auto_resume_local_zones(&state).await;
+
     // Create shared OpenHome event listener
     let oh_event_listener = tune_server::startup::create_oh_listener().await;
 
@@ -206,6 +221,9 @@ async fn main() {
     // Background tasks: squeezebox poller, session GC, position poller,
     // token refresh, UPnP advertiser, Deezer proxy, alarms, notifications, memory diag
     tune_server::background::spawn_background_tasks(&state, &config).await;
+
+    // Auto-resume network zones (waits for device.reconnected events)
+    tune_server::auto_resume::spawn_auto_resume_listener(&state);
 
     state.event_bus.emit(
         "system.started",

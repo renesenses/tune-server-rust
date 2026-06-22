@@ -491,6 +491,11 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
         name: "add_zones_is_hidden",
         up: "ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0;",
     },
+    Migration {
+        version: 39,
+        name: "add_zones_last_play_state",
+        up: "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped';",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

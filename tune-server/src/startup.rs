@@ -80,6 +80,23 @@ fn ensure_zones_is_hidden(state: &AppState) {
             // Migration v38 handles this.
         }
     }
+
+    // Ensure last_play_state column exists (migration v39 for SQLite,
+    // idempotent ALTER for Postgres).
+    match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => {
+            let result = state.backend.execute(
+                "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped'",
+                &[],
+            );
+            match result {
+                Ok(_) => info!("zones_last_play_state_column_added"),
+                Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
+                Err(e) => tracing::warn!(error = %e, "zones_last_play_state_add_failed"),
+            }
+        }
+        _ => {}
+    }
 }
 
 fn deduplicate_radios(state: &AppState) {

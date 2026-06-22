@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod auth;
+pub mod auto_resume;
 pub mod auto_scan;
 pub mod background;
 pub mod config;

@@ -27,6 +27,16 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
+    #[cfg(feature = "cloud-relay")]
+    spawn_relay_client(state);
+}
+
+#[cfg(feature = "cloud-relay")]
+fn spawn_relay_client(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    if let Some(client) = tune_core::cloud::relay::spawn_relay_client(&settings) {
+        info!("cloud relay client spawned");
+    }
 }
 
 fn spawn_ssdp_startup_scan(state: &AppState) {
@@ -410,6 +420,19 @@ fn spawn_heartbeat(state: &AppState) {
                 "services": authenticated_services,
                 "devices": devices,
             });
+
+            // Update server_last_alive_at timestamp for crash detection
+            {
+                let settings =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                settings
+                    .set("server_last_alive_at", &now_ts.to_string())
+                    .ok();
+            }
 
             match client
                 .post("https://mozaiklabs.fr/api/v1/heartbeat")

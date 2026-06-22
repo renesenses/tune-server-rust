@@ -251,6 +251,11 @@ impl PlaybackOrchestrator {
 
         self.playback.play(req.zone_id, np).await;
 
+        // Persist play state for auto-resume after server restart
+        crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .save_play_state(req.zone_id, "playing")
+            .ok();
+
         // Last.fm Now Playing
         self.lastfm_now_playing(&resolved.title, resolved.artist.as_deref());
 
@@ -2045,6 +2050,9 @@ impl PlaybackOrchestrator {
 
     pub async fn pause(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
+        crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .save_play_state(zone_id, "paused")
+            .ok();
         self.playback.pause(zone_id).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
@@ -2070,6 +2078,9 @@ impl PlaybackOrchestrator {
 
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         self.persist_position(zone_id).await;
+        crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+            .save_play_state(zone_id, "stopped")
+            .ok();
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
         let state = self.playback.get_state(zone_id).await;

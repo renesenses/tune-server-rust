@@ -409,6 +409,20 @@ async fn process_responses(
             continue;
         }
         seen_locations.insert(resp.location.clone());
+
+        if let Some(host_str) = host_from_location(&resp.location) {
+            if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
+                if is_virtual_ip(ip) {
+                    debug!(
+                        location = %resp.location,
+                        ip = %ip,
+                        "ssdp_response_rejected_virtual_ip_in_location"
+                    );
+                    continue;
+                }
+            }
+        }
+
         let dev_id = device_id_from_usn(&resp.usn);
         seen_ids.insert(dev_id.clone());
 

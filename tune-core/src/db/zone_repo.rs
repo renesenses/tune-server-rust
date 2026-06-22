@@ -477,6 +477,34 @@ impl ZoneRepo {
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
     }
+
+    /// Persist the play state ("playing", "paused", "stopped") for a zone.
+    /// Silently ignores missing column (pre-v39 database).
+    pub fn save_play_state(&self, id: i64, state: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("last_play_state");
+        let params: [&dyn ToSqlValue; 2] = [&state, &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read the last persisted play state for a zone.
+    /// Returns None if the column doesn't exist (pre-v39) or the zone is not found.
+    pub fn get_last_play_state(&self, id: i64) -> Option<String> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!("SELECT last_play_state FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+    }
 }
 
 fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {

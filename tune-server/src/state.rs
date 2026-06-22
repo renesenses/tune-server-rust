@@ -51,6 +51,8 @@ pub struct AppState {
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
+    #[cfg(feature = "cloud-relay")]
+    pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
 
 impl AppState {
@@ -159,6 +161,8 @@ impl AppState {
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "cloud-relay")]
+            relay_client: None,
         })
     }
 

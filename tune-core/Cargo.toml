@@ -44,6 +44,7 @@ oaat-core = { workspace = true, optional = true }
 oaat-controller = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 tokio-stream = "0.1.18"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
@@ -58,4 +59,5 @@ default = ["local-audio"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio"]
 asio = ["cpal/asio"]
 oaat = ["dep:oaat-core", "dep:oaat-controller"]
+cloud-relay = ["dep:tokio-tungstenite"]
 postgres = ["dep:sqlx"]

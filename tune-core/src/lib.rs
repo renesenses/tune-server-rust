@@ -75,6 +75,8 @@ pub fn enabled_features() -> Vec<&'static str> {
     features.push("asio");
     #[cfg(feature = "oaat")]
     features.push("oaat");
+    #[cfg(feature = "cloud-relay")]
+    features.push("cloud-relay");
     #[cfg(feature = "postgres")]
     features.push("postgres");
     features
