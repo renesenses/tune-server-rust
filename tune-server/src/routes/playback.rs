@@ -840,7 +840,8 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
         }
         let local_items = qr.get_queue(zone_id).unwrap_or_default();
         if let Some(first) = local_items.first() {
-            if let Some(track_id) = first.track_id {
+            {
+                let track_id = first.track_id;
                 let orch_req = tune_core::orchestrator::PlayRequest {
                     zone_id,
                     output_device_id,

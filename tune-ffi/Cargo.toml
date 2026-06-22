@@ -9,7 +9,12 @@ name = "tuneserver"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-tune-core = { path = "../tune-core", features = ["local-audio"] }
+tune-core = { path = "../tune-core" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Local audio only on desktop (cpal needs platform audio libs)
+# On Android, audio goes through DLNA/HTTP to the Flutter player
+
 tune-server = { path = "../tune-server" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

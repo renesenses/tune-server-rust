@@ -11,6 +11,7 @@ use crate::state::AppState;
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
+    cleanup_orphan_queues(state);
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -40,6 +41,24 @@ fn deduplicate_zones(state: &AppState) {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
+    }
+}
+
+fn cleanup_orphan_queues(state: &AppState) {
+    let sqls = [
+        "DELETE FROM play_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
+        "DELETE FROM streaming_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
+    ];
+    for sql in &sqls {
+        match state.backend.execute(sql, &[]) {
+            Ok(removed) if removed > 0 => {
+                info!(removed, sql = *sql, "orphan_queue_records_cleaned");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "orphan_queue_cleanup_failed");
+            }
+        }
     }
 }
 
