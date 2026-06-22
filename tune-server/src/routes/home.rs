@@ -148,9 +148,12 @@ fn fetch_continue_listening(
     Ok(rows
         .iter()
         .map(|cols| {
+            let album_id = cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": album_id,
+                "album_id": album_id,
                 "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "album_title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "year": cols.get(3).and_then(|v| v.as_i64()),
                 "cover_path": cols.get(4).and_then(|v| v.as_string()),
