@@ -88,7 +88,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
@@ -107,13 +107,13 @@ jobs:
           $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
           echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
 
-      - name: Build (native, Windows with local-audio + ASIO)
+      - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,asio,postgres
 
-      - name: Build (native, macOS with local-audio)
+      - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres
 
       - name: Package (unix)
         if: runner.os != 'Windows'
