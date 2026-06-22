@@ -408,34 +408,46 @@ impl PositionPoller {
 
                     // Radio metadata polling (title/artist from ICY or external)
                     if let Some(ref np) = zone_state.now_playing {
-                        if let Some(ref source_id) = np.source_id {
-                            if let Ok(sid) = source_id.parse::<i64>() {
-                                let radio_repo =
-                                    crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
-                                if let Ok(Some(station)) = radio_repo.get(sid) {
-                                    if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
-                                        &station.name,
-                                        &station.url,
-                                    )
-                                    .await
-                                    {
-                                        let title_changed =
-                                            np.title != meta.title || np.artist_name != meta.artist;
-                                        if title_changed {
-                                            let new_np = crate::playback::NowPlaying {
-                                                track_id: None,
-                                                title: meta.title,
-                                                artist_name: meta.artist,
-                                                album_title: Some(station.name.clone()),
-                                                cover_path: np.cover_path.clone(),
-                                                duration_ms: 0,
-                                                source: "radio".into(),
-                                                source_id: np.source_id.clone(),
-                                                stream_id: np.stream_id.clone(),
-                                            };
-                                            self.playback.update_now_playing(zone_id, new_np).await;
-                                            debug!(zone_id, station = %station.name, "radio_metadata_updated");
-                                        }
+                        if np.source == "radio" {
+                            if let Some(ref source_id) = np.source_id {
+                                // source_id is either a numeric radio DB id or the stream URL itself
+                                let (station_name, stream_url) = if let Ok(sid) =
+                                    source_id.parse::<i64>()
+                                {
+                                    let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(
+                                        self.db.clone(),
+                                    );
+                                    if let Ok(Some(station)) = radio_repo.get(sid) {
+                                        (station.name.clone(), station.url.clone())
+                                    } else {
+                                        (np.title.clone(), source_id.clone())
+                                    }
+                                } else {
+                                    (np.title.clone(), source_id.clone())
+                                };
+
+                                if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(
+                                    &station_name,
+                                    &stream_url,
+                                )
+                                .await
+                                {
+                                    let title_changed =
+                                        np.title != meta.title || np.artist_name != meta.artist;
+                                    if title_changed {
+                                        let new_np = crate::playback::NowPlaying {
+                                            track_id: None,
+                                            title: meta.title,
+                                            artist_name: meta.artist,
+                                            album_title: Some(station_name.clone()),
+                                            cover_path: np.cover_path.clone(),
+                                            duration_ms: 0,
+                                            source: "radio".into(),
+                                            source_id: np.source_id.clone(),
+                                            stream_id: np.stream_id.clone(),
+                                        };
+                                        self.playback.update_now_playing(zone_id, new_np).await;
+                                        debug!(zone_id, station = %station_name, "radio_metadata_updated");
                                     }
                                 }
                             }
