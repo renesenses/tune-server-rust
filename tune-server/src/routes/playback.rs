@@ -334,8 +334,44 @@ async fn play(
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
                             .into_response()
                     }
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                    Err(e) => {
+                        tracing::warn!(zone_id, error = %e, "play_resume_failed_trying_queue");
+                        // Fallback: try to play from queue position 0
+                        let qr = PlayQueueRepo::with_backend(state.backend.clone());
+                        let local_c = qr.count(zone_id).unwrap_or(0);
+                        let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+                        let q_len = if local_c > 0 { local_c } else { stream_c };
+                        if q_len > 0 {
+                            let pos = current.queue_position.min(q_len - 1);
+                            state.playback.update_queue_info(zone_id, pos, q_len).await;
+                            if let Ok(result) =
+                                state.orchestrator.play_from_queue(zone_id, pos).await
+                            {
+                                return Json(
+                                    build_zone_json_with_result(&state, zone_id, &result).await,
+                                )
+                                .into_response();
+                            }
+                        }
+                        (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+                    }
                 };
+            }
+            // No now_playing — try queue fallback
+            {
+                let qr = PlayQueueRepo::with_backend(state.backend.clone());
+                let local_c = qr.count(zone_id).unwrap_or(0);
+                let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+                let q_len = if local_c > 0 { local_c } else { stream_c };
+                if q_len > 0 {
+                    let current = state.playback.get_state(zone_id).await;
+                    let pos = current.queue_position.min(q_len - 1);
+                    state.playback.update_queue_info(zone_id, pos, q_len).await;
+                    if let Ok(result) = state.orchestrator.play_from_queue(zone_id, pos).await {
+                        return Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                            .into_response();
+                    }
+                }
             }
             return (
                 StatusCode::BAD_REQUEST,
