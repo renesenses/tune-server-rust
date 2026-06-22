@@ -94,9 +94,9 @@ jobs:
         if: "!matrix.cross && runner.os == 'Linux'"
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Build (native, Linux with local-audio)
+      - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,local-audio,postgres
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
