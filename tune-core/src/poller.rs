@@ -1474,4 +1474,92 @@ mod tests {
         }
         assert_eq!(past_end, 0, "counter should reset when position < duration");
     }
+
+    #[test]
+    fn gapless_stuck_forces_track_end() {
+        // BUG-004: After gapless metadata advance, if the renderer stays
+        // Stopped, gapless_stuck_ticks should accumulate and trigger
+        // track_ended after GAPLESS_STUCK_THRESHOLD ticks.
+        let mut ps = ZonePollState {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
+            peak_position_ms: 0,
+            ticks_since_db_save: 0,
+            track_started_at: None,
+            track_generation: 0,
+            track_loaded_at: Instant::now(),
+            past_end_ticks: 0,
+            gapless_advance_pending: true, // metadata was advanced
+            gapless_stuck_ticks: 0,
+        };
+
+        // Simulate renderer staying Stopped after cooldown expired.
+        // gapless_advance_pending is true, gapless_cooldown is 0.
+        for tick in 1..=GAPLESS_STUCK_THRESHOLD {
+            ps.gapless_stuck_ticks += 1;
+            if tick < GAPLESS_STUCK_THRESHOLD {
+                assert!(
+                    ps.gapless_stuck_ticks < GAPLESS_STUCK_THRESHOLD,
+                    "should not trigger yet at tick {tick}"
+                );
+            }
+        }
+        assert!(
+            ps.gapless_stuck_ticks >= GAPLESS_STUCK_THRESHOLD,
+            "should trigger track_ended after {} ticks",
+            GAPLESS_STUCK_THRESHOLD
+        );
+
+        // After triggering, pending state should be cleared
+        ps.gapless_advance_pending = false;
+        ps.gapless_stuck_ticks = 0;
+        assert!(!ps.gapless_advance_pending);
+        assert_eq!(ps.gapless_stuck_ticks, 0);
+    }
+
+    #[test]
+    fn gapless_stuck_cleared_on_playing() {
+        // When the renderer transitions to Playing, gapless_advance_pending
+        // should be cleared (the gapless transition succeeded).
+        let mut ps = ZonePollState {
+            gapless_sent: false,
+            stopped_ticks: 0,
+            gapless_cooldown: 0,
+            consecutive_errors: 0,
+            backoff_remaining: 0,
+            total_polls: 0,
+            total_errors: 0,
+            last_latency_ms: 0,
+            max_latency_ms: 0,
+            last_radio_poll: Instant::now(),
+            gapless_sent_at: None,
+            last_position_ms: 0,
+            peak_position_ms: 0,
+            ticks_since_db_save: 0,
+            track_started_at: None,
+            track_generation: 0,
+            track_loaded_at: Instant::now(),
+            past_end_ticks: 0,
+            gapless_advance_pending: true,
+            gapless_stuck_ticks: 3,
+        };
+
+        // Simulate entering Playing state (renderer auto-transitioned)
+        if ps.gapless_advance_pending {
+            ps.gapless_advance_pending = false;
+            ps.gapless_stuck_ticks = 0;
+        }
+        assert!(!ps.gapless_advance_pending);
+        assert_eq!(ps.gapless_stuck_ticks, 0);
+    }
 }

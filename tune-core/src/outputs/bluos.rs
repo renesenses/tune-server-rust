@@ -156,6 +156,7 @@ impl OutputTarget for BluosOutput {
             current_uri,
             track_title: extract_tag(&xml, "title1"),
             track_artist: extract_tag(&xml, "artist"),
+            ended_naturally: false,
         })
     }
 

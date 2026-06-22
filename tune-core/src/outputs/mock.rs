@@ -156,6 +156,7 @@ impl OutputTarget for MockOutput {
             current_uri: self.current_uri.lock().await.clone(),
             track_title: None,
             track_artist: None,
+            ended_naturally: false,
         })
     }
 

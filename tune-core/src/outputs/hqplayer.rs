@@ -420,6 +420,7 @@ impl OutputTarget for HqplayerOutput {
             current_uri,
             track_title,
             track_artist,
+            ended_naturally: false,
         })
     }
 

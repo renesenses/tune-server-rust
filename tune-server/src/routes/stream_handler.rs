@@ -19,9 +19,17 @@ pub async fn handle_head(
     State(sessions): State<SharedSessions>,
 ) -> Response {
     let stream_id = extract_stream_id(&raw_id);
-    let sessions = sessions.lock().await;
+    // Clone the Arc so we release the sessions lock before any async I/O.
+    // Holding the global sessions lock across tokio::fs::metadata() (an async
+    // syscall) would serialize ALL concurrent stream requests — HEAD and GET
+    // included — on a single lock, causing unnecessary latency on renderers
+    // that issue HEAD+GET in quick succession (DMP-A8, darTZeel, etc.).
+    let session = {
+        let sessions = sessions.lock().await;
+        sessions.get(stream_id).cloned()
+    };
 
-    let Some(session) = sessions.get(stream_id) else {
+    let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -31,7 +39,10 @@ pub async fn handle_head(
     } else {
         let fp = session.file_path.lock().await;
         if let Some(ref path) = *fp {
-            tokio::fs::metadata(path).await.ok().map(|m| m.len())
+            tokio::fs::metadata(path.as_str())
+                .await
+                .ok()
+                .map(|m| m.len())
         } else {
             session.info.wav_content_length()
         }

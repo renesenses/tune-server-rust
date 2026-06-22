@@ -324,6 +324,7 @@ impl OutputTarget for ChromecastOutput {
 
             let Some(app) = recv_status.applications.first() else {
                 return Ok(OutputStatus {
+                    ended_naturally: false,
                     volume,
                     muted,
                     ..Default::default()
@@ -332,6 +333,7 @@ impl OutputTarget for ChromecastOutput {
 
             if device.connection.connect(&app.transport_id).is_err() {
                 return Ok(OutputStatus {
+                    ended_naturally: false,
                     volume,
                     muted,
                     ..Default::default()
@@ -342,6 +344,7 @@ impl OutputTarget for ChromecastOutput {
                 Ok(s) => s,
                 Err(_) => {
                     return Ok(OutputStatus {
+                        ended_naturally: false,
                         volume,
                         muted,
                         ..Default::default()
@@ -351,6 +354,7 @@ impl OutputTarget for ChromecastOutput {
 
             let Some(entry) = media_status.entries.first() else {
                 return Ok(OutputStatus {
+                    ended_naturally: false,
                     volume,
                     muted,
                     ..Default::default()
@@ -386,6 +390,7 @@ impl OutputTarget for ChromecastOutput {
                 current_uri,
                 track_title: None,
                 track_artist: None,
+                ended_naturally: false,
             })
         })
         .await

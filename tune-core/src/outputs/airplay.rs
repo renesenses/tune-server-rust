@@ -481,6 +481,7 @@ impl OutputTarget for AirplayOutput {
             current_uri: self.current_uri.lock().await.clone(),
             track_title: self.current_title.lock().await.clone(),
             track_artist: self.current_artist.lock().await.clone(),
+            ended_naturally: false,
         })
     }
 

@@ -446,6 +446,7 @@ impl OutputTarget for DlnaOutput {
             current_uri,
             track_title: extract_tag(&position_resp, "dc:title"),
             track_artist: extract_tag(&position_resp, "dc:creator"),
+            ended_naturally: false,
         })
     }
 

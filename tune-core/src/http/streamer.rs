@@ -145,6 +145,11 @@ impl AudioStreamer {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StreamSession::new(id.clone(), info, bit_perfect, 64);
         *session.file_path.lock().await = Some(file_path);
+        // File is already written to disk — signal data_ready immediately so
+        // gapless pre-buffer logic (poller::prepare_gapless → wait_stream_data_ready)
+        // does not block for its full 5-second timeout waiting for data that will
+        // never arrive via the mpsc channel.
+        session.data_ready.notify_one();
         self.sessions
             .lock()
             .await
@@ -294,7 +299,10 @@ pub fn cleanup_leftover_transcode_files() {
     let mut count = 0;
     for entry in entries.flatten() {
         if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with("tune-transcode-") {
+            if name.starts_with("tune-transcode-")
+                || name.starts_with("tune-aac-transcode-")
+                || name.starts_with("tune-dash-transcode-")
+            {
                 if std::fs::remove_file(entry.path()).is_ok() {
                     count += 1;
                 }
@@ -324,12 +332,19 @@ pub fn build_wav_header(
 /// Check if a file path is a temporary transcode file created by the
 /// pre-transcode pipeline.  Only these files should be auto-deleted
 /// when a session is removed — never actual music files.
+///
+/// Patterns:
+/// - `tune-transcode-{uuid}.{ext}` — local file pre-transcode (FLAC/WAV target)
+/// - `tune-aac-transcode-{uuid}.flac` — Tidal AAC→FLAC pre-transcode
+/// - `tune-dash-transcode-{uuid}.flac` — Tidal DASH fMP4→FLAC pre-transcode
 fn is_temp_transcode_file(path: &str) -> bool {
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     file_name.starts_with("tune-transcode-")
+        || file_name.starts_with("tune-aac-transcode-")
+        || file_name.starts_with("tune-dash-transcode-")
 }
 
 pub fn build_icy_metadata(
