@@ -2256,10 +2256,24 @@ impl PlaybackOrchestrator {
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
+                info!(
+                    zone_id,
+                    volume,
+                    device_id = did,
+                    "device_set_volume_sending"
+                );
                 if let Err(e) = output.lock().await.set_volume(volume).await {
                     warn!(zone_id, error = %e, "device_set_volume_failed");
                 }
+            } else {
+                warn!(
+                    zone_id,
+                    device_id = did,
+                    "device_set_volume_output_not_found"
+                );
             }
+        } else {
+            info!(zone_id, volume, "set_volume_no_device_id");
         }
     }
 
