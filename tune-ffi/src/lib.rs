@@ -182,6 +182,7 @@ async fn run_server(
         .map_err(|e| format!("init state: {e}"))?;
 
     tune_server::startup::init_state(&state, &config).await;
+    #[cfg(feature = "local-audio")]
     tune_server::startup::register_local_outputs(&state).await;
 
     let oh_listener = tune_server::startup::create_oh_listener().await;
