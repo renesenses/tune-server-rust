@@ -29,6 +29,9 @@ pub fn router() -> Router<AppState> {
         .route("/community/genre-correction", post(submit_genre_correction))
         .route("/community/covers", post(submit_community_cover))
         .route("/community/covers/sync", post(sync_community_covers))
+        .route("/bridge/status", get(bridge_status))
+        .route("/bridge/enable", post(bridge_enable))
+        .route("/bridge/disable", post(bridge_disable))
 }
 
 // ---------------------------------------------------------------------------
@@ -592,4 +595,90 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Bridge (cloud relay)
+// ---------------------------------------------------------------------------
+
+async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = TelemetryReporter::get_or_create_server_id(&settings);
+    let bridge_token = settings.get("bridge_token").ok().flatten();
+    let bridge_url = settings
+        .get("bridge_url")
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("TUNE_BRIDGE_URL").ok())
+        .unwrap_or_else(|| "wss://bridge.mozaiklabs.fr/ws/server".to_string());
+
+    let enabled = settings
+        .get("bridge_enabled")
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+        || std::env::var("TUNE_BRIDGE_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false);
+
+    let connected = {
+        #[cfg(feature = "cloud-relay")]
+        {
+            state
+                .relay_client
+                .as_ref()
+                .map(|c| c.is_connected())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "cloud-relay"))]
+        {
+            false
+        }
+    };
+
+    Json(json!({
+        "enabled": enabled,
+        "connected": connected,
+        "server_id": server_id,
+        "relay_url": bridge_url,
+        "has_token": bridge_token.is_some(),
+        "access_url": if enabled {
+            Some(format!("https://bridge.mozaiklabs.fr/{server_id}/"))
+        } else {
+            None
+        },
+    }))
+}
+
+async fn bridge_enable(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let _ = settings.set("bridge_enabled", "true");
+
+    let token = match settings.get("bridge_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let t = uuid::Uuid::new_v4().to_string();
+            let _ = settings.set("bridge_token", &t);
+            t
+        }
+    };
+
+    let server_id = TelemetryReporter::get_or_create_server_id(&settings);
+    info!(server_id = %server_id, "bridge enabled");
+
+    Json(json!({
+        "enabled": true,
+        "server_id": server_id,
+        "bridge_token": token,
+        "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
+        "note": "restart server to activate the relay connection"
+    }))
+}
+
+async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let _ = settings.set("bridge_enabled", "false");
+    info!("bridge disabled");
+    Json(json!({"enabled": false}))
 }
