@@ -19,6 +19,10 @@ pub struct OutputStatus {
     pub current_uri: Option<String>,
     pub track_title: Option<String>,
     pub track_artist: Option<String>,
+    /// The local audio thread has finished draining all audio data naturally
+    /// (not via stop/skip). When true + state==Stopped, this is a definitive
+    /// end-of-track that should trigger auto_next regardless of played_enough.
+    pub ended_naturally: bool,
 }
 
 impl Default for OutputStatus {
@@ -32,6 +36,7 @@ impl Default for OutputStatus {
             current_uri: None,
             track_title: None,
             track_artist: None,
+            ended_naturally: false,
         }
     }
 }

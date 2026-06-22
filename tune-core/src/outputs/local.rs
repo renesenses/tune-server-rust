@@ -2393,7 +2393,6 @@ impl OutputTarget for LocalOutput {
         {
             return Ok(OutputStatus {
                 state: TransportState::Playing,
-                // Report 5 s past the end so the poller's 3 s margin is met.
                 position_ms: duration_ms.saturating_add(5000),
                 duration_ms,
                 volume: self.volume.load(Ordering::Relaxed) as f64 / 1000.0,
@@ -2401,6 +2400,7 @@ impl OutputTarget for LocalOutput {
                 current_uri: self.current_uri.lock().unwrap().clone(),
                 track_title: self.track_title.lock().unwrap().clone(),
                 track_artist: self.track_artist.lock().unwrap().clone(),
+                ended_naturally: true,
             });
         }
 
@@ -2423,6 +2423,7 @@ impl OutputTarget for LocalOutput {
             current_uri: self.current_uri.lock().unwrap().clone(),
             track_title: self.track_title.lock().unwrap().clone(),
             track_artist: self.track_artist.lock().unwrap().clone(),
+            ended_naturally: self.track_ended_naturally.load(Ordering::Relaxed),
         })
     }
 

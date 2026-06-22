@@ -643,6 +643,8 @@ impl PositionPoller {
                     ps.peak_position_ms = 0;
                     ps.last_position_ms = 0;
                     ps.track_started_at = None;
+                    ps.gapless_advance_pending = false;
+                    ps.gapless_stuck_ticks = 0;
                     if let Some(next_pos) = Self::next_position(zone_state) {
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         if let Err(e) = self
@@ -773,6 +775,7 @@ impl PositionPoller {
                             let repeat_end = repeat_active && ps.peak_position_ms > 5_000;
                             let natural_end = played_enough
                                 || repeat_end
+                                || status.ended_naturally
                                 || (is_short_track
                                     && ps.peak_position_ms as f64
                                         >= track_duration_ms as f64 * 0.5);
@@ -908,6 +911,8 @@ impl PositionPoller {
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
                         ps.track_started_at = None;
+                        ps.gapless_advance_pending = false;
+                        ps.gapless_stuck_ticks = 0;
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_advance_metadata");
                             if let Err(e) = self
@@ -1352,6 +1357,8 @@ mod tests {
             track_generation: 0,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
+            gapless_advance_pending: false,
+            gapless_stuck_ticks: 0,
         };
 
         // Simulate consecutive errors with exponential backoff

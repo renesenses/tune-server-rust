@@ -196,6 +196,20 @@ impl AudioStreamer {
         id
     }
 
+    /// Check if a session is a proxy session (direct CDN URL forwarding)
+    /// or a file session — both support HTTP Range-based seeking.
+    /// Decoded/transcoded WAV sessions (mpsc channel) do NOT support Range seeking.
+    pub async fn is_seekable_session(&self, stream_id: &str) -> bool {
+        let sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(stream_id) {
+            let has_proxy = session.proxy_url.lock().await.is_some();
+            let has_file = session.file_path.lock().await.is_some();
+            has_proxy || has_file
+        } else {
+            false
+        }
+    }
+
     pub async fn remove_session(&self, stream_id: &str) {
         let removed = self.sessions.lock().await.remove(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.

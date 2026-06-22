@@ -2128,14 +2128,18 @@ impl PlaybackOrchestrator {
 
         if let Some(did) = device_id {
             // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
-            // a simple Seek SOAP command won't work because the audio is served
-            // through a one-shot proxy/transcoded session that doesn't support
-            // byte-range seeks.  The renderer's position freezes, the poller
-            // sees stopped_early_waiting, and eventually skips to the next track.
+            // the seek strategy depends on whether the stream session supports
+            // HTTP Range-based seeking:
             //
-            // Fix: re-create the stream session, send a new SetAVTransportURI,
-            // then issue the Seek command on the fresh stream so the renderer
-            // can buffer from the beginning and seek within it.
+            // - Proxy sessions (FLAC from Tidal/Qobuz CDN) and file sessions
+            //   support Range requests.  The renderer can seek by closing the
+            //   current HTTP connection and re-requesting with a byte offset.
+            //   For these, a direct SOAP Seek command is sufficient — the
+            //   renderer handles the rest.
+            //
+            // - Decoded/transcoded sessions (WAV via mpsc channel) do NOT
+            //   support Range seeking.  For these, we must recreate the stream
+            //   session as a fallback.
             let is_streaming_source = state
                 .now_playing
                 .as_ref()
@@ -2163,72 +2167,110 @@ impl PlaybackOrchestrator {
             );
 
             if is_streaming_source && is_network {
-                info!(
-                    zone_id,
-                    position_ms,
-                    source = ?state.now_playing.as_ref().map(|np| &np.source),
-                    "seek_streaming_on_network_output_recreating_stream"
-                );
-
-                // Pre-set the seek timestamp BEFORE play() so the poller's
-                // seek grace period covers the entire stream-recreation
-                // window.  play() calls playback.play() which increments
-                // track_generation and clears last_seek_at — we re-set it
-                // again after play() returns (and once more after the Seek
-                // command) to maintain continuous coverage.
-                self.playback.seek(zone_id, position_ms as i64).await;
-
-                // Re-create the stream: build a PlayRequest from the current NowPlaying
-                let np = state.now_playing.as_ref().unwrap();
-                let output_device_id = ZoneRepo::with_backend(self.db.clone())
-                    .get(zone_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|z| z.output_device_id);
-                let req = PlayRequest {
-                    zone_id,
-                    output_device_id,
-                    track_id: np.track_id,
-                    source: Some(np.source.clone()),
-                    source_id: np.source_id.clone(),
-                    title: Some(np.title.clone()),
-                    artist_name: np.artist_name.clone(),
-                    album_title: np.album_title.clone(),
-                    cover_url: np.cover_path.clone(),
-                    duration_ms: Some(np.duration_ms),
+                // Check if the current stream session supports Range seeking
+                let stream_id = state
+                    .now_playing
+                    .as_ref()
+                    .and_then(|np| np.stream_id.clone());
+                let is_seekable = if let Some(ref sid) = stream_id {
+                    self.streamer.is_seekable_session(sid).await
+                } else {
+                    false
                 };
 
-                match self.play(req).await {
-                    Ok(_) => {
-                        // play() cleared last_seek_at — re-set it immediately
-                        // so the poller's seek grace covers the buffering window.
-                        self.playback.seek(zone_id, position_ms as i64).await;
+                if is_seekable {
+                    // Proxy/file session: the stream handler already supports
+                    // Range-based seeking.  Send a direct SOAP Seek — the
+                    // renderer will close the current connection and re-request
+                    // with the appropriate byte offset.  Same stream URL, no
+                    // interruption, no "new track" artifact.
+                    info!(
+                        zone_id,
+                        position_ms,
+                        source = ?state.now_playing.as_ref().map(|np| &np.source),
+                        stream_id = ?stream_id,
+                        "seek_streaming_direct_on_seekable_session"
+                    );
 
-                        // Stream is now fresh — issue the seek on the output.
-                        // Small delay to let the renderer start buffering.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let outputs = self.outputs.lock().await;
-                        if let Some(output) = outputs.get(did) {
-                            if let Err(e) = output.lock().await.seek(position_ms).await {
-                                warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
-                            }
+                    let outputs = self.outputs.lock().await;
+                    if let Some(output) = outputs.get(did) {
+                        if let Err(e) = output.lock().await.seek(position_ms).await {
+                            warn!(zone_id, error = %e, "device_seek_on_seekable_session_failed");
                         }
-                        // Re-set the seek timestamp so the poller grace period
-                        // starts from after the Seek SOAP command, not from
-                        // the play() call.
-                        self.playback.seek(zone_id, position_ms as i64).await;
-                        info!(zone_id, position_ms, "seek_streaming_complete");
                     }
-                    Err(e) => {
-                        warn!(zone_id, error = %e, "seek_streaming_play_recreate_failed");
-                        // Restore seek timestamp so the poller doesn't
-                        // misinterpret the Stopped state as a playback failure.
-                        self.playback.seek(zone_id, position_ms as i64).await;
-                        // Fall back to direct seek (best effort)
-                        let outputs = self.outputs.lock().await;
-                        if let Some(output) = outputs.get(did) {
-                            if let Err(e) = output.lock().await.seek(position_ms).await {
-                                warn!(zone_id, error = %e, "device_seek_fallback_failed");
+                    self.playback.seek(zone_id, position_ms as i64).await;
+                    info!(zone_id, position_ms, "seek_streaming_direct_complete");
+                } else {
+                    // Decoded/transcoded session (WAV via mpsc): no Range
+                    // support.  Recreate the stream so the renderer gets a
+                    // fresh URL to buffer from.
+                    info!(
+                        zone_id,
+                        position_ms,
+                        source = ?state.now_playing.as_ref().map(|np| &np.source),
+                        "seek_streaming_on_network_output_recreating_stream"
+                    );
+
+                    // Pre-set the seek timestamp BEFORE play() so the poller's
+                    // seek grace period covers the entire stream-recreation
+                    // window.  play() calls playback.play() which increments
+                    // track_generation and clears last_seek_at — we re-set it
+                    // again after play() returns (and once more after the Seek
+                    // command) to maintain continuous coverage.
+                    self.playback.seek(zone_id, position_ms as i64).await;
+
+                    // Re-create the stream: build a PlayRequest from the current NowPlaying
+                    let np = state.now_playing.as_ref().unwrap();
+                    let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id);
+                    let req = PlayRequest {
+                        zone_id,
+                        output_device_id,
+                        track_id: np.track_id,
+                        source: Some(np.source.clone()),
+                        source_id: np.source_id.clone(),
+                        title: Some(np.title.clone()),
+                        artist_name: np.artist_name.clone(),
+                        album_title: np.album_title.clone(),
+                        cover_url: np.cover_path.clone(),
+                        duration_ms: Some(np.duration_ms),
+                    };
+
+                    match self.play(req).await {
+                        Ok(_) => {
+                            // play() cleared last_seek_at — re-set it immediately
+                            // so the poller's seek grace covers the buffering window.
+                            self.playback.seek(zone_id, position_ms as i64).await;
+
+                            // Stream is now fresh — issue the seek on the output.
+                            // Small delay to let the renderer start buffering.
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let outputs = self.outputs.lock().await;
+                            if let Some(output) = outputs.get(did) {
+                                if let Err(e) = output.lock().await.seek(position_ms).await {
+                                    warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
+                                }
+                            }
+                            // Re-set the seek timestamp so the poller grace period
+                            // starts from after the Seek SOAP command, not from
+                            // the play() call.
+                            self.playback.seek(zone_id, position_ms as i64).await;
+                            info!(zone_id, position_ms, "seek_streaming_complete");
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "seek_streaming_play_recreate_failed");
+                            // Restore seek timestamp so the poller doesn't
+                            // misinterpret the Stopped state as a playback failure.
+                            self.playback.seek(zone_id, position_ms as i64).await;
+                            // Fall back to direct seek (best effort)
+                            let outputs = self.outputs.lock().await;
+                            if let Some(output) = outputs.get(did) {
+                                if let Err(e) = output.lock().await.seek(position_ms).await {
+                                    warn!(zone_id, error = %e, "device_seek_fallback_failed");
+                                }
                             }
                         }
                     }
