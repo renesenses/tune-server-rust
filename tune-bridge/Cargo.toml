@@ -1,0 +1,26 @@
+[package]
+name = "tune-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tune Bridge — cloud relay for remote access to Tune servers"
+
+[[bin]]
+name = "tune-bridge"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+dashmap = "6"
+dotenvy = { workspace = true }
