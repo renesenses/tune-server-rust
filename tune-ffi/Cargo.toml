@@ -1,0 +1,18 @@
+[package]
+name = "tune-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tuneserver"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tune-core = { path = "../tune-core", features = ["local-audio"] }
+tune-server = { path = "../tune-server" }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
