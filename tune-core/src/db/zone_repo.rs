@@ -250,8 +250,6 @@ impl ZoneRepo {
         // Check if a zone with this device_id already exists (including hidden).
         if let Some(existing) = self.get_by_device_id(output_device_id)? {
             if let Some(id) = existing.id {
-                // Unhide if it was soft-deleted — the device is back.
-                let _ = self.unhide(id);
                 return Ok((id, false));
             }
         }
