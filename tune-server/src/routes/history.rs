@@ -73,12 +73,37 @@ async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams
 
 async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
-    let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items: Vec<Value> = repo
-        .top_artists(limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, plays)| json!({ "name": name, "plays": plays }))
+    let engine = state.backend.engine();
+    let p1 = if engine == tune_core::db::engine::Engine::Postgres {
+        "$1"
+    } else {
+        "?"
+    };
+    let sql = format!(
+        "SELECT lh.artist_name, COUNT(*) as plays, ar.id as artist_id \
+         FROM listen_history lh \
+         LEFT JOIN artists ar ON LOWER(lh.artist_name) = LOWER(ar.name) \
+         WHERE lh.artist_name IS NOT NULL \
+         GROUP BY lh.artist_name, ar.id \
+         ORDER BY plays DESC \
+         LIMIT {p1}"
+    );
+    use tune_core::db::backend::ToSqlValue;
+    let rows = state
+        .backend
+        .query_many(&sql, &[&limit as &dyn ToSqlValue])
+        .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "name": cols.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                "plays": cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                "artist_id": cols.get(2).and_then(|v| v.as_i64()),
+                "id": cols.get(2).and_then(|v| v.as_i64()),
+            })
+        })
         .collect();
     Json(json!(items))
 }
