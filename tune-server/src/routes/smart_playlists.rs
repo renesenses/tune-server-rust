@@ -5,6 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::backend::ToSqlValue;
+use tune_core::db::engine::Engine;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -51,31 +53,32 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists ORDER BY name")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-                let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "rules": rules,
-                    "sort_by": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "sort_order": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "max_tracks": row.get::<_, Option<i64>>(5).ok().flatten(),
-                    "created_at": row.get::<_, Option<String>>(6).ok().flatten(),
-                }))
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists ORDER BY name",
+            &[],
+        )
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            let rules_str = cols
+                .get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "name": cols.get(1).and_then(|v| v.as_string()),
+                "rules": rules,
+                "sort_by": cols.get(3).and_then(|v| v.as_string()),
+                "sort_order": cols.get(4).and_then(|v| v.as_string()),
+                "max_tracks": cols.get(5).and_then(|v| v.as_i64()),
+                "created_at": cols.get(6).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -87,19 +90,26 @@ async fn create_smart_playlist(
     let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
-    let result = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        conn.execute(
-            "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)",
-            rusqlite::params![body.name, rules_json, sort_by, sort_order, body.max_tracks],
-        )
-        .map(|_| conn.last_insert_rowid())
-        .map_err(|e| e.to_string())
+    let sql = if state.backend.engine() == Engine::Postgres {
+        "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES ($1, $2, $3, $4, $5)"
+    } else {
+        "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)"
     };
+
+    let result = state
+        .backend
+        .execute(
+            sql,
+            &[
+                &body.name as &dyn ToSqlValue,
+                &rules_json as &dyn ToSqlValue,
+                &sort_by as &dyn ToSqlValue,
+                &sort_order as &dyn ToSqlValue,
+                &body.max_tracks as &dyn ToSqlValue,
+            ],
+        )
+        .map(|_| state.backend.last_insert_rowid())
+        .map_err(|e| AppError::internal(e));
 
     match result {
         Ok(id) => {
@@ -113,7 +123,7 @@ async fn create_smart_playlist(
             });
             Ok((StatusCode::CREATED, Json(created)).into_response())
         }
-        Err(e) => Err(AppError::internal(e)),
+        Err(e) => Err(e),
     }
 }
 
@@ -121,33 +131,35 @@ async fn get_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                "rules": rules,
-                "sort_by": row.get::<_, Option<String>>(3).ok().flatten(),
-                "sort_order": row.get::<_, Option<String>>(4).ok().flatten(),
-                "max_tracks": row.get::<_, Option<i64>>(5).ok().flatten(),
-                "created_at": row.get::<_, Option<String>>(6).ok().flatten(),
-            }))
-        },
-    );
-    drop(conn);
+    let sql = if state.backend.engine() == Engine::Postgres {
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = $1"
+    } else {
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?"
+    };
+    let result = state
+        .backend
+        .query_one(sql, &[&id as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
 
     match result {
-        Ok(v) => Ok(Json(v).into_response()),
-        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+        Some(cols) => {
+            let rules_str = cols
+                .get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            Ok(Json(json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "name": cols.get(1).and_then(|v| v.as_string()),
+                "rules": rules,
+                "sort_by": cols.get(3).and_then(|v| v.as_string()),
+                "sort_order": cols.get(4).and_then(|v| v.as_string()),
+                "max_tracks": cols.get(5).and_then(|v| v.as_i64()),
+                "created_at": cols.get(6).and_then(|v| v.as_string()),
+            }))
+            .into_response())
+        }
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -156,80 +168,104 @@ async fn update_smart_playlist(
     Path(id): Path<i64>,
     Json(body): Json<UpdateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
+    let pg = state.backend.engine() == Engine::Postgres;
+
     if let Some(ref name) = body.name {
+        let sql = if pg {
+            "UPDATE smart_playlists SET name = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET name = ? WHERE id = ?"
+        };
         state
-            .db
-            .execute(
-                "UPDATE smart_playlists SET name = ? WHERE id = ?",
-                &[name as &dyn rusqlite::types::ToSql, &id],
-            )
+            .backend
+            .execute(sql, &[name as &dyn ToSqlValue, &id as &dyn ToSqlValue])
             .ok();
     }
     if let Some(ref rules) = body.rules {
+        let rules_str = rules.to_string();
+        let sql = if pg {
+            "UPDATE smart_playlists SET rules = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET rules = ? WHERE id = ?"
+        };
         state
-            .db
+            .backend
             .execute(
-                "UPDATE smart_playlists SET rules = ? WHERE id = ?",
-                &[&rules.to_string() as &dyn rusqlite::types::ToSql, &id],
+                sql,
+                &[&rules_str as &dyn ToSqlValue, &id as &dyn ToSqlValue],
             )
             .ok();
     }
     if let Some(ref sort_by) = body.sort_by {
+        let sql = if pg {
+            "UPDATE smart_playlists SET sort_by = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET sort_by = ? WHERE id = ?"
+        };
         state
-            .db
-            .execute(
-                "UPDATE smart_playlists SET sort_by = ? WHERE id = ?",
-                &[sort_by as &dyn rusqlite::types::ToSql, &id],
-            )
+            .backend
+            .execute(sql, &[sort_by as &dyn ToSqlValue, &id as &dyn ToSqlValue])
             .ok();
     }
     if let Some(ref sort_order) = body.sort_order {
+        let sql = if pg {
+            "UPDATE smart_playlists SET sort_order = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET sort_order = ? WHERE id = ?"
+        };
         state
-            .db
+            .backend
             .execute(
-                "UPDATE smart_playlists SET sort_order = ? WHERE id = ?",
-                &[sort_order as &dyn rusqlite::types::ToSql, &id],
+                sql,
+                &[sort_order as &dyn ToSqlValue, &id as &dyn ToSqlValue],
             )
             .ok();
     }
     if let Some(ref max_tracks) = body.max_tracks {
+        let sql = if pg {
+            "UPDATE smart_playlists SET max_tracks = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET max_tracks = ? WHERE id = ?"
+        };
         state
-            .db
+            .backend
             .execute(
-                "UPDATE smart_playlists SET max_tracks = ? WHERE id = ?",
-                &[max_tracks as &dyn rusqlite::types::ToSql, &id],
+                sql,
+                &[max_tracks as &dyn ToSqlValue, &id as &dyn ToSqlValue],
             )
             .ok();
     }
 
     // Return the updated smart playlist as JSON
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            let rules_str: String = row.get(2).unwrap_or_else(|_| "[]".into());
-            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "name": row.get::<_, Option<String>>(1).ok().flatten(),
-                "rules": rules,
-                "sort_by": row.get::<_, Option<String>>(3).ok().flatten(),
-                "sort_order": row.get::<_, Option<String>>(4).ok().flatten(),
-                "max_tracks": row.get::<_, Option<i64>>(5).ok().flatten(),
-                "created_at": row.get::<_, Option<String>>(6).ok().flatten(),
-            }))
-        },
-    );
-    drop(conn);
+    let sql = if pg {
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = $1"
+    } else {
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?"
+    };
+    let result = state
+        .backend
+        .query_one(sql, &[&id as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
 
     match result {
-        Ok(v) => Ok(Json(v).into_response()),
-        Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
+        Some(cols) => {
+            let rules_str = cols
+                .get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            Ok(Json(json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "name": cols.get(1).and_then(|v| v.as_string()),
+                "rules": rules,
+                "sort_by": cols.get(3).and_then(|v| v.as_string()),
+                "sort_order": cols.get(4).and_then(|v| v.as_string()),
+                "max_tracks": cols.get(5).and_then(|v| v.as_i64()),
+                "created_at": cols.get(6).and_then(|v| v.as_string()),
+            }))
+            .into_response())
+        }
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -237,10 +273,12 @@ async fn delete_smart_playlist(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    state
-        .db
-        .execute("DELETE FROM smart_playlists WHERE id = ?", &[&id])
-        .ok();
+    let sql = if state.backend.engine() == Engine::Postgres {
+        "DELETE FROM smart_playlists WHERE id = $1"
+    } else {
+        "DELETE FROM smart_playlists WHERE id = ?"
+    };
+    state.backend.execute(sql, &[&id as &dyn ToSqlValue]).ok();
     Json(json!({"deleted": true, "id": id}))
 }
 
@@ -402,25 +440,29 @@ fn load_smart_criteria(
     state: &AppState,
     id: i64,
 ) -> Result<Option<(String, String, String, Option<i64>)>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn
-        .query_row(
-            "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?",
-            rusqlite::params![id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_else(|_| "[]".into()),
-                    row.get::<_, String>(1).unwrap_or_else(|_| "title".into()),
-                    row.get::<_, String>(2).unwrap_or_else(|_| "asc".into()),
-                    row.get::<_, Option<i64>>(3).ok().flatten(),
-                ))
-            },
+    let sql = if state.backend.engine() == Engine::Postgres {
+        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = $1"
+    } else {
+        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?"
+    };
+    let result = state
+        .backend
+        .query_one(sql, &[&id as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
+    Ok(result.map(|cols| {
+        (
+            cols.get(0)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into()),
+            cols.get(1)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "title".into()),
+            cols.get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "asc".into()),
+            cols.get(3).and_then(|v| v.as_i64()),
         )
-        .ok())
+    }))
 }
 
 async fn resolve_tracks(

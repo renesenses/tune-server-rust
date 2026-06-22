@@ -3,6 +3,8 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::backend::ToSqlValue;
+use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -22,79 +24,86 @@ pub(super) async fn list_duplicates(
     let limit = p.limit.unwrap_or(100);
     let offset = p.offset.unwrap_or(0);
 
-    let (hash_dups, meta_dups) = {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-
-        // Duplicates by audio_hash
-        let hash_dups: Vec<Value> = conn
-            .prepare(
-                "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.audio_hash, t1.duration_ms,
-                        t2.id, t2.file_path, ar2.name
-                 FROM tracks t1
-                 JOIN tracks t2 ON t1.audio_hash = t2.audio_hash AND t1.id < t2.id
-                 LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
-                 LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
-                 WHERE t1.audio_hash IS NOT NULL AND t1.audio_hash != ''
-                 LIMIT ? OFFSET ?",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![limit, offset], |row| {
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0).unwrap_or(0),
-                        "title": row.get::<_, String>(1).unwrap_or_default(),
-                        "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                        "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
-                        "audio_hash": row.get::<_, Option<String>>(4).unwrap_or(None),
-                        "duration_ms": row.get::<_, i64>(5).unwrap_or(0),
-                        "dup_id": row.get::<_, i64>(6).unwrap_or(0),
-                        "dup_path": row.get::<_, Option<String>>(7).unwrap_or(None),
-                        "dup_artist_name": row.get::<_, Option<String>>(8).unwrap_or(None),
-                        "match_type": "audio_hash",
-                    }))
-                })
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            })
-            .unwrap_or_default();
-
-        // Duplicates by (title + artist_name + duration_ms) where no hash match
-        let meta_dups: Vec<Value> = conn
-            .prepare(
-                "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms,
-                        t2.id, t2.file_path, ar2.name
-                 FROM tracks t1
-                 JOIN tracks t2 ON t1.title = t2.title COLLATE NOCASE
-                               AND t1.duration_ms = t2.duration_ms
-                               AND t1.id < t2.id
-                 LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
-                 LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
-                 WHERE ar1.name = ar2.name COLLATE NOCASE
-                   AND (t1.audio_hash IS NULL OR t2.audio_hash IS NULL OR t1.audio_hash != t2.audio_hash)
-                 LIMIT ? OFFSET ?",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![limit, offset], |row| {
-                    Ok(json!({
-                        "id": row.get::<_, i64>(0).unwrap_or(0),
-                        "title": row.get::<_, String>(1).unwrap_or_default(),
-                        "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                        "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
-                        "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                        "dup_id": row.get::<_, i64>(5).unwrap_or(0),
-                        "dup_path": row.get::<_, Option<String>>(6).unwrap_or(None),
-                        "dup_artist_name": row.get::<_, Option<String>>(7).unwrap_or(None),
-                        "match_type": "metadata",
-                    }))
-                })
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            })
-            .unwrap_or_default();
-
-        (hash_dups, meta_dups)
+    let make_ph = |i: usize| match state.backend.engine() {
+        Engine::Sqlite => SqliteDialect.placeholder(i),
+        Engine::Postgres => PostgresDialect.placeholder(i),
     };
+
+    // Duplicates by audio_hash
+    let hash_sql = format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.audio_hash, t1.duration_ms,
+                t2.id, t2.file_path, ar2.name
+         FROM tracks t1
+         JOIN tracks t2 ON t1.audio_hash = t2.audio_hash AND t1.id < t2.id
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+         WHERE t1.audio_hash IS NOT NULL AND t1.audio_hash != ''
+         LIMIT {lim} OFFSET {off}",
+        lim = make_ph(1),
+        off = make_ph(2),
+    );
+    let limit_val = limit as i64;
+    let offset_val = offset as i64;
+    let hash_params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
+    let hash_rows = state
+        .backend
+        .query_many(&hash_sql, hash_params)
+        .unwrap_or_default();
+    let hash_dups: Vec<Value> = hash_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": row.get(2).and_then(|v| v.as_string()),
+                "file_path": row.get(3).and_then(|v| v.as_string()),
+                "audio_hash": row.get(4).and_then(|v| v.as_string()),
+                "duration_ms": row.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                "dup_id": row.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                "dup_path": row.get(7).and_then(|v| v.as_string()),
+                "dup_artist_name": row.get(8).and_then(|v| v.as_string()),
+                "match_type": "audio_hash",
+            })
+        })
+        .collect();
+
+    // Duplicates by (title + artist_name + duration_ms) where no hash match
+    let meta_sql = format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms,
+                t2.id, t2.file_path, ar2.name
+         FROM tracks t1
+         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title)
+                       AND t1.duration_ms = t2.duration_ms
+                       AND t1.id < t2.id
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id
+         WHERE LOWER(ar1.name) = LOWER(ar2.name)
+           AND (t1.audio_hash IS NULL OR t2.audio_hash IS NULL OR t1.audio_hash != t2.audio_hash)
+         LIMIT {lim} OFFSET {off}",
+        lim = make_ph(1),
+        off = make_ph(2),
+    );
+    let meta_params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
+    let meta_rows = state
+        .backend
+        .query_many(&meta_sql, meta_params)
+        .unwrap_or_default();
+    let meta_dups: Vec<Value> = meta_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": row.get(2).and_then(|v| v.as_string()),
+                "file_path": row.get(3).and_then(|v| v.as_string()),
+                "duration_ms": row.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "dup_id": row.get(5).and_then(|v| v.as_i64()).unwrap_or(0),
+                "dup_path": row.get(6).and_then(|v| v.as_string()),
+                "dup_artist_name": row.get(7).and_then(|v| v.as_string()),
+                "match_type": "metadata",
+            })
+        })
+        .collect();
 
     let fp_groups =
         tune_core::library::duplicate_detector::scan_fingerprint_duplicates(&state.backend);
@@ -124,27 +133,33 @@ pub(super) async fn resolve_duplicate(
     State(state): State<AppState>,
     Json(body): Json<ResolveDuplicate>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let make_ph = |i: usize| match state.backend.engine() {
+        Engine::Sqlite => SqliteDialect.placeholder(i),
+        Engine::Postgres => PostgresDialect.placeholder(i),
+    };
 
     // Verify both tracks exist
-    let keep_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE id = ?",
-            [body.keep_id],
-            |row| row.get::<_, i64>(0),
+    let keep_exists = state
+        .backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks WHERE id = {}", make_ph(1)),
+            &[&body.keep_id as &dyn ToSqlValue],
         )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
         .unwrap_or(0)
         > 0;
-    let delete_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE id = ?",
-            [body.delete_id],
-            |row| row.get::<_, i64>(0),
+
+    let delete_exists = state
+        .backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks WHERE id = {}", make_ph(1)),
+            &[&body.delete_id as &dyn ToSqlValue],
         )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
         .unwrap_or(0)
         > 0;
 
@@ -153,44 +168,78 @@ pub(super) async fn resolve_duplicate(
     }
 
     // Reassign playlist references from deleted track to kept track
-    conn.execute(
-        "UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?",
-        rusqlite::params![body.keep_id, body.delete_id],
-    )
-    .ok();
+    state
+        .backend
+        .execute(
+            &format!(
+                "UPDATE playlist_tracks SET track_id = {} WHERE track_id = {}",
+                make_ph(1),
+                make_ph(2)
+            ),
+            &[&body.keep_id as &dyn ToSqlValue, &body.delete_id],
+        )
+        .ok();
 
     // Reassign play queue references
-    conn.execute(
-        "UPDATE play_queue SET track_id = ? WHERE track_id = ?",
-        rusqlite::params![body.keep_id, body.delete_id],
-    )
-    .ok();
+    state
+        .backend
+        .execute(
+            &format!(
+                "UPDATE play_queue SET track_id = {} WHERE track_id = {}",
+                make_ph(1),
+                make_ph(2)
+            ),
+            &[&body.keep_id as &dyn ToSqlValue, &body.delete_id],
+        )
+        .ok();
 
     // Reassign listen history references
-    conn.execute(
-        "UPDATE listen_history SET track_id = ? WHERE track_id = ?",
-        rusqlite::params![body.keep_id, body.delete_id],
-    )
-    .ok();
+    state
+        .backend
+        .execute(
+            &format!(
+                "UPDATE listen_history SET track_id = {} WHERE track_id = {}",
+                make_ph(1),
+                make_ph(2)
+            ),
+            &[&body.keep_id as &dyn ToSqlValue, &body.delete_id],
+        )
+        .ok();
 
     // Reassign bookmarks
-    conn.execute(
-        "UPDATE bookmarks SET track_id = ? WHERE track_id = ?",
-        rusqlite::params![body.keep_id, body.delete_id],
-    )
-    .ok();
+    state
+        .backend
+        .execute(
+            &format!(
+                "UPDATE bookmarks SET track_id = {} WHERE track_id = {}",
+                make_ph(1),
+                make_ph(2)
+            ),
+            &[&body.keep_id as &dyn ToSqlValue, &body.delete_id],
+        )
+        .ok();
 
     // Reassign favorites
-    conn.execute(
-        "UPDATE favorites SET item_id = ? WHERE item_type = 'track' AND item_id = ?",
-        rusqlite::params![body.keep_id, body.delete_id],
-    )
-    .ok();
+    state
+        .backend
+        .execute(
+            &format!(
+                "UPDATE favorites SET item_id = {} WHERE item_type = 'track' AND item_id = {}",
+                make_ph(1),
+                make_ph(2)
+            ),
+            &[&body.keep_id as &dyn ToSqlValue, &body.delete_id],
+        )
+        .ok();
 
     // Delete the duplicate track
-    conn.execute("DELETE FROM tracks WHERE id = ?", [body.delete_id])
+    state
+        .backend
+        .execute(
+            &format!("DELETE FROM tracks WHERE id = {}", make_ph(1)),
+            &[&body.delete_id as &dyn ToSqlValue],
+        )
         .ok();
-    drop(conn);
 
     Ok(Json(json!({
         "kept": body.keep_id,
@@ -205,52 +254,56 @@ pub(super) async fn smart_duplicates(
     let limit = p.limit.unwrap_or(100);
     let offset = p.offset.unwrap_or(0);
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    // Find tracks with same title (case-insensitive), same artist, and similar duration (within 3 seconds)
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms, t1.format, t1.sample_rate, t1.bit_depth, \
-                    t2.id, t2.file_path, t2.duration_ms, t2.format, t2.sample_rate, t2.bit_depth, ar2.name \
-             FROM tracks t1 \
-             JOIN tracks t2 ON t1.title = t2.title COLLATE NOCASE AND t1.id < t2.id \
-             LEFT JOIN artists ar1 ON t1.artist_id = ar1.id \
-             LEFT JOIN artists ar2 ON t2.artist_id = ar2.id \
-             WHERE ar1.name = ar2.name COLLATE NOCASE \
-               AND ABS(COALESCE(t1.duration_ms,0) - COALESCE(t2.duration_ms,0)) < 3000 \
-             LIMIT ? OFFSET ?"
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![limit, offset], |row| {
-                Ok(json!({
-                    "track_a": {
-                        "id": row.get::<_, i64>(0).unwrap_or(0),
-                        "title": row.get::<_, String>(1).unwrap_or_default(),
-                        "artist": row.get::<_, Option<String>>(2).unwrap_or(None),
-                        "file_path": row.get::<_, Option<String>>(3).unwrap_or(None),
-                        "duration_ms": row.get::<_, Option<i64>>(4).unwrap_or(None),
-                        "format": row.get::<_, Option<String>>(5).unwrap_or(None),
-                        "sample_rate": row.get::<_, Option<i32>>(6).unwrap_or(None),
-                        "bit_depth": row.get::<_, Option<i32>>(7).unwrap_or(None),
-                    },
-                    "track_b": {
-                        "id": row.get::<_, i64>(8).unwrap_or(0),
-                        "file_path": row.get::<_, Option<String>>(9).unwrap_or(None),
-                        "duration_ms": row.get::<_, Option<i64>>(10).unwrap_or(None),
-                        "format": row.get::<_, Option<String>>(11).unwrap_or(None),
-                        "sample_rate": row.get::<_, Option<i32>>(12).unwrap_or(None),
-                        "bit_depth": row.get::<_, Option<i32>>(13).unwrap_or(None),
-                        "artist": row.get::<_, Option<String>>(14).unwrap_or(None),
-                    },
-                }))
+    let make_ph = |i: usize| match state.backend.engine() {
+        Engine::Sqlite => SqliteDialect.placeholder(i),
+        Engine::Postgres => PostgresDialect.placeholder(i),
+    };
+
+    let sql = format!(
+        "SELECT t1.id, t1.title, ar1.name, t1.file_path, t1.duration_ms, t1.format, t1.sample_rate, t1.bit_depth, \
+                t2.id, t2.file_path, t2.duration_ms, t2.format, t2.sample_rate, t2.bit_depth, ar2.name \
+         FROM tracks t1 \
+         JOIN tracks t2 ON LOWER(t1.title) = LOWER(t2.title) AND t1.id < t2.id \
+         LEFT JOIN artists ar1 ON t1.artist_id = ar1.id \
+         LEFT JOIN artists ar2 ON t2.artist_id = ar2.id \
+         WHERE LOWER(ar1.name) = LOWER(ar2.name) \
+           AND ABS(COALESCE(t1.duration_ms,0) - COALESCE(t2.duration_ms,0)) < 3000 \
+         LIMIT {lim} OFFSET {off}",
+        lim = make_ph(1),
+        off = make_ph(2),
+    );
+
+    let limit_val = limit as i64;
+    let offset_val = offset as i64;
+    let params: &[&dyn ToSqlValue] = &[&limit_val, &offset_val];
+    let rows = state.backend.query_many(&sql, params).unwrap_or_default();
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "track_a": {
+                    "id": row.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "title": row.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    "artist": row.get(2).and_then(|v| v.as_string()),
+                    "file_path": row.get(3).and_then(|v| v.as_string()),
+                    "duration_ms": row.get(4).and_then(|v| v.as_i64()),
+                    "format": row.get(5).and_then(|v| v.as_string()),
+                    "sample_rate": row.get(6).and_then(|v| v.as_i64()),
+                    "bit_depth": row.get(7).and_then(|v| v.as_i64()),
+                },
+                "track_b": {
+                    "id": row.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "file_path": row.get(9).and_then(|v| v.as_string()),
+                    "duration_ms": row.get(10).and_then(|v| v.as_i64()),
+                    "format": row.get(11).and_then(|v| v.as_string()),
+                    "sample_rate": row.get(12).and_then(|v| v.as_i64()),
+                    "bit_depth": row.get(13).and_then(|v| v.as_i64()),
+                    "artist": row.get(14).and_then(|v| v.as_string()),
+                },
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
 
     Ok(Json(json!({
         "duplicates": items,

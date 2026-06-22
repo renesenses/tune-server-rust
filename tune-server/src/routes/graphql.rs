@@ -144,33 +144,47 @@ fn try_execute(query: &str, variables: &Value, state: &AppState) -> Option<Value
 }
 
 fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
-    let items: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, artist_name, album_title, duration, path, format, sample_rate, bit_depth \
-                 FROM tracks ORDER BY title LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map([limit, offset], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                    "album_title": row.get::<_, Option<String>>(3)?,
-                    "duration": row.get::<_, Option<f64>>(4)?,
-                    "path": row.get::<_, Option<String>>(5)?,
-                    "format": row.get::<_, Option<String>>(6)?,
-                    "sample_rate": row.get::<_, Option<i64>>(7)?,
-                    "bit_depth": row.get::<_, Option<i64>>(8)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
+    use tune_core::db::backend::ToSqlValue;
+    let (p1, p2) = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        ("$1".to_string(), "$2".to_string())
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+    let sql = format!(
+        "SELECT id, title, artist_name, album_title, duration, path, format, sample_rate, bit_depth \
+         FROM tracks ORDER BY title LIMIT {p1} OFFSET {p2}"
+    );
+    let rows = state
+        .backend
+        .query_many(
+            &sql,
+            &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "album_title": r.get(3).and_then(|v| v.as_string()),
+                "duration": r.get(4).and_then(|v| v.as_f64()),
+                "path": r.get(5).and_then(|v| v.as_string()),
+                "format": r.get(6).and_then(|v| v.as_string()),
+                "sample_rate": r.get(7).and_then(|v| v.as_i64()),
+                "bit_depth": r.get(8).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
 
     let total: i64 = state
-        .db
-        .read(|conn| conn.query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0)))
+        .backend
+        .query_one("SELECT COUNT(*) FROM tracks", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.into_iter().next())
+        .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
     json!({
@@ -180,30 +194,44 @@ fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
-    let items: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, artist_name, year, track_count, cover_path \
-                 FROM albums ORDER BY title LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map([limit, offset], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                    "year": row.get::<_, Option<i64>>(3)?,
-                    "track_count": row.get::<_, Option<i64>>(4)?,
-                    "cover_path": row.get::<_, Option<String>>(5)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
+    use tune_core::db::backend::ToSqlValue;
+    let (p1, p2) = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        ("$1".to_string(), "$2".to_string())
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+    let sql = format!(
+        "SELECT id, title, artist_name, year, track_count, cover_path \
+         FROM albums ORDER BY title LIMIT {p1} OFFSET {p2}"
+    );
+    let rows = state
+        .backend
+        .query_many(
+            &sql,
+            &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "year": r.get(3).and_then(|v| v.as_i64()),
+                "track_count": r.get(4).and_then(|v| v.as_i64()),
+                "cover_path": r.get(5).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
 
     let total: i64 = state
-        .db
-        .read(|conn| conn.query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0)))
+        .backend
+        .query_one("SELECT COUNT(*) FROM albums", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.into_iter().next())
+        .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
     json!({
@@ -213,28 +241,42 @@ fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
-    let items: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, name, album_count, track_count \
-                 FROM artists ORDER BY name LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map([limit, offset], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?,
-                    "album_count": row.get::<_, Option<i64>>(2)?,
-                    "track_count": row.get::<_, Option<i64>>(3)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
-        })
+    use tune_core::db::backend::ToSqlValue;
+    let (p1, p2) = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        ("$1".to_string(), "$2".to_string())
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+    let sql = format!(
+        "SELECT id, name, album_count, track_count \
+         FROM artists ORDER BY name LIMIT {p1} OFFSET {p2}"
+    );
+    let rows = state
+        .backend
+        .query_many(
+            &sql,
+            &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "name": r.get(1).and_then(|v| v.as_string()),
+                "album_count": r.get(2).and_then(|v| v.as_i64()),
+                "track_count": r.get(3).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
 
     let total: i64 = state
-        .db
-        .read(|conn| conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0)))
+        .backend
+        .query_one("SELECT COUNT(*) FROM artists", &[])
+        .ok()
+        .flatten()
+        .and_then(|r| r.into_iter().next())
+        .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
     json!({
@@ -244,61 +286,76 @@ fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
 }
 
 fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
+    use tune_core::db::backend::ToSqlValue;
     let pattern = format!("%{q}%");
 
+    let (p1, p2) = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        ("$1".to_string(), "$2".to_string())
+    } else {
+        ("?".to_string(), "?".to_string())
+    };
+
+    let tracks_sql = format!(
+        "SELECT id, title, artist_name, album_title, duration \
+         FROM tracks WHERE title LIKE {p1} OR artist_name LIKE {p1} LIMIT {p2}"
+    );
     let tracks: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, artist_name, album_title, duration \
-                 FROM tracks WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                    "album_title": row.get::<_, Option<String>>(3)?,
-                    "duration": row.get::<_, Option<f64>>(4)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
+        .backend
+        .query_many(
+            &tracks_sql,
+            &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "album_title": r.get(3).and_then(|v| v.as_string()),
+                "duration": r.get(4).and_then(|v| v.as_f64()),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
+    let albums_sql = format!(
+        "SELECT id, title, artist_name, year \
+         FROM albums WHERE title LIKE {p1} OR artist_name LIKE {p1} LIMIT {p2}"
+    );
     let albums: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, artist_name, year \
-                 FROM albums WHERE title LIKE ?1 OR artist_name LIKE ?1 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "title": row.get::<_, Option<String>>(1)?,
-                    "artist_name": row.get::<_, Option<String>>(2)?,
-                    "year": row.get::<_, Option<i64>>(3)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
+        .backend
+        .query_many(
+            &albums_sql,
+            &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "year": r.get(3).and_then(|v| v.as_i64()),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
+    let artists_sql = format!("SELECT id, name FROM artists WHERE name LIKE {p1} LIMIT {p2}");
     let artists: Vec<Value> = state
-        .db
-        .read(|conn| {
-            let mut stmt =
-                conn.prepare("SELECT id, name FROM artists WHERE name LIKE ?1 LIMIT ?2")?;
-            let rows = stmt.query_map(rusqlite::params![&pattern, limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?,
-                }))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()
+        .backend
+        .query_many(
+            &artists_sql,
+            &[&pattern as &dyn ToSqlValue, &limit as &dyn ToSqlValue],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "name": r.get(1).and_then(|v| v.as_string()),
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
     json!({
         "tracks": tracks,

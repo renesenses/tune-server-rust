@@ -5,6 +5,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -38,32 +39,27 @@ struct BatchFields {
 }
 
 fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Value)>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    Ok(conn
-        .prepare(
-            "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = ?1",
+    let row = state
+        .backend
+        .query_one(
+            "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = $1",
+            &[&track_id as &dyn ToSqlValue],
         )
-        .ok()
-        .and_then(|mut stmt| {
-            stmt.query_row([track_id], |row| {
-                let path: String = row.get(0)?;
-                let info = json!({
-                    "id": track_id,
-                    "path": path.clone(),
-                    "title": row.get::<_, Option<String>>(1).unwrap_or(None),
-                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                    "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
-                    "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
-                    "year": row.get::<_, Option<String>>(5).unwrap_or(None),
-                });
-                Ok((path, info))
-            })
-            .ok()
-        }))
+        .map_err(|e| AppError::internal(e))?;
+
+    Ok(row.and_then(|r| {
+        let path = r.first()?.as_string()?;
+        let info = json!({
+            "id": track_id,
+            "path": path.clone(),
+            "title": r.get(1).and_then(|v| v.as_string()),
+            "artist_name": r.get(2).and_then(|v| v.as_string()),
+            "album_title": r.get(3).and_then(|v| v.as_string()),
+            "genre": r.get(4).and_then(|v| v.as_string()),
+            "year": r.get(5).and_then(|v| v.as_string()),
+        });
+        Some((path, info))
+    }))
 }
 
 fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, String> {
@@ -159,45 +155,50 @@ async fn batch_edit_tags(
 }
 
 fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Result<(), AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
     if let Some(title) = &fields.title {
-        conn.execute(
-            "UPDATE tracks SET title = ?1 WHERE id = ?2",
-            rusqlite::params![title, track_id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET title = $1 WHERE id = $2",
+                &[title as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
     if let Some(artist) = &fields.artist {
-        conn.execute(
-            "UPDATE tracks SET artist_name = ?1 WHERE id = ?2",
-            rusqlite::params![artist, track_id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET artist_name = $1 WHERE id = $2",
+                &[artist as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
     if let Some(album) = &fields.album {
-        conn.execute(
-            "UPDATE tracks SET album_title = ?1 WHERE id = ?2",
-            rusqlite::params![album, track_id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET album_title = $1 WHERE id = $2",
+                &[album as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
     if let Some(genre) = &fields.genre {
-        conn.execute(
-            "UPDATE tracks SET genre = ?1 WHERE id = ?2",
-            rusqlite::params![genre, track_id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET genre = $1 WHERE id = $2",
+                &[genre as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
     if let Some(year) = &fields.year {
-        conn.execute(
-            "UPDATE tracks SET year = ?1 WHERE id = ?2",
-            rusqlite::params![year, track_id],
-        )
-        .ok();
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET year = $1 WHERE id = $2",
+                &[year as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+            )
+            .ok();
     }
     Ok(())
 }
@@ -248,21 +249,23 @@ async fn auto_number_album(
     State(state): State<AppState>,
     Path(album_id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let tracks: Vec<(i64, String, Option<String>)> = conn
-        .prepare("SELECT id, path, title FROM tracks WHERE album_id = ?1 ORDER BY path ASC")
-        .and_then(|mut stmt| {
-            stmt.query_map([album_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, path, title FROM tracks WHERE album_id = $1 ORDER BY path ASC",
+            &[&album_id as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
-    drop(conn);
+
+    let tracks: Vec<(i64, String, Option<String>)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.first()?.as_i64()?;
+            let path = r.get(1)?.as_string()?;
+            let title = r.get(2).and_then(|v| v.as_string());
+            Some((id, path, title))
+        })
+        .collect();
 
     if tracks.is_empty() {
         return Ok((
@@ -288,17 +291,13 @@ async fn auto_number_album(
             Ok(())
         })();
 
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        conn.execute(
-            "UPDATE tracks SET track_number = ?1 WHERE id = ?2",
-            rusqlite::params![track_num, track_id],
-        )
-        .ok();
-        drop(conn);
+        state
+            .backend
+            .execute(
+                "UPDATE tracks SET track_number = $1 WHERE id = $2",
+                &[&track_num as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
+            )
+            .ok();
 
         results.push(json!({
             "track_id": track_id,
@@ -327,25 +326,30 @@ async fn set_album_genre(
     Path(album_id): Path<i64>,
     Json(body): Json<SetGenreBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let paths: Vec<(i64, String)> = conn
-        .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
-        .and_then(|mut stmt| {
-            stmt.query_map([album_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, path FROM tracks WHERE album_id = $1",
+            &[&album_id as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
+    let paths: Vec<(i64, String)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.first()?.as_i64()?;
+            let path = r.get(1)?.as_string()?;
+            Some((id, path))
+        })
+        .collect();
+
     // Update DB for all tracks
-    conn.execute(
-        "UPDATE tracks SET genre = ?1 WHERE album_id = ?2",
-        rusqlite::params![body.genre, album_id],
-    )
-    .ok();
-    drop(conn);
+    state
+        .backend
+        .execute(
+            "UPDATE tracks SET genre = $1 WHERE album_id = $2",
+            &[&body.genre as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
+        )
+        .ok();
 
     let mut file_errors: Vec<Value> = Vec::new();
     for (track_id, path) in &paths {
@@ -384,24 +388,29 @@ async fn set_album_year(
     Path(album_id): Path<i64>,
     Json(body): Json<SetYearBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let paths: Vec<(i64, String)> = conn
-        .prepare("SELECT id, path FROM tracks WHERE album_id = ?1")
-        .and_then(|mut stmt| {
-            stmt.query_map([album_id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, path FROM tracks WHERE album_id = $1",
+            &[&album_id as &dyn ToSqlValue],
+        )
         .unwrap_or_default();
-    conn.execute(
-        "UPDATE tracks SET year = ?1 WHERE album_id = ?2",
-        rusqlite::params![body.year, album_id],
-    )
-    .ok();
-    drop(conn);
+    let paths: Vec<(i64, String)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.first()?.as_i64()?;
+            let path = r.get(1)?.as_string()?;
+            Some((id, path))
+        })
+        .collect();
+
+    state
+        .backend
+        .execute(
+            "UPDATE tracks SET year = $1 WHERE album_id = $2",
+            &[&body.year as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
+        )
+        .ok();
 
     let year_num: Option<u16> = body.year.parse().ok();
     let mut file_errors: Vec<Value> = Vec::new();
@@ -452,26 +461,28 @@ async fn rename_by_pattern(
     let mut results: Vec<Value> = Vec::new();
 
     for track_id in &body.track_ids {
-        let conn = state
-            .db
-            .connection()
-            .lock()
-            .map_err(|e| AppError::internal(format!("{e}")))?;
-        let track_info: Option<(String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>)> = conn
-            .prepare("SELECT path, title, artist_name, album_title, track_number, year FROM tracks WHERE id = ?1")
-            .ok()
-            .and_then(|mut stmt| {
-                stmt.query_row([track_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-                })
-                .ok()
-            });
-        drop(conn);
+        let row = state
+            .backend
+            .query_one(
+                "SELECT path, title, artist_name, album_title, track_number, year FROM tracks WHERE id = $1",
+                &[track_id as &dyn ToSqlValue],
+            )
+            .map_err(|e| AppError::internal(e))?;
 
-        let Some((path, title, artist, album, track_num, year)) = track_info else {
+        let Some(r) = row else {
             results.push(json!({"track_id": track_id, "error": "Track not found"}));
             continue;
         };
+
+        let Some(path) = r.first().and_then(|v| v.as_string()) else {
+            results.push(json!({"track_id": track_id, "error": "Track not found"}));
+            continue;
+        };
+        let title = r.get(1).and_then(|v| v.as_string());
+        let artist = r.get(2).and_then(|v| v.as_string());
+        let album = r.get(3).and_then(|v| v.as_string());
+        let track_num = r.get(4).and_then(|v| v.as_i64());
+        let year = r.get(5).and_then(|v| v.as_string());
 
         let ext = std::path::Path::new(&path)
             .extension()
@@ -507,17 +518,13 @@ async fn rename_by_pattern(
         } else if path != new_path {
             match std::fs::rename(&path, &new_path) {
                 Ok(()) => {
-                    let conn = state
-                        .db
-                        .connection()
-                        .lock()
-                        .map_err(|e| AppError::internal(format!("{e}")))?;
-                    conn.execute(
-                        "UPDATE tracks SET path = ?1 WHERE id = ?2",
-                        rusqlite::params![new_path, track_id],
-                    )
-                    .ok();
-                    drop(conn);
+                    state
+                        .backend
+                        .execute(
+                            "UPDATE tracks SET path = $1 WHERE id = $2",
+                            &[&new_path as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
+                        )
+                        .ok();
                     results.push(json!({
                         "track_id": track_id,
                         "old_path": path,

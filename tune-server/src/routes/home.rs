@@ -1,10 +1,11 @@
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use tune_core::db::backend::ToSqlValue;
+use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -31,6 +32,14 @@ pub fn router() -> Router<AppState> {
         .route("/new-in-library", get(new_in_library))
         .route("/radio-picks", get(radio_picks))
         .route("/streaming-highlights", get(streaming_highlights))
+}
+
+/// Returns a placeholder string appropriate for the engine.
+fn ph(engine: Engine, idx: usize) -> String {
+    match engine {
+        Engine::Sqlite => SqliteDialect.placeholder(idx),
+        Engine::Postgres => PostgresDialect.placeholder(idx),
+    }
 }
 
 /// Aggregated home page: returns all sections in a single response.
@@ -112,11 +121,7 @@ fn fetch_continue_listening(
     limit: i64,
     zone_id: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let engine = state.backend.engine();
     // When a zone_id filter is provided, only show albums that were listened
     // to on that zone.  This ensures the "continue listening" section matches
     // the user's currently selected zone (B-09 fix).
@@ -124,6 +129,7 @@ fn fetch_continue_listening(
         Some(zid) => format!("AND lh.zone_id = {zid} "),
         None => String::new(),
     };
+    let p1 = ph(engine, 1);
     let sql = format!(
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                COUNT(DISTINCT lh.title) as listened_tracks, a.track_count \
@@ -135,27 +141,25 @@ fn fetch_continue_listening(
         GROUP BY a.id \
         HAVING listened_tracks < a.track_count \
         ORDER BY MAX(lh.listened_at) DESC \
-        LIMIT ?"
+        LIMIT {p1}"
     );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    Ok(stmt
-        .query_map(params![limit], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0).unwrap_or(0),
-                "title": row.get::<_, String>(1).unwrap_or_default(),
-                "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                "year": row.get::<_, Option<i32>>(3).unwrap_or(None),
-                "cover_path": row.get::<_, Option<String>>(4).unwrap_or(None),
-                "genre": row.get::<_, Option<String>>(5).unwrap_or(None),
-                "listened_tracks": row.get::<_, i64>(6).unwrap_or(0),
-                "track_count": row.get::<_, Option<i32>>(7).unwrap_or(None),
-            }))
+    let params: [&dyn ToSqlValue; 1] = [&limit];
+    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    Ok(rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "year": cols.get(3).and_then(|v| v.as_i64()),
+                "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "listened_tracks": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                "track_count": cols.get(7).and_then(|v| v.as_i64()),
+            })
         })
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .unwrap_or_default())
+        .collect())
 }
 
 /// Albums added in the last 7 days (by file mtime of tracks).
@@ -169,45 +173,42 @@ async fn recently_added(
 }
 
 fn fetch_recently_added(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let engine = state.backend.engine();
     let seven_days_ago = chrono_epoch_seven_days_ago();
-    let sql = "\
-        SELECT DISTINCT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
+    let p1 = ph(engine, 1);
+    let p2 = ph(engine, 2);
+    let sql = format!(
+        "SELECT DISTINCT a.id, a.title, ar.name, a.year, a.cover_path, a.genre, \
                a.format, a.sample_rate, a.bit_depth, a.track_count, \
                MAX(t.file_mtime) as newest_mtime \
         FROM tracks t \
         JOIN albums a ON t.album_id = a.id \
         LEFT JOIN artists ar ON a.artist_id = ar.id \
-        WHERE t.file_mtime IS NOT NULL AND t.file_mtime > ? \
+        WHERE t.file_mtime IS NOT NULL AND t.file_mtime > {p1} \
         GROUP BY a.id \
         ORDER BY newest_mtime DESC \
-        LIMIT ?";
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    Ok(stmt
-        .query_map(params![seven_days_ago, limit], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0).unwrap_or(0),
-                "title": row.get::<_, String>(1).unwrap_or_default(),
-                "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                "year": row.get::<_, Option<i32>>(3).unwrap_or(None),
-                "cover_path": row.get::<_, Option<String>>(4).unwrap_or(None),
-                "genre": row.get::<_, Option<String>>(5).unwrap_or(None),
-                "format": row.get::<_, Option<String>>(6).unwrap_or(None),
-                "sample_rate": row.get::<_, Option<i32>>(7).unwrap_or(None),
-                "bit_depth": row.get::<_, Option<i32>>(8).unwrap_or(None),
-                "track_count": row.get::<_, Option<i32>>(9).unwrap_or(None),
-                "added_mtime": row.get::<_, Option<f64>>(10).unwrap_or(None),
-            }))
+        LIMIT {p2}"
+    );
+    let params: [&dyn ToSqlValue; 2] = [&seven_days_ago, &limit];
+    let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+    Ok(rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "year": cols.get(3).and_then(|v| v.as_i64()),
+                "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
+                "format": cols.get(6).and_then(|v| v.as_string()),
+                "sample_rate": cols.get(7).and_then(|v| v.as_i64()),
+                "bit_depth": cols.get(8).and_then(|v| v.as_i64()),
+                "track_count": cols.get(9).and_then(|v| v.as_i64()),
+                "added_mtime": cols.get(10).and_then(|v| v.as_f64()),
+            })
         })
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .unwrap_or_default())
+        .collect())
 }
 
 /// Returns epoch seconds for 7 days ago.
@@ -231,15 +232,12 @@ async fn home_recommendations(
 }
 
 fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let engine = state.backend.engine();
 
     // Find top genres from listen history
-    let top_genres: Vec<String> = conn
-        .prepare(
+    let top_genres: Vec<String> = state
+        .backend
+        .query_many(
             "SELECT genre, COUNT(*) as cnt \
              FROM (SELECT COALESCE(t.genre, a.genre) as genre \
                    FROM listen_history lh \
@@ -247,91 +245,95 @@ fn fetch_recommendations(state: &AppState, limit: i64) -> Result<Vec<Value>, App
                    LEFT JOIN albums a ON lh.album_title = a.title \
                    WHERE genre IS NOT NULL AND genre != '') \
              GROUP BY genre ORDER BY cnt DESC LIMIT 5",
+            &[],
         )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cols| cols.into_iter().next().and_then(|v| v.as_string()))
+        .collect();
 
     if top_genres.is_empty() {
         // Fallback: return random albums
-        let sql = "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
+        let p1 = ph(engine, 1);
+        let sql = format!(
+            "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
                    FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id \
-                   ORDER BY RANDOM() LIMIT ?";
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(Vec::new()),
-        };
-        return Ok(stmt
-            .query_map(params![limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0).unwrap_or(0),
-                    "title": row.get::<_, String>(1).unwrap_or_default(),
-                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                    "year": row.get::<_, Option<i32>>(3).unwrap_or(None),
-                    "cover_path": row.get::<_, Option<String>>(4).unwrap_or(None),
-                    "genre": row.get::<_, Option<String>>(5).unwrap_or(None),
+                   ORDER BY RANDOM() LIMIT {p1}"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&limit];
+        let rows = state.backend.query_many(&sql, &params).unwrap_or_default();
+        return Ok(rows
+            .iter()
+            .map(|cols| {
+                json!({
+                    "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                    "year": cols.get(3).and_then(|v| v.as_i64()),
+                    "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                    "genre": cols.get(5).and_then(|v| v.as_string()),
                     "reason": "random",
-                }))
+                })
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_default());
+            .collect());
     }
 
-    // Find albums matching top genres that the user hasn't listened to
-    let placeholders: String = top_genres.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // Find albums matching top genres that the user hasn't listened to.
+    // Build engine-specific placeholders for the IN clause.
+    let genre_placeholders: String = top_genres
+        .iter()
+        .enumerate()
+        .map(|(i, _)| ph(engine, i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let limit_ph = ph(engine, top_genres.len() + 1);
     let sql = format!(
         "SELECT a.id, a.title, ar.name, a.year, a.cover_path, a.genre \
          FROM albums a \
          LEFT JOIN artists ar ON a.artist_id = ar.id \
-         WHERE a.genre IN ({placeholders}) \
+         WHERE a.genre IN ({genre_placeholders}) \
            AND a.title NOT IN (SELECT DISTINCT album_title FROM listen_history WHERE album_title IS NOT NULL) \
          ORDER BY RANDOM() \
-         LIMIT ?"
+         LIMIT {limit_ph}"
     );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = top_genres
-        .into_iter()
-        .map(|g| Box::new(g) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    param_values.push(Box::new(limit));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        param_values.iter().map(|p| p.as_ref()).collect();
 
-    Ok(stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0).unwrap_or(0),
-                "title": row.get::<_, String>(1).unwrap_or_default(),
-                "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                "year": row.get::<_, Option<i32>>(3).unwrap_or(None),
-                "cover_path": row.get::<_, Option<String>>(4).unwrap_or(None),
-                "genre": row.get::<_, Option<String>>(5).unwrap_or(None),
+    // Build a Vec of owned SqlValue-able params: genres + limit.
+    let mut param_vals: Vec<Box<dyn ToSqlValue>> = top_genres
+        .iter()
+        .map(|g| Box::new(g.clone()) as Box<dyn ToSqlValue>)
+        .collect();
+    param_vals.push(Box::new(limit));
+    let param_refs: Vec<&dyn ToSqlValue> = param_vals.iter().map(|p| p.as_ref()).collect();
+
+    let rows = state
+        .backend
+        .query_many(&sql, &param_refs)
+        .unwrap_or_default();
+    Ok(rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "year": cols.get(3).and_then(|v| v.as_i64()),
+                "cover_path": cols.get(4).and_then(|v| v.as_string()),
+                "genre": cols.get(5).and_then(|v| v.as_string()),
                 "reason": "genre_match",
-            }))
+            })
         })
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .unwrap_or_default())
+        .collect())
 }
 
 /// Auto-generated "mixes" by genre from top genres in history.
 /// Each mix = playlist of 20 tracks from that genre.
 async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    let engine = state.backend.engine();
 
     // Get top 5 genres from history
-    let top_genres: Vec<(String, i64)> = conn
-        .prepare(
+    let top_genres: Vec<(String, i64)> = state
+        .backend
+        .query_many(
             "SELECT genre, COUNT(*) as cnt \
              FROM (SELECT COALESCE(t.genre, a.genre) as genre \
                    FROM listen_history lh \
@@ -339,48 +341,49 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
                    LEFT JOIN albums a ON lh.album_title = a.title \
                    WHERE genre IS NOT NULL AND genre != '') \
              GROUP BY genre ORDER BY cnt DESC LIMIT 5",
+            &[],
         )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0).unwrap_or_default(),
-                    row.get::<_, i64>(1).unwrap_or(0),
-                ))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_default()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|cols| {
+            let genre = cols.first()?.as_string()?;
+            let cnt = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+            Some((genre, cnt))
         })
-        .unwrap_or_default();
+        .collect();
+
+    let p1 = ph(engine, 1);
+    let p2 = ph(engine, 2);
+    let tracks_sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, \
+                CAST(t.duration_ms AS BIGINT), al.cover_path \
+         FROM tracks t \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id \
+         WHERE t.genre = {p1} OR al.genre = {p2} \
+         ORDER BY RANDOM() LIMIT 20"
+    );
 
     let mixes: Vec<Value> = top_genres
         .into_iter()
         .filter_map(|(genre, play_count)| {
-            let tracks: Vec<Value> = conn
-                .prepare(
-                    "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, al.cover_path \
-                     FROM tracks t \
-                     LEFT JOIN albums al ON t.album_id = al.id \
-                     LEFT JOIN artists ar ON t.artist_id = ar.id \
-                     WHERE t.genre = ? OR al.genre = ? \
-                     ORDER BY RANDOM() LIMIT 20",
-                )
-                .ok()
-                .and_then(|mut stmt| {
-                    stmt.query_map(params![genre, genre], |row| {
-                        Ok(json!({
-                            "id": row.get::<_, i64>(0).unwrap_or(0),
-                            "title": row.get::<_, String>(1).unwrap_or_default(),
-                            "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                            "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
-                            "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                            "cover_path": row.get::<_, Option<String>>(5).unwrap_or(None),
-                        }))
+            let params: [&dyn ToSqlValue; 2] = [&genre, &genre];
+            let tracks: Vec<Value> = state
+                .backend
+                .query_many(&tracks_sql, &params)
+                .unwrap_or_default()
+                .iter()
+                .map(|cols| {
+                    json!({
+                        "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                        "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                        "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                        "album_title": cols.get(3).and_then(|v| v.as_string()),
+                        "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                        "cover_path": cols.get(5).and_then(|v| v.as_string()),
                     })
-                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                    .ok()
                 })
-                .unwrap_or_default();
+                .collect();
 
             if tracks.is_empty() {
                 return None;
@@ -405,42 +408,40 @@ async fn new_in_library(
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(30);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let sql = "\
-        SELECT t.id, t.title, ar.name, al.title, t.duration_ms, al.cover_path, \
+    let engine = state.backend.engine();
+    let p1 = ph(engine, 1);
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, \
+                CAST(t.duration_ms AS BIGINT), al.cover_path, \
                t.format, t.sample_rate, t.bit_depth, t.file_mtime \
         FROM tracks t \
         LEFT JOIN albums al ON t.album_id = al.id \
         LEFT JOIN artists ar ON t.artist_id = ar.id \
         WHERE t.file_mtime IS NOT NULL \
         ORDER BY t.file_mtime DESC \
-        LIMIT ?";
-    let items: Vec<Value> = conn
-        .prepare(sql)
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(params![limit], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0).unwrap_or(0),
-                    "title": row.get::<_, String>(1).unwrap_or_default(),
-                    "artist_name": row.get::<_, Option<String>>(2).unwrap_or(None),
-                    "album_title": row.get::<_, Option<String>>(3).unwrap_or(None),
-                    "duration_ms": row.get::<_, i64>(4).unwrap_or(0),
-                    "cover_path": row.get::<_, Option<String>>(5).unwrap_or(None),
-                    "format": row.get::<_, Option<String>>(6).unwrap_or(None),
-                    "sample_rate": row.get::<_, Option<i32>>(7).unwrap_or(None),
-                    "bit_depth": row.get::<_, Option<i32>>(8).unwrap_or(None),
-                    "file_mtime": row.get::<_, Option<f64>>(9).unwrap_or(None),
-                }))
+        LIMIT {p1}"
+    );
+    let params: [&dyn ToSqlValue; 1] = [&limit];
+    let items: Vec<Value> = state
+        .backend
+        .query_many(&sql, &params)
+        .unwrap_or_default()
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(2).and_then(|v| v.as_string()),
+                "album_title": cols.get(3).and_then(|v| v.as_string()),
+                "duration_ms": cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                "cover_path": cols.get(5).and_then(|v| v.as_string()),
+                "format": cols.get(6).and_then(|v| v.as_string()),
+                "sample_rate": cols.get(7).and_then(|v| v.as_i64()),
+                "bit_depth": cols.get(8).and_then(|v| v.as_i64()),
+                "file_mtime": cols.get(9).and_then(|v| v.as_f64()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_default()
         })
-        .unwrap_or_default();
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -460,36 +461,30 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
         .map(|r| json!(r))
         .collect();
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let recent: Vec<Value> = conn
-        .prepare(
+    let recent: Vec<Value> = state
+        .backend
+        .query_many(
             "SELECT id, name, url, logo_url, genre, last_played, play_count \
              FROM radio_stations \
              WHERE is_favorite = 0 AND last_played IS NOT NULL \
              ORDER BY last_played DESC LIMIT 10",
+            &[],
         )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, i64>(0).unwrap_or(0),
-                    "name": row.get::<_, String>(1).unwrap_or_default(),
-                    "url": row.get::<_, String>(2).unwrap_or_default(),
-                    "logo_url": row.get::<_, Option<String>>(3).unwrap_or(None),
-                    "genre": row.get::<_, Option<String>>(4).unwrap_or(None),
-                    "last_played": row.get::<_, Option<String>>(5).unwrap_or(None),
-                    "play_count": row.get::<_, i64>(6).unwrap_or(0),
-                    "is_favorite": false,
-                }))
+        .unwrap_or_default()
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "name": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                "url": cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                "logo_url": cols.get(3).and_then(|v| v.as_string()),
+                "genre": cols.get(4).and_then(|v| v.as_string()),
+                "last_played": cols.get(5).and_then(|v| v.as_string()),
+                "play_count": cols.get(6).and_then(|v| v.as_i64()).unwrap_or(0),
+                "is_favorite": false,
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_default()
         })
-        .unwrap_or_default();
+        .collect();
 
     items.extend(recent);
     Ok(items)

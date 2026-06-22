@@ -1478,31 +1478,36 @@ async fn get_alarms(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds FROM alarms WHERE zone_id = ? ORDER BY time")
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![zone_id], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "zone_id": row.get::<_, Option<i64>>(1).ok().flatten(),
-                    "time": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "enabled": row.get::<_, i32>(3).unwrap_or(1) != 0,
-                    "days": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "source_type": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "source_id": row.get::<_, Option<i64>>(6).ok().flatten(),
-                    "volume": row.get::<_, Option<f64>>(7).ok().flatten(),
-                    "fade_in_seconds": row.get::<_, Option<i32>>(8).ok().flatten(),
-                }))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
+    use tune_core::db::backend::ToSqlValue;
+    let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1".to_string()
+    } else {
+        "?".to_string()
+    };
+    let sql = format!(
+        "SELECT id, zone_id, time, enabled, days, source_type, source_id, volume, fade_in_seconds \
+         FROM alarms WHERE zone_id = {p1} ORDER BY time"
+    );
+    let rows = state
+        .backend
+        .query_many(&sql, &[&zone_id as &dyn ToSqlValue])
         .unwrap_or_default();
-    drop(conn);
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "zone_id": r.get(1).and_then(|v| v.as_i64()),
+                "time": r.get(2).and_then(|v| v.as_string()),
+                "enabled": r.get(3).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+                "days": r.get(4).and_then(|v| v.as_string()),
+                "source_type": r.get(5).and_then(|v| v.as_string()),
+                "source_id": r.get(6).and_then(|v| v.as_i64()),
+                "volume": r.get(7).and_then(|v| v.as_f64()),
+                "fade_in_seconds": r.get(8).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -1542,9 +1547,18 @@ async fn delete_alarm(
     State(state): State<AppState>,
     Path((_zone_id, alarm_id)): Path<(i64, i64)>,
 ) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
+    let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1".to_string()
+    } else {
+        "?".to_string()
+    };
     state
-        .db
-        .execute("DELETE FROM alarms WHERE id = ?", &[&alarm_id])
+        .backend
+        .execute(
+            &format!("DELETE FROM alarms WHERE id = {p1}"),
+            &[&alarm_id as &dyn ToSqlValue],
+        )
         .ok();
     StatusCode::NO_CONTENT
 }

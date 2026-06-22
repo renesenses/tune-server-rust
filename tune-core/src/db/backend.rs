@@ -699,6 +699,30 @@ impl PostgresBackend {
             last_id: std::sync::Arc::new(std::sync::Mutex::new(0)),
         }
     }
+
+    fn translate_placeholders(sql: &str) -> String {
+        let mut result = String::with_capacity(sql.len() + 32);
+        let mut idx = 1usize;
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '?' {
+                result.push('$');
+                result.push_str(&idx.to_string());
+                idx += 1;
+            } else if c == '\'' {
+                result.push(c);
+                while let Some(sc) = chars.next() {
+                    result.push(sc);
+                    if sc == '\'' {
+                        break;
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -773,7 +797,7 @@ impl DbBackend for PostgresBackend {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
         let pool = self.pool.clone();
         let last_id_handle = self.last_id.clone();
-        let mut sql_owned = sql.to_string();
+        let mut sql_owned = Self::translate_placeholders(sql);
         // Auto-append `RETURNING id` to bare INSERT statements so
         // `last_insert_rowid()` works on PG (it has no equivalent of
         // SQLite's per-connection last-insert id). Detection is
@@ -834,7 +858,7 @@ impl DbBackend for PostgresBackend {
     ) -> Result<Option<Vec<SqlValue>>, String> {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
         let pool = self.pool.clone();
-        let sql_owned = sql.to_string();
+        let sql_owned = Self::translate_placeholders(sql);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
@@ -861,7 +885,7 @@ impl DbBackend for PostgresBackend {
     ) -> Result<Vec<Vec<SqlValue>>, String> {
         let owned: Vec<SqlValue> = params.iter().map(|p| p.to_sql_value()).collect();
         let pool = self.pool.clone();
-        let sql_owned = sql.to_string();
+        let sql_owned = Self::translate_placeholders(sql);
 
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {

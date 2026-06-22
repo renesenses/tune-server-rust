@@ -101,9 +101,18 @@ async fn create_mount(
 }
 
 async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    use tune_core::db::backend::ToSqlValue;
+    let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1".to_string()
+    } else {
+        "?".to_string()
+    };
     state
-        .db
-        .execute("DELETE FROM network_mounts WHERE id = ?", &[&id])
+        .backend
+        .execute(
+            &format!("DELETE FROM network_mounts WHERE id = {p1}"),
+            &[&id as &dyn ToSqlValue],
+        )
         .ok();
     StatusCode::NO_CONTENT
 }
@@ -383,31 +392,27 @@ async fn trigger_smb_scan() -> impl IntoResponse {
 
 /// List all stored SMB mounts from the network_mounts table.
 async fn list_smb_mounts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
+    let rows = state
+        .backend
+        .query_many(
             "SELECT id, server, share, mount_path, username, active \
              FROM network_mounts WHERE mount_type = 'smb' ORDER BY id",
+            &[],
         )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "server": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "share": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "mount_path": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "username": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "active": row.get::<_, i32>(5).unwrap_or(1) != 0,
-                }))
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "server": r.get(1).and_then(|v| v.as_string()),
+                "share": r.get(2).and_then(|v| v.as_string()),
+                "mount_path": r.get(3).and_then(|v| v.as_string()),
+                "username": r.get(4).and_then(|v| v.as_string()),
+                "active": r.get(5).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
@@ -739,29 +744,31 @@ async fn get_share_detail(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let result = conn.query_row(
-        "SELECT id, mount_type, server, share, mount_path, username, active FROM network_mounts WHERE id = ?",
-        rusqlite::params![id],
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                "mount_type": row.get::<_, Option<String>>(1).ok().flatten(),
-                "server": row.get::<_, Option<String>>(2).ok().flatten(),
-                "share": row.get::<_, Option<String>>(3).ok().flatten(),
-                "mount_path": row.get::<_, Option<String>>(4).ok().flatten(),
-                "username": row.get::<_, Option<String>>(5).ok().flatten(),
-                "active": row.get::<_, i32>(6).unwrap_or(1) != 0,
-            }))
-        },
+    use tune_core::db::backend::ToSqlValue;
+    let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1".to_string()
+    } else {
+        "?".to_string()
+    };
+    let result = state.backend.query_one(
+        &format!(
+            "SELECT id, mount_type, server, share, mount_path, username, active \
+             FROM network_mounts WHERE id = {p1}"
+        ),
+        &[&id as &dyn ToSqlValue],
     );
-    drop(conn);
     match result {
-        Ok(val) => Ok(Json(val).into_response()),
+        Ok(Some(r)) => Ok(Json(json!({
+            "id": r.get(0).and_then(|v| v.as_i64()),
+            "mount_type": r.get(1).and_then(|v| v.as_string()),
+            "server": r.get(2).and_then(|v| v.as_string()),
+            "share": r.get(3).and_then(|v| v.as_string()),
+            "mount_path": r.get(4).and_then(|v| v.as_string()),
+            "username": r.get(5).and_then(|v| v.as_string()),
+            "active": r.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+        }))
+        .into_response()),
+        Ok(None) => Ok(StatusCode::NOT_FOUND.into_response()),
         Err(_) => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }

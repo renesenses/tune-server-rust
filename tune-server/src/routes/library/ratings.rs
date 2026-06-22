@@ -2,6 +2,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::db::backend::ToSqlValue;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -30,35 +31,36 @@ pub(super) async fn export_ratings(
     Query(q): Query<ExportRatingQuery>,
 ) -> Result<Json<Value>, AppError> {
     let profile_id = q.profile_id.unwrap_or(1);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare(
-            "SELECT r.album_id, a.title, ar.name, r.rating, r.note, r.created_at \
-             FROM album_ratings r \
-             LEFT JOIN albums a ON r.album_id = a.id \
-             LEFT JOIN artists ar ON a.artist_id = ar.id \
-             WHERE r.profile_id = ? \
-             ORDER BY r.rating DESC",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![profile_id], |row| {
-                Ok(json!({
-                    "album_id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "album_title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist_name": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "rating": row.get::<_, Option<i32>>(3).ok().flatten(),
-                    "note": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "created_at": row.get::<_, Option<String>>(5).ok().flatten(),
-                }))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
+    let p1 = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1".to_string()
+    } else {
+        "?".to_string()
+    };
+    let sql = format!(
+        "SELECT r.album_id, a.title, ar.name, r.rating, r.note, r.created_at \
+         FROM album_ratings r \
+         LEFT JOIN albums a ON r.album_id = a.id \
+         LEFT JOIN artists ar ON a.artist_id = ar.id \
+         WHERE r.profile_id = {p1} \
+         ORDER BY r.rating DESC"
+    );
+    let rows = state
+        .backend
+        .query_many(&sql, &[&profile_id as &dyn ToSqlValue])
         .unwrap_or_default();
-    drop(conn);
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "album_id": r.get(0).and_then(|v| v.as_i64()),
+                "album_title": r.get(1).and_then(|v| v.as_string()),
+                "artist_name": r.get(2).and_then(|v| v.as_string()),
+                "rating": r.get(3).and_then(|v| v.as_i64()),
+                "note": r.get(4).and_then(|v| v.as_string()),
+                "created_at": r.get(5).and_then(|v| v.as_string()),
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "profile_id": profile_id,
         "ratings": items,

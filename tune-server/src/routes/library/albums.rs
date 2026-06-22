@@ -9,6 +9,8 @@ use crate::error::AppError;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::db::backend::ToSqlValue;
+use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -91,26 +93,26 @@ pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let formats: Vec<String> = conn
-        .prepare("SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .unwrap_or_default();
-    let sample_rates: Vec<i32> = conn
-        .prepare("SELECT DISTINCT sample_rate FROM albums WHERE sample_rate IS NOT NULL ORDER BY sample_rate")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        })
-        .unwrap_or_default();
-    drop(conn);
+    let formats: Vec<String> = state
+        .backend
+        .query_many(
+            "SELECT DISTINCT format FROM albums WHERE format IS NOT NULL ORDER BY format",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.into_iter().next()?.as_string())
+        .collect();
+    let sample_rates: Vec<i64> = state
+        .backend
+        .query_many(
+            "SELECT DISTINCT sample_rate FROM albums WHERE sample_rate IS NOT NULL ORDER BY sample_rate",
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| row.into_iter().next()?.as_i64())
+        .collect();
     Ok(Json(
         json!({ "formats": formats, "sample_rates": sample_rates }),
     ))
@@ -308,20 +310,36 @@ pub(super) async fn album_similar(
 pub(super) async fn merge_duplicate_albums_route(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+    // Pick engine-specific aggregate and placeholder helpers.
+    let (group_concat_expr, p1, p2) = match state.backend.engine() {
+        Engine::Postgres => (
+            PostgresDialect.group_concat(&PostgresDialect.placeholder(1), ","),
+            PostgresDialect.placeholder(1),
+            PostgresDialect.placeholder(2),
+        ),
+        Engine::Sqlite => (
+            SqliteDialect.group_concat("id", ","),
+            SqliteDialect.placeholder(1),
+            SqliteDialect.placeholder(2),
+        ),
+    };
+
     // Case-insensitive grouping: LOWER(title) catches duplicates that differ
     // only by case (e.g. "The Dark Side of the Moon" vs "The Dark Side Of The Moon").
-    let dupes: Vec<(String, String)> = conn
-        .prepare("SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    let dupes_sql = format!(
+        "SELECT LOWER(title), {group_concat_expr} FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1"
+    );
+    let dupes: Vec<(String, String)> = state
+        .backend
+        .query_many(&dupes_sql, &[])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let title = row.first()?.as_string()?;
+            let ids = row.get(1)?.as_string()?;
+            Some((title, ids))
         })
-        .unwrap_or_default();
+        .collect();
 
     let mut deleted = 0i64;
     for (_title, ids_str) in &dupes {
@@ -331,36 +349,45 @@ pub(super) async fn merge_duplicate_albums_route(
         }
         let mut best_id = ids[0];
         let mut best_count = 0i64;
+        let count_sql = format!("SELECT COUNT(id) FROM tracks WHERE album_id = {p1}");
         for &aid in &ids {
-            let cnt: i64 = conn
-                .query_row(
-                    "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                    rusqlite::params![aid],
-                    |r| r.get(0),
-                )
+            let cnt: i64 = state
+                .backend
+                .query_one(&count_sql, &[&aid as &dyn ToSqlValue])
+                .ok()
+                .flatten()
+                .and_then(|row| row.into_iter().next()?.as_i64())
                 .unwrap_or(0);
             if cnt > best_count {
                 best_count = cnt;
                 best_id = aid;
             }
         }
+        let update_sql = format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}");
+        let delete_sql = format!("DELETE FROM albums WHERE id = {p1}");
         for &aid in &ids {
             if aid != best_id {
-                conn.execute(
-                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                    rusqlite::params![best_id, aid],
-                )
-                .ok();
-                conn.execute("DELETE FROM albums WHERE id = ?", rusqlite::params![aid])
+                state
+                    .backend
+                    .execute(
+                        &update_sql,
+                        &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                    )
+                    .ok();
+                state
+                    .backend
+                    .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
                     .ok();
                 deleted += 1;
             }
         }
     }
-    conn.execute_batch(
-        "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
-    ).ok();
-    drop(conn);
+    state
+        .backend
+        .execute_batch(
+            "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)"
+        )
+        .ok();
     Ok(Json(json!({ "merged": deleted })))
 }
 
@@ -460,29 +487,34 @@ pub(super) async fn album_completeness(
         .flatten()
         .ok_or(AppError::not_found("album not found"))?;
 
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let actual_tracks: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tracks WHERE album_id = ?",
-            rusqlite::params![id],
-            |row| row.get(0),
+    let p1 = match state.backend.engine() {
+        Engine::Postgres => PostgresDialect.placeholder(1),
+        Engine::Sqlite => SqliteDialect.placeholder(1),
+    };
+
+    let actual_tracks: i64 = state
+        .backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks WHERE album_id = {p1}"),
+            &[&id as &dyn ToSqlValue],
         )
+        .ok()
+        .flatten()
+        .and_then(|row| row.into_iter().next()?.as_i64())
         .unwrap_or(0);
     let expected_tracks = album.track_count.unwrap_or(0) as i64;
 
     // Check total_tracks from metadata tags
-    let max_tag_total: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(CAST(track_number AS INTEGER)), 0) FROM tracks WHERE album_id = ?",
-            rusqlite::params![id],
-            |row| row.get(0),
+    let max_tag_total: i64 = state
+        .backend
+        .query_one(
+            &format!("SELECT COALESCE(MAX(CAST(track_number AS INTEGER)), 0) FROM tracks WHERE album_id = {p1}"),
+            &[&id as &dyn ToSqlValue],
         )
+        .ok()
+        .flatten()
+        .and_then(|row| row.into_iter().next()?.as_i64())
         .unwrap_or(0);
-    drop(conn);
 
     let expected = if expected_tracks > 0 {
         expected_tracks

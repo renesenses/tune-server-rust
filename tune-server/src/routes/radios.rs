@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -458,44 +457,40 @@ async fn list_radio_favorites(
     State(state): State<AppState>,
     Query(q): Query<RadioFavPagination>,
 ) -> Result<Json<Value>, AppError> {
+    use tune_core::db::backend::ToSqlValue;
     let limit = q.limit.unwrap_or(100);
     let offset = q.offset.unwrap_or(0);
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(params![limit, offset], |row| {
-                Ok(json!({
-                    "id": row.get::<_, Option<i64>>(0).ok().flatten(),
-                    "title": row.get::<_, Option<String>>(1).ok().flatten(),
-                    "artist": row.get::<_, Option<String>>(2).ok().flatten(),
-                    "station_name": row.get::<_, Option<String>>(3).ok().flatten(),
-                    "cover_url": row.get::<_, Option<String>>(4).ok().flatten(),
-                    "stream_url": row.get::<_, Option<String>>(5).ok().flatten(),
-                    "saved_at": row.get::<_, Option<String>>(6).ok().flatten(),
-                }))
+    let rows = state
+        .backend
+        .query_many(
+            "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?",
+            &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
+        )
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "title": r.get(1).and_then(|v| v.as_string()),
+                "artist": r.get(2).and_then(|v| v.as_string()),
+                "station_name": r.get(3).and_then(|v| v.as_string()),
+                "cover_url": r.get(4).and_then(|v| v.as_string()),
+                "stream_url": r.get(5).and_then(|v| v.as_string()),
+                "saved_at": r.get(6).and_then(|v| v.as_string()),
             })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
         })
-        .unwrap_or_default();
-    drop(conn);
+        .collect();
     Ok(Json(json!(items)))
 }
 
 async fn radio_favorites_count(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM radio_favorites", [], |row| row.get(0))
+    let count: i64 = state
+        .backend
+        .query_one("SELECT COUNT(*) FROM radio_favorites", &[])
+        .map_err(|e| AppError::internal(e))?
+        .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    drop(conn);
     Ok(Json(json!({ "count": count })))
 }
 
@@ -509,20 +504,18 @@ async fn is_radio_favorite(
     State(state): State<AppState>,
     Query(q): Query<IsFavoriteQuery>,
 ) -> Result<Json<Value>, AppError> {
+    use tune_core::db::backend::ToSqlValue;
     let artist = q.artist.unwrap_or_default();
-    let conn = state
-        .db
-        .connection()
-        .lock()
-        .map_err(|e| AppError::internal(format!("{e}")))?;
-    let exists: bool = conn
-        .query_row(
+    let exists: bool = state
+        .backend
+        .query_one(
             "SELECT EXISTS(SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?)",
-            params![q.title, artist],
-            |row| row.get(0),
+            &[&q.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue],
         )
+        .map_err(|e| AppError::internal(e))?
+        .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
+        .map(|v| v != 0)
         .unwrap_or(false);
-    drop(conn);
     Ok(Json(json!({ "is_favorite": exists })))
 }
 
