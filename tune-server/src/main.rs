@@ -111,21 +111,62 @@ async fn main() {
     // Use local time for log timestamps (fixes UTC display on Windows/CEST systems).
     // Must capture offset before spawning threads (security restriction on some OS).
     let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
-        time_offset,
-        time::macros::format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
-        ),
+    let time_fmt = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
     );
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
 
-    tracing_subscriber::fmt()
-        .with_timer(timer)
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
-                .add_directive(format!("tune_core={}", config.log_level).parse().unwrap()),
-        )
-        .init();
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
+        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap());
+
+    // On macOS/Windows, also write logs to a file so the Diagnostics
+    // "Export logs" button works even when not launched from a terminal.
+    let log_file = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+        let log_dir = if cfg!(target_os = "macos") {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join("Library/Logs"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        } else {
+            std::env::var("LOCALAPPDATA")
+                .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("C:\\ProgramData\\TuneServer"))
+        };
+        std::fs::create_dir_all(&log_dir).ok();
+        let path = log_dir.join("tune-server.log");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+            .map(|f| {
+                eprintln!("Logging to {}", path.display());
+                f
+            })
+    } else {
+        None
+    };
+
+    if let Some(file) = log_file {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let file_timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_timer(file_timer)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file));
+        let stderr_layer = tracing_subscriber::fmt::layer().with_timer(timer);
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(stderr_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_timer(timer)
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");

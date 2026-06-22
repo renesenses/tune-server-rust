@@ -781,6 +781,95 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
         }
     }
 
+    // Stopped with no now_playing (e.g. after server restart) — try to
+    // play the first track from the queue instead of a bare resume.
+    if current.state == tune_core::playback::PlayState::Stopped {
+        let qr = PlayQueueRepo::with_backend(state.backend.clone());
+        let output_device_id = get_zone_device_id(&state, zone_id);
+        // Try streaming queue first, then local queue
+        let streaming_items = qr.get_streaming_queue(zone_id).unwrap_or_default();
+        if let Some(first) = streaming_items.first() {
+            let source = first
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source_id = first
+                .get("source_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let title = first
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if !source.is_empty() && !source_id.is_empty() {
+                let orch_req = tune_core::orchestrator::PlayRequest {
+                    zone_id,
+                    output_device_id,
+                    track_id: None,
+                    source: Some(source),
+                    source_id: Some(source_id),
+                    title,
+                    artist_name: first
+                        .get("artist_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    album_title: first
+                        .get("album_title")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    cover_url: first
+                        .get("cover_path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    duration_ms: first.get("duration_ms").and_then(|v| v.as_i64()),
+                };
+                return match state.orchestrator.play(orch_req).await {
+                    Ok(result) => {
+                        let q_len = qr.count_streaming(zone_id).unwrap_or(0);
+                        if q_len > 0 {
+                            state.playback.update_queue_info(zone_id, 0, q_len).await;
+                        }
+                        Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                            .into_response()
+                    }
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                };
+            }
+        }
+        let local_items = qr.get_queue(zone_id).unwrap_or_default();
+        if let Some(first) = local_items.first() {
+            if let Some(track_id) = first.track_id {
+                let orch_req = tune_core::orchestrator::PlayRequest {
+                    zone_id,
+                    output_device_id,
+                    track_id: Some(track_id),
+                    source: None,
+                    source_id: None,
+                    title: None,
+                    artist_name: None,
+                    album_title: None,
+                    cover_url: None,
+                    duration_ms: None,
+                };
+                return match state.orchestrator.play(orch_req).await {
+                    Ok(result) => {
+                        let q_len = qr.count(zone_id).unwrap_or(0);
+                        if q_len > 0 {
+                            state.playback.update_queue_info(zone_id, 0, q_len).await;
+                        }
+                        Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                            .into_response()
+                    }
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                };
+            }
+        }
+        // Nothing in the queue — return stopped state, don't set Playing
+        return Json(build_zone_json(&state, zone_id).await).into_response();
+    }
+
     // For a normal resume (paused → playing), also ensure queue_length is
     // populated — it may be zero after a server restart.
     {
