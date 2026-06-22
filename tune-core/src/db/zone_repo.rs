@@ -31,6 +31,10 @@ pub mod sql {
     }
 
     pub fn list_all() -> String {
+        format!("SELECT {COLS} FROM zones WHERE COALESCE(is_hidden, 0) = 0 ORDER BY name")
+    }
+
+    pub fn list_all_including_hidden() -> String {
         format!("SELECT {COLS} FROM zones ORDER BY name")
     }
 
@@ -66,7 +70,17 @@ pub mod sql {
     }
 
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
-        format!("DELETE FROM zones WHERE id = {}", d.placeholder(1))
+        format!(
+            "UPDATE zones SET is_hidden = 1 WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn unhide_by_device_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 0 WHERE output_device_id = {} AND COALESCE(is_hidden, 0) = 1",
+            d.placeholder(1)
+        )
     }
 
     pub fn save_playback_position<D: SqlDialect>(d: &D) -> String {
@@ -365,6 +379,25 @@ impl ZoneRepo {
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    pub fn unhide(&self, id: i64) -> Result<(), String> {
+        let sql = self.dialect_sql(
+            |d| {
+                format!(
+                    "UPDATE zones SET is_hidden = 0 WHERE id = {}",
+                    d.placeholder(1)
+                )
+            },
+            |d| {
+                format!(
+                    "UPDATE zones SET is_hidden = 0 WHERE id = {}",
+                    d.placeholder(1)
+                )
+            },
+        );
+        self.db.execute(&sql, &[&id as &dyn ToSqlValue])?;
         Ok(())
     }
 

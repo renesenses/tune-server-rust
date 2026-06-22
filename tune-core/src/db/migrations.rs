@@ -486,6 +486,11 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
         name: "add_listen_history_source_id_album_id",
         up: "",
     },
+    Migration {
+        version: 38,
+        name: "add_zones_is_hidden",
+        up: "ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0;",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

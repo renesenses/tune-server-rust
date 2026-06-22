@@ -10,6 +10,7 @@ use crate::state::AppState;
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     deduplicate_zones(state);
+    ensure_zones_is_hidden(state);
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
@@ -39,6 +40,24 @@ fn deduplicate_zones(state: &AppState) {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
+    }
+}
+
+fn ensure_zones_is_hidden(state: &AppState) {
+    // Idempotent: adds is_hidden column if it doesn't exist.
+    // SQLite: ALTER TABLE fails silently if column exists (handled by migration v38).
+    // PG: use DO block for idempotent ALTER.
+    let sql = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => {
+            "DO $$ BEGIN ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0; EXCEPTION WHEN duplicate_column THEN NULL; END $$;"
+        }
+        tune_core::db::engine::Engine::Sqlite => {
+            // Migration v38 handles this; no-op here.
+            return;
+        }
+    };
+    if let Err(e) = state.backend.execute_batch(sql) {
+        tracing::warn!(error = %e, "zones_is_hidden_column_add_failed");
     }
 }
 
