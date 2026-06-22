@@ -110,7 +110,7 @@ pub mod sql {
 
     pub fn update<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {} WHERE id = {}",
+            "UPDATE albums SET title = {}, artist_id = {}, year = {}, original_year = {}, genre = {}, genres = {}, disc_count = {}, track_count = {}, cover_path = {}, label = {}, catalog_number = {}, format = {}, sample_rate = {}, bit_depth = {}, bio = {}, musicbrainz_release_id = {}, musicbrainz_release_group_id = {}, release_date = {}, original_date = {} WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -129,6 +129,8 @@ pub mod sql {
             d.placeholder(16),
             d.placeholder(17),
             d.placeholder(18),
+            d.placeholder(19),
+            d.placeholder(20),
         )
     }
 
@@ -491,7 +493,7 @@ impl AlbumRepo {
     pub fn update(&self, album: &Album) -> Result<(), TuneError> {
         let id = album.id.ok_or("album has no id")?;
         let sql = self.dialect_sql(sql::update, sql::update);
-        let params: [&dyn ToSqlValue; 18] = [
+        let params: [&dyn ToSqlValue; 20] = [
             &album.title,
             &album.artist_id,
             &album.year,
@@ -509,6 +511,8 @@ impl AlbumRepo {
             &album.bio,
             &album.musicbrainz_release_id,
             &album.musicbrainz_release_group_id,
+            &album.release_date,
+            &album.original_date,
             &id,
         ];
         self.db.execute(&sql, &params)?;
@@ -767,10 +771,14 @@ impl AlbumRepo {
         };
         let order_clause = match sort {
             "title" => format!("LOWER(a.title) {dir}"),
-            "release_date" | "year" => format!("a.year {dir}, LOWER(a.title) ASC"),
+            "release_date" => format!(
+                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir}, LOWER(a.title) ASC"
+            ),
+            "year" => format!("a.year {dir}, LOWER(a.title) ASC"),
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
+            "added_at" => format!("a.id {dir}"),
             _ => format!("a.id {dir}"),
         };
 

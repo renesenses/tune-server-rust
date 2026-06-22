@@ -38,6 +38,8 @@ struct AlbumEdit {
     genre: Option<String>,
     year: Option<i32>,
     label: Option<String>,
+    release_date: Option<String>,
+    original_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +178,12 @@ async fn edit_album(
     }
     if let Some(ref v) = body.label {
         album.label = Some(v.clone());
+    }
+    if let Some(ref v) = body.release_date {
+        album.release_date = Some(v.clone());
+    }
+    if let Some(ref v) = body.original_date {
+        album.original_date = Some(v.clone());
     }
     // artist_id takes priority; fall back to artist_name resolution
     if let Some(aid) = body.artist_id {
