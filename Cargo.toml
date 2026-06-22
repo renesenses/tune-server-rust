@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
+members = ["tune-core", "tune-server", "tune-cli", "tune-ffi"]
 resolver = "2"
 
 [workspace.package]
