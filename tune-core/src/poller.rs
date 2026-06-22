@@ -232,8 +232,12 @@ impl PositionPoller {
                 }
             };
 
-            // Sync volume from device regardless of state (skip if fixed_volume)
-            if !zone.fixed_volume && status.volume > 0.001 {
+            // Sync volume from device only when playing — idle renderers
+            // often report 100% which would overwrite the user's safe default.
+            if !zone.fixed_volume
+                && status.volume > 0.001
+                && status.state == TransportState::Playing
+            {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())

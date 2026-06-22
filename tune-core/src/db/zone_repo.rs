@@ -485,7 +485,7 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
         output_type: cols.get(2).and_then(|v| v.as_string()),
         output_device_id: cols.get(3).and_then(|v| v.as_string()),
-        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(50) as i32,
+        volume: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(20) as i32,
         muted: cols.get(5).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
         online: cols.get(6).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
         gapless_enabled: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
@@ -521,7 +521,7 @@ mod tests {
             .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 20);
         assert!(!zone.muted);
 
         repo.update_volume(id, 75).unwrap();
@@ -596,7 +596,7 @@ mod tests {
 
         let id = repo.create("Default Zone", None, None).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
-        assert_eq!(zone.volume, 50);
+        assert_eq!(zone.volume, 20);
         assert!(!zone.muted);
         assert!(zone.online);
         assert!(zone.output_type.is_none());
