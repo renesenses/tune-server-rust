@@ -33,8 +33,16 @@ pub mod sql {
     }
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
+        let conflict = match d.engine() {
+            crate::db::engine::Engine::Sqlite => " OR IGNORE",
+            crate::db::engine::Engine::Postgres => "",
+        };
+        let pg_conflict = match d.engine() {
+            crate::db::engine::Engine::Sqlite => "",
+            crate::db::engine::Engine::Postgres => " ON CONFLICT (name, url) DO NOTHING",
+        };
         format!(
-            "INSERT INTO radio_stations (name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT{conflict} INTO radio_stations (name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}){pg_conflict}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),

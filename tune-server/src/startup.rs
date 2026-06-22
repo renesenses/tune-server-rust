@@ -10,6 +10,7 @@ use crate::state::AppState;
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
     deduplicate_zones(state);
+    deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;
     restore_queues(state, config);
@@ -38,6 +39,24 @@ fn deduplicate_zones(state: &AppState) {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
     ) {
         tracing::warn!(error = %e, "zone_unique_index_failed");
+    }
+}
+
+fn deduplicate_radios(state: &AppState) {
+    let dedup_sql = "DELETE FROM radio_stations WHERE id NOT IN (SELECT MIN(id) FROM radio_stations GROUP BY name, url)";
+    match state.backend.execute(dedup_sql, &[]) {
+        Ok(removed) if removed > 0 => {
+            info!(removed, "radio_duplicates_removed");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "radio_dedup_failed");
+        }
+    }
+    if let Err(e) = state.backend.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_radio_stations_name_url ON radio_stations(name, url);"
+    ) {
+        tracing::warn!(error = %e, "radio_unique_index_failed");
     }
 }
 
