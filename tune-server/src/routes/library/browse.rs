@@ -3,6 +3,8 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -29,17 +31,18 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .iter()
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
-            let pattern = format!("{norm}%");
-            let count: i64 = state
-                .backend
-                .query_one(
-                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
-                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                )
-                .ok()
-                .flatten()
-                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
-                .unwrap_or(0);
+            let pattern = format!("{norm}/%");
+            let count: i64 = match state.backend.query_one(
+                "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
+                &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+            ) {
+                Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(path = %norm, error = %e, "browse_root_count_failed");
+                    0
+                }
+            };
             let name = std::path::Path::new(&norm)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -87,7 +90,7 @@ pub(super) async fn browse_directory(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                let dir_path = path.to_string_lossy().to_string();
+                let dir_path: String = path.to_string_lossy().nfc().collect();
                 let name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -96,17 +99,18 @@ pub(super) async fn browse_directory(
                 if name.starts_with('.') {
                     continue;
                 }
-                let pattern = format!("{}%", dir_path);
-                let track_count: i64 = state
-                    .backend
-                    .query_one(
-                        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
-                        &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                    )
-                    .ok()
-                    .flatten()
-                    .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
-                    .unwrap_or(0);
+                let pattern = format!("{dir_path}/%");
+                let track_count: i64 = match state.backend.query_one(
+                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
+                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+                ) {
+                    Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    Ok(None) => 0,
+                    Err(e) => {
+                        warn!(path = %dir_path, error = %e, "browse_dir_count_failed");
+                        0
+                    }
+                };
                 subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
             }
         }
@@ -120,7 +124,7 @@ pub(super) async fn browse_directory(
     });
 
     // List tracks in this directory (not recursive — only direct children)
-    let dir_prefix = format!("{}%", q.path);
+    let dir_prefix = format!("{}/%", normalized_query);
     let sql = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
                t.disc_number, t.track_number, t.duration_ms, t.file_path, \
                t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path \
@@ -146,7 +150,7 @@ pub(super) async fn browse_directory(
                         .parent()
                         .and_then(|p| p.to_str())
                         .unwrap_or("");
-                    parent == q.path
+                    parent == normalized_query
                 })
                 .unwrap_or(false);
             if !is_direct {
