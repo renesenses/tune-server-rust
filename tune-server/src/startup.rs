@@ -128,7 +128,10 @@ async fn restore_playback_positions(state: &AppState) {
     if let Ok(zones) = zone_repo.list() {
         for zone in &zones {
             let Some(zone_id) = zone.id else { continue };
-            if zone.last_position_ms == 0 && zone.last_track_id.is_none() {
+            if zone.last_position_ms == 0
+                && zone.last_track_id.is_none()
+                && zone.last_track_source.as_deref() != Some("radio")
+            {
                 continue;
             }
             let np = if let Some(track_id) = zone.last_track_id {
@@ -149,6 +152,19 @@ async fn restore_playback_positions(state: &AppState) {
                     }
                 } else {
                     continue;
+                }
+            } else if zone.last_track_source.as_deref() == Some("radio") {
+                let radio_url = zone.last_track_source_id.clone().unwrap_or_default();
+                tune_core::playback::NowPlaying {
+                    track_id: None,
+                    title: "Recovering...".into(),
+                    artist_name: Some("Live Radio".into()),
+                    album_title: Some("Live Radio".into()),
+                    cover_path: None,
+                    duration_ms: 0,
+                    source: "radio".into(),
+                    source_id: Some(radio_url),
+                    stream_id: None,
                 }
             } else {
                 continue;
