@@ -52,6 +52,11 @@ async fn main() {
         .route("/health", get(health))
         .route("/ws/server", get(ws_server_handler))
         .route("/api/relay/{server_id}/{*path}", any(api_proxy::proxy_api))
+        .route("/ws/client/{server_id}", get(ws_client::ws_client_handler))
+        .route(
+            "/stream/relay/{server_id}/{*stream_path}",
+            get(stream_proxy::proxy_stream),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
