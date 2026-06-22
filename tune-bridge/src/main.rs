@@ -1,6 +1,8 @@
 mod api_proxy;
 mod protocol;
 mod state;
+mod stream_proxy;
+mod ws_client;
 mod ws_server;
 
 use std::sync::Arc;

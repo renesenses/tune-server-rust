@@ -12,18 +12,31 @@ pub struct RelayClient {
     pub server_id: String,
     pub bridge_token: String,
     pub relay_url: String,
+    pub local_port: u16,
     connected: Arc<AtomicBool>,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    http_client: reqwest::Client,
 }
 
 impl RelayClient {
-    pub fn new(server_id: String, bridge_token: String, relay_url: String) -> Self {
+    pub fn new(
+        server_id: String,
+        bridge_token: String,
+        relay_url: String,
+        local_port: u16,
+    ) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("http client");
         Self {
             server_id,
             bridge_token,
             relay_url,
+            local_port,
             connected: Arc::new(AtomicBool::new(false)),
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            http_client,
         }
     }
 
@@ -175,28 +188,228 @@ impl RelayClient {
                 }
             }
             "relay.request" => {
-                // TODO Phase 1: dispatch to local router via tower::Service
-                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                warn!(id = %id, "relay.request received but dispatch not yet implemented");
-                let tx = self.ws_tx.lock().await;
-                if let Some(tx) = tx.as_ref() {
+                let id = v
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                let body = v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .map(|s| s.to_string());
+                let headers = v.get("headers").and_then(|h| h.as_object()).cloned();
+
+                let url = format!("http://127.0.0.1:{}{}", self.local_port, path);
+                let mut req = match method {
+                    "POST" => self.http_client.post(&url),
+                    "PUT" => self.http_client.put(&url),
+                    "DELETE" => self.http_client.delete(&url),
+                    "PATCH" => self.http_client.patch(&url),
+                    _ => self.http_client.get(&url),
+                };
+
+                if let Some(hdrs) = headers {
+                    for (k, val) in &hdrs {
+                        if let Some(v) = val.as_str() {
+                            req = req.header(k.as_str(), v);
+                        }
+                    }
+                }
+                if let Some(b) = body {
+                    req = req.body(b);
+                }
+
+                let ws_tx = self.ws_tx.clone();
+                let id_clone = id.clone();
+                tokio::spawn(async move {
+                    let (status, resp_headers, resp_body) = match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let ct = resp
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("application/json")
+                                .to_string();
+                            let body = resp.text().await.unwrap_or_default();
+                            let mut hdrs = serde_json::Map::new();
+                            hdrs.insert("content-type".to_string(), serde_json::Value::String(ct));
+                            (status, hdrs, body)
+                        }
+                        Err(e) => {
+                            warn!(id = %id_clone, error = %e, "relay local dispatch failed");
+                            let mut hdrs = serde_json::Map::new();
+                            hdrs.insert(
+                                "content-type".to_string(),
+                                serde_json::Value::String("application/json".into()),
+                            );
+                            (
+                                502,
+                                hdrs,
+                                format!("{{\"error\": \"local dispatch failed: {e}\"}}"),
+                            )
+                        }
+                    };
+
                     let resp = serde_json::json!({
                         "type": "relay.response",
-                        "id": id,
-                        "status": 501,
-                        "headers": {},
-                        "body": "{\"error\": \"relay dispatch not yet implemented\"}"
+                        "id": id_clone,
+                        "status": status,
+                        "headers": resp_headers,
+                        "body": resp_body,
                     });
-                    let _ = tx.send(resp.to_string()).await;
-                }
+
+                    let tx = ws_tx.lock().await;
+                    if let Some(tx) = tx.as_ref() {
+                        let _ = tx.send(resp.to_string()).await;
+                    }
+                });
             }
             "relay.stream_request" => {
-                // TODO Phase 2: pipe local stream data back
-                warn!("relay.stream_request not yet implemented");
+                let id = v
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stream_id = v
+                    .get("stream_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let range = v
+                    .get("range")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+
+                let url = format!("http://127.0.0.1:{}/stream/{}", self.local_port, stream_id);
+                let ws_tx = self.ws_tx.clone();
+                let http = self.http_client.clone();
+
+                tokio::spawn(async move {
+                    let mut req = http.get(&url);
+                    if let Some(r) = range {
+                        req = req.header("range", r);
+                    }
+
+                    match req.send().await {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let ct = resp
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("application/octet-stream")
+                                .to_string();
+                            let content_length = resp
+                                .headers()
+                                .get("content-length")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok());
+
+                            let mut hdrs = serde_json::Map::new();
+                            hdrs.insert("content-type".to_string(), serde_json::Value::String(ct));
+
+                            let start_msg = serde_json::json!({
+                                "type": "relay.stream_start",
+                                "id": id,
+                                "status": status,
+                                "headers": hdrs,
+                                "content_length": content_length,
+                            });
+
+                            {
+                                let tx = ws_tx.lock().await;
+                                if let Some(tx) = tx.as_ref() {
+                                    let _ = tx.send(start_msg.to_string()).await;
+                                }
+                            }
+
+                            use futures_util::StreamExt;
+                            let mut stream = resp.bytes_stream();
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        let tx = ws_tx.lock().await;
+                                        if let Some(tx) = tx.as_ref() {
+                                            // Binary frame: first 36 bytes = request id (UUID), rest = audio data
+                                            let mut frame = Vec::with_capacity(36 + bytes.len());
+                                            frame.extend_from_slice(
+                                                id.as_bytes().get(..36).unwrap_or(id.as_bytes()),
+                                            );
+                                            // Pad to 36 if id shorter
+                                            while frame.len() < 36 {
+                                                frame.push(0);
+                                            }
+                                            frame.extend_from_slice(&bytes);
+                                            // Send as JSON with base64 would be too slow,
+                                            // so we encode the stream_id in the frame header
+                                            let _ = tx
+                                                .send(format!(
+                                                    "BINARY:{}:{}",
+                                                    id,
+                                                    base64_encode(&bytes)
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(id = %id, error = %e, "stream chunk error");
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let end_msg = serde_json::json!({"type": "relay.stream_end", "id": id});
+                            let tx = ws_tx.lock().await;
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send(end_msg.to_string()).await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(id = %id, error = %e, "relay stream request failed");
+                            let resp = serde_json::json!({
+                                "type": "relay.stream_start",
+                                "id": id,
+                                "status": 502,
+                                "headers": {},
+                            });
+                            let tx = ws_tx.lock().await;
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send(resp.to_string()).await;
+                            }
+                        }
+                    }
+                });
             }
             _ => {}
         }
     }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(CHARS[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((n >> 6) & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 63) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
 
 fn hostname() -> String {
@@ -205,7 +418,7 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "Tune Server".to_string())
 }
 
-pub fn spawn_relay_client(settings: &SettingsRepo) -> Option<Arc<RelayClient>> {
+pub fn spawn_relay_client(settings: &SettingsRepo, local_port: u16) -> Option<Arc<RelayClient>> {
     let enabled = settings
         .get("bridge_enabled")
         .ok()
@@ -249,7 +462,12 @@ pub fn spawn_relay_client(settings: &SettingsRepo) -> Option<Arc<RelayClient>> {
 
     let server_id = crate::cloud::telemetry::TelemetryReporter::get_or_create_server_id(settings);
 
-    let client = Arc::new(RelayClient::new(server_id, bridge_token, relay_url));
+    let client = Arc::new(RelayClient::new(
+        server_id,
+        bridge_token,
+        relay_url,
+        local_port,
+    ));
     client.clone().spawn();
     Some(client)
 }

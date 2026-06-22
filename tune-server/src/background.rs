@@ -34,7 +34,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
 #[cfg(feature = "cloud-relay")]
 fn spawn_relay_client(state: &AppState) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    if let Some(client) = tune_core::cloud::relay::spawn_relay_client(&settings) {
+    if let Some(_client) = tune_core::cloud::relay::spawn_relay_client(&settings, state.port) {
         info!("cloud relay client spawned");
     }
 }
