@@ -44,20 +44,22 @@ fn deduplicate_zones(state: &AppState) {
 }
 
 fn ensure_zones_is_hidden(state: &AppState) {
-    // Idempotent: adds is_hidden column if it doesn't exist.
-    // SQLite: ALTER TABLE fails silently if column exists (handled by migration v38).
-    // PG: use DO block for idempotent ALTER.
-    let sql = match state.backend.engine() {
+    match state.backend.engine() {
         tune_core::db::engine::Engine::Postgres => {
-            "DO $$ BEGIN ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0; EXCEPTION WHEN duplicate_column THEN NULL; END $$;"
+            // Try ALTER TABLE; ignore "duplicate column" error.
+            let result = state.backend.execute(
+                "ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0",
+                &[],
+            );
+            match result {
+                Ok(_) => info!("zones_is_hidden_column_added"),
+                Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
+                Err(e) => tracing::warn!(error = %e, "zones_is_hidden_column_add_failed"),
+            }
         }
         tune_core::db::engine::Engine::Sqlite => {
-            // Migration v38 handles this; no-op here.
-            return;
+            // Migration v38 handles this.
         }
-    };
-    if let Err(e) = state.backend.execute_batch(sql) {
-        tracing::warn!(error = %e, "zones_is_hidden_column_add_failed");
     }
 }
 

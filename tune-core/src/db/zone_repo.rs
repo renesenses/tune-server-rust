@@ -30,8 +30,12 @@ pub mod sql {
         )
     }
 
+    pub fn select_base() -> String {
+        format!("SELECT {COLS} FROM zones")
+    }
+
     pub fn list_all() -> String {
-        format!("SELECT {COLS} FROM zones WHERE COALESCE(is_hidden, 0) = 0 ORDER BY name")
+        format!("SELECT {COLS} FROM zones ORDER BY name")
     }
 
     pub fn list_all_including_hidden() -> String {
@@ -194,18 +198,20 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        // First try the read path (cheap, no contention with writes).
-        // If empty, fall back to query_many_strong — under WAL the
-        // read-only snapshot can lag behind the write conn's commits,
-        // which surfaced as the "zone disappears after create" P0
-        // (forum #2, #6). The strong path always sees the writer's
-        // own commits. Pattern preserved from commit 8af95ec.
-        let query = sql::list_all();
-        let rows = self.db.query_many(&query, &[])?;
+        // Try with is_hidden filter first; fall back to unfiltered if
+        // the column doesn't exist yet (pre-migration).
+        let filtered = format!(
+            "{} WHERE COALESCE(is_hidden, 0) = 0 ORDER BY name",
+            sql::select_base()
+        );
+        let rows = self
+            .db
+            .query_many(&filtered, &[])
+            .or_else(|_| self.db.query_many(&sql::list_all(), &[]))?;
         if !rows.is_empty() {
             return Ok(rows.iter().map(row_to_zone).collect());
         }
-        let strong = self.db.query_many_strong(&query, &[])?;
+        let strong = self.db.query_many_strong(&sql::list_all(), &[])?;
         Ok(strong.iter().map(row_to_zone).collect())
     }
 
