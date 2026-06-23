@@ -341,26 +341,21 @@ impl PlaybackOrchestrator {
                         db_volume as f64 / 100.0
                     }
                 };
-                if is_default_volume {
-                    info!(zone_id = req.zone_id, "play_initial_volume_skipped_default");
-                }
-                if !is_default_volume {
-                    let did = device_id.clone();
-                    let outputs = self.outputs.clone();
-                    let zone_id = req.zone_id;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        let outputs = outputs.lock().await;
-                        if let Some(output) = outputs.get(&did) {
-                            let vol_clamped = zone_volume.clamp(0.0, 1.0);
-                            if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
-                                warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
-                            } else {
-                                info!(zone_id, volume = %vol_clamped, "play_initial_volume_sent");
-                            }
+                let did = device_id.clone();
+                let outputs = self.outputs.clone();
+                let zone_id = req.zone_id;
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let outputs = outputs.lock().await;
+                    if let Some(output) = outputs.get(&did) {
+                        let vol_clamped = zone_volume.clamp(0.0, 1.0);
+                        if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
+                            warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
+                        } else {
+                            info!(zone_id, volume = %vol_clamped, "play_initial_volume_sent");
                         }
-                    });
-                }
+                    }
+                });
             }
 
             result
