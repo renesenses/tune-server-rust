@@ -545,15 +545,36 @@ async fn fetch_github_changelog() -> Result<Value, String> {
         .user_agent("Tune/2.0")
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get("https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=20")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API {}", resp.status()));
+
+    // Try mozaiklabs.fr proxy first, fallback to GitHub
+    let releases: Vec<Value> = match async {
+        let resp = client
+            .get("https://mozaiklabs.fr/api/tune/releases?per_page=20")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("proxy API {}", resp.status()));
+        }
+        resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())
     }
-    let releases: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            let mut req = client.get(
+                "https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=20",
+            );
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("GitHub API {}", resp.status()));
+            }
+            resp.json::<Vec<Value>>().await.map_err(|e| e.to_string())?
+        }
+    };
     let entries: Vec<Value> = releases
         .iter()
         .filter_map(|r| {

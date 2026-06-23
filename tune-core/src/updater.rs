@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+const PROXY_RELEASES_URL: &str = "https://mozaiklabs.fr/api/tune/releases/latest";
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/renesenses/tune-server-rust/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 6 * 3600;
@@ -68,21 +69,14 @@ impl UpdateChecker {
     }
 
     pub async fn check(&self) -> Result<Option<ReleaseInfo>, String> {
-        let resp = self
-            .client
-            .get(GITHUB_RELEASES_URL)
-            .send()
-            .await
-            .map_err(|e| format!("update check: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("github api: {}", resp.status()));
-        }
-
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("update parse: {e}"))?;
+        // Try mozaiklabs.fr proxy first (no rate limit), fallback to GitHub
+        let data = match self.fetch_release_json(PROXY_RELEASES_URL).await {
+            Ok(d) => d,
+            Err(proxy_err) => {
+                warn!(error = %proxy_err, "proxy_check_failed, falling back to github");
+                self.fetch_release_json(GITHUB_RELEASES_URL).await?
+            }
+        };
 
         let tag = data["tag_name"].as_str().unwrap_or("").to_string();
         let version = tag.trim_start_matches('v').to_string();
@@ -112,6 +106,20 @@ impl UpdateChecker {
             html_url: data["html_url"].as_str().unwrap_or("").to_string(),
             assets,
         }))
+    }
+
+    async fn fetch_release_json(&self, url: &str) -> Result<serde_json::Value, String> {
+        let mut req = self.client.get(url);
+        if url.contains("github.com") {
+            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+        }
+        let resp = req.send().await.map_err(|e| format!("request: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("api: {} {}", url, resp.status()));
+        }
+        resp.json().await.map_err(|e| format!("parse: {e}"))
     }
 
     pub fn spawn_periodic(self) -> tokio::task::JoinHandle<()> {

@@ -378,6 +378,34 @@ async fn play(
                     }
                 }
             }
+            // Last resort: resume from last_track saved in DB (after stop)
+            {
+                let zone_repo =
+                    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+                if let Ok(Some(zone)) = zone_repo.get(zone_id) {
+                    if let Some(track_id) = zone.last_track_id {
+                        let output_device_id = get_zone_device_id(&state, zone_id);
+                        let orch_req = tune_core::orchestrator::PlayRequest {
+                            zone_id,
+                            output_device_id,
+                            track_id: Some(track_id),
+                            source: zone.last_track_source.clone().filter(|s| s != "local"),
+                            source_id: zone.last_track_source_id.clone(),
+                            title: None,
+                            artist_name: None,
+                            album_title: None,
+                            cover_url: None,
+                            duration_ms: None,
+                        };
+                        if let Ok(result) = state.orchestrator.play(orch_req).await {
+                            return Json(
+                                build_zone_json_with_result(&state, zone_id, &result).await,
+                            )
+                            .into_response();
+                        }
+                    }
+                }
+            }
             return (
                 StatusCode::BAD_REQUEST,
                 "no track source specified and nothing to resume",
