@@ -400,9 +400,19 @@ fn decode_to_pcm_streaming_inner(
         for chunk in pcm_bytes.chunks(chunk_size) {
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
-            if rt.block_on(tx.send(chunk.to_vec())).is_err() {
-                debug!("streaming_decode_consumer_dropped (fallback)");
-                return Ok(output_bd);
+            match rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tx.send(chunk.to_vec()),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    debug!("streaming_decode_consumer_dropped (fallback)");
+                    return Ok(output_bd);
+                }
+                Err(_) => {
+                    tracing::warn!("streaming_decode_send_timeout_10s (fallback)");
+                    return Ok(output_bd);
+                }
             }
             if !first_chunk_sent {
                 first_chunk_sent = true;
@@ -562,9 +572,19 @@ fn decode_to_pcm_streaming_inner(
             // compute_levels() is CPU-intensive (iterates all frames with
             // floating-point math) and was previously called before send(),
             // introducing micro-pauses that caused Squeezebox/LMS stuttering.
-            if rt.block_on(tx.send(chunk.clone())).is_err() {
-                debug!("streaming_decode_consumer_dropped");
-                return Ok(output_bd);
+            match rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tx.send(chunk.clone()),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    debug!("streaming_decode_consumer_dropped");
+                    return Ok(output_bd);
+                }
+                Err(_) => {
+                    tracing::warn!("streaming_decode_send_timeout_10s");
+                    return Ok(output_bd);
+                }
             }
             if !first_chunk_sent {
                 first_chunk_sent = true;
@@ -588,8 +608,17 @@ fn decode_to_pcm_streaming_inner(
 
     // Flush remaining bytes
     if !pcm_buf.is_empty() {
-        if rt.block_on(tx.send(pcm_buf)).is_err() {
-            debug!("streaming_decode_consumer_dropped (final)");
+        match rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tx.send(pcm_buf),
+        )) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                debug!("streaming_decode_consumer_dropped (final)");
+            }
+            Err(_) => {
+                tracing::warn!("streaming_decode_send_timeout_10s (final)");
+            }
         }
     }
 
@@ -946,9 +975,19 @@ fn decode_dsd_streaming(
                 let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
-                if rt.block_on(tx.send(chunk.clone())).is_err() {
-                    debug!("dsd_streaming_consumer_dropped");
-                    return Ok(true); // consumer gone
+                match rt.block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tx.send(chunk.clone()),
+                )) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        debug!("dsd_streaming_consumer_dropped");
+                        return Ok(true); // consumer gone
+                    }
+                    Err(_) => {
+                        tracing::warn!("dsd_streaming_send_timeout_10s");
+                        return Ok(true); // channel stalled
+                    }
                 }
                 if !*first_chunk_sent {
                     *first_chunk_sent = true;
@@ -1000,15 +1039,29 @@ fn decode_dsd_streaming(
 
     // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
-        if rt.block_on(tx.send(pcm_buf.clone())).is_err() {
-            debug!("dsd_streaming_consumer_dropped (final)");
-        } else if let Some(ltx) = levels_tx {
-            let _ = ltx.send(super::levels::compute_levels(
-                &pcm_buf,
-                output_bd,
-                ch,
-                output_rate,
-            ));
+        let send_ok = match rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tx.send(pcm_buf.clone()),
+        )) {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => {
+                debug!("dsd_streaming_consumer_dropped (final)");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("dsd_streaming_send_timeout_10s (final)");
+                false
+            }
+        };
+        if send_ok {
+            if let Some(ltx) = levels_tx {
+                let _ = ltx.send(super::levels::compute_levels(
+                    &pcm_buf,
+                    output_bd,
+                    ch,
+                    output_rate,
+                ));
+            }
         }
     }
 

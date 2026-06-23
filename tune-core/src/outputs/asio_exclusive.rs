@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
@@ -174,52 +175,41 @@ impl AsioExclusiveOutput {
         //
         // ASIO drivers typically support the exact hardware rates of the DAC.
         // We look for a config that matches our desired sample rate and
-        // channel count.
-        let stream_config = Self::find_exclusive_config(&device, channels as u16, sample_rate)
-            .ok_or_else(|| {
-                format!(
-                    "ASIO device {resolved_name} does not support {channels}ch @ {sample_rate} Hz"
-                )
-            })?;
+        // channel count.  The returned `native_fmt` is the driver's native
+        // sample format — cpal's ASIO backend does NO format conversion, so
+        // we must build the stream with an exact-match callback type.
+        let (stream_config, native_fmt) = Self::find_exclusive_config(
+            &device,
+            channels as u16,
+            sample_rate,
+        )
+        .ok_or_else(|| {
+            format!("ASIO device {resolved_name} does not support {channels}ch @ {sample_rate} Hz")
+        })?;
 
         info!(
             device = %resolved_name,
             sample_rate = stream_config.sample_rate,
             channels = stream_config.channels,
+            native_format = ?native_fmt,
             "asio_exclusive_config_found"
         );
 
         // -- 5. Build output stream with render callback --------------------
-        let ring_for_callback = ring.clone();
-        let vol_for_callback = volume.clone();
-        let paused_for_callback = paused.clone();
-
-        let stream = device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if paused_for_callback.load(Ordering::Relaxed) {
-                        data.fill(0.0);
-                        return;
-                    }
-
-                    let read = ring_for_callback.pop(data);
-
-                    // Apply volume
-                    let v = vol_for_callback.load(Ordering::Relaxed) as f32 / 1000.0;
-                    for sample in &mut data[..read] {
-                        *sample *= v;
-                    }
-
-                    // Silence for any remaining samples
-                    for sample in &mut data[read..] {
-                        *sample = 0.0;
-                    }
-                },
-                |e| warn!(error = %e, "asio_exclusive_stream_error"),
-                None,
-            )
-            .map_err(|e| format!("Failed to build ASIO stream: {e}"))?;
+        //
+        // The ring buffer always stores f32 samples internally.  When the
+        // ASIO driver's native format is *not* F32 we read f32 from the
+        // ring, apply volume, then convert to the driver's native type in
+        // the callback.  This keeps the entire pipeline in f32 while giving
+        // the driver the exact integer format it expects.
+        let stream = Self::build_native_stream(
+            &device,
+            &stream_config,
+            native_fmt,
+            ring.clone(),
+            volume.clone(),
+            paused.clone(),
+        )?;
 
         stream
             .play()
@@ -283,13 +273,121 @@ impl AsioExclusiveOutput {
         &self.ring
     }
 
+    /// Build the cpal output stream using the driver's native sample format.
+    ///
+    /// The ring buffer always contains f32 samples.  For native I32 or I16
+    /// drivers (e.g. RME Babyface Pro FS) we read f32 from the ring, apply
+    /// volume, and convert to the target integer type in the callback.
+    fn build_native_stream(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        native_fmt: SampleFormat,
+        ring: Arc<RingBuf>,
+        volume: Arc<AtomicU32>,
+        paused: Arc<AtomicBool>,
+    ) -> Result<cpal::Stream, String> {
+        match native_fmt {
+            SampleFormat::I32 => {
+                info!("asio_exclusive_building_i32_stream");
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(0);
+                                return;
+                            }
+                            // Read f32 from ring into a temporary buffer
+                            let mut tmp = vec![0.0f32; data.len()];
+                            let read = ring.pop(&mut tmp);
+                            // Apply volume and convert f32 → i32
+                            let v = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let scale = i32::MAX as f64;
+                            for i in 0..read {
+                                let s = (tmp[i] as f64 * v).clamp(-1.0, 1.0);
+                                data[i] = (s * scale) as i32;
+                            }
+                            // Silence remaining
+                            for sample in &mut data[read..] {
+                                *sample = 0;
+                            }
+                        },
+                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build ASIO I32 stream: {e}"))
+            }
+            SampleFormat::I16 => {
+                info!("asio_exclusive_building_i16_stream");
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(0);
+                                return;
+                            }
+                            let mut tmp = vec![0.0f32; data.len()];
+                            let read = ring.pop(&mut tmp);
+                            let v = volume.load(Ordering::Relaxed) as f64 / 1000.0;
+                            let scale = i16::MAX as f64;
+                            for i in 0..read {
+                                let s = (tmp[i] as f64 * v).clamp(-1.0, 1.0);
+                                data[i] = (s * scale) as i16;
+                            }
+                            for sample in &mut data[read..] {
+                                *sample = 0;
+                            }
+                        },
+                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build ASIO I16 stream: {e}"))
+            }
+            _ => {
+                // F32 (default) and any other format — use f32 callback
+                if native_fmt != SampleFormat::F32 {
+                    warn!(
+                        native_format = ?native_fmt,
+                        "asio_exclusive_unexpected_format_falling_back_to_f32"
+                    );
+                }
+                device
+                    .build_output_stream(
+                        config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            if paused.load(Ordering::Relaxed) {
+                                data.fill(0.0);
+                                return;
+                            }
+                            let read = ring.pop(data);
+                            let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+                            for sample in &mut data[..read] {
+                                *sample *= v;
+                            }
+                            for sample in &mut data[read..] {
+                                *sample = 0.0;
+                            }
+                        },
+                        |e| warn!(error = %e, "asio_exclusive_stream_error"),
+                        None,
+                    )
+                    .map_err(|e| format!("Failed to build ASIO F32 stream: {e}"))
+            }
+        }
+    }
+
     /// Find a stream config matching the desired channels and sample rate
     /// using the ASIO device's supported configurations.
+    ///
+    /// Returns `(StreamConfig, SampleFormat)` — the sample format is the
+    /// driver's **native** format, which cpal's ASIO backend requires an
+    /// exact match for (no implicit conversion).
     fn find_exclusive_config(
         device: &cpal::Device,
         channels: u16,
         sample_rate: u32,
-    ) -> Option<cpal::StreamConfig> {
+    ) -> Option<(cpal::StreamConfig, SampleFormat)> {
         // First, try to find an exact match in supported configs
         if let Ok(configs) = device.supported_output_configs() {
             for config in configs {
@@ -297,11 +395,15 @@ impl AsioExclusiveOutput {
                     && config.min_sample_rate() <= sample_rate
                     && config.max_sample_rate() >= sample_rate
                 {
-                    return Some(cpal::StreamConfig {
-                        channels: channels.min(config.channels()),
-                        sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
+                    let native_fmt = config.sample_format();
+                    return Some((
+                        cpal::StreamConfig {
+                            channels: channels.min(config.channels()),
+                            sample_rate,
+                            buffer_size: cpal::BufferSize::Default,
+                        },
+                        native_fmt,
+                    ));
                 }
             }
         }
@@ -309,6 +411,7 @@ impl AsioExclusiveOutput {
         // If no exact match, try with the device's default config
         if let Ok(default_cfg) = device.default_output_config() {
             let cfg = default_cfg.config();
+            let native_fmt = default_cfg.sample_format();
             // Even if the rate doesn't match, ASIO drivers may accept it
             // and switch the hardware rate internally.
             debug!(
@@ -316,13 +419,17 @@ impl AsioExclusiveOutput {
                 default_ch = cfg.channels,
                 requested_sr = sample_rate,
                 requested_ch = channels,
+                native_format = ?native_fmt,
                 "asio_exclusive_using_direct_config"
             );
-            return Some(cpal::StreamConfig {
-                channels: channels.min(cfg.channels),
-                sample_rate,
-                buffer_size: cpal::BufferSize::Default,
-            });
+            return Some((
+                cpal::StreamConfig {
+                    channels: channels.min(cfg.channels),
+                    sample_rate,
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                native_fmt,
+            ));
         }
 
         None

@@ -98,12 +98,7 @@ pub struct AudioCapabilities {
 
 pub fn dlna_capabilities() -> AudioCapabilities {
     AudioCapabilities {
-        formats: vec![
-            AudioFormat::Flac,
-            AudioFormat::Wav,
-            AudioFormat::Mp3,
-            AudioFormat::Aac,
-        ],
+        formats: vec![AudioFormat::Flac, AudioFormat::Wav, AudioFormat::Mp3],
         max_sample_rate: 192000,
         max_bit_depth: 24,
         supports_gapless: true,
@@ -256,23 +251,24 @@ impl AudioFormat {
     }
 
     /// Returns true if this format needs transcoding before DLNA streaming.
-    /// FLAC, WAV, MP3, AAC pass through as-is.
+    /// FLAC, WAV, MP3 pass through as-is.
+    /// AAC is transcoded to FLAC: most DLNA renderers cannot play AAC.
     /// DSD (DSF/DFF) MUST be transcoded to PCM: most DLNA renderers cannot
     /// decode raw DSD bitstreams, and serving raw DSD corrupts the renderer
     /// buffer state causing subsequent tracks to fail too (BUG-006).
     pub fn needs_transcode_for_dlna(&self) -> bool {
         matches!(
             self,
-            Self::Aiff | Self::WavPack | Self::Ape | Self::Alac | Self::Wma | Self::Dsd
+            Self::Aac | Self::Aiff | Self::WavPack | Self::Ape | Self::Alac | Self::Wma | Self::Dsd
         )
     }
 
     /// Returns the target output format for DLNA transcoding.
-    /// AIFF/ALAC -> FLAC (lossless, universally supported by DLNA renderers)
+    /// AAC/AIFF/ALAC -> FLAC (universally supported by DLNA renderers)
     /// DSD/WavPack/APE/WMA -> WAV (universal PCM, avoids re-encoding overhead)
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
-            Self::Aiff | Self::Alac => AudioFormat::Flac,
+            Self::Aac | Self::Aiff | Self::Alac => AudioFormat::Flac,
             Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
             other => *other,
         }
@@ -630,7 +626,7 @@ mod tests {
         assert!(caps.formats.contains(&AudioFormat::Flac));
         assert!(caps.formats.contains(&AudioFormat::Wav));
         assert!(caps.formats.contains(&AudioFormat::Mp3));
-        assert!(caps.formats.contains(&AudioFormat::Aac));
+        assert!(!caps.formats.contains(&AudioFormat::Aac));
         assert!(!caps.formats.contains(&AudioFormat::Ogg));
         assert_eq!(caps.max_sample_rate, 192000);
         assert_eq!(caps.max_bit_depth, 24);
