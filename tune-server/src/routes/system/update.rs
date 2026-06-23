@@ -87,10 +87,51 @@ pub(super) async fn update_check() -> Json<Value> {
 
 /// POST /system/update/install
 ///
-/// Downloads the latest release archive, extracts the binary and web/ directory,
-/// replaces the current binary, and restarts the server.
+/// Validates that an update is available, then spawns the download/extract/install
+/// cycle in the background and returns immediately.  Progress is exposed via
+/// `GET /system/update/status` (`phase` field).
 pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoResponse {
-    // 1. Check for update
+    // Prevent concurrent updates
+    {
+        let phase = state.update_phase.lock().unwrap();
+        if let Some(ref p) = *phase {
+            if !p.starts_with("failed") {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "status": "already_in_progress",
+                        "phase": p,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Guard: refuse update if .no-auto-update flag file exists
+    let working_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(ref dir) = working_dir {
+        if dir.join(".no-auto-update").exists() {
+            warn!("update_blocked_no_auto_update_flag");
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "blocked",
+                    "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Guard: refuse update if current binary has postgres but we might lose it
+    if cfg!(feature = "postgres") {
+        // This is a pre-flight warning; the actual binary check happens after download
+    }
+
+    // 1. Check for update (fast — just a GitHub API call)
     let checker = UpdateChecker::new();
     let release = match checker.check().await {
         Ok(Some(r)) => r,
@@ -98,13 +139,15 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             return (
                 StatusCode::OK,
                 Json(json!({"status": "up_to_date", "message": "Already running the latest version"})),
-            ).into_response();
+            )
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"status": "error", "message": format!("Failed to check for updates: {e}")})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -114,7 +157,8 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"status": "error", "message": "No compatible archive found for this platform"})),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -125,173 +169,148 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         "update_download_starting"
     );
 
-    // 2. Download the archive
-    let client = &state.http_client;
-    let resp = match client
-        .get(&asset.browser_download_url)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .await
+    // 2. Mark phase = downloading and spawn the background task
     {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            let status = r.status();
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"status": "error", "message": format!("Download failed: HTTP {status}")})),
-            ).into_response();
+        let mut phase = state.update_phase.lock().unwrap();
+        *phase = Some("downloading".into());
+    }
+
+    let version = release.version.clone();
+    let response_version = version.clone();
+    let http_client = state.http_client.clone();
+    let update_phase = state.update_phase.clone();
+
+    tokio::spawn(async move {
+        let set_phase = |p: &str| {
+            *update_phase.lock().unwrap() = Some(p.to_string());
+        };
+
+        // --- Download ---
+        let archive_bytes = match async {
+            let resp = http_client
+                .get(&asset.browser_download_url)
+                .timeout(std::time::Duration::from_secs(600))
+                .send()
+                .await
+                .map_err(|e| format!("Download failed: {e}"))?;
+
+            if !resp.status().is_success() {
+                return Err(format!("Download failed: HTTP {}", resp.status()));
+            }
+
+            resp.bytes()
+                .await
+                .map_err(|e| format!("Failed to read download: {e}"))
         }
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"status": "error", "message": format!("Download failed: {e}")})),
-            )
-                .into_response();
-        }
-    };
+        .await
+        {
+            Ok(b) => {
+                info!(size = b.len(), "update_downloaded");
+                b
+            }
+            Err(e) => {
+                error!(error = %e, "update_download_failed");
+                set_phase(&format!("failed: {e}"));
+                return;
+            }
+        };
 
-    let archive_bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"status": "error", "message": format!("Failed to read download: {e}")}),
-                ),
-            )
-                .into_response();
-        }
-    };
+        // --- Extract ---
+        set_phase("extracting");
 
-    info!(size = archive_bytes.len(), "update_downloaded");
-
-    // 3. Extract to a temp directory
-    let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", release.version));
-    if tmp_dir.exists() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": format!("Failed to create temp dir: {e}")})),
-        )
-            .into_response();
-    }
-
-    let is_zip = asset.name.to_lowercase().ends_with(".zip");
-    if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": format!("Extraction failed: {e}")})),
-        )
-            .into_response();
-    }
-
-    info!(dir = %tmp_dir.display(), "update_extracted");
-
-    // 4. Find the extracted binary
-    let binary_name = if cfg!(windows) {
-        "tune-server.exe"
-    } else {
-        "tune-server"
-    };
-    let new_binary = tmp_dir.join(binary_name);
-    if !new_binary.exists() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": format!("Binary '{}' not found in archive", binary_name)})),
-        ).into_response();
-    }
-
-    // 4b. Guard: refuse update if current binary has postgres but new one doesn't
-    if cfg!(feature = "postgres") {
-        let new_has_pg = std::fs::read(&new_binary)
-            .map(|bytes| {
-                let s = String::from_utf8_lossy(&bytes);
-                s.contains("postgresql://") || s.contains("PostgreSQL engine requested")
-            })
-            .unwrap_or(false);
-        if !new_has_pg {
+        let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+        if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            warn!("update_blocked_missing_postgres_feature");
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "blocked",
-                    "message": "Update blocked: current binary has PostgreSQL support but the downloaded release does not. Build with --features postgres or use a PG-enabled release."
-                })),
-            ).into_response();
         }
-    }
+        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+            set_phase(&format!("failed: Failed to create temp dir: {e}"));
+            return;
+        }
 
-    // 4c. Guard: refuse update if .no-auto-update flag file exists
-    let working_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    if let Some(ref dir) = working_dir {
-        if dir.join(".no-auto-update").exists() {
+        let is_zip = asset.name.to_lowercase().ends_with(".zip");
+        if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            warn!("update_blocked_no_auto_update_flag");
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "status": "blocked",
-                    "message": "Update blocked: .no-auto-update flag file exists. Remove it to allow updates."
-                })),
-            ).into_response();
+            set_phase(&format!("failed: Extraction failed: {e}"));
+            return;
         }
-    }
 
-    // 5. Replace binary and web/ directory
-    let current_exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
+        info!(dir = %tmp_dir.display(), "update_extracted");
+
+        // --- Install ---
+        set_phase("installing");
+
+        let binary_name = if cfg!(windows) {
+            "tune-server.exe"
+        } else {
+            "tune-server"
+        };
+        let new_binary = tmp_dir.join(binary_name);
+        if !new_binary.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"status": "error", "message": format!("Cannot determine current exe: {e}")})),
-            ).into_response();
+            set_phase(&format!(
+                "failed: Binary '{}' not found in archive",
+                binary_name
+            ));
+            return;
         }
-    };
 
-    if cfg!(windows) {
-        if let Err(e) = install_windows(&current_exe, &new_binary, &tmp_dir) {
+        // Guard: refuse update if current binary has postgres but new one doesn't
+        if cfg!(feature = "postgres") {
+            let new_has_pg = std::fs::read(&new_binary)
+                .map(|bytes| {
+                    let s = String::from_utf8_lossy(&bytes);
+                    s.contains("postgresql://") || s.contains("PostgreSQL engine requested")
+                })
+                .unwrap_or(false);
+            if !new_has_pg {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                warn!("update_blocked_missing_postgres_feature");
+                set_phase(
+                    "failed: Update blocked: current binary has PostgreSQL support but the downloaded release does not.",
+                );
+                return;
+            }
+        }
+
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                set_phase(&format!("failed: Cannot determine current exe: {e}"));
+                return;
+            }
+        };
+
+        if cfg!(windows) {
+            if let Err(e) = install_windows(&current_exe, &new_binary, &tmp_dir) {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                set_phase(&format!("failed: Windows install failed: {e}"));
+                return;
+            }
+        } else if let Err(e) = install_unix(&current_exe, &new_binary, &tmp_dir) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"status": "error", "message": format!("Windows install failed: {e}")})),
-            )
-                .into_response();
+            set_phase(&format!("failed: Install failed: {e}"));
+            return;
         }
-    } else if let Err(e) = install_unix(&current_exe, &new_binary, &tmp_dir) {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"status": "error", "message": format!("Install failed: {e}")})),
-        )
-            .into_response();
-    }
 
-    info!(
-        from = %tune_core::version(),
-        to = %release.version,
-        "update_installed"
-    );
+        info!(
+            from = %tune_core::version(),
+            to = %version,
+            "update_installed"
+        );
 
-    // 6. Schedule restart (small delay so the HTTP response reaches the client)
-    tokio::spawn(async {
+        // --- Restart ---
+        set_phase("restarting");
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         info!("update_restarting");
         std::process::exit(0);
     });
 
+    // Return immediately — client polls /system/update/status
     Json(json!({
-        "status": "installed",
-        "previous_version": tune_core::version(),
-        "new_version": release.version,
-        "message": "Update installed, server restarting...",
+        "status": "downloading",
+        "version": response_version,
     }))
     .into_response()
 }
@@ -467,20 +486,17 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 }
 
 /// GET /system/update/status
-pub(super) async fn update_status(State(_state): State<AppState>) -> Json<Value> {
-    let update_exists = std::env::temp_dir()
-        .read_dir()
-        .ok()
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().starts_with("tune-update-"))
-        })
+pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> {
+    let phase = state.update_phase.lock().unwrap().clone();
+    let is_failed = phase
+        .as_deref()
+        .map(|p| p.starts_with("failed"))
         .unwrap_or(false);
 
     Json(json!({
         "current_version": tune_core::version(),
-        "update_pending": update_exists,
+        "phase": phase,
+        "update_in_progress": phase.is_some() && !is_failed,
     }))
 }
 

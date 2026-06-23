@@ -1848,6 +1848,32 @@ impl PlaybackOrchestrator {
                     (false, Some(format!("Output device error: {e}")))
                 }
             }
+        } else if device_id.starts_with("local:") {
+            let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
+            info!(device_id, "output_not_found_recreating_local_output");
+            let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
+            {
+                let mut outputs = self.outputs.lock().await;
+                outputs.register(Box::new(local_out));
+            }
+            let outputs = self.outputs.lock().await;
+            if let Some(arc) = outputs.get(device_id) {
+                let output = arc.lock().await;
+                match output.play_media(media).await {
+                    Ok(()) => {
+                        drop(output);
+                        info!(device_id, "output_play_sent_after_recreate");
+                        (true, None)
+                    }
+                    Err(e) => {
+                        drop(output);
+                        warn!(device_id, error = %e, "output_play_failed_after_recreate");
+                        (false, Some(format!("Output device error: {e}")))
+                    }
+                }
+            } else {
+                (false, Some(format!("Device not found: {device_id}")))
+            }
         } else {
             warn!(device_id, "output_not_found");
             (

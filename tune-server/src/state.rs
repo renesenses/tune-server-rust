@@ -49,6 +49,7 @@ pub struct AppState {
     pub spotify_connect: Arc<SpotifyConnectManager>,
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
+    pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
     #[cfg(feature = "cloud-relay")]
@@ -159,6 +160,7 @@ impl AppState {
             spotify_connect,
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            update_phase: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "cloud-relay")]
