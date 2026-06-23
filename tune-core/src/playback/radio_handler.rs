@@ -68,6 +68,7 @@ impl RadioMetadataHandler {
                                 source: "radio".into(),
                                 source_id: None,
                                 stream_id: None,
+                                ..Default::default()
                             };
 
                             handler.playback.update_now_playing(zone_id, np).await;

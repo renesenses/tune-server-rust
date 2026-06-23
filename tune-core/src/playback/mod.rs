@@ -20,7 +20,7 @@ pub enum PlayState {
     Paused,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NowPlaying {
     pub track_id: Option<i64>,
     pub title: String,
@@ -31,6 +31,11 @@ pub struct NowPlaying {
     pub source: String,
     pub source_id: Option<String>,
     pub stream_id: Option<String>,
+    pub format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

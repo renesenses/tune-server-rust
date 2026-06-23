@@ -276,6 +276,7 @@ impl PositionPoller {
                     source: "local".into(),
                     source_id: None,
                     stream_id: None,
+                    ..Default::default()
                 };
                 self.playback.play(zone_id, np).await;
                 info!(zone_id, device = %device_id, "playback_recovered_from_device");
@@ -469,6 +470,7 @@ impl PositionPoller {
                                             source: "radio".into(),
                                             source_id: np.source_id.clone(),
                                             stream_id: np.stream_id.clone(),
+                                            ..Default::default()
                                         };
                                         self.playback.update_now_playing(zone_id, new_np).await;
                                         debug!(zone_id, station = %station_name, "radio_metadata_updated");

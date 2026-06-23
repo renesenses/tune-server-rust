@@ -214,6 +214,7 @@ async fn play_episode(
         source: "podcast".into(),
         source_id: Some(body.audio_url.clone()),
         stream_id: None,
+        ..Default::default()
     };
     state.playback.play(zone_id, np).await;
     let (output_sent, output_error) = if let Some(ref did) = device_id {

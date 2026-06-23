@@ -222,6 +222,11 @@ async fn restore_playback_positions(state: &AppState) {
                             .unwrap_or_else(|| "local".into()),
                         source_id: zone.last_track_source_id.clone(),
                         stream_id: None,
+                        format: track.format.clone(),
+                        sample_rate: track.sample_rate.map(|v| v as u32),
+                        bit_depth: track.bit_depth.map(|v| v as u32),
+                        genre: track.genre.clone(),
+                        year: track.year,
                     }
                 } else {
                     continue;
@@ -238,6 +243,7 @@ async fn restore_playback_positions(state: &AppState) {
                     source: "radio".into(),
                     source_id: Some(radio_url),
                     stream_id: None,
+                    ..Default::default()
                 }
             } else {
                 continue;

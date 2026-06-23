@@ -237,6 +237,12 @@ impl PlaybackOrchestrator {
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
         let album = req.album_title.clone().or(resolved.album.clone());
+        let track_meta = req.track_id.and_then(|tid| {
+            crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+                .get(tid)
+                .ok()
+                .flatten()
+        });
         let np = NowPlaying {
             track_id: req.track_id,
             title: resolved.title.clone(),
@@ -247,6 +253,18 @@ impl PlaybackOrchestrator {
             source: resolved.source.clone(),
             source_id: req.source_id.clone(),
             stream_id: resolved.stream_id.clone(),
+            format: track_meta
+                .as_ref()
+                .and_then(|t| t.format.clone())
+                .or_else(|| Some(resolved.mime_type.clone())),
+            sample_rate: resolved.sample_rate.or(track_meta
+                .as_ref()
+                .and_then(|t| t.sample_rate.map(|v| v as u32))),
+            bit_depth: resolved.bit_depth.or(track_meta
+                .as_ref()
+                .and_then(|t| t.bit_depth.map(|v| v as u32))),
+            genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
+            year: track_meta.as_ref().and_then(|t| t.year),
         };
 
         self.playback.play(req.zone_id, np).await;
@@ -2483,6 +2501,11 @@ impl PlaybackOrchestrator {
                 source: "local".into(),
                 source_id: None,
                 stream_id: None,
+                format: track.as_ref().and_then(|t| t.format.clone()),
+                sample_rate: track.as_ref().and_then(|t| t.sample_rate.map(|v| v as u32)),
+                bit_depth: track.as_ref().and_then(|t| t.bit_depth.map(|v| v as u32)),
+                genre: track.as_ref().and_then(|t| t.genre.clone()),
+                year: track.as_ref().and_then(|t| t.year),
             };
             // Use update_now_playing (not play) to avoid bumping
             // track_generation — the poller must keep its gapless_cooldown
@@ -2526,6 +2549,7 @@ impl PlaybackOrchestrator {
                 source,
                 source_id: item["source_id"].as_str().map(String::from),
                 stream_id: None,
+                ..Default::default()
             };
             // Same rationale: gapless metadata-only advance must not
             // bump track_generation — but position MUST reset to 0
@@ -2912,6 +2936,7 @@ mod tests {
             source: "local".into(),
             source_id: None,
             stream_id: None,
+            ..Default::default()
         };
         orch.playback.play(zone_id, np).await;
 
@@ -2950,6 +2975,7 @@ mod tests {
             source: "local".into(),
             source_id: None,
             stream_id: None,
+            ..Default::default()
         };
         orch.playback.play(zone_id, np).await;
 
@@ -2983,6 +3009,7 @@ mod tests {
             source: "local".into(),
             source_id: None,
             stream_id: None,
+            ..Default::default()
         };
         orch.playback.play(zone_id, np).await;
 
@@ -3053,6 +3080,7 @@ mod tests {
             source: "local".into(),
             source_id: Some("src-7".into()),
             stream_id: None,
+            ..Default::default()
         };
         orch.playback.play(zone_id, np).await;
         orch.playback.update_position(zone_id, 55_000).await;
@@ -3083,6 +3111,7 @@ mod tests {
             source: "tidal".into(),
             source_id: Some("tidal-10".into()),
             stream_id: None,
+            ..Default::default()
         };
         orch.playback.play(zone_id, np).await;
         orch.playback.update_position(zone_id, 90_000).await;
