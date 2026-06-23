@@ -497,6 +497,14 @@ pub struct LocalOutput {
     ///
     /// Cleared on every `play_url()` and `stop()` call.
     track_ended_naturally: Arc<AtomicBool>,
+    /// The play-generation that set `track_ended_naturally = true`.
+    ///
+    /// When the playback thread signals natural end-of-stream, it also
+    /// stores its own `my_generation` here.  `get_status()` only honours
+    /// the flag when the generation matches the *current*
+    /// `play_generation`, preventing a detached old thread from
+    /// contaminating the new track's status.
+    track_ended_generation: Arc<AtomicU64>,
 }
 
 impl LocalOutput {
@@ -533,6 +541,7 @@ impl LocalOutput {
             play_generation: Arc::new(AtomicU64::new(0)),
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
+            track_ended_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -952,9 +961,11 @@ impl OutputTarget for LocalOutput {
         let my_generation = self.play_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let play_generation = self.play_generation.clone();
 
-        // Clear the natural-end flag for the new track.
+        // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
+        self.track_ended_generation.store(0, Ordering::SeqCst);
         let track_ended_naturally = self.track_ended_naturally.clone();
+        let track_ended_generation = self.track_ended_generation.clone();
 
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let device_name = self.device_name.clone();
@@ -1263,6 +1274,7 @@ impl OutputTarget for LocalOutput {
                         // independently of the thread join (500ms detach path).
                         if !force_silent.load(Ordering::Relaxed) {
                             track_ended_naturally.store(true, Ordering::SeqCst);
+                            track_ended_generation.store(my_generation, Ordering::SeqCst);
                         }
                         break;
                     }
@@ -1418,6 +1430,7 @@ impl OutputTarget for LocalOutput {
                     if ring.available() == 0 {
                         if http_eof_excl && !force_silent.load(Ordering::Relaxed) {
                             track_ended_naturally.store(true, Ordering::SeqCst);
+                            track_ended_generation.store(my_generation, Ordering::SeqCst);
                         }
                         break;
                     }
@@ -1565,6 +1578,7 @@ impl OutputTarget for LocalOutput {
                     if ring.available() == 0 {
                         if http_eof_asio && !force_silent.load(Ordering::Relaxed) {
                             track_ended_naturally.store(true, Ordering::SeqCst);
+                            track_ended_generation.store(my_generation, Ordering::SeqCst);
                         }
                         break;
                     }
@@ -1710,6 +1724,8 @@ impl OutputTarget for LocalOutput {
                                 if ring.available() == 0 {
                                     if http_eof_wasapi && !force_silent.load(Ordering::Relaxed) {
                                         track_ended_naturally.store(true, Ordering::SeqCst);
+                                        track_ended_generation
+                                            .store(my_generation, Ordering::SeqCst);
                                     }
                                     break;
                                 }
@@ -2279,6 +2295,7 @@ impl OutputTarget for LocalOutput {
                     // playing=false in time for the poller to act on it.
                     if http_eof && !force_silent.load(Ordering::Relaxed) {
                         track_ended_naturally.store(true, Ordering::SeqCst);
+                        track_ended_generation.store(my_generation, Ordering::SeqCst);
                     }
                     break;
                 }
@@ -2364,9 +2381,10 @@ impl OutputTarget for LocalOutput {
         self.playing.store(false, Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
         self.duration_ms.store(0, Ordering::SeqCst);
-        // Clear the natural-end flag so stale signals from the previous track
-        // do not affect the next track's end-detection cycle.
+        // Clear the natural-end flag and generation so stale signals from
+        // the previous track do not affect the next track's end-detection cycle.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
+        self.track_ended_generation.store(0, Ordering::SeqCst);
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
         *self.track_artist.lock().unwrap() = None;
@@ -2430,6 +2448,8 @@ impl OutputTarget for LocalOutput {
         if self.track_ended_naturally.load(Ordering::Relaxed)
             && self.playing.load(Ordering::Relaxed)
             && duration_ms > 0
+            && self.track_ended_generation.load(Ordering::Relaxed)
+                == self.play_generation.load(Ordering::Relaxed)
         {
             return Ok(OutputStatus {
                 state: TransportState::Playing,

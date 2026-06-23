@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
 use tune_core::db::playlist_repo::PlaylistRepo;
@@ -902,6 +902,7 @@ async fn stop(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<V
 }
 
 async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    info!(zone_id = zone_id, "api_next_requested");
     let current = state.playback.get_state(zone_id).await;
 
     let Some(next_pos) = tune_core::poller::PositionPoller::next_position(&current) else {
@@ -921,6 +922,7 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
 }
 
 async fn previous(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+    info!(zone_id = zone_id, "api_previous_requested");
     let current = state.playback.get_state(zone_id).await;
 
     if current.position_ms > 3000 {

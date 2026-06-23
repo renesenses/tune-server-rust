@@ -775,10 +775,19 @@ impl PositionPoller {
                             let repeat_end = repeat_active && ps.peak_position_ms > 5_000;
                             let natural_end = played_enough
                                 || repeat_end
-                                || status.ended_naturally
+                                || (status.ended_naturally && wall_elapsed >= 5)
                                 || (is_short_track
                                     && ps.peak_position_ms as f64
                                         >= track_duration_ms as f64 * 0.5);
+                            if status.ended_naturally && wall_elapsed < 5 && !played_enough {
+                                warn!(
+                                    zone_id,
+                                    wall_elapsed,
+                                    peak_pos = ps.peak_position_ms,
+                                    track_dur = track_duration_ms,
+                                    "ended_naturally_rejected_too_early"
+                                );
+                            }
                             if natural_end {
                                 if ps.gapless_sent {
                                     // Gapless was prepared via SetNextAVTransportURI.
@@ -1038,6 +1047,18 @@ impl PositionPoller {
     }
 
     async fn handle_track_end(&self, zone_id: i64, zone_state: &crate::playback::ZoneState) {
+        // Diagnostic: capture now-playing info to help diagnose premature advance issues.
+        let np_title = zone_state
+            .now_playing
+            .as_ref()
+            .map(|np| np.title.as_str())
+            .unwrap_or("unknown");
+        let np_duration = zone_state
+            .now_playing
+            .as_ref()
+            .map(|np| np.duration_ms)
+            .unwrap_or(0);
+
         let device_id = self.get_zone_device_id(zone_id);
 
         let Some(next_pos) = Self::next_position(zone_state) else {
@@ -1122,7 +1143,12 @@ impl PositionPoller {
             zone_id,
             next_pos,
             repeat = ?zone_state.repeat,
+            shuffle = zone_state.shuffle,
             is_repeat,
+            title = %np_title,
+            duration_ms = np_duration,
+            queue_len = zone_state.queue_length,
+            queue_pos = zone_state.queue_position,
             "auto_next"
         );
         if let Err(e) = self.orchestrator.play_from_queue(zone_id, next_pos).await {
