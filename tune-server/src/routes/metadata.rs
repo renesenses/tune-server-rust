@@ -998,12 +998,12 @@ async fn fix_genres_by_artist(
         }
         for (album_id, title) in missing {
             state
-                .db
+                .backend
                 .execute(
                     "UPDATE albums SET genre = ? WHERE id = ?",
                     &[
-                        &top_genre as &dyn rusqlite::types::ToSql,
-                        album_id as &dyn rusqlite::types::ToSql,
+                        &top_genre as &dyn tune_core::db::backend::ToSqlValue,
+                        album_id as &dyn tune_core::db::backend::ToSqlValue,
                     ],
                 )
                 .ok();
@@ -1122,12 +1122,12 @@ async fn fix_genres_by_artist_fuzzy(
         }
         for (album_id, title, original_artist) in missing {
             state
-                .db
+                .backend
                 .execute(
                     "UPDATE albums SET genre = ? WHERE id = ?",
                     &[
-                        &top_genre as &dyn rusqlite::types::ToSql,
-                        album_id as &dyn rusqlite::types::ToSql,
+                        &top_genre as &dyn tune_core::db::backend::ToSqlValue,
+                        album_id as &dyn tune_core::db::backend::ToSqlValue,
                     ],
                 )
                 .ok();
@@ -1283,12 +1283,12 @@ async fn fix_genres_by_family(
 
         for (album_id, title, original_artist) in missing {
             state
-                .db
+                .backend
                 .execute(
                     "UPDATE albums SET genre = ? WHERE id = ?",
                     &[
-                        &target_genre as &dyn rusqlite::types::ToSql,
-                        album_id as &dyn rusqlite::types::ToSql,
+                        &target_genre as &dyn tune_core::db::backend::ToSqlValue,
+                        album_id as &dyn tune_core::db::backend::ToSqlValue,
                     ],
                 )
                 .ok();
@@ -1528,12 +1528,12 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
 
         if let Some(ref g) = genre {
             state
-                .db
+                .backend
                 .execute(
                     "UPDATE albums SET genre = ? WHERE id = ?",
                     &[
-                        g as &dyn rusqlite::types::ToSql,
-                        album_id as &dyn rusqlite::types::ToSql,
+                        g as &dyn tune_core::db::backend::ToSqlValue,
+                        album_id as &dyn tune_core::db::backend::ToSqlValue,
                     ],
                 )
                 .ok();
@@ -1600,10 +1600,10 @@ async fn fetch_album_cover(
                         .await;
                 if let Some(ref discovered_mbid) = found {
                     state
-                        .db
+                        .backend
                         .execute(
                             "UPDATE albums SET musicbrainz_release_id = ? WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
-                            &[discovered_mbid as &dyn rusqlite::types::ToSql, &id],
+                            &[discovered_mbid as &dyn tune_core::db::backend::ToSqlValue, &id as &dyn tune_core::db::backend::ToSqlValue],
                         )
                         .ok();
                     tracing::info!(
@@ -1769,28 +1769,28 @@ async fn merge_albums(
             continue;
         }
         let moved = state
-            .db
+            .backend
             .execute(
                 "UPDATE tracks SET album_id = ? WHERE album_id = ?",
                 &[
-                    &best_id as &dyn rusqlite::types::ToSql,
-                    &aid as &dyn rusqlite::types::ToSql,
+                    &best_id as &dyn tune_core::db::backend::ToSqlValue,
+                    &aid as &dyn tune_core::db::backend::ToSqlValue,
                 ],
             )
             .unwrap_or(0) as i64;
         tracks_moved += moved;
         state
-            .db
+            .backend
             .execute(
                 "DELETE FROM albums WHERE id = ?",
-                &[&aid as &dyn rusqlite::types::ToSql],
+                &[&aid as &dyn tune_core::db::backend::ToSqlValue],
             )
             .ok();
         merged_ids.push(aid);
     }
 
     state
-        .db
+        .backend
         .execute_batch(
             "UPDATE albums SET track_count = (SELECT COUNT(t.id) FROM tracks t WHERE t.album_id = albums.id)",
         )

@@ -183,6 +183,35 @@ pub fn spawn_auto_resume_listener(state: &AppState) {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(RECONNECT_DEADLINE_SECS);
 
+        // Check devices that already reconnected before we subscribed.
+        // SSDP/mDNS discovery may have emitted `device.reconnected` events
+        // during boot before this listener was registered, so we do an
+        // immediate pass over the output registry.
+        {
+            let outputs = state.outputs.lock().await;
+            let already_online: Vec<String> = pending
+                .keys()
+                .filter(|id| outputs.contains(id))
+                .cloned()
+                .collect();
+            drop(outputs);
+            for device_id in already_online {
+                if let Some(zone_id) = pending.remove(&device_id) {
+                    info!(
+                        zone_id,
+                        device_id = %device_id,
+                        "auto_resume_device_already_online_attempting"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    try_auto_resume_zone(&state, zone_id).await;
+                }
+            }
+        }
+        if pending.is_empty() {
+            info!("auto_resume_all_zones_resumed_on_initial_check");
+            return;
+        }
+
         loop {
             if pending.is_empty() {
                 info!("auto_resume_listener_all_zones_resumed");
