@@ -16,7 +16,7 @@ use crate::metadata::{TrackMetadata, try_read_metadata};
 /// Maximum time allowed for reading metadata + computing hash for a single file.
 /// Files on NAS over a flaky network can hang indefinitely; this prevents the
 /// entire scan from stalling on a single corrupt or unreachable file.
-const FILE_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
