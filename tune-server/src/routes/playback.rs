@@ -657,6 +657,21 @@ async fn play(
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             };
         }
+        // No now_playing — try queue fallback (same as empty-body path)
+        let qr_fallback = PlayQueueRepo::with_backend(state.backend.clone());
+        let local_c = qr_fallback.count(zone_id).unwrap_or(0);
+        let stream_c = qr_fallback.count_streaming(zone_id).unwrap_or(0);
+        let q_len = if local_c > 0 { local_c } else { stream_c };
+        if q_len > 0 {
+            let current = state.playback.get_state(zone_id).await;
+            let pos = current.queue_position.min(q_len - 1);
+            state.playback.update_queue_info(zone_id, pos, q_len).await;
+            if let Ok(result) = state.orchestrator.play_from_queue(zone_id, pos).await {
+                persist_queue_async(&state, zone_id);
+                return Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                    .into_response();
+            }
+        }
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
 
@@ -974,6 +989,10 @@ async fn set_volume(
         .orchestrator
         .set_volume(zone_id, body.volume, device_id.as_deref())
         .await;
+    let vol_int = (body.volume * 100.0).round() as i32;
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .update_volume(zone_id, vol_int)
+        .ok();
     Json(json!({ "volume": body.volume }))
 }
 

@@ -93,9 +93,9 @@ impl AsioExclusiveOutput {
                 .ok_or_else(|| "No default ASIO output device found".to_string())?
         } else {
             let mut found = None;
+            let mut available_names = Vec::new();
             let search = device_name.to_lowercase();
             if let Ok(devices) = host.output_devices() {
-                let mut available_names = Vec::new();
                 for dev in devices {
                     if let Ok(desc) = dev.description() {
                         let name = desc.name().to_string();

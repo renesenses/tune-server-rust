@@ -698,6 +698,11 @@ async fn playback_manager_state_transitions() {
         source: "local".into(),
         source_id: None,
         stream_id: Some("stream-001".into()),
+        format: None,
+        sample_rate: None,
+        bit_depth: None,
+        genre: None,
+        year: None,
     };
     state.playback.play(zone_id, np).await;
     let zs = state.playback.get_state(zone_id).await;
@@ -716,6 +721,11 @@ async fn playback_manager_state_transitions() {
         source: "local".into(),
         source_id: None,
         stream_id: None,
+        format: None,
+        sample_rate: None,
+        bit_depth: None,
+        genre: None,
+        year: None,
     };
     state.playback.play(zone_id, np2).await;
     let zs = state.playback.get_state(zone_id).await;
