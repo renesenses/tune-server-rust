@@ -1255,6 +1255,14 @@ impl OutputTarget for LocalOutput {
                 let duration = (total_frames as f64 / dec_sr as f64 * 1000.0) as u64;
                 position_ms.store(duration, Ordering::Relaxed);
 
+                // Signal natural track end BEFORE draining so the
+                // orchestrator can detect end-of-track even if a new play
+                // command sets force_silent while the ring buffer is still
+                // being consumed (e.g. resampling 44.1→192 kHz).
+                // play_url() clears this flag for the next track.
+                track_ended_naturally.store(true, Ordering::SeqCst);
+                track_ended_generation.store(my_generation, Ordering::SeqCst);
+
                 // Wait for ring buffer to drain
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -1264,13 +1272,6 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
-                        // Ring fully drained — signal natural track end before
-                        // thread exits so the orchestrator can advance the queue
-                        // independently of the thread join (500ms detach path).
-                        if !force_silent.load(Ordering::Relaxed) {
-                            track_ended_naturally.store(true, Ordering::SeqCst);
-                            track_ended_generation.store(my_generation, Ordering::SeqCst);
-                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1414,6 +1415,14 @@ impl OutputTarget for LocalOutput {
                     position_ms.store(pos, Ordering::Relaxed);
                 }
 
+                // Signal natural track end BEFORE draining when the HTTP
+                // stream reached EOF, so the orchestrator can detect
+                // end-of-track even if force_silent is set during slow drain.
+                if http_eof_excl {
+                    track_ended_naturally.store(true, Ordering::SeqCst);
+                    track_ended_generation.store(my_generation, Ordering::SeqCst);
+                }
+
                 // Wait for ring buffer to drain
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -1423,10 +1432,6 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
-                        if http_eof_excl && !force_silent.load(Ordering::Relaxed) {
-                            track_ended_naturally.store(true, Ordering::SeqCst);
-                            track_ended_generation.store(my_generation, Ordering::SeqCst);
-                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1562,6 +1567,14 @@ impl OutputTarget for LocalOutput {
                     position_ms.store(pos, Ordering::Relaxed);
                 }
 
+                // Signal natural track end BEFORE draining when the HTTP
+                // stream reached EOF, so the orchestrator can detect
+                // end-of-track even if force_silent is set during slow drain.
+                if http_eof_asio {
+                    track_ended_naturally.store(true, Ordering::SeqCst);
+                    track_ended_generation.store(my_generation, Ordering::SeqCst);
+                }
+
                 // Wait for ring buffer to drain
                 loop {
                     if stop_rx.try_recv().is_ok() {
@@ -1571,10 +1584,6 @@ impl OutputTarget for LocalOutput {
                         break;
                     }
                     if ring.available() == 0 {
-                        if http_eof_asio && !force_silent.load(Ordering::Relaxed) {
-                            track_ended_naturally.store(true, Ordering::SeqCst);
-                            track_ended_generation.store(my_generation, Ordering::SeqCst);
-                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1708,6 +1717,15 @@ impl OutputTarget for LocalOutput {
                                 }
                             }
 
+                            // Signal natural track end BEFORE draining when
+                            // the HTTP stream reached EOF, so the orchestrator
+                            // can detect end-of-track even if force_silent is
+                            // set during slow drain (e.g. 44.1→192 kHz resample).
+                            if http_eof_wasapi {
+                                track_ended_naturally.store(true, Ordering::SeqCst);
+                                track_ended_generation.store(my_generation, Ordering::SeqCst);
+                            }
+
                             // Wait for ring buffer to drain
                             loop {
                                 if stop_rx.try_recv().is_ok() {
@@ -1717,11 +1735,6 @@ impl OutputTarget for LocalOutput {
                                     break;
                                 }
                                 if ring.available() == 0 {
-                                    if http_eof_wasapi && !force_silent.load(Ordering::Relaxed) {
-                                        track_ended_naturally.store(true, Ordering::SeqCst);
-                                        track_ended_generation
-                                            .store(my_generation, Ordering::SeqCst);
-                                    }
                                     break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2271,6 +2284,27 @@ impl OutputTarget for LocalOutput {
             // Signal that HTTP reading is done
             finished_flag.store(true, Ordering::SeqCst);
 
+            // Signal natural track end BEFORE draining when the HTTP stream
+            // reached EOF.  This is critical when resampling causes slow
+            // ring-buffer consumption (e.g. 44.1→192 kHz, ×4.35 expansion):
+            // the HTTP stream finishes sending all data, but the ring drains
+            // slowly.  If a new play command (next track or poller timeout)
+            // sets force_silent during the drain, the old code would exit
+            // without setting track_ended_naturally, causing the poller to
+            // never detect end-of-track and never advance the queue.
+            // Setting the flag here ensures the orchestrator sees it
+            // immediately.  play_url() clears the flag for the next track.
+            if http_eof {
+                track_ended_naturally.store(true, Ordering::SeqCst);
+                track_ended_generation.store(my_generation, Ordering::SeqCst);
+                debug!(
+                    ring_available = ring.available(),
+                    total_bytes_read,
+                    total_frames_fed,
+                    "local_audio_track_ended_naturally_pre_drain"
+                );
+            }
+
             // Wait for ring buffer to drain or stop signal
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -2280,18 +2314,6 @@ impl OutputTarget for LocalOutput {
                     break;
                 }
                 if ring.available() == 0 {
-                    // Ring fully drained — if the HTTP stream also ended
-                    // naturally (http_eof=true, not a stop/error), signal
-                    // track_ended_naturally so the orchestrator can detect
-                    // end-of-track via get_status() independently of the
-                    // thread join.  This is critical on WASAPI where
-                    // drop(stream) can block longer than the 500ms detach
-                    // window, preventing the old thread from setting
-                    // playing=false in time for the poller to act on it.
-                    if http_eof && !force_silent.load(Ordering::Relaxed) {
-                        track_ended_naturally.store(true, Ordering::SeqCst);
-                        track_ended_generation.store(my_generation, Ordering::SeqCst);
-                    }
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
