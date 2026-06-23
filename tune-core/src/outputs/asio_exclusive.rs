@@ -118,22 +118,10 @@ impl AsioExclusiveOutput {
             match found {
                 Some(dev) => dev,
                 None => {
-                    // Fall back to default ASIO device
-                    let default = host.default_output_device().ok_or_else(|| {
-                        format!(
-                            "ASIO device not found: {device_name} (and no default device available)"
-                        )
-                    })?;
-                    let default_name = default
-                        .description()
-                        .map(|d| d.name().to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    warn!(
-                        requested = %device_name,
-                        fallback = %default_name,
-                        "asio_exclusive_device_not_found_falling_back_to_default"
-                    );
-                    default
+                    return Err(format!(
+                        "ASIO device not found: {device_name}. Available: {:?}",
+                        available_names
+                    ));
                 }
             }
         };

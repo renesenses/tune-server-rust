@@ -1447,7 +1447,7 @@ impl OutputTarget for LocalOutput {
 
             // ------- Exclusive mode path (Windows ASIO) -------
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            if exclusive_mode {
+            if exclusive_mode && audio_backend == "asio" {
                 use super::asio_exclusive::AsioExclusiveOutput;
 
                 info!(
