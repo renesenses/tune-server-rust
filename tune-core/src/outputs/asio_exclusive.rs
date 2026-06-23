@@ -88,12 +88,12 @@ impl AsioExclusiveOutput {
         );
 
         // -- 2. Resolve device ---------------------------------------------
+        let mut available_names: Vec<String> = Vec::new();
         let device = if device_name == "default" {
             host.default_output_device()
                 .ok_or_else(|| "No default ASIO output device found".to_string())?
         } else {
             let mut found = None;
-            let mut available_names = Vec::new();
             let search = device_name.to_lowercase();
             if let Ok(devices) = host.output_devices() {
                 for dev in devices {
