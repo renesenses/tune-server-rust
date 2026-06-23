@@ -330,7 +330,6 @@ impl PlaybackOrchestrator {
                     .flatten();
                 let db_volume = zone_db.as_ref().map(|z| z.volume).unwrap_or(50);
                 let is_fixed = zone_db.as_ref().is_some_and(|z| z.fixed_volume);
-                let is_default_volume = db_volume == 50;
                 let zone_volume = if is_fixed {
                     1.0
                 } else {
@@ -931,6 +930,8 @@ impl PlaybackOrchestrator {
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
+                let streamer_sessions = self.streamer.sessions_state();
+                let close_session_id = session_id.clone();
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
@@ -985,6 +986,13 @@ impl PlaybackOrchestrator {
                         Err(e) => {
                             warn!(error = %e, file = %fp, "transcode_streaming_task_panic");
                         }
+                    }
+
+                    // Close the session's sender so the HTTP stream gets EOF
+                    // and the local output detects end-of-track.
+                    let sessions = streamer_sessions.lock().await;
+                    if let Some(session) = sessions.get(&close_session_id) {
+                        session.close_sender().await;
                     }
                 });
 

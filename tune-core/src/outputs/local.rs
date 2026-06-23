@@ -912,13 +912,15 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
-        // Store the known track duration so get_status() can report it
-        // and the poller can detect near-end-of-track for gapless/advance.
+        let result = self
+            .play_url(media.url, media.mime_type, media.title, media.artist)
+            .await;
+        // Store duration AFTER play_url() because play_url() calls stop()
+        // which resets duration_ms to 0.
         if let Some(dur) = media.duration_ms {
             self.duration_ms.store(dur, Ordering::SeqCst);
         }
-        self.play_url(media.url, media.mime_type, media.title, media.artist)
-            .await
+        result
     }
 
     async fn play_url(

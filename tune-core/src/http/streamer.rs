@@ -38,7 +38,7 @@ impl StreamInfo {
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
-    pub tx: mpsc::Sender<Vec<u8>>,
+    pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     pub file_path: Mutex<Option<String>>,
     pub proxy_url: Mutex<Option<String>>,
@@ -60,7 +60,7 @@ impl StreamSession {
         Self {
             id,
             info,
-            tx,
+            tx: Mutex::new(Some(tx)),
             rx: Mutex::new(rx),
             file_path: Mutex::new(None),
             proxy_url: Mutex::new(None),
@@ -79,6 +79,10 @@ impl StreamSession {
 
     pub async fn recv_chunk(&self) -> Option<Vec<u8>> {
         self.rx.lock().await.recv().await
+    }
+
+    pub async fn close_sender(&self) {
+        self.tx.lock().await.take();
     }
 }
 
@@ -110,7 +114,12 @@ impl AudioStreamer {
     ) {
         let id = uuid::Uuid::new_v4().to_string();
         let session = StreamSession::new(id.clone(), info, bit_perfect, buffer_size);
-        let tx = session.tx.clone();
+        let tx = session
+            .tx
+            .lock()
+            .await
+            .clone()
+            .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
         self.sessions
             .lock()
@@ -173,7 +182,12 @@ impl AudioStreamer {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, buffer_size);
         session.is_radio = true;
-        let tx = session.tx.clone();
+        let tx = session
+            .tx
+            .lock()
+            .await
+            .clone()
+            .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
         self.sessions
             .lock()
