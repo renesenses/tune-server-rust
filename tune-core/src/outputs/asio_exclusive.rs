@@ -73,22 +73,7 @@ impl AsioExclusiveOutput {
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        // -- 0. Initialize COM for this thread (required for ASIO SDK) ------
-        // tokio::task::spawn_blocking worker threads don't have COM initialized.
-        // Without this, cpal::host_from_id(Asio) fails to enumerate drivers
-        // because the ASIO SDK uses COM internally.
-        // ASIO drivers are old-school COM objects that require STA (Single-Threaded
-        // Apartment) mode — MTA causes registry reads and driver instantiation to fail.
-        #[cfg(target_os = "windows")]
-        {
-            unsafe extern "system" {
-                fn CoInitializeEx(pvreserved: *const std::ffi::c_void, dwcoinit: u32) -> i32;
-            }
-            const COINIT_APARTMENTTHREADED: u32 = 0x2;
-            unsafe {
-                CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED);
-            }
-        }
+        ensure_com_initialized();
 
         // -- 1. Get the ASIO host -------------------------------------------
         let host = cpal::host_from_id(cpal::HostId::Asio)
@@ -445,12 +430,38 @@ impl Drop for AsioExclusiveOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: COM initialization for ASIO (Windows only)
+// ---------------------------------------------------------------------------
+
+/// Initialize COM in STA mode on the current thread.
+/// ASIO drivers are COM objects that require Single-Threaded Apartment mode.
+/// Must be called before any cpal ASIO host/device operations.
+#[cfg(target_os = "windows")]
+pub(crate) fn ensure_com_initialized() {
+    unsafe extern "system" {
+        fn CoInitializeEx(pvreserved: *const std::ffi::c_void, dwcoinit: u32) -> i32;
+    }
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const S_OK: i32 = 0;
+    const S_FALSE: i32 = 1;
+    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED) };
+    match hr {
+        S_OK => debug!("com_sta_initialized"),
+        S_FALSE => debug!("com_sta_already_initialized"),
+        _ => warn!(hresult = hr, "com_init_failed_or_changed_mode"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn ensure_com_initialized() {}
+
+// ---------------------------------------------------------------------------
 // Helper: check exclusive mode support at runtime
 // ---------------------------------------------------------------------------
 
 /// Returns `true` on Windows with ASIO support (where ASIO exclusive mode is available).
 pub fn supports_exclusive_mode() -> bool {
-    // Runtime check: can we actually load the ASIO host?
+    ensure_com_initialized();
     cpal::host_from_id(cpal::HostId::Asio).is_ok()
 }
 

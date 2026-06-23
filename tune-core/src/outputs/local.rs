@@ -27,14 +27,8 @@ pub fn select_host(backend: &str) -> cpal::Host {
 
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
-        // ASIO SDK requires COM to be initialized on the calling thread
-        #[cfg(target_os = "windows")]
-        unsafe {
-            unsafe extern "system" {
-                fn CoInitializeEx(pv: *const std::ffi::c_void, dw: u32) -> i32;
-            }
-            CoInitializeEx(std::ptr::null(), 0x2); // COINIT_APARTMENTTHREADED (STA required by ASIO drivers)
-        }
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        super::asio_exclusive::ensure_com_initialized();
         match backend_lower.as_str() {
             "asio" => match cpal::host_from_id(cpal::HostId::Asio) {
                 Ok(host) => {
@@ -137,6 +131,7 @@ pub fn asio_available() -> bool {
 pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
+        super::asio_exclusive::ensure_com_initialized();
         let host = match cpal::host_from_id(cpal::HostId::Asio) {
             Ok(h) => h,
             Err(e) => {
