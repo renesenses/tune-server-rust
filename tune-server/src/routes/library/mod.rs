@@ -11,6 +11,7 @@ mod ratings;
 mod search;
 mod stats;
 mod tracks;
+mod write_tags;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -248,6 +249,8 @@ pub fn router() -> Router<AppState> {
         .route("/ratings/import", post(ratings::import_ratings))
         .route("/enrich-all", post(enrich::enrich_all_library))
         .route("/enrich-all/status", get(enrich::enrich_all_status))
+        .route("/write-tags", post(write_tags::write_tags_to_files))
+        .route("/write-tags/status", get(write_tags::write_tags_status))
         .route("/artwork/rescan", post(artwork::rescan_all_artwork))
         .route("/rescan-metadata", post(tracks::rescan_metadata))
         .route(

@@ -1281,6 +1281,7 @@ mod tests {
             past_end_ticks: 0,
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1325,6 +1326,7 @@ mod tests {
             past_end_ticks: 0,
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
         };
 
         // Simulates entering Playing state
@@ -1421,6 +1423,7 @@ mod tests {
             past_end_ticks: 0,
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -1563,6 +1566,7 @@ mod tests {
             past_end_ticks: 0,
             gapless_advance_pending: true, // metadata was advanced
             gapless_stuck_ticks: 0,
+            last_bytes_sent: 0,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -1614,6 +1618,7 @@ mod tests {
             past_end_ticks: 0,
             gapless_advance_pending: true,
             gapless_stuck_ticks: 3,
+            last_bytes_sent: 0,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)

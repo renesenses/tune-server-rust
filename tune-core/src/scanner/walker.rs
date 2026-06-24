@@ -130,6 +130,12 @@ pub struct ListAudioResult {
     pub missing_dirs: Vec<String>,
 }
 
+impl ListAudioResult {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.missing_dirs.is_empty()
+    }
+}
+
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
