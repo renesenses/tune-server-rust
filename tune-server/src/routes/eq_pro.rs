@@ -127,6 +127,14 @@ async fn create_preset(
     State(state): State<AppState>,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let mut presets = load_presets(&state);
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -166,6 +174,14 @@ async fn update_preset(
     Path(id): Path<String>,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let mut presets = load_presets(&state);
     let idx = presets.iter().position(|p| p["id"].as_str() == Some(&id));
 
@@ -197,6 +213,14 @@ async fn delete_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let mut presets = load_presets(&state);
     let before = presets.len();
     presets.retain(|p| p["id"].as_str() != Some(&id));
@@ -224,6 +248,14 @@ async fn activate_preset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return resp;
+    }
+
     let presets = load_presets(&state);
     let preset = presets.iter().find(|p| p["id"].as_str() == Some(&id));
 
@@ -279,7 +311,15 @@ struct SetBandsBody {
 async fn set_bands(
     State(state): State<AppState>,
     Json(body): Json<SetBandsBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let bands_json: Vec<Value> = body.bands.iter().map(|b| b.to_json()).collect();
 
@@ -303,7 +343,8 @@ async fn set_bands(
         "bands": bands_json,
         "count": bands_json.len(),
         "applied": true,
-    })))
+    }))
+    .into_response())
 }
 
 // --- Advanced EQ routes ---
@@ -335,7 +376,15 @@ struct ParametricBody {
 async fn set_parametric(
     State(state): State<AppState>,
     Json(body): Json<ParametricBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut current: Value = settings
         .get("eq_parametric")
@@ -357,7 +406,7 @@ async fn set_parametric(
     settings
         .set("eq_parametric", &serde_json::to_string(&current)?)
         .ok();
-    Ok(Json(json!({"saved": true, "parametric": current})))
+    Ok(Json(json!({"saved": true, "parametric": current})).into_response())
 }
 
 /// Get graphic EQ state (fixed frequency bands).
@@ -400,7 +449,15 @@ struct GraphicBody {
 async fn set_graphic(
     State(state): State<AppState>,
     Json(body): Json<GraphicBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let mut current: Value = settings
         .get("eq_graphic")
@@ -422,7 +479,7 @@ async fn set_graphic(
     settings
         .set("eq_graphic", &serde_json::to_string(&current)?)
         .ok();
-    Ok(Json(json!({"saved": true, "graphic": current})))
+    Ok(Json(json!({"saved": true, "graphic": current})).into_response())
 }
 
 #[derive(Deserialize)]
@@ -438,6 +495,14 @@ async fn apply_room_correction(
     State(state): State<AppState>,
     Json(body): Json<RoomCorrectionBody>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(resp);
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     let correction = json!({

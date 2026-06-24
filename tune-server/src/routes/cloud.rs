@@ -654,7 +654,17 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn bridge_enable(State(state): State<AppState>) -> Json<Value> {
+async fn bridge_enable(State(state): State<AppState>) -> impl IntoResponse {
+    // Premium gate: Cloud Relay requires Premium
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::CloudRelay,
+    )
+    .await
+    {
+        return resp;
+    }
+
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let _ = settings.set("bridge_enabled", "true");
 
@@ -677,6 +687,7 @@ async fn bridge_enable(State(state): State<AppState>) -> Json<Value> {
         "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
         "note": "restart server to activate the relay connection"
     }))
+    .into_response()
 }
 
 async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {

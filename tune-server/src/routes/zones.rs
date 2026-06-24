@@ -135,6 +135,14 @@ async fn set_zone_dsp(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // Premium gate: DSP & EQ mutations require Premium
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return resp;
+    }
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     // Handle eq_profile if present
@@ -688,6 +696,30 @@ async fn create_zone(
     State(state): State<AppState>,
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
+    // Premium gate: Free tier is limited to 3 zones (existing zones are grandfathered)
+    let zone_count = ZoneRepo::with_backend(state.backend.clone())
+        .count()
+        .unwrap_or(0);
+    if !state.license.check_zone_limit(zone_count).await {
+        info!(
+            zone_count,
+            limit = tune_core::license::LicenseManager::free_zone_limit(),
+            "zone_creation_blocked_free_tier"
+        );
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(json!({
+                "error": "premium_required",
+                "feature": "Unlimited Zones",
+                "message": "Free tier is limited to 3 zones. Upgrade to Tune Premium for unlimited zones.",
+                "current_zones": zone_count,
+                "zone_limit": tune_core::license::LicenseManager::free_zone_limit(),
+                "upgrade_url": "https://mozaiklabs.fr/pricing"
+            })),
+        )
+            .into_response();
+    }
+
     let output_type = body.output_type.as_deref();
     let output_device_id = body.output_device_id.as_deref();
 
@@ -969,6 +1001,16 @@ async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroup>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Premium gate: Multiroom sync requires Premium
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::MultiroomSync,
+    )
+    .await
+    {
+        return Ok(resp);
+    }
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let mut groups: Vec<Value> = settings
         .get("zone_groups")

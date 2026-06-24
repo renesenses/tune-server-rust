@@ -31,6 +31,7 @@ pub fn spawn_ssdp_handler(
     let event_bus = state.event_bus.clone();
     let media_servers = state.media_servers.clone();
     let playback = state.playback.clone();
+    let license = state.license.clone();
     tokio::spawn(async move {
         use tune_core::discovery::ssdp::SsdpEvent;
         while let Some(event) = ssdp_rx.recv().await {
@@ -44,6 +45,7 @@ pub fn spawn_ssdp_handler(
                         &event_bus,
                         &oh_listener,
                         &playback,
+                        &license,
                     )
                     .await;
                 }
@@ -72,6 +74,7 @@ async fn handle_ssdp_discovered(
     event_bus: &Arc<tune_core::event_bus::EventBus>,
     oh_listener: &Option<Arc<OpenHomeEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
+    license: &Arc<tune_core::license::LicenseManager>,
 ) {
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
         || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
@@ -166,6 +169,17 @@ async fn handle_ssdp_discovered(
             }),
         );
     } else if !is_tv {
+        // Premium gate: check zone limit before auto-creating
+        let zone_count = zone_repo.count().unwrap_or(0);
+        if !license.check_zone_limit(zone_count).await {
+            info!(
+                name = %dev.name,
+                zone_count,
+                "ssdp_zone_creation_blocked_free_tier_limit"
+            );
+            return;
+        }
+
         let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
         let existing = zone_repo.list().unwrap_or_default();
         let name_taken = existing.iter().any(|z| z.name == short_name);
@@ -225,6 +239,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let playback = state.playback.clone();
+    let license = state.license.clone();
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -283,6 +298,17 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         }
                         #[cfg(feature = "oaat")]
                         OutputType::Oaat => {
+                            // Premium gate: OAAT Protocol requires Premium
+                            if !license
+                                .check_feature(tune_core::license::Feature::OaatProtocol)
+                                .await
+                            {
+                                info!(
+                                    name = %dev.name,
+                                    "oaat_zone_blocked_premium_required"
+                                );
+                                continue;
+                            }
                             let oaat = tune_core::outputs::oaat::OaatOutput::new(
                                 dev.name.clone(),
                                 dev.host.clone(),
@@ -408,20 +434,31 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     let _ = zone_repo.set_online_by_device(&dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                                 } else {
-                                    match zone_repo.get_or_create(
-                                        &dev.name,
-                                        Some(output_type_str),
-                                        &dev.id,
-                                    ) {
-                                        Ok((zid, true)) => {
-                                            info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
-                                        }
-                                        Ok((zid, false)) => {
-                                            let _ = zone_repo.set_online_by_device(&dev.id, true);
-                                            info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                    // Premium gate: check zone limit before auto-creating
+                                    let zone_count = zone_repo.count().unwrap_or(0);
+                                    if !license.check_zone_limit(zone_count).await {
+                                        info!(
+                                            name = %dev.name,
+                                            zone_count,
+                                            "mdns_zone_creation_blocked_free_tier_limit"
+                                        );
+                                    } else {
+                                        match zone_repo.get_or_create(
+                                            &dev.name,
+                                            Some(output_type_str),
+                                            &dev.id,
+                                        ) {
+                                            Ok((zid, true)) => {
+                                                info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                            }
+                                            Ok((zid, false)) => {
+                                                let _ =
+                                                    zone_repo.set_online_by_device(&dev.id, true);
+                                                info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                            }
                                         }
                                     }
                                 }

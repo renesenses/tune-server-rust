@@ -7,6 +7,7 @@ pub mod background;
 pub mod config;
 pub mod discovery_setup;
 pub mod error;
+pub mod premium_guard;
 pub mod routes;
 pub mod startup;
 pub mod state;

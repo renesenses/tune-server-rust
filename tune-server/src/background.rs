@@ -30,11 +30,21 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
     #[cfg(feature = "cloud-relay")]
-    spawn_relay_client(state);
+    spawn_relay_client(state).await;
 }
 
 #[cfg(feature = "cloud-relay")]
-fn spawn_relay_client(state: &AppState) {
+async fn spawn_relay_client(state: &AppState) {
+    // Premium gate: Cloud Relay requires Premium
+    if !state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await
+    {
+        info!("cloud_relay_requires_premium");
+        return;
+    }
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     if let Some(_client) = tune_core::cloud::relay::spawn_relay_client(&settings, state.port) {
         info!("cloud relay client spawned");
@@ -95,6 +105,21 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
 
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             for d in &devices {
+                // Premium gate: check zone limit before auto-creating new zones.
+                // get_or_create returns (id, false) for existing zones, so we only
+                // need to check when the zone doesn't already exist.
+                if zone_repo.get_by_device_id(&d.id).ok().flatten().is_none() {
+                    let zone_count = zone_repo.count().unwrap_or(0);
+                    if !state.license.check_zone_limit(zone_count).await {
+                        info!(
+                            name = %d.name,
+                            zone_count,
+                            "ssdp_startup_zone_creation_blocked_free_tier_limit"
+                        );
+                        continue;
+                    }
+                }
+
                 match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                     Ok((zid, true)) => {
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
