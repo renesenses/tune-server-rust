@@ -108,7 +108,7 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("amazon_music_enabled", json!(false)),
         ("discovery_enabled", json!(true)),
         ("squeezebox_enabled", json!(false)),
-        ("db_engine", json!("sqlite")),
+        ("db_engine", json!(state.backend.engine().as_str())),
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
         ("enrich_on_scan", json!(false)),

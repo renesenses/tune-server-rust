@@ -30,13 +30,22 @@ pub fn spawn_ssdp_handler(
     let config = config.clone();
     let event_bus = state.event_bus.clone();
     let media_servers = state.media_servers.clone();
+    let playback = state.playback.clone();
     tokio::spawn(async move {
         use tune_core::discovery::ssdp::SsdpEvent;
         while let Some(event) = ssdp_rx.recv().await {
             match event {
                 SsdpEvent::DeviceDiscovered(dev) => {
-                    handle_ssdp_discovered(&dev, &outputs, &db, &config, &event_bus, &oh_listener)
-                        .await;
+                    handle_ssdp_discovered(
+                        &dev,
+                        &outputs,
+                        &db,
+                        &config,
+                        &event_bus,
+                        &oh_listener,
+                        &playback,
+                    )
+                    .await;
                 }
                 SsdpEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
@@ -62,6 +71,7 @@ async fn handle_ssdp_discovered(
     config: &TuneConfig,
     event_bus: &Arc<tune_core::event_bus::EventBus>,
     oh_listener: &Option<Arc<OpenHomeEventListener>>,
+    playback: &Arc<tune_core::playback::PlaybackManager>,
 ) {
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
         || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
@@ -140,8 +150,12 @@ async fn handle_ssdp_discovered(
     let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
 
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
-    if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
+    if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
         let _ = zone_repo.set_online_by_device(&dev.id, true);
+        if let Some(zone_id) = zone.id {
+            let vol = zone.volume as f64 / 100.0;
+            playback.set_volume(zone_id, vol).await;
+        }
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
         event_bus.emit(
             "device.reconnected",
@@ -210,6 +224,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
     let outputs = state.outputs.clone();
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
+    let playback = state.playback.clone();
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -314,8 +329,12 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
 
                         let zone_repo =
                             tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
-                        if let Ok(Some(_)) = zone_repo.get_by_device_id(&dev.id) {
+                        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             let _ = zone_repo.set_online_by_device(&dev.id, true);
+                            if let Some(zone_id) = zone.id {
+                                let vol = zone.volume as f64 / 100.0;
+                                playback.set_volume(zone_id, vol).await;
+                            }
                             info!(name = %dev.name, id = %dev.id, "mdns_zone_reconnected");
                             event_bus.emit(
                                 "device.reconnected",
