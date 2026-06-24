@@ -2821,6 +2821,10 @@ impl PlaybackOrchestrator {
         self.streamer.wait_data_ready(stream_id, timeout_ms).await
     }
 
+    pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
+        self.streamer.stream_bytes_sent(stream_id).await
+    }
+
     async fn persist_position(&self, zone_id: i64) {
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {

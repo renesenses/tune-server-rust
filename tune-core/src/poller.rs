@@ -155,6 +155,7 @@ struct ZonePollState {
     /// GAPLESS_STUCK_THRESHOLD, the poller gives up on the gapless
     /// transition and forces play_from_queue.
     gapless_stuck_ticks: u8,
+    last_bytes_sent: u64,
 }
 
 pub struct PositionPoller {
@@ -321,6 +322,7 @@ impl PositionPoller {
                 past_end_ticks: 0,
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
+                last_bytes_sent: 0,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -841,28 +843,30 @@ impl PositionPoller {
                                 // Check if the stream is still being consumed
                                 // (renderer actively fetching audio data). If so,
                                 // don't kill — the renderer is playing but not
-                                // reporting state (MPlayer-based renderers like
-                                // Shanling SCD1.3).
-                                let stream_active = zone_state
+                                // reporting state (DMP-A10, LHC, Shanling, etc.).
+                                let stream_id = zone_state
                                     .now_playing
                                     .as_ref()
-                                    .and_then(|np| np.stream_id.as_ref())
-                                    .map(|_sid| {
-                                        // If stream session still exists, renderer
-                                        // hasn't finished fetching
-                                        true // conservative: assume active
-                                    })
-                                    .unwrap_or(false);
+                                    .and_then(|np| np.stream_id.clone());
+                                let current_bytes = if let Some(ref sid) = stream_id {
+                                    self.orchestrator
+                                        .streamer_bytes_sent(sid)
+                                        .await
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let stream_consuming =
+                                    current_bytes > 0 && current_bytes > ps.last_bytes_sent;
+                                ps.last_bytes_sent = current_bytes;
 
-                                if stream_active && wall_elapsed < 300 {
-                                    // Give DLNA renderers up to 5 minutes before
-                                    // declaring failure — they may be buffering or
-                                    // just not reporting position.
+                                if stream_consuming {
                                     if ps.stopped_ticks % 30 == 0 {
                                         debug!(
                                             zone_id,
                                             peak_pos = ps.peak_position_ms,
                                             wall_secs = wall_elapsed,
+                                            bytes_sent = current_bytes,
                                             "dlna_renderer_not_reporting_state_waiting"
                                         );
                                     }
@@ -872,6 +876,7 @@ impl PositionPoller {
                                         peak_pos = ps.peak_position_ms,
                                         track_dur = track_duration_ms,
                                         wall_secs = wall_elapsed,
+                                        bytes_sent = current_bytes,
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;

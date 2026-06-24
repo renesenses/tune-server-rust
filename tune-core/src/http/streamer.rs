@@ -258,6 +258,13 @@ impl AudioStreamer {
         self.sessions.clone()
     }
 
+    pub async fn stream_bytes_sent(&self, stream_id: &str) -> Option<u64> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(stream_id)
+            .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub async fn cleanup_stale_sessions(&self) -> usize {
         let mut sessions = self.sessions.lock().await;
         let before = sessions.len();
