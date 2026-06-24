@@ -766,6 +766,19 @@ impl PositionPoller {
                                 "gapless_advance_waiting_for_renderer"
                             );
                         }
+                    } else if status.ended_naturally && (played_enough || wall_elapsed >= 5) {
+                        // Local outputs (WASAPI/ALSA/CoreAudio) signal
+                        // ended_naturally when the audio stream reaches EOF.
+                        // Skip the STOPPED_TICKS_THRESHOLD wait — we know
+                        // the track is done, no need to accumulate 5s of
+                        // stopped ticks.
+                        info!(
+                            zone_id,
+                            wall_elapsed,
+                            peak_pos = ps.peak_position_ms,
+                            "local_output_ended_naturally_advancing"
+                        );
+                        track_ended = true;
                     } else {
                         ps.stopped_ticks += 1;
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
