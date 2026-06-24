@@ -738,3 +738,52 @@ pub(super) async fn set_prefetch(
         "ok": true,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// License endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(super) struct LicenseBody {
+    key: String,
+}
+
+pub(super) async fn get_license(State(state): State<AppState>) -> Json<Value> {
+    let ls = state.license.license_state().await;
+    Json(json!({
+        "tier": ls.tier,
+        "license_key_masked": ls.license_key.as_deref().map(|k| {
+            if k.len() <= 4 { "****".to_string() }
+            else { format!("{}{}", "*".repeat(k.len() - 4), &k[k.len()-4..]) }
+        }),
+        "expires_at": ls.expires_at,
+        "last_validated": ls.last_validated,
+        "hardware_fingerprint": ls.hardware_fingerprint,
+    }))
+}
+
+pub(super) async fn set_license(
+    State(state): State<AppState>,
+    Json(body): Json<LicenseBody>,
+) -> impl IntoResponse {
+    match state.license.set_license_key(&body.key).await {
+        Ok(()) => Json(json!({
+            "status": "ok",
+            "tier": "premium",
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": e,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
+    state.license.clear_license().await;
+    Json(json!({ "status": "ok", "tier": "free" }))
+}

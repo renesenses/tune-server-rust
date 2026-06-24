@@ -125,6 +125,12 @@ pub fn router() -> Router<AppState> {
         .route("/update/install", post(update::update_install))
         .route("/update/apply", post(update::update_apply))
         .route("/update/status", get(update::update_status))
+        .route(
+            "/license",
+            get(config::get_license)
+                .post(config::set_license)
+                .delete(config::delete_license),
+        )
         .route("/bug-report", get(diagnostics::generate_bug_report))
         .route("/audio-check", get(diagnostics::audio_check))
         .route("/audio/asio-devices", get(diagnostics::asio_devices))
