@@ -125,11 +125,17 @@ fn read_file_with_timeout(
         .map_err(|_| "timeout".to_string())?
 }
 
-pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
+pub struct ListAudioResult {
+    pub files: Vec<PathBuf>,
+    pub missing_dirs: Vec<String>,
+}
+
+pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     let extensions: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
     let skip_set: HashSet<&str> = SKIP_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
+    let mut missing_dirs = Vec::new();
     for dir in dirs {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
@@ -140,6 +146,7 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
                 original = %dir,
                 "scan_dir_not_found — directory does not exist, skipping"
             );
+            missing_dirs.push(normalized);
             continue;
         }
         if !dir_path.is_dir() {
@@ -224,8 +231,16 @@ pub fn list_audio_files(dirs: &[String]) -> Vec<PathBuf> {
         );
     }
 
-    info!(count = files.len(), dirs = dirs.len(), "audio_files_listed");
-    files
+    info!(
+        count = files.len(),
+        dirs = dirs.len(),
+        missing = missing_dirs.len(),
+        "audio_files_listed"
+    );
+    ListAudioResult {
+        files,
+        missing_dirs,
+    }
 }
 
 pub fn scan_files_parallel(
@@ -503,8 +518,8 @@ pub fn scan_directories(
     with_hash: bool,
     progress_callback: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
 ) -> (Vec<ScannedFile>, ScanStats) {
-    let files = list_audio_files(dirs);
-    scan_files_parallel(&files, with_hash, progress_callback)
+    let result = list_audio_files(dirs);
+    scan_files_parallel(&result.files, with_hash, progress_callback)
 }
 
 #[cfg(test)]

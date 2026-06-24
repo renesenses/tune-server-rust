@@ -47,7 +47,9 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             "scan_starting"
         );
 
-        let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let missing_dirs = list_result.missing_dirs;
+        let files = list_result.files;
         let total_discovered = files.len();
 
         let discovered_paths: std::collections::HashSet<String> = files
@@ -547,15 +549,30 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             },
         );
 
-        // Prune tracks whose files no longer exist on disk
+        // Prune tracks whose files no longer exist on disk.
+        // SAFETY: skip tracks in missing directories — the volume/NAS may
+        // simply be unmounted. Deleting them would wipe the entire library.
         {
             let mut pruned = 0i64;
+            let mut protected = 0i64;
             for (db_path, &(track_id, _, _)) in &existing_tracks {
                 if !discovered_paths.contains(db_path.as_str()) {
+                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
+                    if in_missing_dir {
+                        protected += 1;
+                        continue;
+                    }
                     if track_repo.delete(track_id).is_ok() {
                         pruned += 1;
                     }
                 }
+            }
+            if protected > 0 {
+                tracing::warn!(
+                    protected,
+                    dirs = ?missing_dirs,
+                    "post_scan_tracks_protected_missing_dirs"
+                );
             }
             if pruned > 0 {
                 tracing::info!(pruned, "post_scan_stale_tracks_removed");

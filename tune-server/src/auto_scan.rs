@@ -165,7 +165,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             return;
         }
 
-        let files = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
 
