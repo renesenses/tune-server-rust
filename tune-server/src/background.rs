@@ -43,72 +43,81 @@ fn spawn_relay_client(state: &AppState) {
 fn spawn_ssdp_startup_scan(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
-        // Wait for the network stack and mDNS to settle before scanning.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        info!("ssdp_startup_scan_starting");
-
-        let scanner = state.scanner.lock().await;
-        let devices = scanner.rescan().await;
-        drop(scanner);
-
-        let mut registered = 0u32;
-        let mut outputs = state.outputs.lock().await;
-        for d in &devices {
-            let location = d.location.as_deref().unwrap_or("");
-            if location.is_empty() || outputs.contains(&d.id) {
-                continue;
+        // Multiple scan passes to catch slow DLNA renderers (DMP-A8, etc.)
+        // that don't respond to the first SSDP multicast.
+        for (pass, delay_secs) in [(1, 3), (2, 8), (3, 15)] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            if pass == 1 {
+                info!("ssdp_startup_scan_starting");
             }
-            if let Ok(desc) =
-                tune_core::discovery::xml_parser::fetch_device_description(location).await
-            {
-                if desc.is_media_renderer() {
-                    let service_urls = desc.service_urls();
-                    if let (Some(av), Some(rc)) = (
-                        service_urls.get("avtransport"),
-                        service_urls.get("renderingcontrol"),
-                    ) {
-                        let base = format!("http://{}:{}", d.host, d.port);
-                        let cm_url = service_urls
-                            .get("connectionmanager")
-                            .or_else(|| service_urls.get("ConnectionManager"))
-                            .map(|p| format!("{base}{p}"));
-                        let dlna = tune_core::outputs::dlna::DlnaOutput::new(
-                            d.name.clone(),
-                            d.id.clone(),
-                            d.host.clone(),
-                            format!("{base}{av}"),
-                            format!("{base}{rc}"),
-                            cm_url,
-                        );
-                        outputs.register(Box::new(dlna));
-                        registered += 1;
+
+            let scanner = state.scanner.lock().await;
+            let devices = scanner.rescan().await;
+            drop(scanner);
+
+            let mut registered = 0u32;
+            let mut outputs = state.outputs.lock().await;
+            for d in &devices {
+                let location = d.location.as_deref().unwrap_or("");
+                if location.is_empty() || outputs.contains(&d.id) {
+                    continue;
+                }
+                if let Ok(desc) =
+                    tune_core::discovery::xml_parser::fetch_device_description(location).await
+                {
+                    if desc.is_media_renderer() {
+                        let service_urls = desc.service_urls();
+                        if let (Some(av), Some(rc)) = (
+                            service_urls.get("avtransport"),
+                            service_urls.get("renderingcontrol"),
+                        ) {
+                            let base = format!("http://{}:{}", d.host, d.port);
+                            let cm_url = service_urls
+                                .get("connectionmanager")
+                                .or_else(|| service_urls.get("ConnectionManager"))
+                                .map(|p| format!("{base}{p}"));
+                            let dlna = tune_core::outputs::dlna::DlnaOutput::new(
+                                d.name.clone(),
+                                d.id.clone(),
+                                d.host.clone(),
+                                format!("{base}{av}"),
+                                format!("{base}{rc}"),
+                                cm_url,
+                            );
+                            outputs.register(Box::new(dlna));
+                            registered += 1;
+                        }
                     }
                 }
             }
-        }
-        drop(outputs);
+            drop(outputs);
 
-        // Auto-create zones for discovered devices (skip if zone already exists)
-        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-        for d in &devices {
-            match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
-                Ok((zid, true)) => {
-                    info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
-                }
-                Ok((_, false)) => {
-                    let _ = zone_repo.set_online_by_device(&d.id, true);
-                }
-                Err(e) => {
-                    tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
+            let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+            for d in &devices {
+                match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
+                    Ok((zid, true)) => {
+                        info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
+                    }
+                    Ok((_, false)) => {
+                        let _ = zone_repo.set_online_by_device(&d.id, true);
+                    }
+                    Err(e) => {
+                        tracing::warn!(name = %d.name, device_id = %d.id, error = %e, "ssdp_startup_zone_create_failed");
+                    }
                 }
             }
-        }
 
-        info!(
-            registered,
-            total = devices.len(),
-            "ssdp_startup_scan_complete"
-        );
+            info!(
+                registered,
+                total = devices.len(),
+                pass,
+                "ssdp_startup_scan_complete"
+            );
+
+            if pass > 1 && registered == 0 {
+                break;
+            }
+        }
     });
 }
 
