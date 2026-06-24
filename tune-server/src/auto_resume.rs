@@ -75,6 +75,7 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         album_title: None,
         cover_url: None,
         duration_ms: None,
+        seek_ms: None,
     };
 
     match state.orchestrator.play(req).await {

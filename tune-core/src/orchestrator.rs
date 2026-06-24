@@ -30,7 +30,7 @@ pub struct PlaybackOrchestrator {
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PlayRequest {
     pub zone_id: i64,
     pub output_device_id: Option<String>,
@@ -42,6 +42,7 @@ pub struct PlayRequest {
     pub album_title: Option<String>,
     pub cover_url: Option<String>,
     pub duration_ms: Option<i64>,
+    pub seek_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +505,7 @@ impl PlaybackOrchestrator {
                     channels: 2,
                     file_size: None,
                     duration_ms: None,
+                    ..Default::default()
                 };
 
                 let (session_id, tx, data_ready) =
@@ -558,6 +560,7 @@ impl PlaybackOrchestrator {
                     channels: 2,
                     file_size: None,
                     duration_ms: None,
+                    ..Default::default()
                 };
                 let sid = self
                     .streamer
@@ -785,6 +788,7 @@ impl PlaybackOrchestrator {
                 channels,
                 file_size: None,
                 duration_ms: Some(track.duration_ms as u64),
+                ..Default::default()
             };
 
             if use_file_transcode {
@@ -934,6 +938,7 @@ impl PlaybackOrchestrator {
                             channels,
                             file_size: Some(file_size),
                             duration_ms: Some(track.duration_ms as u64),
+                            ..Default::default()
                         };
                         let session_id = self
                             .streamer
@@ -980,6 +985,7 @@ impl PlaybackOrchestrator {
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
+                let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
                 let streamer_sessions = self.streamer.sessions_state();
                 let close_session_id = session_id.clone();
                 tokio::spawn(async move {
@@ -1013,7 +1019,7 @@ impl PlaybackOrchestrator {
                     drop(tx);
 
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_with_levels(
+                        crate::audio::decode::decode_to_pcm_streaming_seeked(
                             &fp_clone,
                             Some(out_sr),
                             Some(channels as u32),
@@ -1022,6 +1028,7 @@ impl PlaybackOrchestrator {
                             32768,
                             data_ready,
                             levels_tx,
+                            seek_s,
                         )
                     })
                     .await;
@@ -1070,6 +1077,7 @@ impl PlaybackOrchestrator {
                 channels,
                 file_size: track.file_size.map(|s| s as u64),
                 duration_ms: Some(track.duration_ms as u64),
+                ..Default::default()
             };
 
             let passthrough_file_size = track.file_size.map(|s| s as u64);
@@ -1247,6 +1255,7 @@ impl PlaybackOrchestrator {
             channels: 2,
             file_size: None,
             duration_ms: None,
+            ..Default::default()
         };
 
         let is_https = stream_data.url.starts_with("https://");
@@ -1288,6 +1297,7 @@ impl PlaybackOrchestrator {
                 channels: 2,
                 file_size: None,
                 duration_ms: None,
+                ..Default::default()
             };
 
             let (session_id, tx, data_ready) =
@@ -1540,6 +1550,7 @@ impl PlaybackOrchestrator {
                         channels: 2,
                         file_size: Some(file_size),
                         duration_ms: None,
+                        ..Default::default()
                     };
                     let session_id = self
                         .streamer
@@ -1670,6 +1681,7 @@ impl PlaybackOrchestrator {
                             channels: 2,
                             file_size: Some(file_size),
                             duration_ms: None,
+                            ..Default::default()
                         };
                         let session_id = self
                             .streamer
@@ -1795,6 +1807,7 @@ impl PlaybackOrchestrator {
             channels: ch,
             file_size: None,
             duration_ms: Some(prefetched.duration_ms),
+            ..Default::default()
         };
 
         let (session_id, tx, data_ready) = self.streamer.create_session(wav_info, false, 256).await;
@@ -2345,6 +2358,7 @@ impl PlaybackOrchestrator {
                         album_title: np.album_title.clone(),
                         cover_url: np.cover_path.clone(),
                         duration_ms: Some(np.duration_ms),
+                        seek_ms: None,
                     };
 
                     match self.play(req).await {
@@ -2384,11 +2398,52 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
-                // Local tracks or non-network outputs: direct seek works fine
-                let outputs = self.outputs.lock().await;
-                if let Some(output) = outputs.get(did) {
-                    if let Err(e) = output.lock().await.seek(position_ms).await {
-                        warn!(zone_id, error = %e, "device_seek_failed");
+                // Local output: the WAV stream is sequential (mpsc channel),
+                // so we must stop+replay from the seek position.
+                let is_local_output =
+                    zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
+                let has_track = state.now_playing.is_some();
+
+                if is_local_output && has_track {
+                    info!(zone_id, position_ms, "seek_local_output_recreating_stream");
+                    self.playback.seek(zone_id, position_ms as i64).await;
+
+                    let np = state.now_playing.as_ref().unwrap();
+                    let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                        .get(zone_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|z| z.output_device_id);
+                    let req = PlayRequest {
+                        zone_id,
+                        output_device_id,
+                        track_id: np.track_id,
+                        source: Some(np.source.clone()),
+                        source_id: np.source_id.clone(),
+                        title: Some(np.title.clone()),
+                        artist_name: np.artist_name.clone(),
+                        album_title: np.album_title.clone(),
+                        cover_url: np.cover_path.clone(),
+                        duration_ms: Some(np.duration_ms),
+                        seek_ms: Some(position_ms),
+                    };
+
+                    match self.play(req).await {
+                        Ok(_) => {
+                            self.playback.seek(zone_id, position_ms as i64).await;
+                            info!(zone_id, position_ms, "seek_local_output_complete");
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "seek_local_output_play_failed");
+                            self.playback.seek(zone_id, position_ms as i64).await;
+                        }
+                    }
+                } else {
+                    let outputs = self.outputs.lock().await;
+                    if let Some(output) = outputs.get(did) {
+                        if let Err(e) = output.lock().await.seek(position_ms).await {
+                            warn!(zone_id, error = %e, "device_seek_failed");
+                        }
                     }
                 }
             }
@@ -2507,6 +2562,7 @@ impl PlaybackOrchestrator {
                 album_title: item.album_title.clone(),
                 cover_url: item.cover_path.clone(),
                 duration_ms: item.duration_ms,
+                seek_ms: None,
             };
             let result = self.play(req).await?;
             self.playback
@@ -2552,6 +2608,7 @@ impl PlaybackOrchestrator {
             album_title: album,
             cover_url: cover,
             duration_ms: duration,
+            seek_ms: None,
         };
 
         let result = self.play(req).await?;
@@ -2672,6 +2729,7 @@ impl PlaybackOrchestrator {
                 album_title: album.clone(),
                 cover_url: cover.clone(),
                 duration_ms: item.duration_ms,
+                seek_ms: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -2733,6 +2791,7 @@ impl PlaybackOrchestrator {
             album_title: album.clone(),
             cover_url: cover.clone(),
             duration_ms: duration,
+            seek_ms: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -3310,6 +3369,7 @@ mod tests {
             album_title: None,
             cover_url: None,
             duration_ms: None,
+            seek_ms: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -3341,6 +3401,7 @@ mod tests {
             album_title: None,
             cover_url: None,
             duration_ms: Some(3600000),
+            seek_ms: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(

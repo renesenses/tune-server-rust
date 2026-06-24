@@ -321,13 +321,31 @@ impl OutputTarget for DlnaOutput {
             tokio::time::sleep(std::time::Duration::from_millis(self.play_delay_ms)).await;
         }
 
-        let play_resp = self
-            .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-            .await?;
+        // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
+        // reject Play immediately after SetAVTransportURI while still loading the URI.
+        let mut last_err = String::new();
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                let delay = 500 * (1 << (attempt - 1)); // 500ms, 1s, 2s
+                info!(device = %self.name, attempt, delay_ms = delay, "dlna_play_retry");
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            let play_resp = self
+                .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                .await?;
 
-        if play_resp.contains("UPnPError") || play_resp.contains("<errorCode>") {
-            warn!(device = %self.name, response = %play_resp, "dlna_play_error");
-            return Err(format!("Play rejected: {play_resp}"));
+            if !play_resp.contains("UPnPError") && !play_resp.contains("<errorCode>") {
+                if attempt > 0 {
+                    info!(device = %self.name, attempt, "dlna_play_retry_succeeded");
+                }
+                last_err.clear();
+                break;
+            }
+            warn!(device = %self.name, attempt, response = %play_resp, "dlna_play_error");
+            last_err = format!("Play rejected: {play_resp}");
+        }
+        if !last_err.is_empty() {
+            return Err(last_err);
         }
 
         info!(device = %self.name, url = media.url, delay_ms = self.play_delay_ms, "dlna_play");

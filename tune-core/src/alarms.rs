@@ -332,6 +332,7 @@ impl AlarmScheduler {
             album_title: None,
             cover_url: None,
             duration_ms: None,
+            seek_ms: None,
         };
         if let Err(e) = self.orchestrator.play(req).await {
             warn!(alarm_id, error = %e, "alarm_play_error");

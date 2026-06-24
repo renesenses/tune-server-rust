@@ -202,6 +202,7 @@ async fn play_radio(
         album_title: Some("Live Radio".into()),
         cover_url: radio.logo_url.clone(),
         duration_ms: None,
+        ..Default::default()
     };
 
     let (output_sent, output_error, stream_url) = match state.orchestrator.play(play_req).await {

@@ -298,6 +298,7 @@ pub fn decode_to_pcm_streaming(
         chunk_size,
         None,
         None,
+        0.0,
     )
 }
 
@@ -318,6 +319,7 @@ pub fn decode_to_pcm_streaming_with_notify(
         chunk_size,
         Some(data_ready),
         None,
+        0.0,
     )
 }
 
@@ -340,6 +342,31 @@ pub fn decode_to_pcm_streaming_with_levels(
         chunk_size,
         Some(data_ready),
         Some(levels_tx),
+        0.0,
+    )
+}
+
+pub fn decode_to_pcm_streaming_seeked(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
+    seek_s: f64,
+) -> Result<u16, String> {
+    decode_to_pcm_streaming_inner(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        seek_s,
     )
 }
 
@@ -352,6 +379,7 @@ fn decode_to_pcm_streaming_inner(
     chunk_size: usize,
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
+    seek_s: f64,
 ) -> Result<u16, String> {
     let ext = Path::new(file_path)
         .extension()
@@ -483,6 +511,20 @@ fn decode_to_pcm_streaming_inner(
 
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime for streaming decode")?;
+
+    if seek_s > 0.0 {
+        let seconds = seek_s as i64;
+        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+        let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
+        let _ = format.seek(
+            SeekMode::Coarse,
+            SeekTo::Time {
+                time,
+                track_id: Some(track_id),
+            },
+        );
+        debug!(file = file_path, seek_s, "streaming_decode_seeked");
+    }
 
     // Accumulate PCM bytes and flush when exceeding chunk_size.
     // This avoids sending tiny per-packet buffers over the channel.

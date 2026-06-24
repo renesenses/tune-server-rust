@@ -117,6 +117,7 @@ struct PlayRequest {
     album_title: Option<String>,
     cover_path: Option<String>,
     duration_ms: Option<i64>,
+    seek_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -319,6 +320,7 @@ async fn play(
                     album_title: np.album_title.clone(),
                     cover_url: np.cover_path.clone(),
                     duration_ms: Some(np.duration_ms),
+                    seek_ms: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -396,6 +398,7 @@ async fn play(
                             album_title: None,
                             cover_url: None,
                             duration_ms: None,
+                            seek_ms: None,
                         };
                         if let Ok(result) = state.orchestrator.play(orch_req).await {
                             return Json(
@@ -466,6 +469,7 @@ async fn play(
             album_title: first.album.clone(),
             cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
+            seek_ms: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -546,6 +550,7 @@ async fn play(
             album_title: first.album.clone(),
             cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
+            seek_ms: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -610,6 +615,7 @@ async fn play(
             album_title: body.album_title,
             cover_url: body.cover_path,
             duration_ms: body.duration_ms,
+            seek_ms: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -675,6 +681,7 @@ async fn play(
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
+                seek_ms: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -759,6 +766,7 @@ async fn play(
         duration_ms: body
             .duration_ms
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
+        seek_ms: body.seek_ms,
     };
 
     match state.orchestrator.play(orch_req).await {
@@ -805,6 +813,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 album_title: np.album_title.clone(),
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
+                seek_ms: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -872,6 +881,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     duration_ms: first.get("duration_ms").and_then(|v| v.as_i64()),
+                    ..Default::default()
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -901,6 +911,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     album_title: None,
                     cover_url: None,
                     duration_ms: None,
+                    seek_ms: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -1843,6 +1854,7 @@ async fn invoke_zone_pin(
         album_title: None,
         cover_url: None,
         duration_ms: None,
+        seek_ms: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2014,6 +2026,7 @@ pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
         album_title: track.as_ref().and_then(|t| t.album_title.clone()),
         cover_url: track.as_ref().and_then(|t| t.cover_path.clone()),
         duration_ms: track.as_ref().map(|t| t.duration_ms),
+        seek_ms: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {

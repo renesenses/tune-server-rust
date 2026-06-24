@@ -9,7 +9,7 @@ use crate::audio::wav::build_wav_header_with_duration;
 
 pub const ICY_METAINT: usize = 16384;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
     pub format: String,
     pub mime_type: String,
@@ -18,6 +18,7 @@ pub struct StreamInfo {
     pub channels: u16,
     pub file_size: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub seek_ms: Option<u64>,
 }
 
 impl StreamInfo {
@@ -406,6 +407,7 @@ mod tests {
             channels: 2,
             file_size: None,
             duration_ms: None,
+            ..Default::default()
         };
         let (id, _tx, _data_ready) = streamer.create_session(info, false, 128).await;
         assert!(!id.is_empty());
@@ -423,6 +425,7 @@ mod tests {
             channels: 2,
             file_size: Some(50_000_000),
             duration_ms: None,
+            ..Default::default()
         };
         let id = streamer
             .create_file_session(info, "/music/test.flac".into(), true)
@@ -466,6 +469,7 @@ mod tests {
             channels: 2,
             file_size: None,
             duration_ms: None,
+            ..Default::default()
         };
         let id = streamer
             .create_proxy_session(info, "https://cdn.tidal.com/track.flac".into(), false)
@@ -490,6 +494,7 @@ mod tests {
             channels: 2,
             file_size: None,
             duration_ms: Some(180_000),
+            ..Default::default()
         };
         // 180s * 44100 * 2ch * 2bytes + 44 header
         let expected = 180 * 44100 * 2 * 2 + 44;
@@ -506,6 +511,7 @@ mod tests {
             channels: 2,
             file_size: None,
             duration_ms: None,
+            ..Default::default()
         };
         assert_eq!(info.wav_content_length(), None);
     }
@@ -520,6 +526,7 @@ mod tests {
             channels: 2,
             file_size: None,
             duration_ms: Some(256_487),
+            ..Default::default()
         };
         let expected = 256_487u64 * 96000 * 2 * 3 / 1000 + 44;
         assert_eq!(info.wav_content_length(), Some(expected));

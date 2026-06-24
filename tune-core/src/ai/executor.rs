@@ -108,6 +108,7 @@ impl ToolExecutor {
             album_title: first_track.album_title.clone(),
             cover_url: first_track.cover_path.clone(),
             duration_ms: Some(first_track.duration_ms),
+            seek_ms: None,
         };
 
         // Queue remaining tracks
@@ -156,6 +157,7 @@ impl ToolExecutor {
             album_title: track.album_title.clone(),
             cover_url: track.cover_path.clone(),
             duration_ms: Some(track.duration_ms),
+            seek_ms: None,
         };
 
         match self.orchestrator.play(req).await {
