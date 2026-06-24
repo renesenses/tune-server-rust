@@ -157,6 +157,29 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .is_some_and(|s| !s.is_empty());
     config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
+    // Premium licensing info
+    let premium_tier = state.license.tier().await;
+    let zone_limit = if premium_tier == tune_core::license::Tier::Premium {
+        serde_json::Value::Null
+    } else {
+        json!(tune_core::license::LicenseManager::free_zone_limit())
+    };
+    let mut premium_features = serde_json::Map::new();
+    for f in tune_core::license::Feature::all_premium() {
+        let key = serde_json::to_value(f)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let enabled = state.license.check_feature(*f).await;
+        premium_features.insert(key, json!(enabled));
+    }
+    config.insert("premium_tier".to_string(), json!(premium_tier));
+    config.insert(
+        "premium_features".to_string(),
+        Value::Object(premium_features),
+    );
+    config.insert("zone_limit".to_string(), zone_limit);
     Json(Value::Object(config))
 }
 

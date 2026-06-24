@@ -52,6 +52,7 @@ pub struct AppState {
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
+    pub license: Arc<tune_core::license::LicenseManager>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -79,6 +80,8 @@ impl AppState {
 
         // Clean up any leftover temp transcode files from a previous crash.
         tune_core::http::streamer::cleanup_leftover_transcode_files();
+
+        let license = Arc::new(tune_core::license::LicenseManager::new(backend.clone()));
 
         let streamer = Arc::new(AudioStreamer::new(port));
         let playback = Arc::new(PlaybackManager::new());
@@ -163,6 +166,7 @@ impl AppState {
             update_phase: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
+            license,
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })

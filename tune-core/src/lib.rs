@@ -23,6 +23,7 @@ pub mod health;
 pub mod health_monitor;
 pub mod http;
 pub mod library;
+pub mod license;
 pub mod metadata;
 pub mod mount_manager;
 pub mod network;

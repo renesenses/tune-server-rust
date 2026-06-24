@@ -1,6 +1,7 @@
 pub mod bio_sync;
 pub mod community;
 pub mod community_sync;
+pub mod concert_alerts;
 pub mod plugins;
 #[cfg(feature = "cloud-relay")]
 pub mod relay;

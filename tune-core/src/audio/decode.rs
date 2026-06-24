@@ -309,7 +309,7 @@ pub fn decode_to_pcm_streaming_with_notify(
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
         target_sample_rate,
@@ -332,7 +332,7 @@ pub fn decode_to_pcm_streaming_with_levels(
     chunk_size: usize,
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
         target_sample_rate,
@@ -356,7 +356,7 @@ pub fn decode_to_pcm_streaming_seeked(
     data_ready: std::sync::Arc<tokio::sync::Notify>,
     levels_tx: tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>,
     seek_s: f64,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
         target_sample_rate,
@@ -380,7 +380,7 @@ fn decode_to_pcm_streaming_inner(
     data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
     seek_s: f64,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -388,6 +388,7 @@ fn decode_to_pcm_streaming_inner(
         .to_lowercase();
 
     let mut first_chunk_sent = false;
+    let mut source_rate = target_sample_rate.unwrap_or(44100);
 
     // DSD files (DSF/DFF): streaming decode using chunk-based DSD→PCM converter.
     // This avoids loading the entire DSD file into memory (200MB+ → OOM).
@@ -435,11 +436,11 @@ fn decode_to_pcm_streaming_inner(
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     debug!("streaming_decode_consumer_dropped (fallback)");
-                    return Ok(output_bd);
+                    return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
                     tracing::warn!("streaming_decode_send_timeout_10s (fallback)");
-                    return Ok(output_bd);
+                    return Ok((output_bd, source_rate));
                 }
             }
             if !first_chunk_sent {
@@ -453,7 +454,7 @@ fn decode_to_pcm_streaming_inner(
                 let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch, sr));
             }
         }
-        return Ok(output_bd);
+        return Ok((output_bd, source_rate));
     }
 
     // Symphonia streaming decode: packet-by-packet progressive output
@@ -493,7 +494,7 @@ fn decode_to_pcm_streaming_inner(
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    let source_rate = audio_params.sample_rate.unwrap_or(44100);
+    source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_bd = resolve_bit_depth(&audio_params);
     let shift = 32u16.saturating_sub(source_bd);
 
@@ -524,6 +525,25 @@ fn decode_to_pcm_streaming_inner(
             },
         );
         debug!(file = file_path, seek_s, "streaming_decode_seeked");
+    }
+
+    // Send the WAV header as the first chunk using the REAL source sample
+    // rate detected by Symphonia — not the API-reported rate which may be
+    // wrong (Tidal Hi-Res mislabeling).
+    if target_bit_depth.is_some() {
+        let channels = target_channels.unwrap_or(source_channels) as u16;
+        let wav_hdr = super::wav::build_wav_header(channels, source_rate, output_bd);
+        if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+            return Ok((output_bd, source_rate));
+        }
+        if let Some(ref n) = data_ready {
+            n.notify_one();
+        }
+        first_chunk_sent = true;
+        debug!(
+            source_rate,
+            output_bd, channels, "streaming_decode_wav_header_sent"
+        );
     }
 
     // Accumulate PCM bytes and flush when exceeding chunk_size.
@@ -632,11 +652,11 @@ fn decode_to_pcm_streaming_inner(
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     debug!("streaming_decode_consumer_dropped");
-                    return Ok(output_bd);
+                    return Ok((output_bd, source_rate));
                 }
                 Err(_) => {
                     tracing::warn!("streaming_decode_send_timeout_10s");
-                    return Ok(output_bd);
+                    return Ok((output_bd, source_rate));
                 }
             }
             if !first_chunk_sent {
@@ -994,7 +1014,7 @@ fn decode_dsd_streaming(
     data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
     rt: &tokio::runtime::Handle,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     use super::dsd_to_pcm::DsdToPcmStreamer;
 
     // Parse header once, then create streamer + reader from the same info.
@@ -1066,7 +1086,7 @@ fn decode_dsd_streaming(
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
             if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
-                return Ok(output_bd);
+                return Ok((output_bd, output_rate));
             }
         }
     } else {
@@ -1078,7 +1098,7 @@ fn decode_dsd_streaming(
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
             if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
-                return Ok(output_bd);
+                return Ok((output_bd, output_rate));
             }
         }
     }
@@ -1127,7 +1147,7 @@ fn decode_dsd_streaming(
         ext, dsd_rate, output_rate, channels, total_samples, duration_s, "decoded_dsd_streaming"
     );
 
-    Ok(output_bd)
+    Ok((output_bd, output_rate))
 }
 
 /// Convert 24-bit LE PCM byte triples to the target bit depth.

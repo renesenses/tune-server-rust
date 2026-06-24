@@ -32,6 +32,9 @@ pub fn router() -> Router<AppState> {
         .route("/bridge/status", get(bridge_status))
         .route("/bridge/enable", post(bridge_enable))
         .route("/bridge/disable", post(bridge_disable))
+        .route("/license/status", get(license_status))
+        .route("/license/activate", post(license_activate))
+        .route("/license/deactivate", post(license_deactivate))
 }
 
 // ---------------------------------------------------------------------------
@@ -681,4 +684,72 @@ async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {
     let _ = settings.set("bridge_enabled", "false");
     info!("bridge disabled");
     Json(json!({"enabled": false}))
+}
+
+// ---------------------------------------------------------------------------
+// License
+// ---------------------------------------------------------------------------
+
+async fn license_status(State(state): State<AppState>) -> Json<Value> {
+    let ls = state.license.license_state().await;
+    let mut features = serde_json::Map::new();
+    for f in tune_core::license::Feature::all_premium() {
+        let enabled = state.license.check_feature(*f).await;
+        features.insert(
+            serde_json::to_value(f)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string(),
+            json!({
+                "display_name": f.display_name(),
+                "enabled": enabled,
+            }),
+        );
+    }
+
+    let zone_limit = if ls.tier == tune_core::license::Tier::Premium {
+        None
+    } else {
+        Some(tune_core::license::LicenseManager::free_zone_limit())
+    };
+
+    Json(json!({
+        "tier": ls.tier,
+        "license_key": ls.license_key,
+        "expires_at": ls.expires_at,
+        "last_validated": ls.last_validated,
+        "hardware_fingerprint": ls.hardware_fingerprint,
+        "features": features,
+        "zone_limit": zone_limit,
+    }))
+}
+
+async fn license_activate(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let key = body["license_key"].as_str().unwrap_or("");
+    if key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "license_key required"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.license.set_license_key(key).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+    }
+    let ls = state.license.license_state().await;
+    Json(json!({
+        "status": "activated",
+        "tier": ls.tier,
+        "license_key": key,
+    }))
+    .into_response()
+}
+
+async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
+    state.license.clear_license().await;
+    Json(json!({"status": "deactivated", "tier": "free"}))
 }

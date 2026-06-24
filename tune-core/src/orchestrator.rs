@@ -982,6 +982,19 @@ impl PlaybackOrchestrator {
                 let (session_id, tx, data_ready) =
                     self.streamer.create_session(info, false, 256).await;
 
+                // Mark session: the streaming decoder sends the WAV header
+                // with the real source sample rate, so the stream handler
+                // must NOT prepend its own.
+                {
+                    let sessions = self.streamer.sessions_state();
+                    let sessions = sessions.lock().await;
+                    if let Some(session) = sessions.get(&session_id) {
+                        session
+                            .wav_header_included
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+
                 let fp = file_path.clone();
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
@@ -1303,6 +1316,16 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready) =
                 self.streamer.create_session(wav_info, false, 256).await;
 
+            {
+                let sessions = self.streamer.sessions_state();
+                let sessions = sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session
+                        .wav_header_included
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+
             info!(
                 service = service_name,
                 codec = %codec,
@@ -1435,7 +1458,14 @@ impl PlaybackOrchestrator {
                 let _ = std::fs::remove_file(&tmp_file);
 
                 match decode_result {
-                    Ok(Ok(_bit_depth)) => {
+                    Ok(Ok((_bit_depth, actual_rate))) => {
+                        if actual_rate != sr {
+                            tracing::info!(
+                                api_rate = sr,
+                                actual_rate,
+                                "streaming_sample_rate_mismatch_wav_header_has_correct_rate"
+                            );
+                        }
                         debug!("streaming_transcode_complete_progressive");
                     }
                     Ok(Err(e)) => {

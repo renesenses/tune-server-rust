@@ -198,8 +198,11 @@ pub async fn handle_stream(
         vec![0u8]
     };
 
+    let wav_header_included = session
+        .wav_header_included
+        .load(std::sync::atomic::Ordering::Relaxed);
     let body = Body::from_stream(async_stream::stream! {
-        if is_wav {
+        if is_wav && !wav_header_included {
             let hdr = build_wav_header(ch, sr, bd, dur_ms);
             yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&hdr));
         }

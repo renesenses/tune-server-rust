@@ -148,6 +148,26 @@ pub fn router() -> Router<AppState> {
         .route("/convert", post(convert::convert_track))
         .route("/convert/{job_id}", get(convert::convert_status))
         .route("/convert/{job_id}/download", get(convert::convert_download))
+        // Concert alerts — upcoming concerts for library artists
+        .route("/concerts", get(concerts_handler))
+}
+
+/// GET /system/concerts — upcoming concerts for artists in the local library.
+async fn concerts_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let instance_id = SettingsRepo::with_backend(state.backend.clone())
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    match tune_core::cloud::concert_alerts::get_upcoming_concerts(&state.http_client, &instance_id)
+        .await
+    {
+        Ok(concerts) => axum::Json(serde_json::json!({"concerts": concerts})),
+        Err(e) => axum::Json(serde_json::json!({"concerts": [], "error": e})),
+    }
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.
