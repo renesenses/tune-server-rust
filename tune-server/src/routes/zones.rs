@@ -544,6 +544,15 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
+            let online = match z.output_type.as_deref() {
+                Some("local") | Some("browser") => true,
+                _ => z
+                    .output_device_id
+                    .as_deref()
+                    .map(|id| devices.iter().any(|d| d.id == id))
+                    .unwrap_or(false),
+            };
+            obj.insert("online".into(), json!(online));
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -599,6 +608,15 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
                 obj.insert("signal_path".into(), json!(signal_path));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                let online = match zone.output_type.as_deref() {
+                    Some("local") | Some("browser") => true,
+                    _ => zone
+                        .output_device_id
+                        .as_deref()
+                        .map(|did| devices.iter().any(|d| d.id == did))
+                        .unwrap_or(false),
+                };
+                obj.insert("online".into(), json!(online));
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
                 if let Some(ref np) = ps.now_playing {
