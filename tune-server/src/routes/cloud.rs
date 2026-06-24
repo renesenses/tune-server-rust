@@ -36,6 +36,9 @@ pub fn router() -> Router<AppState> {
         .route("/license/activate", post(license_activate))
         .route("/license/deactivate", post(license_deactivate))
         .route("/license/validate", post(license_validate))
+        .route("/library-sync/status", get(library_sync_status))
+        .route("/library-sync/trigger", post(library_sync_trigger))
+        .route("/library-sync/full-sync", post(library_sync_full))
 }
 
 // ---------------------------------------------------------------------------

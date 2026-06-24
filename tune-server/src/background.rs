@@ -26,6 +26,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_bio_sync(state);
     spawn_community_sync(state);
     spawn_concert_alerts(state);
+    spawn_cloud_library_sync(state);
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
@@ -604,6 +605,10 @@ fn spawn_community_sync(state: &AppState) {
 
 fn spawn_concert_alerts(state: &AppState) {
     tune_core::cloud::concert_alerts::spawn(state.backend.clone());
+}
+
+fn spawn_cloud_library_sync(state: &AppState) {
+    tune_core::cloud::library_sync::spawn(state.backend.clone(), state.license.clone());
 }
 
 fn spawn_memory_diagnostics(outputs: Arc<tokio::sync::Mutex<OutputRegistry>>) {

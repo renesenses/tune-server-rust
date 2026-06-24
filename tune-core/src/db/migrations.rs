@@ -516,6 +516,22 @@ INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, d
 INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🕺 Soul & Funk', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"soul\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"funk\"}]', 'any', '🕺', '#E67E22', 'Soul, Funk, R&B' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
 ",
     },
+    Migration {
+        version: 42,
+        name: "create_sync_changelog",
+        up: "
+CREATE TABLE IF NOT EXISTS sync_changelog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now')),
+    synced INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sync_changelog_unsynced ON sync_changelog(synced, changed_at);
+CREATE INDEX IF NOT EXISTS idx_sync_changelog_entity ON sync_changelog(entity_type, entity_id);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
