@@ -104,6 +104,10 @@ async fn handle_ssdp_discovered(
         let rc_url = svc_urls
             .get("renderingcontrol")
             .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+        let cm_url = svc_urls
+            .get("connectionmanager")
+            .or_else(|| svc_urls.get("ConnectionManager"))
+            .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
         if let (Some(av), Some(rc)) = (av_url, rc_url) {
             let delay = config.play_delay_for(&dev.name);
             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
@@ -112,6 +116,7 @@ async fn handle_ssdp_discovered(
                 dev.host.clone(),
                 av,
                 rc,
+                cm_url,
             )
             .with_play_delay(delay);
             let mut reg = outputs.lock().await;

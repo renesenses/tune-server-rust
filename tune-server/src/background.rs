@@ -67,12 +67,17 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                         service_urls.get("renderingcontrol"),
                     ) {
                         let base = format!("http://{}:{}", d.host, d.port);
+                        let cm_url = service_urls
+                            .get("connectionmanager")
+                            .or_else(|| service_urls.get("ConnectionManager"))
+                            .map(|p| format!("{base}{p}"));
                         let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                             d.name.clone(),
                             d.id.clone(),
                             d.host.clone(),
                             format!("{base}{av}"),
                             format!("{base}{rc}"),
+                            cm_url,
                         );
                         outputs.register(Box::new(dlna));
                         registered += 1;

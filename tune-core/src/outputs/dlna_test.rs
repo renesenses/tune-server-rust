@@ -150,6 +150,7 @@ mod tests {
             "127.0.0.1".into(),
             format!("{base}/AVTransport"),
             format!("{base}/RenderingControl"),
+            None,
         )
     }
 

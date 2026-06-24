@@ -35,6 +35,9 @@ pub struct DlnaOutput {
     next_item_id_flip: AtomicBool,
     /// Micromega M-One uses a proprietary TCP protocol on port 7000 for volume.
     micromega_ip: Option<String>,
+    /// URL for the ConnectionManager service (used to query GetProtocolInfo).
+    /// Falls back to av_transport_url if not available.
+    connection_manager_url: Option<String>,
 }
 
 impl DlnaOutput {
@@ -44,6 +47,7 @@ impl DlnaOutput {
         host: String,
         av_transport_url: String,
         rendering_control_url: String,
+        connection_manager_url: Option<String>,
     ) -> Self {
         let micromega_ip = if name.to_lowercase().contains("micromega") {
             let ip = host
@@ -81,6 +85,7 @@ impl DlnaOutput {
             play_delay_ms: 0,
             next_item_id_flip: AtomicBool::new(false),
             micromega_ip,
+            connection_manager_url,
         }
     }
 
@@ -266,6 +271,10 @@ impl OutputTarget for DlnaOutput {
 
     fn output_type(&self) -> &str {
         "dlna"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn host(&self) -> Option<&str> {
@@ -473,9 +482,13 @@ impl OutputTarget for DlnaOutput {
 
 impl DlnaOutput {
     pub async fn get_protocol_info(&self) -> Result<Vec<String>, String> {
+        let cm_url = self
+            .connection_manager_url
+            .as_deref()
+            .unwrap_or(&self.av_transport_url);
         let body = self
             .soap_action(
-                &self.av_transport_url,
+                cm_url,
                 "urn:schemas-upnp-org:service:ConnectionManager:1",
                 "GetProtocolInfo",
                 "",
@@ -487,6 +500,35 @@ impl DlnaOutput {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DsdCapability {
+    pub supports_dsf: bool,
+    pub supports_dff: bool,
+}
+
+impl DlnaOutput {
+    pub async fn probe_dsd_support(&self) -> DsdCapability {
+        let protocols = match self.get_protocol_info().await {
+            Ok(p) => p,
+            Err(_) => return DsdCapability::default(),
+        };
+        let mut cap = DsdCapability::default();
+        for proto in &protocols {
+            let lower = proto.to_lowercase();
+            if lower.contains("x-dsd")
+                || lower.contains("audio/dsf")
+                || lower.contains("application/x-dsd")
+            {
+                cap.supports_dsf = true;
+            }
+            if lower.contains("audio/dff") || lower.contains("x-dff") {
+                cap.supports_dff = true;
+            }
+        }
+        cap
     }
 }
 

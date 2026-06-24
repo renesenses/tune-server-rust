@@ -374,6 +374,34 @@ impl ZoneRepo {
             .unwrap_or(true)
     }
 
+    pub fn get_dsd_mode(&self, id: i64) -> String {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!("SELECT COALESCE(dsd_mode, 'auto') FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
+    pub fn update_dsd_mode(&self, id: i64, mode: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("dsd_mode");
+        let params: [&dyn ToSqlValue; 2] = [&mode.to_string(), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "dsd_mode_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);

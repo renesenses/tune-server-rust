@@ -232,6 +232,10 @@ async fn add_device(
                         });
                         let device_id = format!("dlna-{}-{}", host, port);
                         let delay = state.config.play_delay_for(&device_name);
+                        let cm_url = service_urls
+                            .get("connectionmanager")
+                            .or_else(|| service_urls.get("ConnectionManager"))
+                            .map(|p| format!("{base}{p}"));
 
                         let dlna = DlnaOutput::new(
                             device_name.clone(),
@@ -239,6 +243,7 @@ async fn add_device(
                             host.clone(),
                             format!("{base}{av}"),
                             format!("{base}{rc}"),
+                            cm_url,
                         )
                         .with_play_delay(delay);
 
@@ -348,12 +353,17 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                 if let (Some(av), Some(rc)) = (av_url, rc_url) {
                     let base = format!("http://{}:{}", d.host, d.port);
                     let delay = state.config.play_delay_for(&d.name);
+                    let cm_url = service_urls
+                        .get("connectionmanager")
+                        .or_else(|| service_urls.get("ConnectionManager"))
+                        .map(|p| format!("{base}{p}"));
                     let dlna = DlnaOutput::new(
                         d.name.clone(),
                         d.id.clone(),
                         d.host.clone(),
                         format!("{base}{av}"),
                         format!("{base}{rc}"),
+                        cm_url,
                     )
                     .with_play_delay(delay);
                     outputs.register(Box::new(dlna));

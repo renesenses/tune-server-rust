@@ -55,6 +55,8 @@ struct PatchZone {
     fixed_volume: Option<bool>,
     /// When enabled, automatically generates and queues similar tracks when the queue ends.
     autoplay_enabled: Option<bool>,
+    /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
+    dsd_mode: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -532,6 +534,8 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 build_signal_path(&ps, z, &state.backend, renderer_label, audio_backend);
             obj.insert("signal_path".into(), json!(signal_path));
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
+            let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+            obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
             // Include stream_url for browser playback zones so the web client
             // can feed it to an HTML5 <audio> element.
             if let Some(ref np) = ps.now_playing {
@@ -586,6 +590,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 let signal_path =
                     build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
                 obj.insert("signal_path".into(), json!(signal_path));
+                obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
                 // Include stream_url for browser playback zones so the web client
                 // can feed it to an HTML5 <audio> element.
                 if let Some(ref np) = ps.now_playing {
@@ -670,6 +675,11 @@ async fn patch_zone(
         && let Err(e) = repo.update_autoplay_enabled(id, autoplay)
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Some(ref mode) = body.dsd_mode {
+        if let Err(e) = repo.update_dsd_mode(id, mode) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
     }
     get_zone(State(state), Path(id)).await.into_response()
 }
@@ -802,12 +812,23 @@ async fn register_dlna_output_from_device(
     let rc_url = svc_urls
         .get("renderingcontrol")
         .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+    let cm_url = svc_urls
+        .get("connectionmanager")
+        .or_else(|| svc_urls.get("ConnectionManager"))
+        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
 
     // If cached service URLs are available, use them
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
         let delay = state.config.play_delay_for(&dev.name);
-        let dlna = DlnaOutput::new(dev.name.clone(), dev.id.clone(), dev.host.clone(), av, rc)
-            .with_play_delay(delay);
+        let dlna = DlnaOutput::new(
+            dev.name.clone(),
+            dev.id.clone(),
+            dev.host.clone(),
+            av,
+            rc,
+            cm_url,
+        )
+        .with_play_delay(delay);
         let mut outputs = state.outputs.lock().await;
         outputs.register(Box::new(dlna));
         info!(name = %dev.name, id = %dev.id, "dlna_output_registered_on_zone_create");
@@ -824,6 +845,10 @@ async fn register_dlna_output_from_device(
                     let rc = service_urls.get("renderingcontrol");
                     if let (Some(av_path), Some(rc_path)) = (av, rc) {
                         let base = format!("http://{}:{}", dev.host, dev.port);
+                        let cm_path = service_urls
+                            .get("connectionmanager")
+                            .or_else(|| service_urls.get("ConnectionManager"))
+                            .map(|p| format!("{base}{p}"));
                         let delay = state.config.play_delay_for(&dev.name);
                         let dlna = DlnaOutput::new(
                             dev.name.clone(),
@@ -831,6 +856,7 @@ async fn register_dlna_output_from_device(
                             dev.host.clone(),
                             format!("{base}{av_path}"),
                             format!("{base}{rc_path}"),
+                            cm_path,
                         )
                         .with_play_delay(delay);
                         let mut outputs = state.outputs.lock().await;

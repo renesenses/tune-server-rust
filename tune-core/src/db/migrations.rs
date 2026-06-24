@@ -496,6 +496,11 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
         name: "add_zones_last_play_state",
         up: "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped';",
     },
+    Migration {
+        version: 40,
+        name: "add_zones_dsd_mode",
+        up: "ALTER TABLE zones ADD COLUMN dsd_mode TEXT DEFAULT 'auto';",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -826,6 +831,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "dsp_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
+    add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");

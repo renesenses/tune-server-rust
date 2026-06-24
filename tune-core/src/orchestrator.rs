@@ -27,6 +27,7 @@ pub struct PlaybackOrchestrator {
     pub event_bus: Option<Arc<EventBus>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
     pub prefetch: Arc<PrefetchEngine>,
+    dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +109,7 @@ impl PlaybackOrchestrator {
             event_bus: None,
             gapless_sessions: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
+            dsd_capabilities: Mutex::new(HashMap::new()),
         }
     }
 
@@ -418,6 +420,40 @@ impl PlaybackOrchestrator {
         })
     }
 
+    async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
+        let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
+        match dsd_mode.as_str() {
+            "pcm" => false,
+            "native" => true,
+            _ => {
+                // Auto mode: probe renderer
+                let mut cache = self.dsd_capabilities.lock().await;
+                if let Some(cap) = cache.get(device_id) {
+                    return cap.supports_dsf || cap.supports_dff;
+                }
+                let cap = {
+                    let outputs = self.outputs.lock().await;
+                    if let Some(output) = outputs.get(device_id) {
+                        let locked = output.lock().await;
+                        if let Some(dlna) = locked
+                            .as_any()
+                            .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                        {
+                            dlna.probe_dsd_support().await
+                        } else {
+                            crate::outputs::dlna::DsdCapability::default()
+                        }
+                    } else {
+                        crate::outputs::dlna::DsdCapability::default()
+                    }
+                };
+                let result = cap.supports_dsf || cap.supports_dff;
+                cache.insert(device_id.to_string(), cap);
+                result
+            }
+        }
+    }
+
     async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         if let Some(ref source) = req.source
             && source != "local"
@@ -626,7 +662,21 @@ impl PlaybackOrchestrator {
                 | Some("bluos")
                 | Some("squeezebox")
         );
+
+        // DSD native passthrough: skip transcode when the renderer supports DSD natively.
+        let dsd_passthrough = if source_format == Some(AudioFormat::Dsd) && is_network_output {
+            let did = req
+                .output_device_id
+                .as_deref()
+                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                .unwrap_or("");
+            self.should_dsd_passthrough(req.zone_id, did).await
+        } else {
+            false
+        };
+
         let needs_transcode_for_output = is_network_output
+            && !dsd_passthrough
             && source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());

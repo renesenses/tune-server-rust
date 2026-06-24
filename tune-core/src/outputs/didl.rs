@@ -27,6 +27,9 @@ pub fn dlna_flags_for_mime(mime: &str) -> &'static str {
         "audio/mp4" | "audio/aac" => {
             "DLNA.ORG_PN=AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
         }
+        "application/x-dsd" | "audio/x-dsd" | "audio/dsf" | "audio/dff" | "audio/x-dff" => {
+            "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        }
         _ => "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
     }
 }
