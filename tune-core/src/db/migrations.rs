@@ -501,6 +501,21 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
         name: "add_zones_dsd_mode",
         up: "ALTER TABLE zones ADD COLUMN dsd_mode TEXT DEFAULT 'auto';",
     },
+    Migration {
+        version: 41,
+        name: "seed_default_smart_collections",
+        up: "
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '💎 Audiophile', '[{\"field\":\"sample_rate\",\"operator\":\"greater_than\",\"value\":\"96000\"}]', 'all', '💎', '#9B59B6', 'Enregistrements haute résolution' WHERE NOT EXISTS (SELECT 1 FROM smart_collections);
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🎬 Bandes Originales', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"soundtrack\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"Stage\"}]', 'any', '🎬', '#C0392B', 'Bandes originales de films' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🎻 Classique', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"classical\"}]', 'all', '🎻', '#6B6ED9', 'Musique classique et orchestrale' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🎧 Electro & Ambient', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"electro\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"ambient\"}]', 'any', '🎧', '#00CED1', 'Électronique et ambient' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🇫🇷 French Touch', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"chanson\"}]', 'all', '🇫🇷', '#2060B8', 'Chanson française' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🎷 Jazz', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"jazz\"}]', 'all', '🎷', '#E8A838', 'Tous les albums de jazz' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🎸 Rock', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"rock\"}]', 'all', '🎸', '#E04040', 'Rock, alt-rock, prog-rock' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '💿 SACD / DSD', '[{\"field\":\"format\",\"operator\":\"equals\",\"value\":\"dsd\"}]', 'all', '💿', '#C0C0C0', 'Super Audio CD et DSD' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) SELECT '🕺 Soul & Funk', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"soul\"},{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"funk\"}]', 'any', '🕺', '#E67E22', 'Soul, Funk, R&B' WHERE NOT EXISTS (SELECT 1 FROM smart_collections WHERE name LIKE '%Audiophile%');
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
