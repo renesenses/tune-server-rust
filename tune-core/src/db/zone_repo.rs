@@ -75,7 +75,7 @@ pub mod sql {
 
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE zones SET is_hidden = 1 WHERE id = {}",
+            "UPDATE zones SET is_hidden = 1, output_device_id = NULL WHERE id = {}",
             d.placeholder(1)
         )
     }

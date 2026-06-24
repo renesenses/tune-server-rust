@@ -162,6 +162,14 @@ pub fn router() -> Router<AppState> {
         )
         // Concert alerts — upcoming concerts for library artists
         .route("/concerts", get(concerts_handler))
+        // Weekly digest — new releases from library artists
+        .route("/new-releases", get(new_releases_handler))
+        // AI Recommendations — discover new music based on library
+        .route("/recommendations", get(recommendations_handler))
+        .route(
+            "/recommendations/generate",
+            post(recommendations_generate_handler),
+        )
 }
 
 /// GET /system/concerts — upcoming concerts for artists in the local library.
@@ -179,6 +187,65 @@ async fn concerts_handler(
     {
         Ok(concerts) => axum::Json(serde_json::json!({"concerts": concerts})),
         Err(e) => axum::Json(serde_json::json!({"concerts": [], "error": e})),
+    }
+}
+
+/// GET /system/new-releases — new album releases from library artists (digest).
+async fn new_releases_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let instance_id = SettingsRepo::with_backend(state.backend.clone())
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    match tune_core::cloud::digest::get_new_releases(&state.http_client, &instance_id).await {
+        Ok(releases) => axum::Json(serde_json::json!({"releases": releases})),
+        Err(e) => axum::Json(serde_json::json!({"releases": [], "error": e})),
+    }
+}
+
+/// GET /system/recommendations — get cached recommendations from cloud.
+async fn recommendations_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let instance_id = SettingsRepo::with_backend(state.backend.clone())
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    match tune_core::cloud::recommendations::get_recommendations(&state.http_client, &instance_id)
+        .await
+    {
+        Ok(recs) => axum::Json(serde_json::json!({"recommendations": recs})),
+        Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
+    }
+}
+
+/// POST /system/recommendations/generate — trigger recommendation generation.
+async fn recommendations_generate_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let instance_id = SettingsRepo::with_backend(state.backend.clone())
+        .get("instance_id")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    match tune_core::cloud::recommendations::generate_recommendations(
+        &state.backend,
+        &state.http_client,
+        &instance_id,
+    )
+    .await
+    {
+        Ok(recs) => axum::Json(serde_json::json!({
+            "recommendations": recs,
+            "count": recs.len(),
+        })),
+        Err(e) => axum::Json(serde_json::json!({"recommendations": [], "error": e})),
     }
 }
 

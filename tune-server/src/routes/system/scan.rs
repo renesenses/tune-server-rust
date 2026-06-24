@@ -726,7 +726,11 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                  PRAGMA wal_checkpoint(PASSIVE);",
             ).ok();
             tracing::info!("post_scan_fts_rebuilt");
+
         }
+
+        // Populate cloud sync changelog with all new/updated entities
+        tune_core::cloud::library_sync::populate_changelog_after_scan(&db);
 
         let settings = SettingsRepo::with_backend(db.clone());
         if let Err(e) = settings.set("scan_status", "idle") {

@@ -915,3 +915,178 @@ async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
     }))
     .into_response()
 }
+
+// ---------------------------------------------------------------------------
+// Cloud Library Sync
+// ---------------------------------------------------------------------------
+
+/// GET /cloud/library-sync/status — returns pending count, last sync time, enabled state.
+async fn library_sync_status(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let pending = tune_core::cloud::library_sync::pending_count(&state.backend);
+    let last_sync = settings.get("cloud_library_last_sync").ok().flatten();
+    let has_token = settings
+        .get("mozaik_access_token")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let is_premium = state.license.is_premium().await;
+
+    Json(json!({
+        "enabled": is_premium && has_token,
+        "pending": pending,
+        "last_sync": last_sync,
+        "is_premium": is_premium,
+        "has_token": has_token,
+    }))
+}
+
+/// POST /cloud/library-sync/trigger — triggers immediate sync (premium only).
+async fn library_sync_trigger(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::CloudBackup,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let token = match settings.get("mozaik_access_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error": "No Mozaik access token — log in via SSO first"})),
+            )
+                .into_response();
+        }
+    };
+
+    if server_id.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error": "No server_id configured"})),
+        )
+            .into_response();
+    }
+
+    let pending = tune_core::cloud::library_sync::pending_count(&state.backend);
+    if pending == 0 {
+        return Json(json!({
+            "status": "nothing_to_sync",
+            "pending": 0,
+        }))
+        .into_response();
+    }
+
+    // Spawn the sync in the background so the request returns immediately
+    let backend = state.backend.clone();
+    let http_client = state.http_client.clone();
+    tokio::spawn(async move {
+        match tune_core::cloud::library_sync::push_changes(
+            &backend,
+            &http_client,
+            &server_id,
+            &token,
+        )
+        .await
+        {
+            Ok(report) => {
+                let settings = SettingsRepo::with_backend(backend.clone());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string();
+                settings.set("cloud_library_last_sync", &now).ok();
+                info!(
+                    tracks = report.tracks_synced,
+                    albums = report.albums_synced,
+                    artists = report.artists_synced,
+                    "cloud_library_sync_triggered_complete"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "cloud_library_sync_triggered_failed");
+            }
+        }
+    });
+
+    Json(json!({
+        "status": "sync_triggered",
+        "pending": pending,
+    }))
+    .into_response()
+}
+
+/// POST /cloud/library-sync/full-sync — queues a full library resync (premium only).
+async fn library_sync_full(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::CloudBackup,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+    let token = match settings.get("mozaik_access_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                Json(json!({"error": "No Mozaik access token — log in via SSO first"})),
+            )
+                .into_response();
+        }
+    };
+
+    if server_id.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({"error": "No server_id configured"})),
+        )
+            .into_response();
+    }
+
+    // Spawn the full sync in the background
+    let backend = state.backend.clone();
+    let http_client = state.http_client.clone();
+    tokio::spawn(async move {
+        match tune_core::cloud::library_sync::full_sync(&backend, &http_client, &server_id, &token)
+            .await
+        {
+            Ok(report) => {
+                let settings = SettingsRepo::with_backend(backend.clone());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string();
+                settings.set("cloud_library_last_sync", &now).ok();
+                info!(
+                    tracks = report.tracks_synced,
+                    albums = report.albums_synced,
+                    artists = report.artists_synced,
+                    errors = report.errors.len(),
+                    "cloud_library_full_sync_triggered_complete"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "cloud_library_full_sync_triggered_failed");
+            }
+        }
+    });
+
+    Json(json!({
+        "status": "full_sync_queued",
+        "message": "Full library sync has been queued in the background",
+    }))
+    .into_response()
+}

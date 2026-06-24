@@ -587,6 +587,9 @@ pub(super) async fn update_album(
         if let Ok(Some(artist)) = artist_repo.get_by_name(name) {
             album.artist_id = artist.id;
             album.artist_name = Some(artist.name);
+        } else if let Ok(artist) = artist_repo.get_or_create(name, None, None) {
+            album.artist_id = artist.id;
+            album.artist_name = Some(artist.name);
         }
     }
 
