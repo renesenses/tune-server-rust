@@ -6,6 +6,7 @@ mod database;
 mod diagnostics;
 mod enrich;
 mod import;
+mod playlist_hub;
 mod plugins;
 mod remote;
 mod scan;
@@ -13,7 +14,7 @@ mod tags;
 mod update;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -148,6 +149,17 @@ pub fn router() -> Router<AppState> {
         .route("/convert", post(convert::convert_track))
         .route("/convert/{job_id}", get(convert::convert_status))
         .route("/convert/{job_id}/download", get(convert::convert_download))
+        // Playlist Hub — cloud-based cross-service playlist manager
+        .route("/playlist-hub/backup", post(playlist_hub::backup))
+        .route("/playlist-hub", get(playlist_hub::list_playlists))
+        .route(
+            "/playlist-hub/{hub_id}",
+            get(playlist_hub::get_playlist).delete(playlist_hub::delete_playlist),
+        )
+        .route(
+            "/playlist-hub/{hub_id}/transfer",
+            post(playlist_hub::transfer),
+        )
         // Concert alerts — upcoming concerts for library artists
         .route("/concerts", get(concerts_handler))
 }
