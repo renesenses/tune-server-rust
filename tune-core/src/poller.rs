@@ -959,12 +959,15 @@ impl PositionPoller {
                             .map(|z| z.gapless_enabled)
                             .unwrap_or(true);
                         if gapless_enabled {
-                            self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                            ps.gapless_sent_at = Some(Instant::now());
+                            let ok = self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                            if ok {
+                                ps.gapless_sent_at = Some(Instant::now());
+                                ps.gapless_sent = true;
+                            }
                         } else {
                             debug!(zone_id, "gapless_disabled_for_zone");
+                            ps.gapless_sent = true;
                         }
-                        ps.gapless_sent = true;
                     }
 
                     // Position-based end-of-track detection: when the output
@@ -1170,9 +1173,9 @@ impl PositionPoller {
         zone_id: i64,
         zone_state: &crate::playback::ZoneState,
         device_id: &str,
-    ) {
+    ) -> bool {
         let Some(next_pos) = Self::next_position(zone_state) else {
-            return;
+            return false;
         };
 
         match self
@@ -1208,12 +1211,19 @@ impl PositionPoller {
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         debug!(zone_id, error = %e, "gapless_set_next_failed");
+                        false
                     } else {
                         info!(zone_id, title = %resolved.title, "gapless_next_set");
+                        true
                     }
+                } else {
+                    false
                 }
             }
-            Err(e) => debug!(zone_id, error = %e, "gapless_resolve_failed"),
+            Err(e) => {
+                debug!(zone_id, error = %e, "gapless_resolve_failed");
+                false
+            }
         }
     }
 

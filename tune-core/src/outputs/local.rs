@@ -911,6 +911,16 @@ impl OutputTarget for LocalOutput {
         "local"
     }
 
+    async fn set_next_url(
+        &self,
+        _url: &str,
+        _mime_type: &str,
+        _title: Option<&str>,
+        _artist: Option<&str>,
+    ) -> Result<(), String> {
+        Err("local output does not support gapless set_next".into())
+    }
+
     async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
         let result = self
             .play_url(media.url, media.mime_type, media.title, media.artist)
