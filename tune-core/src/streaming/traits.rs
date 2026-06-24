@@ -341,7 +341,6 @@ mod tests {
             year: Some(1959),
             track_count: 5,
             quality: None,
-            ..Default::default()
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["source_id"], "789");
