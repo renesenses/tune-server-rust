@@ -144,6 +144,7 @@ struct RepeatQuery {
 struct QueueAddRequest {
     #[serde(default)]
     track_ids: Vec<i64>,
+    track_id: Option<i64>,
     position: Option<i64>,
     // Streaming track fields (single)
     source: Option<String>,
@@ -1202,14 +1203,18 @@ async fn queue_add(
     }
 
     // --- Local tracks ---
-    if body.track_ids.is_empty() {
+    let mut ids = body.track_ids;
+    if let Some(single) = body.track_id {
+        ids.push(single);
+    }
+    if ids.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            "track_ids, source+source_id, or tracks[] required".to_string(),
+            "track_ids, track_id, source+source_id, or tracks[] required".to_string(),
         )
             .into_response();
     }
-    match queue_repo.add_tracks(zone_id, &body.track_ids, body.position) {
+    match queue_repo.add_tracks(zone_id, &ids, body.position) {
         Ok(_) => {
             let new_length = queue_repo.count(zone_id).unwrap_or(0);
             let current_pos = state.playback.get_state(zone_id).await.queue_position;
@@ -1220,7 +1225,7 @@ async fn queue_add(
             persist_queue_async(&state, zone_id);
             (
                 StatusCode::CREATED,
-                Json(json!({ "added": body.track_ids.len(), "queue_length": new_length })),
+                Json(json!({ "added": ids.len(), "queue_length": new_length })),
             )
                 .into_response()
         }

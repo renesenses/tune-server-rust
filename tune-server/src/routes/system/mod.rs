@@ -1,6 +1,7 @@
 mod admin;
 mod backup;
 mod config;
+mod convert;
 mod database;
 mod diagnostics;
 mod enrich;
@@ -143,6 +144,10 @@ pub fn router() -> Router<AppState> {
             "/settings/prefetch",
             get(config::get_prefetch).put(config::set_prefetch),
         )
+        // Cloud audio format conversion
+        .route("/convert", post(convert::convert_track))
+        .route("/convert/{job_id}", get(convert::convert_status))
+        .route("/convert/{job_id}/download", get(convert::convert_download))
 }
 
 /// Helper used by multiple sub-modules to get the configured music directories.

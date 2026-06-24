@@ -288,7 +288,7 @@ pub fn decode_to_pcm_streaming(
     target_channels: Option<u32>,
     tx: mpsc::Sender<Vec<u8>>,
     chunk_size: usize,
-) -> Result<u16, String> {
+) -> Result<(u16, u32), String> {
     decode_to_pcm_streaming_inner(
         file_path,
         target_sample_rate,
@@ -689,7 +689,7 @@ fn decode_to_pcm_streaming_inner(
         "decoded_symphonia_streaming"
     );
 
-    Ok(output_bd)
+    Ok((output_bd, source_rate))
 }
 
 /// Extract a human-readable message from a panic payload.
