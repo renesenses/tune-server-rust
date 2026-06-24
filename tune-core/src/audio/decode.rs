@@ -488,6 +488,7 @@ fn decode_to_pcm_streaming_inner(
     // This avoids sending tiny per-packet buffers over the channel.
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
     let mut total_samples: usize = 0;
+    let mut decode_errors: usize = 0;
 
     loop {
         let packet = match format.next_packet() {
@@ -496,9 +497,13 @@ fn decode_to_pcm_streaming_inner(
             Err(symphonia::core::errors::Error::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
+                debug!(file = file_path, total_samples, "streaming_decode_eof");
                 break;
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_packet_error");
+                break;
+            }
         };
 
         if packet.track_id != track_id {
@@ -507,7 +512,13 @@ fn decode_to_pcm_streaming_inner(
 
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
-            Err(_) => continue,
+            Err(e) => {
+                decode_errors += 1;
+                if decode_errors <= 3 {
+                    tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_frame_error");
+                }
+                continue;
+            }
         };
 
         let mut packet_samples: Vec<i32> = Vec::new();
