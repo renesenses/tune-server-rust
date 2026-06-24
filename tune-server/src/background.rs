@@ -344,12 +344,16 @@ fn spawn_telemetry_reporter(state: &AppState) {
 
 /// Lightweight heartbeat — runs ALWAYS regardless of TUNE_TELEMETRY.
 /// Sends a minimal ping every 5 minutes to mozaiklabs.fr so the admin
-/// can see all running instances in real-time.
+/// can see all running instances in real-time.  Also carries license_key
+/// and hardware_fingerprint so the server can validate the license and
+/// return tier / expiry information.
 fn spawn_heartbeat(state: &AppState) {
     let backend = state.backend.clone();
     let services = state.services.clone();
     let outputs = state.outputs.clone();
     let started_at = state.started_at;
+    let license = state.license.clone();
+    let event_bus = state.event_bus.clone();
     tokio::spawn(async move {
         // Let startup finish before the first heartbeat
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -450,6 +454,10 @@ fn spawn_heartbeat(state: &AppState) {
                 Err(_) => Vec::new(),
             };
 
+            // Include license info so the server can validate and respond
+            // with the authoritative tier / expiry.
+            let ls = license.license_state().await;
+
             let payload = serde_json::json!({
                 "instance_id": instance_id,
                 "version": tune_core::version(),
@@ -460,6 +468,8 @@ fn spawn_heartbeat(state: &AppState) {
                 "hostname": hostname,
                 "services": authenticated_services,
                 "devices": devices,
+                "license_key": ls.license_key,
+                "hardware_fingerprint": ls.hardware_fingerprint,
             });
 
             // Update server_last_alive_at timestamp for crash detection
@@ -484,6 +494,54 @@ fn spawn_heartbeat(state: &AppState) {
             {
                 Ok(resp) if resp.status().is_success() => {
                     debug!(instance_id = %instance_id, tracks, uptime_s, "heartbeat_sent");
+
+                    // Parse license validation data from the response body.
+                    // The server may or may not include license fields — if
+                    // absent (old server, 204, empty body, etc.) we keep the
+                    // cached state unchanged.
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Some(tier_str) = body.get("license_tier").and_then(|v| v.as_str()) {
+                            let valid = body
+                                .get("license_valid")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+
+                            if !valid {
+                                // Server explicitly says the license is invalid.
+                                info!("license_invalidated_by_server");
+                                license
+                                    .update_from_server(tune_core::license::Tier::Free, None)
+                                    .await;
+                                event_bus.emit(
+                                    "license.updated",
+                                    serde_json::json!({
+                                        "tier": "free",
+                                        "expires_at": null,
+                                    }),
+                                );
+                            } else {
+                                let tier = match tier_str {
+                                    "premium" => tune_core::license::Tier::Premium,
+                                    _ => tune_core::license::Tier::Free,
+                                };
+                                let expires_at = body
+                                    .get("license_expires_at")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                license.update_from_server(tier, expires_at.clone()).await;
+                                info!(tier = %tier, "license_validated_from_heartbeat");
+                                event_bus.emit(
+                                    "license.updated",
+                                    serde_json::json!({
+                                        "tier": tier,
+                                        "expires_at": expires_at,
+                                    }),
+                                );
+                            }
+                        }
+                        // else: no license fields in response — keep cached state.
+                    }
                 }
                 Ok(resp) => {
                     debug!(status = %resp.status(), "heartbeat_rejected");

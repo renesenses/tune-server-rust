@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/license/status", get(license_status))
         .route("/license/activate", post(license_activate))
         .route("/license/deactivate", post(license_deactivate))
+        .route("/license/validate", post(license_validate))
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +753,10 @@ async fn license_activate(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
     let ls = state.license.license_state().await;
+    state.event_bus.emit(
+        "license.updated",
+        json!({"tier": ls.tier, "expires_at": ls.expires_at}),
+    );
     Json(json!({
         "status": "activated",
         "tier": ls.tier,
@@ -762,5 +767,151 @@ async fn license_activate(
 
 async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
     state.license.clear_license().await;
+    state.event_bus.emit(
+        "license.updated",
+        json!({"tier": "free", "expires_at": null}),
+    );
     Json(json!({"status": "deactivated", "tier": "free"}))
+}
+
+/// POST /cloud/license/validate
+///
+/// Triggers an immediate license validation against mozaiklabs.fr.
+/// Returns the authoritative tier from the server, or the cached state
+/// if the server is unreachable (graceful degradation).
+async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
+    let ls = state.license.license_state().await;
+    let Some(ref key) = ls.license_key else {
+        return Json(json!({
+            "status": "no_license",
+            "tier": "free",
+            "message": "No license key configured",
+        }))
+        .into_response();
+    };
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
+
+    let payload = json!({
+        "license_key": key,
+        "hardware_fingerprint": ls.hardware_fingerprint,
+        "server_id": server_id,
+        "version": tune_core::version(),
+    });
+
+    let resp = match state
+        .http_client
+        .post("https://mozaiklabs.fr/api/v1/license/validate")
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "license_validate_request_failed");
+            return Json(json!({
+                "status": "error",
+                "tier": ls.tier,
+                "message": format!("Validation request failed: {e}"),
+                "cached": true,
+            }))
+            .into_response();
+        }
+    };
+
+    // 404 means the server endpoint doesn't exist yet — keep cached state.
+    if resp.status() == StatusCode::NOT_FOUND {
+        info!("license_validate_endpoint_not_found, keeping cached state");
+        return Json(json!({
+            "status": "cached",
+            "tier": ls.tier,
+            "message": "Validation endpoint not available yet",
+            "cached": true,
+        }))
+        .into_response();
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        warn!(status = %status, "license_validate_server_error");
+        return Json(json!({
+            "status": "error",
+            "tier": ls.tier,
+            "message": format!("Server returned {status}"),
+            "cached": true,
+        }))
+        .into_response();
+    }
+
+    // Parse the server's authoritative response.
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "license_validate_parse_failed");
+            return Json(json!({
+                "status": "error",
+                "tier": ls.tier,
+                "message": format!("Failed to parse response: {e}"),
+                "cached": true,
+            }))
+            .into_response();
+        }
+    };
+
+    let valid = body
+        .get("license_valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    if !valid {
+        info!("license_invalidated_by_server_validate");
+        state
+            .license
+            .update_from_server(tune_core::license::Tier::Free, None)
+            .await;
+        state.event_bus.emit(
+            "license.updated",
+            json!({"tier": "free", "expires_at": null}),
+        );
+        return Json(json!({
+            "status": "invalid",
+            "tier": "free",
+            "message": "License key is not valid",
+        }))
+        .into_response();
+    }
+
+    let tier_str = body
+        .get("license_tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("free");
+    let tier = match tier_str {
+        "premium" => tune_core::license::Tier::Premium,
+        _ => tune_core::license::Tier::Free,
+    };
+    let expires_at = body
+        .get("license_expires_at")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    state
+        .license
+        .update_from_server(tier, expires_at.clone())
+        .await;
+    info!(tier = %tier, "license_validated_on_demand");
+    state.event_bus.emit(
+        "license.updated",
+        json!({"tier": tier, "expires_at": expires_at}),
+    );
+
+    let updated = state.license.license_state().await;
+    Json(json!({
+        "status": "validated",
+        "tier": updated.tier,
+        "expires_at": updated.expires_at,
+        "last_validated": updated.last_validated,
+    }))
+    .into_response()
 }

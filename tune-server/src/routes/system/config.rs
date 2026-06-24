@@ -158,7 +158,8 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
             .is_some_and(|s| !s.is_empty());
     config.insert("discogs_token_set".to_string(), json!(discogs_token_set));
     // Premium licensing info
-    let premium_tier = state.license.tier().await;
+    let license_state = state.license.license_state().await;
+    let premium_tier = license_state.tier;
     let zone_limit = if premium_tier == tune_core::license::Tier::Premium {
         serde_json::Value::Null
     } else {
@@ -174,12 +175,23 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         let enabled = state.license.check_feature(*f).await;
         premium_features.insert(key, json!(enabled));
     }
+    // Masked license key: show only the last 4 characters.
+    let license_key_masked = license_state.license_key.as_deref().map(|k| {
+        if k.len() <= 4 {
+            k.to_string()
+        } else {
+            let visible = &k[k.len() - 4..];
+            let masked = "*".repeat(k.len() - 4);
+            format!("{masked}{visible}")
+        }
+    });
     config.insert("premium_tier".to_string(), json!(premium_tier));
     config.insert(
         "premium_features".to_string(),
         Value::Object(premium_features),
     );
     config.insert("zone_limit".to_string(), zone_limit);
+    config.insert("license_key_masked".to_string(), json!(license_key_masked));
     Json(Value::Object(config))
 }
 
