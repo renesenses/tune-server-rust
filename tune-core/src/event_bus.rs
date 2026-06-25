@@ -55,6 +55,14 @@ impl EventBus {
         });
     }
 
+    /// Emit using the typed [`EventType`] taxonomy. Preferred over [`emit`]
+    /// for new events: the event name is compile-checked against the enum
+    /// rather than a free-form string, while staying wire-compatible (it
+    /// resolves to the same canonical dotted name via [`EventType::as_str`]).
+    pub fn emit_typed(&self, event_type: crate::event_types::EventType, data: Value) {
+        self.emit(event_type.as_str(), data);
+    }
+
     /// Create a new receiver that will receive all future events.
     pub fn subscribe(&self) -> broadcast::Receiver<TuneEvent> {
         self.tx.subscribe()

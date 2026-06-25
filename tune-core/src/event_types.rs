@@ -32,6 +32,44 @@ pub enum EventType {
     Error,
 }
 
+impl EventType {
+    /// Canonical dotted name used on the wire (event_bus `event_type` and the
+    /// WebSocket `type` field). These strings are part of the client contract —
+    /// keep them stable. New events should be added here so emitters reference
+    /// the enum (compile-checked) instead of free-form strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::PlaybackStarted => "playback.started",
+            EventType::PlaybackStopped => "playback.stopped",
+            EventType::PlaybackPaused => "playback.paused",
+            EventType::PlaybackResumed => "playback.resumed",
+            EventType::TrackChanged => "playback.track_changed",
+            EventType::VolumeChanged => "playback.volume",
+            EventType::QueueChanged => "playback.queue.changed",
+            EventType::SeekChanged => "playback.seek",
+            EventType::ShuffleChanged => "playback.shuffle",
+            EventType::RepeatChanged => "playback.repeat",
+            EventType::DeviceDiscovered => "device.discovered",
+            EventType::DeviceLost => "device.lost",
+            EventType::ScanStarted => "library.scan.started",
+            EventType::ScanProgress => "library.scan.progress",
+            EventType::ScanComplete => "library.scan.completed",
+            EventType::LibraryTrackAdded => "library.track.added",
+            EventType::LibraryTrackRemoved => "library.track.removed",
+            EventType::LibraryTrackUpdated => "library.track.updated",
+            EventType::ZoneCreated => "zone.created",
+            EventType::ZoneDeleted => "zone.deleted",
+            EventType::ZoneUpdated => "zone.updated",
+            EventType::ProfileSwitched => "profile.switched",
+            EventType::PartyTrackAdded => "party.track_added",
+            EventType::PartyVote => "party.vote",
+            EventType::ServiceConnected => "service.connected",
+            EventType::ServiceDisconnected => "service.disconnected",
+            EventType::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypedEvent {
     pub event_type: EventType,
@@ -229,5 +267,53 @@ mod tests {
             EventType::Error,
         ];
         assert_eq!(types.len(), 10);
+    }
+
+    #[test]
+    fn as_str_matches_wire_contract() {
+        // These strings are consumed by existing clients — they must not drift.
+        assert_eq!(EventType::ZoneDeleted.as_str(), "zone.deleted");
+        assert_eq!(EventType::ScanComplete.as_str(), "library.scan.completed");
+        assert_eq!(EventType::ScanProgress.as_str(), "library.scan.progress");
+        assert_eq!(EventType::DeviceLost.as_str(), "device.lost");
+        assert_eq!(EventType::VolumeChanged.as_str(), "playback.volume");
+    }
+
+    #[test]
+    fn as_str_is_unique_per_variant() {
+        let all = [
+            EventType::PlaybackStarted,
+            EventType::PlaybackStopped,
+            EventType::PlaybackPaused,
+            EventType::PlaybackResumed,
+            EventType::TrackChanged,
+            EventType::VolumeChanged,
+            EventType::QueueChanged,
+            EventType::SeekChanged,
+            EventType::ShuffleChanged,
+            EventType::RepeatChanged,
+            EventType::DeviceDiscovered,
+            EventType::DeviceLost,
+            EventType::ScanStarted,
+            EventType::ScanProgress,
+            EventType::ScanComplete,
+            EventType::LibraryTrackAdded,
+            EventType::LibraryTrackRemoved,
+            EventType::LibraryTrackUpdated,
+            EventType::ZoneCreated,
+            EventType::ZoneDeleted,
+            EventType::ZoneUpdated,
+            EventType::ProfileSwitched,
+            EventType::PartyTrackAdded,
+            EventType::PartyVote,
+            EventType::ServiceConnected,
+            EventType::ServiceDisconnected,
+            EventType::Error,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|e| e.as_str()).collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "duplicate wire name in EventType::as_str");
     }
 }

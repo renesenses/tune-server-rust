@@ -942,7 +942,10 @@ async fn delete_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl
     let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.delete(id) {
         Ok(_) => {
-            state.event_bus.emit("zone.deleted", json!({"id": id}));
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneDeleted,
+                json!({"id": id}),
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
