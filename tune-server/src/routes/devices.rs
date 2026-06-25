@@ -243,6 +243,10 @@ pub async fn register_manual_device(
             state.outputs.lock().await.register(Box::new(bluos));
 
             let zone_id = ensure_zone(state, &device_name, "bluos", &device_id);
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::DeviceDiscovered,
+                json!({ "device_id": device_id, "name": device_name, "device_type": "bluos", "host": dev.host }),
+            );
             info!(name = %device_name, id = %device_id, host = %dev.host, port = dev.port, "manual_bluos_device_registered");
             Ok((device_id, device_name, zone_id))
         }
@@ -294,6 +298,10 @@ pub async fn register_manual_device(
             state.outputs.lock().await.register(Box::new(dlna));
 
             let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::DeviceDiscovered,
+                json!({ "device_id": device_id, "name": device_name, "device_type": "dlna", "host": dev.host }),
+            );
             info!(name = %device_name, id = %device_id, host = %dev.host, port = dev.port, "manual_dlna_device_registered");
             Ok((device_id, device_name, zone_id))
         }
@@ -741,6 +749,10 @@ async fn delete_device(
     drop(outputs);
     // Also drop it from persistence so it isn't re-registered on next startup.
     forget_manual_device(&state, &device_id);
+    state.event_bus.emit_typed(
+        tune_core::event_types::EventType::DeviceLost,
+        json!({ "device_id": device_id }),
+    );
     StatusCode::NO_CONTENT
 }
 
