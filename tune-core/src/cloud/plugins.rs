@@ -5,11 +5,21 @@ const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplacePlugin {
+    pub slug: String,
     pub name: String,
-    pub version: String,
     pub description: String,
+    pub version: String,
     pub author: String,
+    /// `None` means free plugin.
+    pub price: Option<f64>,
+    pub category: String,
     pub downloads: u64,
+    pub rating: f64,
+    #[serde(default)]
+    pub installed: bool,
+    pub installed_version: Option<String>,
+    /// Legacy field kept for backward compat.
+    #[serde(default)]
     pub votes: i64,
     pub download_url: Option<String>,
 }
@@ -28,9 +38,9 @@ impl PluginMarketplace {
         }
     }
 
-    /// List available plugins from the marketplace.
+    /// List available plugins from the marketplace catalog.
     pub async fn list(&self) -> Vec<MarketplacePlugin> {
-        let url = format!("{}/api/v1/plugins", self.base_url);
+        let url = format!("{}/api/v1/plugins/catalog", self.base_url);
         let client = crate::http::client::shared();
 
         match client.get(&url).send().await {
@@ -42,6 +52,28 @@ impl PluginMarketplace {
             Err(e) => {
                 debug!(error = %e, "marketplace_list_request_failed");
                 vec![]
+            }
+        }
+    }
+
+    /// Fetch detail for a single marketplace plugin by slug.
+    pub async fn detail(&self, slug: &str) -> Option<MarketplacePlugin> {
+        let url = format!(
+            "{}/api/v1/plugins/catalog/{}",
+            self.base_url,
+            urlencoding::encode(slug)
+        );
+        let client = crate::http::client::shared();
+
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
+            Ok(resp) => {
+                debug!(slug, status = %resp.status(), "marketplace_detail_failed");
+                None
+            }
+            Err(e) => {
+                debug!(slug, error = %e, "marketplace_detail_request_failed");
+                None
             }
         }
     }

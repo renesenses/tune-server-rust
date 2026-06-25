@@ -27,6 +27,7 @@ pub mod library;
 pub mod listenbrainz;
 pub mod listening_stats;
 pub mod lyrics;
+pub mod marketplace;
 pub mod mediasync;
 pub mod metadata;
 pub mod mqa;
@@ -271,6 +272,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/peers", peers::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
+        .nest("/marketplace", marketplace::router())
         .nest("/dj", dj::router())
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())

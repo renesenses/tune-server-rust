@@ -50,6 +50,7 @@ pub enum Feature {
     CloudConfigBackup,
     SocialSharing,
     DeveloperApi,
+    PluginMarketplace,
 }
 
 impl Feature {
@@ -75,6 +76,7 @@ impl Feature {
             Feature::CloudConfigBackup,
             Feature::SocialSharing,
             Feature::DeveloperApi,
+            Feature::PluginMarketplace,
         ]
     }
 
@@ -100,6 +102,7 @@ impl Feature {
             Feature::CloudConfigBackup => "Cloud Config Backup",
             Feature::SocialSharing => "Social Sharing",
             Feature::DeveloperApi => "Developer API",
+            Feature::PluginMarketplace => "Plugin Marketplace",
         }
     }
 }
@@ -427,8 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_nineteen_features() {
-        assert_eq!(Feature::all_premium().len(), 19);
+    fn all_premium_has_twenty_features() {
+        assert_eq!(Feature::all_premium().len(), 20);
     }
 
     #[test]
