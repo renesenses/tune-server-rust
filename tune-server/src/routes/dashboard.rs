@@ -34,11 +34,11 @@ async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
         Err(e) => {
             tracing::warn!(error = %e, "dashboard_stats_error");
             Json(json!({
-            "total_listens": 0,
-            "total_duration_ms": 0,
-            "unique_tracks": 0,
-            "unique_artists": 0,
-        }))
+                "total_listens": 0,
+                "total_duration_ms": 0,
+                "unique_tracks": 0,
+                "unique_artists": 0,
+            }))
         }
     }
 }
