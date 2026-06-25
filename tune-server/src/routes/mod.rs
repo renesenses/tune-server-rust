@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
 pub mod connect;
+pub mod dac_calibration;
 pub mod dashboard;
 pub mod deezer_proxy_handler;
 pub mod developer_api;
@@ -299,6 +300,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/cd-rip", cd_rip::router())
         .nest("/sacd-rip", sacd_rip::router())
         .nest("/hqplayer", hqplayer::router())
+        .nest("/dac-calibration", dac_calibration::router())
         .nest("/room-calibration", room_calibration::router())
         .nest("/room-correction", room_correction::router())
         .nest("/visualizer", visualizer::router())

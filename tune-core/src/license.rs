@@ -52,6 +52,7 @@ pub enum Feature {
     DeveloperApi,
     PluginMarketplace,
     MultiServer,
+    DacCalibration,
 }
 
 impl Feature {
@@ -79,6 +80,7 @@ impl Feature {
             Feature::DeveloperApi,
             Feature::PluginMarketplace,
             Feature::MultiServer,
+            Feature::DacCalibration,
         ]
     }
 
@@ -106,6 +108,7 @@ impl Feature {
             Feature::DeveloperApi => "Developer API",
             Feature::PluginMarketplace => "Plugin Marketplace",
             Feature::MultiServer => "Multi-Server",
+            Feature::DacCalibration => "DAC Calibration",
         }
     }
 }
@@ -433,8 +436,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyone_features() {
-        assert_eq!(Feature::all_premium().len(), 21);
+    fn all_premium_has_twentytwo_features() {
+        assert_eq!(Feature::all_premium().len(), 22);
     }
 
     #[test]

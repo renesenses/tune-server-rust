@@ -13,6 +13,7 @@ pub mod collaborative;
 pub mod config;
 pub mod config_backup;
 pub mod credentials_vault;
+pub mod dac_calibration;
 pub mod dashboard;
 pub mod db;
 pub mod db_backup;
