@@ -62,6 +62,7 @@ pub mod sql {
              LEFT JOIN tracks t ON h.track_id = t.id \
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN albums al2 ON al2.title = h.album_title AND al2.cover_path IS NOT NULL \
+             WHERE h.source != 'radio' \
              GROUP BY h.title, h.artist_name \
              ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
@@ -70,20 +71,20 @@ pub mod sql {
 
     pub fn top_artists<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND source != 'radio' GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn top_albums<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
+            "SELECT album_title, artist_name, COUNT(*) as plays FROM listen_history WHERE album_title IS NOT NULL AND source != 'radio' GROUP BY album_title, artist_name ORDER BY plays DESC LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn dashboard_total_duration() -> &'static str {
-        "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history"
+        "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE source != 'radio'"
     }
 
     pub fn dashboard_unique_tracks() -> &'static str {

@@ -31,12 +31,15 @@ async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
     let repo = HistoryRepo::with_backend(state.backend.clone());
     match repo.dashboard() {
         Ok(s) => Json(json!(s)),
-        Err(_) => Json(json!({
-            "total_listens": 0,
-            "total_duration_ms": 0,
-            "unique_tracks": 0,
-            "unique_artists": 0,
-        })),
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard_stats_error");
+            Json(json!({
+                "total_listens": 0,
+                "total_duration_ms": 0,
+                "unique_tracks": 0,
+                "unique_artists": 0,
+            }))
+        }
     }
 }
 
