@@ -41,11 +41,13 @@ fn default_episode_limit() -> usize {
 }
 #[derive(Deserialize)]
 struct Subscribe {
+    #[serde(default)]
     feed_url: String,
     title: String,
     author: Option<String>,
     image_url: Option<String>,
     description: Option<String>,
+    source_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct PlayEpisodeRequest {
@@ -93,6 +95,36 @@ async fn subscribe(
     Json(body): Json<Subscribe>,
 ) -> impl IntoResponse {
     use tune_core::db::backend::ToSqlValue;
+
+    let feed_url = if body.feed_url.is_empty() {
+        // Top chart podcasts have no feed URL — resolve via iTunes lookup.
+        let apple_id = body
+            .source_id
+            .as_deref()
+            .and_then(|s| s.strip_prefix("apple-"))
+            .unwrap_or("");
+        if apple_id.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "No feed URL and no Apple ID to resolve"})),
+            )
+                .into_response();
+        }
+        let svc = PodcastService::with_client(state.http_client.clone());
+        match svc.resolve_feed_url(apple_id).await {
+            Some(url) => url,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "Could not resolve feed URL from Apple ID"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body.feed_url.clone()
+    };
+
     let sql = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "INSERT INTO podcast_subscriptions (feed_url, title, author, image_url, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (feed_url) DO NOTHING"
     } else {
@@ -101,7 +133,7 @@ async fn subscribe(
     match state.backend.execute(
         sql,
         &[
-            &body.feed_url as &dyn ToSqlValue,
+            &feed_url as &dyn ToSqlValue,
             &body.title as &dyn ToSqlValue,
             &body.author as &dyn ToSqlValue,
             &body.image_url as &dyn ToSqlValue,
@@ -109,10 +141,10 @@ async fn subscribe(
         ],
     ) {
         Ok(_) => {
-            info!(title = %body.title, feed_url = %body.feed_url, "podcast_subscribed");
+            info!(title = %body.title, feed_url = %feed_url, "podcast_subscribed");
             (
                 StatusCode::CREATED,
-                Json(json!({"title": body.title, "feed_url": body.feed_url})),
+                Json(json!({"title": body.title, "feed_url": feed_url})),
             )
                 .into_response()
         }

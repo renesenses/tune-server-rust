@@ -139,7 +139,7 @@ impl PodcastService {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(60))
+                .timeout(Duration::from_secs(10))
                 .user_agent(USER_AGENT)
                 .redirect(reqwest::redirect::Policy::limited(10))
                 .build()
@@ -160,6 +160,22 @@ impl PodcastService {
     ) -> Result<Vec<Podcast>, String> {
         let limit = limit.min(50).max(1);
         let cc = if country.is_empty() { "US" } else { country };
+        let query_lower = query.to_lowercase();
+
+        // Check search cache (5 min TTL).
+        type SearchCache = std::collections::HashMap<String, (Instant, Vec<Podcast>)>;
+        static SEARCH_CACHE: OnceLock<Mutex<SearchCache>> = OnceLock::new();
+        let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let cache_key = format!("{cc}:{query_lower}:{limit}");
+        {
+            let guard = cache.lock().await;
+            if let Some((ts, data)) = guard.get(&cache_key) {
+                if ts.elapsed() < Duration::from_secs(300) {
+                    return Ok(data.clone());
+                }
+            }
+        }
+
         let resp = self
             .client
             .get(ITUNES_SEARCH_URL)
@@ -177,7 +193,7 @@ impl PodcastService {
             .await
             .map_err(|e| format!("podcast parse: {e}"))?;
         let results = data["results"].as_array().cloned().unwrap_or_default();
-        Ok(results
+        let podcasts: Vec<Podcast> = results
             .iter()
             .filter_map(|r| {
                 let feed_url = r["feedUrl"].as_str()?.to_string();
@@ -210,7 +226,18 @@ impl PodcastService {
                     category,
                 })
             })
-            .collect())
+            .collect();
+
+        // Update cache.
+        {
+            let mut guard = cache.lock().await;
+            if guard.len() > 200 {
+                guard.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(300));
+            }
+            guard.insert(cache_key, (Instant::now(), podcasts.clone()));
+        }
+
+        Ok(podcasts)
     }
 
     pub async fn get_episodes(
@@ -362,6 +389,16 @@ impl PodcastService {
     /// Backward-compatible alias — returns the same curated list.
     pub fn radio_france_podcasts() -> Vec<Podcast> {
         Self::curated_french_podcasts()
+    }
+
+    /// Resolve a podcast feed URL from an Apple podcast ID via iTunes lookup.
+    pub async fn resolve_feed_url(&self, apple_id: &str) -> Option<String> {
+        let url = format!("https://itunes.apple.com/lookup?id={apple_id}&entity=podcast");
+        let resp = self.client.get(&url).send().await.ok()?;
+        let data: serde_json::Value = resp.json().await.ok()?;
+        data["results"].as_array()?.first()?["feedUrl"]
+            .as_str()
+            .map(String::from)
     }
 
     // ── Apple Top Podcasts ──────────────────────────────────────────
