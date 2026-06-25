@@ -75,8 +75,10 @@ pub fn spawn_ssdp_handler(
                     let mut reg = outputs.lock().await;
                     reg.remove(&id);
                     set_zone_online(&event_bus, &db, &id, false);
-                    event_bus
-                        .emit_typed(EventType::DeviceLost, serde_json::json!({ "device_id": id }));
+                    event_bus.emit_typed(
+                        EventType::DeviceLost,
+                        serde_json::json!({ "device_id": id }),
+                    );
                     info!(id = %id, "output_removed_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
@@ -511,8 +513,10 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                     reg.remove(&id);
                     drop(reg);
                     set_zone_online(&event_bus, &db, &id, false);
-                    event_bus
-                        .emit_typed(EventType::DeviceLost, serde_json::json!({ "device_id": id }));
+                    event_bus.emit_typed(
+                        EventType::DeviceLost,
+                        serde_json::json!({ "device_id": id }),
+                    );
                     info!(id = %id, "mdns_output_removed_zone_offline");
                 }
             }

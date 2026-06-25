@@ -444,9 +444,9 @@ impl HistoryRepo {
             "AND h.source != 'radio' AND"
         };
         let albums_sql = format!(
-            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays
+            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id
              FROM listen_history h
-             LEFT JOIN albums a ON a.title = h.album_title
+             LEFT JOIN albums a ON LOWER(a.title) = LOWER(h.album_title)
              {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
              GROUP BY h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url)
              ORDER BY plays DESC LIMIT {top_n}",
@@ -460,12 +460,19 @@ impl HistoryRepo {
                 artist_name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 cover_path: cols.get(2).and_then(|v| v.as_string()),
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                album_id: cols.get(4).and_then(|v| v.as_i64()),
             })
             .collect();
 
         // ── Top tracks (exclude radio) ──
         let tracks_sql = format!(
-            "SELECT MAX(lh.track_id), lh.title, lh.artist_name, COUNT(*) as plays,
+            "SELECT COALESCE(MAX(lh.track_id), (
+                        SELECT t3.id FROM tracks t3
+                        WHERE LOWER(t3.title) = LOWER(lh.title)
+                          AND LOWER(COALESCE(t3.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
+                        LIMIT 1
+                    )) as track_id,
+                    lh.title, lh.artist_name, COUNT(*) as plays,
                     CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
                     COALESCE(MAX(lh.cover_url), (
                         SELECT a2.cover_path FROM tracks t2
@@ -500,11 +507,14 @@ impl HistoryRepo {
             "AND source = 'radio' AND"
         };
         let radios_sql = format!(
-            "SELECT title as station_name, COUNT(*) as plays, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as ms,
-                    MAX(cover_url) as cover_url
-             FROM listen_history
-             {simple_where} {radio_and} title IS NOT NULL
-             GROUP BY title ORDER BY plays DESC LIMIT {top_n}"
+            "SELECT lh.title as station_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
+                    MAX(lh.cover_url) as cover_url,
+                    MAX(r.id) as radio_id,
+                    MAX(r.cover_path) as cover_path
+             FROM listen_history lh
+             LEFT JOIN radios r ON LOWER(r.name) = LOWER(lh.title)
+             {simple_where} {radio_and} lh.title IS NOT NULL
+             GROUP BY lh.title ORDER BY plays DESC LIMIT {top_n}"
         );
         let top_radios: Vec<TopRadioEntry> = self
             .db
@@ -516,6 +526,8 @@ impl HistoryRepo {
                 plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
                 cover_url: cols.get(3).and_then(|v| v.as_string()),
+                radio_id: cols.get(4).and_then(|v| v.as_i64()),
+                cover_path: cols.get(5).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -755,16 +767,18 @@ impl HistoryRepo {
             Engine::Sqlite => "?".to_string(),
             Engine::Postgres => "$1".to_string(),
         };
+        let current_year = to.get(0..4).unwrap_or("2026");
+        let yr_expr = match self.db.engine() {
+            Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
+            Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
+        };
         let otd_sql = format!(
             "SELECT title, artist_name, album_title, NULL, listened_at,
-                    {} as yr
+                    {yr_expr} as yr
              FROM listen_history
-             WHERE listened_at LIKE {ph}
-             ORDER BY listened_at DESC LIMIT 10",
-            match self.db.engine() {
-                Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
-                Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
-            }
+             WHERE listened_at LIKE {ph} AND {yr_expr} < {current_year}
+             GROUP BY title, artist_name
+             ORDER BY yr DESC LIMIT 10"
         );
         let on_this_day: Vec<OnThisDayEntry> = self
             .db
@@ -861,6 +875,7 @@ pub struct TopArtistEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopAlbumEntry {
+    pub album_id: Option<i64>,
     pub album_title: String,
     pub artist_name: String,
     pub cover_path: Option<String>,
@@ -881,10 +896,13 @@ pub struct TopTrackEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopRadioEntry {
     pub station_name: String,
+    pub radio_id: Option<i64>,
     pub plays: i64,
     pub listening_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
