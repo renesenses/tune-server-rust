@@ -4,7 +4,7 @@
 //! favorites, radios, alarms, EQ, room profiles, streaming tokens) into a
 //! single JSON-serialisable [`ConfigSnapshot`].  Sensitive keys (jwt_secret,
 //! api_key, license_key, etc.) are excluded; streaming tokens are stored as
-//! opaque base64-encoded blobs.
+//! opaque hex-encoded XOR-obfuscated blobs.
 
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ pub struct ConfigSnapshot {
     pub eq_presets: Vec<Value>,
     /// Room correction profiles (stored as settings blobs).
     pub room_profiles: Vec<Value>,
-    /// Streaming service tokens — base64 of XOR-obfuscated JSON.
+    /// Streaming service tokens — hex-encoded XOR-obfuscated JSON.
     pub streaming_tokens: Vec<(String, String)>,
 }
 
@@ -87,7 +87,7 @@ fn is_room_profile_key(key: &str) -> bool {
 }
 
 // ── Token obfuscation ───────────────────────────────────────────────
-// Streaming tokens are XOR-obfuscated with a fixed key before base64
+// Streaming tokens are XOR-obfuscated with a fixed key before hex
 // encoding so they are not stored as raw secrets in the snapshot JSON.
 
 const OBFUSCATION_KEY: &[u8; 32] = b"TuneConfigBackup2026-obfuscate!!";
@@ -98,7 +98,6 @@ fn obfuscate(data: &[u8]) -> String {
         .enumerate()
         .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
         .collect();
-    // Hex-encode (no external base64 dep needed)
     xored.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -190,10 +189,7 @@ fn sqlvalue_to_json(v: &SqlValue) -> Value {
             .unwrap_or(Value::Null),
         SqlValue::Text(s) => Value::String(s.clone()),
         SqlValue::Bool(b) => Value::Bool(*b),
-        SqlValue::Blob(data) => {
-            // Hex-encode blobs (no base64 dep)
-            Value::String(data.iter().map(|b| format!("{b:02x}")).collect())
-        }
+        SqlValue::Blob(data) => Value::String(data.iter().map(|b| format!("{b:02x}")).collect()),
     }
 }
 
@@ -363,7 +359,6 @@ fn export_streaming_tokens(backend: &Arc<dyn DbBackend>) -> Result<Vec<(String, 
         return Ok(Vec::new());
     }
 
-    // Parse the vault; each key is a service name
     let vault: serde_json::Map<String, Value> =
         serde_json::from_str(&json_str).map_err(|e| format!("vault parse: {e}"))?;
 
@@ -426,14 +421,12 @@ fn import_zones(
     for z in zones {
         let name = z["name"].as_str().unwrap_or("Unnamed Zone");
 
-        // Check if zone with this name exists
         let existing = backend.query_one(
             "SELECT id FROM zones WHERE name = ?",
             &[&name.to_string() as &dyn ToSqlValue],
         )?;
 
         if existing.is_some() {
-            // Update existing zone
             backend.execute(
                 "UPDATE zones SET output_type = ?, output_device_id = ?, volume = ?, \
                  muted = ?, gapless_enabled = ?, max_sample_rate = ?, \
@@ -445,7 +438,7 @@ fn import_zones(
                     &z["volume"].as_i64().unwrap_or(50) as &dyn ToSqlValue,
                     &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
-                    &z["max_sample_rate"].as_i64().map(|n| n) as &dyn ToSqlValue,
+                    &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
                     &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["autoplay_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                     &name.to_string() as &dyn ToSqlValue,
@@ -463,7 +456,7 @@ fn import_zones(
                     &z["volume"].as_i64().unwrap_or(50) as &dyn ToSqlValue,
                     &z["muted"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["gapless_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
-                    &z["max_sample_rate"].as_i64().map(|n| n) as &dyn ToSqlValue,
+                    &z["max_sample_rate"].as_i64() as &dyn ToSqlValue,
                     &z["fixed_volume"].as_i64().unwrap_or(0) as &dyn ToSqlValue,
                     &z["autoplay_enabled"].as_i64().unwrap_or(1) as &dyn ToSqlValue,
                 ],
@@ -501,7 +494,6 @@ fn import_playlists(
         let name = pl["name"].as_str().unwrap_or("Unnamed");
         let desc = pl["description"].as_str();
 
-        // Check if playlist with same name already exists
         let existing = backend.query_one(
             "SELECT id FROM playlists WHERE name = ?",
             &[&name.to_string() as &dyn ToSqlValue],
@@ -522,7 +514,6 @@ fn import_playlists(
         )?;
         let pl_id = backend.last_insert_rowid();
 
-        // Insert tracks by matching on (title, artist_name, source, source_id)
         if let Some(tracks) = pl["tracks"].as_array() {
             for t in tracks {
                 let title = t["title"].as_str().unwrap_or_default();
@@ -531,7 +522,6 @@ fn import_playlists(
                 let source_id = t["source_id"].as_str().unwrap_or_default();
                 let position = t["position"].as_i64().unwrap_or(0);
 
-                // Try to find the track in the local library
                 let track_row = if !source_id.is_empty() {
                     backend.query_one(
                         "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
@@ -581,7 +571,6 @@ fn import_favorites(
         let item_type = fav["item_type"].as_str().unwrap_or_default();
         let item_id = fav["item_id"].as_i64().unwrap_or(0);
 
-        // ON CONFLICT DO NOTHING — upsert
         let affected = backend.execute(
             "INSERT OR IGNORE INTO favorites (profile_id, item_type, item_id) \
              VALUES (?, ?, ?)",
@@ -612,7 +601,6 @@ fn import_radios(
             continue;
         }
 
-        // Upsert by name+url
         let existing = backend.query_one(
             "SELECT id FROM radio_stations WHERE name = ? AND url = ?",
             &[
@@ -658,7 +646,6 @@ fn import_alarms(
         let time = a["time"].as_str().unwrap_or("07:00");
         let name = a["name"].as_str().unwrap_or("Alarm");
 
-        // Upsert: match on zone_id + time + name
         let existing = if let Some(zid) = zone_id {
             backend.query_one(
                 "SELECT id FROM alarms WHERE zone_id = ? AND time = ? AND name = ?",

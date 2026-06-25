@@ -20,14 +20,11 @@ fn utc_now() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // Convert to broken-down UTC manually
     let days = secs / 86400;
     let day_secs = secs % 86400;
     let h = day_secs / 3600;
     let m = (day_secs % 3600) / 60;
     let s = day_secs % 60;
-
-    // Compute year/month/day from days since epoch (1970-01-01)
     let (y, mo, d) = days_to_ymd(days as i64);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
@@ -174,7 +171,6 @@ pub(super) async fn cloud_push(State(state): State<AppState>) -> impl IntoRespon
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            // Store last backup timestamp
             let now = utc_now();
             settings.set("config_backup_last_push", &now).ok();
             settings
