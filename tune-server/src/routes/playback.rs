@@ -1195,6 +1195,10 @@ async fn queue_add(
             .update_queue_info(zone_id, current_pos, new_length)
             .await;
         persist_queue_async(&state, zone_id);
+        state.event_bus.emit(
+            "playback.queue.track_added",
+            json!({ "zone_id": zone_id, "added": count, "queue_length": new_length }),
+        );
         return (
             StatusCode::CREATED,
             Json(json!({ "added": count, "queue_length": new_length })),
@@ -1223,6 +1227,10 @@ async fn queue_add(
                 .update_queue_info(zone_id, current_pos, new_length)
                 .await;
             persist_queue_async(&state, zone_id);
+            state.event_bus.emit(
+                "playback.queue.track_added",
+                json!({ "zone_id": zone_id, "added": ids.len(), "queue_length": new_length }),
+            );
             (
                 StatusCode::CREATED,
                 Json(json!({ "added": ids.len(), "queue_length": new_length })),
@@ -1251,6 +1259,10 @@ async fn queue_move(
         let track_ids: Vec<i64> = items.iter().map(|i| i.track_id).collect();
         queue_repo.set_queue(zone_id, &track_ids).ok();
         persist_queue_async(&state, zone_id);
+        state.event_bus.emit(
+            "playback.queue.moved",
+            json!({ "zone_id": zone_id, "from": from, "to": to }),
+        );
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::BAD_REQUEST, "position out of range").into_response()
