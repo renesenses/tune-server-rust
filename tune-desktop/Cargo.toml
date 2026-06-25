@@ -1,0 +1,23 @@
+[package]
+name = "tune-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tune native desktop controller (Tauri 2) — thin client over tune-server's HTTP/WS API."
+
+# A lib + bin split: the bin is a thin entry point, the lib holds the app so a
+# future mobile target can reuse it via the mobile_entry_point macro.
+[lib]
+name = "tune_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
