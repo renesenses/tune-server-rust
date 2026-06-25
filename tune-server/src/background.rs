@@ -596,7 +596,30 @@ fn spawn_slimproto_server(state: &AppState) {
 }
 
 fn spawn_bio_sync(state: &AppState) {
-    tune_core::cloud::bio_sync::spawn(state.backend.clone(), state.event_bus.subscribe());
+    let license = state.license.clone();
+    let db = state.backend.clone();
+    let rx = state.event_bus.subscribe();
+    tokio::spawn(async move {
+        // Wait for startup to settle before checking license
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if !license
+            .check_feature(tune_core::license::Feature::AutoEnrichment)
+            .await
+        {
+            info!("bio_sync_auto_download_requires_premium — upload-only mode");
+            // Still upload local bios (community contribution) but skip auto download
+            let db_upload = db.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(55)).await;
+                loop {
+                    tune_core::cloud::bio_sync::upload_bios(&db_upload).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                }
+            });
+            return;
+        }
+        tune_core::cloud::bio_sync::spawn(db, rx);
+    });
 }
 
 fn spawn_community_sync(state: &AppState) {

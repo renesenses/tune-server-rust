@@ -21,6 +21,10 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
+    let auto_enrich_allowed = state
+        .license
+        .check_feature(tune_core::license::Feature::AutoEnrichment)
+        .await;
     tokio::spawn(async move {
         let db_for_panic = db.clone();
         let handle = tokio::runtime::Handle::current();
@@ -805,17 +809,22 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
             std::fs::write(&report_path, json).ok();
         }
 
-        let enrich_db = db.clone();
-        let artist_cache_dir = cache_dir.clone();
-        let artist_enrich_db = db.clone();
-        handle.spawn(async move {
-            tune_core::library::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
-        });
+        // Auto enrichment after scan: Premium only
+        if auto_enrich_allowed {
+            let enrich_db = db.clone();
+            let artist_cache_dir = cache_dir.clone();
+            let artist_enrich_db = db.clone();
+            handle.spawn(async move {
+                tune_core::library::artwork::batch_enrich_artwork(enrich_db, cache_dir).await;
+            });
 
-        handle.spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            tune_core::library::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
-        });
+            handle.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tune_core::library::artwork::batch_enrich_artist_artwork(artist_enrich_db, artist_cache_dir).await;
+            });
+        } else {
+            tracing::info!("auto_enrichment_after_scan_requires_premium");
+        }
         }).await;
         if let Err(e) = result {
             tracing::error!("scan_task_panicked — {:?}", e);

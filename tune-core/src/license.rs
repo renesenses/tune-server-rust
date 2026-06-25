@@ -45,6 +45,7 @@ pub enum Feature {
     AdvancedAlarms,
     MultiProfiles,
     WeeklyDigest,
+    AutoEnrichment,
 }
 
 impl Feature {
@@ -65,6 +66,7 @@ impl Feature {
             Feature::AdvancedAlarms,
             Feature::MultiProfiles,
             Feature::WeeklyDigest,
+            Feature::AutoEnrichment,
         ]
     }
 
@@ -85,6 +87,7 @@ impl Feature {
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
             Feature::WeeklyDigest => "Weekly Digest",
+            Feature::AutoEnrichment => "Auto Metadata Enrichment",
         }
     }
 }
@@ -412,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_fourteen_features() {
-        assert_eq!(Feature::all_premium().len(), 14);
+    fn all_premium_has_fifteen_features() {
+        assert_eq!(Feature::all_premium().len(), 15);
     }
 
     #[test]
