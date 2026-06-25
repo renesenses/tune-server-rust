@@ -12,6 +12,7 @@
         "label": "main",
         "title": "Tune",
         "url": "http://localhost:8888",
+        "dragDropEnabled": false,
         "width": 1200,
         "height": 800,
         "minWidth": 900,
