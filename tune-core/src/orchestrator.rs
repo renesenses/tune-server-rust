@@ -2157,6 +2157,51 @@ impl PlaybackOrchestrator {
         ))
     }
 
+    /// Recreate a local (cpal) output on demand and play to it. Only the
+    /// `local-audio` build has `outputs::local`; without that feature there is
+    /// no local backend, so this is a no-op that reports the device as missing.
+    #[cfg(feature = "local-audio")]
+    async fn recreate_local_and_play(
+        &self,
+        device_id: &str,
+        media: &crate::outputs::traits::PlayMedia<'_>,
+    ) -> (bool, Option<String>) {
+        let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
+        info!(device_id, "output_not_found_recreating_local_output");
+        let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
+        {
+            let mut outputs = self.outputs.lock().await;
+            outputs.register(Box::new(local_out));
+        }
+        let outputs = self.outputs.lock().await;
+        if let Some(arc) = outputs.get(device_id) {
+            let output = arc.lock().await;
+            match output.play_media(media).await {
+                Ok(()) => {
+                    drop(output);
+                    info!(device_id, "output_play_sent_after_recreate");
+                    (true, None)
+                }
+                Err(e) => {
+                    drop(output);
+                    warn!(device_id, error = %e, "output_play_failed_after_recreate");
+                    (false, Some(format!("Output device error: {e}")))
+                }
+            }
+        } else {
+            (false, Some(format!("Device not found: {device_id}")))
+        }
+    }
+
+    #[cfg(not(feature = "local-audio"))]
+    async fn recreate_local_and_play(
+        &self,
+        device_id: &str,
+        _media: &crate::outputs::traits::PlayMedia<'_>,
+    ) -> (bool, Option<String>) {
+        (false, Some(format!("Device not found: {device_id}")))
+    }
+
     async fn send_to_output(
         &self,
         device_id: &str,
@@ -2196,45 +2241,7 @@ impl PlaybackOrchestrator {
                 }
             }
         } else if device_id.starts_with("local:") {
-            #[cfg(feature = "local-audio")]
-            {
-                let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
-                info!(device_id, "output_not_found_recreating_local_output");
-                let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
-                {
-                    let mut outputs = self.outputs.lock().await;
-                    outputs.register(Box::new(local_out));
-                }
-                let outputs = self.outputs.lock().await;
-                if let Some(arc) = outputs.get(device_id) {
-                    let output = arc.lock().await;
-                    match output.play_media(media).await {
-                        Ok(()) => {
-                            drop(output);
-                            info!(device_id, "output_play_sent_after_recreate");
-                            (true, None)
-                        }
-                        Err(e) => {
-                            drop(output);
-                            warn!(device_id, error = %e, "output_play_failed_after_recreate");
-                            (false, Some(format!("Output device error: {e}")))
-                        }
-                    }
-                } else {
-                    (false, Some(format!("Device not found: {device_id}")))
-                }
-            }
-            #[cfg(not(feature = "local-audio"))]
-            {
-                warn!(
-                    device_id,
-                    "local_output_not_available_without_local_audio_feature"
-                );
-                (
-                    false,
-                    Some(format!("Local audio not available on this build")),
-                )
-            }
+            self.recreate_local_and_play(device_id, media).await
         } else {
             warn!(device_id, "output_not_found");
             (
