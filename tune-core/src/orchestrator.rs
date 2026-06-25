@@ -1610,11 +1610,19 @@ impl PlaybackOrchestrator {
             }
         } else if is_https {
             let codec_lower = stream_data.quality.codec.to_lowercase();
-            let is_aac = codec_lower == "aac"
+            // Codecs that legacy DLNA renderers can't decode must be
+            // pre-transcoded to FLAC. AAC/MP4 (most renderers reject AAC over
+            // DLNA) plus Opus/Ogg-Vorbis: YouTube delivers Opus-in-WebM, which
+            // old renderers like the Cyrus Stream X reject outright (no
+            // audio/webm or audio/opus sink), leaving the transport in
+            // ERROR_OCCURRED.
+            let needs_flac_transcode = codec_lower == "aac"
                 || codec_lower == "mp4"
-                || stream_data.mime_type.contains("mp4");
+                || stream_data.mime_type.contains("mp4")
+                || AudioFormat::from_extension(&codec_lower)
+                    .is_some_and(|f| f.needs_transcode_for_dlna());
 
-            if is_aac {
+            if needs_flac_transcode {
                 // AAC/MP4 streams need transcoding for DLNA — most renderers
                 // (DMP-A8, etc.) don't support AAC via DLNA.  Pre-transcode to
                 // FLAC temp file so we serve with Content-Length (chunked WAV

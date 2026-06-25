@@ -243,7 +243,21 @@ pub fn decode_to_pcm(
     }
 
     if ext == "wma" || ext == "asf" {
-        return decode_wma_via_ffmpeg(
+        return decode_via_ffmpeg(
+            file_path,
+            target_sample_rate,
+            target_channels,
+            seek_s,
+            max_duration_s,
+        );
+    }
+
+    // Opus/Ogg-Vorbis (and the WebM container YouTube delivers Opus in) are
+    // routed through ffmpeg rather than symphonia: ffmpeg demuxes the WebM
+    // container that symphonia does not handle, sniffing by content so a file
+    // named ".opus" that actually holds WebM still decodes correctly.
+    if ext == "opus" || ext == "ogg" || ext == "oga" || ext == "webm" || ext == "weba" {
+        return decode_via_ffmpeg(
             file_path,
             target_sample_rate,
             target_channels,
@@ -728,7 +742,7 @@ fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// Symphonia does not support the WMA codec or ASF container, so we shell out
 /// to FFmpeg which handles all WMA variants (WMA v1/v2/Pro/Lossless).
 /// FFmpeg outputs raw signed 16-bit little-endian PCM to stdout.
-fn decode_wma_via_ffmpeg(
+fn decode_via_ffmpeg(
     file_path: &str,
     _target_sample_rate: Option<u32>,
     _target_channels: Option<u32>,
@@ -801,7 +815,7 @@ fn decode_wma_via_ffmpeg(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg WMA decode error: {stderr}"));
+        return Err(format!("ffmpeg decode error: {stderr}"));
     }
 
     let pcm_data = output.stdout;
@@ -847,7 +861,7 @@ fn decode_wma_via_ffmpeg(
         channels = source_channels,
         bit_depth = out_bd,
         duration_s,
-        "decoded_wma_ffmpeg"
+        "decoded_via_ffmpeg"
     );
 
     Ok(DecodedAudio {
