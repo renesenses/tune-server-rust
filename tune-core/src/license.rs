@@ -51,6 +51,7 @@ pub enum Feature {
     SocialSharing,
     DeveloperApi,
     PluginMarketplace,
+    MultiServer,
 }
 
 impl Feature {
@@ -77,6 +78,7 @@ impl Feature {
             Feature::SocialSharing,
             Feature::DeveloperApi,
             Feature::PluginMarketplace,
+            Feature::MultiServer,
         ]
     }
 
@@ -103,6 +105,7 @@ impl Feature {
             Feature::SocialSharing => "Social Sharing",
             Feature::DeveloperApi => "Developer API",
             Feature::PluginMarketplace => "Plugin Marketplace",
+            Feature::MultiServer => "Multi-Server",
         }
     }
 }
@@ -430,8 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twenty_features() {
-        assert_eq!(Feature::all_premium().len(), 20);
+    fn all_premium_has_twentyone_features() {
+        assert_eq!(Feature::all_premium().len(), 21);
     }
 
     #[test]

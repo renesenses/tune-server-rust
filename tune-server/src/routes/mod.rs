@@ -31,6 +31,7 @@ pub mod marketplace;
 pub mod mediasync;
 pub mod metadata;
 pub mod mqa;
+pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
@@ -318,6 +319,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/upnp", upnp::router())
         .nest("/auth", crate::auth::router())
         .nest("/cloud", cloud::router())
+        .nest("/multi-server", multi_server::router())
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())
