@@ -85,7 +85,7 @@ pub mod sql {
     }
 
     pub fn dashboard_total_duration() -> &'static str {
-        "SELECT COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE source != 'radio'"
+        "SELECT CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) FROM listen_history WHERE source != 'radio'"
     }
 
     pub fn dashboard_unique_tracks() -> &'static str {
@@ -102,7 +102,7 @@ pub mod sql {
         let day_col = d.date_trunc_day("listened_at");
         let since = d.since_days("listened_at", days);
         format!(
-            "SELECT {day_col} as day, COUNT(*) as play_count, COALESCE(SUM(duration_ms), 0) as total_ms \
+            "SELECT {day_col} as day, COUNT(*) as play_count, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as total_ms \
              FROM listen_history WHERE {since} \
              GROUP BY 1 ORDER BY 1"
         )
@@ -392,7 +392,7 @@ impl HistoryRepo {
         // ── Totals ──
         let totals_sql = format!(
             "SELECT COUNT(*),
-                    COALESCE(SUM(duration_ms), 0),
+                    CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT),
                     COUNT(DISTINCT title || COALESCE(artist_name, '')),
                     COUNT(DISTINCT CASE WHEN artist_name IS NOT NULL THEN artist_name END)
              FROM listen_history {simple_where}"
@@ -413,7 +413,7 @@ impl HistoryRepo {
             "AND source != 'radio' AND"
         };
         let artists_sql = format!(
-            "SELECT lh.artist_name, COUNT(*) as plays, COALESCE(SUM(lh.duration_ms), 0) as ms,
+            "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
                     COALESCE(ar.image_path, (
                         SELECT a2.cover_path FROM albums a2
                         JOIN tracks t2 ON t2.album_id = a2.id
@@ -466,7 +466,7 @@ impl HistoryRepo {
         // ── Top tracks (exclude radio) ──
         let tracks_sql = format!(
             "SELECT MAX(lh.track_id), lh.title, lh.artist_name, COUNT(*) as plays,
-                    COALESCE(SUM(lh.duration_ms), 0) as ms,
+                    CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
                     COALESCE(MAX(lh.cover_url), (
                         SELECT a2.cover_path FROM tracks t2
                         JOIN albums a2 ON t2.album_id = a2.id
@@ -500,7 +500,8 @@ impl HistoryRepo {
             "AND source = 'radio' AND"
         };
         let radios_sql = format!(
-            "SELECT title as station_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+            "SELECT title as station_name, COUNT(*) as plays, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as ms,
+                    MAX(cover_url) as cover_url
              FROM listen_history
              {simple_where} {radio_and} title IS NOT NULL
              GROUP BY title ORDER BY plays DESC LIMIT {top_n}"
@@ -514,6 +515,7 @@ impl HistoryRepo {
                 station_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
                 plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                cover_url: cols.get(3).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -524,7 +526,7 @@ impl HistoryRepo {
             None => String::new(),
         };
         let trend_sql = format!(
-            "SELECT {} as day, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+            "SELECT {} as day, COUNT(*) as plays, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as ms
              FROM listen_history
              WHERE {} {trend_zone_and}
              GROUP BY 1 ORDER BY 1",
@@ -562,7 +564,7 @@ impl HistoryRepo {
 
         // ── By zone ──
         let by_zone_sql = format!(
-            "SELECT h.zone_id, z.name, COUNT(*) as plays, COALESCE(SUM(h.duration_ms), 0) as ms
+            "SELECT h.zone_id, z.name, COUNT(*) as plays, CAST(COALESCE(SUM(h.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history h
              LEFT JOIN zones z ON z.id = h.zone_id
              {where_clause}
@@ -582,7 +584,7 @@ impl HistoryRepo {
 
         // ── By source ──
         let by_source_sql = format!(
-            "SELECT source, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+            "SELECT source, COUNT(*) as plays, CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) as ms
              FROM listen_history
              {simple_where}
              GROUP BY source ORDER BY plays DESC"
@@ -659,7 +661,7 @@ impl HistoryRepo {
 
         // ── By genre (via tracks join) ──
         let genre_sql = format!(
-            "SELECT t.genre, COUNT(*) as plays, COALESCE(SUM(h.duration_ms), 0) as ms
+            "SELECT t.genre, COUNT(*) as plays, CAST(COALESCE(SUM(h.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history h
              INNER JOIN tracks t ON t.id = h.track_id
              {where_clause} {and_or} t.genre IS NOT NULL AND t.genre != ''
@@ -881,6 +883,8 @@ pub struct TopRadioEntry {
     pub station_name: String,
     pub plays: i64,
     pub listening_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

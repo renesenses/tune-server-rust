@@ -130,7 +130,7 @@ pub struct LicenseState {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FREE_MAX_ZONES: i64 = 3;
+const FREE_MAX_ZONES: i64 = 10;
 const GRACE_PERIOD_DAYS: i64 = 30;
 
 // ---------------------------------------------------------------------------
