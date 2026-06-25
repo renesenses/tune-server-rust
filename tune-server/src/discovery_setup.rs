@@ -6,8 +6,30 @@ use tune_core::db::backend::DbBackend;
 use tune_core::outputs::OutputRegistry;
 use tune_core::outputs::oh_events::OpenHomeEventListener;
 
+use tune_core::event_bus::EventBus;
+use tune_core::event_types::EventType;
+
 use crate::config::TuneConfig;
 use crate::state::AppState;
+
+/// Set a zone's online state and, if it actually changed, broadcast a
+/// `zone.updated` event so controllers see availability flip in real time.
+/// (`set_online_by_device` alone is silent — clients never learned of it.)
+fn set_zone_online(event_bus: &EventBus, db: &Arc<dyn DbBackend>, device_id: &str, online: bool) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
+    let prev = zone_repo
+        .get_by_device_id(device_id)
+        .ok()
+        .flatten()
+        .map(|z| z.online);
+    let _ = zone_repo.set_online_by_device(device_id, online);
+    if prev != Some(online) {
+        event_bus.emit_typed(
+            EventType::ZoneUpdated,
+            serde_json::json!({ "device_id": device_id, "online": online }),
+        );
+    }
+}
 
 /// Spawn the SSDP handler that registers DLNA/OpenHome outputs and auto-creates zones.
 pub fn spawn_ssdp_handler(
@@ -52,8 +74,7 @@ pub fn spawn_ssdp_handler(
                 SsdpEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
                     reg.remove(&id);
-                    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
-                    let _ = zone_repo.set_online_by_device(&id, false);
+                    set_zone_online(&event_bus, &db, &id, false);
                     info!(id = %id, "output_removed_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
@@ -154,7 +175,7 @@ async fn handle_ssdp_discovered(
 
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
-        let _ = zone_repo.set_online_by_device(&dev.id, true);
+        set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
             let vol = zone.volume as f64 / 100.0;
             playback.set_volume(zone_id, vol).await;
@@ -195,10 +216,19 @@ async fn handle_ssdp_discovered(
         };
         match zone_repo.get_or_create(&zone_name, Some(type_str), &dev.id) {
             Ok((zid, true)) => {
+                event_bus.emit_typed(
+                    EventType::ZoneCreated,
+                    serde_json::json!({
+                        "zone_id": zid,
+                        "name": zone_name,
+                        "device_id": dev.id,
+                        "type": type_str,
+                    }),
+                );
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
             }
             Ok((zid, false)) => {
-                let _ = zone_repo.set_online_by_device(&dev.id, true);
+                set_zone_online(event_bus, db, &dev.id, true);
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, "ssdp_zone_already_existed");
             }
             Err(e) => {
@@ -356,7 +386,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         let zone_repo =
                             tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
                         if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
-                            let _ = zone_repo.set_online_by_device(&dev.id, true);
+                            set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
                                 let vol = zone.volume as f64 / 100.0;
                                 playback.set_volume(zone_id, vol).await;
@@ -412,7 +442,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 }
                                 let _ = zone_repo.update_output_device(zid, &dev.id);
                                 let _ = zone_repo.update_output_type(zid, output_type_str);
-                                let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                set_zone_online(&event_bus, &db, &dev.id, true);
                                 info!(
                                     name = %dev.name,
                                     id = %dev.id,
@@ -431,7 +461,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 {
                                     let _ = zone_repo.update_output_device(zid, &dev.id);
                                     let _ = zone_repo.update_output_type(zid, output_type_str);
-                                    let _ = zone_repo.set_online_by_device(&dev.id, true);
+                                    set_zone_online(&event_bus, &db, &dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                                 } else {
                                     // Premium gate: check zone limit before auto-creating
@@ -449,11 +479,19 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                             &dev.id,
                                         ) {
                                             Ok((zid, true)) => {
+                                                event_bus.emit_typed(
+                                                    EventType::ZoneCreated,
+                                                    serde_json::json!({
+                                                        "zone_id": zid,
+                                                        "name": dev.name,
+                                                        "device_id": dev.id,
+                                                        "type": output_type_str,
+                                                    }),
+                                                );
                                                 info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
                                             }
                                             Ok((zid, false)) => {
-                                                let _ =
-                                                    zone_repo.set_online_by_device(&dev.id, true);
+                                                set_zone_online(&event_bus, &db, &dev.id, true);
                                                 info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
                                             }
                                             Err(e) => {
@@ -469,6 +507,9 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                 MdnsEvent::DeviceLost(id) => {
                     let mut reg = outputs.lock().await;
                     reg.remove(&id);
+                    drop(reg);
+                    set_zone_online(&event_bus, &db, &id, false);
+                    info!(id = %id, "mdns_output_removed_zone_offline");
                 }
             }
         }
