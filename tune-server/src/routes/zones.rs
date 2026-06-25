@@ -498,6 +498,12 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.list().unwrap_or_default();
     let devices = state.scanner.lock().await.devices().await;
+    // Manually-added devices (e.g. legacy DLNA renderers that never appear in
+    // SSDP discovery) are registered as outputs but absent from `devices`.
+    // Treat a registered output as online too, otherwise its zone is shown
+    // offline even though playback works.
+    let registered_output_ids: std::collections::HashSet<String> =
+        state.outputs.lock().await.list().into_iter().collect();
     let default_zone_id: Option<i64> =
         tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
             .get("default_zone_id")
@@ -549,7 +555,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 _ => z
                     .output_device_id
                     .as_deref()
-                    .map(|id| devices.iter().any(|d| d.id == id))
+                    .map(|id| {
+                        devices.iter().any(|d| d.id == id)
+                            || registered_output_ids.contains(id)
+                    })
                     .unwrap_or(false),
             };
             obj.insert("online".into(), json!(online));
@@ -600,6 +609,8 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("queue_length".into(), json!(ps.queue_length));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
                 let devices = state.scanner.lock().await.devices().await;
+                let registered_output_ids: std::collections::HashSet<String> =
+                    state.outputs.lock().await.list().into_iter().collect();
                 let renderer_label = zone
                     .output_device_id
                     .as_deref()
@@ -613,7 +624,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     _ => zone
                         .output_device_id
                         .as_deref()
-                        .map(|did| devices.iter().any(|d| d.id == did))
+                        .map(|did| {
+                            devices.iter().any(|d| d.id == did)
+                                || registered_output_ids.contains(did)
+                        })
                         .unwrap_or(false),
                 };
                 obj.insert("online".into(), json!(online));
