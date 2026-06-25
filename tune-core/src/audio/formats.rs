@@ -256,19 +256,31 @@ impl AudioFormat {
     /// DSD (DSF/DFF) MUST be transcoded to PCM: most DLNA renderers cannot
     /// decode raw DSD bitstreams, and serving raw DSD corrupts the renderer
     /// buffer state causing subsequent tracks to fail too (BUG-006).
+    /// Opus/Ogg-Vorbis are transcoded to FLAC: streaming sources such as
+    /// YouTube deliver Opus-in-WebM, which legacy DLNA renderers (e.g. Cyrus
+    /// Stream X) reject outright -- they advertise no audio/webm or audio/opus
+    /// sink, so passthrough leaves the transport in ERROR_OCCURRED.
     pub fn needs_transcode_for_dlna(&self) -> bool {
         matches!(
             self,
-            Self::Aac | Self::Aiff | Self::WavPack | Self::Ape | Self::Alac | Self::Wma | Self::Dsd
+            Self::Aac
+                | Self::Aiff
+                | Self::WavPack
+                | Self::Ape
+                | Self::Alac
+                | Self::Wma
+                | Self::Dsd
+                | Self::Opus
+                | Self::Ogg
         )
     }
 
     /// Returns the target output format for DLNA transcoding.
-    /// AAC/AIFF/ALAC -> FLAC (universally supported by DLNA renderers)
+    /// AAC/AIFF/ALAC/Opus/Ogg -> FLAC (universally supported by DLNA renderers)
     /// DSD/WavPack/APE/WMA -> WAV (universal PCM, avoids re-encoding overhead)
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
-            Self::Aac | Self::Aiff | Self::Alac => AudioFormat::Flac,
+            Self::Aac | Self::Aiff | Self::Alac | Self::Opus | Self::Ogg => AudioFormat::Flac,
             Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
             other => *other,
         }
@@ -360,6 +372,17 @@ mod tests {
     }
 
     #[test]
+    fn opus_needs_transcode() {
+        // YouTube delivers Opus-in-WebM; legacy DLNA renderers reject it.
+        assert!(AudioFormat::Opus.needs_transcode_for_dlna());
+    }
+
+    #[test]
+    fn ogg_needs_transcode() {
+        assert!(AudioFormat::Ogg.needs_transcode_for_dlna());
+    }
+
+    #[test]
     fn flac_no_transcode() {
         assert!(!AudioFormat::Flac.needs_transcode_for_dlna());
     }
@@ -407,6 +430,16 @@ mod tests {
         // ALAC must transcode to FLAC (not WAV 32-bit) for DLNA.
         // WAV 32-bit is rejected by many renderers including Eversolo.
         assert_eq!(AudioFormat::Alac.dlna_transcode_target(), AudioFormat::Flac);
+    }
+
+    #[test]
+    fn opus_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Opus.dlna_transcode_target(), AudioFormat::Flac);
+    }
+
+    #[test]
+    fn ogg_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Ogg.dlna_transcode_target(), AudioFormat::Flac);
     }
 
     #[test]
