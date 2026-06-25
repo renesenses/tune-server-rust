@@ -41,6 +41,7 @@ pub enum Feature {
     ListeningStats,
     MultiScrobbling,
     AiRecommendations,
+    PlaylistTransfer,
 }
 
 impl Feature {
@@ -57,6 +58,7 @@ impl Feature {
             Feature::ListeningStats,
             Feature::MultiScrobbling,
             Feature::AiRecommendations,
+            Feature::PlaylistTransfer,
         ]
     }
 
@@ -73,6 +75,7 @@ impl Feature {
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
+            Feature::PlaylistTransfer => "Playlist Transfer",
         }
     }
 }
@@ -400,8 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_ten_features() {
-        assert_eq!(Feature::all_premium().len(), 10);
+    fn all_premium_has_eleven_features() {
+        assert_eq!(Feature::all_premium().len(), 11);
     }
 
     #[test]

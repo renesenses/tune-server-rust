@@ -35,6 +35,7 @@ pub mod party;
 pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
+pub mod playlist_transfer;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -268,6 +269,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/dj", dj::router())
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
+        .nest("/playlist-transfer", playlist_transfer::router())
         .nest("/zone-manager", zone_manager::router())
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())
