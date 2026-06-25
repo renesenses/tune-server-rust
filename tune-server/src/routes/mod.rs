@@ -56,6 +56,7 @@ pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
 pub mod snapcast;
+pub mod social;
 pub mod sonos;
 pub mod soundcloud;
 pub mod spotify_connect;
@@ -307,6 +308,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
         .nest("/shazam", shazam::router())
+        .nest("/social", social::router())
         .nest("/home", home::router())
         .nest("/onboarding", onboarding::router())
         .nest("/i18n", i18n::router())

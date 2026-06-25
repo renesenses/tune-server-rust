@@ -30,6 +30,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
+    spawn_social_sharing_listener(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
 }
@@ -839,4 +840,118 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             );
         }
     }
+}
+
+fn spawn_social_sharing_listener(state: &AppState) {
+    let license = state.license.clone();
+    let backend = state.backend.clone();
+    let mut rx = state.playback.subscribe();
+    let http_client = state.http_client.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let event = match rx.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(skipped = n, "social_sharing_listener_lagged");
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            // Only react to track-start events
+            if event.event != "started" {
+                continue;
+            }
+
+            // Premium gate
+            if !license
+                .check_feature(tune_core::license::Feature::SocialSharing)
+                .await
+            {
+                continue;
+            }
+
+            // Check sharing profile
+            let profile = tune_core::social::load_profile(&backend);
+            if !profile.enabled || !profile.share_now_playing {
+                continue;
+            }
+
+            // Build the card from event data
+            let title = event
+                .data
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let artist = event
+                .data
+                .get("artist_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let album = event
+                .data
+                .get("album_title")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let cover = event
+                .data
+                .get("cover_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let source = event
+                .data
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local")
+                .to_string();
+
+            if title.is_empty() {
+                continue;
+            }
+
+            let card = tune_core::social::NowListeningCard {
+                title,
+                artist,
+                album,
+                cover_url: cover,
+                format: None,
+                sample_rate: None,
+                bit_depth: None,
+                source,
+                shared_at: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            };
+
+            let payload = serde_json::json!({
+                "display_name": profile.display_name,
+                "now_listening": card,
+            });
+
+            let client = http_client.clone();
+            tokio::spawn(async move {
+                match client
+                    .post("https://mozaiklabs.fr/api/v1/community/now-listening")
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!("social_auto_share_ok");
+                    }
+                    Ok(resp) => {
+                        debug!(
+                            status = resp.status().as_u16(),
+                            "social_auto_share_upstream_error"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "social_auto_share_failed");
+                    }
+                }
+            });
+        }
+    });
 }

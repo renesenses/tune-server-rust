@@ -48,6 +48,7 @@ pub enum Feature {
     AutoEnrichment,
     RoomCorrection,
     CloudConfigBackup,
+    SocialSharing,
 }
 
 impl Feature {
@@ -71,6 +72,7 @@ impl Feature {
             Feature::AutoEnrichment,
             Feature::RoomCorrection,
             Feature::CloudConfigBackup,
+            Feature::SocialSharing,
         ]
     }
 
@@ -94,6 +96,7 @@ impl Feature {
             Feature::AutoEnrichment => "Auto Metadata Enrichment",
             Feature::RoomCorrection => "Room Correction",
             Feature::CloudConfigBackup => "Cloud Config Backup",
+            Feature::SocialSharing => "Social Sharing",
         }
     }
 }
@@ -421,8 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_seventeen_features() {
-        assert_eq!(Feature::all_premium().len(), 17);
+    fn all_premium_has_eighteen_features() {
+        assert_eq!(Feature::all_premium().len(), 18);
     }
 
     #[test]
