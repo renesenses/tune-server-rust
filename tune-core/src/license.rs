@@ -43,6 +43,7 @@ pub enum Feature {
     AiRecommendations,
     PlaylistTransfer,
     AdvancedAlarms,
+    MultiProfiles,
 }
 
 impl Feature {
@@ -61,6 +62,7 @@ impl Feature {
             Feature::AiRecommendations,
             Feature::PlaylistTransfer,
             Feature::AdvancedAlarms,
+            Feature::MultiProfiles,
         ]
     }
 
@@ -79,6 +81,7 @@ impl Feature {
             Feature::AiRecommendations => "AI Recommendations",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
+            Feature::MultiProfiles => "Multi-User Profiles",
         }
     }
 }
@@ -406,8 +409,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twelve_features() {
-        assert_eq!(Feature::all_premium().len(), 12);
+    fn all_premium_has_thirteen_features() {
+        assert_eq!(Feature::all_premium().len(), 13);
     }
 
     #[test]

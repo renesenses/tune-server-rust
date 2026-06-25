@@ -2010,6 +2010,13 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         cover_url: Option<&str>,
     ) {
+        // Resolve active profile from settings (null = default profile).
+        let active_profile_id: Option<i64> = SettingsRepo::with_backend(self.db.clone())
+            .get("active_profile_id")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok());
+
         let repo = HistoryRepo::with_backend(self.db.clone());
         repo.record(&ListenRecord {
             id: None,
@@ -2024,6 +2031,7 @@ impl PlaybackOrchestrator {
             listened_at: None,
             zone_id: Some(zone_id),
             cover_url: cover_url.map(Into::into),
+            profile_id: active_profile_id,
         })
         .ok();
 
