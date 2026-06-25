@@ -46,6 +46,7 @@ pub enum Feature {
     MultiProfiles,
     WeeklyDigest,
     AutoEnrichment,
+    RoomCorrection,
 }
 
 impl Feature {
@@ -67,6 +68,7 @@ impl Feature {
             Feature::MultiProfiles,
             Feature::WeeklyDigest,
             Feature::AutoEnrichment,
+            Feature::RoomCorrection,
         ]
     }
 
@@ -88,6 +90,7 @@ impl Feature {
             Feature::MultiProfiles => "Multi-User Profiles",
             Feature::WeeklyDigest => "Weekly Digest",
             Feature::AutoEnrichment => "Auto Metadata Enrichment",
+            Feature::RoomCorrection => "Room Correction",
         }
     }
 }
@@ -415,8 +418,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_fifteen_features() {
-        assert_eq!(Feature::all_premium().len(), 15);
+    fn all_premium_has_sixteen_features() {
+        assert_eq!(Feature::all_premium().len(), 16);
     }
 
     #[test]

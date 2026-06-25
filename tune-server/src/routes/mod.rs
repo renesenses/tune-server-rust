@@ -43,6 +43,7 @@ pub mod podcasts;
 pub mod profiles;
 pub mod radios;
 pub mod room_calibration;
+pub mod room_correction;
 pub mod roon_bridge;
 pub mod sacd_rip;
 pub mod scrobbler;
@@ -294,6 +295,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/sacd-rip", sacd_rip::router())
         .nest("/hqplayer", hqplayer::router())
         .nest("/room-calibration", room_calibration::router())
+        .nest("/room-correction", room_correction::router())
         .nest("/visualizer", visualizer::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
