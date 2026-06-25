@@ -280,25 +280,40 @@ impl PositionPoller {
                 }
             }
 
-            // Recover playing state from device (only if not already playing in memory)
+            // Recover playing state from device — only if Tune was actually
+            // playing on this zone before (last_play_state == "playing" in DB).
+            // Without this check, playback from other apps (Roon, Spotify
+            // Connect, etc.) on a shared renderer (Sonos) would be captured
+            // by Tune and trigger phantom queue playback when the other app stops.
             let already_playing = states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
             if status.state == TransportState::Playing && !already_playing {
-                let np = crate::playback::NowPlaying {
-                    track_id: None,
-                    title: status.track_title.unwrap_or_else(|| "Recovering...".into()),
-                    artist_name: status.track_artist,
-                    album_title: None,
-                    cover_path: None,
-                    duration_ms: status.duration_ms as i64,
-                    source: "local".into(),
-                    source_id: None,
-                    stream_id: None,
-                    ..Default::default()
-                };
-                self.playback.play(zone_id, np).await;
-                info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                let last_state =
+                    ZoneRepo::with_backend(self.db.clone()).get_last_play_state(zone_id);
+                if last_state.as_deref() == Some("playing") {
+                    let np = crate::playback::NowPlaying {
+                        track_id: None,
+                        title: status.track_title.unwrap_or_else(|| "Recovering...".into()),
+                        artist_name: status.track_artist,
+                        album_title: None,
+                        cover_path: None,
+                        duration_ms: status.duration_ms as i64,
+                        source: "local".into(),
+                        source_id: None,
+                        stream_id: None,
+                        ..Default::default()
+                    };
+                    self.playback.play(zone_id, np).await;
+                    info!(zone_id, device = %device_id, "playback_recovered_from_device");
+                } else {
+                    debug!(
+                        zone_id,
+                        device = %device_id,
+                        last_state = ?last_state,
+                        "playback_recovery_skipped_not_tune_playback"
+                    );
+                }
             }
         }
 
