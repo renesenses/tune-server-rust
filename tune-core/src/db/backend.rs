@@ -1104,11 +1104,21 @@ fn pgrow_to_sqlvalues(row: &sqlx::postgres::PgRow) -> Result<Vec<SqlValue>, Stri
                 .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
                 .map_err(|e| format!("pg col {i} ({type_name}): {e}"))?,
             "NUMERIC" => row
-                .try_get_unchecked::<Option<f64>, _>(i)
-                .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
+                .try_get_unchecked::<Option<i64>, _>(i)
+                .map(|o| o.map_or(SqlValue::Null, SqlValue::Int))
                 .or_else(|_| {
-                    row.try_get_unchecked::<Option<i64>, _>(i)
-                        .map(|o| o.map_or(SqlValue::Null, SqlValue::Int))
+                    row.try_get_unchecked::<Option<f64>, _>(i)
+                        .map(|o| o.map_or(SqlValue::Null, SqlValue::Real))
+                })
+                .or_else(|_| {
+                    row.try_get_unchecked::<Option<String>, _>(i).map(|o| {
+                        o.map_or(SqlValue::Null, |s| {
+                            s.parse::<i64>()
+                                .map(SqlValue::Int)
+                                .or_else(|_| s.parse::<f64>().map(SqlValue::Real))
+                                .unwrap_or(SqlValue::Text(s))
+                        })
+                    })
                 })
                 .unwrap_or(SqlValue::Null),
             "BOOL" => row

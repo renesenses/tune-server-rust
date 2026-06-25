@@ -385,7 +385,9 @@ impl PositionPoller {
                     );
                     ps.last_position_ms = 0;
                     ps.peak_position_ms = 0;
-                    ps.track_started_at = None;
+                    ps.last_bytes_sent = 0;
+                    ps.past_end_ticks = 0;
+                    ps.track_started_at = Some(Instant::now());
                 }
                 ps.gapless_sent = false;
                 ps.gapless_sent_at = None;
@@ -697,9 +699,11 @@ impl PositionPoller {
                     ps.gapless_sent = false;
                     ps.gapless_sent_at = None;
                     ps.stopped_ticks = 0;
+                    ps.past_end_ticks = 0;
                     ps.peak_position_ms = 0;
                     ps.last_position_ms = 0;
-                    ps.track_started_at = None;
+                    ps.last_bytes_sent = 0;
+                    ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
                     ps.gapless_stuck_ticks = 0;
                     if let Some(next_pos) = Self::next_position(zone_state) {
@@ -1008,7 +1012,10 @@ impl PositionPoller {
                         ps.gapless_sent_at = None;
                         ps.peak_position_ms = 0;
                         ps.last_position_ms = 0;
-                        ps.track_started_at = None;
+                        ps.last_bytes_sent = 0;
+                        ps.track_started_at = Some(Instant::now());
+                        ps.stopped_ticks = 0;
+                        ps.past_end_ticks = 0;
                         ps.gapless_advance_pending = false;
                         ps.gapless_stuck_ticks = 0;
                         if let Some(next_pos) = Self::next_position(zone_state) {

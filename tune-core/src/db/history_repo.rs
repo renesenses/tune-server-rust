@@ -406,17 +406,17 @@ impl HistoryRepo {
         let u_tracks = totals_row.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
         let u_artists = totals_row.get(3).and_then(|v| v.as_i64()).unwrap_or(0);
 
-        // ── Top artists ──
+        // ── Top artists (exclude radio) ──
+        let no_radio_and = if simple_where.is_empty() {
+            "WHERE source != 'radio' AND"
+        } else {
+            "AND source != 'radio' AND"
+        };
         let artists_sql = format!(
             "SELECT artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
              FROM listen_history
-             {simple_where} {and_or} artist_name IS NOT NULL
+             {simple_where} {no_radio_and} artist_name IS NOT NULL
              GROUP BY artist_name ORDER BY plays DESC LIMIT {top_n}",
-            and_or = if simple_where.is_empty() {
-                "WHERE"
-            } else {
-                "AND"
-            },
         );
         let top_artists: Vec<TopArtistEntry> = self
             .db
@@ -429,19 +429,19 @@ impl HistoryRepo {
             })
             .collect();
 
-        // ── Top albums ──
+        // ── Top albums (exclude radio) ──
+        let no_radio_and_h = if where_clause.is_empty() {
+            "WHERE h.source != 'radio' AND"
+        } else {
+            "AND h.source != 'radio' AND"
+        };
         let albums_sql = format!(
             "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays
              FROM listen_history h
              LEFT JOIN albums a ON a.title = h.album_title
-             {where_clause} {and_or} h.album_title IS NOT NULL
+             {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
              GROUP BY h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url)
              ORDER BY plays DESC LIMIT {top_n}",
-            and_or = if where_clause.is_empty() {
-                "WHERE"
-            } else {
-                "AND"
-            },
         );
         let top_albums: Vec<TopAlbumEntry> = self
             .db
@@ -455,11 +455,11 @@ impl HistoryRepo {
             })
             .collect();
 
-        // ── Top tracks ──
+        // ── Top tracks (exclude radio) ──
         let tracks_sql = format!(
             "SELECT MAX(track_id), title, artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
              FROM listen_history
-             {simple_where}
+             {simple_where} {no_radio_and} title IS NOT NULL
              GROUP BY title, artist_name ORDER BY plays DESC LIMIT {top_n}"
         );
         let top_tracks: Vec<TopTrackEntry> = self
@@ -472,6 +472,30 @@ impl HistoryRepo {
                 artist_name: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+            .collect();
+
+        // ── Top radios ──
+        let radio_and = if simple_where.is_empty() {
+            "WHERE source = 'radio' AND"
+        } else {
+            "AND source = 'radio' AND"
+        };
+        let radios_sql = format!(
+            "SELECT title as station_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
+             FROM listen_history
+             {simple_where} {radio_and} title IS NOT NULL
+             GROUP BY title ORDER BY plays DESC LIMIT {top_n}"
+        );
+        let top_radios: Vec<TopRadioEntry> = self
+            .db
+            .query_many(&radios_sql, &[])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cols| TopRadioEntry {
+                station_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+                listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
             })
             .collect();
 
@@ -752,6 +776,7 @@ impl HistoryRepo {
             top_artists,
             top_albums,
             top_tracks,
+            top_radios,
             trend,
             hourly,
             by_zone,
@@ -825,6 +850,13 @@ pub struct TopTrackEntry {
     pub track_id: Option<i64>,
     pub title: String,
     pub artist_name: String,
+    pub plays: i64,
+    pub listening_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopRadioEntry {
+    pub station_name: String,
     pub plays: i64,
     pub listening_ms: i64,
 }
@@ -904,6 +936,8 @@ pub struct DashboardData {
     pub top_artists: Vec<TopArtistEntry>,
     pub top_albums: Vec<TopAlbumEntry>,
     pub top_tracks: Vec<TopTrackEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_radios: Vec<TopRadioEntry>,
     pub trend: Vec<TrendEntry>,
     pub hourly: Vec<HourlyEntry>,
     pub by_zone: Vec<ByZoneEntry>,
