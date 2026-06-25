@@ -556,8 +556,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     .output_device_id
                     .as_deref()
                     .map(|id| {
-                        devices.iter().any(|d| d.id == id)
-                            || registered_output_ids.contains(id)
+                        devices.iter().any(|d| d.id == id) || registered_output_ids.contains(id)
                     })
                     .unwrap_or(false),
             };

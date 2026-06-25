@@ -214,7 +214,10 @@ pub async fn register_manual_device(
                 .send()
                 .await
                 .map_err(|e| {
-                    format!("Cannot reach BluOS device at {}:{}: {e}", dev.host, dev.port)
+                    format!(
+                        "Cannot reach BluOS device at {}:{}: {e}",
+                        dev.host, dev.port
+                    )
                 })?;
             if !resp.status().is_success() {
                 return Err(format!(
@@ -269,7 +272,10 @@ pub async fn register_manual_device(
             };
 
             let base = format!("http://{}:{}", dev.host, dev.port);
-            let device_name = dev.name.clone().unwrap_or_else(|| format!("DLNA {}", dev.host));
+            let device_name = dev
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("DLNA {}", dev.host));
             let delay = state.config.play_delay_for(&device_name);
             let cm_url = service_urls
                 .get("connectionmanager")
