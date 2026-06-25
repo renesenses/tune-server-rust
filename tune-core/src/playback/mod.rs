@@ -299,17 +299,31 @@ impl PlaybackManager {
     }
 
     pub async fn set_shuffle(&self, zone_id: i64, enabled: bool) {
-        let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.shuffle = enabled;
+        {
+            let mut zones = self.zones.lock().await;
+            if let Some(state) = zones.get_mut(&zone_id) {
+                state.shuffle = enabled;
+            }
         }
+        self.emit(PlaybackEvent {
+            event: "shuffle".into(),
+            zone_id,
+            data: serde_json::json!({ "enabled": enabled }),
+        });
     }
 
     pub async fn set_repeat(&self, zone_id: i64, mode: RepeatMode) {
-        let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.repeat = mode;
+        {
+            let mut zones = self.zones.lock().await;
+            if let Some(state) = zones.get_mut(&zone_id) {
+                state.repeat = mode;
+            }
         }
+        self.emit(PlaybackEvent {
+            event: "repeat".into(),
+            zone_id,
+            data: serde_json::json!({ "mode": mode }),
+        });
     }
 
     pub async fn update_position(&self, zone_id: i64, position_ms: i64) {
@@ -359,5 +373,32 @@ impl PlaybackManager {
 
     fn emit(&self, event: PlaybackEvent) {
         let _ = self.event_tx.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_shuffle_emits_event() {
+        let pm = PlaybackManager::new();
+        let mut rx = pm.subscribe();
+        pm.set_shuffle(7, true).await;
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event, "shuffle");
+        assert_eq!(ev.zone_id, 7);
+        assert_eq!(ev.data["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn set_repeat_emits_event() {
+        let pm = PlaybackManager::new();
+        let mut rx = pm.subscribe();
+        pm.set_repeat(3, RepeatMode::All).await;
+        let ev = rx.recv().await.unwrap();
+        assert_eq!(ev.event, "repeat");
+        assert_eq!(ev.zone_id, 3);
+        assert_eq!(ev.data["mode"], "all");
     }
 }
