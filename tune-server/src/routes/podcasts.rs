@@ -20,6 +20,11 @@ fn default_limit() -> usize {
     20
 }
 #[derive(Deserialize)]
+struct TopQuery {
+    /// Optional Apple genre ID to filter top podcasts.
+    genre: Option<u32>,
+}
+#[derive(Deserialize)]
 struct EpisodesQuery {
     feed_url: Option<String>,
     #[serde(default = "default_episode_limit")]
@@ -50,6 +55,9 @@ pub fn router() -> Router<AppState> {
         .route("/subscriptions", get(list_subscriptions).post(subscribe))
         .route("/subscriptions/{id}", axum::routing::delete(unsubscribe))
         .route("/radiofrance", get(radiofrance_podcasts))
+        .route("/discover", get(discover_podcasts))
+        .route("/top", get(top_podcasts))
+        .route("/genres", get(list_genres))
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
         .route("/play/{zone_id}", post(play_episode))
@@ -117,7 +125,40 @@ async fn unsubscribe(State(state): State<AppState>, Path(id): Path<i64>) -> impl
     StatusCode::NO_CONTENT
 }
 async fn radiofrance_podcasts() -> Json<Value> {
-    Json(json!(PodcastService::radio_france_podcasts()))
+    Json(json!(PodcastService::curated_french_podcasts()))
+}
+/// GET /discover — curated French podcasts + optional Apple top chart enrichment.
+async fn discover_podcasts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let curated = PodcastService::curated_french_podcasts();
+    let svc = PodcastService::with_client(state.http_client.clone());
+    let top = svc.top_podcasts(None).await.unwrap_or_default();
+    Ok(Json(json!({
+        "curated": curated,
+        "top": top,
+        "genres": PodcastService::available_genres(),
+    })))
+}
+/// GET /top?genre={genreId} — Apple Top 50 podcasts in France, optionally filtered by genre.
+async fn top_podcasts(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Result<Json<Value>, AppError> {
+    let svc = PodcastService::with_client(state.http_client.clone());
+    match svc.top_podcasts(q.genre).await {
+        Ok(podcasts) => Ok(Json(json!({
+            "genre": q.genre,
+            "count": podcasts.len(),
+            "items": podcasts,
+        }))),
+        Err(e) => {
+            warn!(genre = ?q.genre, error = %e, "top_podcasts_failed");
+            Err(AppError::internal(e))
+        }
+    }
+}
+/// GET /genres — list all available genre filters for the top endpoint.
+async fn list_genres() -> Json<Value> {
+    Json(json!(PodcastService::available_genres()))
 }
 async fn episodes_by_feed_url(
     State(state): State<AppState>,

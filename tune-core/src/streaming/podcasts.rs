@@ -1,10 +1,15 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::debug;
 
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
+const APPLE_TOP_URL: &str = "https://rss.applemarketingtools.com/api/v2/fr/podcasts/top/50";
 const USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
+/// Cache TTL for top podcasts (1 hour).
+const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Podcast {
@@ -15,6 +20,105 @@ pub struct Podcast {
     pub description: String,
     pub episode_count: u32,
     pub source_id: String,
+    /// Optional genre/category label (e.g. "News", "Music", "Culture").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+/// Genre IDs recognised by the Apple podcast charts API.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum PodcastGenre {
+    Arts = 1301,
+    Comedy = 1303,
+    Education = 1304,
+    KidsAndFamily = 1305,
+    HealthAndFitness = 1307,
+    TvAndFilm = 1309,
+    Music = 1310,
+    News = 1311,
+    ReligionAndSpirituality = 1314,
+    Science = 1315,
+    Sports = 1316,
+    Technology = 1318,
+    Business = 1321,
+    Government = 1323,
+    SocietyAndCulture = 1324,
+    TrueCrime = 1325,
+    History = 1326,
+    Fiction = 1401,
+}
+
+impl PodcastGenre {
+    pub fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1301 => Some(Self::Arts),
+            1303 => Some(Self::Comedy),
+            1304 => Some(Self::Education),
+            1305 => Some(Self::KidsAndFamily),
+            1307 => Some(Self::HealthAndFitness),
+            1309 => Some(Self::TvAndFilm),
+            1310 => Some(Self::Music),
+            1311 => Some(Self::News),
+            1314 => Some(Self::ReligionAndSpirituality),
+            1315 => Some(Self::Science),
+            1316 => Some(Self::Sports),
+            1318 => Some(Self::Technology),
+            1321 => Some(Self::Business),
+            1323 => Some(Self::Government),
+            1324 => Some(Self::SocietyAndCulture),
+            1325 => Some(Self::TrueCrime),
+            1326 => Some(Self::History),
+            1401 => Some(Self::Fiction),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Arts => "Arts",
+            Self::Comedy => "Comedy",
+            Self::Education => "Education",
+            Self::KidsAndFamily => "Kids & Family",
+            Self::HealthAndFitness => "Health & Fitness",
+            Self::TvAndFilm => "TV & Film",
+            Self::Music => "Music",
+            Self::News => "News",
+            Self::ReligionAndSpirituality => "Religion & Spirituality",
+            Self::Science => "Science",
+            Self::Sports => "Sports",
+            Self::Technology => "Technology",
+            Self::Business => "Business",
+            Self::Government => "Government",
+            Self::SocietyAndCulture => "Society & Culture",
+            Self::TrueCrime => "True Crime",
+            Self::History => "History",
+            Self::Fiction => "Fiction",
+        }
+    }
+
+    /// All available genres.
+    pub fn all() -> &'static [PodcastGenre] {
+        &[
+            Self::Arts,
+            Self::Comedy,
+            Self::Education,
+            Self::KidsAndFamily,
+            Self::HealthAndFitness,
+            Self::TvAndFilm,
+            Self::Music,
+            Self::News,
+            Self::ReligionAndSpirituality,
+            Self::Science,
+            Self::Sports,
+            Self::Technology,
+            Self::Business,
+            Self::Government,
+            Self::SocietyAndCulture,
+            Self::TrueCrime,
+            Self::History,
+            Self::Fiction,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +184,7 @@ impl PodcastService {
                         h.update(feed_url.as_bytes());
                         format!("{:x}", h.finalize())
                     });
+                let category = r["primaryGenreName"].as_str().map(String::from);
                 Some(Podcast {
                     name: r["trackName"].as_str()?.to_string(),
                     artist: r["artistName"].as_str().unwrap_or("").to_string(),
@@ -96,6 +201,7 @@ impl PodcastService {
                         .to_string(),
                     episode_count: r["trackCount"].as_u64().unwrap_or(0) as u32,
                     source_id,
+                    category,
                 })
             })
             .collect())
@@ -128,72 +234,231 @@ impl PodcastService {
         parse_rss(&xml_text, limit)
     }
 
-    pub fn radio_france_podcasts() -> Vec<Podcast> {
+    /// Curated French podcasts from Radio France and other networks.
+    pub fn curated_french_podcasts() -> Vec<Podcast> {
         vec![
+            // ── Radio France — France Inter ──
             Podcast {
-                name: "Le 7/9 de France Inter".into(),
+                name: "Le sept neuf".into(),
                 artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10239.xml".into(),
-                cover_url: String::new(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10241.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/01/197263c5-db60-4f6f-b5e9-94c5ddb901b0/1400x1400_sc_la-grande-matinale-paracuellos.jpg".into(),
                 description: "La matinale de France Inter".into(),
                 episode_count: 0,
-                source_id: "rf-7-9".into(),
+                source_id: "rf-sept-neuf".into(),
+                category: Some("News".into()),
             },
             Podcast {
                 name: "Affaires sensibles".into(),
                 artist: "France Inter".into(),
                 feed_url: "https://radiofrance-podcast.net/podcast09/rss_13940.xml".into(),
-                cover_url: String::new(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2023/04/7b50cf5f-f5bd-4dc4-8b1d-b08666768dcf/1400x1400_sc_affaires-sensibles.jpg".into(),
                 description: "Les grandes affaires qui ont marqué l'actualité".into(),
                 episode_count: 0,
                 source_id: "rf-affaires-sensibles".into(),
-            },
-            Podcast {
-                name: "Les pieds sur terre".into(),
-                artist: "France Culture".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10078.xml".into(),
-                cover_url: String::new(),
-                description: "Documentaires et témoignages du quotidien".into(),
-                episode_count: 0,
-                source_id: "rf-pieds-terre".into(),
+                category: Some("Society & Culture".into()),
             },
             Podcast {
                 name: "Le Masque et la Plume".into(),
                 artist: "France Inter".into(),
                 feed_url: "https://radiofrance-podcast.net/podcast09/rss_14007.xml".into(),
-                cover_url: String::new(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/50cfc964-6b7a-43f0-b42d-f798ae8819ce/1400x1400_sc_sc-rf-omm-0000041327-ite.jpg".into(),
                 description: "L'émission critique cinéma, littérature et théâtre".into(),
                 episode_count: 0,
                 source_id: "rf-masque-plume".into(),
+                category: Some("Arts".into()),
             },
             Podcast {
-                name: "La marche de l'histoire".into(),
+                name: "Boomerang".into(),
                 artist: "France Inter".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_13915.xml".into(),
-                cover_url: String::new(),
-                description: "L'histoire au quotidien".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_13937.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/2c34c20f-2aa1-45af-89bd-0851a725c323/1400x1400_bommerang.jpg".into(),
+                description: "L'interview culturelle d'Augustin Trapenard".into(),
                 episode_count: 0,
-                source_id: "rf-marche-histoire".into(),
+                source_id: "rf-boomerang".into(),
+                category: Some("Arts".into()),
             },
             Podcast {
-                name: "FIP à la carte".into(),
-                artist: "FIP".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18984.xml".into(),
-                cover_url: String::new(),
-                description: "Les playlists musicales de FIP".into(),
+                name: "La Terre au carré".into(),
+                artist: "France Inter".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10212.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2023/05/786780d7-1273-4959-894c-52009150c1d2/1400x1400_sc_la-terre-au-carre.jpg".into(),
+                description: "L'environnement et les sciences au quotidien par Mathieu Vidard".into(),
                 episode_count: 0,
-                source_id: "rf-fip-carte".into(),
+                source_id: "rf-terre-carre".into(),
+                category: Some("Science".into()),
             },
+            Podcast {
+                name: "Le Grand Dimanche Soir".into(),
+                artist: "France Inter".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18153.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/a9d633cc-02b0-4cfa-aa22-9a2836d0af41/1400x1400_sc_le-grand-dimanche-soir.jpg".into(),
+                description: "Le spectacle du dimanche soir de Charline Vanhoenacker".into(),
+                episode_count: 0,
+                source_id: "rf-grand-dimanche".into(),
+                category: Some("Comedy".into()),
+            },
+            // ── Radio France — France Culture ──
+            Podcast {
+                name: "Les pieds sur terre".into(),
+                artist: "France Culture".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10078.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/a7fc766f-3e49-45a0-a41f-5512d5c0f8c1/1400x1400_les-pieds-sur-terre.jpg".into(),
+                description: "Documentaires et témoignages du quotidien".into(),
+                episode_count: 0,
+                source_id: "rf-pieds-terre".into(),
+                category: Some("Society & Culture".into()),
+            },
+            Podcast {
+                name: "Avec philosophie".into(),
+                artist: "France Culture".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_10467.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/7724d8b9-cd17-41f6-b802-5db0c171842b/1400x1400_avec-philosophie-2.jpg".into(),
+                description: "La philosophie au quotidien par Géraldine Muhlmann".into(),
+                episode_count: 0,
+                source_id: "rf-avec-philosophie".into(),
+                category: Some("Education".into()),
+            },
+            Podcast {
+                name: "Les Midis de Culture".into(),
+                artist: "France Culture".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_12360.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/04/3fe0b371-e504-4bbf-b90c-559111dc06fb/1400x1400_sc_sc_sc-fc-midis-de-culture-3000x3000-photo.jpg".into(),
+                description: "Le magazine culturel de la mi-journée de France Culture".into(),
+                episode_count: 0,
+                source_id: "rf-midis-culture".into(),
+                category: Some("Arts".into()),
+            },
+            Podcast {
+                name: "Le vif de l'histoire".into(),
+                artist: "France Inter".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_11739.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2023/06/21d18070-9a66-45aa-b484-3d094c39909a/1400x1400_sc_rf_omm_0000038825_ite.jpg".into(),
+                description: "L'histoire racontée par Jean Lebrun".into(),
+                episode_count: 0,
+                source_id: "rf-vif-histoire".into(),
+                category: Some("History".into()),
+            },
+            // ── Radio France — FIP ──
             Podcast {
                 name: "Club Jazzafip".into(),
                 artist: "FIP".into(),
-                feed_url: "https://radiofrance-podcast.net/podcast09/rss_19354.xml".into(),
-                cover_url: String::new(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_12250.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2026/03/91179aa6-0e09-4748-a281-d0f7a3259a1b/1400x1400_sc_fip-clubjazzafip-3000x3000.jpg".into(),
                 description: "Le jazz sur FIP".into(),
                 episode_count: 0,
                 source_id: "rf-jazzafip".into(),
+                category: Some("Music".into()),
             },
         ]
+    }
+
+    /// Backward-compatible alias — returns the same curated list.
+    pub fn radio_france_podcasts() -> Vec<Podcast> {
+        Self::curated_french_podcasts()
+    }
+
+    // ── Apple Top Podcasts ──────────────────────────────────────────
+
+    /// Fetch the top 50 podcasts in France from the Apple RSS feed generator.
+    /// Results are cached for 1 hour per genre key (None = all genres).
+    pub async fn top_podcasts(&self, genre: Option<u32>) -> Result<Vec<Podcast>, String> {
+        // Build the URL — genre-specific or global.
+        let url = match genre {
+            Some(gid) => format!("{APPLE_TOP_URL}/podcast-{gid}.json"),
+            None => format!("{APPLE_TOP_URL}/podcasts.json"),
+        };
+        let cache_key = genre.unwrap_or(0);
+
+        // Per-genre caches stored in a static map.
+        type CacheEntry = (Instant, Vec<Podcast>);
+        type CacheMap = std::collections::HashMap<u32, CacheEntry>;
+        static CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+        {
+            let guard = cache.lock().await;
+            if let Some((ts, data)) = guard.get(&cache_key) {
+                if ts.elapsed() < TOP_CACHE_TTL && !data.is_empty() {
+                    return Ok(data.clone());
+                }
+            }
+        }
+
+        debug!(url = %url, "apple_top_podcasts_fetch");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("apple top podcasts: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("apple top podcasts HTTP {}", resp.status()));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("apple top podcasts parse: {e}"))?;
+
+        let results = body["feed"]["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        let podcasts: Vec<Podcast> = results
+            .iter()
+            .filter_map(|r| {
+                let apple_id = r["id"].as_str()?.to_string();
+                let name = r["name"].as_str()?.to_string();
+                let artist = r["artistName"].as_str().unwrap_or("").to_string();
+                let artwork = r["artworkUrl100"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+                    // Upgrade to 600px artwork.
+                    .replace("100x100bb", "600x600bb");
+                let category = r["genres"]
+                    .as_array()
+                    .and_then(|g| g.first())
+                    .and_then(|g| g["name"].as_str())
+                    .map(String::from);
+                Some(Podcast {
+                    name,
+                    artist,
+                    feed_url: String::new(), // Apple top chart doesn't include feed URLs
+                    cover_url: artwork,
+                    description: String::new(),
+                    episode_count: 0,
+                    source_id: format!("apple-{apple_id}"),
+                    category,
+                })
+            })
+            .collect();
+
+        debug!(count = podcasts.len(), "apple_top_podcasts_parsed");
+
+        // Update cache.
+        {
+            let mut guard = cache.lock().await;
+            guard.insert(cache_key, (Instant::now(), podcasts.clone()));
+        }
+
+        Ok(podcasts)
+    }
+
+    /// Return the list of available genre filters with their IDs and labels.
+    pub fn available_genres() -> Vec<serde_json::Value> {
+        PodcastGenre::all()
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "id": *g as u32,
+                    "name": g.label(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -366,12 +631,35 @@ mod tests {
         assert_eq!(episodes[0].duration_ms, 1800000);
     }
     #[test]
-    fn radio_france_curated() {
-        let podcasts = PodcastService::radio_france_podcasts();
-        assert!(podcasts.len() >= 4);
-        assert!(podcasts.iter().any(|p| p.name.contains("France Inter")));
+    fn curated_french_podcasts() {
+        let podcasts = PodcastService::curated_french_podcasts();
+        assert!(podcasts.len() >= 10);
+        // Check cover URLs are populated.
         for p in &podcasts {
-            assert!(!p.feed_url.is_empty());
+            assert!(!p.feed_url.is_empty(), "empty feed_url for {}", p.name);
+            assert!(!p.cover_url.is_empty(), "empty cover_url for {}", p.name);
         }
+        // Check some expected shows.
+        assert!(podcasts.iter().any(|p| p.name.contains("sept neuf")));
+        assert!(podcasts.iter().any(|p| p.name == "Boomerang"));
+        assert!(podcasts.iter().any(|p| p.name == "Club Jazzafip"));
+    }
+    #[test]
+    fn radio_france_alias() {
+        let a = PodcastService::radio_france_podcasts();
+        let b = PodcastService::curated_french_podcasts();
+        assert_eq!(a.len(), b.len());
+    }
+    #[test]
+    fn genre_enum() {
+        assert_eq!(PodcastGenre::from_id(1310).unwrap().label(), "Music");
+        assert!(PodcastGenre::from_id(9999).is_none());
+        assert!(PodcastGenre::all().len() >= 18);
+    }
+    #[test]
+    fn available_genres_list() {
+        let genres = PodcastService::available_genres();
+        assert!(genres.len() >= 18);
+        assert!(genres.iter().any(|g| g["name"] == "Music"));
     }
 }

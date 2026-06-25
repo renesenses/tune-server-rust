@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tune-v1';
+const CACHE_NAME = 'tune-v2';
 const PRECACHE = ['/', '/index.html'];
 
 self.addEventListener('install', (e) => {
