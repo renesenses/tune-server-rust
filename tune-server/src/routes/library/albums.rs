@@ -81,7 +81,16 @@ pub(super) async fn list_albums(
             Vec::new()
         }
     };
-    let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
+    let items: Vec<Value> = items
+        .iter()
+        .map(|a| {
+            let mut j = a.to_json();
+            if let Some(obj) = j.as_object_mut() {
+                obj.remove("bio");
+            }
+            j
+        })
+        .collect();
     Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
 }
 
