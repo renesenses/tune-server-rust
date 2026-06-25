@@ -306,3 +306,58 @@ pub(super) async fn artist_image_report(
     settings.set(&key, &val.to_string()).ok();
     Json(json!({"reported": true, "artist_id": id}))
 }
+
+// ---------------------------------------------------------------------------
+// PUT /artists/{id} — update artist metadata (name, sort_name, bio)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(super) struct ArtistUpdate {
+    name: Option<String>,
+    sort_name: Option<String>,
+    bio: Option<String>,
+    musicbrainz_id: Option<String>,
+}
+
+pub(super) async fn update_artist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ArtistUpdate>,
+) -> impl IntoResponse {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
+    let mut artist = match repo.get(id) {
+        Ok(Some(a)) => a,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    if let Some(ref v) = body.name {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "artist name cannot be empty"})),
+            )
+                .into_response();
+        }
+        artist.name = trimmed.to_string();
+    }
+    if let Some(ref v) = body.sort_name {
+        artist.sort_name = Some(v.clone());
+    }
+    if let Some(ref v) = body.bio {
+        artist.bio = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+    if let Some(ref v) = body.musicbrainz_id {
+        artist.musicbrainz_id = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+
+    if let Err(e) = repo.update(&artist) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("update failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(json!(artist)).into_response()
+}

@@ -87,6 +87,8 @@ pub fn router() -> Router<AppState> {
         .route("/fix-genres-by-family", post(fix_genres_by_family))
         // Album merge (targeted, by IDs)
         .route("/albums/merge", post(merge_albums))
+        // Batch rename artist (used by web client)
+        .route("/batch/rename-artist", post(batch_rename_artist))
 }
 
 async fn edit_track(
@@ -224,6 +226,130 @@ async fn edit_artist(
     repo.update(&artist).ok();
 
     Json(json!({ "status": "ok", "artist_id": id })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /batch/rename-artist — rename an artist by ID or name
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BatchRenameArtist {
+    /// Artist ID (preferred — no ambiguity)
+    artist_id: Option<i64>,
+    /// Legacy: match by old name (case-insensitive)
+    old_name: Option<String>,
+    new_name: String,
+    /// Whether to also rewrite file tags on disk (reserved for future use)
+    #[serde(default)]
+    #[allow(dead_code)]
+    update_files: bool,
+}
+
+async fn batch_rename_artist(
+    State(state): State<AppState>,
+    Json(body): Json<BatchRenameArtist>,
+) -> impl IntoResponse {
+    let new_name = body.new_name.trim().to_string();
+    if new_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "new_name cannot be empty"})),
+        )
+            .into_response();
+    }
+
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+
+    // Resolve the artist: prefer ID, fall back to name lookup
+    let mut artist = if let Some(id) = body.artist_id {
+        match artist_repo.get(id) {
+            Ok(Some(a)) => a,
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "artist not found by ID"})),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(ref old_name) = body.old_name {
+        match artist_repo.get_by_name(old_name) {
+            Ok(Some(a)) => a,
+            _ => {
+                // Fallback: case-insensitive search across all artists
+                let all = artist_repo.list(10000, 0).unwrap_or_default();
+                let target = old_name.trim().to_lowercase();
+                match all
+                    .into_iter()
+                    .find(|a| a.name.trim().to_lowercase() == target)
+                {
+                    Some(a) => a,
+                    None => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "artist not found", "old_name": old_name})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "either artist_id or old_name is required"})),
+        )
+            .into_response();
+    };
+
+    let old_name = artist.name.clone();
+    let artist_id = artist.id;
+    artist.name = new_name.clone();
+
+    // Update the artist record
+    if let Err(e) = artist_repo.update(&artist) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("update artist failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Update album_artist / artist_name references in tracks
+    let mut tracks_updated = 0usize;
+    if let Some(aid) = artist_id {
+        let tracks = track_repo.list_by_artist(aid).unwrap_or_default();
+        for t in &tracks {
+            if t.id.is_some() {
+                // Update artist_name on the track
+                let mut updated = t.clone();
+                if updated.artist_name.as_deref() == Some(&old_name) {
+                    updated.artist_name = Some(new_name.clone());
+                }
+                if track_repo.update(&updated).is_ok() {
+                    tracks_updated += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        artist_id = ?artist_id,
+        old = old_name,
+        new = new_name,
+        tracks_updated,
+        "batch_rename_artist_done"
+    );
+
+    Json(json!({
+        "status": "ok",
+        "artist_id": artist_id,
+        "old_name": old_name,
+        "new_name": new_name,
+        "tracks_updated": tracks_updated,
+    }))
+    .into_response()
 }
 
 async fn list_doubtful_metadata(

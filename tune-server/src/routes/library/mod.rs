@@ -135,7 +135,10 @@ pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/artists", get(artists::list_artists))
-        .route("/artists/{id}", get(artists::get_artist))
+        .route(
+            "/artists/{id}",
+            get(artists::get_artist).put(artists::update_artist),
+        )
         .route("/artists/{id}/albums", get(artists::artist_albums))
         .route("/artists/{id}/tracks", get(artists::artist_tracks))
         .route("/artists/{id}/bio", get(artists::artist_bio))

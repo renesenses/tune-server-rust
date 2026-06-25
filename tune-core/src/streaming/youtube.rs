@@ -28,13 +28,13 @@ fn ytm_context() -> serde_json::Value {
     json!({
         "client": {
             "clientName": "WEB_REMIX",
-            "clientVersion": "1.20240101.01.00",
+            "clientVersion": "1.20250620.01.00",
             "hl": "en",
             "gl": "US",
             "experimentIds": [],
             "experimentsToken": "",
             "browserName": "Chrome",
-            "browserVersion": "120.0.0.0",
+            "browserVersion": "137.0.0.0",
             "osName": "Windows",
             "osVersion": "10.0",
             "platform": "DESKTOP",
@@ -43,6 +43,28 @@ fn ytm_context() -> serde_json::Value {
                 "musicLocationMasterSwitch": "MUSIC_LOCATION_MASTER_SWITCH_INDETERMINATE",
                 "pwaInstallabilityStatus": "PWA_INSTALLABILITY_STATUS_UNKNOWN"
             }
+        },
+        "user": {
+            "lockedSafetyMode": false
+        }
+    })
+}
+
+/// Android client context for the `/player` endpoint.
+/// The Android client returns direct audio stream URLs without requiring
+/// a browser-side JavaScript challenge (signature cipher), unlike WEB_REMIX.
+fn ytm_android_context() -> serde_json::Value {
+    json!({
+        "client": {
+            "clientName": "ANDROID_MUSIC",
+            "clientVersion": "7.27.52",
+            "androidSdkVersion": 30,
+            "hl": "en",
+            "gl": "US",
+            "platform": "MOBILE",
+            "osName": "Android",
+            "osVersion": "11",
+            "userAgent": "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"
         },
         "user": {
             "lockedSafetyMode": false
@@ -134,7 +156,7 @@ impl YouTubeService {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(45))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             authenticated: true, // YouTube works without auth
@@ -248,15 +270,136 @@ impl YouTubeService {
     }
 
     // ------------------------------------------------------------------
-    // yt-dlp stream URL extraction
+    // Native stream URL extraction via YTM /player API
     // ------------------------------------------------------------------
 
-    /// Extract audio stream URL via yt-dlp subprocess.
+    /// Extract audio stream URL natively via the YouTube Music `/player` API.
     ///
-    /// Uses `yt-dlp` to get the best audio URL. Prefers non-segmented HTTPS
-    /// streams (progressive m4a/aac) for DLNA compatibility. Falls back to
-    /// best available audio format.
-    async fn extract_audio_url(&self, track_id: &str) -> Result<String, String> {
+    /// Uses the Android Music client context which returns direct audio URLs
+    /// without requiring JavaScript signature deciphering. This is the primary
+    /// extraction method — no external binary dependency.
+    async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
+        let body = json!({
+            "videoId": track_id,
+            "context": ytm_android_context(),
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "signatureTimestamp": 20073
+                }
+            }
+        });
+
+        let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Origin", "https://music.youtube.com")
+            .header("Referer", "https://music.youtube.com/")
+            .header(
+                "User-Agent",
+                "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("ytm player request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            let snippet: String = body_text.chars().take(300).collect();
+            warn!(track_id, status, body = %snippet, "ytm_player_api_error");
+            return Err(format!(
+                "YouTube player API returned {status} for {track_id}"
+            ));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("ytm player json parse: {e}"))?;
+
+        // Check playability status — YouTube may block the video
+        let playability = &data["playabilityStatus"];
+        let status = playability["status"].as_str().unwrap_or("UNKNOWN");
+        if status != "OK" {
+            let reason = playability["reason"]
+                .as_str()
+                .or_else(|| {
+                    playability["messages"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("unknown reason");
+            warn!(track_id, status, reason, "youtube_not_playable");
+            return Err(format!("YouTube track {track_id} not playable: {reason}"));
+        }
+
+        // Extract the best audio stream from adaptiveFormats
+        let formats = data["streamingData"]["adaptiveFormats"]
+            .as_array()
+            .ok_or_else(|| format!("no streaming data for {track_id}"))?;
+
+        // Find best audio format: prefer OPUS (audio/webm) at highest bitrate,
+        // then fall back to AAC (audio/mp4)
+        let mut best_url: Option<&str> = None;
+        let mut best_bitrate: u64 = 0;
+        let mut best_is_opus = false;
+
+        for fmt in formats {
+            let mime = fmt["mimeType"].as_str().unwrap_or("");
+            let is_audio = mime.starts_with("audio/");
+            if !is_audio {
+                continue;
+            }
+
+            let bitrate = fmt["bitrate"].as_u64().unwrap_or(0);
+            let is_opus = mime.contains("opus");
+
+            // Prefer OPUS; within same codec family, prefer higher bitrate
+            let dominated = if best_is_opus && !is_opus {
+                true // Don't replace opus with non-opus
+            } else if !best_is_opus && is_opus {
+                false // Always prefer opus
+            } else {
+                bitrate <= best_bitrate
+            };
+
+            if dominated {
+                continue;
+            }
+
+            // Prefer direct URL (no cipher); skip formats requiring signature
+            if let Some(u) = fmt["url"].as_str() {
+                best_url = Some(u);
+                best_bitrate = bitrate;
+                best_is_opus = is_opus;
+            }
+        }
+
+        let stream_url =
+            best_url.ok_or_else(|| format!("no suitable audio stream found for {track_id}"))?;
+
+        debug!(
+            track_id,
+            bitrate = best_bitrate,
+            opus = best_is_opus,
+            "ytm_native_url_extracted"
+        );
+        Ok(stream_url.to_string())
+    }
+
+    // ------------------------------------------------------------------
+    // yt-dlp stream URL extraction (fallback)
+    // ------------------------------------------------------------------
+
+    /// Extract audio stream URL via yt-dlp subprocess (fallback).
+    ///
+    /// Used when native `/player` API extraction fails (e.g., geo-restricted
+    /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
+    async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<String, String> {
         let video_url = format!("https://www.youtube.com/watch?v={track_id}");
 
         let output = tokio::time::timeout(
@@ -278,7 +421,16 @@ impl YouTubeService {
         )
         .await
         .map_err(|_| format!("yt-dlp timeout for {track_id}"))?
-        .map_err(|e| format!("yt-dlp exec error: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "yt-dlp not found — install it with 'pip install yt-dlp' \
+                     or 'brew install yt-dlp' for YouTube playback fallback"
+                )
+            } else {
+                format!("yt-dlp exec error: {e}")
+            }
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -293,6 +445,30 @@ impl YouTubeService {
         }
 
         Ok(url)
+    }
+
+    /// Extract audio stream URL with native API as primary + yt-dlp fallback.
+    async fn extract_audio_url(&self, track_id: &str) -> Result<String, String> {
+        // Primary: native YTM /player API (no external dependency)
+        match self.extract_audio_url_native(track_id).await {
+            Ok(url) => return Ok(url),
+            Err(e) => {
+                info!(track_id, error = %e, "ytm_native_extraction_failed_trying_ytdlp");
+            }
+        }
+
+        // Fallback: yt-dlp subprocess
+        match self.extract_audio_url_ytdlp(track_id).await {
+            Ok(url) => Ok(url),
+            Err(ytdlp_err) => {
+                warn!(track_id, error = %ytdlp_err, "youtube_all_extraction_methods_failed");
+                Err(format!(
+                    "YouTube playback failed for track {track_id}: \
+                     native API and yt-dlp both failed. \
+                     Last error: {ytdlp_err}"
+                ))
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1809,7 +1985,7 @@ impl StreamingService for YouTubeService {
     }
 
     // ------------------------------------------------------------------
-    // Stream URL (via yt-dlp)
+    // Stream URL (native API + yt-dlp fallback)
     // ------------------------------------------------------------------
 
     async fn get_track_url(
@@ -1837,11 +2013,11 @@ impl StreamingService for YouTubeService {
             }
         }
 
-        // Extract via yt-dlp
+        // Extract via native API (primary) + yt-dlp (fallback)
         let url = self
             .extract_audio_url(track_id)
             .await
-            .map_err(|e| TuneError::Streaming(format!("youtube stream url: {e}")))?;
+            .map_err(|e| TuneError::Streaming(e))?;
 
         // Determine MIME type from URL
         let mime_type = if url.contains("mime=audio%2Fwebm") || url.contains(".webm") {

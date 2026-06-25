@@ -15,6 +15,42 @@ use tune_core::orchestrator::PlayResult;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Map an orchestrator play error to an appropriate HTTP status code.
+///
+/// Streaming service failures (yt-dlp, API errors, auth) are upstream issues
+/// and should be 502 Bad Gateway, not 500 Internal Server Error.
+/// Device-offline errors are 503 Service Unavailable.
+/// Everything else is 500.
+fn play_error_response(e: String) -> (StatusCode, String) {
+    let code = if e.contains("YouTube")
+        || e.contains("youtube")
+        || e.contains("yt-dlp")
+        || e.contains("yt_dlp")
+        || e.contains("stream url")
+        || e.contains("Streaming service")
+        || e.contains("streaming")
+        || e.contains("Qobuz")
+        || e.contains("qobuz")
+        || e.contains("Tidal")
+        || e.contains("tidal")
+        || e.contains("Deezer")
+        || e.contains("deezer")
+        || e.contains("Spotify")
+        || e.contains("spotify")
+        || e.contains("401")
+        || e.contains("403")
+        || e.contains("not playable")
+        || e.contains("extraction")
+    {
+        StatusCode::BAD_GATEWAY
+    } else if e.contains("offline") || e.contains("Output device") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (code, e)
+}
+
 /// Persist the queue state for a zone to disk (non-blocking).
 fn persist_queue_async(state: &AppState, zone_id: i64) {
     let db = state.backend.clone();
@@ -498,7 +534,7 @@ async fn play(
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(e) => play_error_response(e).into_response(),
         };
     }
 
@@ -579,7 +615,7 @@ async fn play(
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(e) => play_error_response(e).into_response(),
         };
     }
 
@@ -637,7 +673,7 @@ async fn play(
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(e) => play_error_response(e).into_response(),
         };
     }
 
