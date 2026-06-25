@@ -515,7 +515,7 @@ impl PlaybackOrchestrator {
         if let Some(ref source) = req.source
             && source != "local"
         {
-            if source == "podcast" || source == "radio" {
+            if source == "podcast" || source == "radio" || source == "upnp" {
                 return self.resolve_direct_url(req).await;
             }
             return self.resolve_streaming_url(source, req).await;
