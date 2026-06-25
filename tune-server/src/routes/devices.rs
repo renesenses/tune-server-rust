@@ -303,9 +303,17 @@ pub async fn register_manual_device(
     }
 }
 
-/// Re-register every persisted manual device at startup.  Failures (device
-/// offline, moved IP) are logged and skipped — the zone simply stays offline
-/// until the device is reachable again.
+/// Re-registration runs very early in boot — before the HTTP server even
+/// binds — so a device (or the local network stack) that isn't reachable in
+/// that exact window would otherwise be lost until the next restart. Retry
+/// each device with exponential backoff to ride out that race.
+const REREGISTER_MAX_ATTEMPTS: u32 = 8;
+const REREGISTER_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const REREGISTER_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Re-register every persisted manual device at startup. Each device is
+/// retried independently (in its own task) with exponential backoff, so an
+/// unreachable device neither blocks the others nor delays boot.
 pub async fn reregister_manual_devices(state: &AppState) {
     let devices = load_manual_devices(state);
     if devices.is_empty() {
@@ -313,15 +321,45 @@ pub async fn reregister_manual_devices(state: &AppState) {
     }
     info!(count = devices.len(), "reregistering_manual_devices");
     for dev in devices {
+        let state = state.clone();
+        tokio::spawn(async move { reregister_with_backoff(&state, dev).await });
+    }
+}
+
+/// Try to register one manual device, retrying with exponential backoff
+/// (1s, 2s, 4s … capped at 60s) until it succeeds or attempts are exhausted.
+async fn reregister_with_backoff(state: &AppState, dev: ManualDevice) {
+    let mut delay = REREGISTER_BASE_DELAY;
+    for attempt in 1..=REREGISTER_MAX_ATTEMPTS {
         match register_manual_device(state, &dev).await {
-            Ok((id, name, _)) => info!(id = %id, name = %name, "manual_device_reregistered"),
-            Err(e) => warn!(
-                host = %dev.host,
-                port = dev.port,
-                r#type = %dev.r#type,
-                error = %e,
-                "manual_device_reregister_failed"
-            ),
+            Ok((id, name, _)) => {
+                info!(id = %id, name = %name, attempt, "manual_device_reregistered");
+                return;
+            }
+            Err(e) if attempt == REREGISTER_MAX_ATTEMPTS => {
+                warn!(
+                    host = %dev.host,
+                    port = dev.port,
+                    r#type = %dev.r#type,
+                    attempts = attempt,
+                    error = %e,
+                    "manual_device_reregister_gave_up"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    host = %dev.host,
+                    port = dev.port,
+                    r#type = %dev.r#type,
+                    attempt,
+                    retry_in_s = delay.as_secs(),
+                    error = %e,
+                    "manual_device_reregister_retry"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(REREGISTER_MAX_DELAY);
+            }
         }
     }
 }
