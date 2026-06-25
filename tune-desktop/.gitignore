@@ -1,0 +1,4 @@
+# Tauri-generated artifacts
+/gen/schemas
+# Build output
+/target
