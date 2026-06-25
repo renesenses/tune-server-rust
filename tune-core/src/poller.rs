@@ -342,20 +342,40 @@ impl PositionPoller {
             // Reset all per-track poller state so stale values from the previous
             // track (peak_position, gapless flags, etc.) cannot cause false
             // gapless advances or premature track-end detection.
+            //
+            // Exception: if last_seek_at is recent (< 10s), this generation
+            // change is from a seek (which recreates the stream), not a real
+            // track change. In that case, preserve position state to avoid
+            // the seek bar jumping back to 0.
             if ps.track_generation != zone_state.track_generation {
-                info!(
-                    zone_id,
-                    old_gen = ps.track_generation,
-                    new_gen = zone_state.track_generation,
-                    "poller_track_generation_changed_resetting_state"
-                );
+                let is_seek = zone_state
+                    .last_seek_at
+                    .map(|t| t.elapsed().as_secs() < 10)
+                    .unwrap_or(false);
+
+                if is_seek {
+                    info!(
+                        zone_id,
+                        old_gen = ps.track_generation,
+                        new_gen = zone_state.track_generation,
+                        position_ms = zone_state.position_ms,
+                        "poller_generation_changed_during_seek_preserving_position"
+                    );
+                } else {
+                    info!(
+                        zone_id,
+                        old_gen = ps.track_generation,
+                        new_gen = zone_state.track_generation,
+                        "poller_track_generation_changed_resetting_state"
+                    );
+                    ps.last_position_ms = 0;
+                    ps.peak_position_ms = 0;
+                    ps.track_started_at = None;
+                }
                 ps.gapless_sent = false;
                 ps.gapless_sent_at = None;
                 ps.gapless_cooldown = 0;
                 ps.stopped_ticks = 0;
-                ps.last_position_ms = 0;
-                ps.peak_position_ms = 0;
-                ps.track_started_at = None;
                 ps.track_generation = zone_state.track_generation;
                 ps.track_loaded_at = Instant::now();
                 ps.past_end_ticks = 0;
