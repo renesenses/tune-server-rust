@@ -39,6 +39,7 @@ pub enum Feature {
     CloudBackup,
     SyncedLyrics,
     ListeningStats,
+    MultiScrobbling,
 }
 
 impl Feature {
@@ -53,6 +54,7 @@ impl Feature {
             Feature::CloudBackup,
             Feature::SyncedLyrics,
             Feature::ListeningStats,
+            Feature::MultiScrobbling,
         ]
     }
 
@@ -67,6 +69,7 @@ impl Feature {
             Feature::CloudBackup => "Cloud Backup",
             Feature::SyncedLyrics => "Synced Lyrics",
             Feature::ListeningStats => "Listening Stats",
+            Feature::MultiScrobbling => "Multi-Service Scrobbling",
         }
     }
 }
@@ -394,8 +397,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_eight_features() {
-        assert_eq!(Feature::all_premium().len(), 8);
+    fn all_premium_has_nine_features() {
+        assert_eq!(Feature::all_premium().len(), 9);
     }
 
     #[test]

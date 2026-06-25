@@ -43,6 +43,7 @@ pub mod radios;
 pub mod room_calibration;
 pub mod roon_bridge;
 pub mod sacd_rip;
+pub mod scrobbler;
 pub mod search;
 pub mod service_tokens;
 pub mod setlistfm;
@@ -273,6 +274,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/squeezebox", squeezebox::router())
         .nest("/spotify-connect", spotify_connect::router())
         .nest("/listenbrainz", listenbrainz::router())
+        .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
         .nest("/bandcamp", bandcamp::router())
         .nest("/archive", archive::router())
