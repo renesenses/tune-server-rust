@@ -38,6 +38,7 @@ pub enum Feature {
     OaatProtocol,
     CloudBackup,
     SyncedLyrics,
+    ListeningStats,
 }
 
 impl Feature {
@@ -51,6 +52,7 @@ impl Feature {
             Feature::OaatProtocol,
             Feature::CloudBackup,
             Feature::SyncedLyrics,
+            Feature::ListeningStats,
         ]
     }
 
@@ -64,6 +66,7 @@ impl Feature {
             Feature::OaatProtocol => "OAAT Protocol",
             Feature::CloudBackup => "Cloud Backup",
             Feature::SyncedLyrics => "Synced Lyrics",
+            Feature::ListeningStats => "Listening Stats",
         }
     }
 }
@@ -391,8 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_seven_features() {
-        assert_eq!(Feature::all_premium().len(), 7);
+    fn all_premium_has_eight_features() {
+        assert_eq!(Feature::all_premium().len(), 8);
     }
 
     #[test]
