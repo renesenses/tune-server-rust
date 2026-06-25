@@ -1,10 +1,16 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tokio::sync::Mutex;
-use tokio::time::{Duration, interval};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Global notify used to wake the poller immediately when a local audio
+/// output reaches end-of-stream.  Without this, the poller only discovers
+/// `track_ended_naturally` on the next 1-second tick, introducing an
+/// average 500 ms gap between tracks on local output.
+pub static TRACK_END_NOTIFY: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::new()));
 
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
@@ -193,11 +199,17 @@ impl PositionPoller {
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("position_poller_started");
-            let mut ticker = interval(Duration::from_millis(POLL_INTERVAL_MS));
+            let mut ticker = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
+            let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
 
             loop {
-                ticker.tick().await;
+                // Wake on either the regular 1-second tick OR an immediate
+                // notification from a local output that finished a track.
+                tokio::select! {
+                    _ = ticker.tick() => {},
+                    _ = notify.notified() => {},
+                }
                 self.tick(&mut poll_states).await;
             }
         })

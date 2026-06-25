@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::traits::{OutputStatus, OutputTarget, TransportState};
+use crate::poller::TRACK_END_NOTIFY;
 
 // ---------------------------------------------------------------------------
 // Audio host selection (WASAPI vs ASIO on Windows)
@@ -1287,6 +1288,7 @@ impl OutputTarget for LocalOutput {
                 // play_url() clears this flag for the next track.
                 track_ended_naturally.store(true, Ordering::SeqCst);
                 track_ended_generation.store(my_generation, Ordering::SeqCst);
+                TRACK_END_NOTIFY.notify_one();
 
                 // Wait for ring buffer to drain
                 loop {
@@ -1446,6 +1448,7 @@ impl OutputTarget for LocalOutput {
                 if http_eof_excl {
                     track_ended_naturally.store(true, Ordering::SeqCst);
                     track_ended_generation.store(my_generation, Ordering::SeqCst);
+                    TRACK_END_NOTIFY.notify_one();
                 }
 
                 // Wait for ring buffer to drain
@@ -1598,6 +1601,7 @@ impl OutputTarget for LocalOutput {
                 if http_eof_asio {
                     track_ended_naturally.store(true, Ordering::SeqCst);
                     track_ended_generation.store(my_generation, Ordering::SeqCst);
+                    TRACK_END_NOTIFY.notify_one();
                 }
 
                 // Wait for ring buffer to drain
@@ -1749,6 +1753,7 @@ impl OutputTarget for LocalOutput {
                             if http_eof_wasapi {
                                 track_ended_naturally.store(true, Ordering::SeqCst);
                                 track_ended_generation.store(my_generation, Ordering::SeqCst);
+                                TRACK_END_NOTIFY.notify_one();
                             }
 
                             // Wait for ring buffer to drain
@@ -2322,6 +2327,7 @@ impl OutputTarget for LocalOutput {
             if http_eof {
                 track_ended_naturally.store(true, Ordering::SeqCst);
                 track_ended_generation.store(my_generation, Ordering::SeqCst);
+                TRACK_END_NOTIFY.notify_one();
                 debug!(
                     ring_available = ring.available(),
                     total_bytes_read,

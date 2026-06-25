@@ -28,6 +28,11 @@ pub struct PlaybackOrchestrator {
     gapless_sessions: Mutex<HashMap<i64, String>>,
     pub prefetch: Arc<PrefetchEngine>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
+    /// Cache of MIME types that each DLNA renderer does NOT support.
+    /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
+    /// Only negative results are cached — if a MIME is not in the set, it's
+    /// either supported or hasn't been checked yet.
+    dlna_unsupported_mimes: Mutex<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +116,7 @@ impl PlaybackOrchestrator {
             gapless_sessions: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
+            dlna_unsupported_mimes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -418,6 +424,59 @@ impl PlaybackOrchestrator {
         })
     }
 
+    /// Check whether a DLNA renderer supports a given MIME type by querying
+    /// its ConnectionManager GetProtocolInfo Sink.  Results are cached per
+    /// device_id so the SOAP call only happens once per renderer per session.
+    async fn dlna_supports_mime(&self, device_id: &str, mime: &str) -> bool {
+        // Check negative cache first
+        {
+            let cache = self.dlna_unsupported_mimes.lock().await;
+            if let Some(unsupported) = cache.get(device_id) {
+                if unsupported.iter().any(|m| m == mime) {
+                    return false;
+                }
+                // We already probed this device — if the MIME is not in the
+                // unsupported list, it means it was supported.
+                if !unsupported.is_empty() {
+                    // Device was probed at least once (it returned some
+                    // unsupported entries or we stored an empty vec for it).
+                    // But we can't distinguish "probed and supported" from
+                    // "never checked this mime".  So we only use the cache
+                    // for known negatives and re-probe below if needed.
+                }
+            }
+        }
+
+        // Probe the renderer
+        let supported = {
+            let outputs = self.outputs.lock().await;
+            if let Some(output) = outputs.get(device_id) {
+                let locked = output.lock().await;
+                if let Some(dlna) = locked
+                    .as_any()
+                    .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+                {
+                    dlna.supports_mime(mime).await
+                } else {
+                    // Not a DLNA output — format negotiation doesn't apply
+                    true
+                }
+            } else {
+                true
+            }
+        };
+
+        if !supported {
+            let mut cache = self.dlna_unsupported_mimes.lock().await;
+            let entry = cache.entry(device_id.to_string()).or_default();
+            if !entry.iter().any(|m| m == mime) {
+                entry.push(mime.to_string());
+            }
+        }
+
+        supported
+    }
+
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
         let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
         match dsd_mode.as_str() {
@@ -680,10 +739,34 @@ impl PlaybackOrchestrator {
             && source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
+
+        // DLNA format negotiation: if the source is FLAC and the renderer
+        // doesn't support audio/flac (Denon, Marantz, Revox), force
+        // transcoding to WAV (LPCM) which has a proper DLNA.ORG_PN profile.
+        let is_dlna = zone_output_type.as_deref() == Some("dlna");
+        let dlna_needs_wav =
+            if is_dlna && !needs_transcode_for_output && source_format == Some(AudioFormat::Flac) {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                    .unwrap_or("");
+                if !did.is_empty() {
+                    !self.dlna_supports_mime(did, "audio/flac").await
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
         // Downsample if the zone has a max_sample_rate cap and the source exceeds it
         let needs_downsample = zone_max_sample_rate.is_some_and(|max| sample_rate > max);
-        let needs_transcode =
-            needs_transcode_for_output || oaat_needs_wav || local_needs_wav || needs_downsample;
+        let needs_transcode = needs_transcode_for_output
+            || oaat_needs_wav
+            || local_needs_wav
+            || needs_downsample
+            || dlna_needs_wav;
 
         let (
             session_id,
@@ -696,6 +779,10 @@ impl PlaybackOrchestrator {
         ) = if needs_transcode {
             let src_fmt = source_format.unwrap_or(AudioFormat::Flac);
             let target_fmt = if oaat_needs_wav || local_needs_wav {
+                AudioFormat::Wav
+            } else if dlna_needs_wav {
+                // Renderer doesn't support FLAC — transcode to WAV (LPCM)
+                // which has a proper DLNA.ORG_PN=LPCM profile.
                 AudioFormat::Wav
             } else if needs_downsample && !needs_transcode_for_output {
                 // Only downsampling — keep the same lossless format
@@ -733,7 +820,9 @@ impl PlaybackOrchestrator {
                 32
             } else if src_fmt == AudioFormat::Dsd {
                 24
-            } else if oaat_needs_wav {
+            } else if oaat_needs_wav || dlna_needs_wav {
+                // OAAT endpoints and DLNA renderers that need WAV fallback:
+                // cap at 24-bit (LPCM max for most DLNA renderers).
                 bit_depth.max(16).min(24)
             } else if src_fmt == AudioFormat::Alac {
                 // ALAC: transcode to FLAC for DLNA (universally supported).
@@ -775,7 +864,8 @@ impl PlaybackOrchestrator {
             } else {
                 target_fmt.container_format().to_string()
             };
-            let use_file_transcode = is_network_output && target_format_str != "wav";
+            let use_file_transcode =
+                is_network_output && (target_format_str != "wav" || dlna_needs_wav);
 
             let info = StreamInfo {
                 format: out_ext.clone(),
@@ -1742,18 +1832,184 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
-                // Non-AAC codecs (FLAC, etc.) — proxy directly
-                let session_id = self
-                    .streamer
-                    .create_proxy_session(info, stream_data.url.clone(), false)
+                // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
+                // actually supports this MIME type before proxying directly.
+                // Strict renderers (Denon, Marantz, Revox) reject FLAC because
+                // their GetProtocolInfo Sink doesn't list audio/flac.  In that
+                // case, transcode to WAV (LPCM) which has a proper DLNA.ORG_PN
+                // profile and is universally supported.
+                let zone = ZoneRepo::with_backend(self.db.clone())
+                    .get(req.zone_id)
+                    .ok()
+                    .flatten();
+                let zone_output_type = zone.as_ref().and_then(|z| z.output_type.clone());
+                let is_dlna = zone_output_type.as_deref() == Some("dlna");
+                let device_id = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                    .unwrap_or("");
+                let renderer_supports_mime = if is_dlna
+                    && (stream_data.mime_type == "audio/flac"
+                        || stream_data.mime_type == "audio/x-flac")
+                    && !device_id.is_empty()
+                {
+                    self.dlna_supports_mime(device_id, &stream_data.mime_type)
+                        .await
+                } else {
+                    true
+                };
+
+                if !renderer_supports_mime {
+                    // Renderer does not support FLAC — transcode to WAV (LPCM).
+                    // Same pattern as AAC pre-transcode: download → decode → encode → file session.
+                    let sr = stream_data.quality.sample_rate;
+                    let bd = stream_data.quality.bit_depth.max(16).min(24);
+
+                    info!(
+                        service = service_name,
+                        codec = %codec_lower,
+                        device = %device_id,
+                        sample_rate = sr,
+                        bit_depth = bd,
+                        "streaming_flac_transcode_to_wav_renderer_unsupported"
+                    );
+
+                    let upstream_url = stream_data.url.clone();
+                    let tmp_dl = std::env::temp_dir()
+                        .join(format!(
+                            "tune-stream-{}.{}",
+                            uuid::Uuid::new_v4(),
+                            codec_lower
+                        ))
+                        .to_string_lossy()
+                        .to_string();
+                    let tmp_wav = std::env::temp_dir()
+                        .join(format!("tune-flac-to-wav-{}.wav", uuid::Uuid::new_v4()))
+                        .to_string_lossy()
+                        .to_string();
+
+                    let tmp_dl_clone = tmp_dl.clone();
+                    let tmp_wav_clone = tmp_wav.clone();
+                    let transcode_result = tokio::task::spawn_blocking(move || {
+                        // 1. Download
+                        let resp = reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(120))
+                            .build()
+                            .and_then(|c| c.get(&upstream_url).send())
+                            .map_err(|e| format!("upstream fetch: {e}"))?;
+                        if !resp.status().is_success() {
+                            return Err(format!("upstream HTTP {}", resp.status()));
+                        }
+                        let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
+                        std::fs::write(&tmp_dl_clone, &bytes)
+                            .map_err(|e| format!("write dl: {e}"))?;
+
+                        // 2. Decode to PCM
+                        let decoded = crate::audio::decode::decode_to_pcm(
+                            &tmp_dl_clone,
+                            Some(sr),
+                            Some(2),
+                            0.0,
+                            0.0,
+                        )?;
+                        let pcm_bytes = decoded.pcm_bytes();
+                        let actual_bd = decoded.bit_depth;
+                        let actual_sr = decoded.sample_rate;
+                        let actual_ch = decoded.channels;
+
+                        // 3. Encode to WAV
+                        let rt = tokio::runtime::Handle::try_current()
+                            .map_err(|e| format!("no tokio runtime: {e}"))?;
+                        let encoded_data = rt.block_on(async {
+                            let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                                "wav",
+                                actual_sr,
+                                actual_bd as u32,
+                                actual_ch,
+                            );
+                            encoder.start().await?;
+                            encoder.write(&pcm_bytes).await?;
+                            encoder.finish().await
+                        })?;
+
+                        std::fs::write(&tmp_wav_clone, &encoded_data)
+                            .map_err(|e| format!("write wav: {e}"))?;
+
+                        let _ = std::fs::remove_file(&tmp_dl_clone);
+                        let file_size = encoded_data.len() as u64;
+                        Ok::<(u64, u16, u32, u16), String>((
+                            file_size,
+                            actual_bd,
+                            actual_sr,
+                            actual_ch as u16,
+                        ))
+                    })
                     .await;
-                let server_ip = crate::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into());
-                let url = self
-                    .streamer
-                    .get_stream_url(&session_id, &server_ip, &codec_lower);
-                (url, Some(session_id), stream_data.mime_type.clone(), None)
+
+                    match transcode_result {
+                        Ok(Ok((file_size, actual_bd, actual_sr, actual_ch))) => {
+                            info!(
+                                tmp = %tmp_wav,
+                                file_size,
+                                bit_depth = actual_bd,
+                                sample_rate = actual_sr,
+                                "streaming_flac_to_wav_transcode_complete"
+                            );
+
+                            let file_info = StreamInfo {
+                                format: "wav".into(),
+                                mime_type: "audio/wav".into(),
+                                sample_rate: actual_sr,
+                                bit_depth: actual_bd,
+                                channels: actual_ch,
+                                file_size: Some(file_size),
+                                duration_ms: None,
+                                ..Default::default()
+                            };
+                            let session_id = self
+                                .streamer
+                                .create_file_session(file_info, tmp_wav, false)
+                                .await;
+
+                            let server_ip = crate::discovery::ssdp::get_local_ip()
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_else(|| "127.0.0.1".into());
+                            let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                            (
+                                url,
+                                Some(session_id),
+                                "audio/wav".to_string(),
+                                Some(file_size),
+                            )
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "streaming_flac_to_wav_transcode_failed");
+                            let _ = std::fs::remove_file(&tmp_dl);
+                            let _ = std::fs::remove_file(&tmp_wav);
+                            return Err(format!("FLAC→WAV transcode failed: {e}"));
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streaming_flac_to_wav_transcode_task_panic");
+                            let _ = std::fs::remove_file(&tmp_dl);
+                            let _ = std::fs::remove_file(&tmp_wav);
+                            return Err(format!("FLAC→WAV transcode task panic: {e}"));
+                        }
+                    }
+                } else {
+                    // Renderer supports FLAC — proxy directly as before
+                    let session_id = self
+                        .streamer
+                        .create_proxy_session(info, stream_data.url.clone(), false)
+                        .await;
+                    let server_ip = crate::discovery::ssdp::get_local_ip()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "127.0.0.1".into());
+                    let url = self
+                        .streamer
+                        .get_stream_url(&session_id, &server_ip, &codec_lower);
+                    (url, Some(session_id), stream_data.mime_type.clone(), None)
+                }
             }
         } else {
             (

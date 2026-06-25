@@ -548,6 +548,47 @@ impl DlnaOutput {
         }
         cap
     }
+
+    /// Probe the renderer's GetProtocolInfo Sink to check if a given MIME type
+    /// is supported.  Protocol info entries have the format:
+    ///   `http-get:*:audio/flac:*`
+    /// The third colon-separated field is the MIME type.
+    pub async fn supports_mime(&self, mime: &str) -> bool {
+        let protocols = match self.get_protocol_info().await {
+            Ok(p) => p,
+            Err(e) => {
+                // If we can't reach ConnectionManager, assume the renderer
+                // supports the format (optimistic — avoids unnecessary
+                // transcoding for renderers that don't implement CM).
+                debug!(device = %self.name, error = %e, mime, "protocol_info_unavailable_assuming_supported");
+                return true;
+            }
+        };
+        if protocols.is_empty() {
+            // Empty Sink list: renderer didn't report capabilities.
+            // Assume it supports the format (same optimistic fallback).
+            debug!(device = %self.name, mime, "protocol_info_empty_sink_assuming_supported");
+            return true;
+        }
+        let mime_lower = mime.to_lowercase();
+        for proto in &protocols {
+            // Each entry: "http-get:*:audio/flac:*" or "http-get:*:audio/flac:DLNA..."
+            let fields: Vec<&str> = proto.split(':').collect();
+            if fields.len() >= 3 {
+                let proto_mime = fields[2].trim().to_lowercase();
+                if proto_mime == mime_lower {
+                    return true;
+                }
+                // Also match wildcard MIME ("*") — some renderers advertise
+                // "http-get:*:*:*" to indicate they accept anything.
+                if proto_mime == "*" {
+                    return true;
+                }
+            }
+        }
+        info!(device = %self.name, mime, protocols_count = protocols.len(), "dlna_mime_not_supported_by_renderer");
+        false
+    }
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {

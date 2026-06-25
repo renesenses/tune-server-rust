@@ -8,6 +8,7 @@ pub mod connect;
 pub mod dashboard;
 pub mod deezer_proxy_handler;
 pub mod devices;
+pub mod digest;
 pub mod discogs;
 pub mod dj;
 pub mod eq_pro;
@@ -263,6 +264,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/export", export::router())
         .nest("/network", network::router())
         .nest("/dashboard", dashboard::router())
+        .nest("/digest", digest::router())
         .nest("/peers", peers::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())

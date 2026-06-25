@@ -44,6 +44,7 @@ pub enum Feature {
     PlaylistTransfer,
     AdvancedAlarms,
     MultiProfiles,
+    WeeklyDigest,
 }
 
 impl Feature {
@@ -63,6 +64,7 @@ impl Feature {
             Feature::PlaylistTransfer,
             Feature::AdvancedAlarms,
             Feature::MultiProfiles,
+            Feature::WeeklyDigest,
         ]
     }
 
@@ -82,6 +84,7 @@ impl Feature {
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
+            Feature::WeeklyDigest => "Weekly Digest",
         }
     }
 }
@@ -409,8 +412,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_thirteen_features() {
-        assert_eq!(Feature::all_premium().len(), 13);
+    fn all_premium_has_fourteen_features() {
+        assert_eq!(Feature::all_premium().len(), 14);
     }
 
     #[test]
