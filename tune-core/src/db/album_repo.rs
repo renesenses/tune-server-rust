@@ -772,9 +772,9 @@ impl AlbumRepo {
         let order_clause = match sort {
             "title" => format!("LOWER(a.title) {dir}"),
             "release_date" => format!(
-                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir}, LOWER(a.title) ASC"
+                "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC"
             ),
-            "year" => format!("a.year {dir}, LOWER(a.title) ASC"),
+            "year" => format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC"),
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
