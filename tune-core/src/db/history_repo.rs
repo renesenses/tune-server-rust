@@ -413,10 +413,17 @@ impl HistoryRepo {
             "AND source != 'radio' AND"
         };
         let artists_sql = format!(
-            "SELECT artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-             FROM listen_history
-             {simple_where} {no_radio_and} artist_name IS NOT NULL
-             GROUP BY artist_name ORDER BY plays DESC LIMIT {top_n}",
+            "SELECT lh.artist_name, COUNT(*) as plays, COALESCE(SUM(lh.duration_ms), 0) as ms,
+                    COALESCE(ar.image_path, (
+                        SELECT a2.cover_path FROM albums a2
+                        JOIN tracks t2 ON t2.album_id = a2.id
+                        WHERE LOWER(t2.album_artist) = LOWER(lh.artist_name) AND a2.cover_path IS NOT NULL
+                        LIMIT 1
+                    )) as cover_path
+             FROM listen_history lh
+             LEFT JOIN artists ar ON LOWER(ar.name) = LOWER(lh.artist_name)
+             {simple_where} {no_radio_and} lh.artist_name IS NOT NULL
+             GROUP BY lh.artist_name, ar.image_path ORDER BY plays DESC LIMIT {top_n}",
         );
         let top_artists: Vec<TopArtistEntry> = self
             .db
@@ -426,6 +433,7 @@ impl HistoryRepo {
                 artist_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
                 plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+                cover_path: cols.get(3).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -457,10 +465,19 @@ impl HistoryRepo {
 
         // ── Top tracks (exclude radio) ──
         let tracks_sql = format!(
-            "SELECT MAX(track_id), title, artist_name, COUNT(*) as plays, COALESCE(SUM(duration_ms), 0) as ms
-             FROM listen_history
-             {simple_where} {no_radio_and} title IS NOT NULL
-             GROUP BY title, artist_name ORDER BY plays DESC LIMIT {top_n}"
+            "SELECT MAX(lh.track_id), lh.title, lh.artist_name, COUNT(*) as plays,
+                    COALESCE(SUM(lh.duration_ms), 0) as ms,
+                    COALESCE(MAX(lh.cover_url), (
+                        SELECT a2.cover_path FROM tracks t2
+                        JOIN albums a2 ON t2.album_id = a2.id
+                        WHERE LOWER(t2.title) = LOWER(lh.title)
+                          AND LOWER(COALESCE(t2.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
+                          AND a2.cover_path IS NOT NULL
+                        LIMIT 1
+                    )) as cover_path
+             FROM listen_history lh
+             {simple_where} {no_radio_and} lh.title IS NOT NULL
+             GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
         );
         let top_tracks: Vec<TopTrackEntry> = self
             .db
@@ -472,6 +489,7 @@ impl HistoryRepo {
                 artist_name: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                cover_path: cols.get(5).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -835,6 +853,8 @@ pub struct TopArtistEntry {
     pub artist_name: String,
     pub plays: i64,
     pub listening_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -852,6 +872,8 @@ pub struct TopTrackEntry {
     pub artist_name: String,
     pub plays: i64,
     pub listening_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
