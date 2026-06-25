@@ -85,7 +85,7 @@ const POSITION_PAST_END_TICKS: u8 = 3;
 /// for this many ticks (after gapless_cooldown expires), force a play_from_queue.
 /// This handles renderers that accept SetNextAVTransportURI but don't actually
 /// auto-transition — the poller would otherwise get stuck forever.
-const GAPLESS_STUCK_THRESHOLD: u8 = 5;
+const GAPLESS_STUCK_THRESHOLD: u8 = 2;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -733,9 +733,12 @@ impl PositionPoller {
                             );
                         } else {
                             // During the gapless guard period, a Stopped state
-                            // means the renderer transitioned via gapless —
-                            // advance metadata instead of triggering track end.
-                            info!(zone_id, "gapless_guard_stopped_advancing");
+                            // MAY mean the renderer transitioned via gapless.
+                            // Don't advance metadata yet — wait for the renderer
+                            // to report Playing (position reset) to confirm.
+                            // If it stays Stopped, the stuck handler will force
+                            // play_from_queue which handles metadata correctly.
+                            info!(zone_id, "gapless_guard_stopped_pending_confirmation");
                             ps.gapless_sent = false;
                             ps.gapless_sent_at = None;
                             ps.stopped_ticks = 0;
@@ -744,16 +747,7 @@ impl PositionPoller {
                             ps.track_started_at = None;
                             ps.gapless_advance_pending = true;
                             ps.gapless_stuck_ticks = 0;
-                            if let Some(next_pos) = Self::next_position(zone_state) {
-                                if let Err(e) = self
-                                    .orchestrator
-                                    .advance_queue_metadata(zone_id, next_pos)
-                                    .await
-                                {
-                                    warn!(zone_id, error = %e, "gapless_advance_failed");
-                                }
-                                ps.gapless_cooldown = 4;
-                            }
+                            ps.gapless_cooldown = 4;
                         }
                     } else if ps.gapless_advance_pending {
                         // The poller advanced metadata expecting the renderer
@@ -826,10 +820,13 @@ impl PositionPoller {
                             if natural_end {
                                 if ps.gapless_sent {
                                     // Gapless was prepared via SetNextAVTransportURI.
-                                    // The renderer already transitioned — just advance
-                                    // metadata without sending a new play command
-                                    // (which would cause noise/glitch on DMP-A8).
-                                    info!(zone_id, "gapless_natural_end_advancing_metadata");
+                                    // Don't advance metadata yet — wait for the
+                                    // renderer to confirm the transition by starting
+                                    // to play (position reset detected in the Playing
+                                    // handler).  If it stays Stopped after the
+                                    // cooldown + stuck threshold, fall through to
+                                    // play_from_queue which handles metadata itself.
+                                    info!(zone_id, "gapless_natural_end_waiting_for_transition");
                                     ps.gapless_sent = false;
                                     ps.gapless_sent_at = None;
                                     ps.stopped_ticks = 0;
@@ -838,16 +835,7 @@ impl PositionPoller {
                                     ps.track_started_at = None;
                                     ps.gapless_advance_pending = true;
                                     ps.gapless_stuck_ticks = 0;
-                                    if let Some(next_pos) = Self::next_position(zone_state) {
-                                        if let Err(e) = self
-                                            .orchestrator
-                                            .advance_queue_metadata(zone_id, next_pos)
-                                            .await
-                                        {
-                                            warn!(zone_id, error = %e, "gapless_natural_advance_failed");
-                                        }
-                                        ps.gapless_cooldown = 4;
-                                    }
+                                    ps.gapless_cooldown = 4;
                                 } else {
                                     track_ended = true;
                                 }
@@ -915,11 +903,24 @@ impl PositionPoller {
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
-                    // Renderer started playing — gapless transition succeeded,
-                    // clear the stuck-detection state.
+                    // Renderer started playing — gapless transition confirmed.
+                    // NOW advance metadata (deferred from the Stopped handler
+                    // to avoid showing the wrong track on renderers that don't
+                    // actually auto-transition via SetNextAVTransportURI).
                     if ps.gapless_advance_pending {
                         ps.gapless_advance_pending = false;
                         ps.gapless_stuck_ticks = 0;
+                        if let Some(next_pos) = Self::next_position(zone_state) {
+                            info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
+                            if let Err(e) = self
+                                .orchestrator
+                                .advance_queue_metadata(zone_id, next_pos)
+                                .await
+                            {
+                                warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
+                            }
+                            ps.gapless_cooldown = 4;
+                        }
                     }
                     if ps.track_started_at.is_none() {
                         ps.track_started_at = Some(Instant::now());
