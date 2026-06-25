@@ -42,6 +42,7 @@ pub enum Feature {
     MultiScrobbling,
     AiRecommendations,
     PlaylistTransfer,
+    AdvancedAlarms,
 }
 
 impl Feature {
@@ -59,6 +60,7 @@ impl Feature {
             Feature::MultiScrobbling,
             Feature::AiRecommendations,
             Feature::PlaylistTransfer,
+            Feature::AdvancedAlarms,
         ]
     }
 
@@ -76,6 +78,7 @@ impl Feature {
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
             Feature::PlaylistTransfer => "Playlist Transfer",
+            Feature::AdvancedAlarms => "Advanced Alarms",
         }
     }
 }
@@ -403,8 +406,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_eleven_features() {
-        assert_eq!(Feature::all_premium().len(), 11);
+    fn all_premium_has_twelve_features() {
+        assert_eq!(Feature::all_premium().len(), 12);
     }
 
     #[test]

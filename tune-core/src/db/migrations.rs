@@ -547,6 +547,11 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
 );
 ",
     },
+    Migration {
+        version: 44,
+        name: "add_advanced_alarm_columns",
+        up: "",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -839,6 +844,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "listen_history", "source_id", "TEXT");
             add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
         }
+        if migration.version == 44 {
+            add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
+            add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -881,6 +890,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
+
+    add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
+    add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");

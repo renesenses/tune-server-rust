@@ -57,6 +57,14 @@ fn is_french_holiday(year: i32, month: u32, day: u32) -> bool {
 
 // ─── Day parsing ───────────────────────────────────────────────
 
+/// Parse 7-char bitmask "1010100" (Mon..Sun) into day indices (0=Mon..6=Sun).
+fn parse_days_of_week(mask: &str) -> Vec<u32> {
+    mask.chars()
+        .enumerate()
+        .filter_map(|(i, c)| if c == '1' { Some(i as u32) } else { None })
+        .collect()
+}
+
 fn parse_days(days_str: Option<&str>) -> Vec<u32> {
     let s = match days_str {
         Some(s) if !s.is_empty() => s.trim().to_lowercase(),
@@ -83,6 +91,26 @@ fn parse_days(days_str: Option<&str>) -> Vec<u32> {
     result.sort();
     result.dedup();
     result
+}
+
+/// Resolve active days for an alarm.  Prefers `days_of_week` (7-char
+/// bitmask) when present; falls back to legacy `days` (CSV/named).
+fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
+    if let Some(dow) = alarm.get("days_of_week").and_then(|v| v.as_str()) {
+        if dow.len() == 7 && dow.chars().all(|c| c == '0' || c == '1') {
+            return parse_days_of_week(dow);
+        }
+    }
+    parse_days(alarm.get("days").and_then(|v| v.as_str()))
+}
+
+/// Parse multi_zone_ids JSON array string into a Vec of zone IDs.
+fn parse_multi_zone_ids(alarm: &serde_json::Value) -> Vec<i64> {
+    alarm
+        .get("multi_zone_ids")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+        .unwrap_or_default()
 }
 
 // ─── Snooze ────────────────────────────────────────────────────
@@ -239,7 +267,7 @@ impl AlarmScheduler {
                 continue;
             }
 
-            let days = parse_days(alarm.get("days").and_then(|v| v.as_str()));
+            let days = resolve_alarm_days(alarm);
             if !days.contains(&dow) {
                 continue;
             }
@@ -275,7 +303,10 @@ impl AlarmScheduler {
         Ok(())
     }
 
-    async fn fire_alarm(&self, alarm: &serde_json::Value) {
+    /// Fire an alarm: play its source on the target zone(s) with optional
+    /// fade-in.  Public so the test endpoint (`POST /alarms/{id}/test`) can
+    /// trigger it directly.
+    pub async fn fire_alarm(&self, alarm: &serde_json::Value) {
         let alarm_id = alarm["id"].as_i64().unwrap_or(0);
         let zone_id = alarm["zone_id"].as_i64();
         let source_type = alarm["source_type"].as_str().unwrap_or("radio");
@@ -298,51 +329,63 @@ impl AlarmScheduler {
             .or_else(|| alarm["fade_in_seconds"].as_u64())
             .unwrap_or(60);
 
+        // Collect target zones: multi_zone_ids if set, else single zone_id,
+        // else fallback to first available zone.
+        let multi_zones = parse_multi_zone_ids(alarm);
+        let target_zones: Vec<i64> = if !multi_zones.is_empty() {
+            multi_zones
+        } else {
+            let z = zone_id.unwrap_or_else(|| {
+                crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                    .list()
+                    .unwrap_or_default()
+                    .first()
+                    .and_then(|z| z.id)
+                    .unwrap_or(1)
+            });
+            vec![z]
+        };
+
         info!(
             alarm_id,
             name = alarm["name"].as_str().unwrap_or(""),
-            zone_id = ?zone_id,
+            zones = ?target_zones,
             source = format!("{source_type}:{source_id_str}"),
             "alarm_triggered"
         );
 
-        let target_zone = zone_id.unwrap_or_else(|| {
-            crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-                .list()
-                .unwrap_or_default()
-                .first()
-                .and_then(|z| z.id)
-                .unwrap_or(1)
-        });
+        let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
 
-        let device_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .get(target_zone)
-            .ok()
-            .flatten()
-            .and_then(|z| z.output_device_id);
+        for &target_zone in &target_zones {
+            let device_id = zone_repo
+                .get(target_zone)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
 
-        let req = crate::orchestrator::PlayRequest {
-            zone_id: target_zone,
-            output_device_id: device_id.clone(),
-            track_id: None,
-            source: Some(source_type.to_string()),
-            source_id: Some(source_id_str),
-            title: None,
-            artist_name: None,
-            album_title: None,
-            cover_url: None,
-            duration_ms: None,
-            seek_ms: None,
-        };
-        if let Err(e) = self.orchestrator.play(req).await {
-            warn!(alarm_id, error = %e, "alarm_play_error");
+            let req = crate::orchestrator::PlayRequest {
+                zone_id: target_zone,
+                output_device_id: device_id.clone(),
+                track_id: None,
+                source: Some(source_type.to_string()),
+                source_id: Some(source_id_str.clone()),
+                title: None,
+                artist_name: None,
+                album_title: None,
+                cover_url: None,
+                duration_ms: None,
+                seek_ms: None,
+            };
+            if let Err(e) = self.orchestrator.play(req).await {
+                warn!(alarm_id, zone_id = target_zone, error = %e, "alarm_play_error");
+            }
+
+            // Fade in volume in background
+            let orch = self.orchestrator.clone();
+            tokio::spawn(async move {
+                fade_in_volume(&orch, target_zone, device_id, volume, fade_s).await;
+            });
         }
-
-        // Fade in volume in background
-        let orch = self.orchestrator.clone();
-        tokio::spawn(async move {
-            fade_in_volume(&orch, target_zone, device_id, volume, fade_s).await;
-        });
 
         // Update last_fired_at
         let now_str = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -368,7 +411,7 @@ impl AlarmScheduler {
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE enabled = '1'",
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids FROM alarms WHERE enabled = '1'",
             &[],
         )?;
         Ok(rows
@@ -388,15 +431,18 @@ impl AlarmScheduler {
                     "one_shot": r.get(10).and_then(SqlValue::as_i64),
                     "skip_holidays": r.get(11).and_then(SqlValue::as_i64),
                     "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
+                    "days_of_week": r.get(13).and_then(SqlValue::as_str),
+                    "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
                 })
             })
             .collect())
     }
 
-    fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
+    /// Retrieve a single alarm by ID. Public so the test endpoint can use it.
+    pub fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let row = self.db.query_one(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled FROM alarms WHERE id = ?",
+            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids FROM alarms WHERE id = ?",
             &[&id as &dyn ToSqlValue],
         )?;
         Ok(row.map(|r| {
@@ -414,6 +460,8 @@ impl AlarmScheduler {
                 "one_shot": r.get(10).and_then(SqlValue::as_i64),
                 "skip_holidays": r.get(11).and_then(SqlValue::as_i64),
                 "enabled": r.get(12).and_then(SqlValue::as_i64).unwrap_or(0),
+                "days_of_week": r.get(13).and_then(SqlValue::as_str),
+                "multi_zone_ids": r.get(14).and_then(SqlValue::as_str),
             })
         }))
     }
@@ -450,6 +498,43 @@ mod tests {
     #[test]
     fn parse_days_named() {
         assert_eq!(parse_days(Some("mon,wed,fri")), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn parse_days_of_week_bitmask() {
+        assert_eq!(parse_days_of_week("1111111"), vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(parse_days_of_week("1010100"), vec![0, 2, 4]);
+        assert_eq!(parse_days_of_week("0000011"), vec![5, 6]);
+        assert_eq!(parse_days_of_week("0000000"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn resolve_alarm_days_prefers_bitmask() {
+        let alarm = serde_json::json!({
+            "days": "0,1,2,3,4",
+            "days_of_week": "0000011"
+        });
+        assert_eq!(resolve_alarm_days(&alarm), vec![5, 6]);
+    }
+
+    #[test]
+    fn resolve_alarm_days_falls_back_to_legacy() {
+        let alarm = serde_json::json!({
+            "days": "weekends"
+        });
+        assert_eq!(resolve_alarm_days(&alarm), vec![5, 6]);
+    }
+
+    #[test]
+    fn parse_multi_zone_ids_valid() {
+        let alarm = serde_json::json!({ "multi_zone_ids": "[1,3,5]" });
+        assert_eq!(parse_multi_zone_ids(&alarm), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn parse_multi_zone_ids_empty() {
+        let alarm = serde_json::json!({});
+        assert!(parse_multi_zone_ids(&alarm).is_empty());
     }
 
     #[test]
