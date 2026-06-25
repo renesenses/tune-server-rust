@@ -314,8 +314,17 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
     let mut failed = 0u32;
 
     for (artist_id, name, mbid) in &artists {
-        // MusicBrainz rate limit
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        if mbid.is_empty() {
+            // No MusicBrainz ID — can't fetch via Wikidata, try Last.fm only
+            if lastfm_key.is_empty() {
+                failed += 1;
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        } else {
+            // MusicBrainz rate limit: 1 req/s + margin for sub-requests
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        }
 
         match fetch_artist_bio(&client, mbid, name, &lastfm_key).await {
             Some(bio) => {
@@ -401,64 +410,35 @@ pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::
         .build()
         .unwrap_or_default();
 
-    let enriched = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let failed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut enriched = 0u32;
+    let mut failed = 0u32;
+    let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
 
-    // Process 4 albums concurrently via semaphore
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    for (album_id, title, artist_name) in albums.iter() {
+        // Gentle rate limit: 2s between each album to avoid Wikipedia/Last.fm bans
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
-    let mut handles = Vec::new();
-    for (album_id, title, artist_name) in albums.iter().cloned() {
-        let permit = semaphore.clone().acquire_owned().await;
-        if permit.is_err() {
-            break;
-        }
-        let permit = permit.unwrap();
-        let client = client.clone();
-        let lastfm_key = lastfm_key.clone();
-        let db = db.clone();
-        let enriched = enriched.clone();
-        let failed = failed.clone();
+        let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
+        let result = fetch_album_bio(&client, artist, title, &lastfm_key).await;
 
-        let handle = tokio::spawn(async move {
-            let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
-            let result = fetch_album_bio(&client, artist, &title, &lastfm_key).await;
-
-            // Small stagger to avoid hammering Wikipedia
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            match result {
-                Some(bio) => {
-                    let repo = crate::db::album_repo::AlbumRepo::with_backend(db);
-                    repo.update_bio(album_id, &bio).ok();
-                    enriched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        album_id,
-                        album = %title,
-                        artist = %artist,
-                        bio_len = bio.len(),
-                        "batch_album_bio_enriched"
-                    );
-                }
-                None => {
-                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    debug!(album_id, album = %title, "batch_album_bio_not_found");
-                }
+        match result {
+            Some(bio) => {
+                album_repo.update_bio(*album_id, &bio).ok();
+                enriched += 1;
+                info!(
+                    album_id,
+                    album = %title,
+                    artist = %artist,
+                    bio_len = bio.len(),
+                    "batch_album_bio_enriched"
+                );
             }
-
-            drop(permit);
-        });
-
-        handles.push(handle);
+            None => {
+                failed += 1;
+                debug!(album_id, album = %title, "batch_album_bio_not_found");
+            }
+        }
     }
-
-    // Await all tasks
-    for h in handles {
-        h.await.ok();
-    }
-
-    let enriched = enriched.load(std::sync::atomic::Ordering::Relaxed);
-    let failed = failed.load(std::sync::atomic::Ordering::Relaxed);
 
     info!(
         total = albums.len(),
