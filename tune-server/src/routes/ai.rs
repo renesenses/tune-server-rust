@@ -1,5 +1,5 @@
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::{Query, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -7,8 +7,10 @@ use tracing::{info, warn};
 
 use tune_core::ai::client::{AnthropicClient, ContentBlock, Message, MessageContent};
 use tune_core::ai::executor::ToolExecutor;
+use tune_core::ai::recommendations;
 use tune_core::ai::tools::all_tools;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::license::Feature;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -30,8 +32,28 @@ struct AiQuery {
     zone_id: Option<i64>,
 }
 
+// ---------------------------------------------------------------------------
+// Query params for recommendations
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RecommendationsParams {
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SmartRadioBody {
+    seed_track_id: Option<i64>,
+    seed_artist: Option<String>,
+    seed_genre: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
-    Router::new().route("/query", post(ai_query))
+    Router::new()
+        .route("/query", post(ai_query))
+        .route("/recommendations", get(ai_recommendations))
+        .route("/daily-mixes", get(ai_daily_mixes))
+        .route("/smart-radio", post(ai_smart_radio))
 }
 
 async fn ai_query(
@@ -140,6 +162,111 @@ async fn ai_query(
         "reply": reply,
         "actions": actions,
         "zone_id": executor.zone_id(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /ai/recommendations — personalized track recommendations
+// Free: 3 tracks max. Premium: full list.
+// ---------------------------------------------------------------------------
+
+async fn ai_recommendations(
+    State(state): State<AppState>,
+    Query(p): Query<RecommendationsParams>,
+) -> Result<Json<Value>, AppError> {
+    let is_premium = state
+        .license
+        .check_feature(Feature::AiRecommendations)
+        .await;
+    let requested_limit = p.limit.unwrap_or(20);
+    let limit = if is_premium {
+        requested_limit.min(100)
+    } else {
+        requested_limit.min(3)
+    };
+
+    let tracks = recommendations::get_recommendations(&state.backend, None, limit);
+
+    Ok(Json(json!({
+        "tracks": tracks,
+        "count": tracks.len(),
+        "premium": is_premium,
+        "limited": !is_premium,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /ai/daily-mixes — Premium only. 3-5 thematic playlists.
+// ---------------------------------------------------------------------------
+
+async fn ai_daily_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let is_premium = state
+        .license
+        .check_feature(Feature::AiRecommendations)
+        .await;
+
+    if !is_premium {
+        return Ok(Json(json!({
+            "error": "premium_required",
+            "message": "Daily mixes require a Premium license",
+            "mixes": [],
+        })));
+    }
+
+    // Try cached mixes first
+    let mixes = recommendations::get_cached_daily_mixes(&state.backend)
+        .unwrap_or_else(|| recommendations::generate_daily_mixes(&state.backend));
+
+    Ok(Json(json!({
+        "mixes": mixes,
+        "count": mixes.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /ai/smart-radio — Premium only. Seed-based radio.
+// Body: { seed_track_id } or { seed_artist } or { seed_genre }
+// ---------------------------------------------------------------------------
+
+async fn ai_smart_radio(
+    State(state): State<AppState>,
+    Json(body): Json<SmartRadioBody>,
+) -> Result<Json<Value>, AppError> {
+    let is_premium = state
+        .license
+        .check_feature(Feature::AiRecommendations)
+        .await;
+
+    if !is_premium {
+        return Ok(Json(json!({
+            "error": "premium_required",
+            "message": "Smart radio requires a Premium license",
+            "tracks": [],
+        })));
+    }
+
+    if body.seed_track_id.is_none() && body.seed_artist.is_none() && body.seed_genre.is_none() {
+        return Err(AppError::bad_request(
+            "at least one of seed_track_id, seed_artist, or seed_genre is required",
+        ));
+    }
+
+    let tracks = recommendations::smart_radio(
+        &state.backend,
+        body.seed_track_id,
+        body.seed_artist.as_deref(),
+        body.seed_genre.as_deref(),
+        30,
+    );
+
+    Ok(Json(json!({
+        "tracks": tracks,
+        "count": tracks.len(),
+        "seed": {
+            "track_id": body.seed_track_id,
+            "artist": body.seed_artist,
+            "genre": body.seed_genre,
+        },
     })))
 }
 

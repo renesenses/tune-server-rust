@@ -40,6 +40,7 @@ pub enum Feature {
     SyncedLyrics,
     ListeningStats,
     MultiScrobbling,
+    AiRecommendations,
 }
 
 impl Feature {
@@ -55,6 +56,7 @@ impl Feature {
             Feature::SyncedLyrics,
             Feature::ListeningStats,
             Feature::MultiScrobbling,
+            Feature::AiRecommendations,
         ]
     }
 
@@ -70,6 +72,7 @@ impl Feature {
             Feature::SyncedLyrics => "Synced Lyrics",
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
+            Feature::AiRecommendations => "AI Recommendations",
         }
     }
 }
@@ -397,8 +400,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_nine_features() {
-        assert_eq!(Feature::all_premium().len(), 9);
+    fn all_premium_has_ten_features() {
+        assert_eq!(Feature::all_premium().len(), 10);
     }
 
     #[test]
