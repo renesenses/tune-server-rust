@@ -713,7 +713,22 @@ impl PositionPoller {
 
             let mut track_ended = false;
             let mut force_stop = false;
+
+            // Guard: if Tune's own playback state for this zone is Stopped
+            // (or has no now_playing), ignore device state changes entirely.
+            // This prevents phantom playback when another app (e.g. Roon)
+            // plays on a shared renderer (e.g. Sonos) and then stops —
+            // Tune would otherwise interpret the Stopped→Playing cycle as
+            // its own track ending and auto-advance to the next queue item.
+            let tune_is_playing =
+                zone_state.state == PlayState::Playing || zone_state.state == PlayState::Paused;
+            let tune_has_track = zone_state.now_playing.is_some();
+
             match status.state {
+                TransportState::Stopped if !tune_is_playing || !tune_has_track => {
+                    // Tune is not playing on this zone — ignore device Stopped.
+                    ps.stopped_ticks = 0;
+                }
                 TransportState::Stopped => {
                     // During the seek grace period, the renderer may report
                     // Stopped while it buffers the new stream (especially for
