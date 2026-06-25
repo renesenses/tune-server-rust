@@ -1251,21 +1251,34 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing_after_prefill"
                 );
 
-                // Feed remaining samples to ring buffer
+                // Feed remaining samples to ring buffer, updating position
+                // progressively so the seek bar advances during playback.
+                let total_output_samples = samples.len() as u64;
+                let output_frames = total_output_samples / output_ch as u64;
+                let output_duration_ms = (output_frames as f64 / output_sr as f64 * 1000.0) as u64;
+                let mut fed_samples = initial_written as u64;
+
                 if initial_written < samples.len() {
-                    feed_ring_abortable(
-                        &ring,
-                        &samples[initial_written..],
-                        &stop_rx,
-                        &paused,
-                        Some(&force_silent),
-                    );
+                    let chunk_size = (output_sr as usize) * (output_ch as usize) / 5; // ~200ms chunks
+                    let remaining = &samples[initial_written..];
+                    for chunk in remaining.chunks(chunk_size) {
+                        if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        while paused.load(Ordering::Relaxed)
+                            && !force_silent.load(Ordering::Relaxed)
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        feed_ring_abortable(&ring, chunk, &stop_rx, &paused, Some(&force_silent));
+                        fed_samples += chunk.len() as u64;
+                        let fed_frames = fed_samples / output_ch as u64;
+                        let pos = (fed_frames as f64 / output_sr as f64 * 1000.0) as u64;
+                        position_ms.store(pos.min(output_duration_ms), Ordering::Relaxed);
+                    }
                 }
 
-                // Update position
-                let total_frames = decoded_len as u64 / dec_ch as u64;
-                let duration = (total_frames as f64 / dec_sr as f64 * 1000.0) as u64;
-                position_ms.store(duration, Ordering::Relaxed);
+                position_ms.store(output_duration_ms, Ordering::Relaxed);
 
                 // Signal natural track end BEFORE draining so the
                 // orchestrator can detect end-of-track even if a new play
