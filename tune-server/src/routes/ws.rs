@@ -30,6 +30,53 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
     event_type == pattern
 }
 
+/// Build the full current state sent to a client on connect (`type: "snapshot"`).
+/// Merges persisted zone metadata (name/online/type/group) with live playback
+/// state (transport, volume, now-playing, queue) so the client renders the
+/// truth without polling.
+async fn build_snapshot(state: &AppState) -> serde_json::Value {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zones = zone_repo.list().unwrap_or_default();
+    let mut zone_snaps = Vec::with_capacity(zones.len());
+    for z in &zones {
+        let zid = z.id.unwrap_or(0);
+        let ps = state.playback.get_state(zid).await;
+        zone_snaps.push(serde_json::json!({
+            "zone_id": zid,
+            "name": z.name,
+            "online": z.online,
+            "output_type": z.output_type,
+            "group_id": z.group_id,
+            "state": match ps.state {
+                tune_core::playback::PlayState::Playing => "playing",
+                tune_core::playback::PlayState::Paused => "paused",
+                tune_core::playback::PlayState::Stopped => "stopped",
+            },
+            "volume": ps.volume,
+            "muted": ps.muted,
+            "shuffle": ps.shuffle,
+            "repeat": ps.repeat,
+            "position_ms": ps.position_ms,
+            "queue_position": ps.queue_position,
+            "queue_length": ps.queue_length,
+            "now_playing": ps.now_playing,
+        }));
+    }
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let groups: serde_json::Value = settings
+        .get("zone_groups")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+
+    serde_json::json!({
+        "type": "snapshot",
+        "data": { "zones": zone_snaps, "groups": groups },
+    })
+}
+
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut rx = state.playback.subscribe();
     let mut event_rx = state.event_bus.subscribe();
@@ -37,6 +84,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.tick().await;
     let mut last_scan_progress = std::time::Instant::now() - Duration::from_secs(10);
+
+    // Snapshot-on-connect: hand the client the full current state up front so
+    // it has the truth immediately, instead of a blank UI until the next event
+    // (or a separate REST round-trip). Subscriptions above are already live, so
+    // any change during snapshot building is buffered and delivered as a delta.
+    {
+        let snapshot = build_snapshot(&state).await;
+        let json = serde_json::to_string(&snapshot).unwrap_or_default();
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
 
     loop {
         tokio::select! {
