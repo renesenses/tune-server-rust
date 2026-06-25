@@ -727,32 +727,51 @@ async fn create_zone(
     State(state): State<AppState>,
     Json(body): Json<CreateZone>,
 ) -> impl IntoResponse {
-    // Premium gate: Free tier is limited to 3 zones (existing zones are grandfathered)
+    let output_type = body.output_type.as_deref();
+    let output_device_id = body.output_device_id.as_deref();
+
+    // If device already has a zone, return it (no premium check needed)
+    if let Some(device_id) = output_device_id {
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        if let Ok(zones) = repo.list() {
+            if let Some(existing) = zones
+                .iter()
+                .find(|z| z.output_device_id.as_deref() == Some(device_id))
+            {
+                if let Some(id) = existing.id {
+                    let _ = repo.update_online(id, true);
+                    let zone = repo.get(id).ok().flatten();
+                    let v = zone
+                        .as_ref()
+                        .map(|z| serde_json::to_value(z).unwrap_or_default())
+                        .unwrap_or(json!({"id": id}));
+                    info!(zone_id = id, device_id, "zone_already_exists_returning");
+                    return (StatusCode::OK, Json(v)).into_response();
+                }
+            }
+        }
+    }
+
+    // Premium gate: Free tier is limited in zone count
     let zone_count = ZoneRepo::with_backend(state.backend.clone())
         .count_online()
         .unwrap_or(0);
     if !state.license.check_zone_limit(zone_count).await {
-        info!(
-            zone_count,
-            limit = tune_core::license::LicenseManager::free_zone_limit(),
-            "zone_creation_blocked_free_tier"
-        );
+        let limit = tune_core::license::LicenseManager::free_zone_limit();
+        info!(zone_count, limit, "zone_creation_blocked_free_tier");
         return (
             StatusCode::PAYMENT_REQUIRED,
             Json(json!({
                 "error": "premium_required",
                 "feature": "Unlimited Zones",
-                "message": "Free tier is limited to 3 zones. Upgrade to Tune Premium for unlimited zones.",
+                "message": format!("Free tier is limited to {} zones. Upgrade to Tune Premium for unlimited zones.", limit),
                 "current_zones": zone_count,
-                "zone_limit": tune_core::license::LicenseManager::free_zone_limit(),
+                "zone_limit": limit,
                 "upgrade_url": "https://mozaiklabs.fr/pricing"
             })),
         )
             .into_response();
     }
-
-    let output_type = body.output_type.as_deref();
-    let output_device_id = body.output_device_id.as_deref();
 
     // For DLNA/OpenHome zones, ensure the output is registered before persisting
     if let Some(device_id) = output_device_id {
@@ -797,21 +816,7 @@ async fn create_zone(
         }
     }
 
-    // Check for duplicate device assignment
-    if let Some(device_id) = output_device_id {
-        let repo = ZoneRepo::with_backend(state.backend.clone());
-        if let Ok(zones) = repo.list()
-            && zones
-                .iter()
-                .any(|z| z.output_device_id.as_deref() == Some(device_id))
-        {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"detail": "Device already assigned to another zone"})),
-            )
-                .into_response();
-        }
-    }
+    // Duplicate device assignment already handled above (early return)
 
     let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.create(&body.name, output_type, output_device_id) {

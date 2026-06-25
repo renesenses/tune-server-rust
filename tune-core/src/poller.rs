@@ -1131,15 +1131,11 @@ impl PositionPoller {
                 }
             }
             RepeatMode::Off => {
-                if zone_state.shuffle {
-                    Some(rand_pos(zone_state.queue_length, zone_state.queue_position))
+                let next = zone_state.queue_position + 1;
+                if next >= zone_state.queue_length {
+                    None
                 } else {
-                    let next = zone_state.queue_position + 1;
-                    if next >= zone_state.queue_length {
-                        None
-                    } else {
-                        Some(next)
-                    }
+                    Some(next)
                 }
             }
         }

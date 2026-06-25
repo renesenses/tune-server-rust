@@ -9,6 +9,7 @@ use crate::state::AppState;
 
 /// Restore zone volumes and playback positions from DB, persist config settings.
 pub async fn init_state(state: &AppState, config: &TuneConfig) {
+    reset_zones_offline(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
     cleanup_orphan_queues(state);
@@ -28,6 +29,20 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     tokio::spawn(async move {
         crate::routes::devices::reregister_manual_devices(&state_clone).await;
     });
+}
+
+/// Reset all zones to offline at startup.  Discovery will set actually-present
+/// devices back online.  This prevents stale "online" zones from accumulating
+/// across restarts and hitting the free-tier zone limit.
+fn reset_zones_offline(state: &AppState) {
+    match state.backend.execute("UPDATE zones SET online = 0", &[]) {
+        Ok(n) => {
+            info!(count = n, "zones_reset_offline_at_startup");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "zones_reset_offline_failed");
+        }
+    }
 }
 
 /// Remove duplicate zones (same output_device_id) and add a unique index to

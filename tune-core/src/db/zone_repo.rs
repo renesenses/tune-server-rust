@@ -126,7 +126,7 @@ pub mod sql {
     }
 
     pub fn count_online() -> &'static str {
-        "SELECT COUNT(*) FROM zones WHERE online = 1"
+        "SELECT COUNT(*) FROM zones WHERE online = 1 AND COALESCE(is_hidden, 0) = 0"
     }
 }
 
@@ -357,17 +357,15 @@ impl ZoneRepo {
         }
     }
 
-    /// Safely read autoplay_enabled for a zone.  Returns true (the default)
+    /// Safely read autoplay_enabled for a zone.  Returns false (the default)
     /// if the column doesn't exist (pre-v36 database).
     pub fn get_autoplay_enabled(&self, id: i64) -> bool {
-        // Try reading the column directly.  If the column doesn't exist,
-        // the query fails and we return the default (true).
         let placeholder = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
         let sql =
-            format!("SELECT COALESCE(autoplay_enabled, 1) FROM zones WHERE id = {placeholder}");
+            format!("SELECT COALESCE(autoplay_enabled, 0) FROM zones WHERE id = {placeholder}");
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db
             .query_one(&sql, &params)
@@ -375,7 +373,7 @@ impl ZoneRepo {
             .flatten()
             .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
             .map(|v| v != 0)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub fn get_dsd_mode(&self, id: i64) -> String {
