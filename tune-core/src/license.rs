@@ -49,6 +49,7 @@ pub enum Feature {
     RoomCorrection,
     CloudConfigBackup,
     SocialSharing,
+    DeveloperApi,
 }
 
 impl Feature {
@@ -73,6 +74,7 @@ impl Feature {
             Feature::RoomCorrection,
             Feature::CloudConfigBackup,
             Feature::SocialSharing,
+            Feature::DeveloperApi,
         ]
     }
 
@@ -97,6 +99,7 @@ impl Feature {
             Feature::RoomCorrection => "Room Correction",
             Feature::CloudConfigBackup => "Cloud Config Backup",
             Feature::SocialSharing => "Social Sharing",
+            Feature::DeveloperApi => "Developer API",
         }
     }
 }
@@ -424,8 +427,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_eighteen_features() {
-        assert_eq!(Feature::all_premium().len(), 18);
+    fn all_premium_has_nineteen_features() {
+        assert_eq!(Feature::all_premium().len(), 19);
     }
 
     #[test]

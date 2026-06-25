@@ -31,6 +31,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
     spawn_social_sharing_listener(state);
+    crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
 }

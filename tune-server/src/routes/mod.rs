@@ -7,6 +7,7 @@ pub mod cloud;
 pub mod connect;
 pub mod dashboard;
 pub mod deezer_proxy_handler;
+pub mod developer_api;
 pub mod devices;
 pub mod digest;
 pub mod discogs;
@@ -318,6 +319,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/offline", offline::router())
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())
+        .nest("/developer", developer_api::router())
         .route(
             "/services/tokens",
             get(service_tokens::list).post(service_tokens::list),
