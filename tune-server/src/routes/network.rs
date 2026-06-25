@@ -546,10 +546,11 @@ async fn browse_media_server(
         Some(ms) => ms.clone(),
         None => {
             return Json(json!({
-                "server_id": id,
                 "object_id": object_id,
+                "containers": [],
                 "items": [],
-                "error": "media server not found",
+                "total_matches": 0,
+                "number_returned": 0,
             }));
         }
     };
@@ -586,28 +587,31 @@ async fn browse_media_server(
     {
         Ok(r) => r,
         Err(e) => {
+            tracing::warn!("browse_media_server soap_error server={} err={e}", ms.name);
             return Json(json!({
-                "server_id": id,
                 "object_id": object_id,
+                "containers": [],
                 "items": [],
-                "error": format!("SOAP request failed: {e}"),
+                "total_matches": 0,
+                "number_returned": 0,
             }));
         }
     };
 
     let body = resp.text().await.unwrap_or_default();
-    let items = parse_didl_from_browse_response(&body);
-    let total = items.len();
+    let (containers, items) = parse_didl_browse_response(&body);
+    let total = containers.len() + items.len();
 
     Json(json!({
-        "server_id": id,
         "object_id": object_id,
+        "containers": containers,
         "items": items,
-        "total": total,
+        "total_matches": total,
+        "number_returned": total,
     }))
 }
 
-fn parse_didl_from_browse_response(xml: &str) -> Vec<Value> {
+fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
     let result_start = xml.find("<Result>").or_else(|| xml.find("<Result "));
     let result_end = xml.find("</Result>");
     let didl = match (result_start, result_end) {
@@ -616,7 +620,7 @@ fn parse_didl_from_browse_response(xml: &str) -> Vec<Value> {
             let content_start = after.find('>').map(|i| s + i + 1).unwrap_or(s);
             &xml[content_start..e]
         }
-        _ => return vec![],
+        _ => return (vec![], vec![]),
     };
     let decoded = didl
         .replace("&lt;", "<")
@@ -625,7 +629,9 @@ fn parse_didl_from_browse_response(xml: &str) -> Vec<Value> {
         .replace("&quot;", "\"")
         .replace("&apos;", "'");
 
+    let mut containers = Vec::new();
     let mut items = Vec::new();
+
     for tag in ["container", "item"] {
         let open = format!("<{tag} ");
         let close = format!("</{tag}>");
@@ -637,29 +643,70 @@ fn parse_didl_from_browse_response(xml: &str) -> Vec<Value> {
                 let id = extract_attr(element, "id").unwrap_or_default();
                 let parent_id = extract_attr(element, "parentID").unwrap_or_default();
                 let title = extract_xml_tag(element, "dc:title").unwrap_or_default();
-                let class = extract_xml_tag(element, "upnp:class").unwrap_or_default();
-                let res_url = extract_xml_tag(element, "res").unwrap_or_default();
-                let album_art = extract_xml_tag(element, "upnp:albumArtURI").unwrap_or_default();
+                let album_art_uri = extract_xml_tag(element, "upnp:albumArtURI");
                 let artist = extract_xml_tag(element, "upnp:artist")
-                    .or_else(|| extract_xml_tag(element, "dc:creator"))
-                    .unwrap_or_default();
-                items.push(json!({
-                    "id": id,
-                    "parent_id": parent_id,
-                    "title": title,
-                    "class": class,
-                    "type": if tag == "container" { "container" } else { "item" },
-                    "url": res_url,
-                    "album_art": album_art,
-                    "artist": artist,
-                }));
+                    .or_else(|| extract_xml_tag(element, "dc:creator"));
+
+                if tag == "container" {
+                    let child_count: u32 = extract_attr(element, "childCount")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    containers.push(json!({
+                        "id": id,
+                        "parent_id": parent_id,
+                        "title": title,
+                        "child_count": child_count,
+                        "album_art_uri": album_art_uri,
+                    }));
+                } else {
+                    let res_url = extract_xml_tag(element, "res");
+                    let album = extract_xml_tag(element, "upnp:album");
+                    let duration_ms =
+                        extract_res_attr(element, "duration").and_then(|d| parse_upnp_duration(&d));
+                    items.push(json!({
+                        "id": id,
+                        "title": title,
+                        "artist": artist,
+                        "album": album,
+                        "res_url": res_url,
+                        "album_art_uri": album_art_uri,
+                        "duration_ms": duration_ms,
+                    }));
+                }
+
                 pos = abs_start + end + close.len();
             } else {
                 break;
             }
         }
     }
-    items
+    (containers, items)
+}
+
+fn extract_res_attr(element: &str, attr_name: &str) -> Option<String> {
+    let res_start = element.find("<res ")?;
+    let res_tag_end = element[res_start..].find('>')? + res_start;
+    let res_tag = &element[res_start..res_tag_end];
+    let pattern = format!("{attr_name}=\"");
+    let attr_start = res_tag.find(&pattern)? + pattern.len();
+    let attr_end = res_tag[attr_start..].find('"')? + attr_start;
+    Some(res_tag[attr_start..attr_end].to_string())
+}
+
+fn parse_upnp_duration(d: &str) -> Option<u64> {
+    let parts: Vec<&str> = d.split(':').collect();
+    if parts.len() == 3 {
+        let h: f64 = parts[0].parse().ok()?;
+        let m: f64 = parts[1].parse().ok()?;
+        let s: f64 = parts[2].parse().ok()?;
+        Some((h * 3_600_000.0 + m * 60_000.0 + s * 1_000.0) as u64)
+    } else if parts.len() == 2 {
+        let m: f64 = parts[0].parse().ok()?;
+        let s: f64 = parts[1].parse().ok()?;
+        Some((m * 60_000.0 + s * 1_000.0) as u64)
+    } else {
+        None
+    }
 }
 
 fn extract_attr(element: &str, name: &str) -> Option<String> {
