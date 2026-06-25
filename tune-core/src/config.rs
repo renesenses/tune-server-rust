@@ -79,6 +79,8 @@ pub struct TuneConfig {
     pub lastfm_api_secret: String,
     pub lastfm_session_key: String,
     pub lastfm_scrobble_enabled: bool,
+    pub listenbrainz_token: String,
+    pub listenbrainz_scrobble_enabled: bool,
     pub enrich_on_scan: bool,
 
     // Artwork
@@ -183,6 +185,8 @@ impl Default for TuneConfig {
             lastfm_api_secret: String::new(),
             lastfm_session_key: String::new(),
             lastfm_scrobble_enabled: false,
+            listenbrainz_token: String::new(),
+            listenbrainz_scrobble_enabled: false,
             enrich_on_scan: false,
             artwork_cache_dir: "artwork_cache".into(),
             artwork_max_size: 1200,
@@ -259,6 +263,11 @@ impl TuneConfig {
         env_bool(
             "TUNE_LASTFM_SCROBBLE_ENABLED",
             &mut config.lastfm_scrobble_enabled,
+        );
+        env_str("TUNE_LISTENBRAINZ_TOKEN", &mut config.listenbrainz_token);
+        env_bool(
+            "TUNE_LISTENBRAINZ_SCROBBLE_ENABLED",
+            &mut config.listenbrainz_scrobble_enabled,
         );
         env_bool("TUNE_ENRICH_ON_SCAN", &mut config.enrich_on_scan);
         env_bool("TUNE_TIDAL_ENABLED", &mut config.tidal_enabled);

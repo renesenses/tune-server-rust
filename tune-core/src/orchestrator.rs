@@ -277,11 +277,8 @@ impl PlaybackOrchestrator {
             .save_play_state(req.zone_id, "playing")
             .ok();
 
-        // Last.fm Now Playing
-        self.lastfm_now_playing(&resolved.title, resolved.artist.as_deref());
-
-        // ListenBrainz Now Playing
-        self.listenbrainz_now_playing(
+        // Multi-service now-playing dispatch with tier gating
+        self.dispatch_now_playing(
             &resolved.title,
             resolved.artist.as_deref(),
             album.as_deref(),
@@ -2030,11 +2027,65 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        // Last.fm scrobble
-        self.lastfm_scrobble(title, artist);
+        // Multi-service scrobble dispatch with tier gating.
+        // Free tier: only the first configured service fires.
+        // Premium tier: all configured services fire simultaneously.
+        self.dispatch_scrobble(title, artist, album);
+    }
 
-        // ListenBrainz scrobble
-        self.listenbrainz_scrobble(title, artist, album);
+    /// Dispatch scrobbles to all configured services, respecting tier limits.
+    /// Free = 1 service max, Premium = all simultaneously.
+    fn dispatch_scrobble(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+
+        let lastfm_ready = self.lastfm_keys().is_some();
+        let lb_ready = self.listenbrainz_token().is_some();
+
+        // Check tier: if both services are active and user is Free, only
+        // dispatch to the first one (Last.fm has priority as legacy default).
+        let is_premium = {
+            let tier_str = settings.get("license_tier").ok().flatten();
+            matches!(tier_str.as_deref(), Some("premium"))
+        };
+
+        if lastfm_ready {
+            self.lastfm_scrobble(title, artist);
+        }
+
+        if lb_ready {
+            if !lastfm_ready || is_premium {
+                // Either Last.fm is not active (so LB is the sole service)
+                // or user is Premium (simultaneous allowed).
+                self.listenbrainz_scrobble(title, artist, album);
+            } else {
+                debug!(
+                    "listenbrainz_scrobble_skipped_free_tier: lastfm active, upgrade to Premium for multi-service"
+                );
+            }
+        }
+    }
+
+    /// Dispatch now-playing updates to all configured services, respecting tier limits.
+    fn dispatch_now_playing(&self, title: &str, artist: Option<&str>, album: Option<&str>) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+
+        let lastfm_ready = self.lastfm_keys().is_some();
+        let lb_ready = self.listenbrainz_token().is_some();
+
+        let is_premium = {
+            let tier_str = settings.get("license_tier").ok().flatten();
+            matches!(tier_str.as_deref(), Some("premium"))
+        };
+
+        if lastfm_ready {
+            self.lastfm_now_playing(title, artist);
+        }
+
+        if lb_ready {
+            if !lastfm_ready || is_premium {
+                self.listenbrainz_now_playing(title, artist, album);
+            }
+        }
     }
 
     fn lastfm_keys(&self) -> Option<(String, String, String)> {
