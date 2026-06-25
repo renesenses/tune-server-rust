@@ -40,6 +40,15 @@ pub enum Feature {
     SyncedLyrics,
     ListeningStats,
     MultiScrobbling,
+    AiRecommendations,
+    PlaylistTransfer,
+    AdvancedAlarms,
+    MultiProfiles,
+    WeeklyDigest,
+    AutoEnrichment,
+    RoomCorrection,
+    CloudConfigBackup,
+    SocialSharing,
 }
 
 impl Feature {
@@ -55,6 +64,15 @@ impl Feature {
             Feature::SyncedLyrics,
             Feature::ListeningStats,
             Feature::MultiScrobbling,
+            Feature::AiRecommendations,
+            Feature::PlaylistTransfer,
+            Feature::AdvancedAlarms,
+            Feature::MultiProfiles,
+            Feature::WeeklyDigest,
+            Feature::AutoEnrichment,
+            Feature::RoomCorrection,
+            Feature::CloudConfigBackup,
+            Feature::SocialSharing,
         ]
     }
 
@@ -70,6 +88,15 @@ impl Feature {
             Feature::SyncedLyrics => "Synced Lyrics",
             Feature::ListeningStats => "Listening Stats",
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
+            Feature::AiRecommendations => "AI Recommendations",
+            Feature::PlaylistTransfer => "Playlist Transfer",
+            Feature::AdvancedAlarms => "Advanced Alarms",
+            Feature::MultiProfiles => "Multi-User Profiles",
+            Feature::WeeklyDigest => "Weekly Digest",
+            Feature::AutoEnrichment => "Auto Metadata Enrichment",
+            Feature::RoomCorrection => "Room Correction",
+            Feature::CloudConfigBackup => "Cloud Config Backup",
+            Feature::SocialSharing => "Social Sharing",
         }
     }
 }
@@ -397,8 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_nine_features() {
-        assert_eq!(Feature::all_premium().len(), 9);
+    fn all_premium_has_eighteen_features() {
+        assert_eq!(Feature::all_premium().len(), 18);
     }
 
     #[test]

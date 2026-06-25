@@ -105,6 +105,18 @@ impl SsdpScanner {
             scan_loop(state, targets, event_tx).await;
         });
         self.task = Some(task);
+
+        // Passive SSDP listener: some legacy renderers (e.g. Cyrus Stream X)
+        // never answer M-SEARCH, they only multicast periodic NOTIFY
+        // ssdp:alive announcements. Without this they are invisible to the
+        // active scanner above. Best-effort: if port 1900 can't be bound the
+        // task just exits and active discovery still works.
+        let notify_state = self.state.clone();
+        let notify_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            notify_listen_loop(notify_state, notify_tx).await;
+        });
+
         info!("ssdp_scanner_started");
     }
 
@@ -175,6 +187,131 @@ async fn scan_loop(
         };
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Passively listen for unsolicited SSDP `NOTIFY` announcements on the
+/// multicast group and feed `ssdp:alive` advertisements into the same
+/// processing path as active M-SEARCH replies. This is what makes legacy
+/// renderers that ignore M-SEARCH (but still announce themselves) discoverable.
+async fn notify_listen_loop(state: Arc<Mutex<ScannerState>>, event_tx: mpsc::Sender<SsdpEvent>) {
+    let socket = match bind_notify_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "ssdp_notify_listener_disabled");
+            return;
+        }
+    };
+    info!("ssdp_notify_listener_started");
+
+    let mut buf = [0u8; 4096];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, addr)) => {
+                let data = &buf[..len];
+                // Only react to NOTIFY datagrams (ignore our own and others'
+                // M-SEARCH requests, and M-SEARCH replies handled elsewhere).
+                let head = String::from_utf8_lossy(&data[..len.min(256)]);
+                if !head.starts_with("NOTIFY") {
+                    continue;
+                }
+                let is_byebye = head.contains("ssdp:byebye");
+                if is_byebye {
+                    if let Some(resp) = parse_ssdp_response(data) {
+                        let dev_id = device_id_from_usn(&resp.usn);
+                        let _ = event_tx.send(SsdpEvent::DeviceLost(dev_id)).await;
+                    } else if let Some(usn) = usn_from_raw(data) {
+                        let _ = event_tx
+                            .send(SsdpEvent::DeviceLost(device_id_from_usn(&usn)))
+                            .await;
+                    }
+                    continue;
+                }
+                // ssdp:alive (or update): reuse the M-SEARCH processing path.
+                // process_responses dedups by location/USN, so repeated
+                // announcements for an already-known device are cheap.
+                if let Some(resp) = parse_ssdp_response(data) {
+                    process_responses(&state, &event_tx, vec![resp]).await;
+                } else {
+                    debug!(from = %addr, bytes = len, "ssdp_notify_unparseable");
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "ssdp_notify_recv_error");
+                // Transient errors shouldn't spin the loop hot.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Bind a UDP socket to the SSDP multicast port for passive listening.
+/// Uses SO_REUSEADDR/SO_REUSEPORT so it can coexist with other SSDP users on
+/// the host (other apps, our own UPnP server), and joins the multicast group
+/// on every real IPv4 interface for multi-NIC / VPN setups.
+fn bind_notify_socket() -> Result<UdpSocket, String> {
+    let sock2 = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .map_err(|e| format!("socket2 new: {e}"))?;
+    sock2.set_reuse_address(true).ok();
+    #[cfg(unix)]
+    sock2.set_reuse_port(true).ok();
+    sock2
+        .bind(&socket2::SockAddr::from(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            SSDP_PORT,
+        )))
+        .map_err(|e| format!("bind 0.0.0.0:{SSDP_PORT}: {e}"))?;
+
+    // Join the multicast group on each real interface (and the default).
+    let mut joined = false;
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V4(ip) = iface.ip()
+                && sock2.join_multicast_v4(&SSDP_MULTICAST_ADDR, &ip).is_ok()
+            {
+                joined = true;
+            }
+        }
+    }
+    if !joined {
+        sock2
+            .join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)
+            .map_err(|e| format!("join_multicast: {e}"))?;
+    }
+
+    sock2
+        .set_nonblocking(true)
+        .map_err(|e| format!("nonblock: {e}"))?;
+    UdpSocket::from_std(std::net::UdpSocket::from(sock2)).map_err(|e| format!("from_std: {e}"))
+}
+
+/// Extract the USN header from a raw SSDP datagram even when LOCATION is
+/// absent (ssdp:byebye carries no LOCATION).
+fn usn_from_raw(data: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(data).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(val) = line
+            .strip_prefix("USN:")
+            .or_else(|| line.strip_prefix("Usn:"))
+            .or_else(|| {
+                if line.to_lowercase().starts_with("usn:") {
+                    Some(&line[4..])
+                } else {
+                    None
+                }
+            })
+        {
+            return Some(val.trim().to_string());
+        }
+    }
+    None
 }
 
 async fn search_all(targets: &[String]) -> Vec<SsdpResponse> {

@@ -30,6 +30,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_local_audio_rescan(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state);
+    spawn_social_sharing_listener(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
 }
@@ -110,7 +111,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // get_or_create returns (id, false) for existing zones, so we only
                 // need to check when the zone doesn't already exist.
                 if zone_repo.get_by_device_id(&d.id).ok().flatten().is_none() {
-                    let zone_count = zone_repo.count().unwrap_or(0);
+                    let zone_count = zone_repo.count_online().unwrap_or(0);
                     if !state.license.check_zone_limit(zone_count).await {
                         info!(
                             name = %d.name,
@@ -596,7 +597,30 @@ fn spawn_slimproto_server(state: &AppState) {
 }
 
 fn spawn_bio_sync(state: &AppState) {
-    tune_core::cloud::bio_sync::spawn(state.backend.clone(), state.event_bus.subscribe());
+    let license = state.license.clone();
+    let db = state.backend.clone();
+    let rx = state.event_bus.subscribe();
+    tokio::spawn(async move {
+        // Wait for startup to settle before checking license
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if !license
+            .check_feature(tune_core::license::Feature::AutoEnrichment)
+            .await
+        {
+            info!("bio_sync_auto_download_requires_premium — upload-only mode");
+            // Still upload local bios (community contribution) but skip auto download
+            let db_upload = db.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(55)).await;
+                loop {
+                    tune_core::cloud::bio_sync::upload_bios(&db_upload).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                }
+            });
+            return;
+        }
+        tune_core::cloud::bio_sync::spawn(db, rx);
+    });
 }
 
 fn spawn_community_sync(state: &AppState) {
@@ -816,4 +840,118 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             );
         }
     }
+}
+
+fn spawn_social_sharing_listener(state: &AppState) {
+    let license = state.license.clone();
+    let backend = state.backend.clone();
+    let mut rx = state.playback.subscribe();
+    let http_client = state.http_client.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let event = match rx.recv().await {
+                Ok(e) => e,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(skipped = n, "social_sharing_listener_lagged");
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            // Only react to track-start events
+            if event.event != "started" {
+                continue;
+            }
+
+            // Premium gate
+            if !license
+                .check_feature(tune_core::license::Feature::SocialSharing)
+                .await
+            {
+                continue;
+            }
+
+            // Check sharing profile
+            let profile = tune_core::social::load_profile(&backend);
+            if !profile.enabled || !profile.share_now_playing {
+                continue;
+            }
+
+            // Build the card from event data
+            let title = event
+                .data
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let artist = event
+                .data
+                .get("artist_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let album = event
+                .data
+                .get("album_title")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let cover = event
+                .data
+                .get("cover_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let source = event
+                .data
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("local")
+                .to_string();
+
+            if title.is_empty() {
+                continue;
+            }
+
+            let card = tune_core::social::NowListeningCard {
+                title,
+                artist,
+                album,
+                cover_url: cover,
+                format: None,
+                sample_rate: None,
+                bit_depth: None,
+                source,
+                shared_at: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            };
+
+            let payload = serde_json::json!({
+                "display_name": profile.display_name,
+                "now_listening": card,
+            });
+
+            let client = http_client.clone();
+            tokio::spawn(async move {
+                match client
+                    .post("https://mozaiklabs.fr/api/v1/community/now-listening")
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!("social_auto_share_ok");
+                    }
+                    Ok(resp) => {
+                        debug!(
+                            status = resp.status().as_u16(),
+                            "social_auto_share_upstream_error"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "social_auto_share_failed");
+                    }
+                }
+            });
+        }
+    });
 }

@@ -18,7 +18,7 @@ pub mod sql {
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -28,7 +28,8 @@ pub mod sql {
             d.placeholder(7),
             d.placeholder(8),
             d.placeholder(9),
-            d.placeholder(10)
+            d.placeholder(10),
+            d.placeholder(11)
         )
     }
 
@@ -122,6 +123,7 @@ pub struct ListenRecord {
     pub listened_at: Option<String>,
     pub zone_id: Option<i64>,
     pub cover_url: Option<String>,
+    pub profile_id: Option<i64>,
 }
 
 pub struct HistoryRepo {
@@ -150,7 +152,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 10] = [
+        let params: [&dyn ToSqlValue; 11] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -161,6 +163,7 @@ impl HistoryRepo {
             &rec.duration_ms,
             &rec.zone_id,
             &rec.cover_url,
+            &rec.profile_id,
         ];
         self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
@@ -933,6 +936,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         listened_at: cols.get(9).and_then(|v| v.as_string()),
         zone_id: cols.get(10).and_then(|v| v.as_i64()),
         cover_url: None,
+        profile_id: None,
     }
 }
 
@@ -964,6 +968,7 @@ mod tests {
             listened_at: None,
             zone_id: None,
             cover_url: None,
+            profile_id: None,
         };
 
         repo.record(&rec).unwrap();
@@ -998,6 +1003,7 @@ mod tests {
                 listened_at: None,
                 zone_id: None,
                 cover_url: None,
+                profile_id: None,
             })
             .unwrap();
         }
@@ -1015,6 +1021,7 @@ mod tests {
                 listened_at: None,
                 zone_id: None,
                 cover_url: None,
+                profile_id: None,
             })
             .unwrap();
         }
@@ -1044,6 +1051,7 @@ mod tests {
                 listened_at: None,
                 zone_id: None,
                 cover_url: None,
+                profile_id: None,
             })
             .unwrap();
         }
@@ -1072,6 +1080,7 @@ mod tests {
             listened_at: None,
             zone_id: None,
             cover_url: None,
+            profile_id: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -1093,6 +1102,7 @@ mod tests {
             listened_at: None,
             zone_id: None,
             cover_url: None,
+            profile_id: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -1108,6 +1118,7 @@ mod tests {
             listened_at: None,
             zone_id: None,
             cover_url: None,
+            profile_id: None,
         })
         .unwrap();
 
@@ -1134,6 +1145,7 @@ mod tests {
                 listened_at: None,
                 zone_id: None,
                 cover_url: None,
+                profile_id: None,
             })
             .unwrap();
         }
@@ -1147,8 +1159,8 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
-        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"));
+        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        assert!(sql::record(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
@@ -1176,6 +1188,7 @@ mod tests {
             listened_at: None,
             zone_id: Some(1),
             cover_url: None,
+            profile_id: None,
         })
         .unwrap();
 
@@ -1206,6 +1219,7 @@ mod tests {
             listened_at: None,
             zone_id: None,
             cover_url: None,
+            profile_id: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);

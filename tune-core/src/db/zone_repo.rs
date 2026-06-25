@@ -124,6 +124,10 @@ pub mod sql {
     pub fn count() -> &'static str {
         "SELECT COUNT(*) FROM zones"
     }
+
+    pub fn count_online() -> &'static str {
+        "SELECT COUNT(*) FROM zones WHERE online = 1"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -501,6 +505,13 @@ impl ZoneRepo {
 
     pub fn count(&self) -> Result<i64, String> {
         match self.db.query_one(sql::count(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
+    pub fn count_online(&self) -> Result<i64, String> {
+        match self.db.query_one(sql::count_online(), &[])? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }

@@ -170,7 +170,7 @@ async fn handle_ssdp_discovered(
         );
     } else if !is_tv {
         // Premium gate: check zone limit before auto-creating
-        let zone_count = zone_repo.count().unwrap_or(0);
+        let zone_count = zone_repo.count_online().unwrap_or(0);
         if !license.check_zone_limit(zone_count).await {
             info!(
                 name = %dev.name,
@@ -435,7 +435,7 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                                 } else {
                                     // Premium gate: check zone limit before auto-creating
-                                    let zone_count = zone_repo.count().unwrap_or(0);
+                                    let zone_count = zone_repo.count_online().unwrap_or(0);
                                     if !license.check_zone_limit(zone_count).await {
                                         info!(
                                             name = %dev.name,

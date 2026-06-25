@@ -715,11 +715,12 @@ pub fn alarms_router() -> Router<AppState> {
             axum::routing::put(update_alarm).delete(delete_alarm_global),
         )
         .route("/{id}/snooze", post(snooze_alarm))
+        .route("/{id}/test", post(test_alarm))
 }
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state.backend.query_many(
-        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds FROM alarms ORDER BY time",
+        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
         &[],
     ).map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
@@ -742,6 +743,8 @@ async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppEr
                 "last_fired_at": r.get(13).and_then(|v| v.as_string()),
                 "created_at": r.get(14).and_then(|v| v.as_string()),
                 "fade_in_seconds": r.get(15).and_then(|v| v.as_i64()),
+                "days_of_week": r.get(16).and_then(|v| v.as_string()),
+                "multi_zone_ids": r.get(17).and_then(|v| v.as_string()),
             })
         })
         .collect();
@@ -763,12 +766,68 @@ struct CreateAlarmGlobal {
     fade_duration_s: Option<i32>,
     fade_in_seconds: Option<i32>,
     enabled: Option<bool>,
+    /// 7-char bitmask "1010100" (Mon..Sun). Premium only for non-"1111111".
+    days_of_week: Option<String>,
+    /// JSON array of zone IDs, e.g. "[1,3,5]". Premium only.
+    multi_zone_ids: Option<String>,
 }
 
 async fn create_alarm_global(
     State(state): State<AppState>,
     Json(body): Json<CreateAlarmGlobal>,
 ) -> impl IntoResponse {
+    let is_premium = state.license.is_premium().await;
+
+    // Free tier: max 1 alarm
+    if !is_premium {
+        let count: i64 = state
+            .backend
+            .query_one("SELECT COUNT(*) FROM alarms", &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if count >= 1 {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "error": "premium_required",
+                    "feature": "Advanced Alarms",
+                    "message": "Free tier allows 1 alarm. Upgrade to Tune Premium for unlimited alarms.",
+                    "upgrade_url": "https://mozaiklabs.fr/pricing"
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Free tier: no advanced fields
+    let fade_in_seconds = body.fade_in_seconds.unwrap_or(0);
+    let days_of_week = body
+        .days_of_week
+        .clone()
+        .unwrap_or_else(|| "1111111".into());
+    let multi_zone_ids = body.multi_zone_ids.clone().unwrap_or_default();
+
+    if !is_premium {
+        let has_fade = fade_in_seconds > 0;
+        let has_multi_zone = !multi_zone_ids.is_empty() && multi_zone_ids != "[]";
+        let has_day_selection = days_of_week != "1111111";
+
+        if has_fade || has_multi_zone || has_day_selection {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "error": "premium_required",
+                    "feature": "Advanced Alarms",
+                    "message": "Fade-in, multi-zone, and day scheduling require Tune Premium.",
+                    "upgrade_url": "https://mozaiklabs.fr/pricing"
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let enabled_int: i32 = if body.enabled.unwrap_or(true) { 1 } else { 0 };
     let one_shot_int: i32 = if body.one_shot.unwrap_or(false) { 1 } else { 0 };
     let skip_holidays_int: i32 = if body.skip_holidays.unwrap_or(false) {
@@ -782,10 +841,14 @@ async fn create_alarm_global(
     let days = body.days.unwrap_or_else(|| "0,1,2,3,4".into());
     let volume = body.volume.unwrap_or(0.3);
     let fade_duration_s = body.fade_duration_s.unwrap_or(60);
-    let fade_in_seconds = body.fade_in_seconds.unwrap_or(30);
+    let multi_zone_ids_opt: Option<String> = if multi_zone_ids.is_empty() {
+        None
+    } else {
+        Some(multi_zone_ids)
+    };
     match state.backend.execute(
-        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue],
+        "INSERT INTO alarms (name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, fade_in_seconds, enabled, days_of_week, multi_zone_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[&name as &dyn ToSqlValue, &body.time as &dyn ToSqlValue, &days as &dyn ToSqlValue, &one_shot_int as &dyn ToSqlValue, &skip_holidays_int as &dyn ToSqlValue, &body.zone_id as &dyn ToSqlValue, &body.source_type as &dyn ToSqlValue, &body.source_id as &dyn ToSqlValue, &body.source_name as &dyn ToSqlValue, &volume as &dyn ToSqlValue, &fade_duration_s as &dyn ToSqlValue, &fade_in_seconds as &dyn ToSqlValue, &enabled_int as &dyn ToSqlValue, &days_of_week as &dyn ToSqlValue, &multi_zone_ids_opt as &dyn ToSqlValue],
     ) {
         Ok(_) => {
             let id = state.backend.last_insert_rowid();
@@ -810,6 +873,8 @@ struct UpdateAlarm {
     fade_duration_s: Option<i32>,
     fade_in_seconds: Option<i32>,
     enabled: Option<bool>,
+    days_of_week: Option<String>,
+    multi_zone_ids: Option<String>,
 }
 
 async fn update_alarm(
@@ -818,6 +883,36 @@ async fn update_alarm(
     Json(body): Json<UpdateAlarm>,
 ) -> Result<impl IntoResponse, AppError> {
     use tune_core::db::backend::{SqlValue, ToSqlValue};
+
+    // Gate advanced fields for Free tier
+    let is_premium = state.license.is_premium().await;
+    if !is_premium {
+        let has_fade = body.fade_in_seconds.map(|v| v > 0).unwrap_or(false);
+        let has_multi_zone = body
+            .multi_zone_ids
+            .as_ref()
+            .map(|s| !s.is_empty() && s != "[]")
+            .unwrap_or(false);
+        let has_day_selection = body
+            .days_of_week
+            .as_ref()
+            .map(|s| s != "1111111")
+            .unwrap_or(false);
+
+        if has_fade || has_multi_zone || has_day_selection {
+            return Ok((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "error": "premium_required",
+                    "feature": "Advanced Alarms",
+                    "message": "Fade-in, multi-zone, and day scheduling require Tune Premium.",
+                    "upgrade_url": "https://mozaiklabs.fr/pricing"
+                })),
+            )
+                .into_response());
+        }
+    }
+
     // Build SET clause dynamically from provided fields
     let mut sets: Vec<String> = Vec::new();
     let mut values: Vec<SqlValue> = Vec::new();
@@ -874,6 +969,14 @@ async fn update_alarm(
         sets.push("enabled = ?".into());
         values.push((enabled as i32).to_sql_value());
     }
+    if let Some(ref days_of_week) = body.days_of_week {
+        sets.push("days_of_week = ?".into());
+        values.push(days_of_week.to_sql_value());
+    }
+    if let Some(ref multi_zone_ids) = body.multi_zone_ids {
+        sets.push("multi_zone_ids = ?".into());
+        values.push(multi_zone_ids.to_sql_value());
+    }
 
     if sets.is_empty() {
         return Ok((StatusCode::BAD_REQUEST, "no fields to update").into_response());
@@ -913,6 +1016,34 @@ async fn snooze_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     ) {
         Ok(0) => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => Json(json!({ "id": id, "snoozed": true })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `POST /alarms/{id}/test` — trigger an alarm immediately for testing.
+/// Premium only.
+async fn test_alarm(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    // Premium gate
+    if let Err(resp) = crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::AdvancedAlarms,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let scheduler = std::sync::Arc::new(tune_core::alarms::AlarmScheduler::with_backend(
+        state.backend.clone(),
+        state.orchestrator.clone(),
+    ));
+
+    match scheduler.get_alarm(id) {
+        Ok(Some(alarm)) => {
+            scheduler.fire_alarm(&alarm).await;
+            Json(json!({ "id": id, "tested": true })).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

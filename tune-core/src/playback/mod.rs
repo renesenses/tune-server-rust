@@ -166,7 +166,16 @@ impl PlaybackManager {
         state.position_ms = 0;
         state.now_playing = Some(np.clone());
         state.track_generation = state.track_generation.wrapping_add(1);
-        state.last_seek_at = None;
+        // Preserve last_seek_at if a seek just happened (< 5s ago) — the
+        // orchestrator recreates the stream during seek, which calls play().
+        // Clearing it here would remove the seek grace period from the poller.
+        let is_recent_seek = state
+            .last_seek_at
+            .map(|t| t.elapsed().as_secs() < 5)
+            .unwrap_or(false);
+        if !is_recent_seek {
+            state.last_seek_at = None;
+        }
 
         self.emit(PlaybackEvent {
             event: "started".into(),

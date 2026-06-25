@@ -6,9 +6,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::license::Feature;
 
 use crate::state::AppState;
 
@@ -170,6 +171,24 @@ async fn create_profile(
     Json(body): Json<CreateProfile>,
 ) -> impl IntoResponse {
     let repo = ProfileRepo::with_backend(state.backend.clone());
+
+    // Free tier: max 1 profile (the default). Premium: unlimited.
+    let is_premium = state.license.check_feature(Feature::MultiProfiles).await;
+    if !is_premium {
+        let count = repo.count().unwrap_or(0);
+        if count >= 1 {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(json!({
+                    "error": "premium_required",
+                    "feature": "multi_profiles",
+                    "message": "Free tier allows 1 profile. Upgrade to Premium for unlimited profiles.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     match repo.create(&body.name, None, body.avatar_color.as_deref()) {
         Ok(id) => {
             // Return the full profile object so the web client can use it directly
@@ -277,9 +296,10 @@ async fn update_profile_settings(
 }
 
 async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    use tune_core::db::backend::ToSqlValue;
-    let result: Result<Vec<(String, i64)>, String> = state
-        .backend
+    let b = &state.backend;
+
+    // Favorites by type
+    let fav_result: Result<Vec<(String, i64)>, String> = b
         .query_many(
             "SELECT item_type, COUNT(*) FROM favorites WHERE profile_id = ? GROUP BY item_type",
             &[&id as &dyn ToSqlValue],
@@ -295,30 +315,140 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 .collect()
         });
 
-    match result {
-        Ok(rows) => {
-            let mut stats = json!({});
-            for (item_type, count) in &rows {
-                stats[item_type] = json!(count);
-            }
-            Json(json!({
-                "profile_id": id,
-                "favorites_by_type": stats,
-            }))
-            .into_response()
+    let mut favorites_by_type = json!({});
+    if let Ok(rows) = &fav_result {
+        for (item_type, count) in rows {
+            favorites_by_type[item_type] = json!(count);
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+
+    // Per-profile listening stats (profile_id NULL = legacy entries, belong to default)
+    let profile_filter = if id == 1 {
+        // Default profile sees entries with profile_id = 1 OR NULL (legacy)
+        "(profile_id = 1 OR profile_id IS NULL)".to_string()
+    } else {
+        format!("profile_id = {id}")
+    };
+
+    let listens_row = b
+        .query_one(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) \
+                 FROM listen_history WHERE {profile_filter}"
+            ),
+            &[],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let total_listens = listens_row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+    let total_ms = listens_row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let top_artists: Vec<serde_json::Value> = b
+        .query_many(
+            &format!(
+                "SELECT artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE {profile_filter} AND artist_name IS NOT NULL \
+                 GROUP BY artist_name ORDER BY plays DESC LIMIT 10"
+            ),
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|cols| {
+            json!({
+                "artist": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "plays": cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
+    let top_tracks: Vec<serde_json::Value> = b
+        .query_many(
+            &format!(
+                "SELECT title, artist_name, COUNT(*) as plays FROM listen_history \
+                 WHERE {profile_filter} \
+                 GROUP BY title, artist_name ORDER BY plays DESC LIMIT 10"
+            ),
+            &[],
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .map(|cols| {
+            json!({
+                "title": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist": cols.get(1).and_then(|v| v.as_string()),
+                "plays": cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
+    // Ratings count
+    let ratings_count = b
+        .query_one(
+            "SELECT COUNT(*) FROM album_ratings WHERE profile_id = ?",
+            &[&id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+
+    Json(json!({
+        "profile_id": id,
+        "favorites_by_type": favorites_by_type,
+        "listening": {
+            "total_listens": total_listens,
+            "total_duration_ms": total_ms,
+            "total_hours": (total_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0,
+            "top_artists": top_artists,
+            "top_tracks": top_tracks,
+        },
+        "ratings_count": ratings_count,
+    }))
+    .into_response()
 }
 
 async fn profile_history(
     State(state): State<AppState>,
-    Path(_id): Path<i64>,
+    Path(id): Path<i64>,
     Query(q): Query<HistoryQuery>,
 ) -> Json<Value> {
-    let repo = HistoryRepo::with_backend(state.backend.clone());
     let limit = q.limit.unwrap_or(50);
-    let items = repo.recent(limit).unwrap_or_default();
+    let profile_filter = if id == 1 {
+        "(profile_id = 1 OR profile_id IS NULL)".to_string()
+    } else {
+        format!("profile_id = {id}")
+    };
+    let sql = format!(
+        "SELECT id, track_id, title, artist_name, album_title, source, source_id, \
+         album_id, duration_ms, listened_at, zone_id \
+         FROM listen_history WHERE {profile_filter} \
+         ORDER BY listened_at DESC LIMIT ?",
+    );
+    let rows = state
+        .backend
+        .query_many(&sql, &[&limit as &dyn ToSqlValue])
+        .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|cols| {
+            json!({
+                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "track_id": cols.get(1).and_then(|v| v.as_i64()),
+                "title": cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.get(3).and_then(|v| v.as_string()),
+                "album_title": cols.get(4).and_then(|v| v.as_string()),
+                "source": cols.get(5).and_then(|v| v.as_string()).unwrap_or_else(|| "local".into()),
+                "source_id": cols.get(6).and_then(|v| v.as_string()),
+                "album_id": cols.get(7).and_then(|v| v.as_i64()),
+                "duration_ms": cols.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
+                "listened_at": cols.get(9).and_then(|v| v.as_string()),
+                "zone_id": cols.get(10).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
     Json(json!(items))
 }
 

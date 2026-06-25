@@ -1,6 +1,7 @@
 mod admin;
 mod backup;
 mod config;
+mod config_backup;
 mod convert;
 mod database;
 mod diagnostics;
@@ -144,6 +145,8 @@ pub fn router() -> Router<AppState> {
         .route("/enrich", post(enrich::system_enrich))
         .route("/enrich-bios", post(enrich::enrich_bios))
         .route("/enrich-metadata", post(enrich::enrich_extended_metadata))
+        .route("/enrichment/status", get(enrich::enrichment_status))
+        .route("/enrichment/run", post(enrich::enrichment_run))
         .route("/database/import", post(database::database_import))
         .route("/plugins", get(plugins::list_system_plugins))
         .route("/supported-tags", get(tags::supported_tags))
@@ -165,6 +168,15 @@ pub fn router() -> Router<AppState> {
         .route(
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
+        )
+        // Cloud config backup — full server config export/import/push/pull
+        .route("/config-backup/export", get(config_backup::export))
+        .route("/config-backup/import", post(config_backup::import))
+        .route("/config-backup/cloud-push", post(config_backup::cloud_push))
+        .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
+        .route(
+            "/config-backup/cloud-status",
+            get(config_backup::cloud_status),
         )
         // Concert alerts — upcoming concerts for library artists
         .route("/concerts", get(concerts_handler))

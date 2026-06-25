@@ -56,6 +56,13 @@ jobs:
   rollback:
     name: Roll back ${{ inputs.version }} → ${{ inputs.previous_version }}
     runs-on: ubuntu-latest
+    # Hoist optional secrets to job level: the `secrets` context is not
+    # allowed in a step `if:` (only `env` is), and referencing it there made
+    # GitHub reject the whole file, emitting a failed "workflow file issue"
+    # run on every push.
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -103,7 +110,7 @@ jobs:
 
       # ─── 3. Homebrew tap → git revert ────────────────────────────
       - name: Homebrew tap → revert bump commit
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ inputs.version }}
@@ -164,7 +171,7 @@ jobs:
 
       # ─── 5. Forum erratum reply ──────────────────────────────────
       - name: Forum erratum
-        if: ${{ inputs.forum_thread_id != '' && secrets.FORUM_TOKEN != '' }}
+        if: ${{ inputs.forum_thread_id != '' && env.FORUM_TOKEN != '' }}
         env:
           FORUM_TOKEN: ${{ secrets.FORUM_TOKEN }}
           THREAD_ID: ${{ inputs.forum_thread_id }}

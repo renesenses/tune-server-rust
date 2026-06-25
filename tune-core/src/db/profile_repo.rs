@@ -225,6 +225,13 @@ impl ProfileRepo {
         }
     }
 
+    pub fn count(&self) -> Result<i64, String> {
+        match self.db.query_one("SELECT COUNT(*) FROM profiles", &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
     pub fn list_favorites(
         &self,
         profile_id: i64,

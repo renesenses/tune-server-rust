@@ -3,9 +3,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
@@ -120,6 +120,212 @@ struct AddDeviceRequest {
     name: Option<String>,
 }
 
+/// Settings key holding the JSON array of manually-added devices.
+const MANUAL_DEVICES_KEY: &str = "manual_devices";
+
+/// A device the user added by hand via `POST /devices/add`.
+///
+/// These are persisted (see [`persist_manual_device`]) and re-registered on
+/// startup by [`reregister_manual_devices`].  Persistence matters because
+/// legacy renderers that don't answer SSDP M-SEARCH (e.g. the Cyrus Stream X)
+/// never resurface through normal discovery, so without this they vanish on
+/// every restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualDevice {
+    pub r#type: String,
+    pub host: String,
+    pub port: u16,
+    pub name: Option<String>,
+}
+
+impl ManualDevice {
+    fn device_id(&self) -> String {
+        format!("{}-{}-{}", self.r#type.to_lowercase(), self.host, self.port)
+    }
+}
+
+fn load_manual_devices(state: &AppState) -> Vec<ManualDevice> {
+    let repo = SettingsRepo::with_backend(state.backend.clone());
+    match repo.get(MANUAL_DEVICES_KEY) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn save_manual_devices(state: &AppState, devices: &[ManualDevice]) {
+    let repo = SettingsRepo::with_backend(state.backend.clone());
+    match serde_json::to_string(devices) {
+        Ok(json) => {
+            if let Err(e) = repo.set(MANUAL_DEVICES_KEY, &json) {
+                warn!(error = %e, "manual_devices_persist_failed");
+            }
+        }
+        Err(e) => warn!(error = %e, "manual_devices_serialize_failed"),
+    }
+}
+
+/// Persist a manual device, replacing any existing entry with the same id.
+fn persist_manual_device(state: &AppState, dev: &ManualDevice) {
+    let id = dev.device_id();
+    let mut devices = load_manual_devices(state);
+    devices.retain(|d| d.device_id() != id);
+    devices.push(dev.clone());
+    save_manual_devices(state, &devices);
+}
+
+/// Drop a manual device from persistence by its device id (no-op if absent).
+fn forget_manual_device(state: &AppState, device_id: &str) {
+    let mut devices = load_manual_devices(state);
+    let before = devices.len();
+    devices.retain(|d| d.device_id() != device_id);
+    if devices.len() != before {
+        save_manual_devices(state, &devices);
+    }
+}
+
+fn ensure_zone(state: &AppState, name: &str, type_str: &str, device_id: &str) -> Option<i64> {
+    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
+    match zone_repo.get_or_create(name, Some(type_str), device_id) {
+        Ok((zid, created)) => {
+            if !created {
+                let _ = zone_repo.set_online_by_device(device_id, true);
+            }
+            Some(zid)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Probe a manually-specified device, register its output, and ensure a zone
+/// exists.  Shared by the `POST /devices/add` route and the startup
+/// re-registration path.  Returns `(device_id, resolved_name, zone_id)`.
+pub async fn register_manual_device(
+    state: &AppState,
+    dev: &ManualDevice,
+) -> Result<(String, String, Option<i64>), String> {
+    let device_id = dev.device_id();
+    match dev.r#type.to_lowercase().as_str() {
+        "bluos" => {
+            let probe_url = format!("http://{}:{}/Status", dev.host, dev.port);
+            let resp = state
+                .http_client
+                .get(&probe_url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Cannot reach BluOS device at {}:{}: {e}",
+                        dev.host, dev.port
+                    )
+                })?;
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "BluOS device at {}:{} responded with status {}",
+                    dev.host,
+                    dev.port,
+                    resp.status()
+                ));
+            }
+            let xml = resp.text().await.unwrap_or_default();
+            let device_name = dev.name.clone().unwrap_or_else(|| {
+                extract_xml_tag(&xml, "name")
+                    .or_else(|| extract_xml_tag(&xml, "modelName"))
+                    .unwrap_or_else(|| format!("BluOS {}", dev.host))
+            });
+
+            let bluos = BluosOutput::new(
+                device_name.clone(),
+                device_id.clone(),
+                dev.host.clone(),
+                dev.port,
+            );
+            state.outputs.lock().await.register(Box::new(bluos));
+
+            let zone_id = ensure_zone(state, &device_name, "bluos", &device_id);
+            info!(name = %device_name, id = %device_id, host = %dev.host, port = dev.port, "manual_bluos_device_registered");
+            Ok((device_id, device_name, zone_id))
+        }
+        "dlna" => {
+            let location = format!("http://{}:{}/description.xml", dev.host, dev.port);
+            let desc = fetch_device_description(&location).await.map_err(|e| {
+                format!(
+                    "Cannot fetch DLNA description from {}:{}: {e}",
+                    dev.host, dev.port
+                )
+            })?;
+            if !desc.is_media_renderer() {
+                return Err(format!(
+                    "Device at {}:{} is not a DLNA Media Renderer",
+                    dev.host, dev.port
+                ));
+            }
+            let service_urls = desc.service_urls();
+            let (Some(av), Some(rc)) = (
+                service_urls.get("avtransport"),
+                service_urls.get("renderingcontrol"),
+            ) else {
+                return Err(
+                    "Device is a media renderer but missing AVTransport or RenderingControl services"
+                        .to_string(),
+                );
+            };
+
+            let base = format!("http://{}:{}", dev.host, dev.port);
+            let device_name = dev
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("DLNA {}", dev.host));
+            let delay = state.config.play_delay_for(&device_name);
+            let cm_url = service_urls
+                .get("connectionmanager")
+                .or_else(|| service_urls.get("ConnectionManager"))
+                .map(|p| format!("{base}{p}"));
+
+            let dlna = DlnaOutput::new(
+                device_name.clone(),
+                device_id.clone(),
+                dev.host.clone(),
+                format!("{base}{av}"),
+                format!("{base}{rc}"),
+                cm_url,
+            )
+            .with_play_delay(delay);
+            state.outputs.lock().await.register(Box::new(dlna));
+
+            let zone_id = ensure_zone(state, &device_name, "dlna", &device_id);
+            info!(name = %device_name, id = %device_id, host = %dev.host, port = dev.port, "manual_dlna_device_registered");
+            Ok((device_id, device_name, zone_id))
+        }
+        other => Err(format!(
+            "Unsupported device type: '{other}'. Supported: bluos, dlna"
+        )),
+    }
+}
+
+/// Re-register every persisted manual device at startup.  Failures (device
+/// offline, moved IP) are logged and skipped — the zone simply stays offline
+/// until the device is reachable again.
+pub async fn reregister_manual_devices(state: &AppState) {
+    let devices = load_manual_devices(state);
+    if devices.is_empty() {
+        return;
+    }
+    info!(count = devices.len(), "reregistering_manual_devices");
+    for dev in devices {
+        match register_manual_device(state, &dev).await {
+            Ok((id, name, _)) => info!(id = %id, name = %name, "manual_device_reregistered"),
+            Err(e) => warn!(
+                host = %dev.host,
+                port = dev.port,
+                r#type = %dev.r#type,
+                error = %e,
+                "manual_device_reregister_failed"
+            ),
+        }
+    }
+}
+
 async fn add_device(
     State(state): State<AppState>,
     Json(body): Json<AddDeviceRequest>,
@@ -135,182 +341,46 @@ async fn add_device(
             .into_response();
     }
 
-    match device_type.as_str() {
-        "bluos" => {
-            let port = body.port.unwrap_or(11000);
-            // Probe the device by fetching /Status
-            let probe_url = format!("http://{}:{}/Status", host, port);
-            let probe = state
-                .http_client
-                .get(&probe_url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await;
-
-            match probe {
-                Ok(resp) if resp.status().is_success() => {
-                    let xml = resp.text().await.unwrap_or_default();
-                    // Try to extract device name from Status XML if not provided
-                    let device_name = body.name.unwrap_or_else(|| {
-                        extract_xml_tag(&xml, "name")
-                            .or_else(|| extract_xml_tag(&xml, "modelName"))
-                            .unwrap_or_else(|| format!("BluOS {}", host))
-                    });
-                    let device_id = format!("bluos-{}-{}", host, port);
-
-                    let bluos = BluosOutput::new(
-                        device_name.clone(),
-                        device_id.clone(),
-                        host.clone(),
-                        port,
-                    );
-
-                    let mut outputs = state.outputs.lock().await;
-                    outputs.register(Box::new(bluos));
-                    drop(outputs);
-
-                    // Auto-create zone
-                    let zone_repo = ZoneRepo::with_backend(state.backend.clone());
-                    let zone_id = match zone_repo.get_or_create(&device_name, Some("bluos"), &device_id) {
-                        Ok((zid, created)) => {
-                            if !created {
-                                let _ = zone_repo.set_online_by_device(&device_id, true);
-                            }
-                            Some(zid)
-                        }
-                        Err(_) => None,
-                    };
-
-                    info!(name = %device_name, id = %device_id, host = %host, port, "manual_bluos_device_added");
-
-                    (
-                        StatusCode::CREATED,
-                        Json(json!({
-                            "status": "ok",
-                            "device_id": device_id,
-                            "name": device_name,
-                            "type": "bluos",
-                            "host": host,
-                            "port": port,
-                            "zone_id": zone_id,
-                        })),
-                    )
-                        .into_response()
-                }
-                Ok(resp) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "error": format!("BluOS device at {}:{} responded with status {}", host, port, resp.status()),
-                        "hint": "Verify the IP address and port. BluOS default port is 11000."
-                    })),
-                )
-                    .into_response(),
-                Err(e) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "error": format!("Cannot reach BluOS device at {}:{}: {}", host, port, e),
-                        "hint": "Verify the IP address is correct and the device is powered on."
-                    })),
-                )
-                    .into_response(),
-            }
-        }
-        "dlna" => {
-            let port = body.port.unwrap_or(80);
-            // For DLNA, try to fetch the device description XML
-            let location = format!("http://{}:{}/description.xml", host, port);
-            match fetch_device_description(&location).await {
-                Ok(desc) if desc.is_media_renderer() => {
-                    let service_urls = desc.service_urls();
-                    let av_url = service_urls.get("avtransport");
-                    let rc_url = service_urls.get("renderingcontrol");
-
-                    if let (Some(av), Some(rc)) = (av_url, rc_url) {
-                        let base = format!("http://{}:{}", host, port);
-                        let device_name = body.name.unwrap_or_else(|| {
-                            format!("DLNA {}", host)
-                        });
-                        let device_id = format!("dlna-{}-{}", host, port);
-                        let delay = state.config.play_delay_for(&device_name);
-                        let cm_url = service_urls
-                            .get("connectionmanager")
-                            .or_else(|| service_urls.get("ConnectionManager"))
-                            .map(|p| format!("{base}{p}"));
-
-                        let dlna = DlnaOutput::new(
-                            device_name.clone(),
-                            device_id.clone(),
-                            host.clone(),
-                            format!("{base}{av}"),
-                            format!("{base}{rc}"),
-                            cm_url,
-                        )
-                        .with_play_delay(delay);
-
-                        let mut outputs = state.outputs.lock().await;
-                        outputs.register(Box::new(dlna));
-                        drop(outputs);
-
-                        // Auto-create zone
-                        let zone_repo = ZoneRepo::with_backend(state.backend.clone());
-                        let zone_id = match zone_repo.get_or_create(&device_name, Some("dlna"), &device_id) {
-                            Ok((zid, created)) => {
-                                if !created {
-                                    let _ = zone_repo.set_online_by_device(&device_id, true);
-                                }
-                                Some(zid)
-                            }
-                            Err(_) => None,
-                        };
-
-                        info!(name = %device_name, id = %device_id, host = %host, port, "manual_dlna_device_added");
-
-                        (
-                            StatusCode::CREATED,
-                            Json(json!({
-                                "status": "ok",
-                                "device_id": device_id,
-                                "name": device_name,
-                                "type": "dlna",
-                                "host": host,
-                                "port": port,
-                                "zone_id": zone_id,
-                            })),
-                        )
-                            .into_response()
-                    } else {
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            Json(json!({
-                                "error": "Device is a media renderer but missing AVTransport or RenderingControl services",
-                                "hint": "This DLNA device may not support playback control."
-                            })),
-                        )
-                            .into_response()
-                    }
-                }
-                Ok(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "error": format!("Device at {}:{} is not a DLNA Media Renderer", host, port),
-                        "hint": "Verify the device supports UPnP AV / DLNA rendering."
-                    })),
-                )
-                    .into_response(),
-                Err(e) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({
-                        "error": format!("Cannot fetch DLNA description from {}:{}: {}", host, port, e),
-                        "hint": "Verify the IP address and port. Try browsing to the device description URL."
-                    })),
-                )
-                    .into_response(),
-            }
-        }
-        _ => (
+    if device_type != "dlna" && device_type != "bluos" {
+        return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!("Unsupported device type: '{}'. Supported: bluos, dlna", device_type),
+            })),
+        )
+            .into_response();
+    }
+
+    let default_port = if device_type == "bluos" { 11000 } else { 80 };
+    let dev = ManualDevice {
+        r#type: device_type,
+        host,
+        port: body.port.unwrap_or(default_port),
+        name: body.name,
+    };
+
+    match register_manual_device(&state, &dev).await {
+        Ok((device_id, name, zone_id)) => {
+            persist_manual_device(&state, &dev);
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "status": "ok",
+                    "device_id": device_id,
+                    "name": name,
+                    "type": dev.r#type,
+                    "host": dev.host,
+                    "port": dev.port,
+                    "zone_id": zone_id,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": e,
+                "hint": "Verify the IP address and port, and that the device is powered on.",
             })),
         )
             .into_response(),
@@ -619,6 +689,8 @@ async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
         outputs.remove(&id);
         removed += 1;
     }
+    // Forget all persisted manual devices too, so a clear is durable.
+    save_manual_devices(&state, &[]);
     Json(json!({"cleared": removed}))
 }
 
@@ -628,6 +700,9 @@ async fn delete_device(
 ) -> impl IntoResponse {
     let mut outputs = state.outputs.lock().await;
     outputs.remove(&device_id);
+    drop(outputs);
+    // Also drop it from persistence so it isn't re-registered on next startup.
+    forget_manual_device(&state, &device_id);
     StatusCode::NO_CONTENT
 }
 

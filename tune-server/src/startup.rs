@@ -20,6 +20,14 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     warm_sqlite_cache(state);
+
+    // Re-register manually-added devices (BluOS, legacy DLNA renderers that
+    // don't answer SSDP M-SEARCH). Done off the startup path so an offline
+    // device's probe timeout doesn't delay boot.
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        crate::routes::devices::reregister_manual_devices(&state_clone).await;
+    });
 }
 
 /// Remove duplicate zones (same output_device_id) and add a unique index to

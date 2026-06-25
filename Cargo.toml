@@ -3,7 +3,7 @@ members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.170"
+version = "0.8.173"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
@@ -26,7 +26,7 @@ notify = "7"
 md-5 = "0.10"
 quick-xml = "0.40"
 mdns-sd = "0.20"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
