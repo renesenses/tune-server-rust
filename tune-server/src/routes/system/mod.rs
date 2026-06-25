@@ -1,6 +1,7 @@
 mod admin;
 mod backup;
 mod config;
+mod config_backup;
 mod convert;
 mod database;
 mod diagnostics;
@@ -167,6 +168,15 @@ pub fn router() -> Router<AppState> {
         .route(
             "/playlist-hub/{hub_id}/transfer",
             post(playlist_hub::transfer),
+        )
+        // Cloud config backup — full server config export/import/push/pull
+        .route("/config-backup/export", get(config_backup::export))
+        .route("/config-backup/import", post(config_backup::import))
+        .route("/config-backup/cloud-push", post(config_backup::cloud_push))
+        .route("/config-backup/cloud-pull", post(config_backup::cloud_pull))
+        .route(
+            "/config-backup/cloud-status",
+            get(config_backup::cloud_status),
         )
         // Concert alerts — upcoming concerts for library artists
         .route("/concerts", get(concerts_handler))
