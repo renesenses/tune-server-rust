@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
-const APPLE_TOP_URL: &str = "https://rss.applemarketingtools.com/api/v2/fr/podcasts/top/50";
+const APPLE_TOP_BASE: &str = "https://rss.applemarketingtools.com/api/v2";
 const USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
 /// Cache TTL for top podcasts (1 hour).
 const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -152,8 +152,14 @@ impl PodcastService {
         Self { client }
     }
 
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Podcast>, String> {
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        country: &str,
+    ) -> Result<Vec<Podcast>, String> {
         let limit = limit.min(50).max(1);
+        let cc = if country.is_empty() { "US" } else { country };
         let resp = self
             .client
             .get(ITUNES_SEARCH_URL)
@@ -161,7 +167,7 @@ impl PodcastService {
                 ("term", query),
                 ("media", "podcast"),
                 ("limit", &limit.to_string()),
-                ("country", "FR"),
+                ("country", cc),
             ])
             .send()
             .await
@@ -360,15 +366,25 @@ impl PodcastService {
 
     // ── Apple Top Podcasts ──────────────────────────────────────────
 
-    /// Fetch the top 50 podcasts in France from the Apple RSS feed generator.
-    /// Results are cached for 1 hour per genre key (None = all genres).
-    pub async fn top_podcasts(&self, genre: Option<u32>) -> Result<Vec<Podcast>, String> {
-        // Build the URL — genre-specific or global.
+    /// Fetch the top 50 podcasts from the Apple RSS feed generator.
+    /// `country` is an ISO 3166-1 alpha-2 code (e.g. "fr", "us", "de", "kr").
+    /// Results are cached for 1 hour per (country, genre) key.
+    pub async fn top_podcasts(
+        &self,
+        genre: Option<u32>,
+        country: &str,
+    ) -> Result<Vec<Podcast>, String> {
+        let cc = country.to_lowercase();
         let url = match genre {
-            Some(gid) => format!("{APPLE_TOP_URL}/podcast-{gid}.json"),
-            None => format!("{APPLE_TOP_URL}/podcasts.json"),
+            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcast-{gid}.json"),
+            None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
         };
-        let cache_key = genre.unwrap_or(0);
+        let cache_key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&cc, &mut h);
+            std::hash::Hash::hash(&genre.unwrap_or(0), &mut h);
+            std::hash::Hasher::finish(&h) as u32
+        };
 
         // Per-genre caches stored in a static map.
         type CacheEntry = (Instant, Vec<Podcast>);

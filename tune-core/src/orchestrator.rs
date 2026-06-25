@@ -2074,11 +2074,113 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
+        let is_network_output = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
         let out_bd = if is_local_stream {
             32
         } else {
             bd.max(16).min(24)
         };
+
+        // For DLNA/network outputs, encode prefetched PCM to a FLAC temp file
+        // to avoid WAV format mismatch noise during gapless transitions.
+        if is_network_output {
+            let tmp_path =
+                std::env::temp_dir().join(format!("tune-prefetch-{}.flac", uuid::Uuid::new_v4()));
+            let tmp_str = tmp_path.to_string_lossy().to_string();
+            let pcm_data = prefetched.pcm_data;
+            let encode_sr = sr;
+            let encode_bd = out_bd;
+            let encode_ch = ch;
+            let encode_path = tmp_str.clone();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let spec = hound::WavSpec {
+                    channels: encode_ch as u16,
+                    sample_rate: encode_sr,
+                    bits_per_sample: encode_bd as u16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let cursor = std::io::Cursor::new(&pcm_data);
+                let reader = hound::WavReader::new(cursor);
+                // Write PCM to temp WAV first, then convert to FLAC
+                let tmp_wav = format!("{}.wav", encode_path);
+                {
+                    let mut f = std::fs::File::create(&tmp_wav)
+                        .map_err(|e| format!("create tmp wav: {e}"))?;
+                    let header = crate::http::wav_header::build_wav_header(
+                        pcm_data.len() as u32,
+                        encode_sr,
+                        encode_bd as u16,
+                        encode_ch as u16,
+                    );
+                    f.write_all(&header)
+                        .map_err(|e| format!("write wav header: {e}"))?;
+                    f.write_all(&pcm_data)
+                        .map_err(|e| format!("write wav pcm: {e}"))?;
+                }
+                // Convert WAV to FLAC using our decoder
+                let status = std::process::Command::new("ffmpeg")
+                    .args(["-y", "-i", &tmp_wav, "-c:a", "flac", &encode_path])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::fs::remove_file(&tmp_wav);
+                match status {
+                    Ok(s) if s.success() => Ok(()),
+                    Ok(s) => Err(format!("ffmpeg exit {s}")),
+                    Err(e) => Err(format!("ffmpeg: {e}")),
+                }
+            })
+            .await
+            .map_err(|e| format!("spawn: {e}"))??;
+
+            let file_size = std::fs::metadata(&tmp_str).map(|m| m.len()).unwrap_or(0);
+            info!(
+                title = %prefetched.title,
+                file_size,
+                "prefetch_pcm_encoded_to_flac_for_dlna"
+            );
+
+            let flac_info = StreamInfo {
+                format: "flac".into(),
+                mime_type: "audio/flac".into(),
+                sample_rate: sr,
+                bit_depth: out_bd,
+                channels: ch,
+                file_size: Some(file_size),
+                duration_ms: Some(prefetched.duration_ms),
+                ..Default::default()
+            };
+
+            let session_id = self
+                .streamer
+                .create_file_session(tmp_str.clone().into(), flac_info)
+                .await;
+
+            let server_ip = self.server_ip();
+            let stream_url = self
+                .streamer
+                .get_stream_url(&session_id, &server_ip, "flac");
+
+            return Ok(ResolvedStream {
+                url: stream_url,
+                stream_id: Some(session_id),
+                title: prefetched.title,
+                artist: prefetched.artist,
+                album: None,
+                duration_ms: Some(prefetched.duration_ms as i64),
+                source: prefetched.source,
+                source_id: Some(prefetched.source_id),
+                mime_type: "audio/flac".into(),
+                sample_rate: sr,
+                bit_depth: out_bd,
+                channels: ch,
+                cover_url: prefetched.cover_url,
+            });
+        }
 
         let wav_info = StreamInfo {
             format: "wav".into(),

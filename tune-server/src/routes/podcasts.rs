@@ -15,14 +15,20 @@ struct SearchQuery {
     q: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default = "default_country")]
+    country: String,
 }
 fn default_limit() -> usize {
     20
 }
+fn default_country() -> String {
+    "us".into()
+}
 #[derive(Deserialize)]
 struct TopQuery {
-    /// Optional Apple genre ID to filter top podcasts.
     genre: Option<u32>,
+    #[serde(default = "default_country")]
+    country: String,
 }
 #[derive(Deserialize)]
 struct EpisodesQuery {
@@ -67,7 +73,7 @@ async fn search_podcasts(
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Value>, AppError> {
     let svc = PodcastService::with_client(state.http_client.clone());
-    match svc.search(&q.q, q.limit).await {
+    match svc.search(&q.q, q.limit, &q.country).await {
         Ok(results) => Ok(Json(
             json!({"query": q.q, "count": results.len(), "items": results}),
         )),
@@ -131,7 +137,7 @@ async fn radiofrance_podcasts() -> Json<Value> {
 async fn discover_podcasts(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let curated = PodcastService::curated_french_podcasts();
     let svc = PodcastService::with_client(state.http_client.clone());
-    let top = svc.top_podcasts(None).await.unwrap_or_default();
+    let top = svc.top_podcasts(None, "us").await.unwrap_or_default();
     Ok(Json(json!({
         "curated": curated,
         "top": top,
@@ -144,7 +150,7 @@ async fn top_podcasts(
     Query(q): Query<TopQuery>,
 ) -> Result<Json<Value>, AppError> {
     let svc = PodcastService::with_client(state.http_client.clone());
-    match svc.top_podcasts(q.genre).await {
+    match svc.top_podcasts(q.genre, &q.country).await {
         Ok(podcasts) => Ok(Json(json!({
             "genre": q.genre,
             "count": podcasts.len(),
