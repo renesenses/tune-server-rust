@@ -111,7 +111,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // get_or_create returns (id, false) for existing zones, so we only
                 // need to check when the zone doesn't already exist.
                 if zone_repo.get_by_device_id(&d.id).ok().flatten().is_none() {
-                    let zone_count = zone_repo.count().unwrap_or(0);
+                    let zone_count = zone_repo.count_online().unwrap_or(0);
                     if !state.license.check_zone_limit(zone_count).await {
                         info!(
                             name = %d.name,

@@ -716,7 +716,7 @@ async fn create_zone(
 ) -> impl IntoResponse {
     // Premium gate: Free tier is limited to 3 zones (existing zones are grandfathered)
     let zone_count = ZoneRepo::with_backend(state.backend.clone())
-        .count()
+        .count_online()
         .unwrap_or(0);
     if !state.license.check_zone_limit(zone_count).await {
         info!(
