@@ -47,6 +47,7 @@ pub enum Feature {
     WeeklyDigest,
     AutoEnrichment,
     RoomCorrection,
+    CloudConfigBackup,
 }
 
 impl Feature {
@@ -69,6 +70,7 @@ impl Feature {
             Feature::WeeklyDigest,
             Feature::AutoEnrichment,
             Feature::RoomCorrection,
+            Feature::CloudConfigBackup,
         ]
     }
 
@@ -91,6 +93,7 @@ impl Feature {
             Feature::WeeklyDigest => "Weekly Digest",
             Feature::AutoEnrichment => "Auto Metadata Enrichment",
             Feature::RoomCorrection => "Room Correction",
+            Feature::CloudConfigBackup => "Cloud Config Backup",
         }
     }
 }
@@ -418,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_sixteen_features() {
-        assert_eq!(Feature::all_premium().len(), 16);
+    fn all_premium_has_seventeen_features() {
+        assert_eq!(Feature::all_premium().len(), 17);
     }
 
     #[test]

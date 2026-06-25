@@ -459,6 +459,9 @@ pub struct LocalOutput {
     muted: Arc<AtomicBool>,
     /// Playback position in milliseconds (updated by the streaming thread)
     position_ms: Arc<AtomicU64>,
+    /// Offset added to position_ms when stream was seeked (the decoded stream
+    /// starts at byte 0 but represents audio from seek_offset_ms onward).
+    seek_offset_ms: Arc<AtomicU64>,
     /// Track duration in milliseconds
     duration_ms: Arc<AtomicU64>,
     current_uri: Arc<std::sync::Mutex<Option<String>>>,
@@ -526,6 +529,7 @@ impl LocalOutput {
             pre_mute_volume: Arc::new(AtomicU32::new(1000)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
+            seek_offset_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(std::sync::Mutex::new(None)),
             track_title: Arc::new(std::sync::Mutex::new(None)),
@@ -982,6 +986,7 @@ impl OutputTarget for LocalOutput {
         let paused = self.paused.clone();
         let volume = self.volume.clone();
         let position_ms = self.position_ms.clone();
+        let seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
 
@@ -992,7 +997,7 @@ impl OutputTarget for LocalOutput {
 
         playing.store(true, Ordering::SeqCst);
         paused.store(false, Ordering::SeqCst);
-        position_ms.store(0, Ordering::SeqCst);
+        position_ms.store(seek_offset, Ordering::SeqCst);
         // NOTE: duration_ms is NOT reset here — play_media() sets it before
         // calling play_url(), and resetting would wipe the known duration.
         // It is cleared in stop() instead.
@@ -1274,12 +1279,14 @@ impl OutputTarget for LocalOutput {
                         feed_ring_abortable(&ring, chunk, &stop_rx, &paused, Some(&force_silent));
                         fed_samples += chunk.len() as u64;
                         let fed_frames = fed_samples / output_ch as u64;
-                        let pos = (fed_frames as f64 / output_sr as f64 * 1000.0) as u64;
-                        position_ms.store(pos.min(output_duration_ms), Ordering::Relaxed);
+                        let pos =
+                            (fed_frames as f64 / output_sr as f64 * 1000.0) as u64 + seek_offset;
+                        position_ms
+                            .store(pos.min(output_duration_ms + seek_offset), Ordering::Relaxed);
                     }
                 }
 
-                position_ms.store(output_duration_ms, Ordering::Relaxed);
+                position_ms.store(output_duration_ms + seek_offset, Ordering::Relaxed);
 
                 // Signal natural track end BEFORE draining so the
                 // orchestrator can detect end-of-track even if a new play
@@ -1438,7 +1445,8 @@ impl OutputTarget for LocalOutput {
 
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
 
-                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
+                        + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
                 }
 
@@ -1591,7 +1599,8 @@ impl OutputTarget for LocalOutput {
 
                     total_frames_fed += (aligned_len / frame_bytes) as u64;
 
-                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                    let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64
+                        + seek_offset;
                     position_ms.store(pos, Ordering::Relaxed);
                 }
 
@@ -1730,7 +1739,8 @@ impl OutputTarget for LocalOutput {
 
                                         let pos = (total_frames_fed as f64 / sample_rate as f64
                                             * 1000.0)
-                                            as u64;
+                                            as u64
+                                            + seek_offset;
                                         position_ms.store(pos, Ordering::Relaxed);
                                     }
                                     Err(ref e)
@@ -2278,7 +2288,8 @@ impl OutputTarget for LocalOutput {
                 }
 
                 // Update position
-                let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64;
+                let pos =
+                    (total_frames_fed as f64 / sample_rate as f64 * 1000.0) as u64 + seek_offset;
                 position_ms.store(pos, Ordering::Relaxed);
             }
 
@@ -2428,6 +2439,7 @@ impl OutputTarget for LocalOutput {
         }
         self.playing.store(false, Ordering::SeqCst);
         self.position_ms.store(0, Ordering::SeqCst);
+        self.seek_offset_ms.store(0, Ordering::SeqCst);
         self.duration_ms.store(0, Ordering::SeqCst);
         // Clear the natural-end flag and generation so stale signals from
         // the previous track do not affect the next track's end-detection cycle.
@@ -2442,9 +2454,9 @@ impl OutputTarget for LocalOutput {
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         // The local output plays from an HTTP stream consumed sequentially,
         // so true seek requires the orchestrator to restart the stream.
-        // However, we immediately update the reported position so that
-        // get_status() reflects the seek target during the grace period
-        // (prevents the progress bar from snapping back).
+        // Store the seek offset so the new stream (which starts counting
+        // frames from 0) reports the correct absolute position.
+        self.seek_offset_ms.store(position_ms, Ordering::SeqCst);
         self.position_ms.store(position_ms, Ordering::SeqCst);
         Ok(())
     }

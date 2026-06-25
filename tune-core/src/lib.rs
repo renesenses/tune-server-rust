@@ -11,6 +11,7 @@ pub mod bug_report;
 pub mod cloud;
 pub mod collaborative;
 pub mod config;
+pub mod config_backup;
 pub mod credentials_vault;
 pub mod dashboard;
 pub mod db;
