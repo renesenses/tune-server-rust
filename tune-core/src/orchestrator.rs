@@ -1474,9 +1474,7 @@ impl PlaybackOrchestrator {
                 }
             });
 
-            let server_ip = crate::discovery::ssdp::get_local_ip()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "127.0.0.1".into());
+            let server_ip = self.server_ip();
             let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
             (url, Some(session_id), "audio/wav".to_string(), None)
         } else if is_dash_file {
@@ -1584,9 +1582,7 @@ impl PlaybackOrchestrator {
                         .create_file_session(file_info, tmp_path, false)
                         .await;
 
-                    let server_ip = crate::discovery::ssdp::get_local_ip()
-                        .map(|ip| ip.to_string())
-                        .unwrap_or_else(|| "127.0.0.1".into());
+                    let server_ip = self.server_ip();
                     let url = self
                         .streamer
                         .get_stream_url(&session_id, &server_ip, "flac");
@@ -1715,9 +1711,7 @@ impl PlaybackOrchestrator {
                             .create_file_session(file_info, tmp_flac, false)
                             .await;
 
-                        let server_ip = crate::discovery::ssdp::get_local_ip()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_else(|| "127.0.0.1".into());
+                        let server_ip = self.server_ip();
                         let url = self
                             .streamer
                             .get_stream_url(&session_id, &server_ip, "flac");
@@ -1747,9 +1741,7 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_proxy_session(info, stream_data.url.clone(), false)
                     .await;
-                let server_ip = crate::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into());
+                let server_ip = self.server_ip();
                 let url = self
                     .streamer
                     .get_stream_url(&session_id, &server_ip, &codec_lower);
