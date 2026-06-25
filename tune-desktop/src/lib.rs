@@ -11,6 +11,7 @@
 //! typed delta events — no polling.
 
 use serde::Serialize;
+use tauri::Manager;
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -43,6 +44,19 @@ pub fn run() {
         // one of the things the web sandbox can't do.
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![app_info])
+        .setup(|app| {
+            // The window loads the live server UI (http://localhost:8888 by
+            // default, set in tauri.conf.json) so it's the exact current web UI
+            // with same-origin API/WS. Override the host at runtime with
+            // TUNE_SERVER_URL — handy for pointing at a remote server.
+            if let Ok(server) = std::env::var("TUNE_SERVER_URL")
+                && let Some(win) = app.get_webview_window("main")
+                && let Ok(url) = server.parse::<tauri::Url>()
+            {
+                let _ = win.navigate(url);
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tune desktop application");
 }

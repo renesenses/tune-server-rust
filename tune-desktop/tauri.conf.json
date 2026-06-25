@@ -4,13 +4,14 @@
   "version": "0.8.176",
   "identifier": "fr.mozaiklabs.tune-desktop",
   "build": {
-    "frontendDist": "../xtune-web"
+    "frontendDist": "../web"
   },
   "app": {
     "windows": [
       {
         "label": "main",
         "title": "Tune",
+        "url": "http://localhost:8888",
         "width": 1200,
         "height": 800,
         "minWidth": 900,
