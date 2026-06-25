@@ -532,6 +532,21 @@ CREATE INDEX IF NOT EXISTS idx_sync_changelog_unsynced ON sync_changelog(synced,
 CREATE INDEX IF NOT EXISTS idx_sync_changelog_entity ON sync_changelog(entity_type, entity_id);
 ",
     },
+    Migration {
+        version: 43,
+        name: "add_lyrics_cache",
+        up: "
+CREATE TABLE IF NOT EXISTS lyrics_cache (
+    track_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    synced_lyrics TEXT,
+    plain_lyrics TEXT,
+    source TEXT NOT NULL DEFAULT 'lrclib',
+    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

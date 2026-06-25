@@ -23,6 +23,7 @@ pub mod kiosk;
 pub mod lastfm_social;
 pub mod library;
 pub mod listenbrainz;
+pub mod lyrics;
 pub mod mediasync;
 pub mod metadata;
 pub mod mqa;
@@ -291,6 +292,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/eq", eq_pro::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
+        .nest("/lyrics", lyrics::router())
         .nest("/mqa", mqa::router())
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())

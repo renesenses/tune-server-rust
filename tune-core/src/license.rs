@@ -37,6 +37,7 @@ pub enum Feature {
     CloudRelay,
     OaatProtocol,
     CloudBackup,
+    SyncedLyrics,
 }
 
 impl Feature {
@@ -49,6 +50,7 @@ impl Feature {
             Feature::CloudRelay,
             Feature::OaatProtocol,
             Feature::CloudBackup,
+            Feature::SyncedLyrics,
         ]
     }
 
@@ -61,6 +63,7 @@ impl Feature {
             Feature::CloudRelay => "Cloud Relay",
             Feature::OaatProtocol => "OAAT Protocol",
             Feature::CloudBackup => "Cloud Backup",
+            Feature::SyncedLyrics => "Synced Lyrics",
         }
     }
 }
@@ -388,8 +391,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_six_features() {
-        assert_eq!(Feature::all_premium().len(), 6);
+    fn all_premium_has_seven_features() {
+        assert_eq!(Feature::all_premium().len(), 7);
     }
 
     #[test]
