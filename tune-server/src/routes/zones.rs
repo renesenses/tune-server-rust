@@ -1009,7 +1009,13 @@ async fn rename_zone(
 ) -> impl IntoResponse {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     match repo.update_name(id, &body.name) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneUpdated,
+                json!({ "id": id, "name": body.name }),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
