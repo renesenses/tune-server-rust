@@ -20,7 +20,7 @@ pub struct StreamTrack {
     pub quality: Option<StreamQuality>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamAlbum {
     #[serde(rename(serialize = "source_id"), alias = "source_id")]
     pub id: String,
