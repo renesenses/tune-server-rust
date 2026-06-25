@@ -445,6 +445,22 @@ fn log_no_devices_diagnostics(host_name: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Gapless: pending next track for seamless chaining
+// ---------------------------------------------------------------------------
+
+/// Stores the next track's metadata for gapless playback.
+/// When the current track reaches clean HTTP EOF and this is set,
+/// the playback thread chains directly into the next track without
+/// closing/reopening the audio device.
+#[derive(Clone)]
+struct PendingNextMedia {
+    url: String,
+    title: Option<String>,
+    artist: Option<String>,
+    duration_ms: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
 // LocalOutput — streams audio from an HTTP URL to a local audio device
 // ---------------------------------------------------------------------------
 
@@ -504,6 +520,9 @@ pub struct LocalOutput {
     /// `play_generation`, preventing a detached old thread from
     /// contaminating the new track's status.
     track_ended_generation: Arc<AtomicU64>,
+    /// Pending next track for gapless playback.  Set by `set_next_media()`,
+    /// consumed by the playback thread when the current track reaches EOF.
+    next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
 }
 
 impl LocalOutput {
@@ -542,6 +561,7 @@ impl LocalOutput {
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
+            next_media: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -918,12 +938,33 @@ impl OutputTarget for LocalOutput {
 
     async fn set_next_url(
         &self,
-        _url: &str,
+        url: &str,
         _mime_type: &str,
-        _title: Option<&str>,
-        _artist: Option<&str>,
+        title: Option<&str>,
+        artist: Option<&str>,
     ) -> Result<(), String> {
-        Err("local output does not support gapless set_next".into())
+        *self.next_media.lock().unwrap() = Some(PendingNextMedia {
+            url: url.to_string(),
+            title: title.map(String::from),
+            artist: artist.map(String::from),
+            duration_ms: None,
+        });
+        debug!("local_audio_gapless_next_url_set");
+        Ok(())
+    }
+
+    async fn set_next_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
+        *self.next_media.lock().unwrap() = Some(PendingNextMedia {
+            url: media.url.to_string(),
+            title: media.title.map(String::from),
+            artist: media.artist.map(String::from),
+            duration_ms: media.duration_ms,
+        });
+        info!(
+            title = ?media.title,
+            "local_audio_gapless_next_media_set"
+        );
+        Ok(())
     }
 
     async fn play_media(&self, media: &super::traits::PlayMedia<'_>) -> Result<(), String> {
@@ -946,6 +987,8 @@ impl OutputTarget for LocalOutput {
         artist: Option<&str>,
     ) -> Result<(), String> {
         self.stop().await.ok();
+        // Clear any staged gapless next — starting from scratch.
+        *self.next_media.lock().unwrap() = None;
 
         // Brief pause after stopping the old stream to allow the OS audio
         // subsystem (CoreAudio / WASAPI / ALSA) to fully release the device.
@@ -986,9 +1029,16 @@ impl OutputTarget for LocalOutput {
         let paused = self.paused.clone();
         let volume = self.volume.clone();
         let position_ms = self.position_ms.clone();
-        let seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
+        let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
+        let seek_offset_arc = self.seek_offset_ms.clone();
+        let duration_ms_arc = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
+        // Arcs for gapless metadata updates from the playback thread
+        let next_media_ref = self.next_media.clone();
+        let uri_ref = self.current_uri.clone();
+        let title_ref = self.track_title.clone();
+        let artist_ref = self.track_artist.clone();
 
         // Store metadata
         *self.current_uri.lock().unwrap() = Some(url.clone());
@@ -1062,7 +1112,7 @@ impl OutputTarget for LocalOutput {
             );
             header_buf.truncate(header_read);
 
-            let (channels, sample_rate, bit_depth, data_offset) = if let Some(parsed) =
+            let (mut channels, mut sample_rate, mut bit_depth, data_offset) = if let Some(parsed) =
                 parse_wav_header(&header_buf)
             {
                 info!(
@@ -1325,7 +1375,7 @@ impl OutputTarget for LocalOutput {
             } else {
                 (bit_depth / 8) as usize
             };
-            let frame_bytes = channels as usize * bytes_per_sample;
+            let mut frame_bytes = channels as usize * bytes_per_sample;
 
             // ------- Exclusive mode path (macOS only) -------
             #[cfg(target_os = "macos")]
@@ -2020,8 +2070,8 @@ impl OutputTarget for LocalOutput {
             );
 
             let mut total_frames_fed: u64 = 0;
-            let needs_resample = output_sr != sample_rate;
-            let needs_channel_adapt = output_ch != channels;
+            let mut needs_resample = output_sr != sample_rate;
+            let mut needs_channel_adapt = output_ch != channels;
 
             // Create rubato sinc resampler once for the entire track.
             // Using FixedAsync::Input so we feed fixed-size input chunks.
@@ -2301,12 +2351,298 @@ impl OutputTarget for LocalOutput {
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
+                stream_started = true;
                 info!(
                     device = %device_name,
                     ring_available = ring.available(),
                     "local_audio_playing_short_track_or_eof"
                 );
             }
+
+            // ---------------------------------------------------------------
+            // Gapless continuation: when the current track reached clean EOF
+            // and a next track was staged via set_next_media(), seamlessly
+            // chain into the next track without closing the cpal stream.
+            // The audio device stays open — zero gap between tracks.
+            // ---------------------------------------------------------------
+            while http_eof && !force_silent.load(Ordering::Relaxed) {
+                let pending = next_media_ref.lock().unwrap().take();
+                let Some(next) = pending else { break };
+
+                info!(
+                    next_title = ?next.title,
+                    next_url = %next.url,
+                    "local_audio_gapless_chaining_next_track"
+                );
+
+                // Flush the current resampler before switching tracks
+                if needs_resample {
+                    let flushed = rubato_resample_chunk(
+                        &mut resampler,
+                        &[],
+                        output_ch,
+                        true,
+                        &mut resample_leftover,
+                    );
+                    if !flushed.is_empty() {
+                        feed_ring_abortable(
+                            &ring,
+                            &flushed,
+                            &stop_rx,
+                            &paused,
+                            Some(&force_silent),
+                        );
+                    }
+                }
+
+                // Update shared metadata for the new track so get_status()
+                // and the poller see the transition.
+                *uri_ref.lock().unwrap() = Some(next.url.clone());
+                *title_ref.lock().unwrap() = next.title.clone();
+                *artist_ref.lock().unwrap() = next.artist.clone();
+                if let Some(dur) = next.duration_ms {
+                    duration_ms_arc.store(dur, Ordering::SeqCst);
+                }
+                // Reset position and seek offset for the new track.
+                // The poller will see position drop from near-end to 0,
+                // detect a gapless position reset, and call
+                // advance_queue_metadata() — no stop/restart needed.
+                seek_offset = 0;
+                seek_offset_arc.store(0, Ordering::SeqCst);
+                position_ms.store(0, Ordering::SeqCst);
+
+                // Fetch the next track's HTTP stream
+                let next_response = match reqwest::blocking::Client::builder()
+                    .timeout(None)
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .and_then(|client| client.get(&next.url).send())
+                {
+                    Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
+                    Ok(r) => {
+                        warn!(
+                            status = %r.status(),
+                            url = %next.url,
+                            "local_audio_gapless_http_error"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            url = %next.url,
+                            "local_audio_gapless_http_fetch_failed"
+                        );
+                        break;
+                    }
+                };
+
+                // Read header bytes from the next track
+                let mut next_reader = next_response;
+                let mut next_header = vec![0u8; 4096];
+                let nh_read = match next_reader.read(&mut next_header) {
+                    Ok(n) if n > 0 => n,
+                    Ok(_) => {
+                        warn!("local_audio_gapless_header_read_empty");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "local_audio_gapless_header_read_failed");
+                        break;
+                    }
+                };
+                next_header.truncate(nh_read);
+
+                // Parse the WAV header of the next track
+                let Some((new_ch, new_sr, new_bd, new_data_offset)) =
+                    parse_wav_header(&next_header)
+                else {
+                    // Not a WAV stream — cannot chain gaplessly.
+                    // Fall through to normal end-of-track handling.
+                    info!("local_audio_gapless_next_not_wav_falling_back");
+                    break;
+                };
+
+                info!(
+                    new_sr,
+                    new_ch,
+                    new_bd,
+                    prev_sr = sample_rate,
+                    prev_ch = channels,
+                    prev_bd = bit_depth,
+                    "local_audio_gapless_next_track_format"
+                );
+
+                // Update source format variables for the new track
+                let prev_sr = sample_rate;
+                sample_rate = new_sr;
+                channels = new_ch;
+                bit_depth = new_bd;
+                let new_bps = if new_bd == 0 {
+                    4
+                } else {
+                    (new_bd / 8) as usize
+                };
+                frame_bytes = new_ch as usize * new_bps;
+                needs_channel_adapt = output_ch != new_ch;
+                needs_resample = output_sr != new_sr;
+
+                // Recreate the resampler if the source sample rate changed
+                if needs_resample && new_sr != prev_sr {
+                    let ratio = output_sr as f64 / new_sr as f64;
+                    let inv_ratio = 1.0 / ratio;
+                    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
+                        (32_usize, 64_usize)
+                    } else {
+                        (64_usize, 128_usize)
+                    };
+                    let window = WindowFunction::BlackmanHarris2;
+                    let f_cutoff = calculate_cutoff(sinc_len, window);
+                    let params = SincInterpolationParameters {
+                        sinc_len,
+                        f_cutoff,
+                        interpolation: SincInterpolationType::Linear,
+                        oversampling_factor,
+                        window,
+                    };
+                    resampler = match Async::<f32>::new_sinc(
+                        ratio,
+                        1.1,
+                        &params,
+                        1024,
+                        output_ch as usize,
+                        FixedAsync::Input,
+                    ) {
+                        Ok(r) => {
+                            info!(
+                                from_sr = new_sr,
+                                to_sr = output_sr,
+                                "local_audio_gapless_resampler_recreated"
+                            );
+                            Some(r)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_gapless_resampler_failed");
+                            None
+                        }
+                    };
+                    resample_leftover.clear();
+                } else if !needs_resample && resampler.is_some() {
+                    // Source rate now matches output — drop the resampler
+                    resampler = None;
+                    resample_leftover.clear();
+                }
+
+                // Reset per-track counters
+                total_frames_fed = 0;
+                total_bytes_read = 0;
+                leftover.clear();
+                http_eof = false;
+
+                // Process initial PCM data from the header read
+                let gapless_pcm = if new_data_offset < next_header.len() {
+                    next_header[new_data_offset..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                if !gapless_pcm.is_empty() {
+                    let aligned = (gapless_pcm.len() / frame_bytes) * frame_bytes;
+                    if aligned > 0 {
+                        let mut smp = pcm_bytes_to_f32(&gapless_pcm[..aligned], bit_depth);
+                        if needs_channel_adapt {
+                            smp = adapt_channels(&smp, channels, output_ch);
+                        }
+                        if needs_resample {
+                            smp = rubato_resample_chunk(
+                                &mut resampler,
+                                &smp,
+                                output_ch,
+                                false,
+                                &mut resample_leftover,
+                            );
+                        }
+                        feed_ring_abortable(&ring, &smp, &stop_rx, &paused, Some(&force_silent));
+                        total_frames_fed += (aligned / frame_bytes) as u64;
+                    }
+                    if aligned < gapless_pcm.len() {
+                        leftover.extend_from_slice(&gapless_pcm[aligned..]);
+                    }
+                }
+
+                // Main read loop for the gapless-chained track
+                let mut gapless_read_buf = vec![0u8; 65536];
+                loop {
+                    if stop_rx.try_recv().is_ok() || force_silent.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match next_reader.read(&mut gapless_read_buf) {
+                        Ok(0) => {
+                            debug!(
+                                total_bytes_read,
+                                total_frames_fed, "local_audio_gapless_track_eof"
+                            );
+                            http_eof = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            total_bytes_read += n as u64;
+                            leftover.extend_from_slice(&gapless_read_buf[..n]);
+                            let aligned = (leftover.len() / frame_bytes) * frame_bytes;
+                            if aligned == 0 {
+                                continue;
+                            }
+                            let mut smp = pcm_bytes_to_f32(&leftover[..aligned], bit_depth);
+                            let rem = leftover[aligned..].to_vec();
+                            leftover = rem;
+                            if needs_channel_adapt {
+                                smp = adapt_channels(&smp, channels, output_ch);
+                            }
+                            if needs_resample {
+                                smp = rubato_resample_chunk(
+                                    &mut resampler,
+                                    &smp,
+                                    output_ch,
+                                    false,
+                                    &mut resample_leftover,
+                                );
+                            }
+                            feed_ring_abortable(
+                                &ring,
+                                &smp,
+                                &stop_rx,
+                                &paused,
+                                Some(&force_silent),
+                            );
+                            total_frames_fed += (aligned / frame_bytes) as u64;
+                            let pos = (total_frames_fed as f64 / sample_rate as f64 * 1000.0)
+                                as u64
+                                + seek_offset;
+                            position_ms.store(pos, Ordering::Relaxed);
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_gapless_read_error");
+                            break;
+                        }
+                    }
+                }
+
+                // If this track also reached clean EOF, loop back to check
+                // for yet another gapless next track.  Otherwise, exit the
+                // gapless loop and fall through to normal end handling.
+                if !http_eof {
+                    break;
+                }
+                info!("local_audio_gapless_track_finished_checking_next");
+            }
+            // ---------------------------------------------------------------
+            // End of gapless continuation
+            // ---------------------------------------------------------------
 
             // Flush the resampler: process any leftover frames + drain internal delay
             if needs_resample {
@@ -2445,6 +2781,7 @@ impl OutputTarget for LocalOutput {
         // the previous track do not affect the next track's end-detection cycle.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        *self.next_media.lock().unwrap() = None;
         *self.current_uri.lock().unwrap() = None;
         *self.track_title.lock().unwrap() = None;
         *self.track_artist.lock().unwrap() = None;
