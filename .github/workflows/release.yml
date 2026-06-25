@@ -229,21 +229,30 @@ jobs:
         run: |
           DMG_NAME="${{ env.ARTIFACT }}.dmg"
           VERSION="${{ env.VERSION }}"
-          # Build .app bundle
           APP="Tune Server.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources/web"
           cp target/${{ matrix.target }}/release/tune-server "$APP/Contents/Resources/"
           cp -r web/* "$APP/Contents/Resources/web/"
-          cat > "$APP/Contents/MacOS/Tune Server" << 'LAUNCHER'
-          #!/bin/bash
-          DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
-          export TUNE_WEB_DIR="$DIR/web"
-          export TUNE_PORT="${TUNE_PORT:-8888}"
-          export TUNE_OPEN_BROWSER=1
-          exec "$DIR/tune-server"
-          LAUNCHER
-          chmod +x "$APP/Contents/MacOS/Tune Server"
+          # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
+          cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
+          on run
+            set appPath to (path to me as text)
+            set posixApp to POSIX path of appPath
+            set resDir to posixApp & "Contents/Resources/"
+            set serverBin to quoted form of (resDir & "tune-server")
+            set webDir to quoted form of (resDir & "web")
+            set logFile to (POSIX path of (path to home folder)) & "Library/Logs/tune-server.log"
+            do shell script "export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=8888; " & serverBin & " >> " & quoted form of logFile & " 2>&1 &"
+            delay 1
+            open location "http://localhost:8888"
+          end run
+          ASCRIPT
+          osacompile -o "$APP/Contents/MacOS/Tune Server.app" /tmp/tune-launcher.applescript
+          # Move the compiled applet contents into our app structure
+          mv "$APP/Contents/MacOS/Tune Server.app/Contents/MacOS/applet" "$APP/Contents/MacOS/Tune Server"
+          mv "$APP/Contents/MacOS/Tune Server.app/Contents/Resources/Scripts" "$APP/Contents/Resources/Scripts"
+          rm -rf "$APP/Contents/MacOS/Tune Server.app"
           cat > "$APP/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -255,19 +264,18 @@ jobs:
             <key>CFBundleVersion</key><string>${VERSION}</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleExecutable</key><string>Tune Server</string>
-            <key>CFBundlePackagetype</key><string>APPL</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
+            <key>NSAppleScriptEnabled</key><true/>
           </dict>
           </plist>
           PLIST
-          # Codesign the bundle
           if [ -n "$APPLE_TEAM_ID" ]; then
             IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
             codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             codesign --force --options runtime --sign "$IDENTITY" "$APP"
           fi
-          # Build DMG with Applications symlink for drag-and-drop
           DMG_DIR="dmg-staging"
           mkdir -p "$DMG_DIR"
           cp -R "$APP" "$DMG_DIR/"
