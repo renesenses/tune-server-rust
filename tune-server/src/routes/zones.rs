@@ -1069,6 +1069,10 @@ async fn create_group(
     settings
         .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
+    state.event_bus.emit_typed(
+        tune_core::event_types::EventType::GroupCreated,
+        json!({ "id": id, "name": body.name, "zone_ids": body.zone_ids }),
+    );
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))).into_response())
 }
 
@@ -1112,6 +1116,10 @@ async fn patch_group(
             settings
                 .set("zone_groups", &serde_json::to_string(&groups)?)
                 .ok();
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::GroupUpdated,
+                json!({ "id": group_id, "group": result }),
+            );
             Ok(Json(result).into_response())
         }
         None => Ok(StatusCode::NOT_FOUND.into_response()),
@@ -1289,6 +1297,10 @@ async fn delete_group(
     settings
         .set("zone_groups", &serde_json::to_string(&groups)?)
         .ok();
+    state.event_bus.emit_typed(
+        tune_core::event_types::EventType::GroupDeleted,
+        json!({ "id": group_id }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
