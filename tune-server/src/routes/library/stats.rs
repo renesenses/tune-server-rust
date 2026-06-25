@@ -22,8 +22,8 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
          (SELECT COUNT(*) FROM albums), \
          (SELECT COUNT(*) FROM tracks), \
          (SELECT COUNT(*) FROM zones), \
-         COALESCE((SELECT SUM({dur_col}) FROM tracks), 0), \
-         COALESCE((SELECT SUM({size_col}) FROM tracks WHERE file_size IS NOT NULL), 0)"
+         COALESCE(CAST((SELECT SUM({dur_col}) FROM tracks) AS bigint), 0), \
+         COALESCE(CAST((SELECT SUM({size_col}) FROM tracks WHERE file_size IS NOT NULL) AS bigint), 0)"
     );
     let row = b
         .query_one(&sql, &[])
