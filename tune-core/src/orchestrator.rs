@@ -323,7 +323,7 @@ impl PlaybackOrchestrator {
                 bit_depth: resolved.bit_depth,
                 channels: resolved.channels,
             };
-            let result = self.send_to_output(device_id, &media).await;
+            let result = self.send_to_output(device_id, &media, req.seek_ms).await;
 
             // After play_media succeeds, send the zone's stored volume to the
             // renderer — but ONLY if the user has explicitly set a volume
@@ -2268,10 +2268,14 @@ impl PlaybackOrchestrator {
         &self,
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
+        start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         let device_name = device_id.strip_prefix("local:").unwrap_or(device_id);
         info!(device_id, "output_not_found_recreating_local_output");
         let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
+        if let Some(position_ms) = start_position_ms {
+            local_out.set_pending_start_position_ms(position_ms);
+        }
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -2301,6 +2305,7 @@ impl PlaybackOrchestrator {
         &self,
         device_id: &str,
         _media: &crate::outputs::traits::PlayMedia<'_>,
+        _start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         (false, Some(format!("Device not found: {device_id}")))
     }
@@ -2309,6 +2314,7 @@ impl PlaybackOrchestrator {
         &self,
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
+        start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
@@ -2330,6 +2336,19 @@ impl PlaybackOrchestrator {
             }
         };
         if let Some(output_arc) = output_arc {
+            // For local outputs, set the pending start position before play
+            if let Some(position_ms) = start_position_ms {
+                if device_id.starts_with("local:") {
+                    let output = output_arc.lock().await;
+                    if let Some(local_output) = output
+                        .as_any()
+                        .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    {
+                        local_output.set_pending_start_position_ms(position_ms);
+                    }
+                    drop(output);
+                }
+            }
             let output = output_arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
@@ -2344,7 +2363,8 @@ impl PlaybackOrchestrator {
                 }
             }
         } else if device_id.starts_with("local:") {
-            self.recreate_local_and_play(device_id, media).await
+            self.recreate_local_and_play(device_id, media, start_position_ms)
+                .await
         } else {
             warn!(device_id, "output_not_found");
             (

@@ -478,6 +478,9 @@ pub struct LocalOutput {
     /// Offset added to position_ms when stream was seeked (the decoded stream
     /// starts at byte 0 but represents audio from seek_offset_ms onward).
     seek_offset_ms: Arc<AtomicU64>,
+    /// One-shot start position supplied by play_media() for recreated seek
+    /// streams. play_url() consumes this after stop() clears the old state.
+    pending_start_position_ms: AtomicU64,
     /// Track duration in milliseconds
     duration_ms: Arc<AtomicU64>,
     current_uri: Arc<std::sync::Mutex<Option<String>>>,
@@ -549,6 +552,7 @@ impl LocalOutput {
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             seek_offset_ms: Arc::new(AtomicU64::new(0)),
+            pending_start_position_ms: AtomicU64::new(0),
             duration_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(std::sync::Mutex::new(None)),
             track_title: Arc::new(std::sync::Mutex::new(None)),
@@ -568,6 +572,11 @@ impl LocalOutput {
     /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
     pub fn supports_exclusive_mode() -> bool {
         cfg!(target_os = "macos") || cfg!(all(target_os = "windows", feature = "asio"))
+    }
+
+    pub fn set_pending_start_position_ms(&self, position_ms: u64) {
+        self.pending_start_position_ms
+            .store(position_ms, Ordering::SeqCst);
     }
 }
 
@@ -987,6 +996,13 @@ impl OutputTarget for LocalOutput {
         artist: Option<&str>,
     ) -> Result<(), String> {
         self.stop().await.ok();
+
+        // Restore seek position after stop() cleared the old state.
+        let start_position_ms = self.pending_start_position_ms.swap(0, Ordering::SeqCst);
+        self.seek_offset_ms
+            .store(start_position_ms, Ordering::SeqCst);
+        self.position_ms.store(start_position_ms, Ordering::SeqCst);
+
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
 

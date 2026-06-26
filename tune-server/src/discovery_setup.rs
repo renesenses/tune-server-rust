@@ -194,6 +194,18 @@ async fn handle_ssdp_discovered(
             }),
         );
     } else if !is_tv {
+        // Check zone_auto_create setting
+        let auto_create = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get("zone_auto_create")
+            .ok()
+            .flatten()
+            .map(|v| v != "false")
+            .unwrap_or(true);
+        if !auto_create {
+            info!(name = %dev.name, id = %dev.id, "ssdp_zone_auto_create_disabled_skipping");
+            return;
+        }
+
         // Premium gate: check zone limit before auto-creating
         let zone_count = zone_repo.count_online().unwrap_or(0);
         if !license.check_zone_limit(zone_count).await {
@@ -468,38 +480,52 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     set_zone_online(&event_bus, &db, &dev.id, true);
                                     info!(name = %dev.name, id = %dev.id, old_id = ?z.output_device_id, "mdns_zone_device_updated");
                                 } else {
-                                    // Premium gate: check zone limit before auto-creating
-                                    let zone_count = zone_repo.count_online().unwrap_or(0);
-                                    if !license.check_zone_limit(zone_count).await {
-                                        info!(
-                                            name = %dev.name,
-                                            zone_count,
-                                            "mdns_zone_creation_blocked_free_tier_limit"
-                                        );
+                                    // Check zone_auto_create setting
+                                    let auto_create =
+                                        tune_core::db::settings_repo::SettingsRepo::with_backend(
+                                            db.clone(),
+                                        )
+                                        .get("zone_auto_create")
+                                        .ok()
+                                        .flatten()
+                                        .map(|v| v != "false")
+                                        .unwrap_or(true);
+                                    if !auto_create {
+                                        info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
                                     } else {
-                                        match zone_repo.get_or_create(
-                                            &dev.name,
-                                            Some(output_type_str),
-                                            &dev.id,
-                                        ) {
-                                            Ok((zid, true)) => {
-                                                event_bus.emit_typed(
-                                                    EventType::ZoneCreated,
-                                                    serde_json::json!({
-                                                        "zone_id": zid,
-                                                        "name": dev.name,
-                                                        "device_id": dev.id,
-                                                        "type": output_type_str,
-                                                    }),
-                                                );
-                                                info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
-                                            }
-                                            Ok((zid, false)) => {
-                                                set_zone_online(&event_bus, &db, &dev.id, true);
-                                                info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                        // Premium gate: check zone limit before auto-creating
+                                        let zone_count = zone_repo.count_online().unwrap_or(0);
+                                        if !license.check_zone_limit(zone_count).await {
+                                            info!(
+                                                name = %dev.name,
+                                                zone_count,
+                                                "mdns_zone_creation_blocked_free_tier_limit"
+                                            );
+                                        } else {
+                                            match zone_repo.get_or_create(
+                                                &dev.name,
+                                                Some(output_type_str),
+                                                &dev.id,
+                                            ) {
+                                                Ok((zid, true)) => {
+                                                    event_bus.emit_typed(
+                                                        EventType::ZoneCreated,
+                                                        serde_json::json!({
+                                                            "zone_id": zid,
+                                                            "name": dev.name,
+                                                            "device_id": dev.id,
+                                                            "type": output_type_str,
+                                                        }),
+                                                    );
+                                                    info!(name = %dev.name, zone_id = zid, r#type = output_type_str, "mdns_zone_auto_created");
+                                                }
+                                                Ok((zid, false)) => {
+                                                    set_zone_online(&event_bus, &db, &dev.id, true);
+                                                    info!(name = %dev.name, zone_id = zid, "mdns_zone_already_existed");
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(name = %dev.name, device = %dev.id, error = %e, "mdns_zone_create_failed");
+                                                }
                                             }
                                         }
                                     }
