@@ -53,6 +53,7 @@ pub enum Feature {
     PluginMarketplace,
     MultiServer,
     DacCalibration,
+    BatchConverter,
 }
 
 impl Feature {
@@ -81,6 +82,7 @@ impl Feature {
             Feature::PluginMarketplace,
             Feature::MultiServer,
             Feature::DacCalibration,
+            Feature::BatchConverter,
         ]
     }
 
@@ -109,6 +111,7 @@ impl Feature {
             Feature::PluginMarketplace => "Plugin Marketplace",
             Feature::MultiServer => "Multi-Server",
             Feature::DacCalibration => "DAC Calibration",
+            Feature::BatchConverter => "Batch Audio Converter",
         }
     }
 }

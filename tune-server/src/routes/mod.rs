@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod cd_rip;
 pub mod cloud;
 pub mod connect;
+pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod deezer_proxy_handler;
@@ -314,6 +315,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/mqa", mqa::router())
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
+        .nest("/converter", converter::router())
         .nest("/shazam", shazam::router())
         .nest("/social", social::router())
         .nest("/home", home::router())
