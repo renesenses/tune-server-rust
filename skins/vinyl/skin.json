@@ -1,0 +1,12 @@
+{
+  "id": "vinyl",
+  "name": "Vinyl Player",
+  "version": "1.0.0",
+  "author": "Mozaik Labs",
+  "description": "Platine vinyle animée — Now Playing immersif inspiré des tourne-disques classiques",
+  "framework": "vanilla",
+  "api_version": "1",
+  "entry": "index.html",
+  "premium": false,
+  "tags": ["official", "now-playing", "vinyl", "animated"]
+}
