@@ -2670,7 +2670,9 @@ impl PlaybackOrchestrator {
         let Some(did) = device_id else { return };
         let output_type = {
             let outputs = self.outputs.lock().await;
-            let Some(output) = outputs.get(did) else { return };
+            let Some(output) = outputs.get(did) else {
+                return;
+            };
             let out = output.lock().await;
             let t = out.output_type().to_string();
             if let Err(e) = out.resume().await {

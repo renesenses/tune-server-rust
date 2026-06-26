@@ -64,7 +64,8 @@ impl Feature {
             Feature::MultiroomSync,
             Feature::DspEq,
             Feature::CloudRelay,
-            Feature::OaatProtocol,
+            // OAAT is free — open-source protocol, core feature
+            // Feature::OaatProtocol,
             Feature::CloudBackup,
             Feature::SyncedLyrics,
             Feature::ListeningStats,

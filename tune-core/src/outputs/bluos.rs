@@ -64,7 +64,19 @@ impl OutputTarget for BluosOutput {
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // BluOS expects the url parameter without re-encoding — .query()
         // would double-encode http:// in the stream URL, causing silent failure.
-        let play_url = format!("{}/Play?url={}", self.base_url(), media.url);
+        let mut play_url = format!("{}/Play?url={}", self.base_url(), media.url);
+        if let Some(t) = media.title {
+            play_url.push_str(&format!("&title={}", urlencoding::encode(t)));
+        }
+        if let Some(a) = media.artist {
+            play_url.push_str(&format!("&artist={}", urlencoding::encode(a)));
+        }
+        if let Some(al) = media.album {
+            play_url.push_str(&format!("&album={}", urlencoding::encode(al)));
+        }
+        if let Some(img) = media.cover_url {
+            play_url.push_str(&format!("&image={}", urlencoding::encode(img)));
+        }
         self.client
             .get(&play_url)
             .send()
@@ -172,7 +184,19 @@ impl OutputTarget for BluosOutput {
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // BluOS /Add?prepend=1 queues the next track for gapless playback.
         // Raw URL construction (no .query()) to avoid double-encoding, same as play_media.
-        let add_url = format!("{}/Add?url={}&prepend=1", self.base_url(), media.url);
+        let mut add_url = format!("{}/Add?url={}&prepend=1", self.base_url(), media.url);
+        if let Some(t) = media.title {
+            add_url.push_str(&format!("&title={}", urlencoding::encode(t)));
+        }
+        if let Some(a) = media.artist {
+            add_url.push_str(&format!("&artist={}", urlencoding::encode(a)));
+        }
+        if let Some(al) = media.album {
+            add_url.push_str(&format!("&album={}", urlencoding::encode(al)));
+        }
+        if let Some(img) = media.cover_url {
+            add_url.push_str(&format!("&image={}", urlencoding::encode(img)));
+        }
         self.client
             .get(&add_url)
             .send()

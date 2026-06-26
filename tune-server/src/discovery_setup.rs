@@ -344,17 +344,6 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                         }
                         #[cfg(feature = "oaat")]
                         OutputType::Oaat => {
-                            // Premium gate: OAAT Protocol requires Premium
-                            if !license
-                                .check_feature(tune_core::license::Feature::OaatProtocol)
-                                .await
-                            {
-                                info!(
-                                    name = %dev.name,
-                                    "oaat_zone_blocked_premium_required"
-                                );
-                                continue;
-                            }
                             let oaat = tune_core::outputs::oaat::OaatOutput::new(
                                 dev.name.clone(),
                                 dev.host.clone(),
