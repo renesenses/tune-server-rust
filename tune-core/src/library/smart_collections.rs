@@ -117,6 +117,8 @@ fn field_to_column(field: &str) -> &str {
         "format" => "t.format",
         "composer" => "t.composer",
         "bpm" => "t.bpm",
+        "label" => "t.label",
+        "album_label" => "al.label",
         _ => "t.title",
     }
 }
@@ -124,8 +126,14 @@ fn field_to_column(field: &str) -> &str {
 fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
     let col = field_to_column(&rule.field);
     match rule.operator {
-        Operator::Equals => (format!("{col} = ?"), vec![rule.value.clone()]),
-        Operator::NotEquals => (format!("{col} != ?"), vec![rule.value.clone()]),
+        Operator::Equals => (
+            format!("{col} = ? COLLATE NOCASE"),
+            vec![rule.value.clone()],
+        ),
+        Operator::NotEquals => (
+            format!("{col} != ? COLLATE NOCASE"),
+            vec![rule.value.clone()],
+        ),
         Operator::Contains => (
             format!("{col} LIKE ? COLLATE NOCASE"),
             vec![format!("%{}%", rule.value)],

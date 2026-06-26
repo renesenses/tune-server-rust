@@ -557,6 +557,11 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
         name: "add_profile_id_to_history_and_ratings",
         up: "",
     },
+    Migration {
+        version: 46,
+        name: "autoplay_default_off",
+        up: "UPDATE zones SET autoplay_enabled = 0 WHERE autoplay_enabled = 1;",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -843,7 +848,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
         }
         if migration.version == 36 {
-            add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
+            add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
         }
         if migration.version == 37 {
             add_column_if_missing(db, "listen_history", "source_id", "TEXT");
@@ -893,7 +898,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "dsp_preset_id", "INTEGER");
     add_column_if_missing(db, "zones", "dsp_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
-    add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 1");
+    add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");

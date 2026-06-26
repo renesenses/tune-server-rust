@@ -12,11 +12,9 @@ pub mod sql {
 
     // NOTE: autoplay_enabled intentionally omitted from COLS.
     // The column is added by migration v36, but on Windows the migration
-    // can fail silently (file locking).  COALESCE(autoplay_enabled, 1)
-    // still crashes with "no such column" when the column doesn't exist.
-    // row_to_zone reads cols.get(16) → None → defaults to true, which is
-    // the correct fallback.  The separate get_autoplay_enabled() method
-    // handles reading the actual value safely.
+    // can fail silently (file locking).  row_to_zone reads cols.get(16) →
+    // None → defaults to false (autoplay off).  The separate
+    // get_autoplay_enabled() method handles reading the actual value safely.
     const COLS: &str = "id, name, output_type, output_device_id, volume, muted, online, gapless_enabled, group_id, sync_delay_ms, last_position_ms, last_track_id, last_track_source, last_track_source_id, max_sample_rate, fixed_volume";
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -562,7 +560,7 @@ fn row_to_zone(cols: &Vec<SqlValue>) -> Zone {
         last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
         max_sample_rate: cols.get(14).and_then(|v| v.as_i64()).map(|v| v as u32),
         fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
-        autoplay_enabled: cols.get(16).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
+        autoplay_enabled: cols.get(16).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }
 

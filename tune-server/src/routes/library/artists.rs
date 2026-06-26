@@ -359,5 +359,30 @@ pub(super) async fn update_artist(
             .into_response();
     }
 
+    if body.name.is_some() {
+        let db = state.backend.clone();
+        let new_name = artist.name.clone();
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::engine::Engine;
+        let p1 = if db.engine() == Engine::Postgres {
+            "$1"
+        } else {
+            "?1"
+        };
+        let p2 = if db.engine() == Engine::Postgres {
+            "$2"
+        } else {
+            "?2"
+        };
+        let _ = db.execute(
+            &format!("UPDATE tracks SET artist_name = {p1} WHERE artist_id = {p2}"),
+            &[&new_name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        );
+        let _ = db.execute(
+            &format!("UPDATE albums SET artist_name = {p1} WHERE artist_id = {p2}"),
+            &[&new_name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        );
+    }
+
     Json(json!(artist)).into_response()
 }
