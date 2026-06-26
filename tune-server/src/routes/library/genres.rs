@@ -103,7 +103,8 @@ pub(super) async fn update_genre_tree(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    settings.set("genre_tree", &body.to_string()).ok();
+    let tree_val = body.get("tree").unwrap_or(&body);
+    settings.set("genre_tree", &tree_val.to_string()).ok();
     Json(json!({"updated": true}))
 }
 
