@@ -33,8 +33,42 @@ pub enum SortOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub field: String,
+    #[serde(alias = "op", deserialize_with = "deserialize_operator")]
     pub operator: Operator,
     pub value: String,
+}
+
+fn deserialize_operator<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Operator, D::Error> {
+    let s: String = serde::Deserialize::deserialize(d)?;
+    match s.as_str() {
+        "=" | "equals" => Ok(Operator::Equals),
+        "!=" | "not_equals" => Ok(Operator::NotEquals),
+        "contains" | "like" => Ok(Operator::Contains),
+        "not_contains" => Ok(Operator::NotContains),
+        "starts_with" | "^" => Ok(Operator::StartsWith),
+        "ends_with" | "$" => Ok(Operator::EndsWith),
+        ">" | "greater_than" | "gt" => Ok(Operator::GreaterThan),
+        "<" | "less_than" | "lt" => Ok(Operator::LessThan),
+        "between" => Ok(Operator::Between),
+        "is_empty" | "empty" => Ok(Operator::IsEmpty),
+        "is_not_empty" | "not_empty" => Ok(Operator::IsNotEmpty),
+        _ => Err(serde::de::Error::unknown_variant(
+            &s,
+            &[
+                "=",
+                "!=",
+                "contains",
+                "not_contains",
+                "starts_with",
+                "ends_with",
+                ">",
+                "<",
+                "between",
+                "is_empty",
+                "is_not_empty",
+            ],
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
