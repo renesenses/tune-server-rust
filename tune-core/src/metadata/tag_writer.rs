@@ -114,6 +114,41 @@ fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, 
         tag.set_comment(v.clone());
         count += 1;
     }
+    if let Some(ref v) = update.composer {
+        tag.insert(lofty::tag::TagItem::new(
+            ItemKey::Composer,
+            lofty::tag::ItemValue::Text(v.clone()),
+        ));
+        count += 1;
+    }
+    if let Some(ref v) = update.label {
+        tag.insert(lofty::tag::TagItem::new(
+            ItemKey::Label,
+            lofty::tag::ItemValue::Text(v.clone()),
+        ));
+        count += 1;
+    }
+    if let Some(ref v) = update.isrc {
+        tag.insert(lofty::tag::TagItem::new(
+            ItemKey::Isrc,
+            lofty::tag::ItemValue::Text(v.clone()),
+        ));
+        count += 1;
+    }
+    if let Some(v) = update.bpm {
+        tag.insert(lofty::tag::TagItem::new(
+            ItemKey::Bpm,
+            lofty::tag::ItemValue::Text(v.to_string()),
+        ));
+        count += 1;
+    }
+    if let Some(ref v) = update.lyrics {
+        tag.insert(lofty::tag::TagItem::new(
+            ItemKey::Lyrics,
+            lofty::tag::ItemValue::Text(v.clone()),
+        ));
+        count += 1;
+    }
 
     if count == 0 {
         return Ok(WriteResult {

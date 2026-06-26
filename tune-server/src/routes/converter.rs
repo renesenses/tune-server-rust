@@ -1037,16 +1037,44 @@ fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
         dst_tag.set_disk(v);
     }
 
-    // Copy additional items (composer, ISRC, year, etc.)
+    // Copy additional items
     for key in [
         ItemKey::Composer,
+        ItemKey::Conductor,
+        ItemKey::Lyricist,
+        ItemKey::Performer,
+        ItemKey::Remixer,
+        ItemKey::Producer,
         ItemKey::Isrc,
         ItemKey::Label,
+        ItemKey::CatalogNumber,
+        ItemKey::Barcode,
         ItemKey::Comment,
         ItemKey::AlbumArtist,
+        ItemKey::AlbumArtistSortOrder,
+        ItemKey::TrackArtistSortOrder,
+        ItemKey::AlbumTitleSortOrder,
         ItemKey::Year,
+        ItemKey::ReleaseDate,
+        ItemKey::OriginalReleaseDate,
+        ItemKey::Bpm,
+        ItemKey::Mood,
+        ItemKey::ContentGroup,
+        ItemKey::CopyrightMessage,
+        ItemKey::Language,
+        ItemKey::EncodedBy,
+        ItemKey::FlagCompilation,
+        ItemKey::Lyrics,
         ItemKey::MusicBrainzRecordingId,
         ItemKey::MusicBrainzReleaseId,
+        ItemKey::MusicBrainzArtistId,
+        ItemKey::MusicBrainzReleaseArtistId,
+        ItemKey::MusicBrainzReleaseGroupId,
+        ItemKey::MusicBrainzWorkId,
+        ItemKey::ReplayGainTrackGain,
+        ItemKey::ReplayGainTrackPeak,
+        ItemKey::ReplayGainAlbumGain,
+        ItemKey::ReplayGainAlbumPeak,
     ] {
         if let Some(item) = src_tag.get(key.clone()) {
             dst_tag.push(item.clone());
