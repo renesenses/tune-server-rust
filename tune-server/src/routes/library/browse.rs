@@ -131,7 +131,7 @@ pub(super) async fn browse_directory(
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
                WHERE t.file_path LIKE $1 \
-               ORDER BY t.disc_number, t.track_number, t.title";
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title";
     let rows = state
         .backend
         .query_many(

@@ -100,7 +100,7 @@ pub mod sql {
 
     pub fn list_by_album<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.album_id = {} ORDER BY t.disc_number, t.track_number, t.title",
+            "{} WHERE t.album_id = {} ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
             select_track(),
             d.placeholder(1)
         )
@@ -108,7 +108,7 @@ pub mod sql {
 
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, t.disc_number, t.track_number",
+            "{} WHERE t.artist_id = {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
             d.placeholder(1)
         )
@@ -413,7 +413,7 @@ impl TrackRepo {
 
     pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
-            "{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT {} OFFSET {}",
+            "{} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
             match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(1),
@@ -544,7 +544,7 @@ impl TrackRepo {
         let limit_ph = make_ph(idx);
         let offset_ph = make_ph(idx + 1);
         let data_sql = format!(
-            "{}{} ORDER BY LOWER(ar.name), LOWER(al.title), t.disc_number, t.track_number LIMIT {} OFFSET {}",
+            "{}{} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
             where_clause,
             limit_ph,
