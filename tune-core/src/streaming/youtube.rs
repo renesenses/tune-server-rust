@@ -22,6 +22,23 @@ const STREAM_URL_TTL_SECS: u64 = 18_000;
 // yt-dlp subprocess timeout
 const YTDLP_TIMEOUT_SECS: u64 = 30;
 
+// ---------------------------------------------------------------------------
+// Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
+// ---------------------------------------------------------------------------
+
+const GOOGLE_CLIENT_ID: &str =
+    "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
+const GOOGLE_CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
+const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+
+/// YouTube Music API key for authenticated WEB_REMIX client requests.
+const YTM_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
+
+/// Refresh the access token when less than this many seconds until expiry.
+const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+
 /// YouTube Music context body for internal API calls.
 /// This mimics the web client request format that YouTube Music expects.
 fn ytm_context() -> serde_json::Value {
@@ -72,6 +89,16 @@ fn ytm_android_context() -> serde_json::Value {
     })
 }
 
+/// Pending Google OAuth Device Code flow state.
+struct PendingDeviceAuth {
+    device_code: String,
+    user_code: String,
+    verification_url: String,
+    #[allow(dead_code)]
+    interval: u64,
+    expires_at: Instant,
+}
+
 /// Cached stream URL entry.
 #[derive(Clone)]
 struct CachedUrl {
@@ -119,18 +146,20 @@ struct BrowseCacheEntry {
     created: Instant,
 }
 
-/// YouTube Music streaming service — works without authentication.
+/// YouTube Music streaming service with optional Google OAuth.
 ///
 /// Uses the YouTube Music internal API (`music.youtube.com/youtubei/v1`) for
 /// search, browse, album/artist/playlist metadata. Uses `yt-dlp` as a
 /// subprocess to extract audio stream URLs for DLNA playback.
 ///
+/// Search and browse work without authentication. Playback via the native
+/// `/player` API requires Google OAuth (Device Code flow). Without OAuth,
+/// playback falls back to `yt-dlp`.
+///
 /// Optional: YouTube Data API v3 with an API key (`TUNE_YOUTUBE_API_KEY`)
 /// provides higher quota and more reliable video metadata.
 pub struct YouTubeService {
     client: Client,
-    /// Always true — YouTube works without auth for search/playback.
-    authenticated: bool,
     url_cache: Mutex<UrlCache>,
     /// General-purpose browse/home cache (30 min TTL).
     browse_cache: Mutex<HashMap<String, BrowseCacheEntry>>,
@@ -138,6 +167,17 @@ pub struct YouTubeService {
     /// Optional YouTube Data API v3 key for higher quota.
     api_key: Option<String>,
     enabled_override: Option<bool>,
+
+    // -- OAuth state ----------------------------------------------------------
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    /// In-memory expiry tracker (not persisted; on restore we refresh eagerly).
+    token_expires: Option<Instant>,
+    /// Google account email, fetched after successful auth.
+    email: Option<String>,
+    /// Active Device Code flow waiting for user approval.
+    pending_device_auth: Option<PendingDeviceAuth>,
+    device_auth_started: Option<Instant>,
 }
 
 impl Default for YouTubeService {
@@ -159,12 +199,18 @@ impl YouTubeService {
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            authenticated: true, // YouTube works without auth
             url_cache: Mutex::new(UrlCache::new(STREAM_URL_TTL_SECS)),
             browse_cache: Mutex::new(HashMap::new()),
             browse_cache_ttl: Duration::from_secs(1800), // 30 minutes
             api_key,
             enabled_override: None,
+            // OAuth — not authenticated until user completes Device Code flow
+            access_token: None,
+            refresh_token: None,
+            token_expires: None,
+            email: None,
+            pending_device_auth: None,
+            device_auth_started: None,
         }
     }
 
@@ -173,20 +219,33 @@ impl YouTubeService {
     // ------------------------------------------------------------------
 
     /// POST to the YouTube Music internal API.
+    /// When the user is OAuth-authenticated, the access token is attached so
+    /// that browse/search can return personalised results and the user's
+    /// library.
     async fn ytm_post(
         &self,
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
+        let url = if self.access_token.is_some() {
+            format!("{YTM_API_BASE}/{endpoint}?key={YTM_API_KEY}&prettyPrint=false")
+        } else {
+            format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false")
+        };
 
-        let resp = self
+        let mut req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Origin", "https://music.youtube.com")
             .header("Referer", "https://music.youtube.com/")
-            .header("X-Goog-Visitor-Id", "")
+            .header("X-Goog-Visitor-Id", "");
+
+        if let Some(ref token) = self.access_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -275,31 +334,57 @@ impl YouTubeService {
 
     /// Extract audio stream URL natively via the YouTube Music `/player` API.
     ///
-    /// Uses the Android Music client context which returns direct audio URLs
-    /// without requiring JavaScript signature deciphering. This is the primary
-    /// extraction method — no external binary dependency.
+    /// When OAuth-authenticated, uses the WEB_REMIX client with a Bearer token
+    /// — this returns direct audio URLs without cipher. Without auth, falls
+    /// back to the Android Music client (may return LOGIN_REQUIRED).
     async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
-        let body = json!({
-            "videoId": track_id,
-            "context": ytm_android_context(),
-            "playbackContext": {
-                "contentPlaybackContext": {
-                    "signatureTimestamp": 20073
-                }
-            }
-        });
+        let has_auth = self.access_token.is_some();
 
-        let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
-        let resp = self
+        let body = if has_auth {
+            json!({
+                "videoId": track_id,
+                "context": ytm_context(),
+                "playbackContext": {
+                    "contentPlaybackContext": {
+                        "signatureTimestamp": 20073
+                    }
+                }
+            })
+        } else {
+            json!({
+                "videoId": track_id,
+                "context": ytm_android_context(),
+                "playbackContext": {
+                    "contentPlaybackContext": {
+                        "signatureTimestamp": 20073
+                    }
+                }
+            })
+        };
+
+        let url = if has_auth {
+            format!("{YTM_API_BASE}/player?key={YTM_API_KEY}&prettyPrint=false")
+        } else {
+            format!("{YTM_API_BASE}/player?prettyPrint=false")
+        };
+
+        let mut req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/")
-            .header(
+            .header("Referer", "https://music.youtube.com/");
+
+        if let Some(ref token) = self.access_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        } else {
+            req = req.header(
                 "User-Agent",
                 "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
-            )
+            );
+        }
+
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -500,6 +585,272 @@ impl YouTubeService {
                 created: Instant::now(),
             },
         );
+    }
+
+    // ------------------------------------------------------------------
+    // OAuth — Device Code Flow
+    // ------------------------------------------------------------------
+
+    /// Start Google OAuth Device Code flow.
+    async fn start_device_code_flow(&mut self) -> Result<AuthStatus, TuneError> {
+        let resp = self
+            .client
+            .post(GOOGLE_DEVICE_CODE_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!("client_id={GOOGLE_CLIENT_ID}&scope={GOOGLE_SCOPE}"))
+            .send()
+            .await
+            .map_err(|e| {
+                TuneError::Streaming(format!("youtube device code request failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(TuneError::Streaming(format!(
+                "youtube device code request returned {status}: {body}"
+            )));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("device code json parse: {e}")))?;
+
+        let device_code = data["device_code"]
+            .as_str()
+            .ok_or_else(|| TuneError::Streaming("missing device_code in response".into()))?
+            .to_string();
+        let user_code = data["user_code"]
+            .as_str()
+            .ok_or_else(|| TuneError::Streaming("missing user_code in response".into()))?
+            .to_string();
+        let verification_url = data["verification_url"]
+            .as_str()
+            .unwrap_or("https://www.google.com/device")
+            .to_string();
+        let expires_in = data["expires_in"].as_u64().unwrap_or(1800);
+        let interval = data["interval"].as_u64().unwrap_or(5);
+
+        info!(user_code = %user_code, url = %verification_url, "youtube_device_code_started");
+
+        self.pending_device_auth = Some(PendingDeviceAuth {
+            device_code,
+            user_code: user_code.clone(),
+            verification_url: verification_url.clone(),
+            interval,
+            expires_at: Instant::now() + Duration::from_secs(expires_in),
+        });
+        self.device_auth_started = Some(Instant::now());
+
+        Ok(AuthStatus {
+            authenticated: false,
+            verification_url: Some(verification_url),
+            user_code: Some(user_code),
+            ..Default::default()
+        })
+    }
+
+    /// Poll Google OAuth for token (during Device Code flow).
+    async fn poll_device_code(&mut self) -> Result<AuthStatus, TuneError> {
+        let pending = self.pending_device_auth.as_ref().ok_or_else(|| {
+            TuneError::Streaming("no pending YouTube device auth — start auth first".into())
+        })?;
+
+        if Instant::now() > pending.expires_at {
+            self.pending_device_auth = None;
+            self.device_auth_started = None;
+            return Err(TuneError::Streaming(
+                "device code expired — please restart authentication".into(),
+            ));
+        }
+
+        let device_code = pending.device_code.clone();
+
+        let resp = self
+            .client
+            .post(GOOGLE_TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!(
+                "client_id={GOOGLE_CLIENT_ID}\
+                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                 &device_code={device_code}\
+                 &grant_type=urn:ietf:params:oauth:grant_type:device_code"
+            ))
+            .send()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("youtube token poll request failed: {e}")))?;
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("token poll json parse: {e}")))?;
+
+        // Check for error responses (user hasn't approved yet, etc.)
+        if let Some(error) = data["error"].as_str() {
+            return match error {
+                "authorization_pending" => {
+                    // User hasn't authorized yet — keep polling
+                    Ok(AuthStatus {
+                        authenticated: false,
+                        verification_url: self
+                            .pending_device_auth
+                            .as_ref()
+                            .map(|p| p.verification_url.clone()),
+                        user_code: self
+                            .pending_device_auth
+                            .as_ref()
+                            .map(|p| p.user_code.clone()),
+                        ..Default::default()
+                    })
+                }
+                "slow_down" => Ok(AuthStatus {
+                    authenticated: false,
+                    ..Default::default()
+                }),
+                "access_denied" | "expired_token" => {
+                    self.pending_device_auth = None;
+                    self.device_auth_started = None;
+                    Err(TuneError::Streaming(format!(
+                        "youtube authentication {error}"
+                    )))
+                }
+                _ => {
+                    let desc = data["error_description"].as_str().unwrap_or(error);
+                    Err(TuneError::Streaming(format!("youtube oauth error: {desc}")))
+                }
+            };
+        }
+
+        // Success — we got tokens
+        let access_token = data["access_token"]
+            .as_str()
+            .ok_or_else(|| TuneError::Streaming("missing access_token in response".into()))?
+            .to_string();
+        let refresh_token = data["refresh_token"].as_str().map(String::from);
+        let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+
+        self.access_token = Some(access_token);
+        self.refresh_token = refresh_token;
+        self.token_expires = Some(Instant::now() + Duration::from_secs(expires_in));
+        self.pending_device_auth = None;
+        self.device_auth_started = None;
+
+        // Fetch the user's email for display
+        self.fetch_user_info().await;
+
+        info!(email = ?self.email, "youtube_oauth_authenticated");
+
+        Ok(AuthStatus {
+            authenticated: true,
+            username: self.email.clone(),
+            subscription: Some("YouTube Music".into()),
+            ..Default::default()
+        })
+    }
+
+    /// Refresh the access token using the stored refresh token.
+    async fn do_refresh_token(&mut self) -> Result<bool, TuneError> {
+        let refresh_token = match &self.refresh_token {
+            Some(rt) => rt.clone(),
+            None => return Ok(false),
+        };
+
+        info!("youtube_refreshing_access_token");
+
+        let resp = self
+            .client
+            .post(GOOGLE_TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(format!(
+                "client_id={GOOGLE_CLIENT_ID}\
+                 &client_secret={GOOGLE_CLIENT_SECRET}\
+                 &refresh_token={refresh_token}\
+                 &grant_type=refresh_token"
+            ))
+            .send()
+            .await
+            .map_err(|e| {
+                TuneError::Streaming(format!("youtube token refresh request failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(
+                status,
+                body = %body.chars().take(200).collect::<String>(),
+                "youtube_token_refresh_failed"
+            );
+            // 400/401 means the refresh token was revoked
+            if status == 400 || status == 401 {
+                self.access_token = None;
+                self.refresh_token = None;
+                self.token_expires = None;
+                self.email = None;
+            }
+            return Ok(false);
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| TuneError::Streaming(format!("token refresh json parse: {e}")))?;
+
+        if let Some(at) = data["access_token"].as_str() {
+            let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+            self.access_token = Some(at.to_string());
+            self.token_expires = Some(Instant::now() + Duration::from_secs(expires_in));
+            // Google sometimes returns a new refresh token
+            if let Some(rt) = data["refresh_token"].as_str() {
+                self.refresh_token = Some(rt.to_string());
+            }
+            info!("youtube_token_refreshed");
+            Ok(true)
+        } else {
+            warn!("youtube_refresh_response_missing_access_token");
+            Ok(false)
+        }
+    }
+
+    /// Fetch user info (email) from Google UserInfo API.
+    async fn fetch_user_info(&mut self) {
+        let Some(ref token) = self.access_token else {
+            return;
+        };
+        let resp = self
+            .client
+            .get("https://www.googleapis.com/oauth2/v3/userinfo")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        if let Ok(resp) = resp {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                self.email = data["email"].as_str().map(String::from);
+            }
+        }
+    }
+
+    /// True when we hold a non-expired access token.
+    fn is_authenticated(&self) -> bool {
+        match (&self.access_token, &self.token_expires) {
+            (Some(_), Some(exp)) => Instant::now() < *exp,
+            // Token restored from DB without expiry — assume valid until a 401.
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// True when the token will expire within the refresh margin.
+    fn token_needs_refresh(&self) -> bool {
+        match (&self.refresh_token, &self.token_expires) {
+            (Some(_), Some(exp)) => {
+                Instant::now() + Duration::from_secs(TOKEN_REFRESH_MARGIN_SECS) > *exp
+            }
+            // Restored tokens without expiry — force an eager refresh once.
+            (Some(_), None) if self.access_token.is_some() => true,
+            _ => false,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1817,33 +2168,84 @@ impl StreamingService for YouTubeService {
         self.enabled_override = Some(enabled);
     }
 
-    /// YouTube works without OAuth. Authenticate is a no-op that returns success.
-    /// In the future, Google OAuth could be added for user playlists/library.
+    /// Google OAuth Device Code flow state machine.
+    ///
+    /// - Empty body / `{"device_flow": true}` → start a new device code flow
+    ///   (returns `verification_url` + `user_code` for the user to visit).
+    /// - `{"poll": true}` → poll for the user's approval.
+    /// - Already authenticated → return current status.
     async fn authenticate(
         &mut self,
-        _credentials: &serde_json::Value,
+        credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError> {
-        self.authenticated = true;
-        info!("youtube_authenticated (no OAuth required)");
-        Ok(AuthStatus {
-            authenticated: true,
-            username: Some("YouTube Music".into()),
-            subscription: Some("Free".into()),
-            ..Default::default()
-        })
+        let is_poll = credentials["poll"].as_bool().unwrap_or(false);
+
+        // If we already have a valid token, just return success.
+        if self.is_authenticated() && !is_poll {
+            return Ok(AuthStatus {
+                authenticated: true,
+                username: self.email.clone(),
+                subscription: Some("YouTube Music".into()),
+                ..Default::default()
+            });
+        }
+
+        // Poll an in-progress device code flow.
+        if is_poll
+            || (self.pending_device_auth.is_some()
+                && !credentials["device_flow"].as_bool().unwrap_or(false))
+        {
+            if self.pending_device_auth.is_some() {
+                return self.poll_device_code().await;
+            }
+            // No pending flow — return unauthenticated
+            return Ok(AuthStatus {
+                authenticated: false,
+                ..Default::default()
+            });
+        }
+
+        // Start a new device code flow.
+        self.start_device_code_flow().await
     }
 
     async fn auth_status(&self) -> AuthStatus {
-        AuthStatus {
-            authenticated: self.authenticated,
-            username: Some("YouTube Music".into()),
-            subscription: Some("Free".into()),
-            ..Default::default()
+        if self.is_authenticated() {
+            AuthStatus {
+                authenticated: true,
+                username: self.email.clone(),
+                subscription: Some("YouTube Music".into()),
+                ..Default::default()
+            }
+        } else if self.pending_device_auth.is_some() {
+            AuthStatus {
+                authenticated: false,
+                verification_url: self
+                    .pending_device_auth
+                    .as_ref()
+                    .map(|p| p.verification_url.clone()),
+                user_code: self
+                    .pending_device_auth
+                    .as_ref()
+                    .map(|p| p.user_code.clone()),
+                ..Default::default()
+            }
+        } else {
+            AuthStatus {
+                authenticated: false,
+                ..Default::default()
+            }
         }
     }
 
     async fn logout(&mut self) -> Result<(), TuneError> {
-        // YouTube doesn't require logout — always authenticated
+        info!("youtube_logout");
+        self.access_token = None;
+        self.refresh_token = None;
+        self.token_expires = None;
+        self.email = None;
+        self.pending_device_auth = None;
+        self.device_auth_started = None;
         Ok(())
     }
 
@@ -2430,27 +2832,103 @@ impl StreamingService for YouTubeService {
     }
 
     // ------------------------------------------------------------------
-    // Token persistence (no-op for YouTube without OAuth)
+    // Token persistence
     // ------------------------------------------------------------------
 
     fn save_tokens(&self) -> Option<serde_json::Value> {
-        // No tokens to persist for unauthenticated YouTube access.
-        // When Google OAuth is added, this will store access/refresh tokens.
-        Some(json!({
-            "authenticated": true,
+        let mut obj = json!({
             "api_key_configured": self.api_key.is_some(),
-        }))
+        });
+
+        if let Some(ref at) = self.access_token {
+            obj["access_token"] = json!(at);
+        }
+        if let Some(ref rt) = self.refresh_token {
+            obj["refresh_token"] = json!(rt);
+        }
+        if let Some(ref email) = self.email {
+            obj["email"] = json!(email);
+        }
+
+        // Persist pending device code so a server restart doesn't lose the flow
+        if let Some(ref pending) = self.pending_device_auth {
+            if let Some(ref started) = self.device_auth_started {
+                let elapsed = started.elapsed().as_secs();
+                obj["pending_device_code"] = json!(pending.device_code);
+                obj["pending_user_code"] = json!(pending.user_code);
+                obj["pending_verification_url"] = json!(pending.verification_url);
+                obj["pending_interval"] = json!(pending.interval);
+                obj["pending_elapsed_secs"] = json!(elapsed);
+            }
+        }
+
+        Some(obj)
     }
 
     fn restore_tokens(&mut self, tokens: &serde_json::Value) -> bool {
-        // YouTube is always authenticated — just restore state
-        if tokens["authenticated"].as_bool() == Some(true) {
-            self.authenticated = true;
-            return true;
+        // Restore OAuth tokens
+        if let Some(at) = tokens["access_token"].as_str() {
+            self.access_token = Some(at.to_string());
+            // No in-memory expiry — will refresh eagerly on first use via
+            // `token_needs_refresh()` returning true when expiry is None.
+            self.token_expires = None;
         }
-        // Even without saved state, YouTube works
-        self.authenticated = true;
-        true
+        if let Some(rt) = tokens["refresh_token"].as_str() {
+            self.refresh_token = Some(rt.to_string());
+        }
+        if let Some(email) = tokens["email"].as_str() {
+            self.email = Some(email.to_string());
+        }
+
+        // Restore pending device code flow if it hasn't expired
+        if let Some(dc) = tokens["pending_device_code"].as_str() {
+            let elapsed = tokens["pending_elapsed_secs"].as_u64().unwrap_or(0);
+            // Device codes typically live 30 min; discard if > 25 min old.
+            if elapsed < 1500 {
+                self.pending_device_auth = Some(PendingDeviceAuth {
+                    device_code: dc.to_string(),
+                    user_code: tokens["pending_user_code"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    verification_url: tokens["pending_verification_url"]
+                        .as_str()
+                        .unwrap_or("https://www.google.com/device")
+                        .to_string(),
+                    interval: tokens["pending_interval"].as_u64().unwrap_or(5),
+                    expires_at: Instant::now()
+                        + Duration::from_secs(1800u64.saturating_sub(elapsed)),
+                });
+                self.device_auth_started = Some(Instant::now());
+            }
+        }
+
+        let has_tokens = self.access_token.is_some();
+        if has_tokens {
+            info!(
+                email = ?self.email,
+                "youtube_tokens_restored"
+            );
+        }
+        has_tokens
+    }
+
+    async fn post_restore(&mut self) {
+        // If we have a refresh token, eagerly refresh to validate the tokens.
+        if self.refresh_token.is_some() && self.access_token.is_some() {
+            match self.do_refresh_token().await {
+                Ok(true) => info!("youtube_post_restore_token_refreshed"),
+                Ok(false) => warn!("youtube_post_restore_refresh_failed"),
+                Err(e) => warn!(error = %e, "youtube_post_restore_refresh_error"),
+            }
+        }
+    }
+
+    async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
+        if self.token_needs_refresh() {
+            return self.do_refresh_token().await;
+        }
+        Ok(false)
     }
 }
 
@@ -2470,9 +2948,10 @@ mod tests {
     }
 
     #[test]
-    fn youtube_default_authenticated() {
+    fn youtube_default_not_authenticated() {
         let svc = YouTubeService::new();
-        assert!(svc.authenticated);
+        // Not authenticated until OAuth Device Code flow completes
+        assert!(!svc.is_authenticated());
     }
 
     #[test]
@@ -2614,31 +3093,50 @@ mod tests {
     }
 
     #[test]
-    fn save_tokens_always_some() {
+    fn save_tokens_without_auth() {
         let svc = YouTubeService::new();
         let tokens = svc.save_tokens();
         assert!(tokens.is_some());
         let t = tokens.unwrap();
-        assert_eq!(t["authenticated"], true);
+        // No access_token when not authenticated
+        assert!(t["access_token"].is_null());
     }
 
     #[test]
-    fn restore_tokens_basic() {
+    fn save_tokens_with_auth() {
         let mut svc = YouTubeService::new();
-        svc.authenticated = false;
-        let tokens = json!({"authenticated": true});
+        svc.access_token = Some("at_test".into());
+        svc.refresh_token = Some("rt_test".into());
+        svc.email = Some("test@gmail.com".into());
+        let tokens = svc.save_tokens().unwrap();
+        assert_eq!(tokens["access_token"], "at_test");
+        assert_eq!(tokens["refresh_token"], "rt_test");
+        assert_eq!(tokens["email"], "test@gmail.com");
+    }
+
+    #[test]
+    fn restore_tokens_with_oauth() {
+        let mut svc = YouTubeService::new();
+        let tokens = json!({
+            "access_token": "at_123",
+            "refresh_token": "rt_456",
+            "email": "user@example.com",
+        });
         assert!(svc.restore_tokens(&tokens));
-        assert!(svc.authenticated);
+        assert_eq!(svc.access_token.as_deref(), Some("at_123"));
+        assert_eq!(svc.refresh_token.as_deref(), Some("rt_456"));
+        assert_eq!(svc.email.as_deref(), Some("user@example.com"));
+        // is_authenticated returns true (access_token present, no expiry = assume valid)
+        assert!(svc.is_authenticated());
     }
 
     #[test]
-    fn restore_tokens_even_empty() {
+    fn restore_tokens_empty() {
         let mut svc = YouTubeService::new();
-        svc.authenticated = false;
         let tokens = json!({});
-        // YouTube is always authenticated
-        assert!(svc.restore_tokens(&tokens));
-        assert!(svc.authenticated);
+        // No tokens to restore
+        assert!(!svc.restore_tokens(&tokens));
+        assert!(!svc.is_authenticated());
     }
 
     #[test]
@@ -2671,18 +3169,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_status_default() {
+    async fn auth_status_default_unauthenticated() {
         let svc = YouTubeService::new();
         let status = svc.auth_status().await;
-        assert!(status.authenticated);
-        assert_eq!(status.username.as_deref(), Some("YouTube Music"));
+        assert!(!status.authenticated);
+        assert!(status.username.is_none());
     }
 
     #[tokio::test]
-    async fn logout_noop() {
+    async fn auth_status_with_token() {
         let mut svc = YouTubeService::new();
+        svc.access_token = Some("test_token".into());
+        svc.token_expires = Some(Instant::now() + Duration::from_secs(3600));
+        svc.email = Some("user@gmail.com".into());
+        let status = svc.auth_status().await;
+        assert!(status.authenticated);
+        assert_eq!(status.username.as_deref(), Some("user@gmail.com"));
+    }
+
+    #[tokio::test]
+    async fn logout_clears_tokens() {
+        let mut svc = YouTubeService::new();
+        svc.access_token = Some("test".into());
+        svc.refresh_token = Some("rt".into());
+        svc.email = Some("user@gmail.com".into());
         assert!(svc.logout().await.is_ok());
-        // Still authenticated after logout (YouTube doesn't require auth)
-        assert!(svc.authenticated);
+        assert!(svc.access_token.is_none());
+        assert!(svc.refresh_token.is_none());
+        assert!(svc.email.is_none());
+        assert!(!svc.is_authenticated());
+    }
+
+    #[test]
+    fn token_needs_refresh_when_near_expiry() {
+        let mut svc = YouTubeService::new();
+        svc.access_token = Some("at".into());
+        svc.refresh_token = Some("rt".into());
+        // Expires in 60 seconds — within the 300s refresh margin
+        svc.token_expires = Some(Instant::now() + Duration::from_secs(60));
+        assert!(svc.token_needs_refresh());
+    }
+
+    #[test]
+    fn token_does_not_need_refresh_when_fresh() {
+        let mut svc = YouTubeService::new();
+        svc.access_token = Some("at".into());
+        svc.refresh_token = Some("rt".into());
+        // Expires in 1 hour — well outside the refresh margin
+        svc.token_expires = Some(Instant::now() + Duration::from_secs(3600));
+        assert!(!svc.token_needs_refresh());
     }
 }
