@@ -945,6 +945,10 @@ impl OutputTarget for LocalOutput {
         "local"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn set_next_url(
         &self,
         url: &str,
