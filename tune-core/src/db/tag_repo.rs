@@ -91,6 +91,55 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+
+    pub fn get_by_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, name, color FROM tags WHERE name = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn search_by_name<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, name, color FROM tags WHERE name LIKE {} ORDER BY name LIMIT 20",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn count_per_tag() -> &'static str {
+        "SELECT t.id, t.name, t.color, COUNT(it.id) as item_count \
+         FROM tags t LEFT JOIN item_tags it ON t.id = it.tag_id \
+         GROUP BY t.id, t.name, t.color ORDER BY t.name"
+    }
+
+    pub fn count_per_tag_by_type<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.id, t.name, t.color, COUNT(it.id) as item_count \
+             FROM tags t LEFT JOIN item_tags it ON t.id = it.tag_id AND it.item_type = {} \
+             GROUP BY t.id, t.name, t.color ORDER BY t.name",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn items_by_any_tags<D: SqlDialect>(d: &D, count: usize) -> String {
+        let placeholders: Vec<String> = (0..count).map(|i| d.placeholder(i + 1)).collect();
+        format!(
+            "SELECT DISTINCT item_id FROM item_tags WHERE item_type = {} AND tag_id IN ({}) ORDER BY item_id",
+            d.placeholder(count + 1),
+            placeholders.join(", ")
+        )
+    }
+
+    pub fn items_by_all_tags<D: SqlDialect>(d: &D, count: usize) -> String {
+        let placeholders: Vec<String> = (0..count).map(|i| d.placeholder(i + 1)).collect();
+        format!(
+            "SELECT item_id FROM item_tags WHERE item_type = {} AND tag_id IN ({}) \
+             GROUP BY item_id HAVING COUNT(DISTINCT tag_id) = {} ORDER BY item_id",
+            d.placeholder(count + 1),
+            placeholders.join(", "),
+            d.placeholder(count + 2)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +147,13 @@ pub struct Tag {
     pub id: Option<i64>,
     pub name: String,
     pub color: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TagWithCount {
+    #[serde(flatten)]
+    pub tag: Tag,
+    pub count: i64,
 }
 
 pub struct TagRepo {
@@ -208,6 +264,107 @@ impl TagRepo {
         let params: [&dyn ToSqlValue; 2] = [&item_type, &item_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_tag).collect())
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Result<Option<Tag>, String> {
+        let sql = self.dialect_sql(sql::get_by_name, sql::get_by_name);
+        let params: [&dyn ToSqlValue; 1] = [&name];
+        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_tag))
+    }
+
+    pub fn search(&self, query: &str) -> Result<Vec<Tag>, String> {
+        let sql = self.dialect_sql(sql::search_by_name, sql::search_by_name);
+        let pattern = format!("%{query}%");
+        let params: [&dyn ToSqlValue; 1] = [&pattern as &dyn ToSqlValue];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_tag).collect())
+    }
+
+    pub fn list_with_counts(&self, item_type: Option<&str>) -> Result<Vec<TagWithCount>, String> {
+        let rows = if let Some(itype) = item_type {
+            let sql = self.dialect_sql(sql::count_per_tag_by_type, sql::count_per_tag_by_type);
+            let params: [&dyn ToSqlValue; 1] = [&itype];
+            self.db.query_many(&sql, &params)?
+        } else {
+            self.db.query_many(sql::count_per_tag(), &[])?
+        };
+        Ok(rows
+            .iter()
+            .map(|cols| TagWithCount {
+                tag: row_to_tag(cols),
+                count: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    pub fn batch_tag(
+        &self,
+        tag_id: i64,
+        item_type: &str,
+        item_ids: &[i64],
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
+        for &item_id in item_ids {
+            let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
+            self.db.execute(&sql, &params)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn batch_untag(
+        &self,
+        tag_id: i64,
+        item_type: &str,
+        item_ids: &[i64],
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        let sql = self.dialect_sql(sql::untag_item, sql::untag_item);
+        for &item_id in item_ids {
+            let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
+            self.db.execute(&sql, &params)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn items_by_any_tags(&self, tag_ids: &[i64], item_type: &str) -> Result<Vec<i64>, String> {
+        if tag_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = match self.db.engine() {
+            Engine::Sqlite => sql::items_by_any_tags(&SqliteDialect, tag_ids.len()),
+            Engine::Postgres => sql::items_by_any_tags(&PostgresDialect, tag_ids.len()),
+        };
+        let mut params: Vec<&dyn ToSqlValue> =
+            tag_ids.iter().map(|id| id as &dyn ToSqlValue).collect();
+        params.push(&item_type);
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    pub fn items_by_all_tags(&self, tag_ids: &[i64], item_type: &str) -> Result<Vec<i64>, String> {
+        if tag_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let count = tag_ids.len() as i64;
+        let sql = match self.db.engine() {
+            Engine::Sqlite => sql::items_by_all_tags(&SqliteDialect, tag_ids.len()),
+            Engine::Postgres => sql::items_by_all_tags(&PostgresDialect, tag_ids.len()),
+        };
+        let mut params: Vec<&dyn ToSqlValue> =
+            tag_ids.iter().map(|id| id as &dyn ToSqlValue).collect();
+        params.push(&item_type);
+        params.push(&count);
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
     }
 }
 
