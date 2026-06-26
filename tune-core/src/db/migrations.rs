@@ -975,6 +975,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "missing_columns",
         include_str!("../../migrations/postgres/006_missing_columns.sql"),
     ),
+    (
+        7,
+        "podcast_subscriptions",
+        include_str!("../../migrations/postgres/007_podcast_subscriptions.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.

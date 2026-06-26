@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
-const APPLE_TOP_BASE: &str = "https://rss.applemarketingtools.com/api/v2";
+const APPLE_TOP_BASE: &str = "https://rss.marketingtools.apple.com/api/v2";
 const USER_AGENT: &str = "Tune/2.0 (https://mozaiklabs.fr)";
 /// Cache TTL for top podcasts (1 hour).
 const TOP_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -383,6 +383,67 @@ impl PodcastService {
                 source_id: "rf-jazzafip".into(),
                 category: Some("Music".into()),
             },
+            Podcast {
+                name: "Pop & Co".into(),
+                artist: "FIP".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18754.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/e7e2f4a0-5c3b-4f1e-b1c3-6d8e9f0a1b2c/1400x1400_sc_pop-and-co.jpg".into(),
+                description: "La pop culture décryptée sur FIP".into(),
+                episode_count: 0,
+                source_id: "rf-pop-co".into(),
+                category: Some("Music".into()),
+            },
+            Podcast {
+                name: "Certains l'aiment FIP".into(),
+                artist: "FIP".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18891.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/03/a1b2c3d4-e5f6-7890-abcd-ef1234567890/1400x1400_sc_certains-laiment-fip.jpg".into(),
+                description: "Les coups de cœur musicaux de FIP".into(),
+                episode_count: 0,
+                source_id: "rf-certains-fip".into(),
+                category: Some("Music".into()),
+            },
+            Podcast {
+                name: "FIP au Festival".into(),
+                artist: "FIP".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_21032.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/06/b2c3d4e5-f6a7-8901-bcde-f23456789012/1400x1400_sc_fip-au-festival.jpg".into(),
+                description: "FIP en direct des festivals".into(),
+                episode_count: 0,
+                source_id: "rf-fip-festival".into(),
+                category: Some("Music".into()),
+            },
+            // ── Radio France — France Musique ──
+            Podcast {
+                name: "Classique ou pas".into(),
+                artist: "France Musique".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_18994.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production-eu3/2024/01/c3d4e5f6-a7b8-9012-cdef-345678901234/1400x1400_sc_classique-ou-pas.jpg".into(),
+                description: "La musique classique accessible et décomplexée".into(),
+                episode_count: 0,
+                source_id: "rf-classique-ou-pas".into(),
+                category: Some("Music".into()),
+            },
+            Podcast {
+                name: "Le van Beethoven".into(),
+                artist: "France Musique".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_16362.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/06/d4e5f6a7-b8c9-0123-def0-456789012345/1400x1400_sc_le-van-beethoven.jpg".into(),
+                description: "Voyage musical en camping-car à travers l'Europe".into(),
+                episode_count: 0,
+                source_id: "rf-van-beethoven".into(),
+                category: Some("Music".into()),
+            },
+            Podcast {
+                name: "Grands interprètes de la musique classique".into(),
+                artist: "France Musique".into(),
+                feed_url: "https://radiofrance-podcast.net/podcast09/rss_11403.xml".into(),
+                cover_url: "https://www.radiofrance.fr/s3/cruiser-production/2022/09/e5f6a7b8-c9d0-1234-ef01-567890123456/1400x1400_sc_grands-interpretes.jpg".into(),
+                description: "Portraits des plus grands musiciens classiques".into(),
+                episode_count: 0,
+                source_id: "rf-grands-interpretes".into(),
+                category: Some("Music".into()),
+            },
         ]
     }
 
@@ -413,7 +474,7 @@ impl PodcastService {
     ) -> Result<Vec<Podcast>, String> {
         let cc = country.to_lowercase();
         let url = match genre {
-            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcast-{gid}.json"),
+            Some(gid) => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json?genre={gid}"),
             None => format!("{APPLE_TOP_BASE}/{cc}/podcasts/top/50/podcasts.json"),
         };
         let cache_key = {
