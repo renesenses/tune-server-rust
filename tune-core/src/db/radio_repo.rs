@@ -196,7 +196,8 @@ impl RadioRepo {
 
     pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<(), String> {
         let sql = self.dialect_sql(sql::set_favorite, sql::set_favorite);
-        let params: [&dyn ToSqlValue; 2] = [&favorite, &id];
+        let val: i32 = if favorite { 1 } else { 0 };
+        let params: [&dyn ToSqlValue; 2] = [&val, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }

@@ -4,6 +4,8 @@
   let currentZoneId = null;
   let pollInterval = null;
   let seekDragging = false;
+  let volumeDragging = false;
+  let lastQueueHash = '';
 
   // DOM refs
   const $ = (sel) => document.querySelector(sel);
@@ -45,6 +47,44 @@
     return res.json();
   }
 
+  function artworkUrl(path) {
+    if (!path) return null;
+    if (path.startsWith('http')) return path;
+    if (path.match(/^[a-f0-9]{32}$/)) return `${BASE}/library/artwork/${path}`;
+    return `${location.protocol}//${location.host}${path}`;
+  }
+
+  function setCover(coverPath) {
+    const src = artworkUrl(coverPath);
+    if (src) {
+      if (coverArt.src !== src) coverArt.src = src;
+      coverArt.classList.add('visible');
+    } else {
+      coverArt.classList.remove('visible');
+    }
+  }
+
+  let lastCoverTrackId = null;
+  async function fetchTrackCover(trackId) {
+    if (trackId === lastCoverTrackId) return;
+    lastCoverTrackId = trackId;
+    try {
+      const track = await api(`/library/tracks/${trackId}`);
+      const cover = track.cover_path || track.album_cover;
+      if (cover) {
+        setCover(cover);
+      } else if (track.album_id) {
+        const album = await api(`/library/albums/${track.album_id}`);
+        if (album.cover_path) setCover(album.cover_path);
+        else coverArt.classList.remove('visible');
+      } else {
+        coverArt.classList.remove('visible');
+      }
+    } catch (e) {
+      coverArt.classList.remove('visible');
+    }
+  }
+
   // Load zones
   async function loadZones() {
     try {
@@ -58,7 +98,10 @@
         zoneSelect.appendChild(opt);
       });
       if (zones.length > 0) {
-        if (!currentZoneId) currentZoneId = zones[0].id;
+        if (!currentZoneId) {
+          const playing = zones.find(z => z.state === 'playing');
+          currentZoneId = playing ? playing.id : zones[0].id;
+        }
         zoneSelect.value = currentZoneId;
         updateFromZone(zones.find(z => z.id == currentZoneId) || zones[0]);
       }
@@ -70,7 +113,7 @@
     if (!zone) return;
     currentZoneId = zone.id;
 
-    const np = zone.now_playing;
+    const np = zone.now_playing || zone.current_track;
     const state = zone.state || 'stopped';
     const isPlaying = state === 'playing';
 
@@ -93,12 +136,12 @@
       trackArtist.textContent = np.artist_name || np.artist || '—';
       trackAlbum.textContent = np.album_title || np.album || '';
 
-      // Cover
+      // Cover — resolve from cover_path, or fetch from track/album API
       const coverUrl = np.cover_path || np.cover_url;
       if (coverUrl) {
-        const src = coverUrl.startsWith('http') ? coverUrl : `${location.protocol}//${location.host}${coverUrl}`;
-        if (coverArt.src !== src) coverArt.src = src;
-        coverArt.classList.add('visible');
+        setCover(coverUrl);
+      } else if (np.track_id || np.id) {
+        fetchTrackCover(np.track_id || np.id);
       } else {
         coverArt.classList.remove('visible');
       }
@@ -133,35 +176,59 @@
       seekBar.value = 0;
     }
 
-    // Volume
-    const vol = Math.round((zone.volume ?? 0.5) * 100);
-    volumeSlider.value = vol;
-    volumeValue.textContent = vol;
+    // Volume — only update if user is not dragging
+    if (!volumeDragging) {
+      const vol = Math.round((zone.volume ?? 0.5) * 100);
+      volumeSlider.value = vol;
+      volumeValue.textContent = vol;
+    }
 
     // Shuffle / Repeat
     btnShuffle.classList.toggle('active', !!zone.shuffle);
     btnRepeat.classList.toggle('active', zone.repeat && zone.repeat !== 'off');
 
-    // Load queue
-    loadQueue();
+    // Queue position highlight (without full rebuild)
+    const queuePos = zone.queue_position ?? 0;
+    const items = queueList.querySelectorAll('.queue-item');
+    items.forEach((item, i) => {
+      item.classList.toggle('active', i === queuePos);
+    });
+    queueCount.textContent = `${items.length > 0 ? queuePos + 1 : 0} / ${items.length}`;
+
+    // Scroll active into view
+    const activeItem = queueList.querySelector('.active');
+    if (activeItem) activeItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
-  // Load queue
+  // Load queue — only rebuild DOM when queue content changes
   async function loadQueue() {
     if (!currentZoneId) return;
     try {
       const q = await api(`/zones/${currentZoneId}/queue`);
       const tracks = q.tracks || [];
       const pos = q.position ?? 0;
-      queueCount.textContent = `${tracks.length > 0 ? pos + 1 : 0} / ${tracks.length}`;
 
+      // Build a hash to detect changes
+      const hash = tracks.map(t => `${t.id || t.source_id || t.title}`).join(',');
+      if (hash === lastQueueHash) {
+        // Just update position highlight
+        const items = queueList.querySelectorAll('.queue-item');
+        items.forEach((item, i) => item.classList.toggle('active', i === pos));
+        queueCount.textContent = `${tracks.length > 0 ? pos + 1 : 0} / ${tracks.length}`;
+        const activeItem = queueList.querySelector('.active');
+        if (activeItem) activeItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        return;
+      }
+      lastQueueHash = hash;
+
+      queueCount.textContent = `${tracks.length > 0 ? pos + 1 : 0} / ${tracks.length}`;
       queueList.innerHTML = '';
       tracks.forEach((t, i) => {
         const div = document.createElement('div');
         div.className = 'queue-item' + (i === pos ? ' active' : '');
-        const coverSrc = t.cover_path
-          ? (t.cover_path.startsWith('http') ? t.cover_path : `${location.protocol}//${location.host}${t.cover_path}`)
-          : '';
+
+        const coverSrc = artworkUrl(t.cover_path) || '';
+
         div.innerHTML = `
           <span class="queue-num">${i + 1}</span>
           ${coverSrc ? `<img class="queue-thumb" src="${coverSrc}" loading="lazy">` : '<div class="queue-thumb"></div>'}
@@ -171,24 +238,24 @@
           </div>
           <span class="queue-duration">${fmt(t.duration_ms)}</span>
         `;
-        div.onclick = () => playQueuePosition(i);
+        div.addEventListener('click', () => playQueuePosition(i));
         queueList.appendChild(div);
       });
 
-      // Scroll active into view
-      const active = queueList.querySelector('.active');
-      if (active) active.scrollIntoView({ block: 'nearest' });
-    } catch (e) { /* ignore */ }
+      const activeItem = queueList.querySelector('.active');
+      if (activeItem) activeItem.scrollIntoView({ block: 'nearest' });
+    } catch (e) { console.error('loadQueue', e); }
   }
 
   async function playQueuePosition(pos) {
     if (!currentZoneId) return;
     try {
-      await api(`/zones/${currentZoneId}/queue/jump`, {
+      const result = await api(`/zones/${currentZoneId}/queue/jump`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ position: pos }),
       });
+      updateFromZone(result);
     } catch (e) { console.error('jump', e); }
   }
 
@@ -217,10 +284,9 @@
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'zone.state' || msg.type === 'playback.state') {
-          if (msg.data?.zone_id == currentZoneId || msg.zone_id == currentZoneId) {
-            pollState();
-          }
+        const t = msg.type || msg.event || '';
+        if (t.includes('zone') || t.includes('playback') || t.includes('queue') || t.includes('track')) {
+          pollState();
         }
       } catch (_) {}
     };
@@ -238,10 +304,12 @@
   // Controls
   btnPlay.onclick = async () => {
     if (!currentZoneId) return;
-    const zone = await api(`/zones/${currentZoneId}`);
-    const action = zone.state === 'playing' ? 'pause' : 'play';
-    await api(`/zones/${currentZoneId}/${action}`, { method: 'POST' });
-    pollState();
+    try {
+      const zone = await api(`/zones/${currentZoneId}`);
+      const action = zone.state === 'playing' ? 'pause' : 'play';
+      await api(`/zones/${currentZoneId}/${action}`, { method: 'POST' });
+      pollState();
+    } catch (e) { console.error('play/pause', e); }
   };
 
   $('#btn-prev').onclick = async () => {
@@ -289,6 +357,9 @@
   });
 
   // Volume
+  volumeSlider.addEventListener('mousedown', () => { volumeDragging = true; });
+  volumeSlider.addEventListener('touchstart', () => { volumeDragging = true; });
+
   let volumeTimeout = null;
   volumeSlider.addEventListener('input', () => {
     volumeValue.textContent = volumeSlider.value;
@@ -303,14 +374,24 @@
     }, 150);
   });
 
+  volumeSlider.addEventListener('change', () => { volumeDragging = false; });
+  volumeSlider.addEventListener('mouseup', () => { volumeDragging = false; });
+  volumeSlider.addEventListener('touchend', () => { volumeDragging = false; });
+
   // Zone selector
   zoneSelect.addEventListener('change', () => {
     currentZoneId = parseInt(zoneSelect.value);
+    lastQueueHash = '';
+    loadQueue();
     pollState();
   });
 
   // Init
   loadZones();
+  loadQueue();
   connectWS();
   pollInterval = setInterval(pollState, 2000);
+
+  // Reload queue less frequently
+  setInterval(loadQueue, 5000);
 })();
