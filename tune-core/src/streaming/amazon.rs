@@ -325,6 +325,7 @@ impl StreamingService for AmazonMusicService {
             expires_at: None,
             verification_url: Some(verification_url),
             user_code: Some(user_code),
+            ..Default::default()
         })
     }
 
@@ -338,6 +339,7 @@ impl StreamingService for AmazonMusicService {
             expires_at: None,
             verification_url: self.verification_url.lock().await.clone(),
             user_code: self.user_code.lock().await.clone(),
+            ..Default::default()
         }
     }
 

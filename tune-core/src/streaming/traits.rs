@@ -453,6 +453,7 @@ mod tests {
             expires_at: Some("3600s".into()),
             verification_url: None,
             user_code: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["authenticated"], true);
