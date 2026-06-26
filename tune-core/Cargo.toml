@@ -18,6 +18,7 @@ socket2 = { workspace = true }
 if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
+zip = { workspace = true }
 rayon = { workspace = true }
 notify = { workspace = true }
 md-5 = { workspace = true }

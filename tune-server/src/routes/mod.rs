@@ -56,6 +56,7 @@ pub mod service_tokens;
 pub mod setlistfm;
 pub mod shazam;
 pub mod siri;
+pub mod skins;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
@@ -326,6 +327,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/smart-ai", smart_ai::router())
         .nest("/ai", ai::router())
         .nest("/developer", developer_api::router())
+        .nest("/skins", skins::router())
         .route(
             "/services/tokens",
             get(service_tokens::list).post(service_tokens::list),
@@ -381,6 +383,9 @@ pub fn router(state: AppState) -> Router {
         )
         .with_state(state.services.clone());
 
+    // Collect mountable skins before state is moved
+    let mountable_skins = state.skin_manager.mountable_skins();
+
     let mut app = Router::new()
         .nest("/api/v1", api)
         .nest("/ws", ws::router())
@@ -400,16 +405,17 @@ pub fn router(state: AppState) -> Router {
         app = app.nest("/upnp", upnp);
     }
 
-    // xTune plugin — vinyl player UI
-    let xtune_dir = std::env::var("TUNE_XTUNE_DIR").unwrap_or_else(|_| "xtune-web".into());
-    let app = if std::path::Path::new(&xtune_dir).exists() {
-        app.nest_service(
-            "/xtune",
-            ServeDir::new(&xtune_dir).fallback(ServeFile::new(format!("{xtune_dir}/index.html"))),
-        )
-    } else {
-        app
-    };
+    // Mount all installed skins on /{skin_id}
+    for (skin_id, skin_path) in mountable_skins {
+        let index = format!("{}/index.html", skin_path.display());
+        if std::path::Path::new(&index).exists() {
+            tracing::info!(skin_id = %skin_id, path = %skin_path.display(), "skin_mounted");
+            app = app.nest_service(
+                &format!("/{skin_id}"),
+                ServeDir::new(&skin_path).fallback(ServeFile::new(&index)),
+            );
+        }
+    }
 
     let index_path = format!("{web_dir}/index.html");
 

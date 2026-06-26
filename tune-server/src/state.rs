@@ -53,6 +53,7 @@ pub struct AppState {
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
     pub license: Arc<tune_core::license::LicenseManager>,
+    pub skin_manager: Arc<tune_core::skins::SkinManager>,
     #[cfg(feature = "cloud-relay")]
     pub relay_client: Option<Arc<tune_core::cloud::relay::RelayClient>>,
 }
@@ -142,6 +143,14 @@ impl AppState {
             .build()
             .expect("http client init");
 
+        let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
+        let skins_dir = std::env::var("TUNE_SKINS_DIR").unwrap_or_else(|_| "skins".into());
+        let skin_manager = Arc::new(tune_core::skins::SkinManager::new(
+            std::path::PathBuf::from(skins_dir),
+            std::path::PathBuf::from(web_dir),
+        ));
+        skin_manager.ensure_dirs();
+
         Ok(Self {
             db,
             backend,
@@ -167,6 +176,7 @@ impl AppState {
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             license,
+            skin_manager,
             #[cfg(feature = "cloud-relay")]
             relay_client: None,
         })
