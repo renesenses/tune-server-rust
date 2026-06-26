@@ -135,6 +135,8 @@ pub struct AuthStatus {
     pub expires_at: Option<String>,
     pub verification_url: Option<String>,
     pub user_code: Option<String>,
+    pub device_code: Option<String>,
+    pub expires_in: Option<u64>,
 }
 
 #[async_trait::async_trait]

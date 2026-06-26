@@ -76,24 +76,25 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
         for genre in &genres {
             tree.entry(genre.clone()).or_default();
         }
-    } else {
-        let mut classified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (parent, children) in &tree {
-            classified.insert(parent.clone());
-            for child in children {
-                classified.insert(child.clone());
-            }
-        }
-        for genre in &genres {
-            if !classified.contains(genre) {
-                tree.entry(genre.clone()).or_default();
-            }
+    }
+
+    let mut classified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (parent, children) in &tree {
+        classified.insert(parent.to_lowercase());
+        for child in children {
+            classified.insert(child.to_lowercase());
         }
     }
+    let unclassified: Vec<String> = genres
+        .iter()
+        .filter(|g| !classified.contains(&g.to_lowercase()))
+        .cloned()
+        .collect();
 
     Ok(Json(json!({
         "tree": tree,
         "genres": genres,
+        "unclassified": unclassified,
         "total": genres.len(),
     })))
 }

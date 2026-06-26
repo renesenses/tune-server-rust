@@ -75,7 +75,10 @@ pub fn router() -> Router<AppState> {
         .route("/status", get(list_services))
         .route("/{service}/status", get(service_status))
         .route("/{service}/auth", post(service_auth))
+        .route("/{service}/auth/device-code", post(service_auth))
+        .route("/{service}/auth/poll", post(service_auth))
         .route("/{service}/auth/status", get(auth_poll_status))
+        .route("/{service}/auth/logout", post(service_logout))
         .route("/{service}/logout", post(service_logout))
         .route("/{service}/disconnect", post(service_logout))
         .route("/compare", get(compare_services))
@@ -498,6 +501,8 @@ async fn service_auth(
                 "username": status.username,
                 "verification_url": status.verification_url,
                 "user_code": status.user_code,
+                "device_code": status.device_code,
+                "expires_in": status.expires_in,
             }))
             .into_response()
         }

@@ -635,7 +635,7 @@ impl YouTubeService {
         info!(user_code = %user_code, url = %verification_url, "youtube_device_code_started");
 
         self.pending_device_auth = Some(PendingDeviceAuth {
-            device_code,
+            device_code: device_code.clone(),
             user_code: user_code.clone(),
             verification_url: verification_url.clone(),
             interval,
@@ -647,6 +647,8 @@ impl YouTubeService {
             authenticated: false,
             verification_url: Some(verification_url),
             user_code: Some(user_code),
+            device_code: Some(device_code),
+            expires_in: Some(expires_in),
             ..Default::default()
         })
     }
