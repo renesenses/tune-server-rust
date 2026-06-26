@@ -544,7 +544,7 @@ impl StreamingService for SpotifyService {
             .unwrap_or_default())
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
+    async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self.api_get("/browse/categories?limit=50").await?;
         Ok(data["categories"]["items"]
             .as_array()

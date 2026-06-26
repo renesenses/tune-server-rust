@@ -698,14 +698,15 @@ impl StreamingService for QobuzService {
         Ok(tracks)
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
-        let data = self
-            .api_get("/genre/list", &[("offset", "0"), ("limit", "500")])
-            .await
-            .map_err(|e| {
-                info!(error = %e, "qobuz_genres_failed");
-                e
-            })?;
+    async fn get_genres(&self, parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
+        let mut params: Vec<(&str, &str)> = vec![("offset", "0"), ("limit", "500")];
+        if let Some(pid) = parent_id {
+            params.push(("parent_id", pid));
+        }
+        let data = self.api_get("/genre/list", &params).await.map_err(|e| {
+            info!(error = %e, "qobuz_genres_failed");
+            e
+        })?;
         let genres: Vec<StreamGenre> = data["genres"]["items"]
             .as_array()
             .or_else(|| data["genres"].as_array())

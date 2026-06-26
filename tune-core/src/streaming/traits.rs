@@ -212,7 +212,8 @@ pub trait StreamingService: Send + Sync {
         Ok(vec![])
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
+    async fn get_genres(&self, parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
+        let _ = parent_id;
         Ok(vec![])
     }
     async fn get_genre_albums(

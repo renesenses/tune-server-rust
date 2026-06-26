@@ -308,8 +308,18 @@ async fn service_new_releases(
     with_svc!(&state, &service, |svc| svc.get_new_releases().await)
 }
 
-async fn service_genres(State(state): State<AppState>, Path(service): Path<String>) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_genres().await)
+#[derive(Deserialize)]
+struct GenreQuery {
+    parent_id: Option<String>,
+}
+
+async fn service_genres(
+    State(state): State<AppState>,
+    Path(service): Path<String>,
+    Query(q): Query<GenreQuery>,
+) -> Response {
+    let pid = q.parent_id.as_deref();
+    with_svc!(&state, &service, |svc| svc.get_genres(pid).await)
 }
 
 async fn service_genre_albums(

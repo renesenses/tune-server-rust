@@ -1303,15 +1303,42 @@ impl PlaybackOrchestrator {
         // Check for prefetched PCM data before downloading.
         // If the prefetch engine has already decoded this track, serve
         // the PCM directly via a streaming session — zero download delay.
+        // Skip prefetch for network outputs (DLNA) when buffer is truncated
+        // (30s mode) — the renderer needs the full file.
         if let Some(prefetched) = self.prefetch.take_prefetched(service_name, source_id).await {
-            info!(
-                service = service_name,
-                source_id = %source_id,
-                title = %prefetched.title,
-                buffer_bytes = prefetched.pcm_data.len(),
-                "prefetch_hit_serving_buffered_pcm"
-            );
-            return self.serve_prefetched_pcm(prefetched, req).await;
+            let is_network = req
+                .output_device_id
+                .as_deref()
+                .is_some_and(|id| !id.starts_with("local:") && !id.starts_with("oaat:"));
+            let bytes_per_sec = (prefetched.sample_rate as usize)
+                * (prefetched.bit_depth as usize / 8)
+                * (prefetched.channels as usize);
+            let buffered_ms = if bytes_per_sec > 0 {
+                (prefetched.pcm_data.len() as u64 * 1000) / bytes_per_sec as u64
+            } else {
+                0
+            };
+            let is_truncated =
+                prefetched.duration_ms > 0 && buffered_ms + 2000 < prefetched.duration_ms;
+
+            if is_network && is_truncated {
+                info!(
+                    service = service_name,
+                    source_id = %source_id,
+                    buffered_ms,
+                    duration_ms = prefetched.duration_ms,
+                    "prefetch_skip_truncated_for_dlna"
+                );
+            } else {
+                info!(
+                    service = service_name,
+                    source_id = %source_id,
+                    title = %prefetched.title,
+                    buffer_bytes = prefetched.pcm_data.len(),
+                    "prefetch_hit_serving_buffered_pcm"
+                );
+                return self.serve_prefetched_pcm(prefetched, req).await;
+            }
         }
 
         let registry = self.services.lock().await;

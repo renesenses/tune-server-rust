@@ -1639,7 +1639,7 @@ impl StreamingService for TidalService {
         Ok(tracks)
     }
 
-    async fn get_genres(&self) -> Result<Vec<StreamGenre>, TuneError> {
+    async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
         let data = self.api_get("/genres").await?;
         let genres = data
             .as_array()
