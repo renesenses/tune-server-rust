@@ -2662,12 +2662,35 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) {
+        // Position is preserved across pause (playback state isn't reset), so we
+        // know where to resume from.
+        let position_ms = self.playback.get_state(zone_id).await.position_ms.max(0) as u64;
         self.playback.resume(zone_id).await;
-        if let Some(did) = device_id {
+
+        let Some(did) = device_id else { return };
+        let output_type = {
+            let outputs = self.outputs.lock().await;
+            let Some(output) = outputs.get(did) else { return };
+            let out = output.lock().await;
+            let t = out.output_type().to_string();
+            if let Err(e) = out.resume().await {
+                warn!(zone_id, error = %e, "device_resume_failed");
+            }
+            t
+        };
+
+        // Legacy DLNA/OpenHome renderers (e.g. Cyrus Stream X) restart the stream
+        // on Play-after-Pause instead of resuming. Seek back to the paused
+        // position once the renderer has had a moment to (re)start, so playback
+        // continues instead of replaying from the top. Locks are released during
+        // the wait so other zones aren't blocked.
+        if (output_type == "dlna" || output_type == "openhome") && position_ms > 3000 {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {
-                if let Err(e) = output.lock().await.resume().await {
-                    warn!(zone_id, error = %e, "device_resume_failed");
+                match output.lock().await.seek(position_ms).await {
+                    Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
+                    Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
                 }
             }
         }
