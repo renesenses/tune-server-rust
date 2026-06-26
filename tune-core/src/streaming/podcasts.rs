@@ -157,16 +157,18 @@ impl PodcastService {
         query: &str,
         limit: usize,
         country: &str,
+        language: Option<&str>,
     ) -> Result<Vec<Podcast>, String> {
         let limit = limit.min(50).max(1);
         let cc = if country.is_empty() { "US" } else { country };
         let query_lower = query.to_lowercase();
+        let lang = language.unwrap_or("");
 
         // Check search cache (5 min TTL).
         type SearchCache = std::collections::HashMap<String, (Instant, Vec<Podcast>)>;
         static SEARCH_CACHE: OnceLock<Mutex<SearchCache>> = OnceLock::new();
         let cache = SEARCH_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-        let cache_key = format!("{cc}:{query_lower}:{limit}");
+        let cache_key = format!("{cc}:{lang}:{query_lower}:{limit}");
         {
             let guard = cache.lock().await;
             if let Some((ts, data)) = guard.get(&cache_key) {
@@ -176,15 +178,26 @@ impl PodcastService {
             }
         }
 
+        let mut params = vec![
+            ("term", query.to_string()),
+            ("media", "podcast".to_string()),
+            ("limit", limit.to_string()),
+            ("country", cc.to_string()),
+        ];
+        if !lang.is_empty() {
+            params.push((
+                "language",
+                format!(
+                    "{lang}_{}",
+                    cc.to_uppercase().chars().take(2).collect::<String>()
+                ),
+            ));
+        }
+
         let resp = self
             .client
             .get(ITUNES_SEARCH_URL)
-            .query(&[
-                ("term", query),
-                ("media", "podcast"),
-                ("limit", &limit.to_string()),
-                ("country", cc),
-            ])
+            .query(&params)
             .send()
             .await
             .map_err(|e| format!("podcast search: {e}"))?;

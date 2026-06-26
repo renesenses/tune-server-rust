@@ -17,6 +17,7 @@ struct SearchQuery {
     limit: usize,
     #[serde(default = "default_country")]
     country: String,
+    language: Option<String>,
 }
 fn default_limit() -> usize {
     20
@@ -75,7 +76,10 @@ async fn search_podcasts(
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Value>, AppError> {
     let svc = PodcastService::with_client(state.http_client.clone());
-    match svc.search(&q.q, q.limit, &q.country).await {
+    match svc
+        .search(&q.q, q.limit, &q.country, q.language.as_deref())
+        .await
+    {
         Ok(results) => Ok(Json(
             json!({"query": q.q, "count": results.len(), "items": results}),
         )),
