@@ -732,25 +732,29 @@ impl PlaybackOrchestrator {
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
 
-        // DLNA format negotiation: if the source is FLAC and the renderer
-        // doesn't support audio/flac (Denon, Marantz, Revox), force
-        // transcoding to WAV (LPCM) which has a proper DLNA.ORG_PN profile.
+        // DLNA format negotiation: if the output will be FLAC (either source
+        // is FLAC, or source needs transcode and target is FLAC), check that
+        // the renderer supports audio/flac. Otherwise force WAV (LPCM).
         let is_dlna = zone_output_type.as_deref() == Some("dlna");
-        let dlna_needs_wav =
-            if is_dlna && !needs_transcode_for_output && source_format == Some(AudioFormat::Flac) {
-                let did = req
-                    .output_device_id
-                    .as_deref()
-                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                    .unwrap_or("");
-                if !did.is_empty() {
-                    !self.dlna_supports_mime(did, "audio/flac").await
-                } else {
-                    false
-                }
+        let will_be_flac = source_format == Some(AudioFormat::Flac)
+            || (needs_transcode_for_output
+                && source_format
+                    .map(|f| f.dlna_transcode_target() == AudioFormat::Flac)
+                    .unwrap_or(false));
+        let dlna_needs_wav = if is_dlna && will_be_flac {
+            let did = req
+                .output_device_id
+                .as_deref()
+                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                .unwrap_or("");
+            if !did.is_empty() {
+                !self.dlna_supports_mime(did, "audio/flac").await
             } else {
                 false
-            };
+            }
+        } else {
+            false
+        };
 
         // Downsample if the zone has a max_sample_rate cap and the source exceeds it
         let needs_downsample = zone_max_sample_rate.is_some_and(|max| sample_rate > max);
