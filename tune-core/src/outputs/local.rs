@@ -1602,27 +1602,59 @@ impl OutputTarget for LocalOutput {
 
                 let mut total_frames_fed: u64 = 0;
 
+                let skip_bytes_asio: u64 = if seek_offset > 0 {
+                    let skip_frames = (seek_offset as f64 / 1000.0 * sample_rate as f64) as u64;
+                    skip_frames * channels as u64 * bytes_per_sample as u64
+                } else {
+                    0
+                };
+                let mut skipped_bytes_asio: u64 = 0;
+
                 // Read and feed the rest of the stream
                 let mut read_buf = vec![0u8; 65536];
                 let mut leftover: Vec<u8> = Vec::new();
 
                 // Process leftover from header read
                 if !pcm_data.is_empty() {
-                    let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
-                    if aligned_len > 0 {
-                        let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
-                        feed_ring_abortable(
-                            &ring,
-                            &samples,
-                            &stop_rx,
-                            &paused,
-                            Some(&force_silent),
-                        );
-                        total_frames_fed += (aligned_len / frame_bytes) as u64;
-                    }
-                    // Carry over unaligned remainder bytes
-                    if aligned_len < pcm_data.len() {
-                        leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                    if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
+                        let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
+                        if pcm_data.len() <= remaining {
+                            skipped_bytes_asio += pcm_data.len() as u64;
+                        } else {
+                            skipped_bytes_asio = skip_bytes_asio;
+                            let kept = &pcm_data[remaining..];
+                            let aligned_len = (kept.len() / frame_bytes) * frame_bytes;
+                            if aligned_len > 0 {
+                                let samples = pcm_bytes_to_f32(&kept[..aligned_len], bit_depth);
+                                feed_ring_abortable(
+                                    &ring,
+                                    &samples,
+                                    &stop_rx,
+                                    &paused,
+                                    Some(&force_silent),
+                                );
+                                total_frames_fed += (aligned_len / frame_bytes) as u64;
+                            }
+                            if aligned_len < kept.len() {
+                                leftover.extend_from_slice(&kept[aligned_len..]);
+                            }
+                        }
+                    } else {
+                        let aligned_len = (pcm_data.len() / frame_bytes) * frame_bytes;
+                        if aligned_len > 0 {
+                            let samples = pcm_bytes_to_f32(&pcm_data[..aligned_len], bit_depth);
+                            feed_ring_abortable(
+                                &ring,
+                                &samples,
+                                &stop_rx,
+                                &paused,
+                                Some(&force_silent),
+                            );
+                            total_frames_fed += (aligned_len / frame_bytes) as u64;
+                        }
+                        if aligned_len < pcm_data.len() {
+                            leftover.extend_from_slice(&pcm_data[aligned_len..]);
+                        }
                     }
                 }
 
@@ -1654,7 +1686,17 @@ impl OutputTarget for LocalOutput {
                         }
                     };
 
-                    leftover.extend_from_slice(&read_buf[..n]);
+                    if skip_bytes_asio > 0 && skipped_bytes_asio < skip_bytes_asio {
+                        let remaining = (skip_bytes_asio - skipped_bytes_asio) as usize;
+                        if n <= remaining {
+                            skipped_bytes_asio += n as u64;
+                            continue;
+                        }
+                        skipped_bytes_asio = skip_bytes_asio;
+                        leftover.extend_from_slice(&read_buf[remaining..n]);
+                    } else {
+                        leftover.extend_from_slice(&read_buf[..n]);
+                    }
 
                     let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
                     if aligned_len == 0 {
