@@ -280,6 +280,8 @@ jobs:
           mkdir -p "$DMG_DIR"
           cp -R "$APP" "$DMG_DIR/"
           ln -s /Applications "$DMG_DIR/Applications"
+          sync
+          sleep 3
           hdiutil create -volname "Tune Server" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG_NAME"
           if [ -n "$APPLE_TEAM_ID" ]; then
             codesign --force --sign "$IDENTITY" "$DMG_NAME"
