@@ -541,10 +541,11 @@ async fn proxy_stream(
     let range_requested = range_value.as_deref().filter(|r| r.starts_with("bytes=0-"));
 
     // Radio streams are infinite — no Content-Length is possible.
-    // When the DMP-A8 sends Range: bytes=0-, we must still reply 206 with
-    // an open-ended Content-Range so the renderer keeps consuming the
-    // stream instead of aborting after ~31 seconds.
-    if is_radio && range_requested.is_some() {
+    // The DMP-A8 sends Range: bytes=0- initially, then reconnects with
+    // bytes=N- (resume). Both must return 206 with an open-ended
+    // Content-Range so the renderer keeps consuming the stream.
+    let any_range = range_value.as_deref().filter(|r| r.starts_with("bytes="));
+    if is_radio && any_range.is_some() {
         headers.remove("Accept-Ranges");
         headers.insert("Content-Range", HeaderValue::from_static("bytes 0-*/*"));
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
