@@ -606,32 +606,16 @@ impl PlaybackOrchestrator {
                     Some(2u32),
                 )
             } else if is_radio {
-                // Network outputs (DLNA, etc.): use proxy session as before
-                let ext = mime_type.split('/').last().unwrap_or("aac");
-                let info = StreamInfo {
-                    format: ext.to_string(),
-                    mime_type: mime_type.to_string(),
-                    sample_rate: 44100,
-                    bit_depth: 16,
-                    channels: 2,
-                    file_size: None,
-                    duration_ms: None,
-                    ..Default::default()
+                // Network outputs (DLNA): serve the radio URL directly to
+                // the renderer — no proxy. Proxying caused 3-min buffer
+                // exhaustion drops on DMP-A8. DLNA renderers can't do TLS,
+                // so downgrade https→http (icecast servers support both).
+                let direct_url = if audio_url.starts_with("https://") {
+                    audio_url.replacen("https://", "http://", 1)
+                } else {
+                    audio_url.to_string()
                 };
-                let sid = self
-                    .streamer
-                    .create_proxy_session(info, audio_url.to_string(), true)
-                    .await;
-                let server_ip = self.server_ip();
-                let stream_url = self.streamer.get_stream_url(&sid, &server_ip, ext);
-                (
-                    stream_url,
-                    Some(sid),
-                    mime_type.to_string(),
-                    None,
-                    None,
-                    None,
-                )
+                (direct_url, None, mime_type.to_string(), None, None, None)
             } else {
                 (
                     audio_url.to_string(),
