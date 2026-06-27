@@ -554,21 +554,22 @@ impl DlnaOutput {
     ///   `http-get:*:audio/flac:*`
     /// The third colon-separated field is the MIME type.
     pub async fn supports_mime(&self, mime: &str) -> bool {
+        let is_universal = matches!(
+            mime.to_lowercase().as_str(),
+            "audio/wav" | "audio/x-wav" | "audio/l16" | "audio/mpeg"
+        );
         let protocols = match self.get_protocol_info().await {
             Ok(p) => p,
             Err(e) => {
-                // If we can't reach ConnectionManager, assume the renderer
-                // supports the format (optimistic — avoids unnecessary
-                // transcoding for renderers that don't implement CM).
-                debug!(device = %self.name, error = %e, mime, "protocol_info_unavailable_assuming_supported");
-                return true;
+                // If we can't reach ConnectionManager, assume universal
+                // formats (WAV/MP3) are supported but not others (FLAC).
+                debug!(device = %self.name, error = %e, mime, is_universal, "protocol_info_unavailable");
+                return is_universal;
             }
         };
         if protocols.is_empty() {
-            // Empty Sink list: renderer didn't report capabilities.
-            // Assume it supports the format (same optimistic fallback).
-            debug!(device = %self.name, mime, "protocol_info_empty_sink_assuming_supported");
-            return true;
+            debug!(device = %self.name, mime, is_universal, "protocol_info_empty_sink");
+            return is_universal;
         }
         let mime_lower = mime.to_lowercase();
         for proto in &protocols {

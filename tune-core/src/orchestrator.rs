@@ -2095,26 +2095,32 @@ impl PlaybackOrchestrator {
             bd.max(16).min(24)
         };
 
-        // For DLNA/network outputs, encode prefetched PCM to a FLAC temp file
-        // to avoid WAV format mismatch noise during gapless transitions.
+        // For DLNA/network outputs, encode prefetched PCM to a file.
+        // Use FLAC if the renderer supports it, otherwise WAV.
         if is_network_output {
+            let use_wav = if let Some(device_id) = req.output_device_id.as_deref() {
+                !self.dlna_supports_mime(device_id, "audio/flac").await
+            } else {
+                false
+            };
+            let ext = if use_wav { "wav" } else { "flac" };
             let tmp_path =
-                std::env::temp_dir().join(format!("tune-prefetch-{}.flac", uuid::Uuid::new_v4()));
+                std::env::temp_dir().join(format!("tune-prefetch-{}.{ext}", uuid::Uuid::new_v4()));
             let tmp_str = tmp_path.to_string_lossy().to_string();
             let pcm_data = prefetched.pcm_data;
             let encode_sr = sr;
             let encode_bd = out_bd;
             let encode_ch = ch;
             let encode_path = tmp_str.clone();
+            let encode_wav = use_wav;
             tokio::task::spawn_blocking(move || {
                 use std::io::Write;
-                let tmp_wav = format!("{}.wav", encode_path);
-                {
-                    let mut f = std::fs::File::create(&tmp_wav)
+                let data_size = pcm_data.len() as u32;
+                let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
+                let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
+                if encode_wav {
+                    let mut f = std::fs::File::create(&encode_path)
                         .map_err(|e| format!("create tmp wav: {e}"))?;
-                    let data_size = pcm_data.len() as u32;
-                    let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
-                    let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
                     let mut hdr = Vec::with_capacity(44);
                     hdr.extend_from_slice(b"RIFF");
                     hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
@@ -2132,33 +2138,62 @@ impl PlaybackOrchestrator {
                         .map_err(|e| format!("write wav header: {e}"))?;
                     f.write_all(&pcm_data)
                         .map_err(|e| format!("write wav pcm: {e}"))?;
-                }
-                // Convert WAV to FLAC using our decoder
-                let status = std::process::Command::new("ffmpeg")
-                    .args(["-y", "-i", &tmp_wav, "-c:a", "flac", &encode_path])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                let _ = std::fs::remove_file(&tmp_wav);
-                match status {
-                    Ok(s) if s.success() => Ok(()),
-                    Ok(s) => Err(format!("ffmpeg exit {s}")),
-                    Err(e) => Err(format!("ffmpeg: {e}")),
+                    Ok(())
+                } else {
+                    let tmp_wav = format!("{}.wav", encode_path);
+                    {
+                        let mut f = std::fs::File::create(&tmp_wav)
+                            .map_err(|e| format!("create tmp wav: {e}"))?;
+                        let mut hdr = Vec::with_capacity(44);
+                        hdr.extend_from_slice(b"RIFF");
+                        hdr.extend_from_slice(&(36 + data_size).to_le_bytes());
+                        hdr.extend_from_slice(b"WAVEfmt ");
+                        hdr.extend_from_slice(&16u32.to_le_bytes());
+                        hdr.extend_from_slice(&1u16.to_le_bytes());
+                        hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
+                        hdr.extend_from_slice(&encode_sr.to_le_bytes());
+                        hdr.extend_from_slice(&byte_rate.to_le_bytes());
+                        hdr.extend_from_slice(&block_align.to_le_bytes());
+                        hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
+                        hdr.extend_from_slice(b"data");
+                        hdr.extend_from_slice(&data_size.to_le_bytes());
+                        f.write_all(&hdr)
+                            .map_err(|e| format!("write wav header: {e}"))?;
+                        f.write_all(&pcm_data)
+                            .map_err(|e| format!("write wav pcm: {e}"))?;
+                    }
+                    let status = std::process::Command::new("ffmpeg")
+                        .args(["-y", "-i", &tmp_wav, "-c:a", "flac", &encode_path])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    let _ = std::fs::remove_file(&tmp_wav);
+                    match status {
+                        Ok(s) if s.success() => Ok(()),
+                        Ok(s) => Err(format!("ffmpeg exit {s}")),
+                        Err(e) => Err(format!("ffmpeg: {e}")),
+                    }
                 }
             })
             .await
             .map_err(|e| format!("spawn: {e}"))??;
 
             let file_size = std::fs::metadata(&tmp_str).map(|m| m.len()).unwrap_or(0);
+            let (out_format, out_mime) = if use_wav {
+                ("wav", "audio/wav")
+            } else {
+                ("flac", "audio/flac")
+            };
             info!(
                 title = %prefetched.title,
                 file_size,
-                "prefetch_pcm_encoded_to_flac_for_dlna"
+                format = out_format,
+                "prefetch_pcm_encoded_for_dlna"
             );
 
             let flac_info = StreamInfo {
-                format: "flac".into(),
-                mime_type: "audio/flac".into(),
+                format: out_format.into(),
+                mime_type: out_mime.into(),
                 sample_rate: sr,
                 bit_depth: out_bd,
                 channels: ch,
