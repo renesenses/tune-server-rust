@@ -73,7 +73,7 @@ pub mod sql {
 
     pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE zones SET is_hidden = 1, output_device_id = NULL WHERE id = {}",
+            "UPDATE zones SET is_hidden = 1 WHERE id = {}",
             d.placeholder(1)
         )
     }
@@ -353,6 +353,24 @@ impl ZoneRepo {
             }
             Err(e) => Err(e),
         }
+    }
+
+    pub fn is_device_hidden(&self, device_id: &str) -> bool {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT COALESCE(is_hidden, 0) FROM zones WHERE output_device_id = {placeholder}"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .map(|v| v != 0)
+            .unwrap_or(false)
     }
 
     /// Safely read autoplay_enabled for a zone.  Returns false (the default)

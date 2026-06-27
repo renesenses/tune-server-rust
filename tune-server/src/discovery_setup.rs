@@ -178,6 +178,10 @@ async fn handle_ssdp_discovered(
     let is_tv = skip_keywords.iter().any(|kw| name_lower.contains(kw));
 
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
+    if zone_repo.is_device_hidden(&dev.id) {
+        tracing::debug!(name = %dev.name, id = %dev.id, "ssdp_zone_hidden_skipping");
+        return;
+    }
     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
         set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
@@ -217,8 +221,20 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
+        // Dedup by host: skip if a zone already exists at the same IP
         let existing = zone_repo.list().unwrap_or_default();
+        let host_taken = existing.iter().any(|z| {
+            z.output_device_id
+                .as_deref()
+                .is_some_and(|did| did.contains(&dev.host))
+                && z.output_type.as_deref() == Some("dlna")
+        });
+        if host_taken {
+            tracing::debug!(name = %dev.name, host = %dev.host, id = %dev.id, "ssdp_zone_host_already_exists_skipping");
+            return;
+        }
+
+        let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
         let name_taken = existing.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
             dev.name.clone()
