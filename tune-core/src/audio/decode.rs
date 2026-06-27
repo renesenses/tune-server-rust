@@ -712,6 +712,16 @@ fn decode_to_pcm_streaming_inner(
     let total_frames = total_samples as f64 / source_channels as f64;
     let duration_s = total_frames / source_rate as f64;
 
+    // If seek was beyond EOF (0 samples decoded), send a short silence
+    // to prevent empty stream that crashes exclusive ASIO readers.
+    if total_samples == 0 && seek_s > 0.0 {
+        let ch = target_channels.unwrap_or(source_channels) as usize;
+        let silence_frames = (source_rate as usize) / 10; // 100ms
+        let silence = vec![0u8; silence_frames * ch * (output_bd as usize / 8)];
+        let _ = rt.block_on(tx.send(silence));
+        tracing::warn!(file = file_path, seek_s, "seek_beyond_eof_sent_silence");
+    }
+
     debug!(
         file = file_path,
         samples = total_samples,

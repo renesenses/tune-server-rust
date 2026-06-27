@@ -525,6 +525,7 @@ impl DlnaOutput {
 pub struct DsdCapability {
     pub supports_dsf: bool,
     pub supports_dff: bool,
+    pub dsf_mime: Option<String>,
 }
 
 impl DlnaOutput {
@@ -541,6 +542,12 @@ impl DlnaOutput {
                 || lower.contains("application/x-dsd")
             {
                 cap.supports_dsf = true;
+                if cap.dsf_mime.is_none() {
+                    let parts: Vec<&str> = proto.split(':').collect();
+                    if parts.len() >= 3 {
+                        cap.dsf_mime = Some(parts[2].trim().to_string());
+                    }
+                }
             }
             if lower.contains("audio/dff") || lower.contains("x-dff") {
                 cap.supports_dff = true;

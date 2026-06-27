@@ -1156,10 +1156,25 @@ impl PlaybackOrchestrator {
                 )
             }
         } else {
-            // Standard passthrough: serve the raw file
-            let mime = source_format
-                .map(|f| f.mime_type().to_string())
-                .unwrap_or_else(|| "audio/flac".into());
+            // Standard passthrough: serve the raw file.
+            // For DSD, use the MIME type declared by the renderer (from GetProtocolInfo)
+            // instead of the generic application/x-dsd — some renderers (Yamaha R-N2000A)
+            // only accept the specific MIME they advertise (e.g. audio/dsf).
+            let mime = if source_format == Some(AudioFormat::Dsd) && is_network_output {
+                let did = req
+                    .output_device_id
+                    .as_deref()
+                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+                    .unwrap_or("");
+                let cap = self.dsd_capabilities.lock().await;
+                cap.get(did)
+                    .and_then(|c| c.dsf_mime.clone())
+                    .unwrap_or_else(|| "application/x-dsd".into())
+            } else {
+                source_format
+                    .map(|f| f.mime_type().to_string())
+                    .unwrap_or_else(|| "audio/flac".into())
+            };
 
             let info = StreamInfo {
                 format: fmt.clone(),
@@ -2798,7 +2813,21 @@ impl PlaybackOrchestrator {
         }
     }
 
-    pub async fn seek(&self, zone_id: i64, position_ms: u64, device_id: Option<&str>) {
+    pub async fn seek(&self, zone_id: i64, mut position_ms: u64, device_id: Option<&str>) {
+        // Clamp seek to track duration to prevent out-of-bounds seek on files
+        // with incorrect metadata duration (e.g. VBR MP3 with wrong header).
+        let state = self.playback.get_state(zone_id).await;
+        if let Some(ref np) = state.now_playing {
+            if np.duration_ms > 0 && position_ms > np.duration_ms as u64 {
+                info!(
+                    zone_id,
+                    requested = position_ms,
+                    duration = np.duration_ms,
+                    "seek_clamped_to_duration"
+                );
+                position_ms = (np.duration_ms as u64).saturating_sub(1000);
+            }
+        }
         self.playback.seek(zone_id, position_ms as i64).await;
         let state = self.playback.get_state(zone_id).await;
         if let Some(ref np) = state.now_playing {
