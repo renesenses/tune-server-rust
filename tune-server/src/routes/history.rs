@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ struct DashboardParams {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(recent_history))
+        .route("/", get(recent_history).delete(clear_history))
         .route("/top-tracks", get(top_tracks))
         .route("/top-artists", get(top_artists))
         .route("/top-albums", get(top_albums))
@@ -48,6 +48,17 @@ async fn recent_history(
         "limit": limit,
         "offset": offset,
     }))
+}
+
+async fn clear_history(State(state): State<AppState>) -> Json<Value> {
+    let repo = HistoryRepo::with_backend(state.backend.clone());
+    match repo.clear() {
+        Ok(()) => Json(json!({ "status": "ok" })),
+        Err(e) => {
+            tracing::error!(error = %e, "clear_history_failed");
+            Json(json!({ "status": "error", "detail": e }))
+        }
+    }
 }
 
 async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {

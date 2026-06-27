@@ -260,6 +260,11 @@ impl HistoryRepo {
             .collect())
     }
 
+    pub fn clear(&self) -> Result<(), String> {
+        self.db.execute("DELETE FROM listen_history", &[])?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<i64, String> {
         match self.db.query_one(sql::count_all(), &[])? {
             None => Ok(0),
