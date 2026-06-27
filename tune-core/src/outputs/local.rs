@@ -2090,6 +2090,13 @@ impl OutputTarget for LocalOutput {
             );
 
             let mut total_frames_fed: u64 = 0;
+            let skip_bytes: u64 = if seek_offset > 0 {
+                let skip_frames = (seek_offset as f64 / 1000.0 * sample_rate as f64) as u64;
+                skip_frames * channels as u64 * bytes_per_sample as u64
+            } else {
+                0
+            };
+            let mut skipped_bytes: u64 = 0;
             let mut needs_resample = output_sr != sample_rate;
             let mut needs_channel_adapt = output_ch != channels;
 
@@ -2299,7 +2306,21 @@ impl OutputTarget for LocalOutput {
                 }
 
                 total_bytes_read += n as u64;
-                leftover.extend_from_slice(&read_buf[..n]);
+
+                // Seek skip: discard PCM bytes until we reach the seek offset
+                if skip_bytes > 0 && skipped_bytes < skip_bytes {
+                    let remaining_to_skip = (skip_bytes - skipped_bytes) as usize;
+                    if n <= remaining_to_skip {
+                        skipped_bytes += n as u64;
+                        continue;
+                    }
+                    // Partial skip: some bytes to discard, rest to process
+                    let start = remaining_to_skip;
+                    skipped_bytes = skip_bytes;
+                    leftover.extend_from_slice(&read_buf[start..n]);
+                } else {
+                    leftover.extend_from_slice(&read_buf[..n]);
+                }
 
                 let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
                 if aligned_len == 0 {
