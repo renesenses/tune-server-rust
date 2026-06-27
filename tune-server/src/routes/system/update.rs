@@ -431,7 +431,26 @@ fn install_windows(
 
     let bat_path = exe_dir.join("tune-update.bat");
     let bat_content = format!(
-        "@echo off\r\necho Waiting for server to stop...\r\ntimeout /t 2 /nobreak >nul\r\ndel \"{exe}\"\r\nrename \"{new}\" \"{exe_name}\"\r\necho Starting updated server...\r\nstart \"\" \"{exe}\"\r\ndel \"%~f0\"\r\n",
+        "@echo off\r\n\
+         echo Waiting for Tune server to stop...\r\n\
+         :wait_loop\r\n\
+         tasklist /FI \"IMAGENAME eq {exe_name}\" 2>nul | find /I \"{exe_name}\" >nul\r\n\
+         if not errorlevel 1 (\r\n\
+           timeout /t 1 /nobreak >nul\r\n\
+           goto wait_loop\r\n\
+         )\r\n\
+         timeout /t 1 /nobreak >nul\r\n\
+         echo Replacing binary...\r\n\
+         del \"{exe}\"\r\n\
+         if exist \"{exe}\" (\r\n\
+           echo File still locked, retrying...\r\n\
+           timeout /t 3 /nobreak >nul\r\n\
+           del \"{exe}\"\r\n\
+         )\r\n\
+         rename \"{new}\" \"{exe_name}\"\r\n\
+         echo Starting updated server...\r\n\
+         start \"\" \"{exe}\"\r\n\
+         del \"%~f0\"\r\n",
         exe = current_exe.display(),
         new = new_staging.display(),
         exe_name = current_exe
