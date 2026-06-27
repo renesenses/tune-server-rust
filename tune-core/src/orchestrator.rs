@@ -265,7 +265,15 @@ impl PlaybackOrchestrator {
             format: track_meta
                 .as_ref()
                 .and_then(|t| t.format.clone())
-                .or_else(|| Some(resolved.mime_type.clone())),
+                .or_else(|| {
+                    let mime = &resolved.mime_type;
+                    Some(
+                        mime.strip_prefix("audio/")
+                            .unwrap_or(mime)
+                            .replace("x-", "")
+                            .to_string(),
+                    )
+                }),
             sample_rate: resolved.sample_rate.or(track_meta
                 .as_ref()
                 .and_then(|t| t.sample_rate.map(|v| v as u32))),
