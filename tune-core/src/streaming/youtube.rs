@@ -2172,10 +2172,15 @@ impl StreamingService for YouTubeService {
 
     /// Google OAuth Device Code flow state machine.
     ///
-    /// - Empty body / `{"device_flow": true}` → start a new device code flow
+    /// - If already authenticated → return current status.
+    /// - If a device code flow is pending → poll Google for approval.
+    /// - Otherwise → start a new device code flow
     ///   (returns `verification_url` + `user_code` for the user to visit).
-    /// - `{"poll": true}` → poll for the user's approval.
-    /// - Already authenticated → return current status.
+    ///
+    /// The web client calls `POST /streaming/youtube/auth` repeatedly with an
+    /// empty body (defaulting to `{"device_flow": true}`). Each call after the
+    /// first must poll the existing flow, not restart it — otherwise the device
+    /// code the user already approved gets invalidated.
     async fn authenticate(
         &mut self,
         credentials: &serde_json::Value,
@@ -2192,15 +2197,14 @@ impl StreamingService for YouTubeService {
             });
         }
 
-        // Poll an in-progress device code flow.
-        if is_poll
-            || (self.pending_device_auth.is_some()
-                && !credentials["device_flow"].as_bool().unwrap_or(false))
-        {
-            if self.pending_device_auth.is_some() {
-                return self.poll_device_code().await;
-            }
-            // No pending flow — return unauthenticated
+        // If a device code flow is in progress, always poll it —
+        // don't restart even if the client sends `device_flow: true` again.
+        if self.pending_device_auth.is_some() {
+            return self.poll_device_code().await;
+        }
+
+        // Explicit poll request but no pending flow — return unauthenticated.
+        if is_poll {
             return Ok(AuthStatus {
                 authenticated: false,
                 ..Default::default()
