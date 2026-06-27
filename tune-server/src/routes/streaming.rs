@@ -446,7 +446,7 @@ async fn service_status(State(state): State<AppState>, Path(service): Path<Strin
     let mut svc = svc.lock().await;
     let mut status = svc.auth_status().await;
     if !status.authenticated
-        && let Ok(poll_status) = svc.authenticate(&json!({})).await
+        && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
         && poll_status.authenticated
     {
         status = poll_status;

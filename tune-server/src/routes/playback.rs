@@ -1165,16 +1165,20 @@ async fn queue_add(
             warn!(zone_id, error = %e, "append_streaming_queue_failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-        let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
-        let current_pos = state.playback.get_state(zone_id).await.queue_position;
-        state
-            .playback
-            .update_queue_info(zone_id, current_pos, new_length)
-            .await;
+        let local_count = queue_repo.count(zone_id).unwrap_or(0);
+        if local_count == 0 {
+            let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
+            let current_pos = state.playback.get_state(zone_id).await.queue_position;
+            state
+                .playback
+                .update_queue_info(zone_id, current_pos, new_length)
+                .await;
+        }
         persist_queue_async(&state, zone_id);
+        let total = queue_repo.count_streaming(zone_id).unwrap_or(0);
         return (
             StatusCode::CREATED,
-            Json(json!({ "added": 1, "queue_length": new_length })),
+            Json(json!({ "added": 1, "queue_length": total })),
         )
             .into_response();
     }

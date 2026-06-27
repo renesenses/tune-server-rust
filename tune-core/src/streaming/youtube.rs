@@ -2197,10 +2197,15 @@ impl StreamingService for YouTubeService {
             });
         }
 
-        // If a device code flow is in progress, always poll it —
-        // don't restart even if the client sends `device_flow: true` again.
-        if self.pending_device_auth.is_some() {
-            return self.poll_device_code().await;
+        // If a device code flow is in progress, poll it — unless expired.
+        if let Some(ref pending) = self.pending_device_auth {
+            if std::time::Instant::now() > pending.expires_at {
+                info!("youtube_device_code_expired_clearing");
+                self.pending_device_auth = None;
+                self.device_auth_started = None;
+            } else {
+                return self.poll_device_code().await;
+            }
         }
 
         // Explicit poll request but no pending flow — return unauthenticated.
