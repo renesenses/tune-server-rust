@@ -1033,6 +1033,29 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
     }
 }
 
+fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if file_size == 0 || lofty_ms == 0 {
+        return lofty_ms;
+    }
+    // Estimate duration from file size assuming ~320kbps max bitrate.
+    // If lofty reports more than 2x this estimate, it's likely wrong.
+    let max_bitrate_bps = 320_000u64;
+    let max_plausible_ms = (file_size * 8 * 1000) / max_bitrate_bps;
+    if lofty_ms > max_plausible_ms * 2 {
+        tracing::warn!(
+            path = %path.display(),
+            lofty_ms,
+            max_plausible_ms,
+            file_size,
+            "mp3_duration_implausible_clamping"
+        );
+        max_plausible_ms
+    } else {
+        lofty_ms
+    }
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -1142,7 +1165,19 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         original_date: get(ItemKey::OriginalReleaseDate),
         genre,
         genres,
-        duration_ms: Some(props.duration().as_millis() as u64),
+        duration_ms: {
+            let lofty_dur = props.duration().as_millis() as u64;
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if ext == "mp3" {
+                Some(mp3_duration_sanity_check(path, lofty_dur))
+            } else {
+                Some(lofty_dur)
+            }
+        },
         sample_rate: props.sample_rate(),
         bit_depth: props.bit_depth().map(|b| b as u16),
         channels: props.channels().map(|c| c as u16),
