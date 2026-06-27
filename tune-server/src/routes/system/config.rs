@@ -113,6 +113,7 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
         ("db_connected", json!(true)),
         ("metadata_readonly", json!(false)),
         ("enrich_on_scan", json!(false)),
+        ("quality_split", json!(true)),
         ("resample_policy", json!("none")),
         ("audio_buffer_kb", json!(256)),
         ("prebuffer_seconds", json!(1.0)),

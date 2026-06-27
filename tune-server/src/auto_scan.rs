@@ -20,6 +20,15 @@ pub fn build_track_from_metadata(
     artist_repo: &ArtistRepo,
     album_repo: &AlbumRepo,
 ) -> Option<(Track, Option<i64>)> {
+    build_track_from_metadata_opts(sf, artist_repo, album_repo, true)
+}
+
+pub fn build_track_from_metadata_opts(
+    sf: &ScannedFile,
+    artist_repo: &ArtistRepo,
+    album_repo: &AlbumRepo,
+    quality_split: bool,
+) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
     let is_compilation = meta.compilation
@@ -71,7 +80,11 @@ pub fn build_track_from_metadata(
         // Quality-based album splitting: append suffix when sample_rate or
         // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
         // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
-        let suffix = tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth);
+        let suffix = if quality_split {
+            tune_core::scanner::quality::quality_suffix(meta.sample_rate, meta.bit_depth)
+        } else {
+            String::new()
+        };
         let album_title = if suffix.is_empty() {
             title.clone()
         } else {
@@ -222,6 +235,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let cache_dir = crate::routes::library::artwork_cache_dir();
         info!(cache_dir = %cache_dir.display(), "artwork_cache_dir_resolved");
+        let quality_split = tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get("quality_split")
+            .ok()
+            .flatten()
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         let mut albums_with_cover: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
         let mut inserted = 0u64;
@@ -263,9 +282,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }
                     }
 
-                    let Some((mut track, album_id)) =
-                        build_track_from_metadata(sf, &artist_repo, &album_repo)
-                    else {
+                    let Some((mut track, album_id)) = build_track_from_metadata_opts(
+                        sf,
+                        &artist_repo,
+                        &album_repo,
+                        quality_split,
+                    ) else {
                         continue;
                     };
 
@@ -439,6 +461,13 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                 if !stale.is_empty() {
                     info!(count = stale.len(), "file_watcher_drained_stale_events");
                 }
+                let watcher_quality_split =
+                    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+                        .get("quality_split")
+                        .ok()
+                        .flatten()
+                        .map(|v| v != "false" && v != "0")
+                        .unwrap_or(true);
                 loop {
                     let changes = watcher.poll_debounced(
                         std::time::Duration::from_secs(2),
@@ -468,9 +497,12 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                         track_repo.delete_by_path(&sf.path).ok();
                                     }
 
-                                    let Some((track, album_id)) =
-                                        build_track_from_metadata(sf, &artist_repo, &album_repo)
-                                    else {
+                                    let Some((track, album_id)) = build_track_from_metadata_opts(
+                                        sf,
+                                        &artist_repo,
+                                        &album_repo,
+                                        watcher_quality_split,
+                                    ) else {
                                         tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                         continue;
                                     };
