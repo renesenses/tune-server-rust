@@ -162,6 +162,7 @@ struct ZonePollState {
     /// transition and forces play_from_queue.
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
+    radio_stopped_ticks: u8,
 }
 
 pub struct PositionPoller {
@@ -350,6 +351,7 @@ impl PositionPoller {
                 gapless_advance_pending: false,
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
+                radio_stopped_ticks: 0,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -473,6 +475,7 @@ impl PositionPoller {
                 let radio_stopped = status.state == TransportState::Stopped;
 
                 if !radio_stopped {
+                    ps.radio_stopped_ticks = 0;
                     // Still playing — sync volume only.
                     let zone_fixed_volume = all_zones
                         .iter()
@@ -551,14 +554,25 @@ impl PositionPoller {
                 );
 
                 if radio_stopped {
-                    // Radio stopped on the renderer — stop the zone.
-                    // Done after metrics sync so `ps` borrow is released.
-                    info!(zone_id, "radio_renderer_stopped");
-                    poll_states.remove(&zone_id);
-                    let device_id_ref = self.get_zone_device_id(zone_id);
-                    self.orchestrator
-                        .stop(zone_id, device_id_ref.as_deref())
-                        .await;
+                    ps.radio_stopped_ticks = ps.radio_stopped_ticks.saturating_add(1);
+                    if ps.radio_stopped_ticks >= 3 {
+                        info!(
+                            zone_id,
+                            ticks = ps.radio_stopped_ticks,
+                            "radio_renderer_stopped"
+                        );
+                        poll_states.remove(&zone_id);
+                        let device_id_ref = self.get_zone_device_id(zone_id);
+                        self.orchestrator
+                            .stop(zone_id, device_id_ref.as_deref())
+                            .await;
+                    } else {
+                        debug!(
+                            zone_id,
+                            ticks = ps.radio_stopped_ticks,
+                            "radio_transient_stopped_tolerating"
+                        );
+                    }
                 }
                 continue;
             }
@@ -1348,6 +1362,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            radio_stopped_ticks: 0,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1393,6 +1408,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            radio_stopped_ticks: 0,
         };
 
         // Simulates entering Playing state
@@ -1490,6 +1506,7 @@ mod tests {
             gapless_advance_pending: false,
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            radio_stopped_ticks: 0,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -1633,6 +1650,7 @@ mod tests {
             gapless_advance_pending: true, // metadata was advanced
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
+            radio_stopped_ticks: 0,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -1685,6 +1703,7 @@ mod tests {
             gapless_advance_pending: true,
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
+            radio_stopped_ticks: 0,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
