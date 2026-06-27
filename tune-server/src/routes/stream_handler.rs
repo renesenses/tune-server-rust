@@ -398,34 +398,11 @@ async fn proxy_stream(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // For non-radio proxy sessions (Qobuz/Tidal FLAC), forward a non-zero
-    // Range header to the upstream CDN.  CDN URLs (signed S3 / Akamai)
-    // support HTTP Range requests, so this enables real seeking: the
-    // renderer closes the connection and re-requests with bytes=N-, and
-    // the CDN delivers audio starting at byte N.
-    let is_seek = !is_radio
-        && range_value
-            .as_deref()
-            .map(|r| {
-                // A seek is any Range header that does NOT start at byte 0.
-                // "bytes=0-"  → initial request, handled below
-                // "bytes=N-"  → seek request, forward upstream
-                if let Some(rest) = r.strip_prefix("bytes=") {
-                    let start = rest.split('-').next().unwrap_or("0");
-                    start != "0" && !start.is_empty()
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false);
-
+    // DMP-A8 (Lavf) sends rapid micro-Range requests for FLAC header parsing.
+    // Forwarding each one to the CDN hammers Akamai and causes drops.
+    // User-initiated seeks go through the orchestrator (stream recreation),
+    // so we never need to forward Range to the CDN for proxy sessions.
     let mut upstream_req = client.get(upstream_url);
-    if is_seek {
-        // Forward the exact Range header so the CDN seeks to the right position.
-        if let Some(ref rv) = range_value {
-            upstream_req = upstream_req.header("Range", rv.as_str());
-        }
-    }
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -434,77 +411,6 @@ async fn proxy_stream(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-
-    // For seek requests, relay the upstream 206 response directly.
-    if is_seek {
-        let upstream_status = upstream_resp.status();
-        let upstream_content_type = upstream_resp
-            .headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(&info.mime_type)
-            .to_string();
-        let upstream_content_range = upstream_resp
-            .headers()
-            .get("Content-Range")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let upstream_content_length = upstream_resp
-            .headers()
-            .get("Content-Length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_str(&upstream_content_type).unwrap(),
-        );
-        headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
-        headers.insert(
-            "transferMode.dlna.org",
-            HeaderValue::from_static("Streaming"),
-        );
-        if let Some(ref cr) = upstream_content_range {
-            headers.insert(
-                "Content-Range",
-                HeaderValue::from_str(cr).unwrap_or_else(|_| HeaderValue::from_static("")),
-            );
-        }
-        if let Some(cl) = upstream_content_length {
-            headers.insert("Content-Length", HeaderValue::from(cl));
-        }
-
-        info!(
-            url = upstream_url,
-            range = range_value.as_deref().unwrap_or("-"),
-            upstream_status = upstream_status.as_u16(),
-            "proxy_seek_forwarded"
-        );
-
-        let body = Body::from_stream(async_stream::stream! {
-            let mut stream = upstream_resp.bytes_stream();
-            use futures_util::StreamExt;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                    Err(e) => {
-                        warn!(error = %e, "proxy_seek_chunk_error");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Use 206 if the upstream returned 206, otherwise mirror status.
-        let status = if upstream_status == reqwest::StatusCode::PARTIAL_CONTENT {
-            StatusCode::PARTIAL_CONTENT
-        } else {
-            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::OK)
-        };
-
-        return (status, headers, body).into_response();
-    }
 
     let upstream_content_type = upstream_resp
         .headers()
