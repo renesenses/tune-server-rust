@@ -2424,6 +2424,7 @@ impl PlaybackOrchestrator {
         };
         if let Some(output_arc) = output_arc {
             // For local outputs, set the pending start position before play
+            #[cfg(feature = "local-audio")]
             if let Some(position_ms) = start_position_ms {
                 if device_id.starts_with("local:") {
                     let output = output_arc.lock().await;
