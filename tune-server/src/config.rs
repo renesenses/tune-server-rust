@@ -152,25 +152,28 @@ impl TuneConfig {
             config.artwork_dir = format!("{data_dir}\\{}", config.artwork_dir);
         }
 
-        // On macOS, resolve a relative db_path to an absolute location so Tune
-        // works correctly regardless of the working directory (e.g. LaunchAgent
-        // starts with CWD = "/").  Backward-compat: if tune.db already exists
-        // in the CWD, keep using it so existing installs are not affected.
+        // On macOS, resolve relative paths to ~/Library/Application Support/Tune/
+        // so Tune works correctly regardless of the working directory (e.g. inside
+        // a signed .app bundle where CWD is read-only).  Backward-compat: if
+        // tune.db already exists in the CWD, keep using it.
         #[cfg(target_os = "macos")]
         if !std::path::Path::new(&config.db_path).is_absolute() {
             let cwd_db = std::path::Path::new(&config.db_path);
             if !cwd_db.exists() {
-                // Resolve to ~/Library/Application Support/Tune/tune.db
                 if let Ok(home) = std::env::var("HOME") {
                     let app_support =
                         std::path::PathBuf::from(&home).join("Library/Application Support/Tune");
                     if std::fs::create_dir_all(&app_support).is_ok() {
                         let abs_path = app_support.join(&config.db_path);
-                        info!(
-                            path = %abs_path.display(),
-                            "db_path_resolved_to_app_support"
-                        );
+                        info!(path = %abs_path.display(), "db_path_resolved_to_app_support");
                         config.db_path = abs_path.to_string_lossy().into_owned();
+
+                        if !std::path::Path::new(&config.artwork_dir).is_absolute() {
+                            let art_path = app_support.join(&config.artwork_dir);
+                            std::fs::create_dir_all(&art_path).ok();
+                            info!(path = %art_path.display(), "artwork_dir_resolved_to_app_support");
+                            config.artwork_dir = art_path.to_string_lossy().into_owned();
+                        }
                     }
                 }
             } else {

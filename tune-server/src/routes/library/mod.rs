@@ -128,6 +128,15 @@ pub(crate) fn artwork_cache_dir() -> std::path::PathBuf {
         return std::path::PathBuf::from(format!("{data_dir}\\artwork_cache"));
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let app_support = std::path::PathBuf::from(home)
+                .join("Library/Application Support/Tune/artwork_cache");
+            return app_support;
+        }
+    }
+
     #[cfg(not(target_os = "windows"))]
     std::path::PathBuf::from("artwork_cache")
 }
