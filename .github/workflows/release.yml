@@ -71,7 +71,7 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.os }}-${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
