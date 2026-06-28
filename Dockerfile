@@ -23,8 +23,9 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
     cargo build --release --package tune-server --no-default-features --features oaat 2>/dev/null || true && \
     rm -rf tune-core/src tune-pyo3/src tune-server/src tune-cli/src
 
-# Build librespot (Spotify Connect) in parallel with deps cache
-RUN cargo install librespot --no-default-features --features "alsa-backend" || true
+# Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
+RUN cargo install librespot --no-default-features --features "alsa-backend" \
+    || touch /usr/local/cargo/bin/librespot
 
 # Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
