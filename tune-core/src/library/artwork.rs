@@ -855,9 +855,8 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
         warn!(
             path = %audio_path.display(),
             cache_dir = %cache_dir.display(),
-            "artwork_extracted_but_save_failed"
+            "artwork_extracted_but_save_failed_trying_folder"
         );
-        return None;
     }
 
     // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.)
