@@ -275,14 +275,14 @@ impl AudioFormat {
     }
 
     /// Returns the target output format for DLNA transcoding.
-    /// AAC/ALAC/Opus/Ogg -> FLAC (universally supported by DLNA renderers)
-    /// DSD/WavPack/APE/WMA -> WAV (universal PCM, avoids re-encoding overhead)
+    /// All transcode targets -> WAV for maximum DLNA renderer compatibility.
+    /// The custom FLAC encoder produces files some renderers (Yamaha R-N2000A)
+    /// reject. WAV is universal PCM that every renderer handles.
     /// AIFF is served directly — DLNA renderers handle it natively.
     pub fn dlna_transcode_target(&self) -> AudioFormat {
         match self {
-            Self::Aac | Self::Aiff | Self::Alac | Self::Opus | Self::Ogg => AudioFormat::Flac,
-            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => AudioFormat::Wav,
-            other => *other,
+            Self::Aiff => AudioFormat::Aiff,
+            _ => AudioFormat::Wav,
         }
     }
 
