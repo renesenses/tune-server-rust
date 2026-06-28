@@ -39,11 +39,11 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             platform: linux-x86_64
             ext: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             platform: linux-aarch64
             ext: tar.gz
             cross: true
