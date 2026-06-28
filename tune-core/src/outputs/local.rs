@@ -1016,11 +1016,17 @@ impl OutputTarget for LocalOutput {
         // few hundred milliseconds of the new stream to contain stale data
         // from the previous session, perceived as white noise / static.
         //
-        // On Windows, WASAPI needs a longer delay (200ms) to fully release
-        // the device — 50ms causes 0x800700AA "resource busy" errors when
-        // switching tracks rapidly (reported by DEvir QA, B-01).
+        // On Windows, ASIO/WASAPI needs time to fully release the device.
+        // ASIO exclusive is slower to release (~500ms for driver teardown).
         #[cfg(target_os = "windows")]
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        {
+            let delay = if self.audio_backend == "asio" {
+                500
+            } else {
+                200
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         #[cfg(not(target_os = "windows"))]
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -2833,12 +2839,10 @@ impl OutputTarget for LocalOutput {
         let old_handle = self.play_thread.lock().unwrap().take();
         if let Some(handle) = old_handle {
             let _ = tokio::task::spawn_blocking(move || {
-                // 500 ms is enough for the thread to notice force_silent and
-                // exit its read loop. On Windows WASAPI the old thread may be
-                // blocked on a reqwest read(); force_silent is already set so
-                // the cpal callback is silent. We detach instead of waiting up
-                // to 4 s, keeping track transitions snappy.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                // Wait for the playback thread to exit. ASIO exclusive needs
+                // the device fully released before reopening — use 2s timeout
+                // instead of 500ms to avoid device contention on rapid seeks.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
                 loop {
                     if handle.is_finished() {
                         let _ = handle.join();
