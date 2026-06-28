@@ -246,13 +246,32 @@ pub struct AudioDevice {
     pub backend: String,
 }
 
+static SCAN_GUARD: std::sync::Mutex<Option<(std::time::Instant, Vec<AudioDevice>)>> =
+    std::sync::Mutex::new(None);
+const SCAN_COOLDOWN_SECS: u64 = 5;
+
 /// List audio devices using the default host.
 pub fn list_audio_devices() -> Vec<AudioDevice> {
     list_audio_devices_with_backend("auto")
 }
 
 /// List audio devices using the specified backend preference.
+/// Protected by a global Mutex + 5s cache to prevent concurrent ASIO
+/// driver enumeration which crashes on Windows (non-reentrant COM STA).
 pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
+    let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((last_scan, ref cached)) = *guard {
+        if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
+            debug!("local_audio_scan_cached");
+            return cached.clone();
+        }
+    }
+    let result = list_audio_devices_uncached(backend);
+    *guard = Some((std::time::Instant::now(), result.clone()));
+    result
+}
+
+fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     let host = select_host(backend);
     let host_name = host.id().name();
     let default_name = host

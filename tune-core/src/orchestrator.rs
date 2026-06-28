@@ -298,10 +298,18 @@ impl PlaybackOrchestrator {
             album.as_deref(),
         );
 
-        // Close old stream BEFORE sending new play to avoid audio glitch
-        // (DMP-A8 can receive stale bytes from the old stream during transition)
-        if let Some(ref old_sid) = old_stream_id {
-            self.streamer.remove_session(old_sid).await;
+        // For local outputs, keep the old stream alive until after play_url()
+        // calls stop() — otherwise the audio thread gets a read error when the
+        // HTTP session is removed while it's still reading. For network outputs
+        // (DLNA), close the old stream first to avoid stale bytes.
+        let is_local = req
+            .output_device_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("local:"));
+        if !is_local {
+            if let Some(ref old_sid) = old_stream_id {
+                self.streamer.remove_session(old_sid).await;
+            }
         }
 
         let (output_sent, output_error) = if let Some(ref device_id) = req.output_device_id {
@@ -380,7 +388,13 @@ impl PlaybackOrchestrator {
             (false, None)
         };
 
-        // Old session already removed above (before play_media)
+        // For local outputs, clean up the old stream now that play_url() has
+        // called stop() and the old audio thread is no longer reading.
+        if is_local {
+            if let Some(ref old_sid) = old_stream_id {
+                self.streamer.remove_session(old_sid).await;
+            }
+        }
 
         self.record_listen(
             &resolved.title,
