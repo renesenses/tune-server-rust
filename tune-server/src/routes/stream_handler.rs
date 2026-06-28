@@ -64,19 +64,25 @@ pub async fn handle_head(
         HeaderValue::from_str(&session.info.mime_type).unwrap(),
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-    headers.insert(
-        "transferMode.dlna.org",
-        HeaderValue::from_static("Streaming"),
-    );
 
     if is_radio {
-        // Radio streams are infinite — do not advertise Accept-Ranges or
-        // Content-Length, which would mislead the renderer into thinking
-        // the stream has a finite size.  Use Transfer-Encoding: chunked
-        // so the DMP-A8 (and similar) knows to consume indefinitely.
+        headers.insert(
+            "transferMode.dlna.org",
+            HeaderValue::from_static("Streaming"),
+        );
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
     } else {
+        headers.insert(
+            "transferMode.dlna.org",
+            HeaderValue::from_static("Interactive"),
+        );
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+        headers.insert(
+            "contentFeatures.dlna.org",
+            HeaderValue::from_static(
+                "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            ),
+        );
         if let Some(size) = file_size {
             headers.insert("Content-Length", HeaderValue::from(size));
         }
@@ -303,7 +309,14 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
         headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
         headers.insert(
             "transferMode.dlna.org",
-            HeaderValue::from_static("Streaming"),
+            HeaderValue::from_static("Interactive"),
+        );
+        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+        headers.insert(
+            "contentFeatures.dlna.org",
+            HeaderValue::from_static(
+                "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            ),
         );
 
         let path_owned = path.to_string();
@@ -349,7 +362,12 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
     headers.insert(
         "transferMode.dlna.org",
-        HeaderValue::from_static("Streaming"),
+        HeaderValue::from_static("Interactive"),
+    );
+    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+    headers.insert(
+        "contentFeatures.dlna.org",
+        HeaderValue::from_static("DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
     );
 
     let path_owned = path.to_string();
