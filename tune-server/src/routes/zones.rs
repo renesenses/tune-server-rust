@@ -285,13 +285,22 @@ fn build_signal_path(
             .flatten()
     });
 
-    let fmt_str = track
-        .as_ref()
-        .and_then(|t| t.format.clone())
+    let fmt_str = np
+        .format
+        .clone()
+        .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
         .unwrap_or_else(|| "flac".into());
     let source_format = AudioFormat::from_extension(&fmt_str);
-    let sample_rate = track.as_ref().and_then(|t| t.sample_rate).unwrap_or(44100);
-    let bit_depth = track.as_ref().and_then(|t| t.bit_depth).unwrap_or(16);
+    let sample_rate = np
+        .sample_rate
+        .map(|v| v as i32)
+        .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
+        .unwrap_or(44100);
+    let bit_depth = np
+        .bit_depth
+        .map(|v| v as i32)
+        .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
+        .unwrap_or(16);
 
     let format_name = source_format
         .as_ref()

@@ -296,13 +296,21 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
 
-                // Skip duplicate device names — cpal/CoreAudio can report the
-                // same physical device multiple times (e.g. with different
-                // stream configurations).  We keep the first occurrence.
-                if !seen_names.insert(name.clone()) {
-                    debug!(device = %name, "local_audio_device_skipped_duplicate");
-                    continue;
-                }
+                // Disambiguate duplicate device names (common on Windows WASAPI
+                // where multiple USB DACs all show as "Haut-Parleurs").
+                let name = if seen_names.contains(&name) {
+                    let mut n = 2;
+                    loop {
+                        let candidate = format!("{name} ({n})");
+                        if !seen_names.contains(&candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    name
+                };
+                seen_names.insert(name.clone());
 
                 let is_default = name == default_name;
 
@@ -2597,6 +2605,8 @@ impl OutputTarget for LocalOutput {
 
                 // Recreate the resampler if the source sample rate changed
                 if needs_resample && new_sr != prev_sr {
+                    // Sample rate changed — flush old resampler residuals
+                    resample_leftover.clear();
                     let ratio = output_sr as f64 / new_sr as f64;
                     let inv_ratio = 1.0 / ratio;
                     let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
@@ -2631,6 +2641,7 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_gapless_resampler_failed");
+                            needs_resample = false;
                             None
                         }
                     };
