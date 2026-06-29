@@ -4,6 +4,7 @@ pub mod ape;
 pub mod channels;
 pub mod decode;
 pub mod dff;
+pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
 pub mod encoder;

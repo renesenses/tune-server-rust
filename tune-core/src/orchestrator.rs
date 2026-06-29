@@ -763,6 +763,79 @@ impl PlaybackOrchestrator {
             .is_some_and(|id| id.starts_with("local:"));
         let local_needs_wav = is_local_output && source_format.is_some();
 
+        // DSD DoP (DSD over PCM) for local output when dsd_mode is "native"
+        if is_local_output && source_format == Some(AudioFormat::Dsd) {
+            let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id);
+            if dsd_mode == "native" || dsd_mode == "dop" {
+                let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
+                let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
+                let dop_channels = track.channels.max(2) as u16;
+
+                let wav_info = StreamInfo {
+                    format: "wav".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: dop_rate,
+                    bit_depth: 24,
+                    channels: dop_channels,
+                    file_size: None,
+                    duration_ms: Some(track.duration_ms as u64),
+                    ..Default::default()
+                };
+
+                let (session_id, tx, data_ready) =
+                    self.streamer.create_session(wav_info, true, 128).await;
+
+                info!(
+                    file = %file_path,
+                    dsd_rate,
+                    dop_rate,
+                    channels = dop_channels,
+                    "dsd_dop_streaming_for_local_output"
+                );
+
+                let fp = file_path.clone();
+                let ext = std::path::Path::new(&fp)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("dsf")
+                    .to_lowercase();
+                tokio::task::spawn_blocking(move || {
+                    // Send WAV header first
+                    let wav_hdr = crate::audio::wav::build_wav_header(dop_channels, dop_rate, 24);
+                    let rt = tokio::runtime::Handle::current();
+                    let _ = rt.block_on(tx.send(wav_hdr.to_vec()));
+                    data_ready.notify_one();
+
+                    let mut first = false;
+                    match crate::audio::decode::decode_dsd_to_dop_streaming(
+                        &fp, &ext, tx, 65536, &mut first, &None, &rt,
+                    ) {
+                        Ok(_) => tracing::debug!("dsd_dop_stream_complete"),
+                        Err(e) => tracing::warn!(error = %e, "dsd_dop_stream_failed"),
+                    }
+                });
+
+                let server_ip = self.server_ip();
+                let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+
+                return Ok(ResolvedStream {
+                    url: stream_url,
+                    stream_id: Some(session_id),
+                    title: track.title.clone(),
+                    artist: track.artist_name.clone(),
+                    album: track.album_title.clone(),
+                    duration_ms: Some(track.duration_ms),
+                    source: "local".into(),
+                    mime_type: "audio/wav".into(),
+                    sample_rate: Some(dop_rate),
+                    bit_depth: Some(24),
+                    channels: Some(dop_channels as u32),
+                    cover_url: self.resolve_cover_url(track.cover_path.as_deref()),
+                    file_size: None,
+                });
+            }
+        }
+
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC, WMA) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
         let is_network_output = matches!(

@@ -1204,6 +1204,93 @@ fn decode_dsd_streaming(
     Ok((output_bd, output_rate))
 }
 
+/// Streaming DSD-to-DoP encoder. Reads DSD from DSF/DFF files and outputs
+/// 24-bit PCM with DoP markers, ready for WASAPI/ASIO/CoreAudio at 176.4/352.8kHz.
+pub fn decode_dsd_to_dop_streaming(
+    file_path: &str,
+    ext: &str,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    rt: &tokio::runtime::Handle,
+) -> Result<(u16, u32), String> {
+    use super::dsd_to_dop::DsdToDoP;
+
+    let (dsd_rate, channels) = if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        (info.sample_rate, info.channels as usize)
+    } else {
+        let info = super::dff::parse_dff(file_path)?;
+        (info.sample_rate, info.channels as usize)
+    };
+    let lsb_first = ext == "dsf";
+    let dop_rate = DsdToDoP::dop_rate(dsd_rate);
+    let mut encoder = DsdToDoP::new(channels, lsb_first);
+    let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
+
+    let mut process_chunk = |dsd_chunk: &[u8]| -> Result<bool, String> {
+        let dop_bytes = encoder.feed(dsd_chunk);
+        if dop_bytes.is_empty() {
+            return Ok(false);
+        }
+        pcm_buf.extend_from_slice(&dop_bytes);
+        while pcm_buf.len() >= chunk_size {
+            let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
+            match rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tx.send(chunk),
+            )) {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Ok(true),
+                Err(_) => {
+                    tracing::warn!("dop_streaming_send_timeout_10s");
+                    return Ok(true);
+                }
+            }
+            if !*first_chunk_sent {
+                *first_chunk_sent = true;
+                if let Some(n) = data_ready {
+                    n.notify_one();
+                }
+            }
+        }
+        Ok(false)
+    };
+
+    if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            if process_chunk(&dsd_chunk)? {
+                return Ok((24, dop_rate));
+            }
+        }
+    } else {
+        let info = super::dff::parse_dff(file_path)?;
+        let read_chunk = 32768 / channels * channels;
+        let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        while let Some(dsd_chunk) = reader.next_chunk()? {
+            if process_chunk(&dsd_chunk)? {
+                return Ok((24, dop_rate));
+            }
+        }
+    }
+
+    if !pcm_buf.is_empty() {
+        let _ = rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tx.send(pcm_buf),
+        ));
+    }
+
+    debug!(
+        file = file_path,
+        dsd_rate, dop_rate, channels, "decoded_dsd_dop_streaming"
+    );
+    Ok((24, dop_rate))
+}
+
 /// Convert 24-bit LE PCM byte triples to the target bit depth.
 fn convert_24bit_pcm_to_depth(pcm_24: &[u8], target_bd: u16) -> Vec<u8> {
     if target_bd == 24 {
