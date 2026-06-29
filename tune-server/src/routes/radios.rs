@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/artwork", post(set_radio_artwork))
         .route("/export.m3u", get(export_radios_m3u))
         .route("/import", post(import_radios))
+        .route("/import/m3u", post(import_radios_m3u))
 }
 
 async fn list_radios(State(state): State<AppState>) -> Json<Value> {
@@ -432,6 +433,62 @@ async fn import_radios(
         }
     }
     (StatusCode::CREATED, Json(json!({ "imported": imported }))).into_response()
+}
+
+async fn import_radios_m3u(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let entries = tune_core::library::m3u_parser::parse_m3u_content(&body, true);
+    let repo = RadioRepo::with_backend(state.backend.clone());
+    let mut imported = 0i64;
+    let mut skipped = 0i64;
+    for entry in &entries {
+        if !entry.is_url {
+            skipped += 1;
+            continue;
+        }
+        let name = entry
+            .title
+            .clone()
+            .or_else(|| entry.extra_attrs.get("tvg-name").cloned())
+            .unwrap_or_else(|| entry.path.clone());
+        let logo = entry.extra_attrs.get("tvg-logo").cloned();
+        let group = entry.extra_attrs.get("group-title").cloned();
+        let station = RadioStation {
+            id: None,
+            name,
+            url: entry.path.clone(),
+            homepage: None,
+            logo_url: logo,
+            country: None,
+            language: None,
+            genre: group,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        };
+        match repo.create(&station) {
+            Ok(_) => imported += 1,
+            Err(e) => {
+                tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
+                skipped += 1;
+            }
+        }
+    }
+    tracing::info!(
+        imported,
+        skipped,
+        total = entries.len(),
+        "radio_import_m3u_complete"
+    );
+    (
+        StatusCode::CREATED,
+        Json(json!({ "imported": imported, "skipped": skipped, "total": entries.len() })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

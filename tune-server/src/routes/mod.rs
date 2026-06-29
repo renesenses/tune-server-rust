@@ -370,7 +370,8 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             analytics_middleware,
-        ));
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
 
     // UPnP MediaServer routes (ContentDirectory / ConnectionManager)
     let upnp_routes = state
