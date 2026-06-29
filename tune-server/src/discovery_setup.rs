@@ -56,6 +56,7 @@ pub fn spawn_ssdp_handler(
     let license = state.license.clone();
     tokio::spawn(async move {
         use tune_core::discovery::ssdp::SsdpEvent;
+        let mut seen_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(event) = ssdp_rx.recv().await {
             match event {
                 SsdpEvent::DeviceDiscovered(dev) => {
@@ -68,6 +69,7 @@ pub fn spawn_ssdp_handler(
                         &oh_listener,
                         &playback,
                         &license,
+                        &mut seen_hosts,
                     )
                     .await;
                 }
@@ -100,6 +102,7 @@ async fn handle_ssdp_discovered(
     oh_listener: &Option<Arc<OpenHomeEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
     license: &Arc<tune_core::license::LicenseManager>,
+    seen_hosts: &mut std::collections::HashSet<String>,
 ) {
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
         || dev.device_type == tune_core::discovery::device::OutputType::Openhome;
@@ -183,6 +186,7 @@ async fn handle_ssdp_discovered(
         return;
     }
     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
+        seen_hosts.insert(dev.host.clone());
         set_zone_online(event_bus, db, &dev.id, true);
         if let Some(zone_id) = zone.id {
             let vol = zone.volume as f64 / 100.0;
@@ -221,21 +225,17 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        // Dedup by host: skip if a zone already exists at the same IP
-        let existing = zone_repo.list().unwrap_or_default();
-        let host_taken = existing.iter().any(|z| {
-            z.output_device_id
-                .as_deref()
-                .is_some_and(|did| did.contains(&dev.host))
-                && z.output_type.as_deref() == Some("dlna")
-        });
-        if host_taken {
-            tracing::debug!(name = %dev.name, host = %dev.host, id = %dev.id, "ssdp_zone_host_already_exists_skipping");
+        // Dedup by host: skip if we already created a zone for this IP
+        // (e.g. Denon AVR exposes 5 UPnP services with different UUIDs
+        // but the same host — only the first one should create a zone)
+        if !seen_hosts.insert(dev.host.clone()) {
+            tracing::debug!(name = %dev.name, host = %dev.host, id = %dev.id, "ssdp_zone_host_already_seen_skipping");
             return;
         }
 
         let short_name = dev.name.split(" - ").next().unwrap_or(&dev.name);
-        let name_taken = existing.iter().any(|z| z.name == short_name);
+        let existing_zones = zone_repo.list().unwrap_or_default();
+        let name_taken = existing_zones.iter().any(|z| z.name == short_name);
         let zone_name = if name_taken {
             dev.name.clone()
         } else {

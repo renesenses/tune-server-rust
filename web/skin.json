@@ -1,0 +1,12 @@
+{
+  "id": "default",
+  "name": "Tune",
+  "version": "1.0.0",
+  "author": "Mozaik Labs",
+  "description": "Interface standard Tune — responsive, dark mode, navigation complète",
+  "framework": "svelte",
+  "api_version": "1",
+  "entry": "index.html",
+  "premium": false,
+  "tags": ["official", "responsive", "dark-mode"]
+}
