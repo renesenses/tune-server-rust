@@ -271,9 +271,15 @@ async fn restore_playback_positions(state: &AppState) {
             } else {
                 continue;
             };
+            let clamped_pos = if np.duration_ms > 0 {
+                zone.last_position_ms
+                    .min(np.duration_ms.saturating_sub(1000))
+            } else {
+                zone.last_position_ms
+            };
             state
                 .playback
-                .restore_position(zone_id, zone.last_position_ms, np)
+                .restore_position(zone_id, clamped_pos, np)
                 .await;
             info!(
                 zone_id,
