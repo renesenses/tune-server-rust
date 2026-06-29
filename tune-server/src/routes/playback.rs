@@ -1166,14 +1166,13 @@ async fn queue_add(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
         let local_count = queue_repo.count(zone_id).unwrap_or(0);
-        if local_count == 0 {
-            let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
-            let current_pos = state.playback.get_state(zone_id).await.queue_position;
-            state
-                .playback
-                .update_queue_info(zone_id, current_pos, new_length)
-                .await;
-        }
+        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
+        let total = local_count + streaming_count;
+        let current_pos = state.playback.get_state(zone_id).await.queue_position;
+        state
+            .playback
+            .update_queue_info(zone_id, current_pos, total)
+            .await;
         persist_queue_async(&state, zone_id);
         let total = queue_repo.count_streaming(zone_id).unwrap_or(0);
         return (
@@ -1228,20 +1227,22 @@ async fn queue_add(
             warn!(zone_id, error = %e, "batch_append_streaming_queue_failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
-        let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
+        let local_count = queue_repo.count(zone_id).unwrap_or(0);
+        let streaming_count = queue_repo.count_streaming(zone_id).unwrap_or(0);
+        let total = local_count + streaming_count;
         let current_pos = state.playback.get_state(zone_id).await.queue_position;
         state
             .playback
-            .update_queue_info(zone_id, current_pos, new_length)
+            .update_queue_info(zone_id, current_pos, total)
             .await;
         persist_queue_async(&state, zone_id);
         state.event_bus.emit(
             "playback.queue.track_added",
-            json!({ "zone_id": zone_id, "added": count, "queue_length": new_length }),
+            json!({ "zone_id": zone_id, "added": count, "queue_length": total }),
         );
         return (
             StatusCode::CREATED,
-            Json(json!({ "added": count, "queue_length": new_length })),
+            Json(json!({ "added": count, "queue_length": total })),
         )
             .into_response();
     }

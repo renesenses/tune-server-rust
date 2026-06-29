@@ -200,6 +200,7 @@ impl PositionPoller {
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("position_poller_started");
+            let startup_at = Instant::now();
             let mut ticker = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
             let notify = TRACK_END_NOTIFY.clone();
             let mut poll_states: HashMap<i64, ZonePollState> = HashMap::new();
@@ -211,12 +212,12 @@ impl PositionPoller {
                     _ = ticker.tick() => {},
                     _ = notify.notified() => {},
                 }
-                self.tick(&mut poll_states).await;
+                self.tick(&mut poll_states, &startup_at).await;
             }
         })
     }
 
-    async fn tick(&self, poll_states: &mut HashMap<i64, ZonePollState>) {
+    async fn tick(&self, poll_states: &mut HashMap<i64, ZonePollState>, startup_at: &Instant) {
         let states = self.playback.all_states().await;
 
         poll_states.retain(|zone_id, _| {
@@ -266,8 +267,11 @@ impl PositionPoller {
             // reports a significantly different volume from what we have in
             // memory.  Many DLNA renderers report a stale default (e.g. 50%)
             // right after playback starts, which would overwrite the user's
-            // saved volume.
+            // saved volume. Skip during the first 30s after startup to let
+            // restore_zone_volumes take precedence over device defaults.
+            let in_startup_grace = startup_at.elapsed().as_secs() < 30;
             if !zone.fixed_volume
+                && !in_startup_grace
                 && status.volume > 0.001
                 && status.state == TransportState::Playing
             {

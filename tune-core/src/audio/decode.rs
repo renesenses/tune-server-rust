@@ -470,6 +470,24 @@ fn decode_to_pcm_streaming_inner(
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| "no tokio runtime for streaming decode")?;
         let ch = target_channels.unwrap_or(decoded.channels as u32) as u16;
+        let sr = target_sample_rate.unwrap_or(decoded.sample_rate);
+        if target_bit_depth.is_some() {
+            let wav_hdr = super::wav::build_wav_header(ch, sr, output_bd);
+            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+                return Ok((output_bd, source_rate));
+            }
+            if let Some(ref n) = data_ready {
+                n.notify_one();
+            }
+            first_chunk_sent = true;
+            debug!(
+                source_rate = sr,
+                output_bd,
+                channels = ch,
+                format = ext.as_str(),
+                "streaming_decode_wav_header_sent_fallback"
+            );
+        }
         for chunk in pcm_bytes.chunks(chunk_size) {
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).

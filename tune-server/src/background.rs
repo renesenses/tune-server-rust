@@ -684,7 +684,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // calls abort() internally, killing the process with no panic/error).
     // ASIO devices are detected at startup; the hotplug rescan only needs to
     // track WASAPI device changes (USB DACs plugged/unplugged).
-    let audio_backend = {
+    let configured_backend = {
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
         settings
@@ -693,7 +693,16 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             .flatten()
             .unwrap_or_else(|| state.config.local_audio_backend.clone())
     };
-    let backend_clone = audio_backend.clone();
+    // When ASIO is configured, force WASAPI for the periodic rescan
+    // (re-probing ASIO during playback can crash the driver).
+    // ASIO devices were registered at startup and won't change.
+    let scan_backend = if configured_backend.eq_ignore_ascii_case("asio") {
+        "wasapi".to_string()
+    } else {
+        configured_backend.clone()
+    };
+    let is_asio_configured = configured_backend.eq_ignore_ascii_case("asio");
+    let backend_clone = scan_backend.clone();
     let devices = match tokio::task::spawn_blocking(move || {
         tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
     })
@@ -734,7 +743,7 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
             let local_out = tune_core::outputs::local::LocalOutput::with_options(
                 dev.name.clone(),
                 state.config.local_exclusive_mode,
-                &audio_backend,
+                &configured_backend,
             );
             outputs.register(Box::new(local_out));
             registered_count += 1;
@@ -811,6 +820,14 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
 
         for (device_id, dev_name, is_default) in &new_devices_to_zone {
+            // When ASIO is configured, don't create new zones for WASAPI
+            // devices discovered by the fallback rescan. Users should only
+            // see ASIO zones (e.g. "HoloAudio ASIO Driver"), not confusing
+            // generic WASAPI names like "Haut-parleurs" for the same DAC.
+            // Only update online status for WASAPI zones that already exist.
+            if is_asio_configured {
+                continue;
+            }
             let zone_name = if *is_default {
                 "This Computer".to_string()
             } else {
