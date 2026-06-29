@@ -628,16 +628,62 @@ impl PlaybackOrchestrator {
                     Some(2u32),
                 )
             } else if is_radio {
-                // Network outputs (DLNA): serve the radio URL directly to
-                // the renderer — no proxy. Proxying caused 3-min buffer
-                // exhaustion drops on DMP-A8. DLNA renderers can't do TLS,
-                // so downgrade https→http (icecast servers support both).
-                let direct_url = if audio_url.starts_with("https://") {
-                    audio_url.replacen("https://", "http://", 1)
+                // Network outputs (DLNA): check if the renderer supports the
+                // radio stream format (typically AAC). If not, proxy + transcode
+                // to WAV so the renderer can play it.
+                let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
+                    let radio_mime = guess_mime_from_url(audio_url);
+                    !self.dlna_supports_mime(device_id, &radio_mime).await
                 } else {
-                    audio_url.to_string()
+                    false
                 };
-                (direct_url, None, mime_type.to_string(), None, None, None)
+
+                if needs_proxy {
+                    let wav_info = StreamInfo {
+                        format: "wav".into(),
+                        mime_type: "audio/wav".into(),
+                        sample_rate: 44100,
+                        bit_depth: 16,
+                        channels: 2,
+                        file_size: None,
+                        duration_ms: None,
+                        ..Default::default()
+                    };
+                    let (session_id, tx, data_ready) =
+                        self.streamer.create_radio_session(wav_info, 256).await;
+                    info!(url = %audio_url, "radio_proxy_transcode_for_dlna");
+                    let radio_url = audio_url.to_string();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            decode_radio_stream_to_pcm(radio_url, tx, data_ready)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(())) => debug!("radio_dlna_decode_stream_ended"),
+                            Ok(Err(e)) => warn!(error = %e, "radio_dlna_decode_failed"),
+                            Err(e) => warn!(error = %e, "radio_dlna_decode_task_panic"),
+                        }
+                    });
+                    let server_ip = self.server_ip();
+                    let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+                    (
+                        stream_url,
+                        Some(session_id),
+                        "audio/wav".to_string(),
+                        Some(44100u32),
+                        Some(16u32),
+                        Some(2u32),
+                    )
+                } else {
+                    // Renderer supports the format — send direct URL.
+                    // Downgrade https→http since DLNA renderers can't do TLS.
+                    let direct_url = if audio_url.starts_with("https://") {
+                        audio_url.replacen("https://", "http://", 1)
+                    } else {
+                        audio_url.to_string()
+                    };
+                    (direct_url, None, mime_type.to_string(), None, None, None)
+                }
             } else {
                 (
                     audio_url.to_string(),
