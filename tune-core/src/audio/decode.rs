@@ -411,6 +411,36 @@ fn decode_to_pcm_streaming_inner(
             .map_err(|_| "no tokio runtime for streaming decode")?;
         let output_bd: u16 = target_bit_depth.unwrap_or(24);
 
+        // Determine output rate + channels before sending WAV header
+        let (dsd_rate, dsd_ch) = if ext == "dsf" {
+            let info = super::dsf::parse_dsf(file_path)?;
+            (info.sample_rate, info.channels)
+        } else {
+            let info = super::dff::parse_dff(file_path)?;
+            (info.sample_rate, info.channels as u32)
+        };
+        let dsd_output_rate =
+            target_sample_rate.unwrap_or_else(|| super::dsd_to_pcm::choose_output_rate(dsd_rate));
+        let dsd_channels = target_channels.unwrap_or(dsd_ch) as u16;
+
+        // Send WAV header so LocalOutput can parse stream metadata
+        if target_bit_depth.is_some() {
+            let wav_hdr = super::wav::build_wav_header(dsd_channels, dsd_output_rate, output_bd);
+            if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
+                return Ok((output_bd, dsd_output_rate));
+            }
+            if let Some(n) = &data_ready {
+                n.notify_one();
+            }
+            first_chunk_sent = true;
+            debug!(
+                source_rate = dsd_output_rate,
+                output_bd,
+                channels = dsd_channels,
+                "streaming_decode_wav_header_sent_dsd"
+            );
+        }
+
         return decode_dsd_streaming(
             file_path,
             &ext,
