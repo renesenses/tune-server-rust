@@ -33,7 +33,14 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             let norm = tune_core::scanner::walker::normalize_path(d);
             let pattern = format!("{norm}/%");
             let count: i64 = match state.backend.query_one(
-                "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
+                &format!(
+                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
+                    if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                        "$1"
+                    } else {
+                        "?1"
+                    }
+                ),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
             ) {
                 Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -101,7 +108,14 @@ pub(super) async fn browse_directory(
                 }
                 let pattern = format!("{dir_path}/%");
                 let track_count: i64 = match state.backend.query_one(
-                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE $1",
+                    &format!(
+                        "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
+                        if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                            "$1"
+                        } else {
+                            "?1"
+                        }
+                    ),
                     &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
                 ) {
                     Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
@@ -125,17 +139,24 @@ pub(super) async fn browse_directory(
 
     // List tracks in this directory (not recursive — only direct children)
     let dir_prefix = format!("{}/%", normalized_query);
-    let sql = "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
+    let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        "$1"
+    } else {
+        "?1"
+    };
+    let sql = format!(
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
                t.disc_number, t.track_number, t.duration_ms, t.file_path, \
                t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path \
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
-               WHERE t.file_path LIKE $1 \
-               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title";
+               WHERE t.file_path LIKE {ph} \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title"
+    );
     let rows = state
         .backend
         .query_many(
-            sql,
+            &sql,
             &[&dir_prefix as &dyn tune_core::db::backend::ToSqlValue],
         )
         .unwrap_or_default();
