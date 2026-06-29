@@ -684,10 +684,15 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
     // calls abort() internally, killing the process with no panic/error).
     // ASIO devices are detected at startup; the hotplug rescan only needs to
     // track WASAPI device changes (USB DACs plugged/unplugged).
-    #[cfg(target_os = "windows")]
-    let audio_backend = "wasapi".to_string();
-    #[cfg(not(target_os = "windows"))]
-    let audio_backend = state.config.local_audio_backend.clone();
+    let audio_backend = {
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .get("local_audio_backend")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| state.config.local_audio_backend.clone())
+    };
     let backend_clone = audio_backend.clone();
     let devices = match tokio::task::spawn_blocking(move || {
         tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)

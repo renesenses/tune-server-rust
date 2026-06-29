@@ -398,7 +398,12 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
 /// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.
 #[cfg(feature = "local-audio")]
 pub async fn register_local_outputs(state: &AppState) {
-    let audio_backend = &state.config.local_audio_backend;
+    // Prefer DB-persisted backend (set via UI) over config/env default
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let db_backend = settings.get("local_audio_backend").ok().flatten();
+    let audio_backend_owned =
+        db_backend.unwrap_or_else(|| state.config.local_audio_backend.clone());
+    let audio_backend = &audio_backend_owned;
     let mut devices = tune_core::outputs::local::list_audio_devices_with_backend(audio_backend);
     // When ASIO is selected but returns no devices, also enumerate WASAPI
     // so the user still has fallback outputs available.
