@@ -53,7 +53,7 @@ const STOPPED_FAILURE_THRESHOLD: u8 = 30;
 /// let the renderer buffer — especially important for streaming sources
 /// that require transcoding (e.g. Tidal AAC→FLAC for DLNA) which can
 /// take 5-15 seconds before the renderer receives any audio data.
-const TRACK_LOAD_GRACE_SECS: u64 = 20;
+const TRACK_LOAD_GRACE_SECS: u64 = 45;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
