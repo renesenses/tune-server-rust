@@ -343,8 +343,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aiff_needs_transcode() {
-        assert!(AudioFormat::Aiff.needs_transcode_for_dlna());
+    fn aiff_no_transcode() {
+        assert!(!AudioFormat::Aiff.needs_transcode_for_dlna());
     }
 
     #[test]

@@ -140,6 +140,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play(&self, mut req: PlayRequest) -> Result<PlayResult, String> {
+        let play_start = std::time::Instant::now();
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
         // the zone's DB record.  This is the primary gate for send_to_output —
@@ -243,6 +244,7 @@ impl PlaybackOrchestrator {
         self.playback.bump_generation(req.zone_id).await;
 
         let resolved = self.resolve_stream(&req).await?;
+        let resolve_ms = play_start.elapsed().as_millis();
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
         let album = req.album_title.clone().or(resolved.album.clone());
@@ -340,6 +342,15 @@ impl PlaybackOrchestrator {
                 channels: resolved.channels,
             };
             let result = self.send_to_output(device_id, &media, req.seek_ms).await;
+            let total_ms = play_start.elapsed().as_millis();
+            info!(
+                zone_id = req.zone_id,
+                resolve_ms,
+                output_ms = total_ms.saturating_sub(resolve_ms),
+                total_ms,
+                title = %resolved.title,
+                "playback_timing"
+            );
 
             // After play_media succeeds, send the zone's stored volume to the
             // renderer — but ONLY if the user has explicitly set a volume
@@ -2972,6 +2983,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn seek(&self, zone_id: i64, mut position_ms: u64, device_id: Option<&str>) {
+        let seek_start = std::time::Instant::now();
         // Clamp seek to track duration to prevent out-of-bounds seek on files
         // with incorrect metadata duration (e.g. VBR MP3 with wrong header).
         let state = self.playback.get_state(zone_id).await;
@@ -3073,7 +3085,12 @@ impl PlaybackOrchestrator {
                         }
                     }
                     self.playback.seek(zone_id, position_ms as i64).await;
-                    info!(zone_id, position_ms, "seek_streaming_direct_complete");
+                    info!(
+                        zone_id,
+                        position_ms,
+                        seek_ms = seek_start.elapsed().as_millis() as u64,
+                        "seek_streaming_direct_complete"
+                    );
                 } else {
                     // Decoded/transcoded session (WAV via mpsc): no Range
                     // support.  Recreate the stream so the renderer gets a
@@ -3133,7 +3150,12 @@ impl PlaybackOrchestrator {
                             // starts from after the Seek SOAP command, not from
                             // the play() call.
                             self.playback.seek(zone_id, position_ms as i64).await;
-                            info!(zone_id, position_ms, "seek_streaming_complete");
+                            info!(
+                                zone_id,
+                                position_ms,
+                                seek_ms = seek_start.elapsed().as_millis() as u64,
+                                "seek_streaming_complete"
+                            );
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "seek_streaming_play_recreate_failed");
@@ -3206,7 +3228,12 @@ impl PlaybackOrchestrator {
                     match self.play(req).await {
                         Ok(_) => {
                             self.playback.seek(zone_id, position_ms as i64).await;
-                            info!(zone_id, position_ms, "seek_local_output_complete");
+                            info!(
+                                zone_id,
+                                position_ms,
+                                seek_ms = seek_start.elapsed().as_millis() as u64,
+                                "seek_local_output_complete"
+                            );
                         }
                         Err(e) => {
                             warn!(zone_id, error = %e, "seek_local_output_play_failed");

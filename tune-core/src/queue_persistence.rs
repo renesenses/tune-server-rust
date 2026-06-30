@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::PlayQueueRepo;
+use crate::db::zone_repo::ZoneRepo;
 use crate::playback::ZoneState;
 
 /// Snapshot of a zone's queue state, serialized to JSON.
@@ -158,6 +159,14 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
         };
 
         let zone_id = snapshot.zone_id;
+
+        // Skip if zone no longer exists in DB
+        let zone_repo = ZoneRepo::with_backend(db.clone());
+        if zone_repo.get(zone_id).ok().flatten().is_none() {
+            debug!(zone_id, "queue_restore_zone_gone");
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
 
         // Check if DB already has a queue for this zone (don't overwrite)
         let existing = repo.get_queue(zone_id).unwrap_or_default();

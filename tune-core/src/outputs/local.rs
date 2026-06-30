@@ -553,6 +553,7 @@ pub struct LocalOutput {
     /// Pending next track for gapless playback.  Set by `set_next_media()`,
     /// consumed by the playback thread when the current track reaches EOF.
     next_media: Arc<std::sync::Mutex<Option<PendingNextMedia>>>,
+    convolver: Arc<std::sync::Mutex<Option<super::super::audio::convolver::Convolver>>>,
 }
 
 impl LocalOutput {
@@ -593,7 +594,24 @@ impl LocalOutput {
             track_ended_naturally: Arc::new(AtomicBool::new(false)),
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
+            convolver: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
+        let conv = super::super::audio::convolver::Convolver::from_wav(path, 1024)?;
+        *self.convolver.lock().unwrap() = Some(conv);
+        tracing::info!(path, device = %self.device_name, "convolver_ir_set");
+        Ok(())
+    }
+
+    pub fn clear_convolver(&self) {
+        *self.convolver.lock().unwrap() = None;
+        tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    pub fn has_convolver(&self) -> bool {
+        self.convolver.lock().unwrap().is_some()
     }
 
     /// Returns `true` if exclusive/bit-perfect mode is supported on this platform.
@@ -1087,6 +1105,7 @@ impl OutputTarget for LocalOutput {
         let duration_ms_arc = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
+        let convolver = self.convolver.clone();
         // Arcs for gapless metadata updates from the playback thread
         let next_media_ref = self.next_media.clone();
         let uri_ref = self.current_uri.clone();
@@ -1541,9 +1560,15 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
-                    let samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
+                    let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
+
+                    if let Ok(mut conv) = convolver.lock() {
+                        if let Some(ref mut c) = *conv {
+                            c.process_interleaved(&mut samples);
+                        }
+                    }
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -1738,9 +1763,15 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
 
-                    let samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
+                    let mut samples = pcm_bytes_to_f32(&leftover[..aligned_len], bit_depth);
                     let remainder = leftover[aligned_len..].to_vec();
                     leftover = remainder;
+
+                    if let Ok(mut conv) = convolver.lock() {
+                        if let Some(ref mut c) = *conv {
+                            c.process_interleaved(&mut samples);
+                        }
+                    }
 
                     feed_ring_abortable(&ring, &samples, &stop_rx, &paused, Some(&force_silent));
 
@@ -2418,6 +2449,12 @@ impl OutputTarget for LocalOutput {
                             sample_count = samples.len(),
                             "local_audio_first_samples_all_zero"
                         );
+                    }
+                }
+
+                if let Ok(mut conv) = convolver.lock() {
+                    if let Some(ref mut c) = *conv {
+                        c.process_interleaved(&mut samples);
                     }
                 }
 
