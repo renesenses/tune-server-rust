@@ -1952,13 +1952,12 @@ impl PlaybackOrchestrator {
                     let pcm_bytes = decoded.pcm_bytes();
                     let actual_bd = decoded.bit_depth;
 
-                    // 3. Encode to WAV (universal PCM, avoids custom FLAC
-                    // encoder issues with some renderers like Revox S100)
+                    // 3. Encode to FLAC (lossless, with Content-Length)
                     let rt = tokio::runtime::Handle::try_current()
                         .map_err(|e| format!("no tokio runtime: {e}"))?;
                     let encoded_data = rt.block_on(async {
                         let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            "wav",
+                            "flac",
                             decoded.sample_rate,
                             actual_bd as u32,
                             decoded.channels,

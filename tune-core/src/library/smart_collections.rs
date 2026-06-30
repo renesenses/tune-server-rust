@@ -165,7 +165,6 @@ fn strip_accents(s: &str) -> String {
 }
 
 fn accent_tolerant_like(s: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
     let stripped = strip_accents(s);
     let mut result = String::with_capacity(stripped.len());
     for (orig, norm) in s.chars().zip(stripped.chars()) {

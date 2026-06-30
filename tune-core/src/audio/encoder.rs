@@ -245,8 +245,8 @@ fn flac_start(sample_rate: u32, bit_depth: u32, channels: u32) -> FlacStreamStat
     output.extend_from_slice(b"fLaC");
 
     // 2. STREAMINFO metadata block header
-    //    1 bit is_last=1, 7 bits type=0, 24 bits length=34
-    let block_header: u32 = (1 << 31) | 34;
+    //    1 bit is_last=0, 7 bits type=0, 24 bits length=34
+    let block_header: u32 = (0 << 31) | 34; // is_last=0: VORBIS_COMMENT follows
     output.extend_from_slice(&block_header.to_be_bytes());
 
     let streaminfo_offset = output.len();
@@ -272,6 +272,11 @@ fn flac_start(sample_rate: u32, bit_depth: u32, channels: u32) -> FlacStreamStat
 
     // MD5 — 16 bytes of zeros (optional, valid per spec)
     output.extend_from_slice(&[0u8; 16]);
+
+    // 3. Empty VORBIS_COMMENT block (is_last=1, type=4, length=8)
+    //    All reference encoders (flac, ffmpeg) emit this block.
+    //    Some DLNA renderers reject FLAC without it.
+    append_empty_vorbis_comment(&mut output);
 
     FlacStreamState {
         output,
@@ -502,8 +507,8 @@ fn encode_flac_batch(
     // 1. fLaC magic
     output.extend_from_slice(b"fLaC");
 
-    // 2. STREAMINFO metadata block
-    let block_header: u32 = (1 << 31) | 34;
+    // 2. STREAMINFO metadata block (is_last=0: VORBIS_COMMENT follows)
+    let block_header: u32 = (0 << 31) | 34;
     output.extend_from_slice(&block_header.to_be_bytes());
 
     let block_size = FLAC_BLOCK_SIZE.min(total_samples);
@@ -525,6 +530,9 @@ fn encode_flac_batch(
     output.extend_from_slice(&(sr_ch_bps as u32).to_be_bytes());
     output.extend_from_slice(&(total_samples as u32).to_be_bytes());
     output.extend_from_slice(&[0u8; 16]);
+
+    // 3. Empty VORBIS_COMMENT block
+    append_empty_vorbis_comment(&mut output);
 
     // 3. Audio frames
     let mut min_frame_size: u32 = u32::MAX;
@@ -578,6 +586,15 @@ fn encode_flac_batch(
         "flac_encoded_native"
     );
     Ok(output)
+}
+
+/// Append an empty VORBIS_COMMENT metadata block (is_last=1, type=4).
+/// Body: vendor_length(0, LE) + user_comment_count(0, LE) = 8 bytes.
+fn append_empty_vorbis_comment(output: &mut Vec<u8>) {
+    let vc_header: u32 = (1 << 31) | (4 << 24) | 8; // is_last=1, type=4, length=8
+    output.extend_from_slice(&vc_header.to_be_bytes());
+    output.extend_from_slice(&0u32.to_le_bytes()); // vendor_length = 0
+    output.extend_from_slice(&0u32.to_le_bytes()); // user_comment_count = 0
 }
 
 /// Decode raw PCM bytes into i32 samples.
