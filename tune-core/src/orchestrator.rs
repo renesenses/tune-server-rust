@@ -3138,6 +3138,28 @@ impl PlaybackOrchestrator {
                     info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                     self.playback.seek(zone_id, position_ms as i64).await;
 
+                    // Stop the current output FIRST so the old ASIO/WASAPI
+                    // thread releases the device before play() creates a new
+                    // stream. Without this, the old thread may still hold the
+                    // HTTP connection when the new session starts, causing a
+                    // "request or response body error" race condition.
+                    if let Some(ref did) = state.now_playing.as_ref().and_then(|_| {
+                        ZoneRepo::with_backend(self.db.clone())
+                            .get(zone_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|z| z.output_device_id)
+                    }) {
+                        if did.starts_with("local:") {
+                            let outputs = self.outputs.lock().await;
+                            if let Some(output) = outputs.get(did.as_str()) {
+                                let _ = output.lock().await.stop().await;
+                            }
+                            drop(outputs);
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        }
+                    }
+
                     let np = state.now_playing.as_ref().unwrap();
                     let output_device_id = ZoneRepo::with_backend(self.db.clone())
                         .get(zone_id)
