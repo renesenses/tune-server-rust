@@ -606,3 +606,64 @@ pub(super) async fn update_album(
 
     Json(album.to_json()).into_response()
 }
+
+#[derive(Deserialize)]
+pub(super) struct BatchAlbumUpdate {
+    album_ids: Vec<i64>,
+    genre: Option<String>,
+    year: Option<i32>,
+    artist_id: Option<i64>,
+    artist_name: Option<String>,
+    label: Option<String>,
+}
+
+pub(super) async fn batch_update_albums(
+    State(state): State<AppState>,
+    Json(body): Json<BatchAlbumUpdate>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let mut updated = 0i64;
+
+    let resolved_artist_id = if let Some(aid) = body.artist_id {
+        Some(aid)
+    } else if let Some(ref name) = body.artist_name {
+        artist_repo
+            .get_by_name(name)
+            .ok()
+            .flatten()
+            .and_then(|a| a.id)
+            .or_else(|| {
+                artist_repo
+                    .get_or_create(name, None, None)
+                    .ok()
+                    .and_then(|a| a.id)
+            })
+    } else {
+        None
+    };
+
+    for &id in &body.album_ids {
+        let mut album = match repo.get(id) {
+            Ok(Some(a)) => a,
+            _ => continue,
+        };
+        if let Some(ref g) = body.genre {
+            album.genre = Some(g.clone());
+        }
+        if let Some(y) = body.year {
+            album.year = Some(y);
+        }
+        if let Some(ref l) = body.label {
+            album.label = Some(l.clone());
+        }
+        if let Some(aid) = resolved_artist_id {
+            album.artist_id = Some(aid);
+        }
+        if repo.update(&album).is_ok() {
+            updated += 1;
+        }
+    }
+
+    Json(serde_json::json!({ "updated": updated, "total": body.album_ids.len() })).into_response()
+}

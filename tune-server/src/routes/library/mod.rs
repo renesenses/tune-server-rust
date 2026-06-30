@@ -154,6 +154,7 @@ pub fn router() -> Router<AppState> {
         .route("/artists/{id}/similar", get(artists::artist_similar))
         .route("/artists/{id}/metadata", get(artists::artist_metadata))
         .route("/albums", get(albums::list_albums))
+        .route("/albums/batch-update", post(albums::batch_update_albums))
         .route("/albums/count", get(albums::album_count))
         .route("/albums/filters", get(albums::album_filters))
         .route("/albums/recent", get(albums::recent_albums))
