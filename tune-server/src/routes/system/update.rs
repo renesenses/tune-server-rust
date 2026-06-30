@@ -304,6 +304,28 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         info!("update_restarting");
+
+        // Spawn the updated binary before exiting. On systemd (Restart=always)
+        // this is redundant but harmless. On macOS/Windows without a service
+        // manager, this ensures the server comes back up after the update.
+        let exe = std::env::current_exe().unwrap_or_else(|_| current_exe.clone());
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match std::process::Command::new(&exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => {
+                info!(pid = child.id(), exe = %exe.display(), "update_new_process_spawned");
+            }
+            Err(e) => {
+                warn!(error = %e, "update_restart_spawn_failed — manual restart required");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);
     });
 
