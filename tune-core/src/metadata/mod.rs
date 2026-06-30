@@ -161,7 +161,40 @@ pub fn normalize_format(raw: &str, bit_depth: Option<u8>) -> String {
                 "aac".to_string()
             }
         }
+        // lofty may report "alac" directly for some M4A files
+        "alac" => "alac".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Detect ALAC vs AAC for M4A files by probing with symphonia.
+/// Returns "alac" if the codec is ALAC, "aac" otherwise.
+pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("m4a");
+    let mut format_reader = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+    let codec = format_reader
+        .default_track()
+        .map(|t| t.codec_params.codec)?;
+    let codec_name = format!("{codec:?}");
+    if codec_name.contains("alac") || codec_name.contains("ALAC") {
+        Some("alac".to_string())
+    } else {
+        Some("aac".to_string())
     }
 }
 
@@ -885,7 +918,15 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         .and_then(|e| e.to_str())
         .unwrap_or("wav")
         .to_lowercase();
-    let format = Some(normalize_format(&ext, props.bit_depth()));
+    let format = {
+        let mut fmt = normalize_format(&ext, props.bit_depth());
+        if fmt == "aac" && (ext == "m4a" || ext == "mp4") && props.bit_depth().is_none() {
+            if let Some(probed) = probe_m4a_codec(path) {
+                fmt = probed;
+            }
+        }
+        Some(fmt)
+    };
 
     tracing::debug!(
         path = %path.display(),
