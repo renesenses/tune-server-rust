@@ -808,9 +808,18 @@ async fn play(
 
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
+            let qr = PlayQueueRepo::with_backend(state.backend.clone());
+            let local_c = qr.count(zone_id).unwrap_or(0);
+            let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
+            let q_len = if local_c > 0 { local_c } else { stream_c };
+            let q_len = if q_len > 0 {
+                q_len
+            } else {
+                track_ids.len() as i64
+            };
             state
                 .playback
-                .update_queue_info(zone_id, start, track_ids.len() as i64)
+                .update_queue_info(zone_id, start, q_len)
                 .await;
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
