@@ -993,8 +993,17 @@ impl PlaybackOrchestrator {
             } else {
                 target_fmt.container_format().to_string()
             };
-            let use_file_transcode =
-                is_network_output && (target_format_str != "wav" || dlna_needs_wav);
+            // Always use file transcode for network outputs AND for local
+            // outputs playing streaming content (Qobuz/Tidal). The streaming
+            // mpsc channel closes when the decoder finishes, which is much
+            // faster than real-time playback on ASIO/WASAPI — the HTTP stream
+            // ends before the audio device has consumed all data (frames=506).
+            // File sessions serve with Content-Length and don't close early.
+            let is_streaming_source = req
+                .source
+                .as_deref()
+                .is_some_and(|s| s != "local" && s != "radio" && s != "podcast");
+            let use_file_transcode = is_network_output || is_streaming_source;
 
             let info = StreamInfo {
                 format: out_ext.clone(),
