@@ -73,60 +73,139 @@ impl MetadataEnricher {
         artist: Option<&str>,
         album: Option<&str>,
     ) -> Result<Option<MusicBrainzRecording>, String> {
-        let mut query_parts = vec![format!("recording:{title}")];
-        if let Some(a) = artist {
-            query_parts.push(format!("artist:{a}"));
-        }
-        if let Some(al) = album {
-            query_parts.push(format!("release:{al}"));
-        }
-        let query = query_parts.join(" AND ");
-
-        let resp = self
-            .client
-            .get(format!("{MUSICBRAINZ_API}/recording"))
-            .query(&[
-                ("query", &query),
-                ("fmt", &"json".to_string()),
-                ("limit", &"1".to_string()),
-            ])
-            .send()
+        self.lookup_musicbrainz_scored(title, artist, album, None)
             .await
-            .map_err(|e| format!("musicbrainz: {e}"))?;
+    }
 
-        if !resp.status().is_success() {
-            return Ok(None);
+    pub async fn lookup_musicbrainz_scored(
+        &self,
+        title: &str,
+        artist: Option<&str>,
+        album: Option<&str>,
+        duration_ms: Option<i64>,
+    ) -> Result<Option<MusicBrainzRecording>, String> {
+        let strategies: Vec<(&str, String)> = {
+            let mut s = Vec::new();
+            if let (Some(a), Some(al)) = (artist, album) {
+                s.push((
+                    "strict",
+                    format!("recording:{title} AND artist:{a} AND release:{al}"),
+                ));
+            }
+            if let Some(a) = artist {
+                s.push(("medium", format!("recording:{title} AND artist:{a}")));
+                let main_artist = a.split(',').next().unwrap_or(a).trim();
+                if main_artist != a {
+                    s.push((
+                        "main_artist",
+                        format!("recording:{title} AND artist:{main_artist}"),
+                    ));
+                }
+            }
+            s.push(("loose", format!("recording:{title}")));
+            s
+        };
+
+        for (strategy, query) in &strategies {
+            let resp = match self
+                .client
+                .get(format!("{MUSICBRAINZ_API}/recording"))
+                .query(&[("query", query.as_str()), ("fmt", "json"), ("limit", "5")])
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(strategy, error = %e, "mb_search_request_failed");
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                warn!(
+                    strategy,
+                    status = resp.status().as_u16(),
+                    "mb_search_http_error"
+                );
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                continue;
+            }
+
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(strategy, error = %e, "mb_search_parse_error");
+                    continue;
+                }
+            };
+
+            let recordings = match data["recordings"].as_array() {
+                Some(recs) if !recs.is_empty() => recs,
+                _ => {
+                    debug!(strategy, query, "mb_search_no_candidates");
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    continue;
+                }
+            };
+
+            let candidates: Vec<ScoredCandidate> = recordings
+                .iter()
+                .filter_map(|r| {
+                    let rec = parse_recording(r)?;
+                    let score = score_candidate(title, artist, duration_ms, r, &rec);
+                    Some(ScoredCandidate {
+                        recording: rec,
+                        score,
+                        mb_score: r["score"].as_i64().unwrap_or(0),
+                    })
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                continue;
+            }
+
+            let best = candidates.iter().max_by_key(|c| c.score).unwrap();
+
+            let confidence = if best.score >= 80 {
+                "high"
+            } else if best.score >= 50 {
+                "medium"
+            } else if best.score >= 30 {
+                "low"
+            } else {
+                "rejected"
+            };
+
+            info!(
+                strategy,
+                candidates = candidates.len(),
+                best_score = best.score,
+                mb_score = best.mb_score,
+                confidence,
+                best_title = %best.recording.title,
+                best_artist = ?best.recording.artist_credit,
+                "mb_search_result"
+            );
+
+            if confidence == "rejected" {
+                debug!(
+                    strategy,
+                    best_score = best.score,
+                    "mb_candidate_rejected_low_score"
+                );
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                continue;
+            }
+
+            let mut result = best.recording.clone();
+            result.confidence = Some(confidence.to_string());
+            return Ok(Some(result));
         }
 
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("mb parse: {e}"))?;
-        let recordings = data["recordings"].as_array();
-
-        let recording = recordings
-            .and_then(|recs| recs.first())
-            .map(|r| MusicBrainzRecording {
-                id: r["id"].as_str().unwrap_or("").to_string(),
-                title: r["title"].as_str().unwrap_or("").to_string(),
-                isrcs: r["isrcs"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                artist_credit: r["artist-credit"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|ac| ac["name"].as_str())
-                    .map(String::from),
-                release_group_id: r["releases"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|rel| rel["release-group"]["id"].as_str())
-                    .map(String::from),
-            });
-
-        Ok(recording)
+        info!(title, artist = ?artist, album = ?album, "mb_search_exhausted_all_strategies");
+        Ok(None)
     }
 
     /// Fetch detailed metadata for a MusicBrainz recording by its ID.
@@ -341,10 +420,11 @@ impl MetadataEnricher {
             .ok_or("track not found")?;
 
         let recording = self
-            .lookup_musicbrainz(
+            .lookup_musicbrainz_scored(
                 &track.title,
                 track.artist_name.as_deref(),
                 track.album_title.as_deref(),
+                Some(track.duration_ms as i64),
             )
             .await?;
 
@@ -404,6 +484,94 @@ pub struct MusicBrainzRecording {
     pub isrcs: Vec<String>,
     pub artist_credit: Option<String>,
     pub release_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+}
+
+struct ScoredCandidate {
+    recording: MusicBrainzRecording,
+    score: i64,
+    mb_score: i64,
+}
+
+fn parse_recording(r: &serde_json::Value) -> Option<MusicBrainzRecording> {
+    Some(MusicBrainzRecording {
+        id: r["id"].as_str()?.to_string(),
+        title: r["title"].as_str().unwrap_or("").to_string(),
+        isrcs: r["isrcs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        artist_credit: r["artist-credit"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|ac| ac["name"].as_str())
+            .map(String::from),
+        release_group_id: r["releases"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|rel| rel["release-group"]["id"].as_str())
+            .map(String::from),
+        confidence: None,
+    })
+}
+
+fn score_candidate(
+    query_title: &str,
+    query_artist: Option<&str>,
+    query_duration_ms: Option<i64>,
+    raw: &serde_json::Value,
+    rec: &MusicBrainzRecording,
+) -> i64 {
+    let mut score: i64 = 0;
+
+    // MusicBrainz API score (0-100) — weighted at 30%
+    let mb_score = raw["score"].as_i64().unwrap_or(0);
+    score += mb_score * 30 / 100;
+
+    // Title similarity (0-40 points)
+    let title_sim = string_similarity(&rec.title.to_lowercase(), &query_title.to_lowercase());
+    score += (title_sim * 40.0) as i64;
+
+    // Artist similarity (0-20 points)
+    if let (Some(rec_artist), Some(q_artist)) = (rec.artist_credit.as_deref(), query_artist) {
+        let artist_sim = string_similarity(&rec_artist.to_lowercase(), &q_artist.to_lowercase());
+        score += (artist_sim * 20.0) as i64;
+    }
+
+    // Duration match (0-10 points, penalty for large difference)
+    if let Some(q_dur) = query_duration_ms {
+        if let Some(mb_dur) = raw["length"].as_i64() {
+            let diff_ms = (q_dur - mb_dur).unsigned_abs();
+            if diff_ms < 2000 {
+                score += 10;
+            } else if diff_ms < 5000 {
+                score += 5;
+            } else if diff_ms > 30000 {
+                score -= 10;
+            }
+        }
+    }
+
+    score
+}
+
+fn string_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let max_len = a_chars.len().max(b_chars.len());
+    let common = a_chars.iter().filter(|c| b_chars.contains(c)).count();
+    common as f64 / max_len as f64
 }
 
 #[cfg(test)]
