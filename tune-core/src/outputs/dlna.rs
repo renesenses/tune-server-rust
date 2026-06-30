@@ -418,9 +418,14 @@ impl OutputTarget for DlnaOutput {
             return Ok(());
         }
         let level = (volume * 100.0).round() as u32;
-        self.rc_action("SetVolume", &format!(
+        let resp = self.rc_action("SetVolume", &format!(
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>"
         )).await?;
+        if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+            warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
+        } else {
+            debug!(device = %self.name, level, "dlna_set_volume_ok");
+        }
         Ok(())
     }
 
