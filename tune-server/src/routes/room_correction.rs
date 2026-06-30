@@ -27,6 +27,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/analyze", post(analyze_handler))
         .route("/profiles/{zone_id}/apply", post(apply_profile_handler))
+        .route("/ir/upload/{zone_id}", post(upload_ir_handler))
+        .route("/ir/clear/{zone_id}", post(clear_ir_handler))
+        .route("/ir/status/{zone_id}", get(ir_status_handler))
 }
 
 // ---------------------------------------------------------------------------
@@ -279,4 +282,145 @@ async fn apply_profile_handler(
         "filter_count": profile.filters.len(),
     }))
     .into_response())
+}
+
+/// `POST /room-correction/ir/upload/{zone_id}` — upload a WAV impulse response
+async fn upload_ir_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone = match zone_repo.get(zone_id) {
+        Ok(Some(z)) => z,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "zone not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let device_id = zone.output_device_id.unwrap_or_default();
+    if !device_id.starts_with("local:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "FIR convolution only available on local outputs"})),
+        )
+            .into_response();
+    }
+
+    let ir_dir =
+        std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
+            .join("ir");
+    std::fs::create_dir_all(&ir_dir).ok();
+    let ir_path = ir_dir.join(format!("zone_{zone_id}.wav"));
+    if let Err(e) = std::fs::write(&ir_path, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
+        )
+            .into_response();
+    }
+
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(local) = output
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+        {
+            match local.set_convolver_ir(ir_path.to_str().unwrap_or("")) {
+                Ok(()) => {
+                    let settings = SettingsRepo::with_backend(state.backend.clone());
+                    settings
+                        .set(
+                            &format!("ir_path_{zone_id}"),
+                            ir_path.to_str().unwrap_or(""),
+                        )
+                        .ok();
+                    return Json(json!({"ok": true, "zone_id": zone_id, "ir_path": ir_path.display().to_string(), "size_bytes": body.len()})).into_response();
+                }
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+                }
+            }
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "local output not found for this zone"})),
+    )
+        .into_response()
+}
+
+/// `POST /room-correction/ir/clear/{zone_id}` — remove FIR convolution
+async fn clear_ir_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> impl IntoResponse {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone = match zone_repo.get(zone_id) {
+        Ok(Some(z)) => z,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "zone not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    let device_id = zone.output_device_id.unwrap_or_default();
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(local) = output
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+        {
+            local.clear_convolver();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            settings.delete(&format!("ir_path_{zone_id}")).ok();
+            return Json(json!({"ok": true, "zone_id": zone_id})).into_response();
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "local output not found"})),
+    )
+        .into_response()
+}
+
+/// `GET /room-correction/ir/status/{zone_id}` — check if FIR is active
+async fn ir_status_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> impl IntoResponse {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone = match zone_repo.get(zone_id) {
+        Ok(Some(z)) => z,
+        _ => return Json(json!({"active": false, "zone_id": zone_id})).into_response(),
+    };
+
+    let device_id = zone.output_device_id.unwrap_or_default();
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(&device_id) {
+        let output = output.lock().await;
+        if let Some(local) = output
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+        {
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let ir_path = settings.get(&format!("ir_path_{zone_id}")).ok().flatten();
+            return Json(json!({
+                "active": local.has_convolver(),
+                "zone_id": zone_id,
+                "ir_path": ir_path,
+            }))
+            .into_response();
+        }
+    }
+    Json(json!({"active": false, "zone_id": zone_id})).into_response()
 }
