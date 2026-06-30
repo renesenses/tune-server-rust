@@ -324,26 +324,30 @@ async fn upload_ir_handler(
             .into_response();
     }
 
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
-        let output = output.lock().await;
-        if let Some(local) = output
-            .as_any()
-            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-        {
-            match local.set_convolver_ir(ir_path.to_str().unwrap_or("")) {
-                Ok(()) => {
-                    let settings = SettingsRepo::with_backend(state.backend.clone());
-                    settings
-                        .set(
-                            &format!("ir_path_{zone_id}"),
-                            ir_path.to_str().unwrap_or(""),
-                        )
-                        .ok();
-                    return Json(json!({"ok": true, "zone_id": zone_id, "ir_path": ir_path.display().to_string(), "size_bytes": body.len()})).into_response();
-                }
-                Err(e) => {
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    #[cfg(feature = "local-audio")]
+    {
+        let outputs = state.outputs.lock().await;
+        if let Some(output) = outputs.get(&device_id) {
+            let output = output.lock().await;
+            if let Some(local) = output
+                .as_any()
+                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            {
+                match local.set_convolver_ir(ir_path.to_str().unwrap_or("")) {
+                    Ok(()) => {
+                        let settings = SettingsRepo::with_backend(state.backend.clone());
+                        settings
+                            .set(
+                                &format!("ir_path_{zone_id}"),
+                                ir_path.to_str().unwrap_or(""),
+                            )
+                            .ok();
+                        return Json(json!({"ok": true, "zone_id": zone_id, "ir_path": ir_path.display().to_string(), "size_bytes": body.len()})).into_response();
+                    }
+                    Err(e) => {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
+                            .into_response();
+                    }
                 }
             }
         }
@@ -373,19 +377,23 @@ async fn clear_ir_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
-        let output = output.lock().await;
-        if let Some(local) = output
-            .as_any()
-            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-        {
-            local.clear_convolver();
-            let settings = SettingsRepo::with_backend(state.backend.clone());
-            settings.delete(&format!("ir_path_{zone_id}")).ok();
-            return Json(json!({"ok": true, "zone_id": zone_id})).into_response();
+    #[cfg(feature = "local-audio")]
+    {
+        let outputs = state.outputs.lock().await;
+        if let Some(output) = outputs.get(&device_id) {
+            let output = output.lock().await;
+            if let Some(local) = output
+                .as_any()
+                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            {
+                local.clear_convolver();
+                let settings = SettingsRepo::with_backend(state.backend.clone());
+                settings.delete(&format!("ir_path_{zone_id}")).ok();
+                return Json(json!({"ok": true, "zone_id": zone_id})).into_response();
+            }
         }
     }
+    let _ = device_id;
     (
         StatusCode::NOT_FOUND,
         Json(json!({"error": "local output not found"})),
@@ -405,22 +413,26 @@ async fn ir_status_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
-    let outputs = state.outputs.lock().await;
-    if let Some(output) = outputs.get(&device_id) {
-        let output = output.lock().await;
-        if let Some(local) = output
-            .as_any()
-            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-        {
-            let settings = SettingsRepo::with_backend(state.backend.clone());
-            let ir_path = settings.get(&format!("ir_path_{zone_id}")).ok().flatten();
-            return Json(json!({
-                "active": local.has_convolver(),
-                "zone_id": zone_id,
-                "ir_path": ir_path,
-            }))
-            .into_response();
+    #[cfg(feature = "local-audio")]
+    {
+        let outputs = state.outputs.lock().await;
+        if let Some(output) = outputs.get(&device_id) {
+            let output = output.lock().await;
+            if let Some(local) = output
+                .as_any()
+                .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            {
+                let settings = SettingsRepo::with_backend(state.backend.clone());
+                let ir_path = settings.get(&format!("ir_path_{zone_id}")).ok().flatten();
+                return Json(json!({
+                    "active": local.has_convolver(),
+                    "zone_id": zone_id,
+                    "ir_path": ir_path,
+                }))
+                .into_response();
+            }
         }
     }
+    let _ = device_id;
     Json(json!({"active": false, "zone_id": zone_id})).into_response()
 }
