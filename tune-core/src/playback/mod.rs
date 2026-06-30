@@ -282,9 +282,11 @@ impl PlaybackManager {
 
     pub async fn set_volume(&self, zone_id: i64, volume: f64) {
         let mut zones = self.zones.lock().await;
-        if let Some(state) = zones.get_mut(&zone_id) {
-            state.volume = volume.clamp(0.0, 1.0);
-        }
+        let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
+            zone_id,
+            ..Default::default()
+        });
+        state.volume = volume.clamp(0.0, 1.0);
         self.emit(PlaybackEvent {
             event: "volume".into(),
             zone_id,
