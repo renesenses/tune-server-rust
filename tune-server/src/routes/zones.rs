@@ -259,6 +259,17 @@ pub async fn create_zone_handler(
     create_zone(state, body).await
 }
 
+/// Public wrapper for use from ws.rs snapshot builder.
+pub fn build_signal_path_pub(
+    ps: &ZoneState,
+    zone: &Zone,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    renderer_label: Option<&str>,
+    audio_backend: &str,
+) -> Option<Value> {
+    build_signal_path(ps, zone, backend, renderer_label, audio_backend)
+}
+
 /// Build the `signal_path` object for a zone's current playback.
 /// Returns `None` when the zone is not playing.
 ///

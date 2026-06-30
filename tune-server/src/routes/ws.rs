@@ -37,10 +37,27 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
 async fn build_snapshot(state: &AppState) -> serde_json::Value {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zones = zone_repo.list().unwrap_or_default();
+    #[cfg(feature = "local-audio")]
+    let audio_backend =
+        tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+    #[cfg(not(feature = "local-audio"))]
+    let audio_backend = "none";
+    let devices = state.scanner.lock().await.devices().await;
     let mut zone_snaps = Vec::with_capacity(zones.len());
     for z in &zones {
         let zid = z.id.unwrap_or(0);
         let ps = state.playback.get_state(zid).await;
+        let renderer_label = z
+            .output_device_id
+            .as_deref()
+            .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+        let signal_path = crate::routes::zones::build_signal_path_pub(
+            &ps,
+            z,
+            &state.backend,
+            renderer_label,
+            audio_backend,
+        );
         zone_snaps.push(serde_json::json!({
             "zone_id": zid,
             "name": z.name,
@@ -60,6 +77,7 @@ async fn build_snapshot(state: &AppState) -> serde_json::Value {
             "queue_position": ps.queue_position,
             "queue_length": ps.queue_length,
             "now_playing": ps.now_playing,
+            "signal_path": signal_path,
         }));
     }
 
