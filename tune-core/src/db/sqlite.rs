@@ -294,7 +294,10 @@ CREATE TABLE IF NOT EXISTS zones (
     last_track_source_id TEXT,
     max_sample_rate INTEGER,
     fixed_volume INTEGER DEFAULT 0,
-    autoplay_enabled INTEGER DEFAULT 0
+    autoplay_enabled INTEGER DEFAULT 0,
+    is_hidden INTEGER DEFAULT 0,
+    last_play_state TEXT DEFAULT 'stopped',
+    dsd_mode TEXT DEFAULT 'auto'
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (

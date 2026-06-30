@@ -739,24 +739,34 @@ async fn create_zone(
     let output_type = body.output_type.as_deref();
     let output_device_id = body.output_device_id.as_deref();
 
-    // If device already has a zone, return it (no premium check needed)
+    // If device already has a zone (visible OR hidden), return it (no premium check needed).
+    // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
+    // prior settings (volume, DSP, gapless, etc.) are preserved.
     if let Some(device_id) = output_device_id {
         let repo = ZoneRepo::with_backend(state.backend.clone());
-        if let Ok(zones) = repo.list() {
-            if let Some(existing) = zones
-                .iter()
-                .find(|z| z.output_device_id.as_deref() == Some(device_id))
-            {
-                if let Some(id) = existing.id {
-                    let _ = repo.update_online(id, true);
-                    let zone = repo.get(id).ok().flatten();
-                    let v = zone
-                        .as_ref()
-                        .map(|z| serde_json::to_value(z).unwrap_or_default())
-                        .unwrap_or(json!({"id": id}));
-                    info!(zone_id = id, device_id, "zone_already_exists_returning");
-                    return (StatusCode::OK, Json(v)).into_response();
+        if let Ok(Some(existing)) = repo.get_by_device_id(device_id) {
+            if let Some(id) = existing.id {
+                // Unhide if the zone was soft-deleted
+                if repo.is_device_hidden(device_id) {
+                    info!(
+                        zone_id = id,
+                        device_id, "unhiding_previously_deleted_zone_via_api"
+                    );
+                    let _ = repo.unhide(id);
+                    // Update name in case device was renamed
+                    let _ = repo.update_name(id, &body.name);
+                    if let Some(ref ot) = body.output_type {
+                        let _ = repo.update_output_type(id, ot);
+                    }
                 }
+                let _ = repo.update_online(id, true);
+                let zone = repo.get(id).ok().flatten();
+                let v = zone
+                    .as_ref()
+                    .map(|z| serde_json::to_value(z).unwrap_or_default())
+                    .unwrap_or(json!({"id": id}));
+                info!(zone_id = id, device_id, "zone_already_exists_returning");
+                return (StatusCode::OK, Json(v)).into_response();
             }
         }
     }
@@ -857,6 +867,34 @@ async fn create_zone(
             );
 
             (StatusCode::CREATED, Json(v)).into_response()
+        }
+        Err(e) if e.contains("UNIQUE constraint failed") => {
+            // Safety net: a hidden zone with this device_id blocked the INSERT.
+            // Unhide it and return it instead of erroring.
+            if let Some(device_id) = output_device_id {
+                if let Ok(Some(existing)) = repo.get_by_device_id(device_id) {
+                    if let Some(id) = existing.id {
+                        warn!(
+                            zone_id = id,
+                            device_id, "unique_constraint_recovery_unhiding_zone"
+                        );
+                        let _ = repo.unhide(id);
+                        let _ = repo.update_name(id, &body.name);
+                        let _ = repo.update_online(id, true);
+                        let zone = repo.get(id).ok().flatten();
+                        let v = zone
+                            .as_ref()
+                            .map(|z| serde_json::to_value(z).unwrap_or_default())
+                            .unwrap_or(json!({"id": id}));
+                        return (StatusCode::OK, Json(v)).into_response();
+                    }
+                }
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": e})),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

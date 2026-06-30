@@ -240,6 +240,9 @@ impl ZoneRepo {
     /// Atomically get an existing zone by output_device_id, or create a new one.
     /// Returns `(zone_id, created)` where `created` is true if a new zone was inserted.
     ///
+    /// If the device previously had a zone that was soft-deleted (is_hidden=1),
+    /// the zone is un-hidden and returned instead of creating a duplicate.
+    ///
     /// If a concurrent writer inserts the same device_id between our check and
     /// our INSERT (race), the UNIQUE index will reject the INSERT.  We catch
     /// that and return the existing zone instead of propagating the error.
@@ -252,6 +255,22 @@ impl ZoneRepo {
         // Check if a zone with this device_id already exists (including hidden).
         if let Some(existing) = self.get_by_device_id(output_device_id)? {
             if let Some(id) = existing.id {
+                // If the zone was soft-deleted, resurrect it so it appears
+                // in list() again.  This preserves the user's previous
+                // settings (volume, DSP, gapless, etc.).
+                if self.is_device_hidden(output_device_id) {
+                    tracing::info!(
+                        zone_id = id,
+                        device_id = output_device_id,
+                        "unhiding_previously_deleted_zone"
+                    );
+                    self.unhide(id)?;
+                    // Update name in case the device was renamed
+                    let _ = self.update_name(id, name);
+                    if let Some(ot) = output_type {
+                        let _ = self.update_output_type(id, ot);
+                    }
+                }
                 return Ok((id, false));
             }
         }
@@ -259,10 +278,23 @@ impl ZoneRepo {
         match self.create(name, output_type, Some(output_device_id)) {
             Ok(id) => Ok((id, true)),
             Err(e) if e.contains("UNIQUE constraint failed") => {
-                // Race: another thread inserted the same device_id between our
-                // check and our INSERT.  Return the existing zone.
+                // Race or hidden zone: another thread inserted the same
+                // device_id, or a hidden zone exists with this device_id.
+                // Unhide + return the existing zone.
                 if let Some(existing) = self.get_by_device_id(output_device_id)? {
                     if let Some(id) = existing.id {
+                        if self.is_device_hidden(output_device_id) {
+                            tracing::info!(
+                                zone_id = id,
+                                device_id = output_device_id,
+                                "unhiding_zone_after_unique_conflict"
+                            );
+                            self.unhide(id)?;
+                            let _ = self.update_name(id, name);
+                            if let Some(ot) = output_type {
+                                let _ = self.update_output_type(id, ot);
+                            }
+                        }
                         return Ok((id, false));
                     }
                 }
