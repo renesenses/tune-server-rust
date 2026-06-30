@@ -116,12 +116,30 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                 )
             {
                 let (sql, params) = sc.compile_sql();
-                let count_sql = format!("SELECT COUNT(*) FROM ({sql})");
+                let track_count_sql = format!("SELECT COUNT(*) FROM ({sql})");
+                let album_count_sql = format!(
+                    "SELECT COUNT(DISTINCT t.album_id) FROM tracks t \
+                     LEFT JOIN albums al ON t.album_id = al.id \
+                     LEFT JOIN artists ar ON t.artist_id = ar.id \
+                     WHERE t.id IN ({sql})"
+                );
                 let param_refs: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
                     .iter()
                     .map(|p| p as &dyn tune_core::db::backend::ToSqlValue)
                     .collect();
-                if let Ok(count_rows) = state.backend.query_many(&count_sql, &param_refs) {
+                if let Ok(count_rows) = state.backend.query_many(&track_count_sql, &param_refs) {
+                    let count = count_rows
+                        .first()
+                        .and_then(|r| r.first())
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    col["track_count"] = json!(count);
+                }
+                let param_refs2: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+                    .iter()
+                    .map(|p| p as &dyn tune_core::db::backend::ToSqlValue)
+                    .collect();
+                if let Ok(count_rows) = state.backend.query_many(&album_count_sql, &param_refs2) {
                     let count = count_rows
                         .first()
                         .and_then(|r| r.first())
