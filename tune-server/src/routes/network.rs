@@ -25,6 +25,8 @@ struct CreateMount {
 struct ScanHostQuery {
     host: String,
     protocol: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +209,7 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
         // Platform-specific SMB share enumeration
         let mut output = String::new();
         let mut success = false;
+        let mut last_error = String::new();
 
         // Windows: net view \\host
         if !success {
@@ -221,47 +224,76 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
                 if out.status.success() {
                     output = String::from_utf8_lossy(&out.stdout).to_string();
                     success = true;
+                } else {
+                    last_error = String::from_utf8_lossy(&out.stderr).to_string();
                 }
             }
         }
 
         // macOS: smbutil view
         if !success {
+            let smb_user = q.username.as_deref().unwrap_or("guest");
+            let smb_url = if let Some(ref pw) = q.password {
+                if !pw.is_empty() {
+                    format!("//{}:{}@{}", smb_user, pw, host)
+                } else {
+                    format!("//{}@{}", smb_user, host)
+                }
+            } else {
+                format!("//{}@{}", smb_user, host)
+            };
             if let Ok(Ok(out)) = tokio::time::timeout(
                 Duration::from_secs(10),
-                Command::new("smbutil")
-                    .args(["view", &format!("//guest@{host}")])
-                    .output(),
+                Command::new("smbutil").args(["view", &smb_url]).output(),
             )
             .await
             {
                 if out.status.success() {
                     output = String::from_utf8_lossy(&out.stdout).to_string();
                     success = true;
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    if !stdout.trim().is_empty() {
+                        output = stdout;
+                        success = true;
+                    } else {
+                        last_error = stderr;
+                    }
                 }
             }
         }
 
         // Linux: smbclient -N -L
         if !success {
+            let mut smb_args = vec!["-L".to_string(), format!("//{host}")];
+            if let Some(ref user) = q.username {
+                smb_args.push("-U".to_string());
+                if let Some(ref pw) = q.password {
+                    if !pw.is_empty() {
+                        smb_args.push(format!("{}%{}", user, pw));
+                    } else {
+                        smb_args.push(user.clone());
+                        smb_args.push("-N".to_string());
+                    }
+                } else {
+                    smb_args.push(user.clone());
+                    smb_args.push("-N".to_string());
+                }
+            } else {
+                smb_args.push("-N".to_string());
+            }
             match tokio::time::timeout(
                 Duration::from_secs(10),
-                Command::new("smbclient")
-                    .args(["-N", "-L", &format!("//{host}")])
-                    .output(),
+                Command::new("smbclient").args(&smb_args).output(),
             )
             .await
             {
                 Ok(Ok(out)) => {
                     output = String::from_utf8_lossy(&out.stdout).to_string();
-                    let _ = success; // final fallback, no further check needed
                 }
-                Ok(Err(e)) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": format!("No SMB client available (net/smbutil/smbclient): {e}") })),
-                    )
-                        .into_response();
+                Ok(Err(_)) => {
+                    // smbclient not available — use last_error from previous tools
                 }
                 Err(_) => {
                     return (
@@ -271,6 +303,20 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
                         .into_response();
                 }
             }
+        }
+
+        if output.trim().is_empty() && !last_error.is_empty() {
+            let msg = if last_error.contains("Authentication")
+                || last_error.contains("auth")
+                || last_error.contains("STATUS_ACCESS_DENIED")
+            {
+                format!(
+                    "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({last_error})"
+                )
+            } else {
+                format!("Impossible de scanner {host}: {last_error}")
+            };
+            return (StatusCode::OK, Json(json!({ "shares": [], "error": msg }))).into_response();
         }
 
         output

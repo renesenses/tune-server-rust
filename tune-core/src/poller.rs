@@ -30,7 +30,7 @@ pub struct ZonePollerMetrics {
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
-const GAPLESS_WINDOW_MS: u64 = 10_000;
+const GAPLESS_WINDOW_MS: u64 = 30_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Grace period (seconds) after a seek during which the poller does not
 /// overwrite the in-memory position with the value reported by the output.
