@@ -86,6 +86,10 @@ const POSITION_PAST_END_TICKS: u8 = 3;
 /// This handles renderers that accept SetNextAVTransportURI but don't actually
 /// auto-transition — the poller would otherwise get stuck forever.
 const GAPLESS_STUCK_THRESHOLD: u8 = 2;
+/// Grace period (seconds) after a user volume change during which the poller
+/// does not overwrite the volume with the renderer-reported value. Prevents
+/// the slider from bouncing back on DLNA renderers with latent GetVolume.
+const VOLUME_GRACE_SECS: u64 = 5;
 
 fn rand_pos(queue_length: i64, current: i64) -> i64 {
     if queue_length <= 1 {
@@ -156,6 +160,10 @@ struct ZonePollState {
     /// renderer stays Stopped after gapless_cooldown expires, this flag lets
     /// the poller detect the stuck state and force a play_from_queue.
     gapless_advance_pending: bool,
+    /// When the user last changed the volume via the API.
+    /// During VOLUME_GRACE_SECS after this, the poller ignores renderer-reported
+    /// volume to prevent the slider from bouncing back.
+    volume_changed_at: Option<Instant>,
     /// Counts Stopped ticks after gapless_cooldown expires while
     /// gapless_advance_pending is true.  When this reaches
     /// GAPLESS_STUCK_THRESHOLD, the poller gives up on the gapless
@@ -270,8 +278,15 @@ impl PositionPoller {
             // saved volume. Skip during the first 30s after startup to let
             // restore_zone_volumes take precedence over device defaults.
             let in_startup_grace = startup_at.elapsed().as_secs() < 30;
+            let in_volume_grace = self
+                .playback
+                .get_state(zone_id)
+                .await
+                .last_volume_set_at
+                .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
             if !zone.fixed_volume
                 && !in_startup_grace
+                && !in_volume_grace
                 && status.volume > 0.001
                 && status.volume < 0.999
                 && status.state == TransportState::Playing
@@ -360,6 +375,7 @@ impl PositionPoller {
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
                 radio_stopped_ticks: 0,
+                volume_changed_at: None,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -490,7 +506,11 @@ impl PositionPoller {
                         .find(|z| z.id == Some(zone_id))
                         .map(|z| z.fixed_volume)
                         .unwrap_or(false);
+                    let in_vol_grace = zone_state
+                        .last_volume_set_at
+                        .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
                     if !zone_fixed_volume
+                        && !in_vol_grace
                         && status.volume < 0.999
                         && (status.volume - zone_state.volume).abs() > 0.005
                     {
@@ -680,7 +700,11 @@ impl PositionPoller {
                 .find(|z| z.id == Some(zone_id))
                 .map(|z| z.fixed_volume)
                 .unwrap_or(false);
+            let in_vol_grace2 = zone_state
+                .last_volume_set_at
+                .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
             if !zone_fixed_volume
+                && !in_vol_grace2
                 && status.volume < 0.999
                 && (status.volume - zone_state.volume).abs() > 0.005
             {
@@ -1419,6 +1443,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            volume_changed_at: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1465,6 +1490,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            volume_changed_at: None,
         };
 
         // Simulates entering Playing state
@@ -1563,6 +1589,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            volume_changed_at: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -1707,6 +1734,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            volume_changed_at: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -1760,6 +1788,7 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            volume_changed_at: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)

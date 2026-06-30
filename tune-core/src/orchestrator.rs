@@ -3215,6 +3215,7 @@ impl PlaybackOrchestrator {
         }
 
         self.playback.set_volume(zone_id, volume).await;
+        self.playback.mark_volume_changed(zone_id).await;
         if let Some(did) = device_id {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(did) {

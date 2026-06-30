@@ -61,6 +61,11 @@ pub struct ZoneState {
     /// period so the UI doesn't snap back to the pre-seek position.
     #[serde(skip)]
     pub last_seek_at: Option<Instant>,
+    /// Timestamp of the last user-initiated volume change.  The poller
+    /// ignores renderer-reported volume for a grace period to prevent
+    /// the slider from bouncing back on slow DLNA renderers.
+    #[serde(skip)]
+    pub last_volume_set_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +91,7 @@ impl Default for ZoneState {
             queue_length: 0,
             track_generation: 0,
             last_seek_at: None,
+            last_volume_set_at: None,
         }
     }
 }
@@ -284,6 +290,13 @@ impl PlaybackManager {
             zone_id,
             data: serde_json::json!({ "volume": volume }),
         });
+    }
+
+    pub async fn mark_volume_changed(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_volume_set_at = Some(Instant::now());
+        }
     }
 
     pub async fn set_mute(&self, zone_id: i64, muted: bool) {
