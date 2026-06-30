@@ -1215,8 +1215,8 @@ impl PlaybackOrchestrator {
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
                 let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-                let streamer_sessions = self.streamer.sessions_state();
-                let close_session_id = session_id.clone();
+                let _streamer_sessions = self.streamer.sessions_state();
+                let _close_session_id = session_id.clone();
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
@@ -1274,12 +1274,9 @@ impl PlaybackOrchestrator {
                         }
                     }
 
-                    // Close the session's sender so the HTTP stream gets EOF
-                    // and the local output detects end-of-track.
-                    let sessions = streamer_sessions.lock().await;
-                    if let Some(session) = sessions.get(&close_session_id) {
-                        session.close_sender().await;
-                    }
+                    // EOF is signalled naturally when the decoder's tx is
+                    // dropped (the session no longer holds a clone since we
+                    // use take() instead of clone() in create_session).
                 });
 
                 (

@@ -121,7 +121,7 @@ impl AudioStreamer {
             .tx
             .lock()
             .await
-            .clone()
+            .take()
             .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
         self.sessions
@@ -189,7 +189,7 @@ impl AudioStreamer {
             .tx
             .lock()
             .await
-            .clone()
+            .take()
             .expect("freshly created session has tx");
         let data_ready = session.data_ready.clone();
         self.sessions
