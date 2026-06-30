@@ -40,6 +40,10 @@ pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// Keeps the channel open until the session is removed, even after the
+    /// decoder drops its tx. Without this, the HTTP stream ends as soon as
+    /// the decoder finishes, before ASIO/WASAPI has consumed all buffered data.
+    _keep_alive_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     pub file_path: Mutex<Option<String>>,
     pub proxy_url: Mutex<Option<String>>,
@@ -59,10 +63,12 @@ pub struct StreamSession {
 impl StreamSession {
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
+        let keep_alive = tx.clone();
         Self {
             id,
             info,
             tx: Mutex::new(Some(tx)),
+            _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),
             file_path: Mutex::new(None),
             proxy_url: Mutex::new(None),
@@ -86,6 +92,7 @@ impl StreamSession {
 
     pub async fn close_sender(&self) {
         self.tx.lock().await.take();
+        self._keep_alive_tx.lock().await.take();
     }
 }
 

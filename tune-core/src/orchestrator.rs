@@ -993,17 +993,13 @@ impl PlaybackOrchestrator {
             } else {
                 target_fmt.container_format().to_string()
             };
-            // Always use file transcode for network outputs AND for local
-            // outputs playing streaming content (Qobuz/Tidal). The streaming
-            // mpsc channel closes when the decoder finishes, which is much
-            // faster than real-time playback on ASIO/WASAPI — the HTTP stream
-            // ends before the audio device has consumed all data (frames=506).
-            // File sessions serve with Content-Length and don't close early.
-            let is_streaming_source = req
-                .source
-                .as_deref()
-                .is_some_and(|s| s != "local" && s != "radio" && s != "podcast");
-            let use_file_transcode = is_network_output || is_streaming_source;
+            // Network outputs need file transcode for Content-Length + Range.
+            // Local outputs use streaming sessions — the _keep_alive_tx in
+            // StreamSession prevents the channel from closing when the decoder
+            // finishes, so ASIO/WASAPI can consume all buffered data at their
+            // own pace. This avoids the 28s download delay of file transcode.
+            let use_file_transcode =
+                is_network_output && (target_format_str != "wav" || dlna_needs_wav);
 
             let info = StreamInfo {
                 format: out_ext.clone(),
@@ -1224,8 +1220,8 @@ impl PlaybackOrchestrator {
                 let ev_bus = self.event_bus.clone();
                 let zone_id = req.zone_id;
                 let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-                let _streamer_sessions = self.streamer.sessions_state();
-                let _close_session_id = session_id.clone();
+                let streamer_sessions = self.streamer.sessions_state();
+                let close_session_id = session_id.clone();
                 tokio::spawn(async move {
                     debug!(file = %fp, sample_rate = out_sr, channels, "transcode_decoding");
 
@@ -1283,9 +1279,14 @@ impl PlaybackOrchestrator {
                         }
                     }
 
-                    // EOF is signalled naturally when the decoder's tx is
-                    // dropped (the session no longer holds a clone since we
-                    // use take() instead of clone() in create_session).
+                    // Signal EOF by dropping the keep-alive sender. The
+                    // decoder's tx is already dropped at this point, but the
+                    // _keep_alive_tx in the session keeps the channel open
+                    // until we explicitly close it here.
+                    let sessions = streamer_sessions.lock().await;
+                    if let Some(session) = sessions.get(&close_session_id) {
+                        session.close_sender().await;
+                    }
                 });
 
                 (
