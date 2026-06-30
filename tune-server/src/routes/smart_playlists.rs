@@ -15,6 +15,7 @@ use crate::state::AppState;
 struct CreateSmartPlaylist {
     name: String,
     rules: Value,
+    match_mode: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     max_tracks: Option<i64>,
@@ -25,6 +26,7 @@ struct CreateSmartPlaylist {
 struct UpdateSmartPlaylist {
     name: Option<String>,
     rules: Option<Value>,
+    match_mode: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     max_tracks: Option<i64>,
@@ -33,6 +35,7 @@ struct UpdateSmartPlaylist {
 #[derive(Deserialize)]
 struct PreviewRequest {
     rules: Value,
+    match_mode: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     max_tracks: Option<i64>,
@@ -87,13 +90,14 @@ async fn create_smart_playlist(
     Json(body): Json<CreateSmartPlaylist>,
 ) -> Result<impl IntoResponse, AppError> {
     let rules_json = body.rules.to_string();
+    let match_mode = body.match_mode.clone().unwrap_or_else(|| "all".into());
     let sort_by = body.sort_by.clone().unwrap_or_else(|| "title".into());
     let sort_order = body.sort_order.clone().unwrap_or_else(|| "asc".into());
 
     let sql = if state.backend.engine() == Engine::Postgres {
-        "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO smart_playlists (name, rules, match_mode, sort_by, sort_order, max_tracks) VALUES ($1, $2, $3, $4, $5, $6)"
     } else {
-        "INSERT INTO smart_playlists (name, rules, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?)"
+        "INSERT INTO smart_playlists (name, rules, match_mode, sort_by, sort_order, max_tracks) VALUES (?, ?, ?, ?, ?, ?)"
     };
 
     let result = state
@@ -103,6 +107,7 @@ async fn create_smart_playlist(
             &[
                 &body.name as &dyn ToSqlValue,
                 &rules_json as &dyn ToSqlValue,
+                &match_mode as &dyn ToSqlValue,
                 &sort_by as &dyn ToSqlValue,
                 &sort_order as &dyn ToSqlValue,
                 &body.max_tracks as &dyn ToSqlValue,
@@ -117,6 +122,7 @@ async fn create_smart_playlist(
                 "id": id,
                 "name": body.name,
                 "rules": body.rules,
+                "match_mode": match_mode,
                 "sort_by": sort_by,
                 "sort_order": sort_order,
                 "max_tracks": body.max_tracks,
@@ -132,9 +138,9 @@ async fn get_smart_playlist(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = $1"
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists WHERE id = $1"
     } else {
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?"
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists WHERE id = ?"
     };
     let result = state
         .backend
@@ -152,6 +158,7 @@ async fn get_smart_playlist(
                 "id": cols.get(0).and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
+                "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
                 "sort_by": cols.get(3).and_then(|v| v.as_string()),
                 "sort_order": cols.get(4).and_then(|v| v.as_string()),
                 "max_tracks": cols.get(5).and_then(|v| v.as_i64()),
@@ -235,12 +242,26 @@ async fn update_smart_playlist(
             )
             .ok();
     }
+    if let Some(ref match_mode) = body.match_mode {
+        let sql = if pg {
+            "UPDATE smart_playlists SET match_mode = $1 WHERE id = $2"
+        } else {
+            "UPDATE smart_playlists SET match_mode = ? WHERE id = ?"
+        };
+        state
+            .backend
+            .execute(
+                sql,
+                &[match_mode as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            )
+            .ok();
+    }
 
     // Return the updated smart playlist as JSON
     let sql = if pg {
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = $1"
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists WHERE id = $1"
     } else {
-        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists WHERE id = ?"
+        "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists WHERE id = ?"
     };
     let result = state
         .backend
@@ -285,19 +306,28 @@ async fn delete_smart_playlist(
 /// Build WHERE, ORDER, LIMIT clauses from smart playlist criteria.
 fn build_smart_query(
     rules_json: &str,
+    match_mode: &str,
     sort_by: &str,
     sort_order: &str,
     max_tracks: Option<i64>,
 ) -> (String, String, String) {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    let joiner = if match_mode == "any" { " OR " } else { " AND " };
 
     let mut conditions = Vec::new();
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
-        let op = rule
+        let raw_op = rule
             .get("op")
             .and_then(|v| v.as_str())
             .unwrap_or("contains");
+        let op = match raw_op {
+            "greater_than" => "gte",
+            "less_than" => "lte",
+            "equals" => "eq",
+            "not_equals" => "neq",
+            other => other,
+        };
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
         let cond = match (field, op) {
@@ -309,8 +339,14 @@ fn build_smart_query(
             ("year", "gte") => format!("t.year >= {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "lte") => format!("t.year <= {}", value.parse::<i32>().unwrap_or(0)),
             ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
-            ("sample_rate", "gte") => {
-                format!("t.sample_rate >= {}", value.parse::<i32>().unwrap_or(0))
+            ("sample_rate", "gte") | ("sample_rate", "gt") => {
+                format!("t.sample_rate > {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("sample_rate", "lte") | ("sample_rate", "lt") => {
+                format!("t.sample_rate < {}", value.parse::<i32>().unwrap_or(0))
+            }
+            ("sample_rate", "eq") => {
+                format!("t.sample_rate = {}", value.parse::<i32>().unwrap_or(0))
             }
             ("duration_ms", "gte") => {
                 format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0))
@@ -358,7 +394,7 @@ fn build_smart_query(
     let where_clause = if conditions.is_empty() {
         String::new()
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        format!("WHERE {}", conditions.join(joiner))
     };
 
     let order = if sort_by == "random" {
@@ -439,11 +475,11 @@ fn execute_smart_track_query(
 fn load_smart_criteria(
     state: &AppState,
     id: i64,
-) -> Result<Option<(String, String, String, Option<i64>)>, AppError> {
+) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
-        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = $1"
+        "SELECT rules, sort_by, sort_order, max_tracks, match_mode FROM smart_playlists WHERE id = $1"
     } else {
-        "SELECT rules, sort_by, sort_order, max_tracks FROM smart_playlists WHERE id = ?"
+        "SELECT rules, sort_by, sort_order, max_tracks, match_mode FROM smart_playlists WHERE id = ?"
     };
     let result = state
         .backend
@@ -460,6 +496,9 @@ fn load_smart_criteria(
             cols.get(2)
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "asc".into()),
+            cols.get(4)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "all".into()),
             cols.get(3).and_then(|v| v.as_i64()),
         )
     }))
@@ -469,13 +508,14 @@ async fn resolve_tracks(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)?
+    let Some((rules_json, sort_by, sort_order, match_mode, max_tracks)) =
+        load_smart_criteria(&state, id)?
     else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let (where_clause, order, limit_clause) =
-        build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
+        build_smart_query(&rules_json, &match_mode, &sort_by, &sort_order, max_tracks);
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!(items)).into_response())
@@ -485,13 +525,14 @@ async fn smart_collection_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {
-    let Some((rules_json, sort_by, sort_order, max_tracks)) = load_smart_criteria(&state, id)?
+    let Some((rules_json, sort_by, sort_order, match_mode, max_tracks)) =
+        load_smart_criteria(&state, id)?
     else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let (where_clause, order, limit_clause) =
-        build_smart_query(&rules_json, &sort_by, &sort_order, max_tracks);
+        build_smart_query(&rules_json, &match_mode, &sort_by, &sort_order, max_tracks);
     let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     // Group tracks by album_id, dedup albums
@@ -519,11 +560,17 @@ async fn preview_smart_collection(
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<Value>, AppError> {
     let rules_json = body.rules.to_string();
+    let match_mode = body.match_mode.as_deref().unwrap_or("all");
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let (where_clause, order, limit_clause) =
-        build_smart_query(&rules_json, sort_by, sort_order, body.max_tracks);
+    let (where_clause, order, limit_clause) = build_smart_query(
+        &rules_json,
+        match_mode,
+        sort_by,
+        sort_order,
+        body.max_tracks,
+    );
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!({"tracks": items, "total": items.len()})))

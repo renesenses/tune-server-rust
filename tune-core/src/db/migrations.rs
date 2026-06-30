@@ -590,6 +590,11 @@ INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, d
 INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, description) VALUES ('🎺 Pop', '[{\"field\":\"genre\",\"operator\":\"contains\",\"value\":\"pop\"}]', 'all', '🎺', '#E91E63', 'Pop et synth-pop');
 ",
     },
+    Migration {
+        version: 48,
+        name: "smart_playlists_match_mode",
+        up: "ALTER TABLE smart_playlists ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'all';",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
