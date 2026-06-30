@@ -422,6 +422,29 @@ impl OutputTarget for DlnaOutput {
             "<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{level}</DesiredVolume>"
         )).await?;
         if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+            // Sonos rejects RenderingControl SetVolume with 401.
+            // Try GroupRenderingControl on the same host instead.
+            if self.device_id.contains("RINCON") {
+                let grc_url = self
+                    .rendering_control_url
+                    .replace("/RenderingControl/", "/GroupRenderingControl/");
+                let grc_resp = self
+                    .soap_action(
+                        &grc_url,
+                        "urn:schemas-upnp-org:service:GroupRenderingControl:1",
+                        "SetGroupVolume",
+                        &format!(
+                            "<InstanceID>0</InstanceID><DesiredVolume>{level}</DesiredVolume>"
+                        ),
+                    )
+                    .await?;
+                if grc_resp.contains("UPnPError") || grc_resp.contains("<errorCode>") {
+                    warn!(device = %self.name, level, response = %grc_resp, "sonos_group_volume_rejected");
+                } else {
+                    debug!(device = %self.name, level, "sonos_group_volume_ok");
+                }
+                return Ok(());
+            }
             warn!(device = %self.name, level, response = %resp, "dlna_set_volume_rejected");
         } else {
             debug!(device = %self.name, level, "dlna_set_volume_ok");
