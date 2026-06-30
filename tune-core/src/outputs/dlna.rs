@@ -547,14 +547,21 @@ impl DlnaOutput {
     pub async fn probe_dsd_support(&self) -> DsdCapability {
         let protocols = match self.get_protocol_info().await {
             Ok(p) => p,
-            Err(_) => return DsdCapability::default(),
+            Err(e) => {
+                warn!(device = %self.name, error = %e, "dsd_probe_protocol_info_failed");
+                return DsdCapability::default();
+            }
         };
+        debug!(device = %self.name, protocols = ?protocols, "dsd_probe_protocol_info_raw");
         let mut cap = DsdCapability::default();
         for proto in &protocols {
             let lower = proto.to_lowercase();
             if lower.contains("x-dsd")
                 || lower.contains("audio/dsf")
+                || lower.contains("audio/x-dsf")
                 || lower.contains("application/x-dsd")
+                || lower.contains("application/dsf")
+                || lower.contains("audio/vnd.dsd")
             {
                 cap.supports_dsf = true;
                 if cap.dsf_mime.is_none() {
@@ -564,10 +571,14 @@ impl DlnaOutput {
                     }
                 }
             }
-            if lower.contains("audio/dff") || lower.contains("x-dff") {
+            if lower.contains("audio/dff")
+                || lower.contains("x-dff")
+                || lower.contains("audio/x-dff")
+            {
                 cap.supports_dff = true;
             }
         }
+        info!(device = %self.name, supports_dsf = cap.supports_dsf, supports_dff = cap.supports_dff, dsf_mime = ?cap.dsf_mime, protocols_count = protocols.len(), "dsd_probe_result");
         cap
     }
 
