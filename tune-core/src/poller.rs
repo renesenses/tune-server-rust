@@ -290,10 +290,13 @@ impl PositionPoller {
             // Without this check, playback from other apps (Roon, Spotify
             // Connect, etc.) on a shared renderer (Sonos) would be captured
             // by Tune and trigger phantom queue playback when the other app stops.
+            // Skip recovery during startup grace (30s) — the orchestrator may
+            // still be sending play commands and the renderer reports Playing
+            // before PlaybackManager is updated.
             let already_playing = states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
-            if status.state == TransportState::Playing && !already_playing {
+            if status.state == TransportState::Playing && !already_playing && !in_startup_grace {
                 let last_state =
                     ZoneRepo::with_backend(self.db.clone()).get_last_play_state(zone_id);
                 if last_state.as_deref() == Some("playing") {
