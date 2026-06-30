@@ -157,32 +157,34 @@ fn field_to_column(field: &str) -> &str {
     }
 }
 
+fn strip_accents(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect()
+}
+
 fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
     let col = field_to_column(&rule.field);
+    let val_norm = strip_accents(&rule.value);
     match rule.operator {
-        Operator::Equals => (
-            format!("{col} = ? COLLATE NOCASE"),
-            vec![rule.value.clone()],
-        ),
-        Operator::NotEquals => (
-            format!("{col} != ? COLLATE NOCASE"),
-            vec![rule.value.clone()],
-        ),
+        Operator::Equals => (format!("{col} = ? COLLATE NOCASE"), vec![val_norm]),
+        Operator::NotEquals => (format!("{col} != ? COLLATE NOCASE"), vec![val_norm]),
         Operator::Contains => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}%", rule.value)],
+            vec![format!("%{val_norm}%")],
         ),
         Operator::NotContains => (
             format!("{col} NOT LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}%", rule.value)],
+            vec![format!("%{val_norm}%")],
         ),
         Operator::StartsWith => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("{}%", rule.value)],
+            vec![format!("{val_norm}%")],
         ),
         Operator::EndsWith => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{}", rule.value)],
+            vec![format!("%{val_norm}")],
         ),
         Operator::GreaterThan => (format!("{col} > ?"), vec![rule.value.clone()]),
         Operator::LessThan => (format!("{col} < ?"), vec![rule.value.clone()]),
