@@ -512,10 +512,21 @@ impl PositionPoller {
                                     if let Ok(Some(station)) = radio_repo.get(sid) {
                                         (station.name.clone(), station.url.clone())
                                     } else {
-                                        (np.title.clone(), source_id.clone())
+                                        // Fallback: use album_title (holds station name)
+                                        // instead of np.title (holds song title after first update)
+                                        let name = np
+                                            .album_title
+                                            .clone()
+                                            .unwrap_or_else(|| np.title.clone());
+                                        (name, source_id.clone())
                                     }
                                 } else {
-                                    (np.title.clone(), source_id.clone())
+                                    // source_id is a URL — use album_title which preserves
+                                    // the station name across metadata updates (np.title
+                                    // gets overwritten with the current song title)
+                                    let name =
+                                        np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                                    (name, source_id.clone())
                                 };
 
                                 if let Some(meta) = crate::radio_metadata::fetch_radio_metadata(

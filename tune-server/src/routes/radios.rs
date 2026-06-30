@@ -200,7 +200,7 @@ async fn play_radio(
         source_id: Some(radio.url.clone()),
         title: Some(radio.name.clone()),
         artist_name: Some("Live Radio".into()),
-        album_title: Some("Live Radio".into()),
+        album_title: Some(radio.name.clone()),
         cover_url: radio.logo_url.clone(),
         duration_ms: None,
         ..Default::default()
