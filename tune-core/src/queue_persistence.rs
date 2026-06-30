@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 
 use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::PlayQueueRepo;
-use crate::db::zone_repo::ZoneRepo;
 use crate::playback::ZoneState;
 
 /// Snapshot of a zone's queue state, serialized to JSON.
