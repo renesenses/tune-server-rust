@@ -206,10 +206,24 @@ impl ZoneRepo {
             "{} WHERE COALESCE(is_hidden, 0) = 0 ORDER BY name",
             sql::select_base()
         );
-        let rows = self
-            .db
-            .query_many(&filtered, &[])
-            .or_else(|_| self.db.query_many(&sql::list_all(), &[]))?;
+        let filter_supported = self.db.query_many(&filtered, &[]);
+        match filter_supported {
+            Ok(rows) if !rows.is_empty() => {
+                return Ok(rows.iter().map(row_to_zone).collect());
+            }
+            Ok(_empty) => {
+                // Filtered query succeeded but returned 0 rows.
+                // Use strong read with the SAME filter to handle WAL lag
+                // (a newly created zone not yet visible via the reader).
+                let strong = self.db.query_many_strong(&filtered, &[])?;
+                return Ok(strong.iter().map(row_to_zone).collect());
+            }
+            Err(_) => {
+                // is_hidden column doesn't exist (pre-migration DB).
+                // Fall back to unfiltered query.
+            }
+        }
+        let rows = self.db.query_many(&sql::list_all(), &[])?;
         if !rows.is_empty() {
             return Ok(rows.iter().map(row_to_zone).collect());
         }
@@ -892,5 +906,51 @@ mod tests {
         let repo = ZoneRepo::with_backend(backend);
         let id = repo.create("X", None, None).unwrap();
         assert_eq!(repo.get(id).unwrap().unwrap().name, "X");
+    }
+
+    #[test]
+    fn get_or_create_unhides_deleted_zone() {
+        let db = test_db();
+        // Add the UNIQUE index that startup.rs normally creates
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id ON zones(output_device_id) WHERE output_device_id IS NOT NULL;"
+        ).unwrap();
+        let repo = ZoneRepo::new(db);
+
+        // Create a zone, customize volume, then soft-delete it
+        let (id1, created) = repo
+            .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
+            .unwrap();
+        assert!(created);
+        repo.update_volume(id1, 75).unwrap();
+
+        // Soft-delete the zone
+        repo.delete(id1).unwrap();
+        // Zone should be hidden from list
+        assert!(repo.list().unwrap().is_empty());
+        // But should still be findable by device_id
+        assert!(repo.get_by_device_id("uuid:jm-dac").unwrap().is_some());
+        assert!(repo.is_device_hidden("uuid:jm-dac"));
+
+        // Re-discover the same device — get_or_create should unhide, not error
+        let (id2, created2) = repo
+            .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
+            .unwrap();
+        assert!(
+            !created2,
+            "should reuse existing zone, not create a new one"
+        );
+        assert_eq!(id1, id2, "should return the same zone id");
+
+        // Zone should be visible again
+        let zones = repo.list().unwrap();
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].name, "Jean-Marie DAC");
+
+        // Previous settings should be preserved
+        assert_eq!(zones[0].volume, 75);
+
+        // is_hidden should be cleared
+        assert!(!repo.is_device_hidden("uuid:jm-dac"));
     }
 }
