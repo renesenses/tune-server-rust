@@ -273,6 +273,7 @@ impl PositionPoller {
             if !zone.fixed_volume
                 && !in_startup_grace
                 && status.volume > 0.001
+                && status.volume < 0.999
                 && status.state == TransportState::Playing
             {
                 let db_vol = zone.volume as f64 / 100.0;
@@ -489,7 +490,10 @@ impl PositionPoller {
                         .find(|z| z.id == Some(zone_id))
                         .map(|z| z.fixed_volume)
                         .unwrap_or(false);
-                    if !zone_fixed_volume && (status.volume - zone_state.volume).abs() > 0.005 {
+                    if !zone_fixed_volume
+                        && status.volume < 0.999
+                        && (status.volume - zone_state.volume).abs() > 0.005
+                    {
                         self.playback.set_volume(zone_id, status.volume).await;
                         let vol_int = (status.volume * 100.0) as i32;
                         let db = self.db.clone();
@@ -676,7 +680,10 @@ impl PositionPoller {
                 .find(|z| z.id == Some(zone_id))
                 .map(|z| z.fixed_volume)
                 .unwrap_or(false);
-            if !zone_fixed_volume && (status.volume - zone_state.volume).abs() > 0.005 {
+            if !zone_fixed_volume
+                && status.volume < 0.999
+                && (status.volume - zone_state.volume).abs() > 0.005
+            {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
                 let db = self.db.clone();

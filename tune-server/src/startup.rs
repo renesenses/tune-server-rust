@@ -210,8 +210,14 @@ async fn restore_zone_volumes(state: &AppState) {
         for zone in &zones {
             if let Some(id) = zone.id {
                 let vol = (zone.volume as f64) / 100.0;
-                state.playback.set_volume(id, vol).await;
-                info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
+                if vol >= 0.999 {
+                    let safe_vol = 0.2;
+                    state.playback.set_volume(id, safe_vol).await;
+                    info!(zone_id = id, zone_name = %zone.name, volume = safe_vol, "zone_volume_clamped_from_100");
+                } else {
+                    state.playback.set_volume(id, vol).await;
+                    info!(zone_id = id, zone_name = %zone.name, volume = vol, "zone_volume_restored");
+                }
             }
         }
     }
