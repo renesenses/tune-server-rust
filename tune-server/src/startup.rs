@@ -277,6 +277,7 @@ async fn restore_playback_positions(state: &AppState) {
             } else {
                 zone.last_position_ms
             };
+            let dur = np.duration_ms;
             state
                 .playback
                 .restore_position(zone_id, clamped_pos, np)
@@ -284,7 +285,9 @@ async fn restore_playback_positions(state: &AppState) {
             info!(
                 zone_id,
                 zone_name = %zone.name,
-                position_ms = zone.last_position_ms,
+                position_ms = clamped_pos,
+                original_ms = zone.last_position_ms,
+                duration_ms = dur,
                 track_id = ?zone.last_track_id,
                 "playback_position_restored"
             );

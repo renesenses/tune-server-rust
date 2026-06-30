@@ -1529,6 +1529,7 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_exclusive_read_error");
+                            http_eof_excl = true;
                             break;
                         }
                     };
@@ -1715,6 +1716,7 @@ impl OutputTarget for LocalOutput {
                         }
                         Err(e) => {
                             warn!(error = %e, "local_audio_asio_exclusive_read_error");
+                            http_eof_asio = true;
                             break;
                         }
                     };
@@ -1896,6 +1898,7 @@ impl OutputTarget for LocalOutput {
                                     }
                                     Err(e) => {
                                         warn!(error = %e, "local_audio_wasapi_exclusive_read_error");
+                                        http_eof_wasapi = true;
                                         break;
                                     }
                                 }
@@ -2358,6 +2361,7 @@ impl OutputTarget for LocalOutput {
                     }
                     Err(e) => {
                         warn!(error = %e, total_bytes_read, "local_audio_read_error");
+                        http_eof = true;
                         break;
                     }
                 };
