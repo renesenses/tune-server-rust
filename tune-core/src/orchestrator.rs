@@ -1889,7 +1889,7 @@ impl PlaybackOrchestrator {
                     codec = %codec_lower,
                     sample_rate = sr,
                     bit_depth = bd,
-                    "streaming_aac_pre_transcode_to_flac_for_dlna"
+                    "streaming_aac_pre_transcode_to_wav_for_dlna"
                 );
 
                 let upstream_url = stream_data.url.clone();
@@ -1899,7 +1899,7 @@ impl PlaybackOrchestrator {
                     .to_string_lossy()
                     .to_string();
                 let tmp_flac = std::env::temp_dir()
-                    .join(format!("tune-aac-transcode-{}.flac", uuid::Uuid::new_v4()))
+                    .join(format!("tune-aac-transcode-{}.wav", uuid::Uuid::new_v4()))
                     .to_string_lossy()
                     .to_string();
 
@@ -1929,12 +1929,13 @@ impl PlaybackOrchestrator {
                     let pcm_bytes = decoded.pcm_bytes();
                     let actual_bd = decoded.bit_depth;
 
-                    // 3. Encode to FLAC
+                    // 3. Encode to WAV (universal PCM, avoids custom FLAC
+                    // encoder issues with some renderers like Revox S100)
                     let rt = tokio::runtime::Handle::try_current()
                         .map_err(|e| format!("no tokio runtime: {e}"))?;
                     let encoded_data = rt.block_on(async {
                         let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            "flac",
+                            "wav",
                             decoded.sample_rate,
                             actual_bd as u32,
                             decoded.channels,
@@ -1963,8 +1964,8 @@ impl PlaybackOrchestrator {
                         );
 
                         let file_info = StreamInfo {
-                            format: "flac".into(),
-                            mime_type: "audio/flac".into(),
+                            format: "wav".into(),
+                            mime_type: "audio/wav".into(),
                             sample_rate: sr,
                             bit_depth: bd,
                             channels: 2,
