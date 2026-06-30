@@ -19,6 +19,7 @@ if-addrs = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
+realfft = "3"
 rayon = { workspace = true }
 notify = { workspace = true }
 md-5 = { workspace = true }

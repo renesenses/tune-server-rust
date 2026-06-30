@@ -1205,11 +1205,17 @@ mod tests {
         assert!(flac.len() > 42);
         assert_eq!(&flac[0..4], b"fLaC");
 
-        // Check STREAMINFO block header
+        // Check STREAMINFO block header (is_last=0, type=0, length=34)
         let block_hdr = u32::from_be_bytes([flac[4], flac[5], flac[6], flac[7]]);
         assert_eq!(block_hdr & (0x7F << 24), 0); // type = 0 (STREAMINFO)
         assert_eq!(block_hdr & 0xFFFFFF, 34); // length = 34
-        assert_eq!(block_hdr >> 31, 1); // is_last = 1
+        assert_eq!(block_hdr >> 31, 0); // is_last = 0 (VORBIS_COMMENT follows)
+
+        // Check VORBIS_COMMENT block at offset 42 (4 magic + 4 header + 34 streaminfo)
+        let vc_hdr = u32::from_be_bytes([flac[42], flac[43], flac[44], flac[45]]);
+        assert_eq!(vc_hdr >> 31, 1); // is_last = 1
+        assert_eq!((vc_hdr >> 24) & 0x7F, 4); // type = 4 (VORBIS_COMMENT)
+        assert_eq!(vc_hdr & 0xFFFFFF, 8); // length = 8
     }
 
     #[tokio::test]

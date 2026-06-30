@@ -396,31 +396,31 @@ mod tests {
     }
 
     #[test]
-    fn aiff_transcodes_to_flac() {
-        assert_eq!(AudioFormat::Aiff.dlna_transcode_target(), AudioFormat::Flac);
+    fn aiff_served_directly() {
+        assert_eq!(AudioFormat::Aiff.dlna_transcode_target(), AudioFormat::Aiff);
     }
 
     #[test]
-    fn dsd_transcodes_to_wav() {
-        assert_eq!(AudioFormat::Dsd.dlna_transcode_target(), AudioFormat::Wav);
+    fn dsd_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Dsd.dlna_transcode_target(), AudioFormat::Flac);
     }
 
     #[test]
-    fn wavpack_transcodes_to_wav() {
+    fn wavpack_transcodes_to_flac() {
         assert_eq!(
             AudioFormat::WavPack.dlna_transcode_target(),
-            AudioFormat::Wav
+            AudioFormat::Flac
         );
     }
 
     #[test]
-    fn ape_transcodes_to_wav() {
-        assert_eq!(AudioFormat::Ape.dlna_transcode_target(), AudioFormat::Wav);
+    fn ape_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Ape.dlna_transcode_target(), AudioFormat::Flac);
     }
 
     #[test]
-    fn wma_transcodes_to_wav() {
-        assert_eq!(AudioFormat::Wma.dlna_transcode_target(), AudioFormat::Wav);
+    fn wma_transcodes_to_flac() {
+        assert_eq!(AudioFormat::Wma.dlna_transcode_target(), AudioFormat::Flac);
     }
 
     #[test]

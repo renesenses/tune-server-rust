@@ -4266,6 +4266,7 @@ dependencies = [
  "objc2-core-audio",
  "quick-xml",
  "rayon",
+ "realfft",
  "regex",
  "reqwest",
  "rubato",
