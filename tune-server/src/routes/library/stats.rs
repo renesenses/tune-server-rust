@@ -99,6 +99,8 @@ pub(super) async fn completeness_stats(
         .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
         .unwrap_or(0);
     let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
+    let albums_with_genre: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a JOIN tracks t ON t.album_id = a.id WHERE t.genre IS NOT NULL AND t.genre != ''", [], |row| row.get(0)).unwrap_or(0);
+    let albums_with_year: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a JOIN tracks t ON t.album_id = a.id WHERE t.year IS NOT NULL AND t.year > 0", [], |row| row.get(0)).unwrap_or(0);
     drop(conn);
 
     let total_artists: i64 = {
@@ -164,8 +166,8 @@ pub(super) async fn completeness_stats(
         "with_cover": with_cover,
         "with_musicbrainz_id": with_mbid,
         "albums_without_cover": total_albums - with_cover,
-        "albums_without_genre": total_albums - (with_genre * total_albums / total_tracks.max(1)),
-        "albums_without_year": total_albums - (with_year * total_albums / total_tracks.max(1)),
+        "albums_without_genre": total_albums - albums_with_genre,
+        "albums_without_year": total_albums - albums_with_year,
         "tracks_without_artist": total_tracks - with_artist,
         "artists_without_image": total_artists,
         "genre_pct": genre_pct.round(),
