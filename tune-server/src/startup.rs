@@ -196,30 +196,40 @@ async fn restore_queue_metadata(state: &AppState, config: &TuneConfig) {
 }
 
 async fn restore_convolvers(state: &AppState) {
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-    if let Ok(zones) = zone_repo.list() {
-        for zone in &zones {
-            let Some(zone_id) = zone.id else { continue };
-            let key = format!("ir_path_{zone_id}");
-            if let Ok(Some(ir_path)) = settings.get(&key) {
-                if !std::path::Path::new(&ir_path).exists() {
-                    continue;
-                }
-                let device_id = zone.output_device_id.as_deref().unwrap_or("");
-                if !device_id.starts_with("local:") {
-                    continue;
-                }
-                let outputs = state.outputs.lock().await;
-                if let Some(output) = outputs.get(device_id) {
-                    let output = output.lock().await;
-                    if let Some(local) = output
-                        .as_any()
-                        .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-                    {
-                        match local.set_convolver_ir(&ir_path) {
-                            Ok(()) => info!(zone_id, ir_path = %ir_path, "convolver_restored"),
-                            Err(e) => warn!(zone_id, error = %e, "convolver_restore_failed"),
+    #[cfg(not(feature = "local-audio"))]
+    let _ = state;
+    #[cfg(feature = "local-audio")]
+    {
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+        if let Ok(zones) = zone_repo.list() {
+            for zone in &zones {
+                let Some(zone_id) = zone.id else { continue };
+                let key = format!("ir_path_{zone_id}");
+                if let Ok(Some(ir_path)) = settings.get(&key) {
+                    if !std::path::Path::new(&ir_path).exists() {
+                        continue;
+                    }
+                    let device_id = zone.output_device_id.as_deref().unwrap_or("");
+                    if !device_id.starts_with("local:") {
+                        continue;
+                    }
+                    let outputs = state.outputs.lock().await;
+                    if let Some(output) = outputs.get(device_id) {
+                        let output = output.lock().await;
+                        if let Some(local) = output
+                            .as_any()
+                            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                        {
+                            match local.set_convolver_ir(&ir_path) {
+                                Ok(()) => {
+                                    info!(zone_id, ir_path = %ir_path, "convolver_restored")
+                                }
+                                Err(e) => {
+                                    warn!(zone_id, error = %e, "convolver_restore_failed")
+                                }
+                            }
                         }
                     }
                 }
