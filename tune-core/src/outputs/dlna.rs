@@ -323,10 +323,25 @@ impl OutputTarget for DlnaOutput {
 
         // Retry Play with backoff — some renderers (Revox S100, stagefright-based)
         // reject Play immediately after SetAVTransportURI while still loading the URI.
+        // On first 501, send another Stop then retry — the Revox needs an explicit
+        // Stop after SetAVTransportURI when it was already playing.
         let mut last_err = String::new();
-        for attempt in 0..4u32 {
+        for attempt in 0..5u32 {
             if attempt > 0 {
-                let delay = 500 * (1 << (attempt - 1)); // 500ms, 1s, 2s
+                let delay = match attempt {
+                    1 => 500,
+                    2 => 1500,
+                    3 => 3000,
+                    _ => 4000,
+                };
+                if attempt == 1 {
+                    debug!(device = %self.name, "dlna_play_retry_sending_stop");
+                    let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    let _ = self
+                        .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                        .await;
+                }
                 info!(device = %self.name, attempt, delay_ms = delay, "dlna_play_retry");
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
