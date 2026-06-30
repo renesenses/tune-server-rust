@@ -59,7 +59,7 @@ async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Valu
     let rows = state
         .backend
         .query_many(
-            "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at FROM smart_playlists ORDER BY name",
+            "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists ORDER BY name",
             &[],
         )
         .map_err(|e| AppError::internal(e))?;
@@ -75,6 +75,7 @@ async fn list_smart_playlists(State(state): State<AppState>) -> Result<Json<Valu
                 "id": cols.get(0).and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
+                "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
                 "sort_by": cols.get(3).and_then(|v| v.as_string()),
                 "sort_order": cols.get(4).and_then(|v| v.as_string()),
                 "max_tracks": cols.get(5).and_then(|v| v.as_i64()),
