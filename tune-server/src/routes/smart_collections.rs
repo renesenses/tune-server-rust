@@ -94,7 +94,45 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
         )
         .map_err(AppError::internal)?;
 
-    let items: Vec<Value> = rows.iter().map(|r| decode_collection_row(r)).collect();
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut col = decode_collection_row(r);
+            let rules_str = r
+                .get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into());
+            if let Ok(sc) =
+                serde_json::from_str::<tune_core::library::smart_collections::SmartCollection>(
+                    &serde_json::json!({
+                        "name": col["name"],
+                        "rules": serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([])),
+                        "match_mode": col["match_mode"],
+                        "sort_by": col["sort_by"],
+                        "sort_order": col["sort_order"],
+                        "limit": col["max_limit"],
+                    })
+                    .to_string(),
+                )
+            {
+                let (sql, params) = sc.compile_sql();
+                let count_sql = format!("SELECT COUNT(*) FROM ({sql})");
+                let param_refs: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
+                    .iter()
+                    .map(|p| p as &dyn tune_core::db::backend::ToSqlValue)
+                    .collect();
+                if let Ok(count_rows) = state.backend.query_many(&count_sql, &param_refs) {
+                    let count = count_rows
+                        .first()
+                        .and_then(|r| r.first())
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    col["album_count"] = json!(count);
+                }
+            }
+            col
+        })
+        .collect();
     Ok(Json(json!(items)))
 }
 

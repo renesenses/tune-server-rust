@@ -164,27 +164,53 @@ fn strip_accents(s: &str) -> String {
         .collect()
 }
 
+fn accent_tolerant_like(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let stripped = strip_accents(s);
+    let mut result = String::with_capacity(stripped.len());
+    for (orig, norm) in s.chars().zip(stripped.chars()) {
+        if orig != norm {
+            result.push('_');
+        } else {
+            match norm {
+                '%' | '_' => {
+                    result.push('\\');
+                    result.push(norm);
+                }
+                _ => result.push(norm),
+            }
+        }
+    }
+    if result.len() < stripped.len() {
+        for c in stripped.chars().skip(result.len()) {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
     let col = field_to_column(&rule.field);
     let val_norm = strip_accents(&rule.value);
+    let val_like = accent_tolerant_like(&rule.value);
     match rule.operator {
-        Operator::Equals => (format!("{col} = ? COLLATE NOCASE"), vec![val_norm]),
-        Operator::NotEquals => (format!("{col} != ? COLLATE NOCASE"), vec![val_norm]),
+        Operator::Equals => (format!("{col} LIKE ? COLLATE NOCASE"), vec![val_like]),
+        Operator::NotEquals => (format!("{col} NOT LIKE ? COLLATE NOCASE"), vec![val_like]),
         Operator::Contains => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{val_norm}%")],
+            vec![format!("%{val_like}%")],
         ),
         Operator::NotContains => (
             format!("{col} NOT LIKE ? COLLATE NOCASE"),
-            vec![format!("%{val_norm}%")],
+            vec![format!("%{val_like}%")],
         ),
         Operator::StartsWith => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("{val_norm}%")],
+            vec![format!("{val_like}%")],
         ),
         Operator::EndsWith => (
             format!("{col} LIKE ? COLLATE NOCASE"),
-            vec![format!("%{val_norm}")],
+            vec![format!("%{val_like}")],
         ),
         Operator::GreaterThan => (format!("{col} > ?"), vec![rule.value.clone()]),
         Operator::LessThan => (format!("{col} < ?"), vec![rule.value.clone()]),
