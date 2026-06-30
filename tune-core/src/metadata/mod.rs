@@ -187,11 +187,9 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
             MetadataOptions::default(),
         )
         .ok()?;
-    let codec = format_reader
-        .default_track()
-        .map(|t| t.codec_params.codec)?;
-    let codec_name = format!("{codec:?}");
-    if codec_name.contains("alac") || codec_name.contains("ALAC") {
+    let track = format_reader.default_track(symphonia::core::formats::TrackType::Audio)?;
+    let codec_name = format!("{:?}", track.codec_params);
+    if codec_name.contains("Alac") || codec_name.contains("alac") || codec_name.contains("ALAC") {
         Some("alac".to_string())
     } else {
         Some("aac".to_string())
