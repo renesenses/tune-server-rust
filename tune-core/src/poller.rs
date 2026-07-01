@@ -602,32 +602,37 @@ impl PositionPoller {
                 if radio_stopped {
                     ps.radio_stopped_ticks = ps.radio_stopped_ticks.saturating_add(1);
                     if ps.radio_stopped_ticks >= 3 && ps.radio_stopped_ticks < 6 {
-                        info!(zone_id, ticks = ps.radio_stopped_ticks, "radio_auto_retry");
-                        let device_id_ref = self.get_zone_device_id(zone_id);
-                        if let Some(ref did) = device_id_ref {
-                            if let Some(ref np) = zone_state.now_playing {
-                                if let Some(ref sid) = np.source_id {
-                                    let req = crate::orchestrator::PlayRequest {
-                                        zone_id,
-                                        output_device_id: Some(did.clone()),
-                                        track_id: None,
-                                        source: Some("radio".into()),
-                                        source_id: Some(sid.clone()),
-                                        title: Some(np.title.clone()),
-                                        artist_name: np.artist_name.clone(),
-                                        album_title: np.album_title.clone(),
-                                        cover_url: np.cover_path.clone(),
-                                        duration_ms: None,
-                                        seek_ms: None,
-                                        temp_file_path: None,
-                                    };
-                                    match self.orchestrator.play(req).await {
-                                        Ok(_) => {
-                                            info!(zone_id, "radio_auto_retry_success");
-                                            ps.radio_stopped_ticks = 0;
-                                        }
-                                        Err(e) => {
-                                            warn!(zone_id, error = %e, "radio_auto_retry_failed")
+                        if zone_state.track_generation != ps.track_generation {
+                            debug!(zone_id, "radio_auto_retry_skipped_generation_changed");
+                            ps.radio_stopped_ticks = 0;
+                        } else {
+                            info!(zone_id, ticks = ps.radio_stopped_ticks, "radio_auto_retry");
+                            let device_id_ref = self.get_zone_device_id(zone_id);
+                            if let Some(ref did) = device_id_ref {
+                                if let Some(ref np) = zone_state.now_playing {
+                                    if let Some(ref sid) = np.source_id {
+                                        let req = crate::orchestrator::PlayRequest {
+                                            zone_id,
+                                            output_device_id: Some(did.clone()),
+                                            track_id: None,
+                                            source: Some("radio".into()),
+                                            source_id: Some(sid.clone()),
+                                            title: Some(np.title.clone()),
+                                            artist_name: np.artist_name.clone(),
+                                            album_title: np.album_title.clone(),
+                                            cover_url: np.cover_path.clone(),
+                                            duration_ms: None,
+                                            seek_ms: None,
+                                            temp_file_path: None,
+                                        };
+                                        match self.orchestrator.play(req).await {
+                                            Ok(_) => {
+                                                info!(zone_id, "radio_auto_retry_success");
+                                                ps.radio_stopped_ticks = 0;
+                                            }
+                                            Err(e) => {
+                                                warn!(zone_id, error = %e, "radio_auto_retry_failed")
+                                            }
                                         }
                                     }
                                 }

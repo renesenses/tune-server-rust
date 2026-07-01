@@ -102,19 +102,21 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                 .get(2)
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into());
-            if let Ok(sc) =
-                serde_json::from_str::<tune_core::library::smart_collections::SmartCollection>(
-                    &serde_json::json!({
-                        "name": col["name"],
-                        "rules": serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([])),
-                        "match_mode": col["match_mode"],
-                        "sort_by": col["sort_by"],
-                        "sort_order": col["sort_order"],
-                        "limit": col["max_limit"],
-                    })
-                    .to_string(),
-                )
-            {
+            let sc_json = serde_json::json!({
+                "name": col["name"],
+                "rules": serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([])),
+                "match_mode": col["match_mode"],
+                "sort_by": col["sort_by"],
+                "sort_order": col["sort_order"],
+                "limit": col["max_limit"],
+            });
+            match serde_json::from_str::<tune_core::library::smart_collections::SmartCollection>(
+                &sc_json.to_string(),
+            ) {
+                Err(e) => {
+                    tracing::debug!(name = %col["name"], error = %e, "smart_collection_compile_failed");
+                }
+                Ok(sc) => {
                 let (sql, params) = sc.compile_sql();
                 let track_count_sql = format!("SELECT COUNT(*) FROM ({sql})");
                 let album_count_sql = format!(
@@ -147,7 +149,7 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                         .unwrap_or(0);
                     col["album_count"] = json!(count);
                 }
-            }
+            }}
             col
         })
         .collect();

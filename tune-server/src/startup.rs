@@ -305,19 +305,7 @@ async fn restore_playback_positions(state: &AppState) {
                     continue;
                 }
             } else if zone.last_track_source.as_deref() == Some("radio") {
-                let radio_url = zone.last_track_source_id.clone().unwrap_or_default();
-                tune_core::playback::NowPlaying {
-                    track_id: None,
-                    title: "Recovering...".into(),
-                    artist_name: Some("Live Radio".into()),
-                    album_title: Some("Live Radio".into()),
-                    cover_path: None,
-                    duration_ms: 0,
-                    source: "radio".into(),
-                    source_id: Some(radio_url),
-                    stream_id: None,
-                    ..Default::default()
-                }
+                continue;
             } else {
                 continue;
             };
