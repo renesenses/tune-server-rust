@@ -285,7 +285,18 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
                     let album = if let Some(ref key) = album_key {
                         if let Some(cached) = album_cache.get(key) {
-                            Some(std::sync::Arc::clone(cached))
+                            let c = std::sync::Arc::clone(cached);
+                            if c.artist_id != Some(key.1) {
+                                tracing::warn!(
+                                    album = %key.0,
+                                    cache_key_artist_id = key.1,
+                                    cached_album_id = ?c.id,
+                                    cached_album_artist_id = ?c.artist_id,
+                                    file = %sf.path,
+                                    "BUG_album_cache_artist_mismatch"
+                                );
+                            }
+                            Some(c)
                         } else {
                             let result = album_repo
                                 .get_or_create_with_mbid(
@@ -293,10 +304,30 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                                     key.1,
                                     key.2,
                                     meta.musicbrainz_release_id.as_deref(),
-                                )
-                                .ok()
-                                .map(std::sync::Arc::new);
+                                );
+                            if let Err(ref e) = result {
+                                tracing::warn!(
+                                    album = %key.0,
+                                    artist_id = key.1,
+                                    year = ?key.2,
+                                    error = %e,
+                                    file = %sf.path,
+                                    "BUG_album_create_failed"
+                                );
+                            }
+                            let result = result.ok().map(std::sync::Arc::new);
                             if let Some(ref a) = result {
+                                if a.artist_id != Some(key.1) {
+                                    tracing::warn!(
+                                        album = %key.0,
+                                        requested_artist_id = key.1,
+                                        returned_album_id = ?a.id,
+                                        returned_artist_id = ?a.artist_id,
+                                        mb_release_id = ?meta.musicbrainz_release_id,
+                                        file = %sf.path,
+                                        "BUG_album_artist_mismatch"
+                                    );
+                                }
                                 album_cache.insert(key.clone(), std::sync::Arc::clone(a));
                             }
                             result
