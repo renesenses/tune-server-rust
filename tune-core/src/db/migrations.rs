@@ -489,7 +489,7 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
     Migration {
         version: 38,
         name: "add_zones_is_hidden",
-        up: "ALTER TABLE zones ADD COLUMN is_hidden INTEGER DEFAULT 0;",
+        up: "", // Applied programmatically via add_column_if_missing
     },
     Migration {
         version: 39,
