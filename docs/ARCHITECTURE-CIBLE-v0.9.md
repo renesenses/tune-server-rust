@@ -2,16 +2,37 @@
 
 **Statut** : Draft (2026-07-01)
 **Auteur** : cadrage architecte
-**Cible** : branche `release/v0.9` (trigger v0.8.50)
-**Contrainte maîtresse** : **régression minimale**, ouverture aux évolutions futures.
+**Cible** : branche `release/v0.9`, livrée sur le cycle **v0.9.0-rc.1 → rc.4 → GA (31/07/2026)**.
+**Contrainte maîtresse** : **régression minimale** (fenêtre RC), ouverture aux évolutions futures.
 
-> Ce document est le **pendant technique** de [`ROADMAP-v0.9.md`](ROADMAP-v0.9.md).
-> La roadmap décrit *quelles features* on livre (Plugin SDK, multi-user, AI, perf 500K, Mozaiklabs, PostgreSQL).
-> Ce document décrit *comment on rend le code prêt à les recevoir* sans casser l'existant.
-> Il traite les **6 points d'attention** identifiés dans `docs/architecture-tune-server-rust.pdf`.
+> ## Périmètre & articulation avec le gel RC — à lire avant tout
 >
-> Ne dupliquent pas ce doc : [`POSTGRES-PLAN.md`](POSTGRES-PLAN.md) (axe DB détaillé) et la RFC plugin
-> (mémoire `project_tune_plugin_rfc`). On y renvoie.
+> Cette refonte fait partie de l'**axe 3 « Refacto »** de la roadmap v0.9.0
+> (`Tune_Roadmap_v0.9.0.pdf`) : *erreurs typées, tests unitaires orchestrator/poller/queue,
+> consolidation queue locale/streaming*. Elle est livrée **sur `release/v0.9`**, pas sur `main`
+> (`main` = v0.8.x stable, bugfix critiques uniquement).
+>
+> **Le défi** : concilier une refonte structurelle avec un **feature freeze / cycle RC hebdomadaire**.
+> La réponse est le principe directeur ci-dessous — *filet d'abord, chaque pièce derrière un flag,
+> bascule par zone, shadow-compare* — décliné rc par rc pour que **chaque RC reste verte** :
+>
+> | RC | Contenu refonte (freeze-safe) |
+> |----|-------------------------------|
+> | **rc.1** | Phase 0 — **filet de tests** (orchestrator/poller/queue) + **erreurs typées** `TuneError`. Zéro changement de comportement. |
+> | **rc.2** | Phase 1 — **Poller FSM** derrière flag `poller_fsm`, shadow-compare vs legacy, bascule par zone. + **consolidation queue** locale/streaming. |
+> | **rc.3** | Phase 2 — **resolvers + `plan_playback`** ; Phase 3 — **`OutputCaps`** + harnais conformité. |
+> | **rc.4** | Nettoyage flags stabilisés, doc, validation finale. Bus FFI + SDK plugin = **différés** si la fenêtre est trop courte (candidats v0.9.1/v1.0). |
+>
+> Règle d'or : **si une pièce n'est pas prête à être flippée sans risque avant une RC, elle glisse à la
+> RC suivante — jamais on ne merge un demi-chemin sur `release/v0.9`.**
+>
+> ---
+>
+> Ce document traite les **6 points d'attention** de `docs/architecture-tune-server-rust.pdf`.
+> Il **remplace** en pertinence l'ancien [`ROADMAP-v0.9.md`](ROADMAP-v0.9.md) (2026-06-02, orienté
+> features Plugin SDK/multi-user/AI) : les roadmaps v0.9.0/v1.0.0 ont requalifié v0.9 en **stabilisation**.
+> Ne dupliquent pas ce doc : [`POSTGRES-PLAN.md`](POSTGRES-PLAN.md) et la RFC plugin
+> (mémoire `project_tune_plugin_rfc`).
 
 ---
 
@@ -478,7 +499,11 @@ JSON couvre 95 % du besoin à coût quasi nul et sans casser l'ABI existante.
 
 ---
 
-## Séquencement (branche `release/v0.9`, features gelées à v0.8.50)
+## Séquencement (branche `release/v0.9`, mappé sur le cycle RC)
+
+> Rappel cadence (voir bandeau en tête) : **rc.1** = Phase 0 + erreurs typées ; **rc.2** = Phase 1 (FSM,
+> flag) + consolidation queue ; **rc.3** = Phases 2-3 ; **rc.4** = nettoyage. Phase 4 (SDK/FFI) différée
+> si la fenêtre 31/07 est trop serrée.
 
 ```mermaid
 flowchart LR
