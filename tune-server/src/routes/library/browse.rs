@@ -31,25 +31,38 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .iter()
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
-            let pattern = format!("{norm}/%");
+            let norm_nfc: String = norm.nfc().collect();
+            let pattern = format!("{norm_nfc}/%");
+            let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+                "$1"
+            } else {
+                "?1"
+            };
             let count: i64 = match state.backend.query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
-                    if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                        "$1"
-                    } else {
-                        "?1"
-                    }
-                ),
+                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}"),
                 &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
             ) {
                 Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 Ok(None) => 0,
                 Err(e) => {
-                    warn!(path = %norm, error = %e, "browse_root_count_failed");
+                    warn!(path = %norm_nfc, error = %e, "browse_root_count_failed");
                     0
                 }
             };
+            if count == 0 {
+                let sample = state
+                    .backend
+                    .query_one("SELECT file_path FROM tracks LIMIT 1", &[])
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.first().and_then(|v| v.as_string()));
+                warn!(
+                    music_dir = %norm_nfc,
+                    pattern = %pattern,
+                    sample_file_path = ?sample,
+                    "browse_root_zero_tracks"
+                );
+            }
             let name = std::path::Path::new(&norm)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -64,7 +77,9 @@ pub(super) async fn browse_directory(
     State(state): State<AppState>,
     Query(q): Query<BrowseQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let normalized_query = tune_core::scanner::walker::normalize_path(&q.path);
+    let normalized_query: String = tune_core::scanner::walker::normalize_path(&q.path)
+        .nfc()
+        .collect();
     let resolved = std::path::Path::new(&normalized_query);
     if !resolved.is_absolute() || !resolved.exists() {
         return Err(AppError::bad_request("invalid path"));
