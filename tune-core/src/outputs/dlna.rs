@@ -467,12 +467,25 @@ impl OutputTarget for DlnaOutput {
         let transport_resp = self
             .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
             .await?;
-        let volume_resp = self
-            .rc_action(
+        let volume_resp = if self.device_id.contains("RINCON") {
+            let grc_url = self
+                .rendering_control_url
+                .replace("/RenderingControl/", "/GroupRenderingControl/");
+            self.soap_action(
+                &grc_url,
+                "urn:schemas-upnp-org:service:GroupRenderingControl:1",
+                "GetGroupVolume",
+                "<InstanceID>0</InstanceID>",
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            self.rc_action(
                 "GetVolume",
                 "<InstanceID>0</InstanceID><Channel>Master</Channel>",
             )
-            .await?;
+            .await?
+        };
         let mute_resp = self
             .rc_action(
                 "GetMute",

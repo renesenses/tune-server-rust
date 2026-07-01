@@ -331,11 +331,31 @@ fn build_smart_query(
         };
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
+        let val_clean = value.replace('\'', "''");
+        let val_unaccented = strip_accents(&val_clean);
+        let has_accents = val_clean != val_unaccented;
+
         let cond = match (field, op) {
-            ("genre", "eq") => format!("t.genre = '{}'", value.replace('\'', "''")),
-            ("genre", "contains") => format!("t.genre LIKE '%{}%'", value.replace('\'', "''")),
-            ("artist", "eq") => format!("ar.name = '{}'", value.replace('\'', "''")),
-            ("artist", "contains") => format!("ar.name LIKE '%{}%'", value.replace('\'', "''")),
+            ("genre", "eq") => {
+                if has_accents {
+                    format!("(t.genre = '{val_clean}' OR t.genre = '{val_unaccented}')")
+                } else {
+                    format!("(t.genre = '{val_clean}' OR t.genre LIKE '{val_clean}')")
+                }
+            }
+            ("genre", "contains") => {
+                format!("(t.genre LIKE '%{val_clean}%' OR t.genre LIKE '%{val_unaccented}%')")
+            }
+            ("artist", "eq") => {
+                if has_accents {
+                    format!("(ar.name = '{val_clean}' OR ar.name = '{val_unaccented}')")
+                } else {
+                    format!("(ar.name = '{val_clean}' OR ar.name LIKE '{val_clean}')")
+                }
+            }
+            ("artist", "contains") => {
+                format!("(ar.name LIKE '%{val_clean}%' OR ar.name LIKE '%{val_unaccented}%')")
+            }
             ("year", "eq") => format!("t.year = {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "gte") => format!("t.year >= {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "lte") => format!("t.year <= {}", value.parse::<i32>().unwrap_or(0)),
@@ -355,7 +375,9 @@ fn build_smart_query(
             ("duration_ms", "lte") => {
                 format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0))
             }
-            ("title", "contains") => format!("t.title LIKE '%{}%'", value.replace('\'', "''")),
+            ("title", "contains") => {
+                format!("(t.title LIKE '%{val_clean}%' OR t.title LIKE '%{val_unaccented}%')")
+            }
             ("comments", "contains") => {
                 format!("t.comments LIKE '%{}%'", value.replace('\'', "''"))
             }
@@ -575,4 +597,85 @@ async fn preview_smart_collection(
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
 
     Ok(Json(json!({"tracks": items, "total": items.len()})))
+}
+
+fn strip_accents(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => {
+                if c.is_uppercase() {
+                    'A'
+                } else {
+                    'a'
+                }
+            }
+            'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => {
+                if c.is_uppercase() {
+                    'E'
+                } else {
+                    'e'
+                }
+            }
+            'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => {
+                if c.is_uppercase() {
+                    'I'
+                } else {
+                    'i'
+                }
+            }
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => {
+                if c.is_uppercase() { 'O' } else { 'o' }
+            }
+            'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => {
+                if c.is_uppercase() {
+                    'U'
+                } else {
+                    'u'
+                }
+            }
+            'ñ' | 'Ñ' => {
+                if c.is_uppercase() {
+                    'N'
+                } else {
+                    'n'
+                }
+            }
+            'ç' | 'Ç' => {
+                if c.is_uppercase() {
+                    'C'
+                } else {
+                    'c'
+                }
+            }
+            'ÿ' | 'Ÿ' => {
+                if c.is_uppercase() {
+                    'Y'
+                } else {
+                    'y'
+                }
+            }
+            'æ' | 'Æ' => {
+                if c.is_uppercase() {
+                    'A'
+                } else {
+                    'a'
+                }
+            }
+            'œ' | 'Œ' => {
+                if c.is_uppercase() {
+                    'O'
+                } else {
+                    'o'
+                }
+            }
+            'ø' | 'Ø' => {
+                if c.is_uppercase() {
+                    'O'
+                } else {
+                    'o'
+                }
+            }
+            _ => c,
+        })
+        .collect()
 }
