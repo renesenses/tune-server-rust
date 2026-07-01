@@ -269,21 +269,12 @@ impl ZoneRepo {
         // Check if a zone with this device_id already exists (including hidden).
         if let Some(existing) = self.get_by_device_id(output_device_id)? {
             if let Some(id) = existing.id {
-                // If the zone was soft-deleted, resurrect it so it appears
-                // in list() again.  This preserves the user's previous
-                // settings (volume, DSP, gapless, etc.).
                 if self.is_device_hidden(output_device_id) {
-                    tracing::info!(
+                    tracing::debug!(
                         zone_id = id,
                         device_id = output_device_id,
-                        "unhiding_previously_deleted_zone"
+                        "zone_hidden_skipping_auto_unhide"
                     );
-                    self.unhide(id)?;
-                    // Update name in case the device was renamed
-                    let _ = self.update_name(id, name);
-                    if let Some(ot) = output_type {
-                        let _ = self.update_output_type(id, ot);
-                    }
                 }
                 return Ok((id, false));
             }
