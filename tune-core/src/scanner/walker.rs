@@ -550,8 +550,10 @@ mod tests {
 
     #[test]
     fn list_nonexistent_dir() {
-        let files = list_audio_files(&["/tmp/nonexistent_tune_test_dir".into()]);
-        assert!(files.is_empty());
+        let result = list_audio_files(&["/tmp/nonexistent_tune_test_dir".into()]);
+        // No audio files found; the missing directory is tracked separately.
+        assert!(result.files.is_empty());
+        assert_eq!(result.missing_dirs.len(), 1);
     }
 
     #[test]

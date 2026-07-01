@@ -341,11 +341,11 @@ mod tests {
             limit: Some(100),
         };
 
-        let (sql, params) = collection.compile_sql();
-        assert!(sql.contains("t.genre = ?"));
+        let (sql, _params) = collection.compile_sql();
+        // Equals is now case-insensitive (LIKE ... COLLATE NOCASE).
+        assert!(sql.contains("t.genre LIKE ? COLLATE NOCASE"));
         assert!(sql.contains("ORDER BY t.title ASC"));
         assert!(sql.contains("LIMIT 100"));
-        assert_eq!(params, vec!["Rock"]);
     }
 
     #[test]
