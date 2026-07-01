@@ -285,7 +285,22 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
                     let album = if let Some(ref key) = album_key {
                         if let Some(cached) = album_cache.get(key) {
-                            Some(std::sync::Arc::clone(cached))
+                            let cached_ref = std::sync::Arc::clone(cached);
+                            if let Some(ref album_title) = meta.album {
+                                let t = album_title.to_lowercase();
+                                if t.contains("best") || t.contains("greatest") {
+                                    tracing::info!(
+                                        album = %album_title,
+                                        cache_key_artist_id = key.1,
+                                        cache_key_year = ?key.2,
+                                        cached_album_id = ?cached_ref.id,
+                                        cached_album_artist_id = ?cached_ref.artist_id,
+                                        file = %sf.path,
+                                        "DIAG_album_cache_hit"
+                                    );
+                                }
+                            }
+                            Some(cached_ref)
                         } else {
                             let result = album_repo
                                 .get_or_create_with_mbid(
@@ -297,6 +312,22 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                                 .ok()
                                 .map(std::sync::Arc::new);
                             if let Some(ref a) = result {
+                                if let Some(ref album_title) = meta.album {
+                                    let t = album_title.to_lowercase();
+                                    if t.contains("best") || t.contains("greatest") {
+                                        tracing::info!(
+                                            album = %album_title,
+                                            lookup_artist_id = key.1,
+                                            lookup_year = ?key.2,
+                                            result_album_id = ?a.id,
+                                            result_artist_id = ?a.artist_id,
+                                            result_title = %a.title,
+                                            mb_release_id = ?meta.musicbrainz_release_id,
+                                            file = %sf.path,
+                                            "DIAG_album_db_lookup"
+                                        );
+                                    }
+                                }
                                 album_cache.insert(key.clone(), std::sync::Arc::clone(a));
                             }
                             result
