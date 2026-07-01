@@ -303,16 +303,35 @@ fn build_signal_path(
         .unwrap_or_else(|| "flac".into());
     let source_format = AudioFormat::from_extension(&fmt_str);
     let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
-    let sample_rate = np
-        .sample_rate
-        .map(|v| v as i32)
-        .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
-        .unwrap_or(if is_dsd { 2_822_400 } else { 44100 });
-    let bit_depth = np
-        .bit_depth
-        .map(|v| v as i32)
-        .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
-        .unwrap_or(if is_dsd { 1 } else { 16 });
+    // For DSD files, prefer the track's original sample rate and bit depth
+    // from the database (which represent the SOURCE format: e.g. 2822400 Hz
+    // / 1-bit for DSD64) over the NowPlaying values, which may contain the
+    // TRANSCODED PCM values (e.g. 176400 Hz / 24-bit) when the file was
+    // converted for network output (DLNA, OpenHome, etc.).
+    let sample_rate = if is_dsd {
+        track
+            .as_ref()
+            .and_then(|t| t.sample_rate)
+            .or_else(|| np.sample_rate.map(|v| v as i32))
+            .unwrap_or(2_822_400)
+    } else {
+        np.sample_rate
+            .map(|v| v as i32)
+            .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
+            .unwrap_or(44100)
+    };
+    let bit_depth = if is_dsd {
+        track
+            .as_ref()
+            .and_then(|t| t.bit_depth)
+            .or_else(|| np.bit_depth.map(|v| v as i32))
+            .unwrap_or(1)
+    } else {
+        np.bit_depth
+            .map(|v| v as i32)
+            .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
+            .unwrap_or(16)
+    };
 
     let format_name = if is_dsd {
         match sample_rate {
@@ -416,17 +435,24 @@ fn build_signal_path(
         other => (false, other, format_name),
     };
 
-    // Detect sample rate capping
-    let resampling_active = zone
-        .max_sample_rate
-        .is_some_and(|max| (sample_rate as u32) > max);
+    // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
+    // already handles rate conversion; showing a separate resampler step
+    // would be misleading since sample_rate here is the DSD MHz rate).
+    let resampling_active = !is_dsd
+        && zone
+            .max_sample_rate
+            .is_some_and(|max| (sample_rate as u32) > max);
 
     // Overall bit-perfect: lossless source + no transcoding + no DSP + no resampling.
     // Volume is excluded — it's a user preference, not a signal degradation.
     let bit_perfect = is_lossless && transport_bit_perfect && !dsp_enabled && !resampling_active;
 
     // Build steps
-    let source_desc = if sample_rate >= 1000 {
+    let source_desc = if is_dsd {
+        // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
+        let mhz = sample_rate as f64 / 1_000_000.0;
+        format!("{format_name} {mhz:.1} MHz")
+    } else if sample_rate >= 1000 {
         format!(
             "{format_name} {sr}kHz/{bit_depth}bit",
             sr = sample_rate / 1000

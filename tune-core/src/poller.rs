@@ -859,7 +859,7 @@ impl PositionPoller {
                     // stopped_ticks to prevent false track-end detection.
                     let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
                         < TRACK_LOAD_GRACE_SECS
-                        && ps.track_started_at.is_none();
+                        && ps.peak_position_ms < 5_000;
                     if in_seek_grace {
                         ps.stopped_ticks = 0;
                         debug!(
@@ -1158,7 +1158,6 @@ impl PositionPoller {
                             }
                         } else {
                             debug!(zone_id, "gapless_disabled_for_zone");
-                            ps.gapless_sent = true;
                         }
                     }
 

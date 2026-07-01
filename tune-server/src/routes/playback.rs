@@ -499,6 +499,29 @@ async fn play(
                 .and_then(|z| z.output_device_id)
         });
 
+        // Write queue BEFORE play so WS-triggered fetchQueue() finds it
+        let queue_items: Vec<_> = tracks
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.title.clone(),
+                    t.artist.clone(),
+                    t.album.clone(),
+                    t.cover_path.clone(),
+                    t.duration_ms as i64,
+                    Some(source.clone()),
+                )
+            })
+            .collect();
+        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+            warn!(zone_id, error = %e, "set_streaming_queue_failed");
+        }
+        state
+            .playback
+            .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+            .await;
+
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -515,27 +538,6 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
-                let queue_items: Vec<_> = tracks
-                    .iter()
-                    .map(|t| {
-                        (
-                            t.id.clone(),
-                            t.title.clone(),
-                            t.artist.clone(),
-                            t.album.clone(),
-                            t.cover_path.clone(),
-                            t.duration_ms as i64,
-                            Some(source.clone()),
-                        )
-                    })
-                    .collect();
-                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
-                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
-                }
-                state
-                    .playback
-                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
-                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
@@ -581,6 +583,29 @@ async fn play(
                 .and_then(|z| z.output_device_id)
         });
 
+        // Write queue BEFORE play so WS-triggered fetchQueue() finds it
+        let queue_items: Vec<_> = tracks
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.title.clone(),
+                    t.artist.clone(),
+                    t.album.clone(),
+                    t.cover_path.clone(),
+                    t.duration_ms as i64,
+                    Some(source.clone()),
+                )
+            })
+            .collect();
+        if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
+            warn!(zone_id, error = %e, "set_streaming_queue_failed");
+        }
+        state
+            .playback
+            .update_queue_info(zone_id, start as i64, tracks.len() as i64)
+            .await;
+
         let orch_req = tune_core::orchestrator::PlayRequest {
             zone_id,
             output_device_id,
@@ -597,27 +622,6 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
-                let queue_items: Vec<_> = tracks
-                    .iter()
-                    .map(|t| {
-                        (
-                            t.id.clone(),
-                            t.title.clone(),
-                            t.artist.clone(),
-                            t.album.clone(),
-                            t.cover_path.clone(),
-                            t.duration_ms as i64,
-                            Some(source.clone()),
-                        )
-                    })
-                    .collect();
-                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_items) {
-                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
-                }
-                state
-                    .playback
-                    .update_queue_info(zone_id, start as i64, tracks.len() as i64)
-                    .await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }

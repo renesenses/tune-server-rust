@@ -545,10 +545,14 @@ impl OutputTarget for DlnaOutput {
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         let item_id = self.next_item_id();
         let metadata = Self::didl_metadata(media, item_id);
-        self.av_action("SetNextAVTransportURI", &format!(
+        let resp = self.av_action("SetNextAVTransportURI", &format!(
             "<InstanceID>0</InstanceID><NextURI>{}</NextURI><NextURIMetaData>{metadata}</NextURIMetaData>",
             media.url
         )).await?;
+        if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+            warn!(device = %self.name, response = %resp, "dlna_set_next_rejected");
+            return Err(format!("SetNextAVTransportURI rejected: {resp}"));
+        }
         info!(device = %self.name, url = media.url, "dlna_set_next");
         Ok(())
     }
