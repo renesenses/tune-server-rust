@@ -812,6 +812,7 @@ async fn play(
             .duration_ms
             .or_else(|| track.as_ref().map(|t| t.duration_ms)),
         seek_ms: body.seek_ms,
+        temp_file_path: body.temp_file_path,
     };
 
     match state.orchestrator.play(orch_req).await {
