@@ -6,22 +6,23 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
-/// Engine-agnostic SQL builders for play_queue_repo.
+/// Engine-agnostic SQL builders for the unified `queue_items` table (v0.9 rc.2).
 ///
-/// The CREATE TABLE for streaming_queue (referenced inline in this
-/// repo) is SQLite-specific (INTEGER PRIMARY KEY AUTOINCREMENT). It
-/// stays in the impl for now; the phase 3 migration sweep will move it
-/// to a portable migration file.
+/// A single table holds both local tracks (`track_id` set, `source='local'`)
+/// and streaming tracks (`track_id` NULL, inline metadata). The two subsets are
+/// discriminated by `track_id IS [NOT] NULL` and keep independent position
+/// spaces, preserving the exact behaviour of the former split
+/// `play_queue` / `streaming_queue` tables.
 pub mod sql {
     use super::SqlDialect;
 
     pub fn queue_select_base() -> &'static str {
-        "SELECT pq.id, pq.zone_id, pq.track_id, pq.position, pq.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path, t.format, t.sample_rate, t.bit_depth FROM play_queue pq LEFT JOIN tracks t ON pq.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
+        "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, al.cover_path, t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
 
     pub fn get_queue<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE pq.zone_id = {} ORDER BY pq.position",
+            "{} WHERE q.zone_id = {} AND q.track_id IS NOT NULL ORDER BY q.position",
             queue_select_base(),
             d.placeholder(1)
         )
@@ -29,7 +30,7 @@ pub mod sql {
 
     pub fn get_current<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE pq.zone_id = {} AND pq.is_current = '1'",
+            "{} WHERE q.zone_id = {} AND q.track_id IS NOT NULL AND q.is_current = '1'",
             queue_select_base(),
             d.placeholder(1)
         )
@@ -37,14 +38,14 @@ pub mod sql {
 
     pub fn delete_for_zone<D: SqlDialect>(d: &D) -> String {
         format!(
-            "DELETE FROM play_queue WHERE zone_id = {}",
+            "DELETE FROM queue_items WHERE zone_id = {} AND track_id IS NOT NULL",
             d.placeholder(1)
         )
     }
 
     pub fn insert_queue_row<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES ({}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) VALUES ({}, {}, {}, {}, 'local')",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -54,14 +55,14 @@ pub mod sql {
 
     pub fn max_position<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT COALESCE(MAX(position), -1) FROM play_queue WHERE zone_id = {}",
+            "SELECT COALESCE(MAX(position), -1) FROM queue_items WHERE zone_id = {} AND track_id IS NOT NULL",
             d.placeholder(1)
         )
     }
 
     pub fn insert_queue_row_no_current<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO play_queue (zone_id, track_id, position, is_current) VALUES ({}, {}, {}, 0)",
+            "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) VALUES ({}, {}, {}, 0, 'local')",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
@@ -70,14 +71,14 @@ pub mod sql {
 
     pub fn unset_current<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE play_queue SET is_current = 0 WHERE zone_id = {}",
+            "UPDATE queue_items SET is_current = 0 WHERE zone_id = {} AND track_id IS NOT NULL",
             d.placeholder(1)
         )
     }
 
     pub fn set_current_at<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE play_queue SET is_current = 1 WHERE zone_id = {} AND position = {}",
+            "UPDATE queue_items SET is_current = 1 WHERE zone_id = {} AND position = {} AND track_id IS NOT NULL",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -85,7 +86,7 @@ pub mod sql {
 
     pub fn delete_at<D: SqlDialect>(d: &D) -> String {
         format!(
-            "DELETE FROM play_queue WHERE zone_id = {} AND position = {}",
+            "DELETE FROM queue_items WHERE zone_id = {} AND position = {} AND track_id IS NOT NULL",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -93,7 +94,7 @@ pub mod sql {
 
     pub fn reindex_after_delete<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE play_queue SET position = position - 1 WHERE zone_id = {} AND position > {}",
+            "UPDATE queue_items SET position = position - 1 WHERE zone_id = {} AND position > {} AND track_id IS NOT NULL",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -101,14 +102,14 @@ pub mod sql {
 
     pub fn delete_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "DELETE FROM streaming_queue WHERE zone_id = {}",
+            "DELETE FROM queue_items WHERE zone_id = {} AND track_id IS NULL",
             d.placeholder(1)
         )
     }
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO streaming_queue (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -123,21 +124,21 @@ pub mod sql {
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source FROM streaming_queue WHERE zone_id = {} ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
             d.placeholder(1)
         )
     }
 
     pub fn count_queue<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT COUNT(*) FROM play_queue WHERE zone_id = {}",
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {} AND track_id IS NOT NULL",
             d.placeholder(1)
         )
     }
 
     pub fn delete_streaming_at<D: SqlDialect>(d: &D) -> String {
         format!(
-            "DELETE FROM streaming_queue WHERE zone_id = {} AND position = {}",
+            "DELETE FROM queue_items WHERE zone_id = {} AND position = {} AND track_id IS NULL",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -145,7 +146,7 @@ pub mod sql {
 
     pub fn reindex_streaming_after_delete<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE streaming_queue SET position = position - 1 WHERE zone_id = {} AND position > {}",
+            "UPDATE queue_items SET position = position - 1 WHERE zone_id = {} AND position > {} AND track_id IS NULL",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -153,23 +154,10 @@ pub mod sql {
 
     pub fn count_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT COUNT(*) FROM streaming_queue WHERE zone_id = {}",
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {} AND track_id IS NULL",
             d.placeholder(1)
         )
     }
-
-    pub const CREATE_STREAMING_QUEUE_SQLITE: &str = "CREATE TABLE IF NOT EXISTS streaming_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        zone_id INTEGER NOT NULL,
-        position INTEGER NOT NULL,
-        source TEXT,
-        source_id TEXT,
-        title TEXT,
-        artist TEXT,
-        album TEXT,
-        cover_url TEXT,
-        duration_ms INTEGER DEFAULT 0
-    )";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,7 +268,7 @@ impl PlayQueueRepo {
         })
     }
 
-    /// Append tracks at the end of the local play queue for a zone.
+    /// Append tracks at the end of the local queue for a zone.
     /// Convenience wrapper over add_tracks(zone_id, track_ids, None).
     pub fn append_tracks(&self, zone_id: i64, track_ids: &[i64]) -> Result<(), String> {
         self.add_tracks(zone_id, track_ids, None)
@@ -318,13 +306,9 @@ impl PlayQueueRepo {
         Ok(deleted > 0)
     }
 
-    /// Remove a track from the streaming_queue at the given position.
+    /// Remove a streaming track (track_id NULL) at the given position.
     /// Returns true if a row was actually deleted.
     pub fn remove_streaming_at(&self, zone_id: i64, position: i64) -> Result<bool, String> {
-        // Ensure the streaming_queue table exists (SQLite-only lazy-create).
-        if self.db.engine() == Engine::Sqlite {
-            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
-        }
         let delete_sql = self.dialect_sql(sql::delete_streaming_at, sql::delete_streaming_at);
         let reindex_sql = self.dialect_sql(
             sql::reindex_streaming_after_delete,
@@ -343,11 +327,8 @@ impl PlayQueueRepo {
         Ok(deleted > 0)
     }
 
-    /// Count tracks in the streaming_queue for a zone.
+    /// Count streaming tracks (track_id NULL) for a zone.
     pub fn count_streaming(&self, zone_id: i64) -> Result<i64, String> {
-        if self.db.engine() == Engine::Sqlite {
-            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
-        }
         let count_sql = self.dialect_sql(sql::count_streaming, sql::count_streaming);
         let params: [&dyn ToSqlValue; 1] = [&zone_id];
         let n = self
@@ -360,13 +341,12 @@ impl PlayQueueRepo {
     }
 
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
-        let delete_queue = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        // Delete both subsets (local + streaming) of the unified table.
+        let delete_local = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         let params: [&dyn ToSqlValue; 1] = [&zone_id];
-        self.db.execute(&delete_queue, &params)?;
-        // streaming_queue may not exist yet — tolerate the error like
-        // the original did.
-        let _ = self.db.execute(&delete_streaming, &params);
+        self.db.execute(&delete_local, &params)?;
+        self.db.execute(&delete_streaming, &params)?;
         Ok(())
     }
 
@@ -384,19 +364,12 @@ impl PlayQueueRepo {
             Option<String>,
         )],
     ) -> Result<(), String> {
-        let delete_queue_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
+        let delete_local_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
-        // Ensure the streaming_queue table exists before the tx — DDL
-        // inside a tx that wraps DML is fine on SQLite but the lazy-
-        // create has always lived outside the durable schema, so keep
-        // it out of the tx for clarity.
-        if self.db.engine() == Engine::Sqlite {
-            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
-        }
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
-            tx.execute(&delete_queue_sql, &p)?;
+            tx.execute(&delete_local_sql, &p)?;
             tx.execute(&delete_streaming_sql, &p)?;
             for (i, (source_id, title, artist, album, cover_url, duration_ms, source)) in
                 tracks.iter().enumerate()
@@ -419,7 +392,7 @@ impl PlayQueueRepo {
         })
     }
 
-    /// Append tracks to the streaming queue for a zone (does NOT clear existing items).
+    /// Append tracks to the streaming subset for a zone (does NOT clear existing items).
     pub fn append_streaming_queue(
         &self,
         zone_id: i64,
@@ -434,9 +407,6 @@ impl PlayQueueRepo {
         )],
     ) -> Result<(), String> {
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
-        if self.db.engine() == Engine::Sqlite {
-            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
-        }
         // Get current count to compute starting position for new items
         let current_count = self.count_streaming(zone_id).unwrap_or(0);
 
@@ -464,11 +434,6 @@ impl PlayQueueRepo {
 
     pub fn get_streaming_queue(&self, zone_id: i64) -> Result<Vec<serde_json::Value>, String> {
         let select_sql = self.dialect_sql(sql::select_streaming, sql::select_streaming);
-        // Ensure the streaming_queue table exists (SQLite-only lazy-
-        // create — the table will be added to migrations in phase 3).
-        if self.db.engine() == Engine::Sqlite {
-            self.db.execute(sql::CREATE_STREAMING_QUEUE_SQLITE, &[])?;
-        }
         let params: [&dyn ToSqlValue; 1] = [&zone_id];
         let rows = self.db.query_many(&select_sql, &params)?;
         let items: Vec<serde_json::Value> = rows
@@ -746,12 +711,52 @@ mod tests {
     }
 
     #[test]
+    fn queue_local_and_streaming_coexist_separately() {
+        // Both subsets live in queue_items with independent position spaces.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+
+        let mut t1 = Track::new("Local".into());
+        t1.file_path = Some("/l.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+        repo.set_queue(1, &[tid1]).unwrap();
+
+        repo.append_streaming_queue(
+            1,
+            &[(
+                "s1".into(),
+                "Stream".into(),
+                "SA".into(),
+                None,
+                None,
+                123_000i64,
+                Some("tidal".into()),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(repo.count(1).unwrap(), 1);
+        assert_eq!(repo.count_streaming(1).unwrap(), 1);
+        // Local read is unaffected by the streaming row.
+        let local = repo.get_queue(1).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].track_id, tid1);
+        // clear() removes both subsets.
+        repo.clear(1).unwrap();
+        assert_eq!(repo.count(1).unwrap(), 0);
+        assert_eq!(repo.count_streaming(1).unwrap(), 0);
+    }
+
+    #[test]
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?)"));
-        assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4)"));
+        assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?, 'local')"));
+        assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
         assert!(sql::insert_streaming(&p).contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+        assert!(sql::get_queue(&s).contains("queue_items"));
+        assert!(sql::select_streaming(&s).contains("track_id IS NULL"));
     }
 
     #[test]
