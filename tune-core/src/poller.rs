@@ -118,7 +118,14 @@ fn rand_pos(queue_length: i64, current: i64) -> i64 {
 /// faithful and seeds the future poller state machine (Axe 2): the FSM
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
-    use super::{MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS};
+    use super::{
+        GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+    };
+
+    /// Margin (ms) added to the track duration before position-based
+    /// end-of-track is accepted, to avoid clipping the last fraction of a
+    /// second on renderers that report position slightly ahead of playback.
+    pub const END_MARGIN_MS: u64 = 3000;
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -161,6 +168,57 @@ pub(crate) mod decisions {
             || repeat_end
             || (ended_naturally && wall_elapsed >= 5)
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
+    }
+
+    /// The renderer now reports a duration that differs from the current
+    /// track's by more than 2s — a signal that a gapless transition to the
+    /// next track has occurred (only meaningful once gapless was armed).
+    pub fn duration_changed(
+        gapless_sent: bool,
+        track_duration_ms: u64,
+        reported_duration_ms: u64,
+    ) -> bool {
+        gapless_sent
+            && track_duration_ms > 0
+            && reported_duration_ms > 0
+            && (reported_duration_ms as i64 - track_duration_ms as i64).unsigned_abs() > 2000
+    }
+
+    /// Does the reported position confirm we are genuinely at the end of the
+    /// current track (or reset to the start of the next one)? Guarded by
+    /// `played_enough` to reject false transitions on renderers (DMP-A8) that
+    /// briefly report position < 5s right after SetNextAVTransportURI.
+    pub fn position_confirms_transition(
+        played_enough: bool,
+        position_ms: u64,
+        track_duration_ms: u64,
+    ) -> bool {
+        played_enough
+            && (position_ms < 5000
+                || (track_duration_ms > 0
+                    && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
+    }
+
+    /// Should `SetNextAVTransportURI` be sent now — i.e. playback has entered
+    /// the final `GAPLESS_WINDOW_MS` of the track and gapless is not yet armed?
+    pub fn should_arm_gapless(
+        gapless_sent: bool,
+        reported_duration_ms: u64,
+        position_ms: u64,
+    ) -> bool {
+        !gapless_sent
+            && reported_duration_ms > GAPLESS_WINDOW_MS
+            && position_ms >= reported_duration_ms - GAPLESS_WINDOW_MS
+    }
+
+    /// Position-based end-of-track: the output still reports Playing but the
+    /// position has run past `duration + END_MARGIN_MS` (e.g. a local/cpal
+    /// output draining its ring buffer). One tick's worth of the condition —
+    /// the caller still requires `POSITION_PAST_END_TICKS` consecutive hits.
+    pub fn past_end_reached(track_duration_ms: u64, played_enough: bool, position_ms: u64) -> bool {
+        track_duration_ms > END_MARGIN_MS
+            && played_enough
+            && position_ms >= track_duration_ms.saturating_add(END_MARGIN_MS)
     }
 }
 
@@ -1141,21 +1199,21 @@ impl PositionPoller {
                     // the track actually ended (near end or reset to start).
                     // Some DLNA renderers (DMP-A6/A8) report inaccurate durations
                     // from the start, so duration mismatch alone is insufficient.
-                    let duration_changed = ps.gapless_sent
-                        && track_duration_ms > 0
-                        && status.duration_ms > 0
-                        && (status.duration_ms as i64 - track_duration_ms as i64).unsigned_abs()
-                            > 2000;
+                    let duration_changed = decisions::duration_changed(
+                        ps.gapless_sent,
+                        track_duration_ms,
+                        status.duration_ms,
+                    );
                     // Position must confirm we are actually at the end of the
                     // current track OR that the position has reset to the
                     // start of the next track.  The played_enough guard
                     // prevents false transitions when a renderer (DMP-A8)
                     // reports position < 5s immediately after SetNext.
-                    let position_confirms_transition = played_enough
-                        && (status.position_ms < 5000
-                            || (track_duration_ms > 0
-                                && status.position_ms
-                                    >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)));
+                    let position_confirms_transition = decisions::position_confirms_transition(
+                        played_enough,
+                        status.position_ms,
+                        track_duration_ms,
+                    );
                     if duration_changed && position_confirms_transition {
                         info!(
                             zone_id,
@@ -1191,10 +1249,11 @@ impl PositionPoller {
                         } else {
                             self.handle_track_end(zone_id, zone_state).await;
                         }
-                    } else if !ps.gapless_sent
-                        && status.duration_ms > GAPLESS_WINDOW_MS
-                        && status.position_ms >= status.duration_ms - GAPLESS_WINDOW_MS
-                    {
+                    } else if decisions::should_arm_gapless(
+                        ps.gapless_sent,
+                        status.duration_ms,
+                        status.position_ms,
+                    ) {
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -1222,11 +1281,11 @@ impl PositionPoller {
                     // Add a 3-second margin to avoid cutting off the end of
                     // tracks on DLNA renderers that report position slightly
                     // ahead of actual playback.
-                    let end_margin_ms = 3000u64;
-                    if track_duration_ms > end_margin_ms
-                        && played_enough
-                        && status.position_ms >= track_duration_ms.saturating_add(end_margin_ms)
-                    {
+                    if decisions::past_end_reached(
+                        track_duration_ms,
+                        played_enough,
+                        status.position_ms,
+                    ) {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
@@ -1792,6 +1851,63 @@ mod tests {
     #[test]
     fn natural_end_all_guards_false() {
         assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
+    }
+
+    #[test]
+    fn duration_changed_requires_armed_and_delta() {
+        // Armed + reported duration differs by > 2s → changed.
+        assert!(decisions::duration_changed(true, 200_000, 210_000));
+        // Not armed → never "changed".
+        assert!(!decisions::duration_changed(false, 200_000, 210_000));
+        // Delta within 2s → not changed.
+        assert!(!decisions::duration_changed(true, 200_000, 201_000));
+        // Zero durations → not changed.
+        assert!(!decisions::duration_changed(true, 0, 210_000));
+        assert!(!decisions::duration_changed(true, 200_000, 0));
+    }
+
+    #[test]
+    fn position_confirms_transition_near_end_or_reset() {
+        // played_enough + position reset to start → confirmed.
+        assert!(decisions::position_confirms_transition(
+            true, 2_000, 300_000
+        ));
+        // played_enough + within GAPLESS_WINDOW_MS of the end → confirmed.
+        assert!(decisions::position_confirms_transition(
+            true, 275_000, 300_000
+        ));
+        // Mid-track, not near end, not reset → not confirmed.
+        assert!(!decisions::position_confirms_transition(
+            true, 150_000, 300_000
+        ));
+        // Not played_enough → never confirmed even at reset.
+        assert!(!decisions::position_confirms_transition(
+            false, 2_000, 300_000
+        ));
+    }
+
+    #[test]
+    fn should_arm_gapless_in_final_window() {
+        // Entered the final GAPLESS_WINDOW_MS, not yet armed → arm.
+        assert!(decisions::should_arm_gapless(false, 300_000, 275_000));
+        // Already armed → don't re-arm.
+        assert!(!decisions::should_arm_gapless(true, 300_000, 275_000));
+        // Still before the final window → don't arm.
+        assert!(!decisions::should_arm_gapless(false, 300_000, 100_000));
+        // Duration shorter than the window → never arm (no underflow).
+        assert!(!decisions::should_arm_gapless(false, 10_000, 9_000));
+    }
+
+    #[test]
+    fn past_end_reached_beyond_margin() {
+        // Position past duration + END_MARGIN_MS, played enough → reached.
+        assert!(decisions::past_end_reached(240_000, true, 244_000));
+        // Just past duration but within the margin → not yet.
+        assert!(!decisions::past_end_reached(240_000, true, 240_500));
+        // Past end but not played_enough → not reached.
+        assert!(!decisions::past_end_reached(240_000, false, 244_000));
+        // Duration at/below the margin → not reached.
+        assert!(!decisions::past_end_reached(1_000, true, 50_000));
     }
 
     #[test]
