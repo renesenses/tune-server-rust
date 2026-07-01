@@ -197,32 +197,23 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             })
                             .unwrap_or(false);
 
-                    // Album artist: use album_artist tag, fall back to existing album's artist
-                    let existing_album_artist: Option<String> = if meta.album_artist.is_none() {
-                        meta.album.as_ref().and_then(|title| {
-                            album_repo
-                                .get_by_title_strong(title)
-                                .ok()
-                                .flatten()
-                                .and_then(|a| a.artist_name)
-                        })
+                    let album_artist_name = if is_compilation {
+                        "Various Artists"
                     } else {
-                        None
+                        meta.album_artist
+                            .as_deref()
+                            .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"))
                     };
-                    let album_artist_name = meta
-                        .album_artist
-                        .as_deref()
-                        .or(existing_album_artist.as_deref())
-                        .unwrap_or_else(|| {
-                            if is_compilation {
-                                "Various Artists"
-                            } else {
-                                meta.artist.as_deref().unwrap_or("Unknown Artist")
-                            }
-                        });
 
                     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
 
+                    let album_artist_mbid = if is_compilation {
+                        None
+                    } else {
+                        meta.musicbrainz_album_artist_id
+                            .as_deref()
+                            .or(meta.musicbrainz_artist_id.as_deref())
+                    };
                     let album_artist_entry =
                         if let Some(cached) = artist_cache.get(album_artist_name) {
                             Some(std::sync::Arc::clone(cached))
@@ -230,11 +221,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                             let result = artist_repo
                                 .get_or_create(
                                     album_artist_name,
-                                    if is_compilation {
-                                        None
-                                    } else {
-                                        meta.musicbrainz_artist_id.as_deref()
-                                    },
+                                    album_artist_mbid,
                                     meta.album_artist_sort.as_deref(),
                                 )
                                 .ok()
