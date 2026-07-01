@@ -49,16 +49,32 @@ pub fn build_track_from_metadata_opts(
 
     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
 
+    let album_artist_mbid = if is_compilation {
+        None
+    } else {
+        meta.musicbrainz_album_artist_id
+            .as_deref()
+            .or(meta.musicbrainz_artist_id.as_deref())
+    };
     let album_artist_entry = match artist_repo.get_or_create(
         album_artist_name,
-        if is_compilation {
-            None
-        } else {
-            meta.musicbrainz_artist_id.as_deref()
-        },
+        album_artist_mbid,
         meta.album_artist_sort.as_deref(),
     ) {
-        Ok(a) => Some(a),
+        Ok(a) => {
+            if let Some(ref mbid) = a.musicbrainz_id {
+                if a.name.to_lowercase() != album_artist_name.to_lowercase() {
+                    tracing::warn!(
+                        expected = album_artist_name,
+                        resolved = %a.name,
+                        mbid = %mbid,
+                        file = %sf.path,
+                        "album_artist_mbid_name_mismatch"
+                    );
+                }
+            }
+            Some(a)
+        }
         Err(e) => {
             tracing::warn!(
                 artist = album_artist_name,
@@ -93,16 +109,18 @@ pub fn build_track_from_metadata_opts(
             tracing::warn!(album = title, file = %sf.path, "album_skipped_no_artist_id");
             return None;
         };
-        if title.to_lowercase().contains("best of") {
-            tracing::info!(
-                album = title,
-                album_artist = album_artist_name,
-                album_artist_id = aid,
-                track_artist = track_artist_name,
-                file = %sf.path,
-                "DIAG_best_of_album_resolution"
-            );
-        }
+        tracing::debug!(
+            album = %title,
+            album_artist_tag = ?meta.album_artist,
+            album_artist_resolved = album_artist_name,
+            album_artist_id = aid,
+            album_artist_mbid = ?album_artist_mbid,
+            track_artist = track_artist_name,
+            mb_artist_id = ?meta.musicbrainz_artist_id,
+            mb_album_artist_id = ?meta.musicbrainz_album_artist_id,
+            file = %sf.path,
+            "DIAG_album_resolution"
+        );
         // Quality-based album splitting: append suffix when sample_rate or
         // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
         // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.

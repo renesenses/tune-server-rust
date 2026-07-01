@@ -431,7 +431,7 @@ async fn fetch_artist_image_musicbrainz_full(
                 "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
                 filename.replace(' ', "_")
             );
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Some(bytes) = download_image(client, &direct_url).await {
                 return Some(bytes);
             }
@@ -450,7 +450,7 @@ async fn fetch_artist_image_musicbrainz_full(
     if !qid.starts_with('Q') {
         return None;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     fetch_image_from_wikidata(client, qid).await
 }
 
@@ -766,8 +766,7 @@ pub async fn batch_enrich_artist_artwork(
                 .unwrap_or_default();
 
             for (artist_id, name) in &no_mbid_artists {
-                // Rate limit: 1s between requests
-                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                 // Try Discogs first
                 if discogs_available {
@@ -785,7 +784,7 @@ pub async fn batch_enrich_artist_artwork(
 
                 // Fallback to Last.fm
                 if lastfm_available {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     if let Some(data) = fetch_artist_image_lastfm(&client, name).await {
                         let hash = artwork_hash(&format!("artist-name-{name}"));
                         std::fs::create_dir_all(&cache_dir).ok();
