@@ -494,12 +494,12 @@ CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
     Migration {
         version: 39,
         name: "add_zones_last_play_state",
-        up: "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped';",
+        up: "", // Applied programmatically via ensure_zones_is_hidden (idempotent ALTER)
     },
     Migration {
         version: 40,
         name: "add_zones_dsd_mode",
-        up: "ALTER TABLE zones ADD COLUMN dsd_mode TEXT DEFAULT 'auto';",
+        up: "", // Applied programmatically via add_column_if_missing
     },
     Migration {
         version: 41,
@@ -889,6 +889,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 38 {
             add_column_if_missing(db, "zones", "is_hidden", "INTEGER DEFAULT 0");
+        }
+        if migration.version == 39 {
+            add_column_if_missing(db, "zones", "last_play_state", "TEXT DEFAULT 'stopped'");
+        }
+        if migration.version == 40 {
+            add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
         }
         if migration.version == 44 {
             add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");

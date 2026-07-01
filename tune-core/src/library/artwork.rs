@@ -303,7 +303,7 @@ pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>
     }
 
     // 2. Fanart.tv
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
         return Some(bytes);
     }
@@ -314,14 +314,14 @@ pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>
     }
 
     // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
         return Some(bytes);
     }
 
     // 6. Discogs (if token configured, search by artist name)
     if !artist_name.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name).await {
             return Some(bytes);
         }
@@ -329,7 +329,7 @@ pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>
 
     // 7. Last.fm (artist.getinfo → image array, "extralarge" or "mega")
     if !artist_name.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name).await {
             return Some(bytes);
         }
@@ -675,8 +675,9 @@ pub async fn batch_enrich_artist_artwork(
     let mut failed = 0u32;
 
     for (artist_id, name, mbid) in &artists {
-        // Rate limit: wait 1.1s between requests
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // Rate limit: short delay between community lookups (no rate limit),
+        // longer delay only when hitting external APIs (MusicBrainz etc.)
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         match fetch_artist_image(mbid, name).await {
             Some(data) => {
