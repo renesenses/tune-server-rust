@@ -309,7 +309,11 @@ impl PositionPoller {
             // Skip recovery during startup grace (30s) — the orchestrator may
             // still be sending play commands and the renderer reports Playing
             // before PlaybackManager is updated.
-            let already_playing = states
+            // Re-read PlaybackManager state AFTER the device poll to avoid
+            // the race where orchestrator.play() sets Playing between the
+            // initial states read and the device poll response.
+            let fresh_states = self.playback.all_states().await;
+            let already_playing = fresh_states
                 .iter()
                 .any(|s| s.zone_id == zone_id && s.state == PlayState::Playing);
             if status.state == TransportState::Playing && !already_playing && !in_startup_grace {
