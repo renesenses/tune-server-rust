@@ -302,21 +302,31 @@ fn build_signal_path(
         .or_else(|| track.as_ref().and_then(|t| t.format.clone()))
         .unwrap_or_else(|| "flac".into());
     let source_format = AudioFormat::from_extension(&fmt_str);
+    let is_dsd = matches!(fmt_str.as_str(), "dsd" | "dsf" | "dff");
     let sample_rate = np
         .sample_rate
         .map(|v| v as i32)
         .or_else(|| track.as_ref().and_then(|t| t.sample_rate))
-        .unwrap_or(44100);
+        .unwrap_or(if is_dsd { 2_822_400 } else { 44100 });
     let bit_depth = np
         .bit_depth
         .map(|v| v as i32)
         .or_else(|| track.as_ref().and_then(|t| t.bit_depth))
-        .unwrap_or(16);
+        .unwrap_or(if is_dsd { 1 } else { 16 });
 
-    let format_name = source_format
-        .as_ref()
-        .map(|f| f.display_name())
-        .unwrap_or("Unknown");
+    let format_name = if is_dsd {
+        match sample_rate {
+            r if r >= 22_000_000 => "DSD512",
+            r if r >= 11_000_000 => "DSD256",
+            r if r >= 5_000_000 => "DSD128",
+            _ => "DSD64",
+        }
+    } else {
+        source_format
+            .as_ref()
+            .map(|f| f.display_name())
+            .unwrap_or("Unknown")
+    };
     let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
 
     let output_type = zone.output_type.as_deref().unwrap_or("local");

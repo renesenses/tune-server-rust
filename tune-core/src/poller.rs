@@ -57,7 +57,7 @@ const TRACK_LOAD_GRACE_SECS: u64 = 45;
 const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
-const GAPLESS_GUARD_SECS: u64 = 5;
+const GAPLESS_GUARD_SECS: u64 = 15;
 /// Minimum fraction of track duration that must have been played before a
 /// gapless transition is accepted.  Prevents false transitions when a
 /// renderer (e.g. DMP-A8) reports state changes immediately after
