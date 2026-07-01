@@ -32,7 +32,8 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
         .map(|d| {
             let norm = tune_core::scanner::walker::normalize_path(d);
             let norm_nfc: String = norm.nfc().collect();
-            let pattern = format!("{norm_nfc}/%");
+            let sep = std::path::MAIN_SEPARATOR;
+            let pattern = format!("{norm_nfc}{sep}%");
             let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
                 "$1"
             } else {
@@ -121,7 +122,8 @@ pub(super) async fn browse_directory(
                 if name.starts_with('.') {
                     continue;
                 }
-                let pattern = format!("{dir_path}/%");
+                let sep = std::path::MAIN_SEPARATOR;
+                let pattern = format!("{dir_path}{sep}%");
                 let track_count: i64 = match state.backend.query_one(
                     &format!(
                         "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
@@ -153,7 +155,8 @@ pub(super) async fn browse_directory(
     });
 
     // List tracks in this directory (not recursive — only direct children)
-    let dir_prefix = format!("{}/%", normalized_query);
+    let sep = std::path::MAIN_SEPARATOR;
+    let dir_prefix = format!("{}{sep}%", normalized_query);
     let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "$1"
     } else {

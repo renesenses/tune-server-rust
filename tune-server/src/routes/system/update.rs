@@ -491,7 +491,8 @@ fn install_windows(
     Ok(())
 }
 
-/// Replace the web/ directory next to the binary with the one from the archive.
+/// Replace the web/ directory with the one from the archive.
+/// Writes to both CWD/web (where the server reads) and exe_dir/web (fallback).
 fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Result<(), String> {
     let new_web = tmp_dir.join("web");
     if !new_web.exists() {
@@ -499,12 +500,33 @@ fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Resul
         return Ok(());
     }
 
-    let target_web = exe_dir.join("web");
+    let target_web = if let Ok(custom) = std::env::var("TUNE_WEB_DIR") {
+        let p = std::path::PathBuf::from(&custom);
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| exe_dir.to_path_buf())
+                .join(p)
+        }
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join("web"))
+            .unwrap_or_else(|_| exe_dir.join("web"))
+    };
 
     if target_web.exists() {
         std::fs::remove_dir_all(&target_web).map_err(|e| format!("remove old web/: {e}"))?;
     }
     copy_dir_all(&new_web, &target_web).map_err(|e| format!("copy new web/: {e}"))?;
+
+    let exe_web = exe_dir.join("web");
+    if exe_web != target_web {
+        if exe_web.exists() {
+            std::fs::remove_dir_all(&exe_web).ok();
+        }
+        copy_dir_all(&new_web, &exe_web).ok();
+    }
 
     info!(dir = %target_web.display(), "web_directory_updated");
     Ok(())

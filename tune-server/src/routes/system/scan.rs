@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
@@ -58,7 +59,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
 
         let discovered_paths: std::collections::HashSet<String> = files
             .iter()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| p.to_string_lossy().nfc().collect::<String>())
             .collect();
 
         let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(db.clone());
