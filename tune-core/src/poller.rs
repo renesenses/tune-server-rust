@@ -1796,6 +1796,25 @@ impl PositionPoller {
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
                     ps.gapless_cooldown = 0;
+                    // v0.9 rc.2 FSM shadow: snapshot the Playing-arm inputs
+                    // (pre-mutation). gapless_enabled is filled in the arm branch
+                    // when it is actually read; default true matches the arm.
+                    let fsm_has_next = Self::next_position(zone_state).is_some();
+                    let mut fsm_pin = fsm::PlayingInput {
+                        gapless_advance_pending: ps.gapless_advance_pending,
+                        has_next: fsm_has_next,
+                        gapless_sent: ps.gapless_sent,
+                        track_duration_ms,
+                        reported_duration_ms: status.duration_ms,
+                        played_enough,
+                        position_ms: status.position_ms,
+                        past_end_ticks: ps.past_end_ticks,
+                        gapless_enabled: true,
+                    };
+                    let mut fsm_pact = fsm::PlayingDecision {
+                        confirm_gapless_advance: ps.gapless_advance_pending && fsm_has_next,
+                        ..Default::default()
+                    };
                     // Renderer started playing — gapless transition confirmed.
                     // NOW advance metadata (deferred from the Stopped handler
                     // to avoid showing the wrong track on renderers that don't
@@ -1839,6 +1858,7 @@ impl PositionPoller {
                         status.position_ms,
                         track_duration_ms,
                     );
+                    fsm_pact.transition_detected = duration_changed && position_confirms_transition;
                     if duration_changed && position_confirms_transition {
                         info!(
                             zone_id,
@@ -1886,6 +1906,8 @@ impl PositionPoller {
                             .flatten()
                             .map(|z| z.gapless_enabled)
                             .unwrap_or(true);
+                        fsm_pin.gapless_enabled = gapless_enabled;
+                        fsm_pact.arm_gapless = gapless_enabled;
                         if gapless_enabled {
                             let ok = self.prepare_gapless(zone_id, zone_state, &device_id).await;
                             if ok {
@@ -1921,9 +1943,22 @@ impl PositionPoller {
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
+                            fsm_pact.past_end_track_ended = true;
                         }
                     } else {
                         ps.past_end_ticks = 0;
+                    }
+                    // v0.9 rc.2 — FSM shadow-compare for the Playing arm.
+                    if *POLLER_FSM_SHADOW {
+                        let predicted = fsm::classify_playing(&fsm_pin);
+                        if predicted != fsm_pact {
+                            warn!(
+                                zone_id,
+                                ?predicted,
+                                actual = ?fsm_pact,
+                                "poller_fsm_shadow_divergence_playing"
+                            );
+                        }
                     }
                 }
                 TransportState::Paused => {
