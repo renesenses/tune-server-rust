@@ -49,34 +49,50 @@ pub fn build_track_from_metadata_opts(
 
     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
 
-    let album_artist_entry = artist_repo
-        .get_or_create(
-            album_artist_name,
-            if is_compilation {
-                None
-            } else {
-                meta.musicbrainz_artist_id.as_deref()
-            },
-            meta.album_artist_sort.as_deref(),
-        )
-        .ok();
+    let album_artist_entry = match artist_repo.get_or_create(
+        album_artist_name,
+        if is_compilation {
+            None
+        } else {
+            meta.musicbrainz_artist_id.as_deref()
+        },
+        meta.album_artist_sort.as_deref(),
+    ) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            tracing::warn!(
+                artist = album_artist_name,
+                error = %e,
+                file = %sf.path,
+                "album_artist_create_failed_skipping_track"
+            );
+            return None;
+        }
+    };
     let album_artist_id = album_artist_entry.as_ref().and_then(|a| a.id);
 
     let track_artist = if is_compilation && track_artist_name != album_artist_name {
-        artist_repo
-            .get_or_create(
-                track_artist_name,
-                meta.musicbrainz_artist_id.as_deref(),
-                None,
-            )
-            .ok()
+        match artist_repo.get_or_create(
+            track_artist_name,
+            meta.musicbrainz_artist_id.as_deref(),
+            None,
+        ) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::warn!(artist = track_artist_name, error = %e, "track_artist_create_failed");
+                album_artist_entry.clone()
+            }
+        }
     } else {
         album_artist_entry.clone()
     };
     let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
     let album = meta.album.as_ref().and_then(|title| {
-        let aid = album_artist_id.unwrap_or(0);
+        let Some(aid) = album_artist_id else {
+            tracing::warn!(album = title, file = %sf.path, "album_skipped_no_artist_id");
+            return None;
+        };
         // Quality-based album splitting: append suffix when sample_rate or
         // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
         // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
