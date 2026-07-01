@@ -4325,7 +4325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn radio_resolve_creates_proxy_session() {
+    async fn radio_resolve_direct_url_without_output_device() {
         let orch = test_orchestrator();
         let req = super::PlayRequest {
             zone_id: 1,
@@ -4342,19 +4342,10 @@ mod tests {
             temp_file_path: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
-        assert!(
-            resolved.stream_id.is_some(),
-            "radio must create a proxy session"
-        );
-        assert!(
-            resolved.url.contains("/stream/"),
-            "radio URL must be proxied through local streamer, got: {}",
-            resolved.url
-        );
-        assert!(
-            !resolved.url.contains("icecast.radiofrance.fr"),
-            "radio URL must NOT be the raw external URL"
-        );
+        // Proxying is now conditional: with no output device (and no DLNA
+        // renderer that needs transcoding), radio resolves to the direct URL.
+        assert!(resolved.stream_id.is_none());
+        assert_eq!(resolved.url, "http://icecast.radiofrance.fr/fip-hifi.aac");
     }
 
     #[tokio::test]
