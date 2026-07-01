@@ -746,6 +746,16 @@ impl TrackRepo {
         let insert_sql = self.dialect_sql(sql::insert, sql::insert);
         let mut count = 0usize;
         for track in tracks {
+            if track.title.to_lowercase().contains("personal jesus") {
+                tracing::warn!(
+                    title = %track.title,
+                    album_id = ?track.album_id,
+                    artist_id = ?track.artist_id,
+                    album_artist = ?track.album_artist,
+                    file = ?track.file_path,
+                    "BUG_TRACE_insert_personal_jesus"
+                );
+            }
             let params: [&dyn ToSqlValue; 27] = [
                 &track.title,
                 &track.album_id,
