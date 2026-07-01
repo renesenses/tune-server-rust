@@ -1095,6 +1095,36 @@ fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
     }
 }
 
+fn raw_vorbis_field(path: &Path, field_name: &str) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if !matches!(ext.as_str(), "flac" | "ogg" | "opus") {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    let needle = format!("{}=", field_name);
+    let needle_upper = format!("{}=", field_name.to_uppercase());
+    let content = String::from_utf8_lossy(&data);
+    for line_bytes in data.windows(needle.len()) {
+        let chunk = std::str::from_utf8(line_bytes).unwrap_or("");
+        if chunk.eq_ignore_ascii_case(&needle) {
+            let start = (line_bytes.as_ptr() as usize) - (data.as_ptr() as usize) + needle.len();
+            if start < data.len() {
+                let rest = &data[start..];
+                let end = rest
+                    .iter()
+                    .position(|&b| b == 0 || b < 0x20)
+                    .unwrap_or(rest.len().min(512));
+                let value = std::str::from_utf8(&rest[..end]).ok()?;
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    let _ = (content, needle_upper);
+    None
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -1182,7 +1212,7 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
         album: tag.album().map(|s| s.to_string()),
-        album_artist: get(ItemKey::AlbumArtist),
+        album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
         track_number: tag.track(),
         disc_number: tag.disk(),
