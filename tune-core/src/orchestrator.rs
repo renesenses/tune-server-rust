@@ -48,6 +48,7 @@ pub struct PlayRequest {
     pub cover_url: Option<String>,
     pub duration_ms: Option<i64>,
     pub seek_ms: Option<u64>,
+    pub temp_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +244,11 @@ impl PlaybackOrchestrator {
         // can run into the 300s timeout from the previous track.
         self.playback.bump_generation(req.zone_id).await;
 
-        let resolved = self.resolve_stream(&req).await?;
+        let resolved = if let Some(ref temp_path) = req.temp_file_path {
+            self.resolve_uploaded_file(temp_path, &req).await?
+        } else {
+            self.resolve_stream(&req).await?
+        };
         let resolve_ms = play_start.elapsed().as_millis();
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
@@ -542,6 +547,103 @@ impl PlaybackOrchestrator {
                 result
             }
         }
+    }
+
+    async fn resolve_uploaded_file(
+        &self,
+        file_path: &str,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            return Err(format!("uploaded file not found: {file_path}"));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("wav")
+            .to_lowercase();
+        let format = crate::audio::formats::AudioFormat::from_extension(&ext);
+        let meta = crate::metadata::try_read_metadata(path);
+        let title = req
+            .title
+            .clone()
+            .or_else(|| meta.as_ref().ok().and_then(|m| m.title.clone()))
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            });
+        let artist = req
+            .artist_name
+            .clone()
+            .or_else(|| meta.as_ref().ok().and_then(|m| m.artist.clone()));
+        let album = req
+            .album_title
+            .clone()
+            .or_else(|| meta.as_ref().ok().and_then(|m| m.album.clone()));
+        let duration_ms = req
+            .duration_ms
+            .map(|d| d as u64)
+            .or_else(|| meta.as_ref().ok().and_then(|m| m.duration_ms))
+            .unwrap_or(0);
+        let sample_rate = meta.as_ref().ok().and_then(|m| m.sample_rate);
+        let bit_depth = meta.as_ref().ok().and_then(|m| m.bit_depth);
+        let channels = meta.as_ref().ok().and_then(|m| m.channels).unwrap_or(2);
+
+        let mime = format
+            .as_ref()
+            .map(|f| f.mime_type())
+            .unwrap_or("audio/wav")
+            .to_string();
+        let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+
+        let info = StreamInfo {
+            format: ext.clone(),
+            mime_type: mime.clone(),
+            sample_rate: sample_rate.unwrap_or(44100) as u32,
+            bit_depth: bit_depth.unwrap_or(16),
+            channels: channels as u16,
+            file_size,
+            duration_ms: Some(duration_ms as u64),
+            ..Default::default()
+        };
+
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, true, 128).await;
+        let fp = file_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let file = std::fs::read(&fp);
+            match file {
+                Ok(data) => {
+                    let _ = rt.block_on(tx.send(data));
+                    data_ready.notify_one();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "uploaded_file_read_failed");
+                }
+            }
+        });
+
+        let server_ip = self.server_ip();
+        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, &ext);
+
+        Ok(ResolvedStream {
+            url: stream_url,
+            stream_id: Some(session_id),
+            title,
+            artist,
+            album,
+            duration_ms: Some(duration_ms as i64),
+            source: "upload".into(),
+            mime_type: mime,
+            sample_rate: sample_rate.map(|s| s as u32),
+            bit_depth: bit_depth.map(|b| b as u32),
+            channels: Some(channels as u32),
+            cover_url: None,
+            file_size,
+        })
     }
 
     async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
@@ -3129,6 +3231,7 @@ impl PlaybackOrchestrator {
                         cover_url: np.cover_path.clone(),
                         duration_ms: Some(np.duration_ms),
                         seek_ms: None,
+                        temp_file_path: None,
                     };
 
                     match self.play(req).await {
@@ -3223,6 +3326,7 @@ impl PlaybackOrchestrator {
                         cover_url: np.cover_path.clone(),
                         duration_ms: Some(np.duration_ms),
                         seek_ms: Some(position_ms),
+                        temp_file_path: None,
                     };
 
                     match self.play(req).await {
@@ -3366,6 +3470,7 @@ impl PlaybackOrchestrator {
                 cover_url: item.cover_path.clone(),
                 duration_ms: item.duration_ms,
                 seek_ms: None,
+                temp_file_path: None,
             };
             let result = self.play(req).await?;
             self.playback
@@ -3412,6 +3517,7 @@ impl PlaybackOrchestrator {
             cover_url: cover,
             duration_ms: duration,
             seek_ms: None,
+            temp_file_path: None,
         };
 
         let result = self.play(req).await?;
@@ -3533,6 +3639,7 @@ impl PlaybackOrchestrator {
                 cover_url: cover.clone(),
                 duration_ms: item.duration_ms,
                 seek_ms: None,
+                temp_file_path: None,
             };
             let resolved = self.resolve_stream(&req).await?;
             if let Some(ref sid) = resolved.stream_id {
@@ -3595,6 +3702,7 @@ impl PlaybackOrchestrator {
             cover_url: cover.clone(),
             duration_ms: duration,
             seek_ms: None,
+            temp_file_path: None,
         };
         let resolved = self.resolve_stream(&req).await?;
         if let Some(ref sid) = resolved.stream_id {
@@ -4177,6 +4285,7 @@ mod tests {
             cover_url: None,
             duration_ms: None,
             seek_ms: None,
+            temp_file_path: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(
@@ -4209,6 +4318,7 @@ mod tests {
             cover_url: None,
             duration_ms: Some(3600000),
             seek_ms: None,
+            temp_file_path: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
         assert!(

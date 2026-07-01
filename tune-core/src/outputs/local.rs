@@ -508,6 +508,10 @@ pub struct LocalOutput {
     /// One-shot start position supplied by play_media() for recreated seek
     /// streams. play_url() consumes this after stop() clears the old state.
     pending_start_position_ms: AtomicU64,
+    /// When true, the audio consumer should NOT skip bytes based on
+    /// seek_offset_ms because the decoder already produced a seeked stream.
+    /// seek_offset_ms is still used for position reporting (progress bar).
+    stream_pre_seeked: AtomicBool,
     /// Track duration in milliseconds
     duration_ms: Arc<AtomicU64>,
     current_uri: Arc<std::sync::Mutex<Option<String>>>,
@@ -581,6 +585,7 @@ impl LocalOutput {
             position_ms: Arc::new(AtomicU64::new(0)),
             seek_offset_ms: Arc::new(AtomicU64::new(0)),
             pending_start_position_ms: AtomicU64::new(0),
+            stream_pre_seeked: AtomicBool::new(false),
             duration_ms: Arc::new(AtomicU64::new(0)),
             current_uri: Arc::new(std::sync::Mutex::new(None)),
             track_title: Arc::new(std::sync::Mutex::new(None)),
@@ -1051,6 +1056,10 @@ impl OutputTarget for LocalOutput {
         self.seek_offset_ms
             .store(start_position_ms, Ordering::SeqCst);
         self.position_ms.store(start_position_ms, Ordering::SeqCst);
+        // When the stream was created with a seek, the decoder already
+        // produced a seeked stream. The consumer must NOT skip bytes.
+        self.stream_pre_seeked
+            .store(start_position_ms > 0, Ordering::SeqCst);
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
@@ -1102,6 +1111,7 @@ impl OutputTarget for LocalOutput {
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
+        let pre_seeked = self.stream_pre_seeked.load(Ordering::SeqCst);
         let duration_ms_arc = self.duration_ms.clone();
         let exclusive_mode = self.exclusive_mode;
         let audio_backend = self.audio_backend.clone();
@@ -1661,7 +1671,11 @@ impl OutputTarget for LocalOutput {
 
                 let mut total_frames_fed: u64 = 0;
 
-                let skip_bytes_asio: u64 = if seek_offset > 0 {
+                // Only skip bytes if the stream was NOT pre-seeked by the
+                // decoder. When pre_seeked=true, the decoder already produced
+                // audio starting at the seek position — skipping would discard
+                // the entire stream (double-seek bug reported by DEvir).
+                let skip_bytes_asio: u64 = if seek_offset > 0 && !pre_seeked {
                     let skip_frames = (seek_offset as f64 / 1000.0 * sample_rate as f64) as u64;
                     skip_frames * channels as u64 * bytes_per_sample as u64
                 } else {
@@ -2199,7 +2213,7 @@ impl OutputTarget for LocalOutput {
             );
 
             let mut total_frames_fed: u64 = 0;
-            let skip_bytes: u64 = if seek_offset > 0 {
+            let skip_bytes: u64 = if seek_offset > 0 && !pre_seeked {
                 let skip_frames = (seek_offset as f64 / 1000.0 * sample_rate as f64) as u64;
                 skip_frames * channels as u64 * bytes_per_sample as u64
             } else {

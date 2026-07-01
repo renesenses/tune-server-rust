@@ -615,6 +615,7 @@ impl PositionPoller {
                                         cover_url: np.cover_path.clone(),
                                         duration_ms: None,
                                         seek_ms: None,
+                                        temp_file_path: None,
                                     };
                                     match self.orchestrator.play(req).await {
                                         Ok(_) => {

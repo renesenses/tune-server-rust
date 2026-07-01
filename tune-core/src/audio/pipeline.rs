@@ -153,6 +153,7 @@ mod tests {
             bit_depth: 16,
             channels: 2,
             seek_ms: None,
+            temp_file_path: None,
         };
         let (pipeline, _rx) = AudioPipeline::new(config, 16);
         let info = pipeline.stream_info();
@@ -178,6 +179,7 @@ mod tests {
             bit_depth: 16,
             channels: 2,
             seek_ms: None,
+            temp_file_path: None,
         };
         let (mut pipeline, mut rx) = AudioPipeline::new(config, 64);
         pipeline.start().await.unwrap();

@@ -154,6 +154,7 @@ struct PlayRequest {
     cover_path: Option<String>,
     duration_ms: Option<i64>,
     seek_ms: Option<u64>,
+    temp_file_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -235,6 +236,7 @@ struct QueueJumpRequest {
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/upload", post(upload_audio_file))
         .route("/now-listening", get(now_listening))
         .route("/{id}/status", get(zone_status))
         .route("/{id}/play", post(play))
@@ -358,6 +360,7 @@ async fn play(
                     cover_url: np.cover_path.clone(),
                     duration_ms: Some(np.duration_ms),
                     seek_ms: None,
+                    temp_file_path: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -436,6 +439,7 @@ async fn play(
                             cover_url: None,
                             duration_ms: None,
                             seek_ms: None,
+                            temp_file_path: None,
                         };
                         if let Ok(result) = state.orchestrator.play(orch_req).await {
                             return Json(
@@ -507,6 +511,7 @@ async fn play(
             cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
+            temp_file_path: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -588,6 +593,7 @@ async fn play(
             cover_url: first.cover_path.clone(),
             duration_ms: Some(first.duration_ms as i64),
             seek_ms: None,
+            temp_file_path: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -653,6 +659,7 @@ async fn play(
             cover_url: body.cover_path,
             duration_ms: body.duration_ms,
             seek_ms: None,
+            temp_file_path: None,
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
@@ -719,6 +726,7 @@ async fn play(
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
+                temp_file_path: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -860,6 +868,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                 cover_url: np.cover_path.clone(),
                 duration_ms: Some(np.duration_ms),
                 seek_ms: None,
+                temp_file_path: None,
             };
             return match state.orchestrator.play(orch_req).await {
                 Ok(result) => {
@@ -958,6 +967,7 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     cover_url: None,
                     duration_ms: None,
                     seek_ms: None,
+                    temp_file_path: None,
                 };
                 return match state.orchestrator.play(orch_req).await {
                     Ok(result) => {
@@ -1922,6 +1932,7 @@ async fn invoke_zone_pin(
         cover_url: None,
         duration_ms: None,
         seek_ms: None,
+        temp_file_path: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2094,6 +2105,7 @@ pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
         cover_url: track.as_ref().and_then(|t| t.cover_path.clone()),
         duration_ms: track.as_ref().map(|t| t.duration_ms),
         seek_ms: None,
+        temp_file_path: None,
     };
     match state.orchestrator.play(orch_req).await {
         Ok(result) => {
@@ -2111,4 +2123,81 @@ pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl IntoResponse {
+    let upload_dir = std::path::Path::new("/tmp/tune-upload");
+    let _ = std::fs::create_dir_all(upload_dir);
+    let file_id = uuid::Uuid::new_v4().to_string();
+
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut original_name = String::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" || name == "audio" {
+            original_name = field.file_name().unwrap_or("unknown.wav").to_string();
+            match field.bytes().await {
+                Ok(bytes) => file_data = Some(bytes.to_vec()),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("upload read failed: {e}")})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let Some(data) = file_data else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no audio file in upload"})),
+        )
+            .into_response();
+    };
+
+    let ext = std::path::Path::new(&original_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_lowercase();
+    let file_path = upload_dir.join(format!("{file_id}.{ext}"));
+    if let Err(e) = std::fs::write(&file_path, &data) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("save failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    let meta = tune_core::metadata::try_read_metadata(&file_path);
+    let title = meta
+        .as_ref()
+        .ok()
+        .and_then(|m| m.title.clone())
+        .unwrap_or_else(|| {
+            std::path::Path::new(&original_name)
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string()
+        });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "file_id": file_id,
+            "file_path": file_path.to_string_lossy(),
+            "title": title,
+            "artist": meta.as_ref().ok().and_then(|m| m.artist.clone()),
+            "album": meta.as_ref().ok().and_then(|m| m.album.clone()),
+            "duration_ms": meta.as_ref().ok().and_then(|m| m.duration_ms).unwrap_or(0),
+            "format": ext,
+            "sample_rate": meta.as_ref().ok().and_then(|m| m.sample_rate),
+            "bit_depth": meta.as_ref().ok().and_then(|m| m.bit_depth),
+        })),
+    )
+        .into_response()
 }

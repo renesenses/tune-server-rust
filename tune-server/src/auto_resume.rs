@@ -76,6 +76,7 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         cover_url: None,
         duration_ms: None,
         seek_ms: None,
+        temp_file_path: None,
     };
 
     match state.orchestrator.play(req).await {
