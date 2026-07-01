@@ -2614,6 +2614,8 @@ impl PlaybackOrchestrator {
         let local_out = crate::outputs::local::LocalOutput::new(device_name.to_string());
         if let Some(position_ms) = start_position_ms {
             local_out.set_pending_start_position_ms(position_ms);
+            let producer_seeked = media.file_path.is_some();
+            local_out.set_producer_seeked(producer_seeked);
         }
         {
             let mut outputs = self.outputs.lock().await;
@@ -2685,6 +2687,12 @@ impl PlaybackOrchestrator {
                         .downcast_ref::<crate::outputs::local::LocalOutput>()
                     {
                         local_output.set_pending_start_position_ms(position_ms);
+                        // Only mark as pre-seeked when the media has a local
+                        // file_path — meaning the decoder used seek_s. For
+                        // streaming sources (TIDAL/Qobuz), the producer always
+                        // starts from 0s and needs consumer-side skip.
+                        let producer_seeked = media.file_path.is_some();
+                        local_output.set_producer_seeked(producer_seeked);
                     }
                     drop(output);
                 }

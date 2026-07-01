@@ -634,6 +634,14 @@ impl LocalOutput {
         self.pending_start_position_ms
             .store(position_ms, Ordering::SeqCst);
     }
+
+    /// Signal that the producer actually emitted a pre-seeked stream.
+    /// Only call this when the decoder used seek_s (local files).
+    /// Do NOT call for streaming sources (TIDAL/Qobuz) where the
+    /// producer always starts from 0s.
+    pub fn set_producer_seeked(&self, seeked: bool) {
+        self.stream_pre_seeked.store(seeked, Ordering::SeqCst);
+    }
 }
 
 /// Ring buffer shared between the HTTP reader thread and the audio callback.
@@ -1062,10 +1070,10 @@ impl OutputTarget for LocalOutput {
         self.seek_offset_ms
             .store(start_position_ms, Ordering::SeqCst);
         self.position_ms.store(start_position_ms, Ordering::SeqCst);
-        // When the stream was created with a seek, the decoder already
-        // produced a seeked stream. The consumer must NOT skip bytes.
-        self.stream_pre_seeked
-            .store(start_position_ms > 0, Ordering::SeqCst);
+        // stream_pre_seeked is set explicitly by set_producer_seeked()
+        // from the orchestrator — only when the decoder actually applied
+        // the seek (local files). For streaming sources (TIDAL/Qobuz),
+        // the producer starts from 0s and needs consumer-side skip.
 
         // Clear any staged gapless next — starting from scratch.
         *self.next_media.lock().unwrap() = None;
