@@ -107,6 +107,63 @@ fn rand_pos(queue_length: i64, current: i64) -> i64 {
     }
 }
 
+/// Pure decision predicates extracted **verbatim** from the poller `tick`
+/// loop. They contain no I/O and no state mutation, so they can be unit-tested
+/// against the *real* code path.
+///
+/// Rationale (v0.9 rc.1 filet): the previous `played_enough_*` tests
+/// re-implemented the logic inline and therefore never exercised the actual
+/// predicate — notably they omitted the `wall_elapsed >= MIN_TRACK_WALL_SECS`
+/// guard. Extracting the predicates here makes the characterization tests
+/// faithful and seeds the future poller state machine (Axe 2): the FSM
+/// `transition` will call exactly these functions.
+pub(crate) mod decisions {
+    use super::{MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS};
+
+    /// Has enough of the current track been played to accept a track-end or
+    /// gapless transition?
+    ///
+    /// - Known duration: `peak_position_ms >= MIN_PLAYED_FRACTION * duration`.
+    /// - Unknown duration (`0`): `peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS`
+    ///   (guards slow renderers that report duration 0 while buffering).
+    ///
+    /// Both branches additionally require `wall_elapsed >= MIN_TRACK_WALL_SECS`.
+    pub fn played_enough(track_duration_ms: u64, peak_position_ms: u64, wall_elapsed: u64) -> bool {
+        if track_duration_ms == 0 {
+            peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS && wall_elapsed >= MIN_TRACK_WALL_SECS
+        } else {
+            peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
+                && wall_elapsed >= MIN_TRACK_WALL_SECS
+        }
+    }
+
+    /// Position dropped from `>30s` to `<5s` while a gapless transition was
+    /// armed — a strong signal the renderer auto-advanced to the next track.
+    pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
+        last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
+    }
+
+    /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
+    /// treated as a natural track end (re-trigger play) rather than a playback
+    /// failure (stop the zone)?
+    pub fn natural_end(
+        played_enough: bool,
+        repeat_active: bool,
+        peak_position_ms: u64,
+        ended_naturally: bool,
+        wall_elapsed: u64,
+        track_duration_ms: u64,
+    ) -> bool {
+        let is_short_track =
+            track_duration_ms > 0 && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
+        let repeat_end = repeat_active && peak_position_ms > 5_000;
+        played_enough
+            || repeat_end
+            || (ended_naturally && wall_elapsed >= 5)
+            || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
+    }
+}
+
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
@@ -768,21 +825,17 @@ impl PositionPoller {
                 .track_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            let played_enough = if track_duration_ms == 0 {
-                // Unknown duration: rely on peak position as the only guard.
-                ps.peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
-                    && wall_elapsed >= MIN_TRACK_WALL_SECS
-            } else {
-                ps.peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
-                    && wall_elapsed >= MIN_TRACK_WALL_SECS
-            };
+            let played_enough =
+                decisions::played_enough(track_duration_ms, ps.peak_position_ms, wall_elapsed);
 
             // Detect position reset: position drops from >30s to <5s.
             // This is a strong signal that the renderer performed a gapless
             // transition (the new track starts from 0).
-            let position_reset = ps.last_position_ms > 30_000
-                && status.position_ms < 5_000
-                && ps.gapless_sent_at.is_some();
+            let position_reset = decisions::position_reset(
+                ps.last_position_ms,
+                status.position_ms,
+                ps.gapless_sent_at.is_some(),
+            );
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
@@ -948,8 +1001,6 @@ impl PositionPoller {
                     } else {
                         ps.stopped_ticks += 1;
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
-                            let is_short_track = track_duration_ms > 0
-                                && track_duration_ms < MIN_TRACK_WALL_SECS * 1000;
                             // When repeat mode is active (One or All) on DLNA,
                             // be more lenient about accepting track-end: if the
                             // renderer has reported Stopped and we've seen any
@@ -959,13 +1010,14 @@ impl PositionPoller {
                             // (DEvir QA B-05: repeat mode doesn't work on DLNA)
                             let repeat_active =
                                 matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All);
-                            let repeat_end = repeat_active && ps.peak_position_ms > 5_000;
-                            let natural_end = played_enough
-                                || repeat_end
-                                || (status.ended_naturally && wall_elapsed >= 5)
-                                || (is_short_track
-                                    && ps.peak_position_ms as f64
-                                        >= track_duration_ms as f64 * 0.5);
+                            let natural_end = decisions::natural_end(
+                                played_enough,
+                                repeat_active,
+                                ps.peak_position_ms,
+                                status.ended_naturally,
+                                wall_elapsed,
+                                track_duration_ms,
+                            );
                             if status.ended_naturally && wall_elapsed < 5 && !played_enough {
                                 warn!(
                                     zone_id,
@@ -1620,59 +1672,126 @@ mod tests {
         assert_eq!(ps.consecutive_errors, 0);
     }
 
+    // These tests now call the REAL predicate `decisions::played_enough`
+    // (v0.9 rc.1 filet). Wall-clock is passed high (300s) unless the test
+    // specifically pins the wall_elapsed guard, so each assertion isolates
+    // the branch it names.
+
     #[test]
     fn played_enough_rejects_early_transition() {
         // Track is 300 seconds (300_000 ms).  Peak at 10s — only 3.3% played.
-        let peak_ms: u64 = 10_000;
-        let duration_ms: u64 = 300_000;
-        let played_enough =
-            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
         assert!(
-            !played_enough,
+            !decisions::played_enough(300_000, 10_000, 300),
             "10s into a 5-min track should NOT be enough"
         );
     }
 
     #[test]
     fn played_enough_accepts_late_transition() {
-        // Track is 300 seconds.  Peak at 280s — 93% played.
-        let peak_ms: u64 = 280_000;
-        let duration_ms: u64 = 300_000;
-        let played_enough =
-            duration_ms == 0 || peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION;
-        assert!(played_enough, "280s into a 5-min track should be enough");
+        // Track is 300 seconds.  Peak at 280s — 93% played, fully elapsed.
+        assert!(
+            decisions::played_enough(300_000, 280_000, 300),
+            "280s into a 5-min track should be enough"
+        );
+    }
+
+    #[test]
+    fn played_enough_requires_wall_elapsed() {
+        // 93% played but only 10s of wall-clock elapsed: the wall_elapsed
+        // guard (MIN_TRACK_WALL_SECS = 30s) must reject it. This branch was
+        // NOT covered by the old re-implemented tests.
+        assert!(
+            !decisions::played_enough(300_000, 280_000, 10),
+            "wall_elapsed < MIN_TRACK_WALL_SECS must reject even at high fraction"
+        );
     }
 
     #[test]
     fn played_enough_unknown_duration_low_peak() {
-        // When duration is unknown (0) and peak position is below the
-        // threshold, played_enough should be false to prevent false skips
-        // on slow renderers like Shanling SCD1.3.
-        let peak_ms: u64 = 5_000;
-        let duration_ms: u64 = 0;
-        let played_enough = if duration_ms == 0 {
-            peak_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
-        } else {
-            peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION
-        };
+        // Unknown duration (0) + peak below MIN_PEAK_UNKNOWN_DURATION_MS:
+        // reject, to prevent false skips on slow renderers (Shanling SCD1.3).
         assert!(
-            !played_enough,
+            !decisions::played_enough(0, 5_000, 300),
             "5s peak with unknown duration should NOT pass"
         );
     }
 
     #[test]
     fn played_enough_unknown_duration_high_peak() {
-        // When duration is unknown (0) but enough position has been reported,
-        // allow the transition.
-        let peak_ms: u64 = 120_000;
-        let duration_ms: u64 = 0;
-        let played_enough = if duration_ms == 0 {
-            peak_ms >= MIN_PEAK_UNKNOWN_DURATION_MS
-        } else {
-            peak_ms as f64 >= duration_ms as f64 * MIN_PLAYED_FRACTION
-        };
-        assert!(played_enough, "120s peak with unknown duration should pass");
+        // Unknown duration (0) but enough position reported + elapsed → pass.
+        assert!(
+            decisions::played_enough(0, 120_000, 300),
+            "120s peak with unknown duration should pass"
+        );
+    }
+
+    #[test]
+    fn played_enough_unknown_duration_high_peak_but_too_soon() {
+        // Unknown duration, high peak, but wall_elapsed guard still applies.
+        assert!(
+            !decisions::played_enough(0, 120_000, 10),
+            "unknown-duration path must also honor the wall_elapsed guard"
+        );
+    }
+
+    #[test]
+    fn position_reset_detects_gapless_advance() {
+        // Position dropped from >30s to <5s while gapless was armed.
+        assert!(decisions::position_reset(40_000, 2_000, true));
+    }
+
+    #[test]
+    fn position_reset_requires_armed_gapless() {
+        // Same position drop but no gapless armed → not a reset.
+        assert!(!decisions::position_reset(40_000, 2_000, false));
+    }
+
+    #[test]
+    fn position_reset_ignores_small_drop() {
+        // Position still above the 5s floor → not a reset.
+        assert!(!decisions::position_reset(40_000, 8_000, true));
+        // Previous position not above the 30s ceiling → not a reset.
+        assert!(!decisions::position_reset(20_000, 2_000, true));
+    }
+
+    #[test]
+    fn natural_end_when_played_enough() {
+        assert!(decisions::natural_end(true, false, 0, false, 0, 300_000));
+    }
+
+    #[test]
+    fn natural_end_repeat_active_with_meaningful_playback() {
+        // Repeat on + peak > 5s → treat as natural end (DEvir QA B-05).
+        assert!(decisions::natural_end(
+            false, true, 6_000, false, 0, 300_000
+        ));
+        // Repeat on but peak <= 5s → not enough.
+        assert!(!decisions::natural_end(
+            false, true, 4_000, false, 0, 300_000
+        ));
+    }
+
+    #[test]
+    fn natural_end_ended_naturally_after_5s() {
+        assert!(decisions::natural_end(false, false, 0, true, 5, 300_000));
+        assert!(!decisions::natural_end(false, false, 0, true, 4, 300_000));
+    }
+
+    #[test]
+    fn natural_end_short_track_half_played() {
+        // Short track (< 30s) with >= 50% peak → natural end.
+        assert!(decisions::natural_end(
+            false, false, 6_000, false, 0, 10_000
+        ));
+        // Short track but < 50% peak → not yet.
+        assert!(!decisions::natural_end(
+            false, false, 4_000, false, 0, 10_000
+        ));
+    }
+
+    #[test]
+    fn natural_end_all_guards_false() {
+        assert!(!decisions::natural_end(false, false, 0, false, 0, 300_000));
     }
 
     #[test]
