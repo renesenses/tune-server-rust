@@ -2554,6 +2554,9 @@ impl OutputTarget for LocalOutput {
                 let pending = next_media_ref.lock().unwrap().take();
                 let Some(next) = pending else { break };
 
+                track_ended_naturally.store(false, Ordering::SeqCst);
+                track_ended_generation.store(0, Ordering::SeqCst);
+
                 info!(
                     next_title = ?next.title,
                     next_url = %next.url,
@@ -2715,8 +2718,12 @@ impl OutputTarget for LocalOutput {
                         }
                     };
                     resample_leftover.clear();
+                } else if needs_resample && new_sr == prev_sr {
+                    if let Some(ref mut r) = resampler {
+                        r.reset();
+                    }
+                    resample_leftover.clear();
                 } else if !needs_resample && resampler.is_some() {
-                    // Source rate now matches output — drop the resampler
                     resampler = None;
                     resample_leftover.clear();
                 }

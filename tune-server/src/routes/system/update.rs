@@ -308,7 +308,7 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         // Spawn the updated binary before exiting. On systemd (Restart=always)
         // this is redundant but harmless. On macOS/Windows without a service
         // manager, this ensures the server comes back up after the update.
-        let exe = std::env::current_exe().unwrap_or_else(|_| current_exe.clone());
+        let exe = current_exe.clone();
         let args: Vec<String> = std::env::args().skip(1).collect();
         match std::process::Command::new(&exe)
             .args(&args)
