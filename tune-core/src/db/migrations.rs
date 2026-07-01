@@ -887,6 +887,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             add_column_if_missing(db, "listen_history", "source_id", "TEXT");
             add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
         }
+        if migration.version == 38 {
+            add_column_if_missing(db, "zones", "is_hidden", "INTEGER DEFAULT 0");
+        }
         if migration.version == 44 {
             add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
             add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
