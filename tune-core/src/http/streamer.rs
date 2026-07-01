@@ -240,6 +240,16 @@ impl AudioStreamer {
     }
 
     pub async fn remove_session(&self, stream_id: &str) {
+        // Close the channel senders BEFORE removing — this ensures the
+        // radio decode thread's tx.send() fails promptly, stopping
+        // the icecast download. Without this, radio streams continue
+        // playing as "ghosts" after stop.
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(stream_id) {
+                session.close_sender().await;
+            }
+        }
         let removed = self.sessions.lock().await.remove(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
