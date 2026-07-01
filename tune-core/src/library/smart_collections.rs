@@ -9,23 +9,28 @@ use crate::db::sqlite::SqliteDb;
 pub struct SmartCollection {
     pub id: Option<i64>,
     pub name: String,
+    #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(default)]
     pub match_mode: MatchMode,
     pub sort_by: Option<String>,
+    #[serde(default)]
     pub sort_order: SortOrder,
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchMode {
+    #[default]
     All,
     Any,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
+    #[default]
     Asc,
     Desc,
 }

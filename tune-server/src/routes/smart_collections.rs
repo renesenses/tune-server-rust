@@ -110,6 +110,7 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                 "sort_order": col["sort_order"],
                 "limit": col["max_limit"],
             });
+            tracing::info!(name = %col["name"], json = %sc_json, "smart_collection_compiling");
             match serde_json::from_str::<tune_core::library::smart_collections::SmartCollection>(
                 &sc_json.to_string(),
             ) {
