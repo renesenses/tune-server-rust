@@ -114,7 +114,7 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                 &sc_json.to_string(),
             ) {
                 Err(e) => {
-                    tracing::debug!(name = %col["name"], error = %e, "smart_collection_compile_failed");
+                    tracing::warn!(name = %col["name"], error = %e, json = %sc_json, "smart_collection_compile_failed");
                 }
                 Ok(sc) => {
                 let (sql, params) = sc.compile_sql();
