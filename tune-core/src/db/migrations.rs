@@ -595,7 +595,66 @@ INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, d
         name: "smart_playlists_match_mode",
         up: "ALTER TABLE smart_playlists ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'all';",
     },
+    Migration {
+        version: 49,
+        name: "unified_queue_items",
+        // Applied programmatically (create table + one-time copy) via
+        // migrate_to_unified_queue so it is idempotent across re-runs and
+        // tolerant of the lazily-created streaming_queue table.
+        up: "",
+    },
 ];
+
+/// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
+/// tables into the unified `queue_items` table. Idempotent: copies only when
+/// `queue_items` is empty, so re-runs never duplicate. Tolerant of a missing
+/// `streaming_queue` table (it is lazily created by the repo). Created without
+/// FK constraints so orphaned rows migrate cleanly; the fresh CORE_SCHEMA
+/// version carries the FKs.
+fn migrate_to_unified_queue(db: &SqliteDb) {
+    let conn = db.connection().lock().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queue_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            zone_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            is_current INTEGER DEFAULT 0,
+            track_id INTEGER,
+            source TEXT,
+            source_id TEXT,
+            title TEXT,
+            artist TEXT,
+            album TEXT,
+            cover_url TEXT,
+            duration_ms INTEGER DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);",
+    )
+    .ok();
+
+    // Only copy once — when the unified table has no rows yet.
+    let already: i64 = conn
+        .query_row("SELECT COUNT(*) FROM queue_items", [], |r| r.get(0))
+        .unwrap_or(0);
+    if already > 0 {
+        return;
+    }
+
+    // Local rows: keep track_id, tag source='local'. Display fields stay NULL
+    // (joined from tracks at read time, as before).
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, track_id, source, duration_ms)
+         SELECT zone_id, position, is_current, track_id, 'local', 0 FROM play_queue;",
+    )
+    .ok();
+
+    // Streaming rows: inline metadata. Tolerant if streaming_queue is absent.
+    conn.execute_batch(
+        "INSERT INTO queue_items (zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
+         SELECT zone_id, position, 0, source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;",
+    )
+    .ok();
+}
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
     let conn = db.connection().lock().unwrap();
@@ -949,6 +1008,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
+
+    // v0.9 rc.2 — unify play_queue + streaming_queue into queue_items (v49).
+    migrate_to_unified_queue(db);
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");

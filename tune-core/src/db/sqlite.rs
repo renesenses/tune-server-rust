@@ -308,10 +308,30 @@ CREATE TABLE IF NOT EXISTS play_queue (
     is_current INTEGER DEFAULT 0
 );
 
+-- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both
+-- local tracks (track_id set, source='local') and streaming tracks (source_id
+-- + inline metadata). Replaces the play_queue / streaming_queue split. Local
+-- display fields (title/artist/...) stay NULL and are joined from tracks.
+CREATE TABLE IF NOT EXISTS queue_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id INTEGER NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    is_current INTEGER DEFAULT 0,
+    track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);
 CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
 CREATE INDEX IF NOT EXISTS idx_play_queue_zone_id ON play_queue(zone_id);
+CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);
 
 -- FTS5 virtual tables for full-text search (accent-insensitive, multi-column)
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(

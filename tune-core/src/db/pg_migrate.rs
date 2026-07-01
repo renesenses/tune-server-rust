@@ -256,6 +256,35 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
     duration_ms TEXT DEFAULT 0
 );
 
+-- Unified queue (v0.9 rc.2): replaces the play_queue / streaming_queue split.
+CREATE TABLE IF NOT EXISTS queue_items (
+    id TEXT PRIMARY KEY,
+    zone_id TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT 0,
+    is_current TEXT DEFAULT 0,
+    track_id TEXT,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms TEXT DEFAULT 0
+);
+
+-- One-time copy of the split tables into queue_items. Idempotent: the guard
+-- runs only while queue_items is empty. IDs are prefixed to avoid collisions
+-- between the two source tables.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM queue_items LIMIT 1) THEN
+        INSERT INTO queue_items (id, zone_id, position, is_current, track_id, source, duration_ms)
+            SELECT 'lq_' || id, zone_id, position, is_current, track_id, 'local', '0' FROM play_queue;
+        INSERT INTO queue_items (id, zone_id, position, is_current, source, source_id, title, artist, album, cover_url, duration_ms)
+            SELECT 'sq_' || id, zone_id, position, '0', source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS listen_history (
     id TEXT PRIMARY KEY,
     track_id TEXT,
