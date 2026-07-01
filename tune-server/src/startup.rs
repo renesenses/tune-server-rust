@@ -69,10 +69,7 @@ fn deduplicate_zones(state: &AppState) {
 }
 
 fn cleanup_orphan_queues(state: &AppState) {
-    let sqls = [
-        "DELETE FROM play_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
-        "DELETE FROM streaming_queue WHERE zone_id NOT IN (SELECT id FROM zones)",
-    ];
+    let sqls = ["DELETE FROM queue_items WHERE zone_id NOT IN (SELECT id FROM zones)"];
     for sql in &sqls {
         match state.backend.execute(sql, &[]) {
             Ok(removed) if removed > 0 => {
