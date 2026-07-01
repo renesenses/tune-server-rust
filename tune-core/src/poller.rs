@@ -222,6 +222,374 @@ pub(crate) mod decisions {
     }
 }
 
+/// Explicit poller state machine — **shadow model** of the `Stopped`-state
+/// decision in `tick()` (v0.9 rc.2 step 2).
+///
+/// `classify_stopped` is a pure, exhaustive reproduction of the
+/// `TransportState::Stopped` match arm's terminal decision. It composes the
+/// `decisions` predicates and the poller thresholds. The caller supplies
+/// I/O-derived facts (e.g. `stream_consuming`) as inputs so the function stays
+/// pure and unit-testable.
+///
+/// Wiring plan: the live loop calls this in shadow mode behind the `poller_fsm`
+/// flag and logs any divergence from the imperative arm before the FSM ever
+/// becomes authoritative (per-zone flip). This is the seed that will replace
+/// the 23-field `ZonePollState`.
+pub mod fsm {
+    use super::{GAPLESS_STUCK_THRESHOLD, STOPPED_FAILURE_THRESHOLD, STOPPED_TICKS_THRESHOLD};
+
+    /// Terminal decision of one poll tick when the output reports Stopped.
+    /// Each variant maps 1:1 to a branch of the `TransportState::Stopped` arm.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StoppedOutcome {
+        /// Tune is not playing on this zone — device Stopped is ignored.
+        Ignore,
+        /// Suppressed by the seek grace window.
+        SuppressSeekGrace,
+        /// Suppressed by the track-load grace window.
+        SuppressLoadGrace,
+        /// Suppressed by the post-gapless cooldown.
+        SuppressCooldown,
+        /// In the gapless guard but not enough played — ignore (false-skip guard).
+        GuardStoppedIgnored,
+        /// In the gapless guard, enough played — arm pending confirmation.
+        GuardStoppedPending,
+        /// Advance pending, renderer still stuck below threshold — keep waiting.
+        StuckWaiting,
+        /// Advance pending + stuck threshold reached — force track end.
+        StuckForceEnd,
+        /// Local output signalled natural EOF — track ended.
+        LocalEndedNaturally,
+        /// Stopped-threshold reached + natural end, gapless armed — wait for transition.
+        NaturalEndGaplessWaiting,
+        /// Stopped-threshold reached + natural end, no gapless — advance track.
+        NaturalEndAdvance,
+        /// Failure threshold reached but the stream is still consuming — keep waiting.
+        FailureWaitingConsuming,
+        /// Failure threshold reached, stream idle — stop the zone.
+        FailureStop,
+        /// Below threshold, or above threshold without a natural end — accumulate.
+        Waiting,
+    }
+
+    impl StoppedOutcome {
+        /// Does this outcome conclude the track has ended (loop sets `track_ended`)?
+        pub fn is_track_end(self) -> bool {
+            matches!(
+                self,
+                StoppedOutcome::StuckForceEnd
+                    | StoppedOutcome::LocalEndedNaturally
+                    | StoppedOutcome::NaturalEndAdvance
+            )
+        }
+
+        /// Does this outcome stop the zone (loop sets `force_stop`)?
+        pub fn is_force_stop(self) -> bool {
+            matches!(self, StoppedOutcome::FailureStop)
+        }
+    }
+
+    /// Snapshot of the inputs the Stopped arm reads, taken BEFORE the arm
+    /// mutates `ZonePollState`. Counters are pre-increment (the classifier
+    /// applies the `+1` the arm would).
+    #[derive(Debug, Clone, Copy)]
+    pub struct StoppedInput {
+        pub tune_is_playing: bool,
+        pub tune_has_track: bool,
+        pub in_seek_grace: bool,
+        pub in_track_load_grace: bool,
+        pub gapless_cooldown: u8,
+        pub in_gapless_guard: bool,
+        pub played_enough: bool,
+        pub gapless_advance_pending: bool,
+        pub gapless_stuck_ticks: u8,
+        pub ended_naturally: bool,
+        pub wall_elapsed: u64,
+        pub stopped_ticks: u8,
+        pub natural_end: bool,
+        pub gapless_sent: bool,
+        pub stream_consuming: bool,
+    }
+
+    /// Pure reproduction of the `TransportState::Stopped` arm's decision tree.
+    /// Branch order is significant and mirrors `tick()` exactly.
+    pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
+        use StoppedOutcome::*;
+        if !i.tune_is_playing || !i.tune_has_track {
+            return Ignore;
+        }
+        if i.in_seek_grace {
+            return SuppressSeekGrace;
+        }
+        if i.in_track_load_grace {
+            return SuppressLoadGrace;
+        }
+        if i.gapless_cooldown > 0 {
+            return SuppressCooldown;
+        }
+        if i.in_gapless_guard {
+            return if !i.played_enough {
+                GuardStoppedIgnored
+            } else {
+                GuardStoppedPending
+            };
+        }
+        if i.gapless_advance_pending {
+            return if i.gapless_stuck_ticks.saturating_add(1) >= GAPLESS_STUCK_THRESHOLD {
+                StuckForceEnd
+            } else {
+                StuckWaiting
+            };
+        }
+        if i.ended_naturally && (i.played_enough || i.wall_elapsed >= 5) {
+            return LocalEndedNaturally;
+        }
+        // Fallthrough: the arm increments stopped_ticks, then branches on it.
+        let stopped_ticks = i.stopped_ticks.saturating_add(1);
+        if stopped_ticks >= STOPPED_TICKS_THRESHOLD {
+            if i.natural_end {
+                return if i.gapless_sent {
+                    NaturalEndGaplessWaiting
+                } else {
+                    NaturalEndAdvance
+                };
+            }
+            if stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
+                return if i.stream_consuming {
+                    FailureWaitingConsuming
+                } else {
+                    FailureStop
+                };
+            }
+            return Waiting;
+        }
+        Waiting
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn base() -> StoppedInput {
+            StoppedInput {
+                tune_is_playing: true,
+                tune_has_track: true,
+                in_seek_grace: false,
+                in_track_load_grace: false,
+                gapless_cooldown: 0,
+                in_gapless_guard: false,
+                played_enough: false,
+                gapless_advance_pending: false,
+                gapless_stuck_ticks: 0,
+                ended_naturally: false,
+                wall_elapsed: 0,
+                stopped_ticks: 0,
+                natural_end: false,
+                gapless_sent: false,
+                stream_consuming: false,
+            }
+        }
+
+        #[test]
+        fn ignore_when_tune_not_playing() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    tune_is_playing: false,
+                    ..base()
+                }),
+                StoppedOutcome::Ignore
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    tune_has_track: false,
+                    ..base()
+                }),
+                StoppedOutcome::Ignore
+            );
+        }
+
+        #[test]
+        fn grace_windows_suppress() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_seek_grace: true,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressSeekGrace
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_track_load_grace: true,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressLoadGrace
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_cooldown: 3,
+                    ..base()
+                }),
+                StoppedOutcome::SuppressCooldown
+            );
+        }
+
+        #[test]
+        fn seek_grace_beats_load_grace() {
+            let i = StoppedInput {
+                in_seek_grace: true,
+                in_track_load_grace: true,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::SuppressSeekGrace);
+        }
+
+        #[test]
+        fn gapless_guard_branches_on_played_enough() {
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_gapless_guard: true,
+                    played_enough: false,
+                    ..base()
+                }),
+                StoppedOutcome::GuardStoppedIgnored
+            );
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    in_gapless_guard: true,
+                    played_enough: true,
+                    ..base()
+                }),
+                StoppedOutcome::GuardStoppedPending
+            );
+        }
+
+        #[test]
+        fn stuck_waits_then_forces_end() {
+            // GAPLESS_STUCK_THRESHOLD = 2. pre=0 → +1=1 < 2 → wait.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_advance_pending: true,
+                    gapless_stuck_ticks: 0,
+                    ..base()
+                }),
+                StoppedOutcome::StuckWaiting
+            );
+            // pre=1 → +1=2 >= 2 → force end.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    gapless_advance_pending: true,
+                    gapless_stuck_ticks: 1,
+                    ..base()
+                }),
+                StoppedOutcome::StuckForceEnd
+            );
+        }
+
+        #[test]
+        fn local_ended_naturally_paths() {
+            // played_enough qualifies.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: true,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // wall_elapsed >= 5 also qualifies.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    wall_elapsed: 5,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // ended_naturally but too early and not played_enough → falls through.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    wall_elapsed: 4,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        #[test]
+        fn below_threshold_waits() {
+            // STOPPED_TICKS_THRESHOLD = 5. pre=0 → +1=1 < 5 → waiting.
+            assert_eq!(classify_stopped(&base()), StoppedOutcome::Waiting);
+        }
+
+        #[test]
+        fn natural_end_advances_without_gapless() {
+            let i = StoppedInput {
+                stopped_ticks: 4,
+                natural_end: true,
+                gapless_sent: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::NaturalEndAdvance);
+            assert!(classify_stopped(&i).is_track_end());
+        }
+
+        #[test]
+        fn natural_end_waits_when_gapless_armed() {
+            let i = StoppedInput {
+                stopped_ticks: 4,
+                natural_end: true,
+                gapless_sent: true,
+                ..base()
+            };
+            assert_eq!(
+                classify_stopped(&i),
+                StoppedOutcome::NaturalEndGaplessWaiting
+            );
+            assert!(!classify_stopped(&i).is_track_end());
+        }
+
+        #[test]
+        fn failure_stops_when_idle_past_failure_threshold() {
+            // STOPPED_FAILURE_THRESHOLD = 30. pre=29 → +1=30, not natural, idle.
+            let i = StoppedInput {
+                stopped_ticks: 29,
+                natural_end: false,
+                stream_consuming: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::FailureStop);
+            assert!(classify_stopped(&i).is_force_stop());
+        }
+
+        #[test]
+        fn failure_waits_when_stream_consuming() {
+            let i = StoppedInput {
+                stopped_ticks: 29,
+                natural_end: false,
+                stream_consuming: true,
+                ..base()
+            };
+            assert_eq!(
+                classify_stopped(&i),
+                StoppedOutcome::FailureWaitingConsuming
+            );
+            assert!(!classify_stopped(&i).is_force_stop());
+        }
+
+        #[test]
+        fn between_thresholds_waits() {
+            // pre=10 → +1=11, >=5 but <30, not natural_end → Waiting.
+            let i = StoppedInput {
+                stopped_ticks: 10,
+                natural_end: false,
+                ..base()
+            };
+            assert_eq!(classify_stopped(&i), StoppedOutcome::Waiting);
+        }
+    }
+}
+
 struct ZonePollState {
     gapless_sent: bool,
     stopped_ticks: u8,
