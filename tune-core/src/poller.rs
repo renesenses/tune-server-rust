@@ -12,6 +12,16 @@ use tracing::{debug, info, warn};
 /// average 500 ms gap between tracks on local output.
 pub static TRACK_END_NOTIFY: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::new()));
 
+/// v0.9 rc.2 — when set (`TUNE_POLLER_FSM_SHADOW=1`), the poller runs the FSM
+/// `fsm::classify_stopped` in shadow alongside the imperative `Stopped` arm and
+/// logs any divergence. The FSM never acts; the legacy arm stays authoritative.
+static POLLER_FSM_SHADOW: LazyLock<bool> = LazyLock::new(|| {
+    matches!(
+        std::env::var("TUNE_POLLER_FSM_SHADOW").as_deref(),
+        Ok("1") | Ok("true")
+    )
+});
+
 use crate::db::zone_repo::ZoneRepo;
 use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
@@ -1339,7 +1349,37 @@ impl PositionPoller {
                     let in_track_load_grace = ps.track_loaded_at.elapsed().as_secs()
                         < TRACK_LOAD_GRACE_SECS
                         && ps.peak_position_ms < 5_000;
+                    // v0.9 rc.2 FSM shadow: snapshot the Stopped-arm inputs
+                    // (pre-mutation) so classify_stopped can be compared to the
+                    // arm's real outcome under TUNE_POLLER_FSM_SHADOW. Cheap
+                    // (no I/O); the compare/log at the arm tail is flag-gated.
+                    let mut fsm_in = fsm::StoppedInput {
+                        tune_is_playing,
+                        tune_has_track,
+                        in_seek_grace,
+                        in_track_load_grace,
+                        gapless_cooldown: ps.gapless_cooldown,
+                        in_gapless_guard,
+                        played_enough,
+                        gapless_advance_pending: ps.gapless_advance_pending,
+                        gapless_stuck_ticks: ps.gapless_stuck_ticks,
+                        ended_naturally: status.ended_naturally,
+                        wall_elapsed,
+                        stopped_ticks: ps.stopped_ticks,
+                        natural_end: decisions::natural_end(
+                            played_enough,
+                            matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All),
+                            ps.peak_position_ms,
+                            status.ended_naturally,
+                            wall_elapsed,
+                            track_duration_ms,
+                        ),
+                        gapless_sent: ps.gapless_sent,
+                        stream_consuming: false,
+                    };
+                    let mut fsm_actual: Option<fsm::StoppedOutcome> = None;
                     if in_seek_grace {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressSeekGrace);
                         ps.stopped_ticks = 0;
                         debug!(
                             zone_id,
@@ -1347,6 +1387,7 @@ impl PositionPoller {
                             "seek_grace_suppressing_stopped_ticks"
                         );
                     } else if in_track_load_grace {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressLoadGrace);
                         ps.stopped_ticks = 0;
                         debug!(
                             zone_id,
@@ -1355,10 +1396,12 @@ impl PositionPoller {
                             "track_load_grace_suppressing_stopped_ticks"
                         );
                     } else if ps.gapless_cooldown > 0 {
+                        fsm_actual = Some(fsm::StoppedOutcome::SuppressCooldown);
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
                     } else if in_gapless_guard {
                         if !played_enough {
+                            fsm_actual = Some(fsm::StoppedOutcome::GuardStoppedIgnored);
                             // Renderer reported Stopped during guard but not
                             // enough of the track was played — ignore to avoid
                             // false skip (DMP-A8 quirk).
@@ -1369,6 +1412,7 @@ impl PositionPoller {
                                 "gapless_guard_stopped_ignored_not_enough_played"
                             );
                         } else {
+                            fsm_actual = Some(fsm::StoppedOutcome::GuardStoppedPending);
                             // During the gapless guard period, a Stopped state
                             // MAY mean the renderer transitioned via gapless.
                             // Don't advance metadata yet — wait for the renderer
@@ -1394,6 +1438,7 @@ impl PositionPoller {
                         // doesn't pick up within GAPLESS_STUCK_THRESHOLD.
                         ps.gapless_stuck_ticks += 1;
                         if ps.gapless_stuck_ticks >= GAPLESS_STUCK_THRESHOLD {
+                            fsm_actual = Some(fsm::StoppedOutcome::StuckForceEnd);
                             warn!(
                                 zone_id,
                                 stuck_ticks = ps.gapless_stuck_ticks,
@@ -1404,6 +1449,7 @@ impl PositionPoller {
                             ps.stopped_ticks = 0;
                             track_ended = true;
                         } else {
+                            fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
                                 zone_id,
                                 stuck_ticks = ps.gapless_stuck_ticks,
@@ -1412,6 +1458,7 @@ impl PositionPoller {
                             );
                         }
                     } else if status.ended_naturally && (played_enough || wall_elapsed >= 5) {
+                        fsm_actual = Some(fsm::StoppedOutcome::LocalEndedNaturally);
                         // Local outputs (WASAPI/ALSA/CoreAudio) signal
                         // ended_naturally when the audio stream reaches EOF.
                         // Skip the STOPPED_TICKS_THRESHOLD wait — we know
@@ -1425,6 +1472,9 @@ impl PositionPoller {
                         );
                         track_ended = true;
                     } else {
+                        // Default for this block; overridden by the natural-end
+                        // and failure sub-branches below.
+                        fsm_actual = Some(fsm::StoppedOutcome::Waiting);
                         ps.stopped_ticks += 1;
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             // When repeat mode is active (One or All) on DLNA,
@@ -1455,6 +1505,8 @@ impl PositionPoller {
                             }
                             if natural_end {
                                 if ps.gapless_sent {
+                                    fsm_actual =
+                                        Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
                                     // Gapless was prepared via SetNextAVTransportURI.
                                     // Don't advance metadata yet — wait for the
                                     // renderer to confirm the transition by starting
@@ -1473,6 +1525,7 @@ impl PositionPoller {
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
                                 } else {
+                                    fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                     track_ended = true;
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
@@ -1495,8 +1548,10 @@ impl PositionPoller {
                                 let stream_consuming =
                                     current_bytes > 0 && current_bytes > ps.last_bytes_sent;
                                 ps.last_bytes_sent = current_bytes;
+                                fsm_in.stream_consuming = stream_consuming;
 
                                 if stream_consuming {
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     if ps.stopped_ticks % 30 == 0 {
                                         debug!(
                                             zone_id,
@@ -1507,6 +1562,7 @@ impl PositionPoller {
                                         );
                                     }
                                 } else {
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureStop);
                                     warn!(
                                         zone_id,
                                         peak_pos = ps.peak_position_ms,
@@ -1532,6 +1588,15 @@ impl PositionPoller {
                                     },
                                     "stopped_early_waiting"
                                 );
+                            }
+                        }
+                    }
+                    // v0.9 rc.2 — FSM shadow-compare (flag-gated, log only).
+                    if *POLLER_FSM_SHADOW {
+                        if let Some(actual) = fsm_actual {
+                            let predicted = fsm::classify_stopped(&fsm_in);
+                            if predicted != actual {
+                                warn!(zone_id, ?predicted, ?actual, "poller_fsm_shadow_divergence");
                             }
                         }
                     }
