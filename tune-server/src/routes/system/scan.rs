@@ -258,6 +258,23 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     };
                     let artist_id = track_artist.as_ref().and_then(|a| a.id);
 
+                    if let Some(ref album_title) = meta.album {
+                        let t = album_title.to_lowercase();
+                        if t.contains("best") || t.contains("greatest") || t.contains("hits") {
+                            tracing::info!(
+                                album = %album_title,
+                                album_artist_tag = ?meta.album_artist,
+                                artist_tag = ?meta.artist,
+                                resolved_album_artist = album_artist_name,
+                                resolved_artist_id = ?album_artist_id,
+                                resolved_artist_name = ?album_artist_entry.as_ref().map(|a| &a.name),
+                                year = ?meta.year,
+                                file = %sf.path,
+                                "DIAG_generic_album_scan"
+                            );
+                        }
+                    }
+
                     let album_key = meta.album.as_ref().map(|t| {
                         (
                             t.clone(),
