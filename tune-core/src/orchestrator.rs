@@ -3870,6 +3870,10 @@ fn decode_radio_stream_to_pcm(
     let chunk_size: usize = 32768;
 
     loop {
+        if tx.is_closed() {
+            debug!("radio_local_decode_channel_closed_before_packet");
+            return Ok(());
+        }
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break, // Stream ended (unlikely for radio)
