@@ -48,12 +48,6 @@ pub enum Feature {
     AutoEnrichment,
     RoomCorrection,
     CloudConfigBackup,
-    SocialSharing,
-    DeveloperApi,
-    PluginMarketplace,
-    MultiServer,
-    DacCalibration,
-    BatchConverter,
 }
 
 impl Feature {
@@ -64,8 +58,7 @@ impl Feature {
             Feature::MultiroomSync,
             Feature::DspEq,
             Feature::CloudRelay,
-            // OAAT is free — open-source protocol, core feature
-            // Feature::OaatProtocol,
+            Feature::OaatProtocol,
             Feature::CloudBackup,
             Feature::SyncedLyrics,
             Feature::ListeningStats,
@@ -78,12 +71,6 @@ impl Feature {
             Feature::AutoEnrichment,
             Feature::RoomCorrection,
             Feature::CloudConfigBackup,
-            Feature::SocialSharing,
-            Feature::DeveloperApi,
-            Feature::PluginMarketplace,
-            Feature::MultiServer,
-            Feature::DacCalibration,
-            Feature::BatchConverter,
         ]
     }
 
@@ -107,12 +94,6 @@ impl Feature {
             Feature::AutoEnrichment => "Auto Metadata Enrichment",
             Feature::RoomCorrection => "Room Correction",
             Feature::CloudConfigBackup => "Cloud Config Backup",
-            Feature::SocialSharing => "Social Sharing",
-            Feature::DeveloperApi => "Developer API",
-            Feature::PluginMarketplace => "Plugin Marketplace",
-            Feature::MultiServer => "Multi-Server",
-            Feature::DacCalibration => "DAC Calibration",
-            Feature::BatchConverter => "Batch Audio Converter",
         }
     }
 }
@@ -134,7 +115,7 @@ pub struct LicenseState {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FREE_MAX_ZONES: i64 = 10;
+const FREE_MAX_ZONES: i64 = 3;
 const GRACE_PERIOD_DAYS: i64 = 30;
 
 // ---------------------------------------------------------------------------
@@ -440,8 +421,8 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentytwo_features() {
-        assert_eq!(Feature::all_premium().len(), 22);
+    fn all_premium_has_seventeen_features() {
+        assert_eq!(Feature::all_premium().len(), 17);
     }
 
     #[test]
