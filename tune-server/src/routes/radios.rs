@@ -11,6 +11,21 @@ use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use crate::error::AppError;
 use crate::state::AppState;
 
+fn favicon_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let after_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let host = after_scheme.split('/').next()?;
+    let host = host.split(':').next()?;
+    if host.is_empty() || !host.contains('.') {
+        return None;
+    }
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={host}&sz=128"
+    ))
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
@@ -69,12 +84,17 @@ async fn create_radio(
     Json(body): Json<CreateRadio>,
 ) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
+    let auto_logo = if body.logo_url.is_none() {
+        favicon_from_url(body.homepage.as_deref().unwrap_or(&body.url))
+    } else {
+        None
+    };
     let station = RadioStation {
         id: None,
         name: body.name,
         url: body.url,
         homepage: body.homepage,
-        logo_url: body.logo_url,
+        logo_url: body.logo_url.or(auto_logo),
         country: body.country,
         language: body.language,
         genre: body.genre,
