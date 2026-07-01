@@ -296,6 +296,12 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
 
+                // Skip ALSA null/dummy sinks that produce no audio
+                if name.contains("Discard all samples") || name.contains("Dummy") {
+                    debug!(device = %name, "local_audio_device_skipped_null_sink");
+                    continue;
+                }
+
                 // Disambiguate duplicate device names (common on Windows WASAPI
                 // where multiple USB DACs all show as "Haut-Parleurs").
                 let name = if seen_names.contains(&name) {
