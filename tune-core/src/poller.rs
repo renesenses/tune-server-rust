@@ -246,7 +246,10 @@ pub(crate) mod decisions {
 /// becomes authoritative (per-zone flip). This is the seed that will replace
 /// the 23-field `ZonePollState`.
 pub mod fsm {
-    use super::{GAPLESS_STUCK_THRESHOLD, STOPPED_FAILURE_THRESHOLD, STOPPED_TICKS_THRESHOLD};
+    use super::{
+        GAPLESS_STUCK_THRESHOLD, POSITION_PAST_END_TICKS, STOPPED_FAILURE_THRESHOLD,
+        STOPPED_TICKS_THRESHOLD, decisions,
+    };
 
     /// Terminal decision of one poll tick when the output reports Stopped.
     /// Each variant maps 1:1 to a branch of the `TransportState::Stopped` arm.
@@ -374,6 +377,72 @@ pub mod fsm {
             return Waiting;
         }
         Waiting
+    }
+
+    /// Decisions taken by the `Playing`/`Transitioning` arm. Unlike the Stopped
+    /// arm (a single-outcome tree), the Playing arm performs a *sequence* of
+    /// independent effects, so this is a bundle of flags, not one enum.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct PlayingDecision {
+        /// (A) A gapless advance was pending and a next track exists — advance
+        /// the queue metadata now.
+        pub confirm_gapless_advance: bool,
+        /// (B) A gapless transition to the next track was detected.
+        pub transition_detected: bool,
+        /// (C) Entered the final window, not armed, gapless enabled — arm SetNext.
+        pub arm_gapless: bool,
+        /// (D) Position ran past the end for POSITION_PAST_END_TICKS ticks —
+        /// the arm sets track_ended.
+        pub past_end_track_ended: bool,
+    }
+
+    /// Inputs read by the Playing arm, snapshot pre-mutation. `has_next` and
+    /// `gapless_enabled` are supplied by the caller (queue lookup / zone config).
+    #[derive(Debug, Clone, Copy)]
+    pub struct PlayingInput {
+        pub gapless_advance_pending: bool,
+        pub has_next: bool,
+        pub gapless_sent: bool,
+        pub track_duration_ms: u64,
+        pub reported_duration_ms: u64,
+        pub played_enough: bool,
+        pub position_ms: u64,
+        pub past_end_ticks: u8,
+        pub gapless_enabled: bool,
+    }
+
+    /// Pure reproduction of the `Playing`/`Transitioning` arm's decisions.
+    /// Mirrors the arm's ordering: a detected transition (B) resets the
+    /// past-end tick counter before (D) is evaluated.
+    pub fn classify_playing(i: &PlayingInput) -> PlayingDecision {
+        let confirm_gapless_advance = i.gapless_advance_pending && i.has_next;
+        let transition_detected = decisions::duration_changed(
+            i.gapless_sent,
+            i.track_duration_ms,
+            i.reported_duration_ms,
+        ) && decisions::position_confirms_transition(
+            i.played_enough,
+            i.position_ms,
+            i.track_duration_ms,
+        );
+        let arm_gapless = !transition_detected
+            && decisions::should_arm_gapless(i.gapless_sent, i.reported_duration_ms, i.position_ms)
+            && i.gapless_enabled;
+        // (B) resets past_end_ticks to 0 before (D) runs.
+        let effective_past_end_ticks = if transition_detected {
+            0
+        } else {
+            i.past_end_ticks
+        };
+        let past_end_track_ended =
+            decisions::past_end_reached(i.track_duration_ms, i.played_enough, i.position_ms)
+                && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
+        PlayingDecision {
+            confirm_gapless_advance,
+            transition_detected,
+            arm_gapless,
+            past_end_track_ended,
+        }
     }
 
     #[cfg(test)]
@@ -596,6 +665,129 @@ pub mod fsm {
                 ..base()
             };
             assert_eq!(classify_stopped(&i), StoppedOutcome::Waiting);
+        }
+
+        fn pbase() -> PlayingInput {
+            PlayingInput {
+                gapless_advance_pending: false,
+                has_next: true,
+                gapless_sent: false,
+                track_duration_ms: 300_000,
+                reported_duration_ms: 300_000,
+                played_enough: false,
+                position_ms: 0,
+                past_end_ticks: 0,
+                gapless_enabled: true,
+            }
+        }
+
+        #[test]
+        fn playing_confirm_gapless_advance() {
+            assert!(
+                classify_playing(&PlayingInput {
+                    gapless_advance_pending: true,
+                    has_next: true,
+                    ..pbase()
+                })
+                .confirm_gapless_advance
+            );
+            // pending but no next → no metadata advance.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_advance_pending: true,
+                    has_next: false,
+                    ..pbase()
+                })
+                .confirm_gapless_advance
+            );
+        }
+
+        #[test]
+        fn playing_transition_detected_requires_armed() {
+            let armed = PlayingInput {
+                gapless_sent: true,
+                track_duration_ms: 200_000,
+                reported_duration_ms: 210_000,
+                played_enough: true,
+                position_ms: 2_000,
+                ..pbase()
+            };
+            assert!(classify_playing(&armed).transition_detected);
+            // Not armed → duration_changed is false → no transition.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_sent: false,
+                    ..armed
+                })
+                .transition_detected
+            );
+        }
+
+        #[test]
+        fn playing_arm_gapless_gated_by_enabled_and_not_transitioning() {
+            let i = PlayingInput {
+                gapless_sent: false,
+                reported_duration_ms: 300_000,
+                position_ms: 275_000,
+                gapless_enabled: true,
+                ..pbase()
+            };
+            let d = classify_playing(&i);
+            assert!(d.arm_gapless && !d.transition_detected);
+            // Disabled for the zone → don't arm.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    gapless_enabled: false,
+                    ..i
+                })
+                .arm_gapless
+            );
+        }
+
+        #[test]
+        fn playing_past_end_advances_after_threshold() {
+            // POSITION_PAST_END_TICKS = 3. pre=2 → +1=3 >= 3, past end reached.
+            let i = PlayingInput {
+                track_duration_ms: 240_000,
+                played_enough: true,
+                position_ms: 244_000,
+                past_end_ticks: 2,
+                ..pbase()
+            };
+            assert!(classify_playing(&i).past_end_track_ended);
+            // pre=1 → +1=2 < 3 → not yet.
+            assert!(
+                !classify_playing(&PlayingInput {
+                    past_end_ticks: 1,
+                    ..i
+                })
+                .past_end_track_ended
+            );
+        }
+
+        #[test]
+        fn playing_transition_resets_past_end_counter() {
+            // Past-end IS reached, but a detected transition resets the counter
+            // to 0 before (D), so no past-end advance this tick.
+            let i = PlayingInput {
+                gapless_sent: true,
+                track_duration_ms: 240_000,
+                reported_duration_ms: 250_000,
+                played_enough: true,
+                position_ms: 244_000,
+                past_end_ticks: 5,
+                ..pbase()
+            };
+            let d = classify_playing(&i);
+            assert!(d.transition_detected);
+            assert!(!d.past_end_track_ended);
+            // Without a transition, the pre-tick counter stands: 5+1 >= 3 → advance.
+            let d2 = classify_playing(&PlayingInput {
+                gapless_sent: false,
+                ..i
+            });
+            assert!(!d2.transition_detected);
+            assert!(d2.past_end_track_ended);
         }
     }
 }
