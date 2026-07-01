@@ -654,6 +654,12 @@ fn migrate_to_unified_queue(db: &SqliteDb) {
          SELECT zone_id, position, 0, source, source_id, title, artist, album, cover_url, duration_ms FROM streaming_queue;",
     )
     .ok();
+
+    // Data is now in queue_items — drop the legacy split tables. This runs only
+    // on the one-time copy pass (the early return above skips it afterwards),
+    // so the drop always immediately follows a successful copy.
+    conn.execute_batch("DROP TABLE IF EXISTS play_queue; DROP TABLE IF EXISTS streaming_queue;")
+        .ok();
 }
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
