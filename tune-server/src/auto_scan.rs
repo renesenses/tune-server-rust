@@ -93,6 +93,16 @@ pub fn build_track_from_metadata_opts(
             tracing::warn!(album = title, file = %sf.path, "album_skipped_no_artist_id");
             return None;
         };
+        if title.to_lowercase().contains("best of") {
+            tracing::info!(
+                album = title,
+                album_artist = album_artist_name,
+                album_artist_id = aid,
+                track_artist = track_artist_name,
+                file = %sf.path,
+                "DIAG_best_of_album_resolution"
+            );
+        }
         // Quality-based album splitting: append suffix when sample_rate or
         // bit_depth indicate a different quality tier (e.g. "Album (96kHz/24bit)").
         // This prevents WAV 96kHz, WAV 44kHz, and MP3 from being merged.
