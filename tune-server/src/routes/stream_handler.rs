@@ -420,7 +420,7 @@ async fn proxy_stream(
     // Forwarding each one to the CDN hammers Akamai and causes drops.
     // User-initiated seeks go through the orchestrator (stream recreation),
     // so we never need to forward Range to the CDN for proxy sessions.
-    let mut upstream_req = client.get(upstream_url);
+    let upstream_req = client.get(upstream_url);
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,

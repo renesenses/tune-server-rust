@@ -1,5 +1,5 @@
 use axum::extract::{Query, State};
-use axum::routing::{delete, get};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};

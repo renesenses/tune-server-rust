@@ -1525,43 +1525,6 @@ async fn set_eq(
 }
 
 #[derive(Deserialize)]
-struct DspSettings {
-    crossfeed: Option<String>,
-    eq_profile: Option<tune_core::audio::eq::EqProfile>,
-}
-
-async fn set_dsp(
-    State(state): State<AppState>,
-    Path(zone_id): Path<i64>,
-    Json(body): Json<DspSettings>,
-) -> Json<Value> {
-    if let Some(ref profile) = body.eq_profile {
-        let settings = SettingsRepo::with_backend(state.backend.clone());
-        let key = format!("zone_{zone_id}_eq_profile");
-        let _ = settings.set(&key, &serde_json::to_string(profile).unwrap_or_default());
-    }
-    Json(json!({
-        "zone_id": zone_id,
-        "crossfeed": body.crossfeed,
-        "eq_profile": body.eq_profile,
-    }))
-}
-
-async fn get_dsp(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let key = format!("zone_{zone_id}_eq_profile");
-    let eq_profile: Option<tune_core::audio::eq::EqProfile> = settings
-        .get(&key)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    Json(json!({
-        "zone_id": zone_id,
-        "eq_profile": eq_profile.unwrap_or_default(),
-    }))
-}
-
-#[derive(Deserialize)]
 struct CrossfadeSettings {
     enabled: bool,
     duration: Option<f64>,
