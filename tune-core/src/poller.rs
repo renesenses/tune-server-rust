@@ -1382,11 +1382,24 @@ impl PositionPoller {
                 .unwrap_or(false);
 
             if !in_seek_grace {
-                self.playback
-                    .update_position(zone_id, status.position_ms as i64)
-                    .await;
-                self.playback
-                    .emit_position(zone_id, status.position_ms as i64);
+                // Clamp the reported position to the track duration so the UI
+                // progress bar doesn't briefly overshoot past the end. The
+                // output can report a position a few seconds past the duration
+                // during the past-end / gapless window before the track
+                // advances (reported by DEvir). Internal poller logic keeps
+                // using the raw status.position_ms (peak, past-end detection).
+                let dur = zone_state
+                    .now_playing
+                    .as_ref()
+                    .map(|np| np.duration_ms as i64)
+                    .unwrap_or(0);
+                let reported = if dur > 0 {
+                    (status.position_ms as i64).min(dur)
+                } else {
+                    status.position_ms as i64
+                };
+                self.playback.update_position(zone_id, reported).await;
+                self.playback.emit_position(zone_id, reported);
             }
 
             // Sync volume from device (skip if fixed_volume)
