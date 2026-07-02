@@ -2392,6 +2392,26 @@ impl PlaybackOrchestrator {
         let bd = prefetched.bit_depth;
         let ch = prefetched.channels;
 
+        // Prefer the request's metadata (from now_playing) over the prefetch
+        // buffer's. The buffer is built for the *next* track and can carry an
+        // empty title (prefetched before its metadata was resolved); serving it
+        // verbatim after a seek wipes the Now Playing title (DEvir: title
+        // disappears when seeking shortly after a TIDAL track starts).
+        let title = req
+            .title
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| prefetched.title.clone());
+        let artist = req
+            .artist_name
+            .clone()
+            .or_else(|| prefetched.artist.clone());
+        let album = req.album_title.clone().or_else(|| prefetched.album.clone());
+        let cover_url = req
+            .cover_url
+            .clone()
+            .or_else(|| prefetched.cover_url.clone());
+
         // Determine output bit depth based on output type
         let is_local_stream = req
             .output_device_id
@@ -2527,8 +2547,8 @@ impl PlaybackOrchestrator {
             return Ok(ResolvedStream {
                 url: stream_url,
                 stream_id: Some(session_id),
-                title: prefetched.title,
-                artist: prefetched.artist,
+                title: title.clone(),
+                artist: artist.clone(),
                 album: None,
                 duration_ms: Some(prefetched.duration_ms as i64),
                 source: prefetched.source,
@@ -2536,7 +2556,7 @@ impl PlaybackOrchestrator {
                 sample_rate: Some(sr),
                 bit_depth: Some(out_bd as u32),
                 channels: Some(ch as u32),
-                cover_url: prefetched.cover_url,
+                cover_url: cover_url.clone(),
                 file_size: Some(file_size),
             });
         }
@@ -2583,12 +2603,12 @@ impl PlaybackOrchestrator {
         Ok(ResolvedStream {
             url: stream_url,
             mime_type: "audio/wav".into(),
-            title: prefetched.title,
-            artist: prefetched.artist,
-            album: prefetched.album,
+            title: title.clone(),
+            artist: artist.clone(),
+            album: album.clone(),
             duration_ms: Some(prefetched.duration_ms as i64),
             source: prefetched.source,
-            cover_url: prefetched.cover_url,
+            cover_url: cover_url.clone(),
             stream_id: Some(session_id),
             file_size: None,
             sample_rate: Some(sr),
