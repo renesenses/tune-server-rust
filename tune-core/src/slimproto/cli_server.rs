@@ -231,7 +231,7 @@ async fn handle_serverstatus(line: &str, state: &Arc<CliState>) -> String {
     )
 }
 
-fn handle_pref(line: &str, state: &Arc<CliState>) -> String {
+fn handle_pref(line: &str, _state: &Arc<CliState>) -> String {
     if line.contains('?') {
         let key = line.split_whitespace().nth(1).unwrap_or("unknown");
         let value = match key {

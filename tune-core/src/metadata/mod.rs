@@ -179,7 +179,7 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
-    let mut format_reader = symphonia::default::get_probe()
+    let format_reader = symphonia::default::get_probe()
         .probe(
             &hint,
             mss,

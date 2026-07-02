@@ -15,7 +15,7 @@ mod tags;
 mod update;
 
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 
 use tune_core::db::settings_repo::SettingsRepo;
 

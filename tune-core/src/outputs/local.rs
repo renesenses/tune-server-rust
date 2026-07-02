@@ -2536,7 +2536,6 @@ impl OutputTarget for LocalOutput {
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
-                stream_started = true;
                 info!(
                     device = %device_name,
                     ring_available = ring.available(),
