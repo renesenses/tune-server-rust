@@ -148,7 +148,6 @@ impl Convolver {
                 let mut output = vec![vec![0.0f32; self.block_size]; ch];
                 self.process_block(&mut output);
 
-                let buf_start = self.input_buf[0].len() - self.block_size;
                 let start_frame = frame + 1 - self.block_size;
                 for f in 0..self.block_size {
                     for c in 0..ch {

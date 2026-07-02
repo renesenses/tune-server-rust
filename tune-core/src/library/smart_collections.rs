@@ -195,7 +195,6 @@ fn accent_tolerant_like(s: &str) -> String {
 
 fn compile_rule(rule: &Rule) -> (String, Vec<String>) {
     let col = field_to_column(&rule.field);
-    let val_norm = strip_accents(&rule.value);
     let val_like = accent_tolerant_like(&rule.value);
     match rule.operator {
         Operator::Equals => (format!("{col} LIKE ? COLLATE NOCASE"), vec![val_like]),

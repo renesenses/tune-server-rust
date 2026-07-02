@@ -224,10 +224,6 @@ struct ZonePollState {
     /// renderer stays Stopped after gapless_cooldown expires, this flag lets
     /// the poller detect the stuck state and force a play_from_queue.
     gapless_advance_pending: bool,
-    /// When the user last changed the volume via the API.
-    /// During VOLUME_GRACE_SECS after this, the poller ignores renderer-reported
-    /// volume to prevent the slider from bouncing back.
-    volume_changed_at: Option<Instant>,
     /// Counts Stopped ticks after gapless_cooldown expires while
     /// gapless_advance_pending is true.  When this reaches
     /// GAPLESS_STUCK_THRESHOLD, the poller gives up on the gapless
@@ -443,7 +439,6 @@ impl PositionPoller {
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
                 radio_stopped_ticks: 0,
-                volume_changed_at: None,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -1524,7 +1519,6 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
-            volume_changed_at: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1571,7 +1565,6 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
-            volume_changed_at: None,
         };
 
         // Simulates entering Playing state
@@ -1670,7 +1663,6 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
-            volume_changed_at: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -1899,7 +1891,6 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
-            volume_changed_at: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -1953,7 +1944,6 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
-            volume_changed_at: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)

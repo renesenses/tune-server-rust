@@ -881,7 +881,7 @@ impl PlaybackOrchestrator {
             let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id);
             if dsd_mode == "native" || dsd_mode == "dop" {
                 let dsd_rate = track.sample_rate.unwrap_or(2_822_400) as u32;
-                let mut dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
+                let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
                 let zone_max_sr = zone.as_ref().and_then(|z| z.max_sample_rate);
                 if let Some(max_sr) = zone_max_sr {
                     if dop_rate > max_sr {
