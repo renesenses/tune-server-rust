@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -11,7 +11,24 @@ use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
-pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(Deserialize)]
+pub(super) struct ScanQuery {
+    /// When true, re-process ALL discovered files (bypass the unchanged-file
+    /// skip) so stale album_id assignments get re-resolved by (title, artist).
+    /// Self-heals DBs corrupted by the old title-only album merge, where a
+    /// track's album_id points at a wrong same-titled album. Slower (re-reads
+    /// every file's metadata); default false keeps the fast incremental scan.
+    force: Option<bool>,
+}
+
+pub(super) async fn trigger_scan(
+    State(state): State<AppState>,
+    Query(q): Query<ScanQuery>,
+) -> impl IntoResponse {
+    let force = q.force.unwrap_or(false);
+    if force {
+        tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(e) = settings.set("scan_status", "scanning") {
         tracing::warn!(error = %e, "scan_status_set_failed");
@@ -73,6 +90,10 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
         let files_to_scan: Vec<std::path::PathBuf> = files
             .into_iter()
             .filter(|path| {
+                // Force mode: re-process everything so album_id is re-resolved.
+                if force {
+                    return true;
+                }
                 let path_str = path.to_string_lossy();
                 if let Some(&(_, existing_mtime, existing_size)) =
                     existing_tracks.get(path_str.as_ref())
@@ -172,15 +193,18 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                     // Without this, get_or_create_with_mbid can create a ghost album
                     // entry (with cover art but no tracks) for files that are ultimately
                     // skipped — the root cause of "duplicate covers after rescan" (#593).
-                    if let Some(&(_existing_id, existing_mtime, existing_size)) =
-                        existing_tracks.get(&sf.path)
-                    {
-                        let file_changed = existing_mtime
-                            .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
-                            || existing_size.map_or(true, |s| s != sf.file_size as i64);
-                        if !file_changed {
-                            skipped += 1;
-                            continue;
+                    // Force mode bypasses this so album_id gets re-resolved.
+                    if !force {
+                        if let Some(&(_existing_id, existing_mtime, existing_size)) =
+                            existing_tracks.get(&sf.path)
+                        {
+                            let file_changed = existing_mtime
+                                .map_or(true, |m| (m - sf.mtime as f64).abs() > 0.5)
+                                || existing_size.map_or(true, |s| s != sf.file_size as i64);
+                            if !file_changed {
+                                skipped += 1;
+                                continue;
+                            }
                         }
                     }
 
