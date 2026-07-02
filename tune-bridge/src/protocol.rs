@@ -1,3 +1,8 @@
+// Tune Bridge wire protocol. Several message types are defined ahead of the
+// bridge implementation (phases 1-3) and not constructed yet — keep them as the
+// protocol contract rather than deleting.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 // --- Server → Relay messages ---
