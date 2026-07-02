@@ -1704,6 +1704,25 @@ impl PlaybackOrchestrator {
                 ..Default::default()
             };
 
+            // Guard against a stale/cleaned-up DASH temp file (mirrors the
+            // `is_dash_file` DLNA path below). The local transcode runs
+            // fire-and-forget in a spawned task, so a missing file would decode
+            // to nothing while play() still reports output_sent=true. Fail early
+            // so the caller sees the real failure instead of silent no-playback.
+            // (Reported on ASIO with 24/192 Tidal DASH after the temp file is gone.)
+            if upstream_url.starts_with("file://") {
+                let fp = upstream_url
+                    .strip_prefix("file://")
+                    .unwrap_or(&upstream_url);
+                let size = std::fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
+                if size == 0 {
+                    warn!(path = %fp, "streaming_dash_file_missing_or_empty");
+                    return Err(format!(
+                        "DASH temp file missing or empty (needs re-download): {fp}"
+                    ));
+                }
+            }
+
             let (session_id, tx, data_ready) =
                 self.streamer.create_session(wav_info, false, 256).await;
 
