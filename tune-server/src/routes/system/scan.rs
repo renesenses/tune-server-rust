@@ -675,7 +675,7 @@ pub(super) async fn trigger_scan(State(state): State<AppState>) -> impl IntoResp
                 let dupe_rows = db.query_many(
                     "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
                      WHERE source = 'local' \
-                     GROUP BY LOWER(title) HAVING COUNT(id) > 1",
+                     GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
                     &[],
                 ).unwrap_or_default();
                 let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
