@@ -1,3 +1,7 @@
+// Bridge server state; some fields are populated by the not-yet-wired bridge
+// phases (1-3) and read later — annotate rather than drop.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;

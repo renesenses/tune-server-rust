@@ -8,6 +8,12 @@ license.workspace = true
 name = "tuneserver"
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# The mobile FFI build omits local audio outputs by default; declaring the
+# feature makes the `#[cfg(feature = "local-audio")]` gate valid (silences the
+# unexpected-cfg warning) and lets a host opt in. Off by default → no build change.
+local-audio = ["tune-server/local-audio"]
+
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false, features = ["oaat"] }
 tune-server = { path = "../tune-server", default-features = false }

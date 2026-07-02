@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::state::RelayState;
 
