@@ -205,9 +205,10 @@ async fn main() {
     #[cfg(feature = "local-audio")]
     tune_server::startup::register_local_outputs(&state).await;
 
-    // Auto-resume local zones (local: devices are already registered)
-    #[cfg(feature = "local-audio")]
-    tune_server::auto_resume::auto_resume_local_zones(&state).await;
+    // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
+    // bound (see below). Running it here fetched the local output's own
+    // /stream/ URL before the server was accepting connections, which failed
+    // with local_audio_http_fetch_failed and left playback silently dead.
 
     // Create shared OpenHome event listener
     let oh_event_listener = tune_server::startup::create_oh_listener().await;
@@ -243,6 +244,11 @@ async fn main() {
 
     routes::spotify_connect::auto_start(&state).await;
 
+    // Clone before `state` is moved into the router — used to auto-resume local
+    // zones once the listener is bound (see below).
+    #[cfg(feature = "local-audio")]
+    let resume_state = state.clone();
+
     let app = routes::router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -272,6 +278,27 @@ async fn main() {
     };
 
     info!(%addr, "listening");
+
+    // Auto-resume local zones now that the listener is bound. Wait until the
+    // server is actually accepting connections before resuming, so the local
+    // output can fetch its own /stream/ URL (fixes the startup race that caused
+    // local_audio_http_fetch_failed → silent no-playback on ASIO).
+    #[cfg(feature = "local-audio")]
+    {
+        let resume_port = config.port;
+        tokio::spawn(async move {
+            for _ in 0..20 {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{resume_port}"))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            tune_server::auto_resume::auto_resume_local_zones(&resume_state).await;
+        });
+    }
 
     // Open browser after listener is bound (server is ready to accept connections).
     // Only when TUNE_OPEN_BROWSER=1 — set by launcher scripts (start-tune-server.bat/.command).
