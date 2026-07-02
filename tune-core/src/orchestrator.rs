@@ -3743,8 +3743,8 @@ impl PlaybackOrchestrator {
             track_id: None,
             source: Some(source),
             source_id: Some(source_id),
-            title,
-            artist_name: artist,
+            title: title.clone(),
+            artist_name: artist.clone(),
             album_title: album.clone(),
             cover_url: cover.clone(),
             duration_ms: duration,
@@ -3762,8 +3762,11 @@ impl PlaybackOrchestrator {
         Ok(ResolvedQueueItem {
             url: resolved.url,
             mime_type: resolved.mime_type,
-            title: resolved.title,
-            artist: resolved.artist,
+            // Prefer the queue item's metadata (the streaming resolve returns an
+            // empty title for Tidal/Qobuz) so the gapless-next SetNext carries
+            // the real title instead of blanking it (DEvir).
+            title: title.filter(|s| !s.is_empty()).unwrap_or(resolved.title),
+            artist: artist.filter(|s| !s.is_empty()).or(resolved.artist),
             album,
             cover_url: self.resolve_cover_url(raw_cover.as_deref()),
             duration_ms: resolved.duration_ms.map(|d| d as u64),
