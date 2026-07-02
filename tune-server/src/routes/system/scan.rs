@@ -83,6 +83,17 @@ pub(super) async fn trigger_scan(
         let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(db.clone());
         let album_repo = tune_core::db::album_repo::AlbumRepo::with_backend(db.clone());
 
+        // "Separate albums by quality" — when on (default), a quality suffix is
+        // appended to the album title so CD and Hi-Res versions become distinct
+        // albums. The manual scan must honour it just like the file-watcher
+        // (auto_scan) does, otherwise the two paths disagree (Fabien).
+        let quality_split = SettingsRepo::with_backend(db.clone())
+            .get("quality_split")
+            .ok()
+            .flatten()
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+
         // Load existing tracks BEFORE scanning to skip unchanged files
         let existing_tracks = track_repo.get_all_local_file_info().unwrap_or_default();
 
@@ -300,11 +311,20 @@ pub(super) async fn trigger_scan(
                     }
 
                     let album_key = meta.album.as_ref().map(|t| {
-                        (
-                            t.clone(),
-                            album_artist_id.unwrap_or(0),
-                            meta.year.map(|y| y as i32),
-                        )
+                        let title = if quality_split {
+                            let suffix = tune_core::scanner::quality::quality_suffix(
+                                meta.sample_rate,
+                                meta.bit_depth,
+                            );
+                            if suffix.is_empty() {
+                                t.clone()
+                            } else {
+                                format!("{t} ({suffix})")
+                            }
+                        } else {
+                            t.clone()
+                        };
+                        (title, album_artist_id.unwrap_or(0), meta.year.map(|y| y as i32))
                     });
 
                     let album = if let Some(ref key) = album_key {
