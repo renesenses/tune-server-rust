@@ -109,6 +109,13 @@ impl TuneConfig {
         let mut config = Self::default();
 
         let search_paths = {
+            // `mut` is only used on macOS/Windows (which push platform paths);
+            // on other targets (Linux, BSD…) nothing pushes, so silence the
+            // otherwise-spurious unused_mut there.
+            #[cfg_attr(
+                not(any(target_os = "macos", target_os = "windows")),
+                allow(unused_mut)
+            )]
             let mut paths = vec!["tune.toml".to_string(), "/etc/tune/tune.toml".to_string()];
             #[cfg(target_os = "windows")]
             if let Ok(appdata) = std::env::var("APPDATA") {
