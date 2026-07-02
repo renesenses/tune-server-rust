@@ -810,7 +810,7 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
     // --- Step 1: UDP connect probe (follows the OS default route → real LAN) ---
     let probe_ip = udp_probe_ip();
     if let Some(ip) = probe_ip {
-        if is_virtual_ip(ip) {
+        if is_virtual_ip(ip) || ip_on_virtual_interface(ip) {
             debug!(ip = %ip, "udp_probe_returned_virtual_ip_skipping");
         } else {
             let o = ip.octets();
@@ -895,6 +895,24 @@ fn has_192_168_interface() -> bool {
     false
 }
 
+/// Returns true if `target` is bound to a known virtual/VPN interface.
+/// Used to reject a udp-probe result that landed on a VPN tunnel (e.g. NordVPN
+/// captures the default route, so the probe returns the tunnel IP that LAN
+/// renderers cannot reach — Pierre Mack QA: NordLynx 10.5.0.2 advertised instead
+/// of the real LAN 10.117.x).
+fn ip_on_virtual_interface(target: Ipv4Addr) -> bool {
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if let std::net::IpAddr::V4(ip) = iface.ip() {
+                if ip == target {
+                    return is_virtual_interface(&iface.name, ip);
+                }
+            }
+        }
+    }
+    false
+}
+
 /// UDP connect probe: the OS picks the interface for the default route.
 fn udp_probe_ip() -> Option<Ipv4Addr> {
     use std::net::UdpSocket;
@@ -921,7 +939,11 @@ fn is_virtual_interface(name: &str, ip: Ipv4Addr) -> bool {
         "virbr",      // libvirt/KVM
         "vethernet",  // Hyper-V / WSL
         "tailscale",  // Tailscale VPN
+        "nordlynx",   // NordVPN (Windows NordLynx / WireGuard adapter)
+        "nordvpn",    // NordVPN (alt adapter name)
         "wg",         // WireGuard
+        "wireguard",  // WireGuard (full name)
+        "proton",     // ProtonVPN
         "tun",        // VPN tunnel
         "utun",       // macOS VPN tunnel (utun0, utun1, ...)
         "ham",        // Hamachi VPN
@@ -963,6 +985,27 @@ fn is_virtual_ip(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nordvpn_interface_is_virtual() {
+        // NordVPN's NordLynx adapter must be treated as virtual so get_local_ip
+        // never advertises its tunnel IP to LAN renderers (Pierre Mack: Klimax
+        // got 10.5.0.2 instead of the real LAN 10.117.x).
+        assert!(is_virtual_interface("NordLynx", Ipv4Addr::new(10, 5, 0, 2)));
+        assert!(is_virtual_interface(
+            "NordVPN Tunnel",
+            Ipv4Addr::new(10, 5, 0, 2)
+        ));
+        // A real wired adapter must NOT be flagged, even on a 10.x LAN.
+        assert!(!is_virtual_interface(
+            "Ethernet",
+            Ipv4Addr::new(10, 117, 233, 82)
+        ));
+        assert!(!is_virtual_interface(
+            "Realtek Gaming 2.5GbE Family Controller",
+            Ipv4Addr::new(192, 168, 1, 50)
+        ));
+    }
 
     #[test]
     fn parse_response_headers() {
