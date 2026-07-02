@@ -1483,10 +1483,18 @@ impl PositionPoller {
                         "gapless_position_reset_ignored_not_enough_played"
                     );
                 } else {
+                    // Real time elapsed between arming SetNext (next-track URL
+                    // resolved) and the renderer actually transitioning. Key
+                    // metric for streaming URL/token expiry diagnosis.
+                    let arm_to_advance_ms = ps
+                        .gapless_sent_at
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
                     info!(
                         zone_id,
                         prev_pos = ps.last_position_ms,
                         new_pos = status.position_ms,
+                        arm_to_advance_ms,
                         "gapless_position_reset_detected"
                     );
                     ps.gapless_sent = false;
@@ -1868,11 +1876,16 @@ impl PositionPoller {
                     );
                     fsm_pact.transition_detected = duration_changed && position_confirms_transition;
                     if duration_changed && position_confirms_transition {
+                        let arm_to_advance_ms = ps
+                            .gapless_sent_at
+                            .map(|t| t.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
                         info!(
                             zone_id,
                             renderer_dur = status.duration_ms,
                             track_dur = track_duration_ms,
                             peak_pos = ps.peak_position_ms,
+                            arm_to_advance_ms,
                             "gapless_transition_detected"
                         );
                         ps.gapless_sent = false;
@@ -2144,15 +2157,32 @@ impl PositionPoller {
             return false;
         };
 
+        // v0.9 gapless characterization: time the next-track resolution and
+        // surface failures at warn. These paths were debug-only, so streaming
+        // gapless instability (Tidal DASH download slowness, URL/token issues)
+        // was invisible in production journald. Logging only — no behaviour change.
+        let t0 = Instant::now();
         match self
             .orchestrator
             .resolve_queue_item_url(zone_id, next_pos)
             .await
         {
             Ok(resolved) => {
+                let resolve_ms = t0.elapsed().as_millis() as u64;
+                let is_streaming = resolved.stream_id.is_some();
                 if let Some(ref sid) = resolved.stream_id {
+                    let w0 = Instant::now();
                     if !self.orchestrator.wait_stream_data_ready(sid, 5000).await {
-                        debug!(zone_id, "gapless_data_ready_timeout");
+                        // The next track's transcode session produced no data
+                        // within the 5s budget — common for Tidal Hi-Res DASH
+                        // multi-segment downloads. We still arm SetNext, but this
+                        // is a prime instability signal.
+                        warn!(
+                            zone_id,
+                            resolve_ms,
+                            waited_ms = w0.elapsed().as_millis() as u64,
+                            "gapless_data_ready_timeout"
+                        );
                     }
                 }
                 let output_arc = {
@@ -2176,10 +2206,16 @@ impl PositionPoller {
                         channels: resolved.channels,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
-                        debug!(zone_id, error = %e, "gapless_set_next_failed");
+                        warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         false
                     } else {
-                        info!(zone_id, title = %resolved.title, "gapless_next_set");
+                        info!(
+                            zone_id,
+                            title = %resolved.title,
+                            resolve_ms,
+                            streaming = is_streaming,
+                            "gapless_next_set"
+                        );
                         true
                     }
                 } else {
@@ -2187,7 +2223,12 @@ impl PositionPoller {
                 }
             }
             Err(e) => {
-                debug!(zone_id, error = %e, "gapless_resolve_failed");
+                warn!(
+                    zone_id,
+                    error = %e,
+                    resolve_ms = t0.elapsed().as_millis() as u64,
+                    "gapless_resolve_failed"
+                );
                 false
             }
         }
