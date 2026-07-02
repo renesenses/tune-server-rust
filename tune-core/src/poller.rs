@@ -149,8 +149,15 @@ pub(crate) mod decisions {
         if track_duration_ms == 0 {
             peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS && wall_elapsed >= MIN_TRACK_WALL_SECS
         } else {
+            // A track shorter than MIN_TRACK_WALL_SECS can never reach that much
+            // wall-clock time even when played in full — cap the wall-time floor
+            // at ~80% of the track's own duration so short tracks (e.g. a 27s
+            // streaming variation) are still recognized as ending naturally.
+            // Without this, sub-30s tracks never trigger natural-end, so
+            // auto-advance and single-track Repeat All silently stop.
+            let wall_floor = MIN_TRACK_WALL_SECS.min(track_duration_ms / 1000 * 4 / 5);
             peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
-                && wall_elapsed >= MIN_TRACK_WALL_SECS
+                && wall_elapsed >= wall_floor
         }
     }
 
@@ -2489,6 +2496,23 @@ mod tests {
         assert!(
             !decisions::played_enough(300_000, 280_000, 10),
             "wall_elapsed < MIN_TRACK_WALL_SECS must reject even at high fraction"
+        );
+    }
+
+    #[test]
+    fn played_enough_accepts_short_track_fully_played() {
+        // DEvir: a 27.67s TIDAL track played to the end. It can NEVER reach
+        // wall_elapsed >= 30s, so the old predicate rejected it → single-track
+        // Repeat All (and auto-advance for any sub-30s track) never triggered.
+        // With the duration-capped wall floor, a fully-played short track passes.
+        assert!(
+            decisions::played_enough(27_670, 27_000, 27),
+            "a fully-played 27s track must count as played_enough"
+        );
+        // But a short track barely played must still be rejected.
+        assert!(
+            !decisions::played_enough(27_670, 3_000, 4),
+            "a 27s track stopped at 3s must NOT count as played_enough"
         );
     }
 
