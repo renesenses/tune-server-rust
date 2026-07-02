@@ -120,7 +120,10 @@ pub mod sql {
     }
 
     pub fn count() -> &'static str {
-        "SELECT COUNT(*) FROM zones"
+        // Exclude soft-deleted (hidden) zones so user-facing counts stay
+        // consistent with list() and count_online(): a deleted zone must
+        // not keep inflating system stats.
+        "SELECT COUNT(*) FROM zones WHERE COALESCE(is_hidden, 0) = 0"
     }
 
     pub fn count_online() -> &'static str {

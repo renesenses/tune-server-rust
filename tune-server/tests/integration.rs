@@ -275,18 +275,25 @@ async fn streaming_services_list() {
 async fn radio_crud() {
     let app = make_app();
 
+    // Fresh DBs are seeded with a set of default radio stations
+    // (migration seed_default_radios), so take the seeded count as baseline
+    // and assert the CRUD create adds exactly one new station.
+    let (_, body) = get(&app, "/api/v1/radios").await;
+    let baseline = body.as_array().unwrap().len();
+
     let (status, _body) = post_json(
         &app,
         "/api/v1/radios",
-        json!({"name": "FIP", "url": "http://icecast.radiofrance.fr/fip-hifi.aac"}),
+        json!({"name": "Test Station CRUD", "url": "http://example.com/test-crud.aac"}),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
     let (status, body) = get(&app, "/api/v1/radios").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_array().unwrap().len(), 1);
-    assert_eq!(body[0]["name"], "FIP");
+    let radios = body.as_array().unwrap();
+    assert_eq!(radios.len(), baseline + 1);
+    assert!(radios.iter().any(|r| r["name"] == "Test Station CRUD"));
 }
 
 #[tokio::test]
@@ -597,7 +604,10 @@ async fn changelog_has_entries() {
         entries.len() >= 5,
         "changelog should have at least 5 versions"
     );
-    assert_eq!(entries[0]["version"], "0.8.15");
+    // The newest entry's version is not hardcoded (it moves with each
+    // release); just assert it's a present, non-empty string.
+    let latest = entries[0]["version"].as_str().unwrap();
+    assert!(!latest.is_empty(), "latest changelog version must be set");
 }
 
 // ── Playback e2e tests with MockOutput ──────────────────────────────
