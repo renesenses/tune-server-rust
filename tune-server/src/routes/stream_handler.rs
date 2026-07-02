@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use tracing::{info, warn};
 
 use tune_core::http::streamer::{
-    ICY_METAINT, SharedSessions, StreamInfo, build_icy_metadata, build_wav_header,
+    ICY_METAINT, SharedSessions, StreamInfo, StreamSession, build_icy_metadata, build_wav_header,
     extract_stream_id,
 };
 
@@ -126,7 +126,7 @@ pub async fn handle_stream(
     // File serving with Range support
     let file_path = session.file_path.lock().await.clone();
     if let Some(ref path) = file_path {
-        return serve_file(path, &session.info, &req_headers).await;
+        return serve_file(path, &session.info, &req_headers, session.clone()).await;
     }
 
     // Proxy mode
@@ -274,7 +274,12 @@ pub async fn handle_stream(
 
 // ─── File serving with Range ────────────────────────────────────
 
-async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> Response {
+async fn serve_file(
+    path: &str,
+    info: &StreamInfo,
+    req_headers: &HeaderMap,
+    session: std::sync::Arc<StreamSession>,
+) -> Response {
     let file_path = std::path::Path::new(path);
     let file_size = match tokio::fs::metadata(file_path).await {
         Ok(m) => m.len(),
@@ -320,6 +325,10 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
         );
 
         let path_owned = path.to_string();
+        // Track served bytes so the poller can tell an actively-fetching
+        // renderer from a genuinely-stalled one (fixes false force-stop of
+        // DLNA renderers that report Stopped while streaming — Linn, RS130).
+        let byte_counter = session.clone();
         let body = Body::from_stream(async_stream::stream! {
             match tokio::fs::File::open(&path_owned).await {
                 Ok(mut file) => {
@@ -336,6 +345,10 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
                             Ok(0) => break,
                             Ok(n) => {
                                 remaining -= n as u64;
+                                byte_counter.bytes_sent.fetch_add(
+                                    n as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                             }
                             Err(e) => {
@@ -371,6 +384,7 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
     );
 
     let path_owned = path.to_string();
+    let byte_counter = session.clone();
     let body = Body::from_stream(async_stream::stream! {
         match tokio::fs::File::open(&path_owned).await {
             Ok(mut file) => {
@@ -379,7 +393,13 @@ async fn serve_file(path: &str, info: &StreamInfo, req_headers: &HeaderMap) -> R
                 loop {
                     match file.read(&mut buf).await {
                         Ok(0) => break,
-                        Ok(n) => yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n])),
+                        Ok(n) => {
+                            byte_counter.bytes_sent.fetch_add(
+                                n as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                        }
                         Err(e) => {
                             warn!(error = %e, "file_read_error");
                             break;
