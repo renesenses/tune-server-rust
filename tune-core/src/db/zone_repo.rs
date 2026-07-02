@@ -200,35 +200,26 @@ impl ZoneRepo {
     }
 
     pub fn list(&self) -> Result<Vec<Zone>, String> {
-        // Try with is_hidden filter first; fall back to unfiltered if
-        // the column doesn't exist yet (pre-migration).
+        // Read via the write connection (strong) so a lagging WAL read snapshot
+        // can never transiently drop a recently-created/updated zone. The old
+        // code read from the pool and only fell back to strong when the result
+        // was EMPTY — a partial stale read (non-empty but missing one zone)
+        // slipped through, causing zones to intermittently disappear from the
+        // UI after activity (reported by DEvir). Zone lists are tiny (a handful
+        // of rows) and this matches the existing WAL-lag fallback pattern.
         let filtered = format!(
             "{} WHERE COALESCE(is_hidden, 0) = 0 ORDER BY name",
             sql::select_base()
         );
-        let filter_supported = self.db.query_many(&filtered, &[]);
-        match filter_supported {
-            Ok(rows) if !rows.is_empty() => {
-                return Ok(rows.iter().map(row_to_zone).collect());
-            }
-            Ok(_empty) => {
-                // Filtered query succeeded but returned 0 rows.
-                // Use strong read with the SAME filter to handle WAL lag
-                // (a newly created zone not yet visible via the reader).
-                let strong = self.db.query_many_strong(&filtered, &[])?;
-                return Ok(strong.iter().map(row_to_zone).collect());
-            }
+        match self.db.query_many_strong(&filtered, &[]) {
+            Ok(rows) => Ok(rows.iter().map(row_to_zone).collect()),
             Err(_) => {
-                // is_hidden column doesn't exist (pre-migration DB).
-                // Fall back to unfiltered query.
+                // is_hidden column doesn't exist (pre-migration DB) — fall back
+                // to the unfiltered query, still via the strong read.
+                let strong = self.db.query_many_strong(&sql::list_all(), &[])?;
+                Ok(strong.iter().map(row_to_zone).collect())
             }
         }
-        let rows = self.db.query_many(&sql::list_all(), &[])?;
-        if !rows.is_empty() {
-            return Ok(rows.iter().map(row_to_zone).collect());
-        }
-        let strong = self.db.query_many_strong(&sql::list_all(), &[])?;
-        Ok(strong.iter().map(row_to_zone).collect())
     }
 
     pub fn create(
