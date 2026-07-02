@@ -1223,18 +1223,35 @@ impl StreamingService for TidalService {
         {
             let cache = self.url_cache.lock().await;
             if let Some(cached) = cache.get(track_id) {
-                return Ok(StreamUrl {
-                    url: cached.url.clone(),
-                    mime_type: cached.mime_type.clone(),
-                    quality: StreamQuality {
-                        codec: cached.codec.clone(),
-                        sample_rate: cached.sample_rate,
-                        bit_depth: cached.bit_depth,
-                        bitrate: cached.bitrate,
-                        channels: 2,
-                    },
-                    expires_at: None,
-                });
+                // A cached DASH `file://` entry becomes stale once the temp file
+                // is consumed and deleted after playback. Serving it again makes
+                // the transcode open a missing/empty file (os error 2) and the
+                // track never plays. Only reuse a file:// entry if the file still
+                // exists and is non-empty; otherwise fall through to re-download.
+                let stale_dash = cached
+                    .url
+                    .strip_prefix("file://")
+                    .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) == 0)
+                    .unwrap_or(false);
+                if !stale_dash {
+                    return Ok(StreamUrl {
+                        url: cached.url.clone(),
+                        mime_type: cached.mime_type.clone(),
+                        quality: StreamQuality {
+                            codec: cached.codec.clone(),
+                            sample_rate: cached.sample_rate,
+                            bit_depth: cached.bit_depth,
+                            bitrate: cached.bitrate,
+                            channels: 2,
+                        },
+                        expires_at: None,
+                    });
+                }
+                tracing::info!(
+                    track_id,
+                    path = %cached.url,
+                    "tidal_dash_cache_stale_redownloading"
+                );
             }
         }
 
