@@ -882,3 +882,146 @@ async fn api_trailing_slash_does_not_serve_html() {
         );
     }
 }
+
+// ── Queue endpoint characterization tests ───────────────────────────
+//
+// These lock the CURRENT intentional behaviour of the unified queue
+// (v0.9 rc.2: local + streaming share the `queue_items` table but keep
+// independent position spaces — "one active queue type per zone"). A
+// future interleaved-queue feature must update these on purpose, not by
+// accident.
+
+async fn make_zone(app: &axum::Router, name: &str) -> i64 {
+    let (status, body) = post_json(app, "/api/v1/zones", json!({ "name": name })).await;
+    assert_eq!(status, StatusCode::CREATED);
+    body["id"].as_i64().expect("zone id")
+}
+
+// queue_items.track_id has a FK to tracks(id) (enforced — foreign_keys=ON),
+// so local queue rows require real tracks. Insert them via the repo first.
+fn insert_track(state: &tune_server::state::AppState, title: &str) -> i64 {
+    let repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
+    repo.create(&tune_core::db::models::Track::new(title.into()))
+        .expect("insert track")
+}
+
+#[tokio::test]
+async fn queue_add_local_and_get() {
+    let (app, state) = make_app_with_state();
+    let t1 = insert_track(&state, "A");
+    let t2 = insert_track(&state, "B");
+    let zid = make_zone(&app, "Q-local").await;
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [t1, t2] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0]["track_id"], t1);
+    assert_eq!(tracks[1]["track_id"], t2);
+    assert_eq!(body["length"], 2);
+}
+
+#[tokio::test]
+async fn queue_add_streaming_and_get() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-streaming").await;
+
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({
+            "source": "qobuz",
+            "source_id": "s1",
+            "title": "Stream Song",
+            "artist_name": "Stream Artist",
+            "duration_ms": 200000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0]["source_id"], "s1");
+    assert_eq!(tracks[0]["title"], "Stream Song");
+    assert_eq!(tracks[0]["source"], "qobuz");
+}
+
+#[tokio::test]
+async fn queue_local_takes_priority_over_streaming() {
+    // Documented behaviour: when both subsets exist, GET /queue returns the
+    // LOCAL queue (streaming is the fallback only when local is empty).
+    let (app, state) = make_app_with_state();
+    let tid = insert_track(&state, "LocalWins");
+    let zid = make_zone(&app, "Q-mixed").await;
+
+    // Add a streaming track first…
+    let (s1, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "source": "tidal", "source_id": "t1", "title": "Streamed" }),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+    // …then a local track.
+    let (s2, _) = post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [tid] }),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CREATED);
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tracks = body["tracks"].as_array().unwrap();
+    // Local wins: exactly the local track, streaming item hidden.
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0]["track_id"], tid);
+    assert!(tracks[0].get("source_id").is_none() || tracks[0]["source_id"].is_null());
+}
+
+#[tokio::test]
+async fn queue_clear_empties_both_subsets() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-clear").await;
+
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "track_ids": [1, 2] }),
+    )
+    .await;
+    post_json(
+        &app,
+        &format!("/api/v1/zones/{zid}/queue/add"),
+        json!({ "source": "qobuz", "source_id": "s9", "title": "X" }),
+    )
+    .await;
+
+    let (status, _) = post_json(&app, &format!("/api/v1/zones/{zid}/queue/clear"), json!({})).await;
+    assert!(status.is_success());
+
+    let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["tracks"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn queue_add_empty_body_is_rejected() {
+    let app = make_app();
+    let zid = make_zone(&app, "Q-empty").await;
+
+    let (status, _) = post_json(&app, &format!("/api/v1/zones/{zid}/queue/add"), json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
