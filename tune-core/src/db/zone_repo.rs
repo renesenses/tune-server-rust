@@ -285,20 +285,17 @@ impl ZoneRepo {
             Err(e) if e.contains("UNIQUE constraint failed") => {
                 // Race or hidden zone: another thread inserted the same
                 // device_id, or a hidden zone exists with this device_id.
-                // Unhide + return the existing zone.
+                // Return the existing zone as-is. A soft-deleted (hidden) zone
+                // stays hidden here too — same rule as the fast path above, so
+                // deleted zones don't reappear regardless of which branch runs.
                 if let Some(existing) = self.get_by_device_id(output_device_id)? {
                     if let Some(id) = existing.id {
                         if self.is_device_hidden(output_device_id) {
-                            tracing::info!(
+                            tracing::debug!(
                                 zone_id = id,
                                 device_id = output_device_id,
-                                "unhiding_zone_after_unique_conflict"
+                                "zone_hidden_skipping_auto_unhide_after_unique_conflict"
                             );
-                            self.unhide(id)?;
-                            let _ = self.update_name(id, name);
-                            if let Some(ot) = output_type {
-                                let _ = self.update_output_type(id, ot);
-                            }
                         }
                         return Ok((id, false));
                     }
@@ -639,7 +636,7 @@ mod tests {
             .unwrap();
         let zone = repo.get(id).unwrap().unwrap();
         assert_eq!(zone.name, "Living Room");
-        assert_eq!(zone.volume, 20);
+        assert_eq!(zone.volume, 50);
         assert!(!zone.muted);
 
         repo.update_volume(id, 75).unwrap();
@@ -648,8 +645,11 @@ mod tests {
         assert_eq!(updated.volume, 75);
         assert!(updated.muted);
 
+        // delete is a soft-delete (is_hidden=1): the row is kept for later
+        // unhide/dedup, but the zone no longer appears in the visible list.
         repo.delete(id).unwrap();
-        assert!(repo.get(id).unwrap().is_none());
+        assert!(repo.list().unwrap().is_empty());
+        assert!(repo.is_device_hidden("uuid:123"));
     }
 
     #[test]
@@ -714,7 +714,7 @@ mod tests {
 
         let id = repo.create("Default Zone", None, None).unwrap();
         let zone = repo.get(id).unwrap().unwrap();
-        assert_eq!(zone.volume, 20);
+        assert_eq!(zone.volume, 50);
         assert!(!zone.muted);
         assert!(zone.online);
         assert!(zone.output_type.is_none());
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn get_or_create_unhides_deleted_zone() {
+    fn get_or_create_keeps_deleted_zone_hidden() {
         let db = test_db();
         // Add the UNIQUE index that startup.rs normally creates
         db.execute_batch(
@@ -923,25 +923,21 @@ mod tests {
         assert!(repo.get_by_device_id("uuid:jm-dac").unwrap().is_some());
         assert!(repo.is_device_hidden("uuid:jm-dac"));
 
-        // Re-discover the same device — get_or_create should unhide, not error
+        // Re-discover the same device — get_or_create returns the existing
+        // (hidden) zone WITHOUT unhiding it. A soft-deleted zone must not
+        // reappear on device re-enumeration (which happens on every restart);
+        // otherwise deleted zones proliferate. It also must not error.
         let (id2, created2) = repo
             .get_or_create("Jean-Marie DAC", Some("dlna"), "uuid:jm-dac")
             .unwrap();
         assert!(
             !created2,
-            "should reuse existing zone, not create a new one"
+            "should reuse the existing hidden zone, not create a new one"
         );
         assert_eq!(id1, id2, "should return the same zone id");
 
-        // Zone should be visible again
-        let zones = repo.list().unwrap();
-        assert_eq!(zones.len(), 1);
-        assert_eq!(zones[0].name, "Jean-Marie DAC");
-
-        // Previous settings should be preserved
-        assert_eq!(zones[0].volume, 75);
-
-        // is_hidden should be cleared
-        assert!(!repo.is_device_hidden("uuid:jm-dac"));
+        // Zone stays hidden — it does not reappear in the list.
+        assert!(repo.list().unwrap().is_empty());
+        assert!(repo.is_device_hidden("uuid:jm-dac"));
     }
 }
