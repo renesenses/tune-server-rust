@@ -2147,6 +2147,31 @@ impl PositionPoller {
         }
     }
 
+    /// Resolve the next queue item's stream URL for gapless, with one bounded
+    /// retry on transient failure (F1). Streaming next-track resolution can
+    /// fail transiently (network blip, DASH parse, token refreshed mid-flight);
+    /// previously a single failure silently abandoned gapless, producing an
+    /// audible Stop+Play gap. The happy path is unchanged (first-try success).
+    async fn resolve_gapless_next(
+        &self,
+        zone_id: i64,
+        next_pos: i64,
+    ) -> Result<crate::orchestrator::ResolvedQueueItem, String> {
+        match self
+            .orchestrator
+            .resolve_queue_item_url(zone_id, next_pos)
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                warn!(zone_id, error = %e, attempt = 1, "gapless_resolve_retry");
+                self.orchestrator
+                    .resolve_queue_item_url(zone_id, next_pos)
+                    .await
+            }
+        }
+    }
+
     async fn prepare_gapless(
         &self,
         zone_id: i64,
@@ -2162,11 +2187,7 @@ impl PositionPoller {
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
         let t0 = Instant::now();
-        match self
-            .orchestrator
-            .resolve_queue_item_url(zone_id, next_pos)
-            .await
-        {
+        match self.resolve_gapless_next(zone_id, next_pos).await {
             Ok(resolved) => {
                 let resolve_ms = t0.elapsed().as_millis() as u64;
                 let is_streaming = resolved.stream_id.is_some();
