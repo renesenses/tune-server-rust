@@ -7,14 +7,13 @@ const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 /// Baked-in OAuth client id for the public **PKCE** "Tune" client on
 /// mozaiklabs.fr.
 ///
-/// Empty until the Laravel Passport public client is created (coordinated with
-/// Bertrand). While empty, SSO stays *unconfigured* and degrades gracefully —
-/// Tune must keep working 100 % without mozaiklabs.fr (SSO is opt-in, never
-/// blocking). Once baked, every install is SSO-capable by default.
+/// This is the public `tune-server` client (RFC 7636 PKCE, no secret): safe to
+/// distribute in every binary. Tune must still keep working 100 % without
+/// mozaiklabs.fr — the SSO login remains opt-in for the user, never blocking.
 ///
 /// Runtime overrides (see `tune-server` route resolution): the `mozaik_client_id`
 /// setting or the `TUNE_MOZAIK_CLIENT_ID` env var take precedence over this const.
-pub const DEFAULT_CLIENT_ID: &str = "";
+pub const DEFAULT_CLIENT_ID: &str = "tune-server";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudUser {
