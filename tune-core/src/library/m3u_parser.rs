@@ -30,6 +30,14 @@ fn decode(raw: &[u8], force_utf8: bool) -> String {
 }
 
 fn parse_text(text: &str) -> Vec<M3UEntry> {
+    // PLS is a distinct format ([playlist] with FileN=/TitleN= keys). The radio
+    // import dialog accepts .pls, but the M3U grammar below treats `File1=url`
+    // as a non-URL path, so a .pls yielded zero importable stations (Dominique
+    // COMET: "Importer M3U/PLS ajoute 0 radios"). Detect and parse PLS here.
+    if is_pls(text) {
+        return parse_pls(text);
+    }
+
     let mut entries = Vec::new();
     let mut pending_title: Option<String> = None;
     let mut pending_artist: Option<String> = None;
@@ -73,6 +81,59 @@ fn parse_text(text: &str) -> Vec<M3UEntry> {
     }
 
     entries
+}
+
+/// Does this look like a PLS playlist ([playlist] header or `FileN=` keys)?
+fn is_pls(text: &str) -> bool {
+    text.lines().take(20).any(|l| {
+        let t = l.trim();
+        if t.eq_ignore_ascii_case("[playlist]") {
+            return true;
+        }
+        if let Some(rest) = t.to_ascii_lowercase().strip_prefix("file") {
+            return rest.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains('=');
+        }
+        false
+    })
+}
+
+/// Parse PLS content, pairing `FileN=<url>` with `TitleN=<name>` by index.
+fn parse_pls(text: &str) -> Vec<M3UEntry> {
+    use std::collections::BTreeMap;
+    let mut files: BTreeMap<u32, String> = BTreeMap::new();
+    let mut titles: BTreeMap<u32, String> = BTreeMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find('=') else { continue };
+        let key = line[..eq].trim().to_ascii_lowercase();
+        let val = line[eq + 1..].trim().to_string();
+        if val.is_empty() {
+            continue;
+        }
+        if let Some(digits) = key.strip_prefix("file") {
+            if let Ok(idx) = digits.parse::<u32>() {
+                files.insert(idx, val);
+            }
+        } else if let Some(digits) = key.strip_prefix("title") {
+            if let Ok(idx) = digits.parse::<u32>() {
+                titles.insert(idx, val);
+            }
+        }
+    }
+    files
+        .into_iter()
+        .map(|(idx, url)| {
+            let is_url = is_url_path(&url);
+            M3UEntry {
+                path: url,
+                title: titles.get(&idx).cloned(),
+                artist: None,
+                duration_s: -1,
+                is_url,
+                extra_attrs: HashMap::new(),
+            }
+        })
+        .collect()
 }
 
 fn parse_extinf(line: &str) -> (i32, Option<String>, Option<String>, HashMap<String, String>) {
@@ -221,6 +282,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_url);
         assert_eq!(entries[0].duration_s, -1);
+    }
+
+    #[test]
+    fn parse_pls_playlist() {
+        let content = b"[playlist]\nNumberOfEntries=2\n\
+                        File1=http://stream.example.com/radio1.mp3\nTitle1=Radio One\nLength1=-1\n\
+                        File2=https://stream.example.com/radio2\nTitle2=Radio Two\n\
+                        Version=2\n";
+        let entries = parse_m3u_content(content, true);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_url);
+        assert_eq!(entries[0].path, "http://stream.example.com/radio1.mp3");
+        assert_eq!(entries[0].title.as_deref(), Some("Radio One"));
+        assert_eq!(entries[1].title.as_deref(), Some("Radio Two"));
+        assert!(entries[1].is_url);
     }
 
     #[test]
