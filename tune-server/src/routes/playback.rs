@@ -667,20 +667,40 @@ async fn play(
         };
         return match state.orchestrator.play(orch_req).await {
             Ok(result) => {
-                // Persist single streaming track to DB so GET /queue returns it
-                let queue_item = vec![(
-                    source_id_val,
-                    title_val,
-                    artist_val,
-                    album_val,
-                    cover_val,
-                    duration_val,
-                    source_for_q,
-                )];
-                if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
-                    warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                // If this track is already part of the loaded streaming queue
+                // (e.g. the user pressed Stop then Play again on a track from an
+                // album/playlist that is already queued), keep the full queue and
+                // just move the current position onto it. Replacing it with a
+                // single-track queue would truncate the album down to the current
+                // title (Pierre M: "Si STOP et relance, la file d'attente se
+                // limite au titre en cours").
+                let existing = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
+                let existing_idx = existing.iter().position(|it| {
+                    it["source_id"].as_str() == Some(source_id_val.as_str())
+                        && (source_for_q.is_none()
+                            || it["source"].as_str() == source_for_q.as_deref())
+                });
+                if let Some(idx) = existing_idx {
+                    state
+                        .playback
+                        .update_queue_info(zone_id, idx as i64, existing.len() as i64)
+                        .await;
+                } else {
+                    // Persist single streaming track to DB so GET /queue returns it
+                    let queue_item = vec![(
+                        source_id_val,
+                        title_val,
+                        artist_val,
+                        album_val,
+                        cover_val,
+                        duration_val,
+                        source_for_q,
+                    )];
+                    if let Err(e) = queue_repo.set_streaming_queue(zone_id, &queue_item) {
+                        warn!(zone_id, error = %e, "set_streaming_queue_failed");
+                    }
+                    state.playback.update_queue_info(zone_id, 0, 1).await;
                 }
-                state.playback.update_queue_info(zone_id, 0, 1).await;
                 persist_queue_async(&state, zone_id);
                 Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
             }
