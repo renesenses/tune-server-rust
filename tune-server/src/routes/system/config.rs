@@ -194,6 +194,18 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     );
     config.insert("zone_limit".to_string(), zone_limit);
     config.insert("license_key_masked".to_string(), json!(license_key_masked));
+    // Redact secrets before returning. The verbatim settings dump above includes
+    // raw credentials that the web client never reads (it uses discogs_token_set,
+    // license_key_masked and the streaming status store). Never expose them.
+    config.remove("license_key");
+    config.remove("discogs_token");
+    if let Some(Value::Object(qobuz)) = config.get_mut("auth_tokens_qobuz") {
+        for k in ["stored_password", "user_auth_token", "app_secret"] {
+            if qobuz.contains_key(k) {
+                qobuz.insert(k.to_string(), json!("********"));
+            }
+        }
+    }
     Json(Value::Object(config))
 }
 
