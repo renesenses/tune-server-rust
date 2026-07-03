@@ -3571,18 +3571,39 @@ impl PlaybackOrchestrator {
             .ok_or("no queue item at position")?;
 
         let source_id = item["source_id"].as_str().unwrap_or("").to_string();
-        let title = item["title"].as_str().map(String::from);
-        let artist = item["artist_name"].as_str().map(String::from);
-        let album = item["album_title"].as_str().map(String::from);
-        let cover = item["cover_path"].as_str().map(String::from);
+        let mut title = item["title"].as_str().map(String::from);
+        let mut artist = item["artist_name"].as_str().map(String::from);
+        let mut album = item["album_title"].as_str().map(String::from);
+        let mut cover = item["cover_path"].as_str().map(String::from);
         let duration = item["duration_ms"].as_i64();
+
+        let current_state = self.playback.get_state(zone_id).await;
+
+        // Repeat on a single-track queue re-plays the SAME position, but the
+        // streaming_queue row can carry an empty title (persisted without
+        // metadata). play() would then hand an empty title down the prefetched
+        // path and blank Now Playing (DEvir: auto_next title=CHANGGWI followed by
+        // orchestrator_play title=). When the row title is empty AND now_playing
+        // is still the very same track (same source_id), reuse its metadata
+        // synchronously — no network round-trip, and it can't mislabel a
+        // different track because the source_id must match.
+        let title_empty = title.as_deref().unwrap_or("").is_empty();
+        if title_empty
+            && let Some(np) = current_state.now_playing.as_ref()
+            && np.source_id.as_deref() == Some(source_id.as_str())
+            && !np.title.is_empty()
+        {
+            title = Some(np.title.clone());
+            artist = artist.or_else(|| np.artist_name.clone());
+            album = album.or_else(|| np.album_title.clone());
+            cover = cover.or_else(|| np.cover_path.clone());
+        }
 
         // Use the stored source from the streaming_queue, falling back to
         // the current now_playing source (handles old DB rows without source).
         let source = if let Some(s) = item["source"].as_str() {
             s.to_string()
         } else {
-            let current_state = self.playback.get_state(zone_id).await;
             current_state
                 .now_playing
                 .as_ref()
