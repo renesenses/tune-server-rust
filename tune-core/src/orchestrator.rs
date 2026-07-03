@@ -2329,7 +2329,12 @@ impl PlaybackOrchestrator {
                     let url = self
                         .streamer
                         .get_stream_url(&session_id, &server_ip, &codec_lower);
-                    (url, Some(session_id), stream_data.mime_type.clone(), None)
+                    // Report the mime of the codec we actually serve, not the
+                    // upstream API's mime_type. Qobuz can return a mime that does
+                    // not normalise to a lossless format, so Now Playing showed
+                    // FLAC tracks as "compressé"/lossy (Progman). codec_lower is
+                    // authoritative for what the proxy streams.
+                    (url, Some(session_id), format!("audio/{codec_lower}"), None)
                 }
             }
         } else {
