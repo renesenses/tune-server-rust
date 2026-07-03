@@ -272,6 +272,14 @@ impl PlaybackOrchestrator {
             format: track_meta
                 .as_ref()
                 .and_then(|t| t.format.clone())
+                // Qobuz only ever streams FLAC; surface the source format even
+                // when the stream is transcoded to WAV for a local output, so
+                // the format chip shows FLAC and not the output container
+                // (Progman/Cyrille: Qobuz shown compressed / wrong format).
+                .or_else(|| match resolved.source.as_str() {
+                    "qobuz" => Some("flac".to_string()),
+                    _ => None,
+                })
                 .or_else(|| {
                     let mime = &resolved.mime_type;
                     Some(
