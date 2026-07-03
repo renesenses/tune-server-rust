@@ -2415,20 +2415,40 @@ impl PlaybackOrchestrator {
         // empty title (prefetched before its metadata was resolved); serving it
         // verbatim after a seek wipes the Now Playing title (DEvir: title
         // disappears when seeking shortly after a TIDAL track starts).
-        let title = req
+        let mut title = req
             .title
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| prefetched.title.clone());
-        let artist = req
+        let mut artist = req
             .artist_name
             .clone()
             .or_else(|| prefetched.artist.clone());
-        let album = req.album_title.clone().or_else(|| prefetched.album.clone());
-        let cover_url = req
+        let mut album = req.album_title.clone().or_else(|| prefetched.album.clone());
+        let mut cover_url = req
             .cover_url
             .clone()
             .or_else(|| prefetched.cover_url.clone());
+
+        // Both the request and the prefetch buffer can carry an empty title when
+        // the streaming_queue row was persisted without metadata (DEvir: Repeat
+        // All on a single-track queue prefetches itself, then re-plays via this
+        // prefetched path with `title=""` — auto_next logs the right title but
+        // orchestrator_play/Now Playing go blank). When that happens, refetch the
+        // real metadata from the service so Now Playing is never blanked. Fires
+        // only when the title is missing, so the normal path is untouched.
+        if title.is_empty() {
+            let registry = self.services.lock().await;
+            if let Some(svc) = registry.get(&prefetched.source) {
+                let svc = svc.lock().await;
+                if let Ok(track) = svc.get_track(&prefetched.source_id).await {
+                    title = track.title;
+                    artist = artist.or(Some(track.artist));
+                    album = album.or(track.album);
+                    cover_url = cover_url.or(track.cover_path);
+                }
+            }
+        }
 
         // Determine output bit depth based on output type
         let is_local_stream = req
