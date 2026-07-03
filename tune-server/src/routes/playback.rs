@@ -262,7 +262,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
         // DSP route is in zones.rs (/{id}/dsp GET+PUT)
-        .route("/{id}/crossfade", post(set_crossfade))
+        .route("/{id}/crossfade", get(get_crossfade).post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
         .route("/{id}/transfer/{target_id}", post(transfer_playback))
         .route("/{id}/transfer", post(transfer_queue))
@@ -1550,15 +1550,51 @@ struct CrossfadeSettings {
     duration: Option<f64>,
 }
 
+/// Read the persisted crossfade settings for a zone.
+///
+/// NOTE: crossfade is not yet applied by the playback engine (the
+/// `CrossfadeHandler` in tune-core is not wired into the transition path).
+/// This endpoint only persists/returns the user's preference so the UI can
+/// round-trip it without a 405 — actually applying the fade is a follow-up.
+async fn get_crossfade(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let enabled = settings
+        .get(&format!("crossfade_enabled:{zone_id}"))
+        .ok()
+        .flatten()
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let duration = settings
+        .get(&format!("crossfade_duration:{zone_id}"))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(3.0);
+    Json(json!({
+        "enabled": enabled,
+        "duration": duration,
+    }))
+}
+
 async fn set_crossfade(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<CrossfadeSettings>,
 ) -> Json<Value> {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let duration = body.duration.unwrap_or(3.0);
+    let _ = settings.set(
+        &format!("crossfade_enabled:{zone_id}"),
+        &body.enabled.to_string(),
+    );
+    let _ = settings.set(
+        &format!("crossfade_duration:{zone_id}"),
+        &duration.to_string(),
+    );
     Json(json!({
         "zone_id": zone_id,
         "crossfade_enabled": body.enabled,
-        "crossfade_duration": body.duration.unwrap_or(3.0),
+        "crossfade_duration": duration,
     }))
 }
 
