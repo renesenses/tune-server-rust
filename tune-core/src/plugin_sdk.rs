@@ -371,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn failing_plugin_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let mut loader = PluginLoader::new(dir.path().to_path_buf());
+        let loader = PluginLoader::new(dir.path().to_path_buf());
         loader.register(Box::new(FailingPlugin)).await;
         loader.register(Box::new(TestPlugin::new())).await;
 
