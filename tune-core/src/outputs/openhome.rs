@@ -297,19 +297,22 @@ impl OpenHomeOutput {
         }
     }
 
-    fn build_didl(
-        title: Option<&str>,
-        artist: Option<&str>,
-        album: Option<&str>,
-        mime_type: &str,
-        url: &str,
-        cover_url: Option<&str>,
-    ) -> String {
-        DidlBuilder::new(title.unwrap_or("Unknown"), url, mime_type)
-            .artist(artist.unwrap_or("Unknown"))
-            .album_opt(album)
-            .album_art_opt(cover_url)
+    fn build_didl(media: &PlayMedia<'_>) -> String {
+        // Include the duration and <res> quality attributes, not just the
+        // text tags. Strict OpenHome renderers (BluOS/Bluesound) drop the whole
+        // item — title, album, cover and duration all vanish — when the <res>
+        // is incomplete (Bilou: no metadata shown on BluOS).
+        let is_dsd = media.mime_type.contains("dsd") || media.mime_type.contains("dsf");
+        DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
+            .artist(media.artist.unwrap_or("Unknown"))
+            .album_opt(media.album)
+            .album_art_opt(media.cover_url)
             .include_upnp_artist(true)
+            .duration_ms_opt(media.duration_ms)
+            .file_size_opt(media.file_size)
+            .sample_rate_opt(if is_dsd { None } else { media.sample_rate })
+            .bit_depth_opt(if is_dsd { None } else { media.bit_depth })
+            .channels_opt(if is_dsd { None } else { media.channels })
             .build()
     }
 }
@@ -339,14 +342,7 @@ impl OutputTarget for OpenHomeOutput {
         self.select_playlist_source().await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let metadata = Self::build_didl(
-            media.title,
-            media.artist,
-            media.album,
-            media.mime_type,
-            media.url,
-            media.cover_url,
-        );
+        let metadata = Self::build_didl(media);
 
         self.playlist_delete_all().await?;
 
@@ -533,14 +529,7 @@ impl OutputTarget for OpenHomeOutput {
     }
 
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        let metadata = Self::build_didl(
-            media.title,
-            media.artist,
-            media.album,
-            media.mime_type,
-            media.url,
-            media.cover_url,
-        );
+        let metadata = Self::build_didl(media);
         let after_id = self.current_oh_id.lock().await.unwrap_or(0);
         let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;
         if let Some(id) = new_id {
@@ -565,32 +554,38 @@ mod tests {
 
     #[test]
     fn didl_with_all_fields() {
-        let didl = OpenHomeOutput::build_didl(
-            Some("Test Track"),
-            Some("Test Artist"),
-            Some("Test Album"),
-            "audio/flac",
-            "http://example.com/stream",
-            Some("http://example.com/cover.jpg"),
-        );
+        let didl = OpenHomeOutput::build_didl(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            title: Some("Test Track"),
+            artist: Some("Test Artist"),
+            album: Some("Test Album"),
+            cover_url: Some("http://example.com/cover.jpg"),
+            duration_ms: Some(256_000),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            ..Default::default()
+        });
         assert!(didl.contains("Test Track"));
         assert!(didl.contains("Test Artist"));
         assert!(didl.contains("Test Album"));
         assert!(didl.contains("albumArtURI"));
         assert!(didl.contains("cover.jpg"));
         assert!(didl.contains("DIDL-Lite"));
+        // The <res> must carry the duration so strict OpenHome renderers
+        // (BluOS) accept the item and display its metadata (Bilou).
+        assert!(didl.contains("duration="));
+        assert!(didl.contains("0:04:16"));
     }
 
     #[test]
     fn didl_without_optional_fields() {
-        let didl = OpenHomeOutput::build_didl(
-            None,
-            None,
-            None,
-            "audio/flac",
-            "http://example.com/stream",
-            None,
-        );
+        let didl = OpenHomeOutput::build_didl(&PlayMedia {
+            url: "http://example.com/stream",
+            mime_type: "audio/flac",
+            ..Default::default()
+        });
         assert!(didl.contains("Unknown"));
         assert!(!didl.contains("albumArtURI"));
         assert!(!didl.contains("upnp:album"));
@@ -598,14 +593,13 @@ mod tests {
 
     #[test]
     fn didl_escapes_special_chars() {
-        let didl = OpenHomeOutput::build_didl(
-            Some("Rock & Roll"),
-            Some("AC/DC"),
-            None,
-            "audio/flac",
-            "http://example.com/stream?a=1&b=2",
-            None,
-        );
+        let didl = OpenHomeOutput::build_didl(&PlayMedia {
+            url: "http://example.com/stream?a=1&b=2",
+            mime_type: "audio/flac",
+            title: Some("Rock & Roll"),
+            artist: Some("AC/DC"),
+            ..Default::default()
+        });
         assert!(didl.contains("Rock &amp; Roll"));
         assert!(didl.contains("a=1&amp;b=2"));
     }
