@@ -187,6 +187,21 @@ pub(crate) mod decisions {
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
 
+    /// Should the poller adopt the renderer-reported volume into the saved
+    /// zone volume? Only when the reported value actually MOVED since the last
+    /// poll (a real change on the device) AND it now differs from what we have
+    /// stored. A renderer that keeps reporting a stale default (Fabien's
+    /// Devialet stuck at 50%) reports the same value every tick, so `prev`
+    /// never differs from `device` and the user's saved volume is preserved.
+    pub fn should_adopt_device_volume(
+        prev_device_vol: Option<f64>,
+        device_vol: f64,
+        db_vol: f64,
+    ) -> bool {
+        prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
+            && (device_vol - db_vol).abs() > 0.02
+    }
+
     /// The renderer now reports a duration that differs from the current
     /// track's by more than 2s — a signal that a gapless transition to the
     /// next track has occurred (only meaningful once gapless was armed).
@@ -474,6 +489,46 @@ pub mod fsm {
                 gapless_sent: false,
                 stream_consuming: false,
             }
+        }
+
+        #[test]
+        fn volume_not_adopted_on_first_observation() {
+            // No previous reading yet — never overwrite on the first poll.
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                None, 0.5, 0.3
+            ));
+        }
+
+        #[test]
+        fn volume_not_adopted_when_device_reports_stale_default() {
+            // Devialet keeps reporting 0.50 while the user saved 0.30 — the
+            // value never moves, so the saved volume must be preserved (Fabien).
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.5,
+                0.3
+            ));
+        }
+
+        #[test]
+        fn volume_adopted_on_real_device_change() {
+            // The knob moved on the device (0.50 -> 0.62) and now differs from
+            // the saved volume — adopt it.
+            assert!(super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.62,
+                0.3
+            ));
+        }
+
+        #[test]
+        fn volume_not_adopted_when_change_matches_saved() {
+            // Device moved but landed on what we already have stored.
+            assert!(!super::super::decisions::should_adopt_device_volume(
+                Some(0.5),
+                0.62,
+                0.62
+            ));
         }
 
         #[test]
@@ -859,6 +914,11 @@ struct ZonePollState {
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
     radio_stopped_ticks: u8,
+    /// Last volume the renderer reported (0.0–1.0) on a previous poll. Used to
+    /// distinguish a real external volume change (the value moved) from a
+    /// renderer that persistently reports a stale default (e.g. Devialet at
+    /// 50%), which must not overwrite the user's saved volume.
+    last_device_volume: Option<f64>,
 }
 
 pub struct PositionPoller {
@@ -980,12 +1040,22 @@ impl PositionPoller {
                 && status.state == TransportState::Playing
             {
                 let db_vol = zone.volume as f64 / 100.0;
-                if (status.volume - db_vol).abs() > 0.02 {
+                let prev_device_vol = poll_states.get(&zone_id).and_then(|p| p.last_device_volume);
+                // Edge-triggered: adopt the renderer's volume only when it
+                // actually moved since the last poll (see decisions::
+                // should_adopt_device_volume), so a stale default (Fabien's
+                // Devialet stuck at 50%) can't overwrite the saved volume.
+                if decisions::should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
                     self.playback.set_volume(zone_id, status.volume).await;
                     let vol_int = (status.volume * 100.0) as i32;
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_int)
                         .ok();
+                }
+                // Remember what the renderer reported so the next tick can
+                // detect a genuine change.
+                if let Some(ps) = poll_states.get_mut(&zone_id) {
+                    ps.last_device_volume = Some(status.volume);
                 }
             }
 
@@ -1067,6 +1137,7 @@ impl PositionPoller {
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
                 radio_stopped_ticks: 0,
+                last_device_volume: None,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -2300,6 +2371,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -2346,6 +2418,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulates entering Playing state
@@ -2444,6 +2517,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -2729,6 +2803,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -2782,6 +2857,7 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
