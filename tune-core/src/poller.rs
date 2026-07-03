@@ -231,6 +231,22 @@ struct ZonePollState {
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
     radio_stopped_ticks: u8,
+    /// Last volume the renderer reported (0.0–1.0) on a previous poll. Used to
+    /// distinguish a real external volume change (the value moved) from a
+    /// renderer that persistently reports a stale default (e.g. Devialet at
+    /// 50%), which must not overwrite the user's saved volume.
+    last_device_volume: Option<f64>,
+}
+
+/// Should the poller adopt the renderer-reported volume into the saved zone
+/// volume? Only when the reported value actually MOVED since the last poll (a
+/// real change on the device) AND it now differs from what we have stored. A
+/// renderer that keeps reporting a stale default (Fabien's Devialet stuck at
+/// 50%) reports the same value every tick, so `prev` never differs from
+/// `device` and the user's saved volume is preserved.
+fn should_adopt_device_volume(prev_device_vol: Option<f64>, device_vol: f64, db_vol: f64) -> bool {
+    prev_device_vol.is_some_and(|prev| (device_vol - prev).abs() > 0.02)
+        && (device_vol - db_vol).abs() > 0.02
 }
 
 pub struct PositionPoller {
@@ -352,12 +368,19 @@ impl PositionPoller {
                 && status.state == TransportState::Playing
             {
                 let db_vol = zone.volume as f64 / 100.0;
-                if (status.volume - db_vol).abs() > 0.02 {
+                let prev_device_vol = poll_states.get(&zone_id).and_then(|p| p.last_device_volume);
+                // Edge-triggered: adopt only when the renderer's volume actually
+                // moved since the last poll, so a stale default (Fabien's
+                // Devialet stuck at 50%) can't overwrite the saved volume.
+                if should_adopt_device_volume(prev_device_vol, status.volume, db_vol) {
                     self.playback.set_volume(zone_id, status.volume).await;
                     let vol_int = (status.volume * 100.0) as i32;
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_int)
                         .ok();
+                }
+                if let Some(ps) = poll_states.get_mut(&zone_id) {
+                    ps.last_device_volume = Some(status.volume);
                 }
             }
 
@@ -439,6 +462,7 @@ impl PositionPoller {
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
                 radio_stopped_ticks: 0,
+                last_device_volume: None,
             });
 
             // Detect track change: if the generation changed, the orchestrator
@@ -572,10 +596,17 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    // Edge-triggered like the main volume-sync path, so a radio
+                    // renderer reporting a stale default can't keep resetting the
+                    // saved volume (Fabien's Devialet Salon reverting to 50).
                     if !zone_fixed_volume
                         && !in_vol_grace
                         && status.volume < 0.999
-                        && (status.volume - zone_state.volume).abs() > 0.005
+                        && should_adopt_device_volume(
+                            ps.last_device_volume,
+                            status.volume,
+                            zone_state.volume,
+                        )
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
                         let vol_int = (status.volume * 100.0) as i32;
@@ -584,6 +615,7 @@ impl PositionPoller {
                             .update_volume(zone_id, vol_int)
                             .ok();
                     }
+                    ps.last_device_volume = Some(status.volume);
 
                     // Radio metadata polling (title/artist from ICY or external)
                     if let Some(ref np) = zone_state.now_playing {
@@ -1495,6 +1527,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn volume_not_adopted_on_first_observation() {
+        // No previous reading yet — never overwrite on the first poll.
+        assert!(!should_adopt_device_volume(None, 0.5, 0.3));
+    }
+
+    #[test]
+    fn volume_not_adopted_when_device_reports_stale_default() {
+        // Devialet keeps reporting 0.50 while the user saved 0.30 — the value
+        // never moves, so the saved volume must be preserved (Fabien).
+        assert!(!should_adopt_device_volume(Some(0.5), 0.5, 0.3));
+    }
+
+    #[test]
+    fn volume_adopted_on_real_device_change() {
+        // The knob moved on the device (0.50 -> 0.62) and now differs from the
+        // saved volume — adopt it.
+        assert!(should_adopt_device_volume(Some(0.5), 0.62, 0.3));
+    }
+
+    #[test]
+    fn volume_not_adopted_when_change_matches_saved() {
+        // Device moved but landed on what we already have stored.
+        assert!(!should_adopt_device_volume(Some(0.5), 0.62, 0.62));
+    }
+
+    #[test]
     fn gapless_cooldown_suppresses_stopped() {
         let mut ps = ZonePollState {
             gapless_sent: false,
@@ -1519,6 +1577,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // While cooldown > 0, stopped_ticks must not accumulate
@@ -1565,6 +1624,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulates entering Playing state
@@ -1663,6 +1723,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate consecutive errors with exponential backoff
@@ -1891,6 +1952,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate renderer staying Stopped after cooldown expired.
@@ -1944,6 +2006,7 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_device_volume: None,
         };
 
         // Simulate entering Playing state (renderer auto-transitioned)
