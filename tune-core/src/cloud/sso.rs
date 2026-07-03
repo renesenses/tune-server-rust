@@ -138,6 +138,35 @@ impl MozaikAuth {
         Ok(token)
     }
 
+    /// Exchange a refresh token for a fresh access/refresh token pair (public
+    /// client, no secret). Used to keep the account premium fresh past the
+    /// access-token expiry.
+    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse, String> {
+        let url = format!("{}/oauth/token", self.base_url);
+        let client = crate::http::client::shared();
+
+        let resp = client
+            .post(&url)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", &self.client_id),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("oauth refresh request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            debug!(status = %status, "oauth_refresh_failed");
+            return Err(format!("oauth refresh failed: {status}"));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| format!("failed to parse refresh response: {e}"))
+    }
+
     /// Fetch the authenticated user's profile from mozaiklabs.
     pub async fn get_user(&self, access_token: &str) -> Result<CloudUser, String> {
         let url = format!("{}/api/v1/user", self.base_url);
