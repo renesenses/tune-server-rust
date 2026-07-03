@@ -564,9 +564,86 @@ fn spawn_heartbeat(state: &AppState) {
                 }
             }
 
+            // Refresh the account premium (SSO) from /api/v1/user so a lapsed
+            // subscription is picked up without waiting for the offline grace or
+            // a re-login. No-op when not connected. Never blocks the heartbeat.
+            refresh_account_premium(&backend, &license).await;
+
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
         }
     });
+}
+
+/// Re-fetch the mozaiklabs.fr account profile and update the account premium
+/// (SSO). No-op if not connected (no access token). On an expired access token,
+/// tries the refresh_token grant once and retries. On any network failure the
+/// cached state is kept (the offline grace in `LicenseManager` covers it).
+async fn refresh_account_premium(
+    backend: &Arc<dyn tune_core::db::backend::DbBackend>,
+    license: &Arc<tune_core::license::LicenseManager>,
+) {
+    use tune_core::cloud::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+
+    let token = match settings.get("mozaik_access_token").ok().flatten() {
+        Some(t) if !t.is_empty() => t,
+        _ => return, // not connected — nothing to refresh
+    };
+
+    let client_id = settings
+        .get("mozaik_client_id")
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+    if client_id.is_empty() {
+        return;
+    }
+    let base_url = settings.get("mozaik_base_url").ok().flatten();
+    let auth = MozaikAuth::new(client_id, base_url.as_deref());
+
+    // Try the current token; if it fails (likely expired), refresh once & retry.
+    let user = match auth.get_user(&token).await {
+        Ok(u) => Some(u),
+        Err(_) => {
+            let refresh = settings
+                .get("mozaik_refresh_token")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty());
+            match refresh {
+                Some(rt) => match auth.refresh_token(&rt).await {
+                    Ok(tok) => {
+                        settings.set("mozaik_access_token", &tok.access_token).ok();
+                        if let Some(ref new_rt) = tok.refresh_token {
+                            settings.set("mozaik_refresh_token", new_rt).ok();
+                        }
+                        auth.get_user(&tok.access_token).await.ok()
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "mozaik_token_refresh_failed");
+                        None
+                    }
+                },
+                None => None,
+            }
+        }
+    };
+
+    if let Some(user) = user {
+        settings
+            .set(
+                "mozaik_user",
+                &serde_json::to_string(&user).unwrap_or_default(),
+            )
+            .ok();
+        license
+            .set_account_premium(user.premium, user.license_expires_at.clone())
+            .await;
+        debug!(premium = user.premium, "mozaik_account_premium_refreshed");
+    }
 }
 
 /// Resolve the machine hostname via the `hostname` command.
