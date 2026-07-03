@@ -229,7 +229,9 @@ async fn api_fallback(
 pub fn router(state: AppState) -> Router {
     let streamer_sessions = state.streamer.sessions_state();
 
-    let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
+    let web_dir = crate::config::resolve_web_dir()
+        .to_string_lossy()
+        .into_owned();
 
     let zones_and_playback = zones::router().merge(playback::router());
     let api = Router::new()

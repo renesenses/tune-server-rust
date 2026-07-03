@@ -238,7 +238,7 @@ async fn main() {
         version = tune_core::version(),
         port = config.port,
         db = %config.db_path,
-        web = %config.web_dir,
+        web = %crate::config::resolve_web_dir().display(),
         "tune_server_starting"
     );
 
