@@ -165,6 +165,11 @@ pub fn build_connection_manager_response(soap_body: &str) -> String {
 // SOAP request parser
 // ---------------------------------------------------------------------------
 
+/// Cap applied when a control point requests "all" children (RequestedCount=0).
+/// Large enough for any realistic library, small enough to stay a valid SQL
+/// LIMIT on both SQLite and Postgres (unlike u64::MAX, which casts to -1).
+const UNLIMITED_BROWSE_COUNT: u64 = 100_000_000;
+
 fn parse_browse_request(soap_xml: &str) -> (String, String, u64, u64) {
     let mut object_id = "0".to_string();
     let mut browse_flag = "BrowseDirectChildren".to_string();
@@ -200,10 +205,15 @@ fn parse_browse_request(soap_xml: &str) -> (String, String, u64, u64) {
                     "BrowseFlag" => browse_flag = text,
                     "StartingIndex" => start = text.parse().unwrap_or(0),
                     "RequestedCount" => {
+                        // Per the UPnP ContentDirectory spec, RequestedCount=0
+                        // means "return every child" — not "return zero". The old
+                        // `if n > 0` left count at the default 100, so a control
+                        // point asking for the whole library only ever saw ~100
+                        // albums (Pierre M: media-server list "très incomplète,
+                        // ~100 sur x xxx"). Map 0 to a large, DB-portable cap
+                        // (u64::MAX -> LIMIT -1 would error on Postgres).
                         let n: u64 = text.parse().unwrap_or(0);
-                        if n > 0 {
-                            count = n;
-                        }
+                        count = if n == 0 { UNLIMITED_BROWSE_COUNT } else { n };
                     }
                     _ => {}
                 }
@@ -725,6 +735,24 @@ mod tests {
         assert_eq!(object_id, "0");
         assert_eq!(start, 0);
         assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn parse_browse_requested_count_zero_means_all() {
+        // RequestedCount=0 must map to "return every child", not the default 100.
+        let soap = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>albums</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#;
+
+        let (_, _, _, count) = parse_browse_request(soap);
+        assert_eq!(count, UNLIMITED_BROWSE_COUNT);
     }
 
     #[test]
