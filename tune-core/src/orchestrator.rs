@@ -2341,7 +2341,16 @@ impl PlaybackOrchestrator {
             )
         };
 
-        let (title, artist, album, duration_ms, cover_path) = if req.title.is_some() {
+        // Only trust the caller-supplied title when it is actually non-empty.
+        // Repeat All (and some queue paths) re-play a streaming_queue row whose
+        // stored title is "" — `req.title` is then Some("") and the old
+        // `is_some()` check served that empty title verbatim, wiping Now Playing
+        // (DEvir: `auto_next title=Shine...` followed by `orchestrator_play
+        // title=`). Falling through to get_track() refetches the real metadata
+        // from the service. The network call only fires when the title is
+        // missing, so the happy path is unchanged.
+        let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+        let (title, artist, album, duration_ms, cover_path) = if has_title {
             (
                 req.title.clone().unwrap_or_default(),
                 req.artist_name.clone(),
@@ -2358,7 +2367,16 @@ impl PlaybackOrchestrator {
                     Some(track.duration_ms as i64),
                     track.cover_path,
                 ),
-                Err(_) => ("Unknown".into(), None, None, req.duration_ms, None),
+                Err(_) => (
+                    req.title
+                        .clone()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Unknown".into()),
+                    req.artist_name.clone(),
+                    req.album_title.clone(),
+                    req.duration_ms,
+                    req.cover_url.clone(),
+                ),
             }
         };
 
