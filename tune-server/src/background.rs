@@ -108,6 +108,16 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
 
             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
             for d in &devices {
+                // Respect user deletions: a device the user removed is marked
+                // hidden. The mDNS/SSDP live handlers already skip zone creation
+                // for hidden devices — this startup batch path must do the same,
+                // otherwise a deleted zone silently reappears on every restart
+                // (Fabien: "Salon: AIRPLAY" zone came back after update).
+                if zone_repo.is_device_hidden(&d.id) {
+                    info!(name = %d.name, device_id = %d.id, "ssdp_startup_zone_hidden_skipping");
+                    continue;
+                }
+
                 // Premium gate: check zone limit before auto-creating new zones.
                 // get_or_create returns (id, false) for existing zones, so we only
                 // need to check when the zone doesn't already exist.
