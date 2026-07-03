@@ -143,11 +143,11 @@ impl AppState {
             .build()
             .expect("http client init");
 
-        let web_dir = std::env::var("TUNE_WEB_DIR").unwrap_or_else(|_| "web".into());
+        let web_dir = crate::config::resolve_web_dir();
         let skins_dir = std::env::var("TUNE_SKINS_DIR").unwrap_or_else(|_| "skins".into());
         let skin_manager = Arc::new(tune_core::skins::SkinManager::new(
             std::path::PathBuf::from(skins_dir),
-            std::path::PathBuf::from(web_dir),
+            web_dir,
         ));
         skin_manager.ensure_dirs();
 

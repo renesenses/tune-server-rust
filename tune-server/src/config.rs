@@ -321,3 +321,46 @@ impl TuneConfig {
         config
     }
 }
+
+/// Resolve the directory the web client (SPA) is served from.
+///
+/// Historically the server served `./web` relative to the process **current
+/// working directory**. That breaks after an in-app auto-update + systemd
+/// restart: the auto-updater writes the fresh `web/` next to the binary, but
+/// systemd restarts the process with a `WorkingDirectory` that may differ from
+/// the install dir, so `./web` resolves to a stale or missing folder and the
+/// browser loads an old SPA build (Fabien: Diagnostics loop + stale
+/// quality_split toggle persisting after auto-update).
+///
+/// Resolution order:
+///   1. `TUNE_WEB_DIR` — honored verbatim (absolute or relative override).
+///   2. `<cwd>/web` when it exists — preserves Docker and manual-run layouts
+///      where the web/ lives next to the working directory, not the binary.
+///   3. `<exe_dir>/web` — where the auto-updater always writes the fresh copy.
+///   4. `<cwd>/web` as a last resort (may not exist yet; ServeDir 404s cleanly).
+pub fn resolve_web_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    if let Ok(custom) = std::env::var("TUNE_WEB_DIR") {
+        return PathBuf::from(custom);
+    }
+
+    let cwd_web = std::env::current_dir()
+        .map(|d| d.join("web"))
+        .unwrap_or_else(|_| PathBuf::from("web"));
+    if cwd_web.exists() {
+        return cwd_web;
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let exe_web = dir.join("web");
+        if exe_web.exists() {
+            info!(path = %exe_web.display(), "web_dir_resolved_to_binary_dir");
+            return exe_web;
+        }
+    }
+
+    cwd_web
+}
