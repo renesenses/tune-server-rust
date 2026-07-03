@@ -434,6 +434,29 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
             info!("discogs_token_persisted_from_env");
         }
     }
+
+    // Seed the quality_split default so the DB is the single source of truth.
+    // get_config injects a `true` default in memory but never persists it, so an
+    // untouched DB has no row — and both the manual and auto scanners fall back
+    // to `unwrap_or(true)`, silently splitting albums by quality while the UI
+    // shows the toggle "enabled". Seeding once (only when the row is absent)
+    // makes the toggle authoritative and inspectable via SQL. Reported by Fabien:
+    // `SELECT value FROM settings WHERE key='quality_split'` returned empty, and
+    // disabling the option in the UI had no visible effect on the next scan.
+    {
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let has_row = settings
+            .get("quality_split")
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+            .is_some();
+        if !has_row {
+            settings.set("quality_split", "true").ok();
+            info!("quality_split_default_seeded value=true");
+        }
+    }
 }
 
 /// Register local audio output devices (USB DAC, headphones, speakers) and auto-create zones.

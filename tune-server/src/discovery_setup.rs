@@ -406,7 +406,17 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
 
                         let zone_repo =
                             tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
-                        if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
+                        // Honour a user deletion: deleting a zone soft-hides it
+                        // (is_hidden=1). The SSDP handler already skips hidden
+                        // devices; the mDNS handler did not, so an AirPlay/
+                        // Chromecast/BluOS device (e.g. Fabien's Beosound Stage)
+                        // was reconnected — or, with no device_id match, re-created
+                        // via auto_create — at startup, resurrecting the deleted
+                        // zone even with "create zones automatically" OFF. Skip the
+                        // whole reconnect/create block for hidden devices.
+                        if zone_repo.is_device_hidden(&dev.id) {
+                            info!(name = %dev.name, id = %dev.id, "mdns_zone_hidden_skipping");
+                        } else if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
                             set_zone_online(&event_bus, &db, &dev.id, true);
                             if let Some(zone_id) = zone.id {
                                 let vol = zone.volume as f64 / 100.0;
