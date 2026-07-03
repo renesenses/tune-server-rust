@@ -19,6 +19,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: renesenses/tune-web-client
+      - name: Verify web-client version matches release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          WEB_VERSION="$(grep -m1 '"version"' package.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+          if [ "$TAG_VERSION" != "$WEB_VERSION" ]; then
+            echo "::error::tune-web-client package.json is $WEB_VERSION but the release tag is $TAG_VERSION."
+            echo "::error::Push the tune-web-client version bump to main BEFORE tagging the server, then re-run this release."
+            exit 1
+          fi
+          echo "web-client version $WEB_VERSION matches release tag $TAG_VERSION"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
