@@ -158,8 +158,11 @@ jobs:
           !include "MUI2.nsh"
           Name "Tune Server"
           OutFile "${{ env.ARTIFACT }}-setup.exe"
-          InstallDir "`$PROGRAMFILES\Tune Server"
-          RequestExecutionLevel admin
+          ; Per-user install (like VS Code / Discord): a writable location so
+          ; the in-app auto-updater can replace tune-server.exe without admin
+          ; rights. A Program Files install could not self-update (Dominique).
+          InstallDir "`$LOCALAPPDATA\Programs\Tune Server"
+          RequestExecutionLevel user
 
           !insertmacro MUI_PAGE_DIRECTORY
           !insertmacro MUI_PAGE_INSTFILES
@@ -200,10 +203,10 @@ jobs:
             WriteUninstaller "`$INSTDIR\uninstall.exe"
 
             ; Registry for Add/Remove Programs
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayVersion" "${version}"
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "UninstallString" "`$INSTDIR\uninstall.exe"
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "Publisher" "Mozaik Labs"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayName" "Tune Server"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "DisplayVersion" "${version}"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "UninstallString" "`$INSTDIR\uninstall.exe"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "Publisher" "Mozaik Labs"
           SectionEnd
 
           Section "Uninstall"
@@ -213,7 +216,7 @@ jobs:
             RMDir /r "`$INSTDIR"
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
-            DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+            DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
           SectionEnd
           "@ | Out-File -Encoding ASCII installer.nsi
           & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" installer.nsi
