@@ -2495,7 +2495,12 @@ impl PlaybackOrchestrator {
             let tmp_path =
                 std::env::temp_dir().join(format!("tune-prefetch-{}.{ext}", uuid::Uuid::new_v4()));
             let tmp_str = tmp_path.to_string_lossy().to_string();
-            let pcm_data = prefetched.pcm_data;
+            // Match the encoded header's bit depth (out_bd) to the actual PCM.
+            let pcm_data = if bd != out_bd {
+                crate::audio::decode::convert_pcm_bytes(&prefetched.pcm_data, bd, out_bd)
+            } else {
+                prefetched.pcm_data
+            };
             let encode_sr = sr;
             let encode_bd = out_bd;
             let encode_ch = ch;
@@ -2632,7 +2637,19 @@ impl PlaybackOrchestrator {
 
         // Feed the prefetched PCM data into the session in chunks.
         // This happens nearly instantly since the data is already in memory.
-        let pcm_data = prefetched.pcm_data;
+        // The buffer is stored at the source bit depth (`bd`); widen it to the
+        // WAV header's `out_bd` (32 for local output) or the device reads 32-bit
+        // frames out of 16-bit data → white noise (Bilou: bruit blanc next-track).
+        let pcm_data = if bd != out_bd {
+            info!(
+                from_bd = bd,
+                to_bd = out_bd,
+                "prefetch_pcm_bit_depth_converted"
+            );
+            crate::audio::decode::convert_pcm_bytes(&prefetched.pcm_data, bd, out_bd)
+        } else {
+            prefetched.pcm_data
+        };
         tokio::spawn(async move {
             let chunk_size = 32768;
             let mut first = true;

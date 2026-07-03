@@ -147,6 +147,39 @@ fn convert_pcm_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
     }
 }
 
+/// Convert interleaved raw PCM **bytes** from `from_bd` to `to_bd` bit depth.
+///
+/// The prefetch buffer stores decoded PCM at the source bit depth (e.g. 16-bit
+/// for a Qobuz 16/44 track). When that buffer is served to a local output —
+/// which expects 32-bit — the bytes must be widened, otherwise the device reads
+/// 32-bit frames out of 16-bit data and plays white noise (Bilou: "bruit blanc"
+/// on next-track for a Qobuz album on Windows local output).
+pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
+    if from_bd == to_bd {
+        return data.to_vec();
+    }
+    let samples: Vec<i32> = match from_bd {
+        16 => data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+            .collect(),
+        24 => data
+            .chunks_exact(3)
+            .map(|b| {
+                // sign-extend 24-bit LE into i32
+                let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
+                (v << 8) >> 8
+            })
+            .collect(),
+        32 => data
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        _ => return data.to_vec(),
+    };
+    convert_pcm_bit_depth(&samples, from_bd, to_bd)
+}
+
 pub fn can_decode_native(file_path: &str) -> bool {
     let ext = Path::new(file_path)
         .extension()
@@ -1581,6 +1614,21 @@ mod decode_integration_tests {
     fn dsf_is_native() {
         assert!(can_decode_native("test.dsf"));
         assert!(can_decode_native("test.dff"));
+    }
+
+    #[test]
+    fn convert_pcm_bytes_16_to_32_widens_samples() {
+        // Two 16-bit LE samples: 1 and -32768.
+        let src = [0x01, 0x00, 0x00, 0x80];
+        let out = convert_pcm_bytes(&src, 16, 32);
+        // 1 << 16 = 0x0001_0000 ; -32768 << 16 = 0x8000_0000 (i32::MIN)
+        assert_eq!(out, vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn convert_pcm_bytes_noop_when_same_depth() {
+        let src = [0x12, 0x34, 0x56, 0x78];
+        assert_eq!(convert_pcm_bytes(&src, 16, 16), src.to_vec());
     }
 
     #[test]
