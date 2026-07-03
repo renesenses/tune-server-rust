@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
-use tune_core::cloud::sso::MozaikAuth;
+use tune_core::cloud::sso::{MozaikAuth, PkceSession};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -45,13 +45,23 @@ pub fn router() -> Router<AppState> {
 // SSO
 // ---------------------------------------------------------------------------
 
-fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
-    let client_id = settings
+/// Resolve the Mozaik OAuth client id.
+///
+/// Precedence: `mozaik_client_id` setting → `TUNE_MOZAIK_CLIENT_ID` env →
+/// baked-in [`sso::DEFAULT_CLIENT_ID`]. Empty at every level ⇒ SSO stays
+/// unconfigured and degrades gracefully (opt-in, never blocking).
+fn resolve_client_id(settings: &SettingsRepo) -> Option<String> {
+    settings
         .get("mozaik_client_id")
         .ok()
         .flatten()
         .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
-        .filter(|s| !s.is_empty())?;
+        .or_else(|| Some(tune_core::cloud::sso::DEFAULT_CLIENT_ID.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
+    let client_id = resolve_client_id(settings)?;
     let base_url = settings
         .get("mozaik_base_url")
         .ok()
@@ -60,13 +70,17 @@ fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
     Some(MozaikAuth::new(client_id, Some(&base_url)))
 }
 
+/// Loopback redirect URI (RFC 8252 §7.3, Option A). Uses the literal loopback
+/// address `127.0.0.1` on the variable listening port; Passport registers
+/// `http://127.0.0.1` and accepts any loopback port. Overridable via the
+/// `mozaik_redirect_uri` setting.
 fn redirect_uri(state: &AppState) -> String {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("mozaik_redirect_uri")
         .ok()
         .flatten()
-        .unwrap_or_else(|| format!("http://localhost:{}/api/v1/cloud/sso/callback", state.port))
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}/api/v1/cloud/sso/callback", state.port))
 }
 
 async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
@@ -87,8 +101,18 @@ async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, Html(html)).into_response();
     };
 
+    // PKCE (RFC 7636): mint a fresh verifier/challenge/state and stash the
+    // verifier + state for the browser round-trip (consumed in sso_callback).
+    let pkce = PkceSession::generate();
+    settings
+        .set(
+            "mozaik_pkce_pending",
+            &serde_json::to_string(&pkce).unwrap_or_default(),
+        )
+        .ok();
+
     let uri = redirect_uri(&state);
-    let url = auth.authorize_url(&uri);
+    let url = auth.authorize_url(&uri, &pkce.challenge, &pkce.state);
     Redirect::temporary(&url).into_response()
 }
 
@@ -96,6 +120,7 @@ async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
 struct CallbackQuery {
     code: Option<String>,
     error: Option<String>,
+    state: Option<String>,
 }
 
 async fn sso_callback(
@@ -127,15 +152,34 @@ async fn sso_callback(
             .into_response();
     };
 
-    let client_secret = settings
-        .get("mozaik_client_secret")
+    // Load & validate the pending PKCE session (CSRF: state must match), then
+    // consume it — one-shot, cleared regardless of the exchange outcome.
+    let pending: Option<PkceSession> = settings
+        .get("mozaik_pkce_pending")
         .ok()
         .flatten()
-        .unwrap_or_default();
+        .and_then(|s| serde_json::from_str(&s).ok());
+    settings.set("mozaik_pkce_pending", "").ok();
+
+    let Some(pkce) = pending else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no pending SSO session (restart login)"})),
+        )
+            .into_response();
+    };
+    if q.state.as_deref() != Some(pkce.state.as_str()) {
+        warn!("sso_state_mismatch");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "state mismatch (possible CSRF)"})),
+        )
+            .into_response();
+    }
 
     let uri = redirect_uri(&state);
 
-    let token = match auth.exchange_code(&code, &uri, &client_secret).await {
+    let token = match auth.exchange_code(&code, &uri, &pkce.verifier).await {
         Ok(t) => t,
         Err(e) => {
             warn!(error = %e, "sso_code_exchange_failed");
@@ -237,13 +281,7 @@ async fn sso_callback(
 
 async fn sso_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let configured = settings
-        .get("mozaik_client_id")
-        .ok()
-        .flatten()
-        .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
-        .filter(|s| !s.is_empty())
-        .is_some();
+    let configured = resolve_client_id(&settings).is_some();
     let connected = settings
         .get("mozaik_access_token")
         .ok()
