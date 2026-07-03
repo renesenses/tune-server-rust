@@ -11,6 +11,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
+use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -99,6 +100,58 @@ pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {
         .count()
         .unwrap_or(0);
     Json(json!({ "count": count }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreateAlbumRequest {
+    title: String,
+    artist_id: Option<i64>,
+}
+
+/// Create an album by title (used by MetadataView when assigning tracks to a
+/// new album name). Reuses an existing album with the same title if one exists.
+pub(super) async fn create_album(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAlbumRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(AppError::bad_request("title is required"));
+    }
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    if let Ok(Some(existing)) = repo.get_by_title(title) {
+        return Ok(Json(json!({ "id": existing.id, "title": existing.title })));
+    }
+    let album = Album {
+        id: None,
+        title: title.to_string(),
+        artist_id: body.artist_id,
+        artist_name: None,
+        year: None,
+        original_year: None,
+        genre: None,
+        genres: None,
+        disc_count: None,
+        track_count: None,
+        cover_path: None,
+        source: "local".to_string(),
+        source_id: None,
+        label: None,
+        catalog_number: None,
+        barcode: None,
+        format: None,
+        sample_rate: None,
+        bit_depth: None,
+        bio: None,
+        musicbrainz_release_id: None,
+        musicbrainz_release_group_id: None,
+        release_date: None,
+        original_date: None,
+    };
+    let id = repo
+        .create(&album)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({ "id": id, "title": title })))
 }
 
 pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
