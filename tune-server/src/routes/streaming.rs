@@ -508,6 +508,11 @@ async fn service_auth(
         }
         Err(e) => {
             let err_msg = e.to_string();
+            // Log the exact reason: the device-code/auth failure was only
+            // returned in the 400 body, invisible in the server logs, so a
+            // failing YouTube login (network to Google, rate limit, etc.)
+            // could not be diagnosed from a log alone (Fabien).
+            tracing::warn!(service = %service, error = %err_msg, "streaming_auth_failed");
             state.event_bus.emit(
                 "streaming.auth.failed",
                 json!({
