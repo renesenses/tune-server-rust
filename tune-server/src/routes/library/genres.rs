@@ -59,7 +59,15 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
         }
     }
 
-    let genres: Vec<String> = genre_set.into_iter().collect();
+    // Case-insensitive dedup so "Classique"/"classique" and "Folk/Rock"/"Folk/rock"
+    // collapse into a single genre instead of appearing as duplicate rows (Bilou).
+    // genre_set is a BTreeSet, so capitalized variants sort first (uppercase <
+    // lowercase in ASCII) and are the ones kept.
+    let mut seen_lc: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let genres: Vec<String> = genre_set
+        .into_iter()
+        .filter(|g| seen_lc.insert(g.to_lowercase()))
+        .collect();
 
     // Load saved tree from settings (persisted by PUT /genre-tree).
     // If a saved tree exists, use it as the base and add any new genres
