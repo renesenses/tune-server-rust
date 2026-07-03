@@ -1145,14 +1145,41 @@ async fn set_repeat(
 
 async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    let ps = state.playback.get_state(zone_id).await;
+
+    // A zone can hold BOTH a local play_queue and a streaming_queue at once.
+    // Returning the local one whenever it is non-empty hid the streaming queue
+    // when a Qobuz album was played on top of a leftover local queue — the
+    // album tracks were invisible and the playing album could not be found
+    // (Cyrille). Instead, return the queue that matches what's actually playing.
+    let playing_source = ps
+        .now_playing
+        .as_ref()
+        .map(|np| np.source.clone())
+        .unwrap_or_default();
+    let is_streaming =
+        !playing_source.is_empty() && playing_source != "local" && playing_source != "file";
+
+    if is_streaming {
+        let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
+        if !streaming_items.is_empty() {
+            return Json(json!({
+                "tracks": streaming_items,
+                "position": ps.queue_position,
+                "length": streaming_items.len(),
+            }));
+        }
+    }
+
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if !items.is_empty() {
         let position = items.iter().position(|i| i.is_current).unwrap_or(0);
         let length = items.len();
         return Json(json!({ "tracks": items, "position": position, "length": length }));
     }
+
+    // Fallback: a freshly-set streaming queue before playback state caught up.
     let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-    let ps = state.playback.get_state(zone_id).await;
     Json(
         json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }),
     )
