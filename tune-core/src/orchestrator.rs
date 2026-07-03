@@ -1582,7 +1582,20 @@ impl PlaybackOrchestrator {
         // the PCM directly via a streaming session — zero download delay.
         // Skip prefetch for network outputs (DLNA) when buffer is truncated
         // (30s mode) — the renderer needs the full file.
-        if let Some(prefetched) = self.prefetch.take_prefetched(service_name, source_id).await {
+        //
+        // A seek must resolve a FRESH stream at the requested position. The
+        // prefetch buffer always starts at position 0, so serving it on a seek
+        // would (a) play from the wrong position and (b) race the recreated
+        // local output: the buffered PCM feed completes before ASIO/WASAPI
+        // attaches, leaving the stream with 0 frames → playback stops.
+        // (DEvir: seek on a TIDAL track → title stays but music stops.)
+        // Only consider the prefetch buffer when NOT seeking.
+        let prefetched = if req.seek_ms.is_some_and(|ms| ms > 0) {
+            None
+        } else {
+            self.prefetch.take_prefetched(service_name, source_id).await
+        };
+        if let Some(prefetched) = prefetched {
             let is_network = req
                 .output_device_id
                 .as_deref()
