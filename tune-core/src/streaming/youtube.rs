@@ -27,8 +27,8 @@ const YTDLP_TIMEOUT_SECS: u64 = 30;
 // ---------------------------------------------------------------------------
 
 const GOOGLE_CLIENT_ID: &str =
-    "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "SboVhoG9s0rNafixCSGGKXAT";
+    "43212718137-t3p59j0tov6ak6jdsuj9leqpdmmmqpt4.apps.googleusercontent.com";
+const GOOGLE_CLIENT_SECRET: &str = "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";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
