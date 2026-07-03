@@ -1,6 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Redirect};
+use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -72,11 +72,19 @@ fn redirect_uri(state: &AppState) -> String {
 async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "SSO not configured — set mozaik_client_id in settings"})),
-        )
-            .into_response();
+        // sso_authorize is a full browser navigation, so degrade to a friendly
+        // HTML page instead of raw JSON when Cloud SSO isn't provisioned on this
+        // server (mozaik_client_id unset). Covers every entry point at once.
+        let html = r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud bientôt disponible</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}.card{max-width:440px;padding:2rem}h1{font-weight:600}a{color:#6ab0ff;text-decoration:none}a:hover{text-decoration:underline}</style>
+</head><body><div class="card">
+<h1>Cloud bientôt disponible</h1>
+<p>La connexion mozaiklabs.fr n'est pas encore activée sur ce serveur.</p>
+<p><a href="https://mozaiklabs.fr">En savoir plus</a> &nbsp;·&nbsp; <a href="/">Retour à Tune</a></p>
+</div></body></html>"#;
+        return (StatusCode::SERVICE_UNAVAILABLE, Html(html)).into_response();
     };
 
     let uri = redirect_uri(&state);
@@ -233,6 +241,7 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
         .get("mozaik_client_id")
         .ok()
         .flatten()
+        .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
         .filter(|s| !s.is_empty())
         .is_some();
     let connected = settings
