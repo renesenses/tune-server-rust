@@ -318,7 +318,16 @@ pub(super) async fn set_mode(
     Json(json!({ "mode": body.mode }))
 }
 
-pub(super) async fn export_config(State(state): State<AppState>) -> Json<Value> {
+#[derive(Deserialize)]
+pub(super) struct ExportConfigQuery {
+    #[serde(default)]
+    include_secrets: bool,
+}
+
+pub(super) async fn export_config(
+    State(state): State<AppState>,
+    Query(q): Query<ExportConfigQuery>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let all = settings.all().unwrap_or_default();
     let mut config = serde_json::Map::new();
@@ -328,6 +337,16 @@ pub(super) async fn export_config(State(state): State<AppState>) -> Json<Value> 
         } else {
             config.insert(k, Value::String(v));
         }
+    }
+    // By default, omit secrets so a shared or leaked backup file carries no
+    // credentials. import_config merges (it only sets keys present in the
+    // payload), so restoring a redacted backup to the SAME server leaves the
+    // existing secrets untouched. Pass ?include_secrets=true for a full backup
+    // when migrating to a fresh server.
+    if !q.include_secrets {
+        config.remove("license_key");
+        config.remove("discogs_token");
+        config.remove("auth_tokens_qobuz");
     }
     Json(Value::Object(config))
 }
