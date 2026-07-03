@@ -22,6 +22,13 @@ pub struct CloudUser {
     pub display_name: String,
     pub is_admin: bool,
     pub avatar_url: Option<String>,
+    /// Premium granted by this mozaiklabs.fr account (derived server-side from the
+    /// email-linked License). Absent on older servers → defaults to false.
+    #[serde(default)]
+    pub premium: bool,
+    /// Subscription end for the account premium (ISO-8601), when known.
+    #[serde(default)]
+    pub license_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

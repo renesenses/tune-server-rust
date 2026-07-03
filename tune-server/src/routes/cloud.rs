@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .route("/sso/authorize", get(sso_authorize))
         .route("/sso/callback", get(sso_callback))
         .route("/sso/status", get(sso_status))
+        .route("/sso/disconnect", post(sso_disconnect))
         .route("/telemetry/status", get(telemetry_status))
         .route("/telemetry/enable", post(telemetry_enable))
         .route("/telemetry/disable", post(telemetry_disable))
@@ -210,6 +211,13 @@ async fn sso_callback(
         )
         .ok();
 
+    // Unlock premium from the linked account (SSO) when the server reports it.
+    // OR-ed with the license-key path — never downgrades a keyed premium.
+    state
+        .license
+        .set_account_premium(user.premium, user.license_expires_at.clone())
+        .await;
+
     // Create or link local profile, then issue a local JWT session
     use tune_core::db::backend::ToSqlValue;
     let existing_id: Option<i64> = state
@@ -299,6 +307,24 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
         "connected": connected,
         "user": user,
     }))
+}
+
+/// POST /cloud/sso/disconnect — log out of the mozaiklabs.fr account: drop the
+/// stored tokens/profile and revoke the account premium. The license-key path is
+/// untouched (a keyed premium survives).
+async fn sso_disconnect(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    for key in [
+        "mozaik_access_token",
+        "mozaik_refresh_token",
+        "mozaik_user",
+        "mozaik_pkce_pending",
+    ] {
+        settings.delete(key).ok();
+    }
+    state.license.clear_account_premium().await;
+    info!("sso_disconnected");
+    Json(json!({ "connected": false }))
 }
 
 // ---------------------------------------------------------------------------
