@@ -194,6 +194,13 @@ impl PlaybackManager {
                 "duration_ms": np.duration_ms,
                 "source": np.source,
                 "source_id": np.source_id,
+                // Carry the technical info so the client can show the quality /
+                // signal-path badge immediately on play, instead of only after a
+                // manual refresh (Benjithom: the signal button appeared only
+                // after Ctrl+R on each track change).
+                "format": np.format,
+                "sample_rate": np.sample_rate,
+                "bit_depth": np.bit_depth,
             }),
         });
     }
