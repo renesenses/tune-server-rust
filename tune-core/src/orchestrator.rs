@@ -445,7 +445,15 @@ impl PlaybackOrchestrator {
         // Only record a listen-history row for genuinely new plays.  Seek and
         // radio auto-retry re-create the stream for a track that is already
         // playing (via play_without_history) and must not add duplicate rows.
-        if record_history {
+        //
+        // Skip live radio entirely: the title/artist supplied at play time is a
+        // frozen snapshot (station name, or a stale song copied from a history
+        // line when replaying) and never describes what the station is actually
+        // streaming now, so recording it produces listen_history rows with no
+        // relation to what was heard, plus a fresh bogus row on every replay
+        // click (Bilou). Station plays are already tracked in the radio_stations
+        // table (record_play), so nothing is lost.
+        if record_history && resolved.source != "radio" {
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
