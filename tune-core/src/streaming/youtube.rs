@@ -32,9 +32,19 @@ const GOOGLE_CLIENT_SECRET: &str = "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";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+/// OAuth 2.0 Device Authorization Grant type (RFC 8628). The URN segment is
+/// `grant-type` with a HYPHEN — an underscore makes Google reject the token
+/// poll with "Invalid grant_type", so device-code login never completes.
+const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// YouTube Music API key for authenticated WEB_REMIX client requests.
-const YTM_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
+/// Current Unix time in seconds, for the `X-Goog-Request-Time` header that
+/// OAuth-authenticated InnerTube requests must carry.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
@@ -227,11 +237,13 @@ impl YouTubeService {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let url = if self.access_token.is_some() {
-            format!("{YTM_API_BASE}/{endpoint}?key={YTM_API_KEY}&prettyPrint=false")
-        } else {
-            format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false")
-        };
+        // Authenticate with the OAuth Bearer token ALONE. Passing both a
+        // `?key=` API key and an `Authorization: Bearer` header makes Google
+        // reject the call with 400 "Request contains an invalid argument".
+        // This only bites once a token exists — it regressed search/browse the
+        // moment #381 made YouTube login actually succeed (Jean Marie, Bilou:
+        // "erreur 502" on search in v0.8.251).
+        let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
 
         let mut req = self
             .client
@@ -242,7 +254,14 @@ impl YouTubeService {
             .header("X-Goog-Visitor-Id", "");
 
         if let Some(ref token) = self.access_token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            // OAuth (device/TV client) InnerTube requests must carry a request
+            // timestamp. Google rejects an OAuth call without it as 400
+            // "Request contains an invalid argument" — this is the header
+            // ytmusicapi sets exclusively for its OAuth auth type, and its
+            // absence is why authenticated search/browse/player kept failing.
+            req = req
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Goog-Request-Time", unix_now_secs().to_string());
         }
 
         let resp = req
@@ -362,11 +381,10 @@ impl YouTubeService {
             })
         };
 
-        let url = if has_auth {
-            format!("{YTM_API_BASE}/player?key={YTM_API_KEY}&prettyPrint=false")
-        } else {
-            format!("{YTM_API_BASE}/player?prettyPrint=false")
-        };
+        // Bearer token alone — never combine `?key=` with an OAuth Bearer
+        // header (Google returns 400 "invalid argument"). Same fix as ytm_post;
+        // this path would otherwise break YouTube playback once authenticated.
+        let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
 
         let mut req = self
             .client
@@ -376,7 +394,10 @@ impl YouTubeService {
             .header("Referer", "https://music.youtube.com/");
 
         if let Some(ref token) = self.access_token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            // See ytm_post: OAuth calls need the request timestamp header.
+            req = req
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Goog-Request-Time", unix_now_secs().to_string());
         } else {
             req = req.header(
                 "User-Agent",
@@ -677,7 +698,7 @@ impl YouTubeService {
                 "client_id={GOOGLE_CLIENT_ID}\
                  &client_secret={GOOGLE_CLIENT_SECRET}\
                  &device_code={device_code}\
-                 &grant_type=urn:ietf:params:oauth:grant_type:device_code"
+                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}"
             ))
             .send()
             .await
@@ -2956,6 +2977,19 @@ mod tests {
     fn youtube_service_name() {
         let svc = YouTubeService::new();
         assert_eq!(svc.name(), "youtube");
+    }
+
+    #[test]
+    fn device_grant_type_uses_rfc8628_hyphen() {
+        // RFC 8628 device grant type uses a HYPHEN in the `grant-type` segment.
+        // An underscore (`grant_type:device_code`) makes Google reject the token
+        // poll with "Invalid grant_type" and YouTube login never completes.
+        assert_eq!(
+            GOOGLE_DEVICE_GRANT_TYPE,
+            "urn:ietf:params:oauth:grant-type:device_code"
+        );
+        assert!(GOOGLE_DEVICE_GRANT_TYPE.contains("grant-type"));
+        assert!(!GOOGLE_DEVICE_GRANT_TYPE.contains("grant_type"));
     }
 
     #[test]

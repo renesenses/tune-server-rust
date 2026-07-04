@@ -3,7 +3,7 @@ members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.229"
+version = "0.8.252"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
@@ -54,8 +54,8 @@ rubato = "3"
 hound = "3.5"
 thiserror = "2"
 unicode-normalization = "0.1"
-oaat-core = { version = "0.2.0", default-features = false }
-oaat-controller = { version = "0.2.0", default-features = false }
+oaat-core = { git = "https://github.com/renesenses/oaat", rev = "a5d5503", default-features = false }
+oaat-controller = { git = "https://github.com/renesenses/oaat", rev = "a5d5503", default-features = false }
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }

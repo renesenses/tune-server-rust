@@ -1271,10 +1271,17 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    // Edge-triggered like the main volume-sync path, so a radio
+                    // renderer reporting a stale default can't keep resetting the
+                    // saved volume (Fabien's Devialet Salon reverting to 50).
                     if !zone_fixed_volume
                         && !in_vol_grace
                         && status.volume < 0.999
-                        && (status.volume - zone_state.volume).abs() > 0.005
+                        && decisions::should_adopt_device_volume(
+                            ps.last_device_volume,
+                            status.volume,
+                            zone_state.volume,
+                        )
                     {
                         self.playback.set_volume(zone_id, status.volume).await;
                         let vol_int = (status.volume * 100.0) as i32;
@@ -1283,6 +1290,7 @@ impl PositionPoller {
                             .update_volume(zone_id, vol_int)
                             .ok();
                     }
+                    ps.last_device_volume = Some(status.volume);
 
                     // Radio metadata polling (title/artist from ICY or external)
                     if let Some(ref np) = zone_state.now_playing {
@@ -2303,6 +2311,7 @@ impl PositionPoller {
                         sample_rate: resolved.sample_rate,
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
+                        live_stream: false,
                     };
                     if let Err(e) = output.set_next_media(&media).await {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
@@ -2345,6 +2354,36 @@ impl PositionPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_not_adopted_on_first_observation() {
+        // No previous reading yet — never overwrite on the first poll.
+        assert!(!decisions::should_adopt_device_volume(None, 0.5, 0.3));
+    }
+
+    #[test]
+    fn volume_not_adopted_when_device_reports_stale_default() {
+        // Devialet keeps reporting 0.50 while the user saved 0.30 — the value
+        // never moves, so the saved volume must be preserved (Fabien).
+        assert!(!decisions::should_adopt_device_volume(Some(0.5), 0.5, 0.3));
+    }
+
+    #[test]
+    fn volume_adopted_on_real_device_change() {
+        // The knob moved on the device (0.50 -> 0.62) and now differs from the
+        // saved volume — adopt it.
+        assert!(decisions::should_adopt_device_volume(Some(0.5), 0.62, 0.3));
+    }
+
+    #[test]
+    fn volume_not_adopted_when_change_matches_saved() {
+        // Device moved but landed on what we already have stored.
+        assert!(!decisions::should_adopt_device_volume(
+            Some(0.5),
+            0.62,
+            0.62
+        ));
+    }
 
     #[test]
     fn gapless_cooldown_suppresses_stopped() {

@@ -446,3 +446,81 @@ mod tests {
         assert_eq!(dsd_rate_from_sample_rate(44100), None);
     }
 }
+
+/// Nanoseconds since UNIX epoch (controller clock domain for OAAT PTS).
+pub(crate) fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Process-wide OAAT clock sync responder port (one clock master identity
+/// for the whole server). Bound once on first use; answers endpoint-initiated
+/// exchanges (OAAT RFC §6.2) so endpoints can PTS-schedule playback against
+/// our clock. Returns 0 if binding failed (announced as "no responder").
+pub(crate) fn oaat_clock_port() -> u16 {
+    use std::sync::OnceLock;
+    static PORT: OnceLock<u16> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        let sock = std::net::UdpSocket::bind(("0.0.0.0", oaat_core::DEFAULT_CLOCK_PORT))
+            .or_else(|_| std::net::UdpSocket::bind(("0.0.0.0", 0)));
+        match sock {
+            Ok(s) => {
+                if s.set_nonblocking(true).is_err() {
+                    return 0;
+                }
+                let port = s.local_addr().map(|a| a.port()).unwrap_or(0);
+                tokio::spawn(async move {
+                    let Ok(sock) = tokio::net::UdpSocket::from_std(s) else {
+                        return;
+                    };
+                    clock_responder_loop(sock).await;
+                });
+                tracing::info!(port, "oaat: clock sync responder listening");
+                port
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "oaat: clock responder unavailable, endpoints cannot sync");
+                0
+            }
+        }
+    })
+}
+
+/// Answer OAAT clock sync requests: stamp t2/t3 and echo t1 back.
+async fn clock_responder_loop(socket: tokio::net::UdpSocket) {
+    use oaat_core::wire::{ClockSyncPacket, ClockSyncType};
+    let mut buf = [0u8; ClockSyncPacket::SIZE];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "oaat: clock responder recv error");
+                break;
+            }
+        };
+        if n < ClockSyncPacket::SIZE {
+            continue;
+        }
+        let Ok(pkt) = ClockSyncPacket::decode(&buf) else {
+            continue;
+        };
+        if pkt.kind != ClockSyncType::Request {
+            continue;
+        }
+        let t2 = now_ns();
+        let t3 = now_ns();
+        let response = ClockSyncPacket {
+            version: 1,
+            kind: ClockSyncType::Response,
+            sequence: pkt.sequence,
+            t1: pkt.t1,
+            t2,
+            t3,
+        };
+        let mut resp = [0u8; ClockSyncPacket::SIZE];
+        response.encode(&mut resp);
+        let _ = socket.send_to(&resp, peer).await;
+    }
+}

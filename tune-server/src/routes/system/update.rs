@@ -182,6 +182,15 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
 
     tokio::spawn(async move {
         let set_phase = |p: &str| {
+            // Log every phase, and warn on failures — set_phase was previously
+            // silent, so a failed install (e.g. permission denied when Tune is
+            // installed under Program Files) left no trace in the logs and the
+            // update just "didn't happen" (Dominique, Windows 11).
+            if p.starts_with("failed") {
+                warn!(phase = %p, "update_phase_failed");
+            } else {
+                info!(phase = %p, "update_phase");
+            }
             *update_phase.lock().unwrap() = Some(p.to_string());
         };
 

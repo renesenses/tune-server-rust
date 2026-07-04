@@ -1145,14 +1145,41 @@ async fn set_repeat(
 
 async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    let ps = state.playback.get_state(zone_id).await;
+
+    // A zone can hold BOTH a local play_queue and a streaming_queue at once.
+    // Returning the local one whenever it is non-empty hid the streaming queue
+    // when a Qobuz album was played on top of a leftover local queue — the
+    // album tracks were invisible and the playing album could not be found
+    // (Cyrille). Instead, return the queue that matches what's actually playing.
+    let playing_source = ps
+        .now_playing
+        .as_ref()
+        .map(|np| np.source.clone())
+        .unwrap_or_default();
+    let is_streaming =
+        !playing_source.is_empty() && playing_source != "local" && playing_source != "file";
+
+    if is_streaming {
+        let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
+        if !streaming_items.is_empty() {
+            return Json(json!({
+                "tracks": streaming_items,
+                "position": ps.queue_position,
+                "length": streaming_items.len(),
+            }));
+        }
+    }
+
     let items = queue_repo.get_queue(zone_id).unwrap_or_default();
     if !items.is_empty() {
         let position = items.iter().position(|i| i.is_current).unwrap_or(0);
         let length = items.len();
         return Json(json!({ "tracks": items, "position": position, "length": length }));
     }
+
+    // Fallback: a freshly-set streaming queue before playback state caught up.
     let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-    let ps = state.playback.get_state(zone_id).await;
     Json(
         json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }),
     )
@@ -2101,16 +2128,72 @@ async fn set_audio_profile(
 // Shuffle All (global playback)
 // ---------------------------------------------------------------------------
 
-pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(serde::Deserialize)]
+pub struct ShuffleAllQuery {
+    zone_id: Option<i64>,
+    search_query: Option<String>,
+    genre: Option<String>,
+    album_id: Option<i64>,
+    artist_id: Option<i64>,
+}
+
+pub async fn shuffle_all(
+    State(state): State<AppState>,
+    Query(q): Query<ShuffleAllQuery>,
+) -> impl IntoResponse {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
 
-    let all_ids = track_repo.random_ids(100).unwrap_or_default();
+    // Honor the current library filter context so the shuffle applies to the
+    // visible results, not the whole library, and target the caller's zone
+    // (Sergio: shuffle from a search result did nothing / played nowhere).
+    let mut all_ids: Vec<i64> = if let Some(aid) = q.album_id {
+        track_repo
+            .list_by_album(aid)
+            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+            .unwrap_or_default()
+    } else if let Some(arid) = q.artist_id {
+        track_repo
+            .list_by_artist(arid)
+            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+            .unwrap_or_default()
+    } else if let Some(sq) = q
+        .search_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        track_repo
+            .search(sq, 500)
+            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+            .unwrap_or_default()
+    } else if let Some(g) = q.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        track_repo
+            .search(g, 500)
+            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+            .unwrap_or_default()
+    } else {
+        track_repo.random_ids(100).unwrap_or_default()
+    };
     if all_ids.is_empty() {
-        return (StatusCode::BAD_REQUEST, "library is empty").into_response();
+        return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
     }
 
-    let zone_id = 1i64; // default zone
+    // Fisher-Yates shuffle (xorshift64, time-seeded — no rand dependency).
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    for i in (1..all_ids.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let j = (seed % (i as u64 + 1)) as usize;
+        all_ids.swap(i, j);
+    }
+
+    let zone_id = q.zone_id.unwrap_or(1);
     queue_repo.set_queue(zone_id, &all_ids).ok();
 
     let first_id = all_ids[0];
@@ -2137,7 +2220,7 @@ pub async fn shuffle_all(State(state): State<AppState>) -> impl IntoResponse {
                 .playback
                 .update_queue_info(zone_id, 0, all_ids.len() as i64)
                 .await;
-            let mut resp = json!({ "zone_id": zone_id, "tracks_queued": all_ids.len(), "output_sent": result.output_sent });
+            let mut resp = json!({ "zone_id": zone_id, "track_count": all_ids.len(), "tracks_queued": all_ids.len(), "output_sent": result.output_sent });
             if let Some(ref err) = result.error {
                 resp.as_object_mut()
                     .unwrap()

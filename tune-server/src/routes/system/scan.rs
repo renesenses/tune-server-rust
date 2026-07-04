@@ -329,22 +329,18 @@ pub(super) async fn trigger_scan(
 
                     let album = if let Some(ref key) = album_key {
                         if let Some(cached) = album_cache.get(key) {
-                            let cached_ref = std::sync::Arc::clone(cached);
-                            if let Some(ref album_title) = meta.album {
-                                let t = album_title.to_lowercase();
-                                if t.contains("best") || t.contains("greatest") {
-                                    tracing::info!(
-                                        album = %album_title,
-                                        cache_key_artist_id = key.1,
-                                        cache_key_year = ?key.2,
-                                        cached_album_id = ?cached_ref.id,
-                                        cached_album_artist_id = ?cached_ref.artist_id,
-                                        file = %sf.path,
-                                        "DIAG_album_cache_hit"
-                                    );
-                                }
+                            let c = std::sync::Arc::clone(cached);
+                            if c.artist_id != Some(key.1) {
+                                tracing::warn!(
+                                    album = %key.0,
+                                    cache_key_artist_id = key.1,
+                                    cached_album_id = ?c.id,
+                                    cached_album_artist_id = ?c.artist_id,
+                                    file = %sf.path,
+                                    "BUG_album_cache_artist_mismatch"
+                                );
                             }
-                            Some(cached_ref)
+                            Some(c)
                         } else {
                             let result = album_repo
                                 .get_or_create_with_mbid(
@@ -352,25 +348,29 @@ pub(super) async fn trigger_scan(
                                     key.1,
                                     key.2,
                                     meta.musicbrainz_release_id.as_deref(),
-                                )
-                                .ok()
-                                .map(std::sync::Arc::new);
+                                );
+                            if let Err(ref e) = result {
+                                tracing::warn!(
+                                    album = %key.0,
+                                    artist_id = key.1,
+                                    year = ?key.2,
+                                    error = %e,
+                                    file = %sf.path,
+                                    "BUG_album_create_failed"
+                                );
+                            }
+                            let result = result.ok().map(std::sync::Arc::new);
                             if let Some(ref a) = result {
-                                if let Some(ref album_title) = meta.album {
-                                    let t = album_title.to_lowercase();
-                                    if t.contains("best") || t.contains("greatest") {
-                                        tracing::info!(
-                                            album = %album_title,
-                                            lookup_artist_id = key.1,
-                                            lookup_year = ?key.2,
-                                            result_album_id = ?a.id,
-                                            result_artist_id = ?a.artist_id,
-                                            result_title = %a.title,
-                                            mb_release_id = ?meta.musicbrainz_release_id,
-                                            file = %sf.path,
-                                            "DIAG_album_db_lookup"
-                                        );
-                                    }
+                                if a.artist_id != Some(key.1) {
+                                    tracing::warn!(
+                                        album = %key.0,
+                                        requested_artist_id = key.1,
+                                        returned_album_id = ?a.id,
+                                        returned_artist_id = ?a.artist_id,
+                                        mb_release_id = ?meta.musicbrainz_release_id,
+                                        file = %sf.path,
+                                        "BUG_album_artist_mismatch"
+                                    );
                                 }
                                 album_cache.insert(key.clone(), std::sync::Arc::clone(a));
                             }

@@ -290,7 +290,11 @@ pub async fn batch_enrich_artwork(
 ///
 /// Order: mozaiklabs community → Fanart.tv → TheAudioDB → MusicBrainz
 /// direct image → MusicBrainz→Wikidata→Wikimedia → Discogs → Last.fm.
-pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>> {
+pub async fn fetch_artist_image(
+    mbid: &str,
+    artist_name: &str,
+    discogs_token: Option<&str>,
+) -> Option<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
@@ -322,7 +326,7 @@ pub async fn fetch_artist_image(mbid: &str, artist_name: &str) -> Option<Vec<u8>
     // 6. Discogs (if token configured, search by artist name)
     if !artist_name.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name).await {
+        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name, discogs_token).await {
             return Some(bytes);
         }
     }
@@ -479,10 +483,17 @@ async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Optio
 async fn fetch_artist_image_discogs(
     client: &reqwest::Client,
     artist_name: &str,
+    token: Option<&str>,
 ) -> Option<Vec<u8>> {
-    let token = std::env::var("TUNE_DISCOGS_TOKEN")
-        .or_else(|_| std::env::var("DISCOGS_TOKEN"))
-        .ok()?;
+    // Prefer the token passed by the caller (resolved from DB settings — where
+    // the UI stores it), falling back to the environment. Previously this read
+    // env only, so a Discogs token configured in the app never applied and no
+    // artist images were fetched (Progman).
+    let token = token
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("TUNE_DISCOGS_TOKEN").ok())
+        .or_else(|| std::env::var("DISCOGS_TOKEN").ok())?;
     if token.is_empty() {
         return None;
     }
@@ -670,6 +681,23 @@ pub async fn batch_enrich_artist_artwork(
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Discogs token as configured in the app UI (stored in settings), so the
+    // by-name Discogs image lookup actually works (Progman: no artist images).
+    let discogs_token = settings
+        .get("discogs_token")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("TUNE_DISCOGS_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("DISCOGS_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
@@ -679,7 +707,7 @@ pub async fn batch_enrich_artist_artwork(
         // longer delay only when hitting external APIs (MusicBrainz etc.)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        match fetch_artist_image(mbid, name).await {
+        match fetch_artist_image(mbid, name, discogs_token.as_deref()).await {
             Some(data) => {
                 // Use artist-specific hash key (same as manual upload)
                 let hash = artwork_hash(&format!("artist-mbid-{mbid}"));
@@ -735,10 +763,7 @@ pub async fn batch_enrich_artist_artwork(
     // --- Phase 3: Try Discogs + Last.fm by name for artists without MBID and without image ---
     let mut discogs_enriched = 0u32;
     let mut lastfm_enriched = 0u32;
-    let discogs_available = std::env::var("TUNE_DISCOGS_TOKEN")
-        .or_else(|_| std::env::var("DISCOGS_TOKEN"))
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
+    let discogs_available = discogs_token.is_some();
     let lastfm_available = std::env::var("TUNE_LASTFM_API_KEY")
         .or_else(|_| std::env::var("LASTFM_API_KEY"))
         .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
@@ -770,7 +795,9 @@ pub async fn batch_enrich_artist_artwork(
 
                 // Try Discogs first
                 if discogs_available {
-                    if let Some(data) = fetch_artist_image_discogs(&client, name).await {
+                    if let Some(data) =
+                        fetch_artist_image_discogs(&client, name, discogs_token.as_deref()).await
+                    {
                         let hash = artwork_hash(&format!("artist-name-{name}"));
                         std::fs::create_dir_all(&cache_dir).ok();
                         if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {

@@ -128,6 +128,17 @@ pub struct LicenseState {
     pub expires_at: Option<String>,
     pub last_validated: Option<String>,
     pub hardware_fingerprint: String,
+    /// Premium granted by the linked mozaiklabs.fr **account** (SSO), independent
+    /// of any license key. Second, OR-ed source of premium (see `effective_tier`).
+    #[serde(default)]
+    pub account_premium: bool,
+    /// Subscription end for the account premium (ISO-8601), `None` = no expiry.
+    #[serde(default)]
+    pub account_premium_expires: Option<String>,
+    /// Last time the account premium was confirmed from the server (ISO-8601);
+    /// drives the offline grace window.
+    #[serde(default)]
+    pub account_premium_checked: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +201,26 @@ impl LicenseManager {
             "license_manager_initialized"
         );
 
+        // Account premium (SSO) — loaded as-is; expiry & offline grace are applied
+        // live in `effective_tier`, so no load-time degradation is needed here.
+        let account_premium = settings
+            .get("mozaik_premium")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let account_premium_expires = settings.get("mozaik_premium_expires").ok().flatten();
+        let account_premium_checked = settings.get("mozaik_premium_checked").ok().flatten();
+
         let state = LicenseState {
             tier,
             license_key,
             expires_at,
             last_validated,
             hardware_fingerprint,
+            account_premium,
+            account_premium_expires,
+            account_premium_checked,
         };
 
         Self {
@@ -204,34 +229,39 @@ impl LicenseManager {
         }
     }
 
-    /// Current tier.
+    /// Effective tier: Premium if EITHER a premium license key OR a valid
+    /// account premium (SSO) is active. This is the tier all gating uses.
     pub async fn tier(&self) -> Tier {
-        self.state.read().await.tier
+        effective_tier(&*self.state.read().await)
     }
 
-    /// Shorthand: is the current tier Premium?
+    /// Shorthand: is the effective tier Premium?
     pub async fn is_premium(&self) -> bool {
         self.tier().await == Tier::Premium
     }
 
-    /// Check whether a specific feature is enabled.
-    /// All 6 premium features require Premium tier.
+    /// Check whether a specific feature is enabled. All premium features require
+    /// the effective Premium tier (license key or account premium).
     pub async fn check_feature(&self, _feature: Feature) -> bool {
-        self.state.read().await.tier == Tier::Premium
+        effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
     /// Check whether adding a new zone is allowed.
     /// Free tier: max FREE_MAX_ZONES.  Premium: unlimited.
     pub async fn check_zone_limit(&self, current_count: i64) -> bool {
-        match self.state.read().await.tier {
+        match effective_tier(&*self.state.read().await) {
             Tier::Premium => true,
             Tier::Free => current_count < FREE_MAX_ZONES,
         }
     }
 
-    /// Clone snapshot of the current license state (for API responses).
+    /// Clone snapshot of the current license state (for API responses). The
+    /// `tier` field reflects the *effective* tier so the UI shows premium even
+    /// when it comes from the account rather than a license key.
     pub async fn license_state(&self) -> LicenseState {
-        self.state.read().await.clone()
+        let mut snapshot = self.state.read().await.clone();
+        snapshot.tier = effective_tier(&snapshot);
+        snapshot
     }
 
     /// Store a license key and set tier to Premium.
@@ -291,6 +321,47 @@ impl LicenseManager {
         state.last_validated = Some(now.clone());
 
         info!(tier = %tier, validated = %now, "license_updated_from_server");
+    }
+
+    /// Set the account premium (SSO) state. Called after an SSO login (and by the
+    /// periodic refresh) with the `premium` flag and optional subscription expiry
+    /// from `/api/v1/user`. Stamps the check time for the offline grace window.
+    pub async fn set_account_premium(&self, premium: bool, expires: Option<String>) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        settings
+            .set("mozaik_premium", if premium { "true" } else { "false" })
+            .ok();
+        settings.set("mozaik_premium_checked", &now).ok();
+        if let Some(ref exp) = expires {
+            settings.set("mozaik_premium_expires", exp).ok();
+        } else {
+            settings.delete("mozaik_premium_expires").ok();
+        }
+
+        let mut state = self.state.write().await;
+        state.account_premium = premium;
+        state.account_premium_expires = expires;
+        state.account_premium_checked = Some(now);
+
+        info!(account_premium = premium, "license_account_premium_updated");
+    }
+
+    /// Clear the account premium (SSO logout / disconnect). The license-key path
+    /// is untouched.
+    pub async fn clear_account_premium(&self) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        settings.delete("mozaik_premium").ok();
+        settings.delete("mozaik_premium_expires").ok();
+        settings.delete("mozaik_premium_checked").ok();
+
+        let mut state = self.state.write().await;
+        state.account_premium = false;
+        state.account_premium_expires = None;
+        state.account_premium_checked = None;
+
+        info!("license_account_premium_cleared");
     }
 
     /// Compute a hardware fingerprint: SHA-256 of (hostname + platform ID).
@@ -404,6 +475,35 @@ fn platform_machine_id() -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether the account premium (SSO) currently counts as active: flag set, its
+/// subscription not past, and last confirmed within the offline grace window.
+fn account_premium_active(state: &LicenseState) -> bool {
+    if !state.account_premium {
+        return false;
+    }
+    // Subscription end (if known): past expiry → not active.
+    if let Some(ref exp) = state.account_premium_expires {
+        if is_expired(exp, 0) {
+            return false;
+        }
+    }
+    // Offline grace: must have been confirmed from the server recently.
+    match state.account_premium_checked {
+        Some(ref checked) => !is_expired(checked, GRACE_PERIOD_DAYS),
+        None => false,
+    }
+}
+
+/// Effective tier = Premium if the license key is premium OR the account premium
+/// (SSO) is active. Otherwise Free.
+fn effective_tier(state: &LicenseState) -> Tier {
+    if state.tier == Tier::Premium || account_premium_active(state) {
+        Tier::Premium
+    } else {
+        Tier::Free
+    }
+}
+
 /// Check whether an ISO-8601 timestamp is older than `days` from now.
 fn is_expired(timestamp: &str, days: i64) -> bool {
     let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H:%M:%SZ") else {
@@ -465,6 +565,121 @@ mod tests {
     #[test]
     fn is_expired_true_for_invalid() {
         assert!(is_expired("not-a-date", 30));
+    }
+
+    // ---- effective_tier / account premium (SSO) ----
+
+    fn now_iso() -> String {
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    fn future_iso(days: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn past_iso(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn state(
+        tier: Tier,
+        account_premium: bool,
+        account_premium_expires: Option<String>,
+        account_premium_checked: Option<String>,
+    ) -> LicenseState {
+        LicenseState {
+            tier,
+            license_key: None,
+            expires_at: None,
+            last_validated: None,
+            hardware_fingerprint: "test".into(),
+            account_premium,
+            account_premium_expires,
+            account_premium_checked,
+        }
+    }
+
+    #[test]
+    fn effective_free_when_nothing() {
+        assert_eq!(
+            effective_tier(&state(Tier::Free, false, None, None)),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_premium_via_license_key() {
+        // Key premium alone wins, regardless of account fields.
+        assert_eq!(
+            effective_tier(&state(Tier::Premium, false, None, None)),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_premium_via_account_recent_check() {
+        // Account premium, confirmed now, no subscription end → Premium.
+        assert_eq!(
+            effective_tier(&state(Tier::Free, true, None, Some(now_iso()))),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_premium_via_account_future_expiry() {
+        assert_eq!(
+            effective_tier(&state(
+                Tier::Free,
+                true,
+                Some(future_iso(30)),
+                Some(now_iso())
+            )),
+            Tier::Premium
+        );
+    }
+
+    #[test]
+    fn effective_free_when_account_subscription_expired() {
+        // Subscription end in the past → not premium even if recently checked.
+        assert_eq!(
+            effective_tier(&state(Tier::Free, true, Some(past_iso(1)), Some(now_iso()))),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_free_when_account_grace_expired() {
+        // Confirmed 40 days ago, past the 30-day offline grace → degrade.
+        assert_eq!(
+            effective_tier(&state(Tier::Free, true, None, Some(past_iso(40)))),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_free_when_account_never_checked() {
+        assert_eq!(
+            effective_tier(&state(Tier::Free, true, None, None)),
+            Tier::Free
+        );
+    }
+
+    #[test]
+    fn effective_premium_key_survives_expired_account() {
+        // A premium license key stays premium even if the account premium lapsed.
+        assert_eq!(
+            effective_tier(&state(
+                Tier::Premium,
+                true,
+                Some(past_iso(1)),
+                Some(now_iso())
+            )),
+            Tier::Premium
+        );
     }
 
     #[test]

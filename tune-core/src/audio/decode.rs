@@ -1391,53 +1391,57 @@ fn decode_dsd_to_pcm(
 ) -> Result<DecodedAudio, String> {
     use super::dsd_to_pcm::DsdToPcmStreamer;
 
-    // Process the file in chunks using the streaming readers.
-    // Parse header once, then create both the streamer and the reader from it.
-    let mut all_pcm_24: Vec<u8> = Vec::new();
+    // Convert the streamer's 24-bit LE output bytes straight to i32 samples,
+    // chunk by chunk, so we never accumulate a second full-file byte buffer
+    // (a DSD64 album track is hundreds of MB; the old code held both the bytes
+    // and the i32 samples, then copied a third time via `to_vec`).
+    let append_pcm24 = |dst: &mut Vec<i32>, bytes: &[u8]| {
+        for c in bytes.chunks_exact(3) {
+            let v = c[0] as u32 | ((c[1] as u32) << 8) | ((c[2] as u32) << 16);
+            dst.push(if v & 0x80_0000 != 0 {
+                (v | 0xFF00_0000) as i32
+            } else {
+                v as i32
+            });
+        }
+    };
+
+    let mut all_samples: Vec<i32> = Vec::new();
 
     let (dsd_rate, output_rate, channels) = if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
         let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        // Pre-reserve the whole output so the Vec doesn't repeatedly reallocate
+        // as it grows: output samples ≈ (dsd_samples / decimation) * channels.
+        let decimation = (dsd_rate / output_rate).max(1) as u64;
+        all_samples.reserve((info.total_samples / decimation) as usize * channels);
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, true);
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
-            all_pcm_24.extend_from_slice(&streamer.feed(&dsd_chunk));
+            append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
         }
-        all_pcm_24.extend_from_slice(&streamer.flush());
+        append_pcm24(&mut all_samples, &streamer.flush());
         (dsd_rate, output_rate, channels)
     } else {
         let info = super::dff::parse_dff(file_path)?;
         let dsd_rate = info.sample_rate;
         let channels = info.channels as usize;
         let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+        // DFF has no explicit sample count; estimate from the data chunk size
+        // (data_size bytes * 8 DSD samples/byte, then decimated).
+        let decimation = (dsd_rate / output_rate).max(1) as u64;
+        all_samples.reserve((info.data_size.saturating_mul(8) / decimation) as usize);
         let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, false);
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
-            all_pcm_24.extend_from_slice(&streamer.feed(&dsd_chunk));
+            append_pcm24(&mut all_samples, &streamer.feed(&dsd_chunk));
         }
-        all_pcm_24.extend_from_slice(&streamer.flush());
+        append_pcm24(&mut all_samples, &streamer.flush());
         (dsd_rate, output_rate, channels)
     };
-
-    // Convert 24-bit LE bytes to i32 samples
-    let num_samples = all_pcm_24.len() / 3;
-    let mut all_samples: Vec<i32> = Vec::with_capacity(num_samples);
-    for i in 0..num_samples {
-        let offset = i * 3;
-        let lo = all_pcm_24[offset] as u32;
-        let mid = all_pcm_24[offset + 1] as u32;
-        let hi = all_pcm_24[offset + 2] as u32;
-        let val24 = lo | (mid << 8) | (hi << 16);
-        let val32 = if val24 & 0x80_0000 != 0 {
-            (val24 | 0xFF00_0000) as i32
-        } else {
-            val24 as i32
-        };
-        all_samples.push(val32);
-    }
 
     // Apply seek and duration limits on the output PCM
     let skip_frames = if seek_s > 0.0 {
@@ -1455,10 +1459,10 @@ fn decode_dsd_to_pcm(
     let max_samples = max_frames.saturating_mul(channels);
 
     let start = skip_samples.min(all_samples.len());
-    let end = (start + max_samples).min(all_samples.len());
-    let trimmed = &all_samples[start..end];
+    let end = start.saturating_add(max_samples).min(all_samples.len());
+    let out_len = end - start;
 
-    let actual_frames = trimmed.len() / channels;
+    let actual_frames = out_len / channels;
     let actual_duration = actual_frames as f64 / output_rate as f64;
 
     debug!(
@@ -1467,13 +1471,19 @@ fn decode_dsd_to_pcm(
         dsd_rate,
         output_rate,
         channels,
-        samples = trimmed.len(),
+        samples = out_len,
         duration_s = actual_duration,
         "decoded_dsd_native"
     );
 
+    // Trim in place (drop tail then head) so the fully-decoded buffer is
+    // returned without allocating a second copy. With no seek (start == 0) the
+    // drain is a no-op and the Vec is moved out directly.
+    all_samples.truncate(end);
+    all_samples.drain(..start);
+
     Ok(DecodedAudio {
-        samples_i32: trimmed.to_vec(),
+        samples_i32: all_samples,
         bit_depth: 24,
         sample_rate: output_rate,
         channels: channels as u32,
@@ -1491,6 +1501,91 @@ mod decode_integration_tests {
         p.push("tests/fixtures");
         p.push(name);
         p.to_string_lossy().to_string()
+    }
+
+    /// Write a minimal valid stereo DSD64 .dsf file to `path`, filling every
+    /// DSD byte with `pattern`. One super-block per channel (4096 bytes each).
+    fn write_test_dsf(path: &str, pattern: u8) {
+        let channels: u32 = 2;
+        let sample_rate: u32 = 2_822_400;
+        let block_size: u32 = 4096;
+        let total_samples: u64 = block_size as u64 * 8; // DSD samples per channel
+        // Data: ch0 block then ch1 block (block-interleaved).
+        let mut data = Vec::new();
+        for _ in 0..channels {
+            data.extend(std::iter::repeat_n(pattern, block_size as usize));
+        }
+
+        let mut buf = Vec::new();
+        // DSD chunk (28 bytes)
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+        // fmt chunk (52 bytes)
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u32.to_le_bytes()); // format id = DSD raw
+        buf.extend_from_slice(&2u32.to_le_bytes()); // channel type = stereo
+        buf.extend_from_slice(&channels.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // bits per sample
+        buf.extend_from_slice(&total_samples.to_le_bytes());
+        buf.extend_from_slice(&block_size.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        // data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    // End-to-end DSD decode: exercises parse_dsf + DsfStreamReader block
+    // deinterleave + DsdToPcmStreamer FIR (incl. the fast path) + the
+    // chunk->i32 conversion and in-place trim. No real .dsf fixtures existed.
+    #[test]
+    fn decode_dsf_end_to_end_silence() {
+        let path = std::env::temp_dir().join("tune_test_dsf_silence.dsf");
+        let p = path.to_str().unwrap();
+        // 0x55 = 01010101, LSB-first -> alternating +1/-1 -> near silence.
+        write_test_dsf(p, 0x55);
+        let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(out.sample_rate, 176_400);
+        assert_eq!(out.bit_depth, 24);
+        assert_eq!(out.channels, 2);
+        assert!(!out.samples_i32.is_empty(), "should produce PCM");
+
+        let n = out.samples_i32.len();
+        let mut max_abs = 0i32;
+        for &s in &out.samples_i32[n / 4..3 * n / 4] {
+            max_abs = max_abs.max(s.abs());
+        }
+        // 24-bit full scale is 8_388_607; alternating DSD must be near silence.
+        assert!(
+            max_abs < 300_000,
+            "alternating DSD should be near silence, got {max_abs}"
+        );
+    }
+
+    #[test]
+    fn decode_dsf_end_to_end_negative_dc() {
+        let path = std::env::temp_dir().join("tune_test_dsf_negdc.dsf");
+        let p = path.to_str().unwrap();
+        // 0x00 = all bits 0 -> all -1.0 -> strong negative DC.
+        write_test_dsf(p, 0x00);
+        let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!out.samples_i32.is_empty());
+        let mid = out.samples_i32[out.samples_i32.len() / 2];
+        assert!(
+            mid < -3_000_000,
+            "all-zero DSD should decode to strong negative PCM, got {mid}"
+        );
     }
 
     #[test]
