@@ -41,20 +41,24 @@ impl PostgresDb {
     /// at runtime. `days_of_week`/`multi_zone_ids` were missing on .15 prod →
     /// the alarm scheduler failed every 30s with `column ... does not exist`.
     async fn ensure_schema(&self) {
-        if let Err(e) = sqlx::query(
-            "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111'",
-        )
-        .execute(&self.pool)
-        .await
-        {
-            warn!(error = %e, "pg_ensure_schema_days_of_week_failed");
-        }
-        if let Err(e) =
-            sqlx::query("ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT")
-                .execute(&self.pool)
-                .await
-        {
-            warn!(error = %e, "pg_ensure_schema_multi_zone_ids_failed");
+        // Every column SQLite gains via `add_column_if_missing` that the
+        // hand-written PG schema omits. All idempotent (ADD COLUMN IF NOT
+        // EXISTS) and TEXT-typed to match this codebase's TEXT-based PG schema.
+        // `days_of_week` was the one that surfaced (.15 prod alarm scheduler
+        // failing every 30s); the others (zones.dsd_mode, is_hidden, …) are
+        // latent landmines audited from migrations.rs.
+        const ENSURE_COLUMNS: &str = "\
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111';\
+ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT;\
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden TEXT DEFAULT '0';\
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS dsd_mode TEXT DEFAULT 'auto';\
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0';\
+ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped';\
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;\
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;\
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;";
+        if let Err(e) = sqlx::raw_sql(ENSURE_COLUMNS).execute(&self.pool).await {
+            warn!(error = %e, "pg_ensure_schema_failed");
         }
     }
 
