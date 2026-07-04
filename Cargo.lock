@@ -2223,9 +2223,8 @@ dependencies = [
 
 [[package]]
 name = "oaat-controller"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78c12236db588204b49252b18bd568ab302594d1bdbec45ab6bf054514c940e1"
+version = "0.2.3"
+source = "git+https://github.com/renesenses/oaat?rev=a5d5503#a5d5503807543d6c1ff027dc4be8dc9268dedd40"
 dependencies = [
  "bytes",
  "hostname",
@@ -2241,9 +2240,8 @@ dependencies = [
 
 [[package]]
 name = "oaat-core"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49944b584717bd3e9ee1f38f2ca50ad8a9280fe16a6a317f1ce512199e61e621"
+version = "0.2.3"
+source = "git+https://github.com/renesenses/oaat?rev=a5d5503#a5d5503807543d6c1ff027dc4be8dc9268dedd40"
 dependencies = [
  "bitflags 2.11.1",
  "bytes",
