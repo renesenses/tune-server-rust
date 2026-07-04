@@ -779,11 +779,26 @@ impl PlaybackOrchestrator {
                 // Network outputs (DLNA): check if the renderer supports the
                 // radio stream format (typically AAC). If not, proxy + transcode
                 // to WAV so the renderer can play it.
+                // Passthrough ONLY when the URL carries an unambiguous,
+                // renderer-supported extension (.mp3/.flac/.wav). Extension-less
+                // Icecast mounts fall through guess_mime_from_url() to the default
+                // "audio/mpeg", and .aac (ADTS) maps to "audio/mp4" — both are
+                // mislabels. The renderer then opens a stream whose bytes don't
+                // match the advertised protocolInfo, reports PLAYING and emits
+                // SILENCE (Cyrille, Yamaha R-N2000A). Transcode every ambiguous
+                // codec (.aac/.ogg/.opus/HLS/extension-less) to WAV so sound is
+                // guaranteed; explicit .mp3/.flac stations still pass through with
+                // no CPU/bandwidth cost.
+                let url_path = audio_url.split(['?', '#']).next().unwrap_or(audio_url);
+                let reliable_ext = {
+                    let p = url_path.to_lowercase();
+                    p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
+                };
                 let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
                     let radio_mime = guess_mime_from_url(audio_url);
-                    !self.dlna_supports_mime(device_id, &radio_mime).await
+                    !reliable_ext || !self.dlna_supports_mime(device_id, &radio_mime).await
                 } else {
-                    false
+                    !reliable_ext
                 };
 
                 if needs_proxy {
