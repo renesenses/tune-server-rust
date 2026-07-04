@@ -37,6 +37,15 @@ const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
 /// poll with "Invalid grant_type", so device-code login never completes.
 const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
+/// Current Unix time in seconds, for the `X-Goog-Request-Time` header that
+/// OAuth-authenticated InnerTube requests must carry.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 
@@ -245,7 +254,14 @@ impl YouTubeService {
             .header("X-Goog-Visitor-Id", "");
 
         if let Some(ref token) = self.access_token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            // OAuth (device/TV client) InnerTube requests must carry a request
+            // timestamp. Google rejects an OAuth call without it as 400
+            // "Request contains an invalid argument" — this is the header
+            // ytmusicapi sets exclusively for its OAuth auth type, and its
+            // absence is why authenticated search/browse/player kept failing.
+            req = req
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Goog-Request-Time", unix_now_secs().to_string());
         }
 
         let resp = req
@@ -378,7 +394,10 @@ impl YouTubeService {
             .header("Referer", "https://music.youtube.com/");
 
         if let Some(ref token) = self.access_token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            // See ytm_post: OAuth calls need the request timestamp header.
+            req = req
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Goog-Request-Time", unix_now_secs().to_string());
         } else {
             req = req.header(
                 "User-Agent",
