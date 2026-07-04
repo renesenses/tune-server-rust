@@ -602,58 +602,97 @@ async fn browse_media_server(
     };
     drop(servers);
 
-    let soap_body = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
+    // UPnP Browse returns results in PAGES. The old code issued a single
+    // Browse with RequestedCount=200 and returned only that page, so a server
+    // with thousands of albums showed just its first page (~100 on MinimServer /
+    // Twonky / Asset, which cap a single response) — "le résumé est juste mais la
+    // liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
+    // StartingIndex, accumulating children until NumberReturned==0 or
+    // StartingIndex>=TotalMatches, with a safety bound.
+    const PAGE_SIZE: u32 = 200;
+    const MAX_PAGES: u32 = 500; // up to 100k children
+    let client = reqwest::Client::new();
+    let mut containers: Vec<Value> = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+    let mut starting_index: u32 = 0;
+    let mut total_matches: u32 = 0;
+
+    for _page in 0..MAX_PAGES {
+        let soap_body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
 <s:Body>
 <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
 <ObjectID>{object_id}</ObjectID>
 <BrowseFlag>BrowseDirectChildren</BrowseFlag>
 <Filter>*</Filter>
-<StartingIndex>0</StartingIndex>
-<RequestedCount>200</RequestedCount>
+<StartingIndex>{starting_index}</StartingIndex>
+<RequestedCount>{PAGE_SIZE}</RequestedCount>
 <SortCriteria></SortCriteria>
 </u:Browse>
 </s:Body>
 </s:Envelope>"#
-    );
+        );
 
-    let client = reqwest::Client::new();
-    let resp = match client
-        .post(&ms.content_directory_url)
-        .header("Content-Type", "text/xml; charset=utf-8")
-        .header(
-            "SOAPAction",
-            "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
-        )
-        .body(soap_body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("browse_media_server soap_error server={} err={e}", ms.name);
-            return Json(json!({
-                "object_id": object_id,
-                "containers": [],
-                "items": [],
-                "total_matches": 0,
-                "number_returned": 0,
-            }));
+        let resp = match client
+            .post(&ms.content_directory_url)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header(
+                "SOAPAction",
+                "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
+            )
+            .body(soap_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "browse_media_server soap_error server={} start={starting_index} err={e}",
+                    ms.name
+                );
+                break;
+            }
+        };
+
+        let body = resp.text().await.unwrap_or_default();
+        let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
+        let parsed = (page_containers.len() + page_items.len()) as u32;
+
+        // NumberReturned / TotalMatches are un-escaped siblings of the escaped
+        // DIDL <Result> in the SOAP body — no collision with the payload.
+        let number_returned: u32 = extract_xml_tag(&body, "NumberReturned")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(parsed);
+        if let Some(tm) = extract_xml_tag(&body, "TotalMatches").and_then(|s| s.trim().parse().ok())
+        {
+            total_matches = tm;
         }
-    };
 
-    let body = resp.text().await.unwrap_or_default();
-    let (containers, items) = parse_didl_browse_response(&body);
-    let total = containers.len() + items.len();
+        containers.append(&mut page_containers);
+        items.append(&mut page_items);
+
+        if number_returned == 0 || parsed == 0 {
+            break;
+        }
+        // Advance by what the server actually returned (robust against servers
+        // that page smaller than RequestedCount).
+        starting_index += number_returned.max(parsed);
+        if total_matches != 0 && starting_index >= total_matches {
+            break;
+        }
+    }
+
+    let fetched = containers.len() + items.len();
+    let total = (total_matches as usize).max(fetched);
 
     Json(json!({
         "object_id": object_id,
         "containers": containers,
         "items": items,
         "total_matches": total,
-        "number_returned": total,
+        "number_returned": fetched,
     }))
 }
 
