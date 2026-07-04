@@ -48,7 +48,7 @@ impl OaatMultiroomOutput {
                 controller_id: uuid::Uuid::new_v4().to_string(),
                 controller_name: "Tune Server".into(),
                 features: vec![],
-                clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+                clock_port: super::helpers::oaat_clock_port(),
                 tls: false,
             };
             Arc::new(Mutex::new(oaat_controller::Zone::new(
@@ -406,6 +406,8 @@ impl OutputTarget for OaatMultiroomOutput {
 
             // Streaming loop — fan-out via Zone
             let mut sample_offset: u64 = 0;
+            // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
+            let stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
             let start = std::time::Instant::now();
             let mut health_check_interval =
@@ -443,9 +445,9 @@ impl OutputTarget for OaatMultiroomOutput {
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
                             let pts_ns = if is_flac {
-                                (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
+                                stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
-                                (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
                             };
                             let flags = if sample_offset == 0 && byte_offset == 0 {
                                 PacketFlags::FIRST_PACKET
