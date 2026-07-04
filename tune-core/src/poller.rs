@@ -821,8 +821,13 @@ impl PositionPoller {
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
             if !zone_fixed_volume
                 && !in_vol_grace2
+                && status.volume > 0.001
                 && status.volume < 0.999
-                && (status.volume - zone_state.volume).abs() > 0.005
+                && should_adopt_device_volume(
+                    ps.last_device_volume,
+                    status.volume,
+                    zone_state.volume,
+                )
             {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
@@ -831,6 +836,13 @@ impl PositionPoller {
                     .update_volume(zone_id, vol_int)
                     .ok();
             }
+            // Edge-triggered like the stopped/radio paths: record the reported
+            // volume so a renderer stuck at a persistent default (HiFi Rose
+            // RS130 reporting 25) can't repeatedly clobber the saved volume.
+            // This normal-playing path was never migrated to the #358 predicate
+            // and still used level-triggered adoption → auto-reset to 25%
+            // (Philippe).
+            ps.last_device_volume = Some(status.volume);
 
             // --- Persist position to DB periodically ---
             ps.ticks_since_db_save += 1;
