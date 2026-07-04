@@ -2058,9 +2058,25 @@ impl OutputTarget for LocalOutput {
                 if default_sr == Some(sample_rate) {
                     // Device is already at the source rate — use it directly
                     default_cfg.unwrap()
+                } else if let Some(cfg) = find_matching_config(&device, channels, sample_rate)
+                    .filter(|c| c.sample_rate == sample_rate)
+                {
+                    // Device SUPPORTS the source rate even though its current
+                    // default differs — open at the source rate for bit-perfect
+                    // output and to avoid an extreme realtime resample.  A DSD256
+                    // file decodes to 352.8kHz; on a DAC left at 44.1kHz by the
+                    // OS the old code resampled 352.8k→44.1k in real time, the
+                    // sinc resampler underran and no sound came out (Cyrille,
+                    // FiiO K3 which natively supports 352.8kHz, iFi Neo iDSD).
+                    info!(
+                        source_sr = sample_rate,
+                        device_default_sr = ?default_sr,
+                        "local_audio_open_at_source_rate_supported"
+                    );
+                    cfg
                 } else if let Some(cfg) = default_cfg {
-                    // Device rate differs from source — open at device rate,
-                    // rubato will resample.
+                    // Device does not support the source rate — open at device
+                    // rate, rubato will resample.
                     info!(
                         source_sr = sample_rate,
                         device_sr = cfg.sample_rate,
