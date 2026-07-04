@@ -1503,6 +1503,91 @@ mod decode_integration_tests {
         p.to_string_lossy().to_string()
     }
 
+    /// Write a minimal valid stereo DSD64 .dsf file to `path`, filling every
+    /// DSD byte with `pattern`. One super-block per channel (4096 bytes each).
+    fn write_test_dsf(path: &str, pattern: u8) {
+        let channels: u32 = 2;
+        let sample_rate: u32 = 2_822_400;
+        let block_size: u32 = 4096;
+        let total_samples: u64 = block_size as u64 * 8; // DSD samples per channel
+        // Data: ch0 block then ch1 block (block-interleaved).
+        let mut data = Vec::new();
+        for _ in 0..channels {
+            data.extend(std::iter::repeat_n(pattern, block_size as usize));
+        }
+
+        let mut buf = Vec::new();
+        // DSD chunk (28 bytes)
+        buf.extend_from_slice(b"DSD ");
+        buf.extend_from_slice(&28u64.to_le_bytes());
+        buf.extend_from_slice(&(28 + 52 + 12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+        // fmt chunk (52 bytes)
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&52u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u32.to_le_bytes()); // format id = DSD raw
+        buf.extend_from_slice(&2u32.to_le_bytes()); // channel type = stereo
+        buf.extend_from_slice(&channels.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // bits per sample
+        buf.extend_from_slice(&total_samples.to_le_bytes());
+        buf.extend_from_slice(&block_size.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        // data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(12 + data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data);
+
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    // End-to-end DSD decode: exercises parse_dsf + DsfStreamReader block
+    // deinterleave + DsdToPcmStreamer FIR (incl. the fast path) + the
+    // chunk->i32 conversion and in-place trim. No real .dsf fixtures existed.
+    #[test]
+    fn decode_dsf_end_to_end_silence() {
+        let path = std::env::temp_dir().join("tune_test_dsf_silence.dsf");
+        let p = path.to_str().unwrap();
+        // 0x55 = 01010101, LSB-first -> alternating +1/-1 -> near silence.
+        write_test_dsf(p, 0x55);
+        let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(out.sample_rate, 176_400);
+        assert_eq!(out.bit_depth, 24);
+        assert_eq!(out.channels, 2);
+        assert!(!out.samples_i32.is_empty(), "should produce PCM");
+
+        let n = out.samples_i32.len();
+        let mut max_abs = 0i32;
+        for &s in &out.samples_i32[n / 4..3 * n / 4] {
+            max_abs = max_abs.max(s.abs());
+        }
+        // 24-bit full scale is 8_388_607; alternating DSD must be near silence.
+        assert!(
+            max_abs < 300_000,
+            "alternating DSD should be near silence, got {max_abs}"
+        );
+    }
+
+    #[test]
+    fn decode_dsf_end_to_end_negative_dc() {
+        let path = std::env::temp_dir().join("tune_test_dsf_negdc.dsf");
+        let p = path.to_str().unwrap();
+        // 0x00 = all bits 0 -> all -1.0 -> strong negative DC.
+        write_test_dsf(p, 0x00);
+        let out = decode_dsd_to_pcm(p, "dsf", Some(176_400), None, 0.0, 0.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!out.samples_i32.is_empty());
+        let mid = out.samples_i32[out.samples_i32.len() / 2];
+        assert!(
+            mid < -3_000_000,
+            "all-zero DSD should decode to strong negative PCM, got {mid}"
+        );
+    }
+
     #[test]
     fn can_decode_native_formats() {
         assert!(can_decode_native("song.flac"));
