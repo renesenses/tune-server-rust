@@ -279,9 +279,10 @@ async fn add_from_web(
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
-        url: q.url,
+        url: q.url.clone(),
         homepage: None,
-        logo_url: q.logo_url,
+        // Fall back to the stream host favicon so a web-added radio shows art.
+        logo_url: q.logo_url.clone().or_else(|| favicon_from_url(&q.url)),
         country: q.country,
         language: None,
         genre: q.genre,
@@ -438,7 +439,7 @@ async fn import_radios(
             name: s.name.clone(),
             url: s.url.clone(),
             homepage: s.homepage.clone(),
-            logo_url: s.logo_url.clone(),
+            logo_url: s.logo_url.clone().or_else(|| favicon_from_url(&s.url)),
             country: s.country.clone(),
             language: s.language.clone(),
             genre: s.genre.clone(),
@@ -473,7 +474,16 @@ async fn import_radios_m3u(
             .clone()
             .or_else(|| entry.extra_attrs.get("tvg-name").cloned())
             .unwrap_or_else(|| entry.path.clone());
-        let logo = entry.extra_attrs.get("tvg-logo").cloned();
+        // Playlists use several logo attribute spellings (tvg-logo / url-logo /
+        // logo); PLS carries none. Fall back to the stream host favicon so every
+        // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
+        let logo = entry
+            .extra_attrs
+            .get("tvg-logo")
+            .or_else(|| entry.extra_attrs.get("url-logo"))
+            .or_else(|| entry.extra_attrs.get("logo"))
+            .cloned()
+            .or_else(|| favicon_from_url(&entry.path));
         let group = entry.extra_attrs.get("group-title").cloned();
         let station = RadioStation {
             id: None,
