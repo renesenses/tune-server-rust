@@ -585,6 +585,49 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Like `list_by_album` but restricted to tracks matching an active
+    /// quality/format filter, so the album detail agrees with a filtered grid.
+    /// Sergio: a Hi-Res + 96kHz + FLAC filter matched a mixed album (the grid
+    /// matches if ANY track qualifies), then the detail listed every track —
+    /// including MP3/44.1 ones. The predicates mirror `AlbumRepo::list_filtered`
+    /// (on the `t.` alias) so grid and detail stay consistent. With no filter it
+    /// delegates to `list_by_album` (identical behavior).
+    pub fn list_by_album_filtered(
+        &self,
+        album_id: i64,
+        format: Option<&str>,
+        quality: Option<&str>,
+    ) -> Result<Vec<Track>, TuneError> {
+        let mut extra = String::new();
+        // Format is user-supplied: validate against an allowlist so it can be
+        // inlined safely (no injection). The quality arms are constant strings.
+        if let Some(fmt) = format {
+            let f = fmt.to_lowercase();
+            const ALLOWED: &[&str] = &[
+                "flac", "mp3", "aac", "alac", "wav", "aiff", "aif", "dsf", "dff", "dsd", "ogg",
+                "opus", "wma", "ape", "wv", "m4a",
+            ];
+            if ALLOWED.contains(&f.as_str()) {
+                extra.push_str(&format!(" AND t.format = '{f}'"));
+            }
+        }
+        match quality {
+            Some("dsd") => extra.push_str(" AND t.format IN ('dsd','dsf','dff')"),
+            Some("hires") => extra.push_str(" AND (t.sample_rate > 44100 OR t.bit_depth > 16)"),
+            Some("cd") => extra.push_str(" AND t.sample_rate = 44100 AND t.bit_depth = 16"),
+            Some("lossy") => extra.push_str(" AND t.format IN ('mp3','aac','ogg','opus','wma')"),
+            _ => {}
+        }
+        if extra.is_empty() {
+            return self.list_by_album(album_id);
+        }
+        let base = self.dialect_sql(sql::list_by_album, sql::list_by_album);
+        let sql = base.replacen(" ORDER BY", &format!("{extra} ORDER BY"), 1);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
