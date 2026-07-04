@@ -894,8 +894,20 @@ impl PlaybackOrchestrator {
         let file_path = track.file_path.ok_or("track has no file_path")?;
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
-        let sample_rate = track.sample_rate.unwrap_or(44100) as u32;
-        let bit_depth = track.bit_depth.unwrap_or(16) as u16;
+        // DSD is 1-bit at MHz rates. When the DB row is missing audio props
+        // (lofty returns None for many .dsf/.dff files), fall back to DSD64
+        // defaults, NOT the PCM 44100/16 defaults — otherwise a native-DSD track
+        // played to a DSD-capable renderer shows "44.1 kHz / 16 bit" in the
+        // signal path / now-playing chip (Benjithom, HiFi Rose RS130), and the
+        // DSD→PCM transcode-fallback rate math is fed the wrong input rate.
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        let sample_rate = track
+            .sample_rate
+            .unwrap_or(if is_dsd_source { 2_822_400 } else { 44100 })
+            as u32;
+        let bit_depth = track
+            .bit_depth
+            .unwrap_or(if is_dsd_source { 1 } else { 16 }) as u16;
         let channels = track.channels as u16;
 
         // Determine the output type and max_sample_rate for this zone.
