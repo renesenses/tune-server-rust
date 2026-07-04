@@ -52,10 +52,14 @@ const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 /// YouTube Music context body for internal API calls.
 /// This mimics the web client request format that YouTube Music expects.
 fn ytm_context() -> serde_json::Value {
+    // clientVersion must be recent — InnerTube rejects a stale WEB_REMIX version
+    // with 400 "invalid argument". ytmusicapi computes it as "1.<YYYYMMDD>.01.00"
+    // from the current date; a hardcoded ~1-year-old version silently rots.
+    let client_version = format!("1.{}.01.00", chrono::Utc::now().format("%Y%m%d"));
     json!({
         "client": {
             "clientName": "WEB_REMIX",
-            "clientVersion": "1.20250620.01.00",
+            "clientVersion": client_version,
             "hl": "en",
             "gl": "US",
             "experimentIds": [],
@@ -245,7 +249,7 @@ impl YouTubeService {
         // "erreur 502" on search in v0.8.251).
         let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
 
-        let mut req = self
+        let req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -253,16 +257,18 @@ impl YouTubeService {
             .header("Referer", "https://music.youtube.com/")
             .header("X-Goog-Visitor-Id", "");
 
-        if let Some(ref token) = self.access_token {
-            // OAuth (device/TV client) InnerTube requests must carry a request
-            // timestamp. Google rejects an OAuth call without it as 400
-            // "Request contains an invalid argument" — this is the header
-            // ytmusicapi sets exclusively for its OAuth auth type, and its
-            // absence is why authenticated search/browse/player kept failing.
-            req = req
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-Goog-Request-Time", unix_now_secs().to_string());
-        }
+        // Do NOT attach the OAuth Bearer here. Every ytm_post endpoint (search,
+        // browse home/album/artist/playlist) is PUBLIC data, and the user-library
+        // endpoints that would need auth (get_user_playlists/albums/artists) are
+        // unimplemented (they return empty). So the token brings zero function
+        // here — it only poisons the call: this is the TV/device-code OAuth flow
+        // that Google deprecated for InnerTube (yt-dlp abandoned it; ytmusicapi
+        // OAuth still 400s). The 502 regression appeared exactly when #381 made
+        // login succeed and the Bearer began being attached (search/browse/home
+        // 502 for Bilou, Jean Marie, Fabien). Removing it restores the pre-#381
+        // working unauthenticated browse/search. #388 (?key=) and #394
+        // (X-Goog-Request-Time) were header-level guesses on this same poisoned
+        // authenticated path and could not help.
 
         let resp = req
             .json(&body)
