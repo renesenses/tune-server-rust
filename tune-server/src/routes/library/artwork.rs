@@ -22,15 +22,18 @@ pub(super) struct ProxyQuery {
 
 pub(super) async fn serve_artwork(Path(hash): Path<String>) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
-    for ext in &["jpg", "png"] {
+    for ext in &["jpg", "png", "webp"] {
         let path = cache_dir.join(format!("{hash}.{ext}"));
         if path.exists()
             && let Ok(data) = tokio::fs::read(&path).await
         {
-            let mime = if *ext == "png" {
-                "image/png"
-            } else {
-                "image/jpeg"
+            // webp is common for radio station logos and custom radio uploads
+            // (set_radio_artwork accepts it) but serve_artwork never served it →
+            // 404 → blank cover (Bilou).
+            let mime = match *ext {
+                "png" => "image/png",
+                "webp" => "image/webp",
+                _ => "image/jpeg",
             };
             let mut headers = axum::http::HeaderMap::new();
             headers.insert("Content-Type", axum::http::HeaderValue::from_static(mime));
