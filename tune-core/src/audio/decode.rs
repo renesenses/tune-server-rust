@@ -502,8 +502,16 @@ fn decode_to_pcm_streaming_inner(
         };
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| "no tokio runtime for streaming decode")?;
-        let ch = target_channels.unwrap_or(decoded.channels as u32) as u16;
-        let sr = target_sample_rate.unwrap_or(decoded.sample_rate);
+        // AIFF/APE/WavPack decoders emit PCM at the file's NATIVE rate/channels
+        // (decode_aiff_to_pcm ignores the target params), so the WAV header must
+        // describe the DECODED truth, not the target — otherwise the local output
+        // plays native-rate bytes as if they were the (different) target rate →
+        // wrong speed/pitch, and .aiff "doesn't play" on USB (Cyrille). This
+        // matches the symphonia path, which headers with the real source rate.
+        // For any decoder in this branch that DOES resample to the target,
+        // decoded.* already equals the target, so this is a no-op there.
+        let ch = decoded.channels as u16;
+        let sr = decoded.sample_rate;
         if target_bit_depth.is_some() {
             let wav_hdr = super::wav::build_wav_header(ch, sr, output_bd);
             if let Err(_) = rt.block_on(tx.send(wav_hdr.to_vec())) {
@@ -545,7 +553,6 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             if let Some(ref ltx) = levels_tx {
-                let sr = target_sample_rate.unwrap_or(decoded.sample_rate);
                 let _ = ltx.send(super::levels::compute_levels(chunk, output_bd, ch, sr));
             }
         }
