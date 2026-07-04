@@ -185,7 +185,25 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 }
             }
             _ = ping_interval.tick() => {
+                // Keepalive. Send BOTH a protocol Ping (standards-compliant native
+                // clients auto-Pong) AND an app-level text ping the web client
+                // matches exactly (`{"type":"ping"}` → it replies "pong"). Protocol
+                // Ping frames are invisible to browser JS and are stripped/ignored
+                // by some proxies / VPNs / webviews, so on their own they don't
+                // keep the app-level channel alive through an intermediary: the
+                // socket is torn down on the intermediary's idle timeout every
+                // ~15s and the client reconnects in a loop (Jean Marie, macOS). A
+                // real Text frame forces data through every hop and defeats idle
+                // timeouts. The client's "pong" reply is non-JSON text and is
+                // harmlessly ignored by the recv arm below.
                 if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+                if socket
+                    .send(Message::Text("{\"type\":\"ping\"}".into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
