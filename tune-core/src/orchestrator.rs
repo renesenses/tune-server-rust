@@ -3692,10 +3692,17 @@ impl PlaybackOrchestrator {
             return Ok(result);
         }
 
-        // Fallback to streaming queue
+        // Fallback to streaming queue. A zone can hold BOTH a local play_queue
+        // and a streaming_queue at once (a Qobuz track added while a local file
+        // plays), and the poller advances through a COMBINED position space:
+        // local items occupy 0..L, streaming items L..L+S. Index the streaming
+        // vec by the offset within its own 0-based table, not the raw combined
+        // position (Progman: the added Qobuz track never played because
+        // streaming.get(1) was None for 1 local + 1 streaming).
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
         let item = streaming
-            .get(position as usize)
+            .get((position - local_count).max(0) as usize)
             .ok_or("no queue item at position")?;
 
         let source_id = item["source_id"].as_str().unwrap_or("").to_string();
@@ -3756,7 +3763,7 @@ impl PlaybackOrchestrator {
 
         let result = self.play(req).await?;
         self.playback
-            .update_queue_info(zone_id, position, streaming.len() as i64)
+            .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
             .await;
         Ok(result)
     }
@@ -3802,8 +3809,9 @@ impl PlaybackOrchestrator {
             return Ok(());
         }
 
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        if let Some(item) = streaming.get(position as usize) {
+        if let Some(item) = streaming.get((position - local_count).max(0) as usize) {
             let title = item["title"].as_str().unwrap_or("").to_string();
             let artist = item["artist_name"].as_str().map(String::from);
             let album = item["album_title"].as_str().map(String::from);
@@ -3837,7 +3845,7 @@ impl PlaybackOrchestrator {
             self.playback.update_position(zone_id, 0).await;
             self.playback.emit_position(zone_id, 0);
             self.playback
-                .update_queue_info(zone_id, position, streaming.len() as i64)
+                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
                 .await;
             return Ok(());
         }
@@ -3899,10 +3907,13 @@ impl PlaybackOrchestrator {
             });
         }
 
-        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.)
+        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.). Combined
+        // position space: local 0..L, streaming L..L+S — index by the offset
+        // within the streaming table.
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
         let item = streaming
-            .get(position as usize)
+            .get((position - local_count).max(0) as usize)
             .ok_or("no queue item at position (local or streaming)")?;
         let source_id = item["source_id"].as_str().unwrap_or("").to_string();
         let title = item["title"].as_str().map(String::from);
