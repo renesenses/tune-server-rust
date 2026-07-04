@@ -676,19 +676,44 @@ const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
     "bit_depth",
 ];
 
-pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled_keys: Vec<String> = settings
-        .get("metadata_visible_fields")
+/// Active profile id (defaults to 1 = default profile) — the visible-metadata
+/// settings are scoped per profile (Bilou: "elles devraient être associées au
+/// profil"), reusing the same `active_profile_id` setting the orchestrator uses.
+fn active_profile_id(settings: &SettingsRepo) -> i64 {
+    settings
+        .get("active_profile_id")
         .ok()
         .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
+fn metadata_fields_key(pid: i64) -> String {
+    format!("metadata_visible_fields:{pid}")
+}
+
+/// Read the profile-scoped visible fields, falling back to the legacy global
+/// key (pre-per-profile installs migrate transparently on first read) then the
+/// built-in defaults.
+fn read_visible_fields(settings: &SettingsRepo) -> Vec<String> {
+    let pid = active_profile_id(settings);
+    settings
+        .get(&metadata_fields_key(pid))
+        .ok()
+        .flatten()
+        .or_else(|| settings.get("metadata_visible_fields").ok().flatten())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| {
             DEFAULT_VISIBLE_FIELDS
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
-        });
+        })
+}
+
+pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let enabled_keys: Vec<String> = read_visible_fields(&settings);
 
     // Group fields by category, preserving catalog order
     let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
@@ -733,7 +758,10 @@ pub(super) async fn set_metadata_fields(
         })
         .collect();
     let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
-    settings.set("metadata_visible_fields", &json_val).ok();
+    // Persist under the profile-scoped key so different profiles keep separate
+    // visible-field sets and an update never loses them.
+    let pid = active_profile_id(&settings);
+    settings.set(&metadata_fields_key(pid), &json_val).ok();
     Json(json!({ "fields": valid_keys }))
 }
 
