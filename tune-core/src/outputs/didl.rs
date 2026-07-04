@@ -34,6 +34,23 @@ pub fn dlna_flags_for_mime(mime: &str) -> &'static str {
     }
 }
 
+/// DLNA flags string for a *live* (infinite) stream such as internet radio.
+///
+/// Differs from [`dlna_flags_for_mime`] in two important ways:
+/// - `DLNA.ORG_OP=00` : no byte-range and no time seek (a live stream is not
+///   seekable). Advertising `OP=01` on a source with no size makes some
+///   renderers reject or silently drop the stream.
+/// - `DLNA.ORG_FLAGS=8D500000…` : senderPaced (`sn-increase`, bit 31) +
+///   streaming-transfer-mode (bit 24) + background (bit 22) + DLNA v1.5
+///   (bit 20). This is the widely-used flag set for live/senderPaced sources.
+///
+/// The `DLNA.ORG_PN` profile name is intentionally omitted: renderers are
+/// stricter about matching a declared PN against an exact bitrate/profile for
+/// live streams, and an absent PN is treated as "unspecified" (accepted).
+pub fn dlna_flags_for_mime_live(_mime: &str) -> &'static str {
+    "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8D500000000000000000000000000000"
+}
+
 /// Format a duration in milliseconds to DIDL `HH:MM:SS.mmm` format.
 pub fn format_duration_didl(ms: u64) -> String {
     let total_secs = ms / 1000;
@@ -99,6 +116,9 @@ pub struct DidlBuilder {
     item_id: String,
     /// Parent id attribute value.
     parent_id: String,
+    /// True for infinite live streams (internet radio): emit live/senderPaced
+    /// protocolInfo flags and never emit `size=`/`duration=` in `<res>`.
+    live_stream: bool,
 }
 
 impl DidlBuilder {
@@ -122,7 +142,18 @@ impl DidlBuilder {
             include_upnp_artist: false,
             item_id: "0".to_string(),
             parent_id: "0".to_string(),
+            live_stream: false,
         }
+    }
+
+    /// Mark this item as an infinite live stream (internet radio).
+    ///
+    /// Switches the `<res>` protocolInfo to live/senderPaced flags
+    /// (`DLNA.ORG_OP=00`, `DLNA.ORG_FLAGS=8D50…`) and suppresses the
+    /// `size=`/`duration=` attributes regardless of any values set.
+    pub fn live_stream(mut self, yes: bool) -> Self {
+        self.live_stream = yes;
+        self
     }
 
     pub fn artist(mut self, artist: &str) -> Self {
@@ -302,23 +333,35 @@ impl DidlBuilder {
         // Protocol info
         let protocol_info = match self.protocol_style {
             ProtocolStyle::Dlna => {
-                let flags = dlna_flags_for_mime(&self.mime_type);
+                let flags = if self.live_stream {
+                    dlna_flags_for_mime_live(&self.mime_type)
+                } else {
+                    dlna_flags_for_mime(&self.mime_type)
+                };
                 format!("http-get:*:{}:{}", self.mime_type, flags)
             }
             ProtocolStyle::Simple => format!("http-get:*:{}:*", self.mime_type),
         };
 
-        // Res attributes
-        let dur_attr = self
-            .duration_ms
-            .filter(|d| *d > 0)
-            .map(|d| format!(" duration=\"{}\"", format_duration_didl(d)))
-            .unwrap_or_default();
+        // Res attributes. Live streams (internet radio) are infinite and not
+        // seekable — never advertise a duration or size for them, otherwise
+        // renderers try to treat the source as a fixed-length file.
+        let dur_attr = if self.live_stream {
+            String::new()
+        } else {
+            self.duration_ms
+                .filter(|d| *d > 0)
+                .map(|d| format!(" duration=\"{}\"", format_duration_didl(d)))
+                .unwrap_or_default()
+        };
 
-        let size_attr = self
-            .file_size
-            .map(|s| format!(" size=\"{s}\""))
-            .unwrap_or_default();
+        let size_attr = if self.live_stream {
+            String::new()
+        } else {
+            self.file_size
+                .map(|s| format!(" size=\"{s}\""))
+                .unwrap_or_default()
+        };
 
         let sr_attr = self
             .sample_rate
@@ -562,6 +605,44 @@ mod tests {
     fn dlna_flags_aac() {
         assert!(dlna_flags_for_mime("audio/mp4").contains("DLNA.ORG_PN=AAC_ISO"));
         assert!(dlna_flags_for_mime("audio/aac").contains("DLNA.ORG_PN=AAC_ISO"));
+    }
+
+    #[test]
+    fn dlna_flags_live_no_seek() {
+        let f = dlna_flags_for_mime_live("audio/mpeg");
+        assert!(f.contains("DLNA.ORG_OP=00"), "live stream must not seek");
+        assert!(f.contains("8D50"), "live stream uses senderPaced flags");
+        assert!(!f.contains("DLNA.ORG_OP=01"));
+    }
+
+    #[test]
+    fn live_stream_didl_omits_size_and_duration() {
+        // Even when a size/duration are set, a live stream must not advertise
+        // them — some renderers (Yamaha R-N2000A) stay silent otherwise.
+        let xml = DidlBuilder::new("France Inter", "http://icecast/fip.mp3", "audio/mpeg")
+            .protocol_style(ProtocolStyle::Dlna)
+            .live_stream(true)
+            .duration_ms(999_000)
+            .file_size(123_456)
+            .build();
+        assert!(
+            xml.contains("DLNA.ORG_OP=00"),
+            "live protocolInfo, got: {xml}"
+        );
+        assert!(!xml.contains("size="), "no size on live stream");
+        assert!(!xml.contains("duration="), "no duration on live stream");
+    }
+
+    #[test]
+    fn non_live_stream_keeps_file_semantics() {
+        let xml = DidlBuilder::new("Track", "http://x/s.flac", "audio/flac")
+            .protocol_style(ProtocolStyle::Dlna)
+            .duration_ms(200_000)
+            .file_size(5_000_000)
+            .build();
+        assert!(xml.contains("DLNA.ORG_OP=01"));
+        assert!(xml.contains("size=\"5000000\""));
+        assert!(xml.contains("duration="));
     }
 
     #[test]

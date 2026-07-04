@@ -353,6 +353,10 @@ impl PlaybackOrchestrator {
                 sample_rate: resolved.sample_rate,
                 bit_depth: resolved.bit_depth,
                 channels: resolved.channels,
+                // Internet radio is an infinite live stream — mark it so the
+                // DLNA DIDL advertises live/senderPaced semantics instead of a
+                // seekable file (Yamaha R-N2000A stays silent otherwise).
+                live_stream: resolved.source == "radio",
             };
             let result = self.send_to_output(device_id, &media, req.seek_ms).await;
             let total_ms = play_start.elapsed().as_millis();

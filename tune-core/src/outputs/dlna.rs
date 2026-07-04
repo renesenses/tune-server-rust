@@ -202,6 +202,7 @@ impl DlnaOutput {
         let is_dsd = media.mime_type.contains("dsd") || media.mime_type.contains("dsf");
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, media.mime_type)
             .protocol_style(ProtocolStyle::Dlna)
+            .live_stream(media.live_stream)
             .dlna_art_profile(true)
             .include_upnp_artist(true)
             .item_id(item_id)
