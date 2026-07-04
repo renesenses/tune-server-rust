@@ -422,10 +422,25 @@ pub(super) async fn trigger_scan(
                                             .extension()
                                             .and_then(|e| e.to_str())
                                             .unwrap_or("jpg");
-                                        if let Ok(data) = std::fs::read(&candidate) {
+                                        // Only record the image in the DB if the
+                                        // cache write actually succeeded. Setting
+                                        // image_path after a failed read/save left
+                                        // the DB claiming "has image" with nothing
+                                        // on disk → grey square + permanent skip
+                                        // (Sandro, fresh install where the cache
+                                        // dir wasn't writable).
+                                        let saved = std::fs::read(&candidate).ok().and_then(|data| {
                                             tune_core::library::artwork::save_to_cache(
                                                 &data, &cache_dir, &hash, ext,
+                                            )
+                                        });
+                                        if saved.is_none() {
+                                            tracing::warn!(
+                                                artist = %art.name,
+                                                candidate = %candidate.display(),
+                                                "artist_image_cache_write_failed_not_recording"
                                             );
+                                            continue;
                                         }
                                         let mut updated_artist =
                                             tune_core::db::models::Artist::clone(art);

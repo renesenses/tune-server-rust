@@ -585,6 +585,18 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
 
 /// Run batch artist image enrichment for all artists with an MBID but no image.
 ///
+/// Whether an artist's recorded artwork actually exists (so enrichment can
+/// re-fetch when the DB claims an image but the cache file is gone).
+/// A remote `http(s)` `image_path` is served by redirect, so treat it as
+/// present. Local paths are cache hashes → probe both `.jpg` and `.png`.
+fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> bool {
+    if image_path.starts_with("http") {
+        return true;
+    }
+    cache_dir.join(format!("{image_path}.jpg")).exists()
+        || cache_dir.join(format!("{image_path}.png")).exists()
+}
+
 /// Phase 1: Check community-approved images from mozaiklabs.fr first.
 /// Phase 2: For remaining artists, fetch from mozaiklabs API / Fanart.tv / MusicBrainz,
 /// then submit discovered images back to the community (fire-and-forget).
@@ -602,9 +614,16 @@ pub async fn batch_enrich_artist_artwork(
         crate::cloud::community::fetch_approved_artist_images("https://mozaiklabs.fr", None).await
     {
         for img in &approved {
-            // Check if this artist is in our DB and still needs an image
+            // Check if this artist is in our DB and still needs an image.
+            // Gate on the cache file actually existing, not just the DB column:
+            // a scan can set image_path while the cache write failed, leaving a
+            // grey square that would otherwise be skipped forever (Sandro).
             if let Ok(Some(artist)) = artist_repo.get_by_musicbrainz_id(&img.mbid) {
-                if artist.image_path.is_some() {
+                if artist
+                    .image_path
+                    .as_deref()
+                    .is_some_and(|ip| cached_artwork_exists(&cache_dir, ip))
+                {
                     continue;
                 }
                 let artist_id = match artist.id {
