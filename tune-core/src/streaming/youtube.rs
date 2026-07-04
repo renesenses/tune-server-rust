@@ -32,6 +32,10 @@ const GOOGLE_CLIENT_SECRET: &str = "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";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+/// OAuth 2.0 Device Authorization Grant type (RFC 8628). The URN segment is
+/// `grant-type` with a HYPHEN — an underscore makes Google reject the token
+/// poll with "Invalid grant_type", so device-code login never completes.
+const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// YouTube Music API key for authenticated WEB_REMIX client requests.
 const YTM_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
@@ -677,7 +681,7 @@ impl YouTubeService {
                 "client_id={GOOGLE_CLIENT_ID}\
                  &client_secret={GOOGLE_CLIENT_SECRET}\
                  &device_code={device_code}\
-                 &grant_type=urn:ietf:params:oauth:grant_type:device_code"
+                 &grant_type={GOOGLE_DEVICE_GRANT_TYPE}"
             ))
             .send()
             .await
@@ -2956,6 +2960,19 @@ mod tests {
     fn youtube_service_name() {
         let svc = YouTubeService::new();
         assert_eq!(svc.name(), "youtube");
+    }
+
+    #[test]
+    fn device_grant_type_uses_rfc8628_hyphen() {
+        // RFC 8628 device grant type uses a HYPHEN in the `grant-type` segment.
+        // An underscore (`grant_type:device_code`) makes Google reject the token
+        // poll with "Invalid grant_type" and YouTube login never completes.
+        assert_eq!(
+            GOOGLE_DEVICE_GRANT_TYPE,
+            "urn:ietf:params:oauth:grant-type:device_code"
+        );
+        assert!(GOOGLE_DEVICE_GRANT_TYPE.contains("grant-type"));
+        assert!(!GOOGLE_DEVICE_GRANT_TYPE.contains("grant_type"));
     }
 
     #[test]
