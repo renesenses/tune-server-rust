@@ -309,6 +309,38 @@ impl AudioFormat {
     }
 }
 
+/// Decide whether a stream must be downsampled to fit a zone's `max_sample_rate`
+/// (a PCM Hz cap).
+///
+/// Two DSD-specific correctness rules that a naive `source_rate > max` check
+/// gets wrong:
+/// - For DSD, the stored `source_sample_rate` is the **raw DSD bit rate**
+///   (e.g. 2_822_400 for DSD64), NOT a PCM Hz value. Comparing it directly to a
+///   PCM cap is always true, which would wrongly force a full DSD→PCM transcode.
+///   We compare the **PCM output** rate ([`AudioFormat::dsd_output_sample_rate`])
+///   instead.
+/// - A stream the renderer plays natively (`dsd_passthrough`) is sent as-is as a
+///   DSD bitstream; a PCM sample-rate cap does not apply, so it is never
+///   downsampled.
+pub fn needs_downsample_for_cap(
+    source_format: Option<AudioFormat>,
+    source_sample_rate: u32,
+    zone_max_sample_rate: Option<u32>,
+    dsd_passthrough: bool,
+) -> bool {
+    if dsd_passthrough {
+        return false;
+    }
+    let Some(max) = zone_max_sample_rate else {
+        return false;
+    };
+    let effective_rate = match source_format {
+        Some(AudioFormat::Dsd) => AudioFormat::Dsd.dsd_output_sample_rate(source_sample_rate),
+        _ => source_sample_rate,
+    };
+    effective_rate > max
+}
+
 pub fn best_output_format(
     source_format: AudioFormat,
     source_sample_rate: u32,
@@ -345,6 +377,72 @@ mod tests {
     #[test]
     fn aiff_no_transcode() {
         assert!(!AudioFormat::Aiff.needs_transcode_for_dlna());
+    }
+
+    // --- needs_downsample_for_cap ---
+
+    #[test]
+    fn dsd_passthrough_never_downsamples() {
+        // Renderer plays DSD natively → the raw DSD bitstream is sent as-is;
+        // a PCM cap must not force a transcode (the RS130 album-cutoff bug).
+        assert!(!needs_downsample_for_cap(
+            Some(AudioFormat::Dsd),
+            2_822_400, // DSD64 raw bit rate
+            Some(384_000),
+            true, // dsd_passthrough
+        ));
+    }
+
+    #[test]
+    fn dsd_raw_bitrate_not_compared_against_pcm_cap() {
+        // Without passthrough, DSD64 decodes to 176.4kHz PCM, which fits a
+        // 384kHz cap → no downsample. The old code compared 2_822_400 > 384_000
+        // and wrongly returned true.
+        assert!(!needs_downsample_for_cap(
+            Some(AudioFormat::Dsd),
+            2_822_400,
+            Some(384_000),
+            false,
+        ));
+    }
+
+    #[test]
+    fn dsd_pcm_output_still_downsamples_when_over_cap() {
+        // DSD128 → 352.8kHz PCM; a 192kHz-capped zone must still downsample.
+        assert!(needs_downsample_for_cap(
+            Some(AudioFormat::Dsd),
+            5_644_800,
+            Some(192_000),
+            false,
+        ));
+    }
+
+    #[test]
+    fn pcm_source_downsamples_normally() {
+        // Non-DSD: 192kHz FLAC into a 96kHz-capped zone → downsample.
+        assert!(needs_downsample_for_cap(
+            Some(AudioFormat::Flac),
+            192_000,
+            Some(96_000),
+            false,
+        ));
+        // 96kHz FLAC into a 96kHz cap → no downsample.
+        assert!(!needs_downsample_for_cap(
+            Some(AudioFormat::Flac),
+            96_000,
+            Some(96_000),
+            false,
+        ));
+    }
+
+    #[test]
+    fn no_cap_never_downsamples() {
+        assert!(!needs_downsample_for_cap(
+            Some(AudioFormat::Flac),
+            192_000,
+            None,
+            false,
+        ));
     }
 
     #[test]
