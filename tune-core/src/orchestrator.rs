@@ -1027,8 +1027,18 @@ impl PlaybackOrchestrator {
             false
         };
 
-        // Downsample if the zone has a max_sample_rate cap and the source exceeds it
-        let needs_downsample = zone_max_sample_rate.is_some_and(|max| sample_rate > max);
+        // Downsample if the zone has a max_sample_rate cap and the source
+        // exceeds it. For DSD, `sample_rate` is the raw DSD bit rate (MHz), so
+        // this uses the PCM *output* rate for the comparison and never
+        // downsamples a native DSD passthrough — otherwise a capped zone would
+        // silently turn passthrough into a full DSD→PCM transcode (100s decode,
+        // transcode_timeout_120s, album cutoff on the HiFi Rose RS130).
+        let needs_downsample = crate::audio::formats::needs_downsample_for_cap(
+            source_format,
+            sample_rate,
+            zone_max_sample_rate,
+            dsd_passthrough,
+        );
         let needs_transcode = needs_transcode_for_output
             || oaat_needs_wav
             || local_needs_wav
