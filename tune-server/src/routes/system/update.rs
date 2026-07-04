@@ -228,6 +228,16 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         set_phase("extracting");
 
         let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+        // Sweep leftover tune-update-* dirs from earlier updates. The success
+        // path used to never remove the extraction dir, so one accumulated per
+        // version (Benjithom, Windows: a new folder on every update).
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with("tune-update-") {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
@@ -301,6 +311,12 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             set_phase(&format!("failed: Install failed: {e}"));
             return;
         }
+
+        // Success: install_windows/install_unix have copied the binary + web/
+        // into the install dir (the Windows .bat swap works entirely within
+        // exe_dir), so the extraction dir is no longer needed. Removing it here
+        // stops the per-version accumulation.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
 
         info!(
             from = %tune_core::version(),
