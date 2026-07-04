@@ -1962,6 +1962,19 @@ impl PlaybackOrchestrator {
                 "streaming_dash_pre_transcode_to_flac"
             );
 
+            // Strict DLNA renderers (Revox, Denon, Marantz) reject FLAC — their
+            // Sink doesn't advertise audio/flac, so they fetch the file but play
+            // nothing. Serve them LPCM/WAV instead, like the local-file path.
+            // Otherwise keep FLAC (smaller, Content-Length). Previously these
+            // streaming paths always emitted audio/flac (Philippe / Revox S100).
+            let dash_did = req.output_device_id.as_deref().unwrap_or("");
+            let dash_enc_format =
+                if dash_did.is_empty() || self.dlna_supports_mime(dash_did, "audio/flac").await {
+                    "flac"
+                } else {
+                    "wav"
+                };
+
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
             let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
@@ -1985,7 +1998,7 @@ impl PlaybackOrchestrator {
                     .map_err(|e| format!("no tokio runtime: {e}"))?;
                 let encoded_data = rt.block_on(async {
                     let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        "flac",
+                        dash_enc_format,
                         decoded.sample_rate,
                         actual_bd as u32,
                         decoded.channels,
