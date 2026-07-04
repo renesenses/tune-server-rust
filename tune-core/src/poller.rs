@@ -1483,6 +1483,30 @@ impl PositionPoller {
                 };
                 if let Some(output_arc) = output_arc {
                     let output = output_arc.lock().await;
+                    // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
+                    // Benjithom). They accept SetNextAVTransportURI for a DSD
+                    // stream but never transition to it — the next stream is
+                    // never consumed (bytes_sent stays 0) and the poller
+                    // force-stops the zone after STOPPED_FAILURE_THRESHOLD ticks,
+                    // i.e. "the album cuts after track 1". Don't arm gapless for a
+                    // DSD next on DLNA; handle_track_end plays it explicitly at
+                    // end-of-track instead (a small gap, never a cut). Local
+                    // output keeps its internal DSD gapless chain untouched.
+                    if output.output_type() == "dlna" {
+                        let url_lc = resolved.url.to_lowercase();
+                        let next_is_dsd = resolved.mime_type.contains("dsd")
+                            || resolved.mime_type.contains("dsf")
+                            || url_lc.ends_with(".dsf")
+                            || url_lc.ends_with(".dff");
+                        if next_is_dsd {
+                            info!(
+                                zone_id,
+                                mime = %resolved.mime_type,
+                                "gapless_skipped_dsd_next_dlna"
+                            );
+                            return false;
+                        }
+                    }
                     let media = crate::outputs::PlayMedia {
                         url: &resolved.url,
                         mime_type: &resolved.mime_type,
