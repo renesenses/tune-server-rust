@@ -2073,6 +2073,40 @@ impl OutputTarget for LocalOutput {
                         device_default_sr = ?default_sr,
                         "local_audio_open_at_source_rate_supported"
                     );
+                    // macOS: cpal's CoreAudio backend does NOT switch the device's
+                    // hardware nominal rate for output streams (see the note
+                    // above), so opening the cpal stream "at the source rate"
+                    // leaves the DAC clocked at the OS rate and CoreAudio silently
+                    // converts — which yields SILENCE for high-rate DSD→PCM
+                    // (DSD128/256/512 all decode to 352.8kHz; only DSD64's 176.4k
+                    // survived). We reach this branch precisely when the device
+                    // SUPPORTS the source rate but its default differs, so set the
+                    // hardware nominal rate explicitly (what the exclusive/hog path
+                    // already does) — the DAC then actually clocks at 352.8kHz.
+                    // Best-effort: if the device can't be resolved/set we fall
+                    // through to today's behavior (no regression). Cyrille: iFi
+                    // Neo iDSD / FiiO K3, DSD128+ silent.
+                    #[cfg(target_os = "macos")]
+                    {
+                        use coreaudio::audio_unit::macos_helpers;
+                        if let Some(dev_id) =
+                            macos_helpers::get_device_id_from_name(&device_name, false)
+                        {
+                            let want = cfg.sample_rate as f64;
+                            match macos_helpers::set_device_sample_rate(dev_id, want) {
+                                Ok(_) => info!(
+                                    device = %device_name,
+                                    to = cfg.sample_rate,
+                                    "local_audio_coreaudio_nominal_rate_set_shared"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    wanted = cfg.sample_rate,
+                                    "local_audio_coreaudio_set_rate_failed"
+                                ),
+                            }
+                        }
+                    }
                     cfg
                 } else if let Some(cfg) = default_cfg {
                     // Device does not support the source rate — open at device
