@@ -206,9 +206,16 @@ pub(super) async fn get_album(
 pub(super) async fn album_tracks(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(f): Query<AlbumFilters>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let items = repo.list_by_album(id).unwrap_or_default();
+    // When the library grid has an active quality/format filter, the client
+    // forwards it here so the album detail shows only the matching tracks
+    // (Sergio: a Hi-Res/FLAC filter must not reveal the album's MP3/44.1
+    // tracks). With no filter this is identical to list_by_album.
+    let items = repo
+        .list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
+        .unwrap_or_default();
     Json(json!(items))
 }
 
