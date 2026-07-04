@@ -37,9 +37,6 @@ const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
 /// poll with "Invalid grant_type", so device-code login never completes.
 const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// YouTube Music API key for authenticated WEB_REMIX client requests.
-const YTM_API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
-
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 
@@ -231,11 +228,13 @@ impl YouTubeService {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let url = if self.access_token.is_some() {
-            format!("{YTM_API_BASE}/{endpoint}?key={YTM_API_KEY}&prettyPrint=false")
-        } else {
-            format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false")
-        };
+        // Authenticate with the OAuth Bearer token ALONE. Passing both a
+        // `?key=` API key and an `Authorization: Bearer` header makes Google
+        // reject the call with 400 "Request contains an invalid argument".
+        // This only bites once a token exists — it regressed search/browse the
+        // moment #381 made YouTube login actually succeed (Jean Marie, Bilou:
+        // "erreur 502" on search in v0.8.251).
+        let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
 
         let mut req = self
             .client
@@ -366,11 +365,10 @@ impl YouTubeService {
             })
         };
 
-        let url = if has_auth {
-            format!("{YTM_API_BASE}/player?key={YTM_API_KEY}&prettyPrint=false")
-        } else {
-            format!("{YTM_API_BASE}/player?prettyPrint=false")
-        };
+        // Bearer token alone — never combine `?key=` with an OAuth Bearer
+        // header (Google returns 400 "invalid argument"). Same fix as ytm_post;
+        // this path would otherwise break YouTube playback once authenticated.
+        let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
 
         let mut req = self
             .client
