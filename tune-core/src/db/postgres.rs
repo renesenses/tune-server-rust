@@ -7,7 +7,7 @@
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::db::engine::{Engine, PostgresDialect};
 
@@ -30,7 +30,32 @@ impl PostgresDb {
             .map_err(|e| format!("postgres connect: {e}"))?;
 
         info!("postgres_connected");
-        Ok(Self { pool })
+        let db = Self { pool };
+        db.ensure_schema().await;
+        Ok(db)
+    }
+
+    /// Idempotently add columns that SQLite gains via `add_column_if_missing`
+    /// (a SQLite-only helper) but the hand-written PG schema never received, so
+    /// an existing Postgres database self-heals on startup instead of erroring
+    /// at runtime. `days_of_week`/`multi_zone_ids` were missing on .15 prod →
+    /// the alarm scheduler failed every 30s with `column ... does not exist`.
+    async fn ensure_schema(&self) {
+        if let Err(e) = sqlx::query(
+            "ALTER TABLE alarms ADD COLUMN IF NOT EXISTS days_of_week TEXT DEFAULT '1111111'",
+        )
+        .execute(&self.pool)
+        .await
+        {
+            warn!(error = %e, "pg_ensure_schema_days_of_week_failed");
+        }
+        if let Err(e) =
+            sqlx::query("ALTER TABLE alarms ADD COLUMN IF NOT EXISTS multi_zone_ids TEXT")
+                .execute(&self.pool)
+                .await
+        {
+            warn!(error = %e, "pg_ensure_schema_multi_zone_ids_failed");
+        }
     }
 
     /// Smoke-test the pool: runs `SELECT 1`.

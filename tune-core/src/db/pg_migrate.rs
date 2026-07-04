@@ -397,7 +397,9 @@ CREATE TABLE IF NOT EXISTS alarms (
     skip_holidays TEXT DEFAULT 0,
     source_name TEXT,
     fade_duration_s TEXT DEFAULT 60,
-    last_fired_at TEXT
+    last_fired_at TEXT,
+    days_of_week TEXT DEFAULT '1111111',
+    multi_zone_ids TEXT
 );
 
 CREATE TABLE IF NOT EXISTS network_mounts (
