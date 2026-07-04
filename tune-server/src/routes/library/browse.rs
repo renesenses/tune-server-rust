@@ -33,7 +33,11 @@ pub(super) async fn browse_roots(State(state): State<AppState>) -> Result<Json<V
             let norm = tune_core::scanner::walker::normalize_path(d);
             let norm_nfc: String = norm.nfc().collect();
             let sep = std::path::MAIN_SEPARATOR;
-            let pattern = format!("{norm_nfc}{sep}%");
+            // Trim any trailing separator so a library pointed at a drive/share
+            // root ("D:\" or "\\NAS\") doesn't produce a double separator in the
+            // LIKE pattern ("D:\\%") that matches nothing → "0 pistes".
+            let base = norm_nfc.trim_end_matches(|c| c == '/' || c == '\\');
+            let pattern = format!("{base}{sep}%");
             let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
                 "$1"
             } else {
@@ -123,7 +127,8 @@ pub(super) async fn browse_directory(
                     continue;
                 }
                 let sep = std::path::MAIN_SEPARATOR;
-                let pattern = format!("{dir_path}{sep}%");
+                let base = dir_path.trim_end_matches(|c| c == '/' || c == '\\');
+                let pattern = format!("{base}{sep}%");
                 let track_count: i64 = match state.backend.query_one(
                     &format!(
                         "SELECT COUNT(*) FROM tracks WHERE file_path LIKE {}",
@@ -156,7 +161,10 @@ pub(super) async fn browse_directory(
 
     // List tracks in this directory (not recursive — only direct children)
     let sep = std::path::MAIN_SEPARATOR;
-    let dir_prefix = format!("{}{sep}%", normalized_query);
+    let dir_prefix = format!(
+        "{}{sep}%",
+        normalized_query.trim_end_matches(|c| c == '/' || c == '\\')
+    );
     let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
         "$1"
     } else {
