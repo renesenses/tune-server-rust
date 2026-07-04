@@ -521,6 +521,43 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                         match change.change_type {
                             tune_core::scanner::watcher::ChangeType::Added
                             | tune_core::scanner::watcher::ChangeType::Modified => {
+                                // Unchanged-file guard (Jean Marie: "le scan tourne
+                                // en boucle", macOS Ventura). A Modified event whose
+                                // on-disk mtime+size still match the stored row is a
+                                // self-induced event: reading a file to import it
+                                // makes macOS write an extended attribute, which
+                                // fires another Modify event → re-read → infinite
+                                // loop. Detect it with a cheap stat and skip —
+                                // crucially WITHOUT reading the content (scan_files_
+                                // parallel), since the read is what re-triggers it.
+                                if change.change_type
+                                    == tune_core::scanner::watcher::ChangeType::Modified
+                                {
+                                    if let Ok(Some(existing)) = TrackRepo::with_backend(db.clone())
+                                        .get_by_path(&change.path)
+                                    {
+                                        if let Ok(fs_meta) = std::fs::metadata(&change.path) {
+                                            let fs_size = fs_meta.len() as i64;
+                                            let fs_mtime = fs_meta
+                                                .modified()
+                                                .ok()
+                                                .and_then(|t| {
+                                                    t.duration_since(std::time::UNIX_EPOCH).ok()
+                                                })
+                                                .map(|d| d.as_secs() as f64);
+                                            let unchanged =
+                                                existing.file_size.map_or(false, |s| s == fs_size)
+                                                    && match (existing.file_mtime, fs_mtime) {
+                                                        (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                                                        _ => false,
+                                                    };
+                                            if unchanged {
+                                                tracing::debug!(path = %change.path, "watcher_skip_unchanged");
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 let files: Vec<std::path::PathBuf> =
                                     vec![std::path::PathBuf::from(&change.path)];
                                 let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(
