@@ -2027,9 +2027,14 @@ impl PlaybackOrchestrator {
                         "streaming_dash_pre_transcode_complete"
                     );
 
+                    let dash_mime = if dash_enc_format == "flac" {
+                        "audio/flac"
+                    } else {
+                        "audio/wav"
+                    };
                     let file_info = StreamInfo {
-                        format: "flac".into(),
-                        mime_type: "audio/flac".into(),
+                        format: dash_enc_format.into(),
+                        mime_type: dash_mime.into(),
                         sample_rate: sr,
                         bit_depth: bd,
                         channels: 2,
@@ -2043,13 +2048,13 @@ impl PlaybackOrchestrator {
                         .await;
 
                     let server_ip = self.server_ip();
-                    let url = self
-                        .streamer
-                        .get_stream_url(&session_id, &server_ip, "flac");
+                    let url =
+                        self.streamer
+                            .get_stream_url(&session_id, &server_ip, dash_enc_format);
                     (
                         url,
                         Some(session_id),
-                        "audio/flac".to_string(),
+                        dash_mime.to_string(),
                         Some(file_size),
                     )
                 }
@@ -2094,6 +2099,15 @@ impl PlaybackOrchestrator {
                     "streaming_aac_pre_transcode_to_wav_for_dlna"
                 );
 
+                // FLAC-rejecting DLNA renderers (Revox/Denon/Marantz) get WAV.
+                let aac_did = req.output_device_id.as_deref().unwrap_or("");
+                let aac_enc_format =
+                    if aac_did.is_empty() || self.dlna_supports_mime(aac_did, "audio/flac").await {
+                        "flac"
+                    } else {
+                        "wav"
+                    };
+
                 let upstream_url = stream_data.url.clone();
                 let codec = codec_lower.clone();
                 let tmp_dl = std::env::temp_dir()
@@ -2101,7 +2115,11 @@ impl PlaybackOrchestrator {
                     .to_string_lossy()
                     .to_string();
                 let tmp_flac = std::env::temp_dir()
-                    .join(format!("tune-aac-transcode-{}.wav", uuid::Uuid::new_v4()))
+                    .join(format!(
+                        "tune-aac-transcode-{}.{}",
+                        uuid::Uuid::new_v4(),
+                        aac_enc_format
+                    ))
                     .to_string_lossy()
                     .to_string();
 
@@ -2131,12 +2149,13 @@ impl PlaybackOrchestrator {
                     let pcm_bytes = decoded.pcm_bytes();
                     let actual_bd = decoded.bit_depth;
 
-                    // 3. Encode to FLAC (lossless, with Content-Length)
+                    // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
+                    //    FLAC-rejecting renderer (Revox/Denon/Marantz).
                     let rt = tokio::runtime::Handle::try_current()
                         .map_err(|e| format!("no tokio runtime: {e}"))?;
                     let encoded_data = rt.block_on(async {
                         let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            "flac",
+                            aac_enc_format,
                             decoded.sample_rate,
                             actual_bd as u32,
                             decoded.channels,
@@ -2164,9 +2183,16 @@ impl PlaybackOrchestrator {
                             "streaming_aac_pre_transcode_complete"
                         );
 
+                        // Label consistently with what was actually encoded
+                        // (previously said audio/wav while emitting FLAC bytes).
+                        let aac_mime = if aac_enc_format == "flac" {
+                            "audio/flac"
+                        } else {
+                            "audio/wav"
+                        };
                         let file_info = StreamInfo {
-                            format: "wav".into(),
-                            mime_type: "audio/wav".into(),
+                            format: aac_enc_format.into(),
+                            mime_type: aac_mime.into(),
                             sample_rate: sr,
                             bit_depth: bd,
                             channels: 2,
@@ -2180,15 +2206,10 @@ impl PlaybackOrchestrator {
                             .await;
 
                         let server_ip = self.server_ip();
-                        let url = self
-                            .streamer
-                            .get_stream_url(&session_id, &server_ip, "flac");
-                        (
-                            url,
-                            Some(session_id),
-                            "audio/flac".to_string(),
-                            Some(file_size),
-                        )
+                        let url =
+                            self.streamer
+                                .get_stream_url(&session_id, &server_ip, aac_enc_format);
+                        (url, Some(session_id), aac_mime.to_string(), Some(file_size))
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "streaming_aac_pre_transcode_failed");
