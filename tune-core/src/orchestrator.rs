@@ -693,6 +693,19 @@ impl PlaybackOrchestrator {
         if let Some(ref source) = req.source
             && source != "local"
         {
+            // An out-of-library file dragged into the queue is stored as
+            // source="upload" with source_id = the uploaded temp file path (see
+            // queue_add). Every advance/jump/repeat funnels through resolve_stream,
+            // so resolve it here — not only via the one-shot temp_file_path field —
+            // otherwise it plays once but fails on queue advance (Sergio:
+            // glisser-lire un fichier hors bibliothèque).
+            if source == "upload" {
+                let path = req
+                    .source_id
+                    .as_deref()
+                    .ok_or("upload source requires source_id (file path)")?;
+                return self.resolve_uploaded_file(path, req).await;
+            }
             if source == "podcast" || source == "radio" || source == "upnp" {
                 return self.resolve_direct_url(req).await;
             }
