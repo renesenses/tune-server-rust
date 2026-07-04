@@ -374,25 +374,55 @@ impl DsdToPcmStreamer {
                     let center =
                         self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
 
+                    // Steady-state fast path: every emitted sample satisfies
+                    // `center + half_filter == total_dsd_samples` (the emit loop
+                    // fires as soon as `needed <= total`, and total increments by
+                    // one, so equality is exact).  With filter_len == 2*half_filter
+                    // the FIR window is then *exactly* the ring buffer contents
+                    // [total-filter_len, total-1]: all taps are valid and map to a
+                    // contiguous walk of the ring starting at the oldest sample
+                    // (index ring_pos % filter_len).  That lets us drop the per-tap
+                    // modulo + two bounds branches (the dominant cost) via a
+                    // two-slice dot product.  Bit-identical to the general path
+                    // below (same f64 values, same summation order k = 0..L-1).
+                    // Only the handful of warm-up samples at stream start are
+                    // misaligned (center + half_filter < total) and take the
+                    // general path.
+                    let aligned = center + half_filter == self.total_dsd_samples;
+                    let ring_start = self.ring_pos % filter_len;
+
                     for emit_ch in 0..channels {
-                        let mut sum = 0.0f64;
-                        for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
-                            let pos = (center as isize) - (half_filter as isize) + (k as isize);
-                            if pos >= 0 && (pos as usize) < self.total_dsd_samples {
-                                // Map absolute DSD position to ring buffer position
-                                // The ring buffer holds the last `filter_len` samples.
-                                // ring_pos points to the next write position.
-                                // The oldest sample in the ring is at index ring_pos % filter_len.
-                                // Absolute position `p` maps to ring index:
-                                //   (ring_pos - (total_dsd_samples - p)) % filter_len
-                                let age = self.total_dsd_samples - pos as usize;
-                                if age <= filter_len {
-                                    let ring_idx = (self.ring_pos + filter_len - age) % filter_len;
-                                    sum += self.ring_bufs[emit_ch][ring_idx] * coeff;
-                                }
-                                // Samples older than filter_len are zero-padded
+                        let sum = if aligned {
+                            let ring = &self.ring_bufs[emit_ch];
+                            let coeffs = &self.filter_coeffs;
+                            let (head, tail) = ring.split_at(ring_start);
+                            let split = tail.len(); // == filter_len - ring_start
+                            let mut s = 0.0f64;
+                            for (x, c) in tail.iter().zip(&coeffs[..split]) {
+                                s += *x * *c;
                             }
-                        }
+                            for (x, c) in head.iter().zip(&coeffs[split..]) {
+                                s += *x * *c;
+                            }
+                            s
+                        } else {
+                            // General path (warm-up / partial window). Absolute
+                            // position `p` maps to ring index p % filter_len; taps
+                            // outside the ring window are zero-padded.
+                            let mut s = 0.0f64;
+                            for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
+                                let pos = (center as isize) - (half_filter as isize) + (k as isize);
+                                if pos >= 0 && (pos as usize) < self.total_dsd_samples {
+                                    let age = self.total_dsd_samples - pos as usize;
+                                    if age <= filter_len {
+                                        let ring_idx =
+                                            (self.ring_pos + filter_len - age) % filter_len;
+                                        s += self.ring_bufs[emit_ch][ring_idx] * coeff;
+                                    }
+                                }
+                            }
+                            s
+                        };
 
                         let clamped = sum.clamp(-1.0, 1.0);
                         let pcm_val = (clamped * 8_388_607.0) as i32;
@@ -887,6 +917,51 @@ mod tests {
         assert!(
             max_diff <= 1,
             "batch and streaming outputs should match (max sample diff = {max_diff})"
+        );
+    }
+
+    #[test]
+    fn streamer_fast_path_matches_batch_long() {
+        // Longer input so most output samples are emitted in steady state and
+        // exercise the contiguous two-slice fast path in `feed`. It must still
+        // match the independent batch converter (which uses the plain indexed
+        // algorithm), guarding the fast-path ring math.
+        let channels = 2;
+        let total_bytes = 4096 * channels; // 32768 DSD samples/ch -> ~2048 out/ch
+        let dsd_data: Vec<u8> = (0..total_bytes)
+            .map(|i| ((i * 101 + 7) % 256) as u8)
+            .collect();
+
+        let batch = DsdToPcmConverter::new(2_822_400, 176_400, channels, true);
+        let batch_pcm = batch.process(&dsd_data);
+
+        let mut streamer = DsdToPcmStreamer::new(2_822_400, 176_400, channels, true);
+        let mut all_stream = streamer.feed(&dsd_data);
+        all_stream.extend_from_slice(&streamer.flush());
+
+        assert_eq!(batch_pcm.len(), all_stream.len());
+        let num_samples = batch_pcm.len() / 3;
+        assert!(
+            num_samples > 2000,
+            "should exercise many steady-state samples"
+        );
+
+        let read = |b: &[u8], off: usize| -> i32 {
+            let v = b[off] as u32 | ((b[off + 1] as u32) << 8) | ((b[off + 2] as u32) << 16);
+            if v & 0x80_0000 != 0 {
+                (v | 0xFF00_0000) as i32
+            } else {
+                v as i32
+            }
+        };
+        let mut max_diff = 0i32;
+        for i in 0..num_samples {
+            let off = i * 3;
+            max_diff = max_diff.max((read(&batch_pcm, off) - read(&all_stream, off)).abs());
+        }
+        assert!(
+            max_diff <= 1,
+            "fast path must match batch (max diff = {max_diff})"
         );
     }
 
