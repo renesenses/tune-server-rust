@@ -716,7 +716,9 @@ impl PositionPoller {
                                             seek_ms: None,
                                             temp_file_path: None,
                                         };
-                                        match self.orchestrator.play(req).await {
+                                        // Reconnecting the *same* station — do
+                                        // not add a duplicate listen-history row.
+                                        match self.orchestrator.play_without_history(req).await {
                                             Ok(_) => {
                                                 info!(zone_id, "radio_auto_retry_success");
                                                 ps.radio_stopped_ticks = 0;

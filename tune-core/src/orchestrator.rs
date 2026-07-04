@@ -140,7 +140,25 @@ impl PlaybackOrchestrator {
         })
     }
 
-    pub async fn play(&self, mut req: PlayRequest) -> Result<PlayResult, String> {
+    pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        // Public entry point: this is a *new* logical play, so it is recorded
+        // in the listen history.
+        self.play_inner(req, true).await
+    }
+
+    /// Like `play`, but does NOT write a listen-history row.  Used for internal
+    /// stream re-creations of a track that is *already* being played (seek,
+    /// radio auto-retry, reconnect) so a single logical play is not counted
+    /// multiple times in the "Historique de lecture".
+    pub async fn play_without_history(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        self.play_inner(req, false).await
+    }
+
+    async fn play_inner(
+        &self,
+        mut req: PlayRequest,
+        record_history: bool,
+    ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
@@ -424,23 +442,28 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.record_listen(
-            &resolved.title,
-            resolved.artist.as_deref(),
-            album.as_deref(),
-            &resolved.source,
-            req.source_id.as_deref(),
-            req.track_id.and_then(|tid| {
-                TrackRepo::with_backend(self.db.clone())
-                    .get(tid)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| t.album_id)
-            }),
-            resolved.duration_ms.unwrap_or(0),
-            req.zone_id,
-            cover_path.as_deref(),
-        );
+        // Only record a listen-history row for genuinely new plays.  Seek and
+        // radio auto-retry re-create the stream for a track that is already
+        // playing (via play_without_history) and must not add duplicate rows.
+        if record_history {
+            self.record_listen(
+                &resolved.title,
+                resolved.artist.as_deref(),
+                album.as_deref(),
+                &resolved.source,
+                req.source_id.as_deref(),
+                req.track_id.and_then(|tid| {
+                    TrackRepo::with_backend(self.db.clone())
+                        .get(tid)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.album_id)
+                }),
+                resolved.duration_ms.unwrap_or(0),
+                req.zone_id,
+                cover_path.as_deref(),
+            );
+        }
 
         info!(
             zone_id = req.zone_id,
@@ -3409,7 +3432,7 @@ impl PlaybackOrchestrator {
                         temp_file_path: None,
                     };
 
-                    match self.play(req).await {
+                    match self.play_without_history(req).await {
                         Ok(_) => {
                             // play() cleared last_seek_at — re-set it immediately
                             // so the poller's seek grace covers the buffering window.
@@ -3504,7 +3527,7 @@ impl PlaybackOrchestrator {
                         temp_file_path: None,
                     };
 
-                    match self.play(req).await {
+                    match self.play_without_history(req).await {
                         Ok(_) => {
                             self.playback.seek(zone_id, position_ms as i64).await;
                             info!(
