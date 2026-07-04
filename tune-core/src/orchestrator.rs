@@ -1630,8 +1630,7 @@ impl PlaybackOrchestrator {
             } else {
                 0
             };
-            let is_truncated =
-                prefetched.duration_ms > 0 && buffered_ms + 2000 < prefetched.duration_ms;
+            let is_truncated = prefetch_buffer_truncated(buffered_ms, prefetched.duration_ms);
 
             if is_network && is_truncated {
                 info!(
@@ -3939,6 +3938,20 @@ fn guess_mime_from_url(url: &str) -> &'static str {
 /// Decode an infinite radio HTTP stream to PCM and send chunks through the
 /// session channel.  Runs on a blocking thread (called via spawn_blocking).
 ///
+/// Whether a prefetch buffer is too short to stand in for the whole track.
+///
+/// An UNKNOWN duration (`duration_ms == 0`) is treated as truncated. The 30s
+/// prefetch mode buffers only the head of the track, and `duration_ms` is not
+/// always populated for streaming queue items (Qobuz) — when it is 0 the old
+/// `duration_ms > 0 && …` guard evaluated false and the partial buffer was
+/// served to a DLNA renderer anyway. The renderer then stalls at the buffer's
+/// end (Patricia Barber / Qobuz on an Eversolo DMP-A8: `bytes_sent=0`,
+/// `peak_pos=30000`, zone force-stopped). Callers only consult this for network
+/// outputs, so local gapless (which serves the buffer) is unaffected.
+fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
+    duration_ms == 0 || buffered_ms + 2000 < duration_ms
+}
+
 /// Uses symphonia with `ReadOnlySource` to handle the non-seekable HTTP stream.
 /// Decodes packets progressively and converts to interleaved 16-bit PCM bytes.
 /// The loop runs until the stream ends, the sender is dropped (stop), or an
@@ -4212,6 +4225,19 @@ mod tests {
             Arc::new(Mutex::new(OutputRegistry::new())),
             None,
         )
+    }
+
+    #[test]
+    fn prefetch_buffer_truncated_cases() {
+        // Unknown duration (0) must count as truncated — the DMP-A8 cut.
+        assert!(super::prefetch_buffer_truncated(30_000, 0));
+        // Partial buffer of a known-length track: truncated.
+        assert!(super::prefetch_buffer_truncated(30_000, 277_000));
+        // Buffer covers (near) the whole track: NOT truncated.
+        assert!(!super::prefetch_buffer_truncated(276_000, 277_000));
+        assert!(!super::prefetch_buffer_truncated(300_000, 277_000));
+        // Within the 2s tolerance: NOT truncated.
+        assert!(!super::prefetch_buffer_truncated(60_000, 61_500));
     }
 
     #[tokio::test]
