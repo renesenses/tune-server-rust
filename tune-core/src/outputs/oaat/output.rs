@@ -299,7 +299,7 @@ impl OutputTarget for OaatOutput {
                 controller_id,
                 controller_name: "Tune Server".into(),
                 features: vec![],
-                clock_port: oaat_core::DEFAULT_CLOCK_PORT,
+                clock_port: super::helpers::oaat_clock_port(),
                 tls: false,
             };
 
@@ -507,6 +507,8 @@ impl OutputTarget for OaatOutput {
 
                     let mut offset = 0usize;
                     let mut sample_offset: u64 = 0;
+                    // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
+                    let stream_start_ns = super::helpers::now_ns() + 500_000_000;
                     let start = std::time::Instant::now();
 
                     while offset < pcm_data.len() && playing.load(Ordering::Relaxed) {
@@ -523,7 +525,8 @@ impl OutputTarget for OaatOutput {
                         let chunk_bytes = packet_size.min(pcm_data.len() - offset);
                         let chunk_samples = chunk_bytes / bytes_per_frame;
                         let payload = &pcm_data[offset..offset + chunk_bytes];
-                        let pts_ns = (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
+                        let pts_ns = stream_start_ns
+                            + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64;
                         let flags = if offset == 0 {
                             PacketFlags::FIRST_PACKET
                         } else {
@@ -913,6 +916,8 @@ impl OutputTarget for OaatOutput {
 
             // Streaming loop
             let mut sample_offset: u64 = 0;
+            // Absolute PTS anchor: frame 0 presents at now + lead (RFC 6.4).
+            let stream_start_ns = super::helpers::now_ns() + 500_000_000;
             let mut byte_offset: u64 = 0;
             let mut start = std::time::Instant::now();
             let mut pause_offset = std::time::Duration::ZERO;
@@ -1068,9 +1073,9 @@ impl OutputTarget for OaatOutput {
                                 while buf.len() >= packet_size && playing.load(Ordering::Relaxed) {
                                     let payload: Vec<u8> = buf.drain(..packet_size).collect();
                                     let pts_ns = if uses_byte_offset {
-                                        (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
+                                        stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                                     } else {
-                                        (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                        stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
                                     };
                                     let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, PacketFlags::empty()).await;
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
@@ -1138,9 +1143,9 @@ impl OutputTarget for OaatOutput {
                         {
                             let payload: Vec<u8> = buf.drain(..packet_size).collect();
                             let pts_ns = if uses_byte_offset {
-                                (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
+                                stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
                             } else {
-                                (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
+                                stream_start_ns + (sample_offset as f64 / cur_sample_rate as f64 * 1e9) as u64
                             };
                             let flags = if sample_offset == 0 && byte_offset == 0 {
                                 PacketFlags::FIRST_PACKET
