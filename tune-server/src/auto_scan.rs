@@ -223,9 +223,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         }
 
         let list_result = tune_core::scanner::walker::list_audio_files(&music_dirs);
+        let missing_dirs = list_result.missing_dirs;
         let files = list_result.files;
         let total_discovered = files.len();
         info!(files = total_discovered, "auto_scan_files_found");
+
+        // NFC-normalized set of every path found on disk this scan. Used after
+        // the scan to prune tracks whose files were deleted while the server was
+        // stopped (Symptom 2: deleted albums persist). Normalization matches how
+        // existing_tracks keys are compared in the pre-filter below.
+        let discovered_paths: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().nfc().collect::<String>())
+            .collect();
 
         let track_repo = TrackRepo::with_backend(db.clone());
         let artist_repo = ArtistRepo::with_backend(db.clone());
@@ -408,6 +418,40 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             },
         );
 
+        // Prune tracks whose files no longer exist on disk. The startup
+        // auto-scan never removed stale rows, so files/folders deleted while
+        // the server was stopped kept track_count>0 and their album was never
+        // orphaned → "les albums supprimés continuent d'apparaître" (eric).
+        // SAFETY: skip tracks under a missing directory (unmounted NAS / a
+        // Docker mount that isn't present) — deleting them would wipe the
+        // library. Mirrors the manual-scan prune (routes/system/scan.rs).
+        {
+            let mut pruned = 0i64;
+            let mut protected = 0i64;
+            for (db_path, &(track_id, _, _)) in &existing_tracks {
+                if !discovered_paths.contains(db_path.as_str()) {
+                    let in_missing_dir = missing_dirs.iter().any(|d| db_path.starts_with(d));
+                    if in_missing_dir {
+                        protected += 1;
+                        continue;
+                    }
+                    if track_repo.delete(track_id).is_ok() {
+                        pruned += 1;
+                    }
+                }
+            }
+            if protected > 0 {
+                tracing::warn!(
+                    protected,
+                    dirs = ?missing_dirs,
+                    "auto_scan_tracks_protected_missing_dirs"
+                );
+            }
+            if pruned > 0 {
+                info!(pruned, "auto_scan_stale_tracks_removed");
+            }
+        }
+
         for album in album_repo.list(99999, 0).unwrap_or_default() {
             if let Some(id) = album.id {
                 album_repo.update_track_count(id).ok();
@@ -517,6 +561,7 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                         std::time::Duration::from_secs(2),
                         std::time::Duration::from_millis(500),
                     );
+                    let had_changes = !changes.is_empty();
                     for change in changes {
                         match change.change_type {
                             tune_core::scanner::watcher::ChangeType::Added
@@ -629,6 +674,19 @@ pub fn spawn_file_watcher(db: Arc<dyn DbBackend>, wait_for_scan: Option<Arc<Atom
                                     info!(path = %change.path, "watcher_track_removed");
                                 }
                             }
+                        }
+                    }
+                    // After a batch, remove any album left with 0 tracks. An
+                    // incremental re-import can re-point a track to a new album
+                    // row (album_artist tag drift) and leave the old row as a
+                    // cover-only ghost — eric: "une fois avec les pistes, une
+                    // autre fois juste la pochette". The manual scan cleans
+                    // these; the watcher never did.
+                    if had_changes {
+                        let album_repo = AlbumRepo::with_backend(db.clone());
+                        let cleaned = album_repo.delete_orphans().unwrap_or(0);
+                        if cleaned > 0 {
+                            info!(cleaned, "watcher_orphan_albums_cleaned");
                         }
                     }
                 }
