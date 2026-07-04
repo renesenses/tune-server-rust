@@ -104,6 +104,7 @@ impl GaplessHandler {
                         sample_rate: resolved.sample_rate,
                         bit_depth: resolved.bit_depth,
                         channels: resolved.channels,
+                        live_stream: false,
                     };
                     match out.set_next_media(&media).await {
                         Ok(()) => {

@@ -59,6 +59,12 @@ pub struct PlayMedia<'a> {
     pub bit_depth: Option<u32>,
     /// Number of audio channels (e.g. 2 for stereo).
     pub channels: Option<u32>,
+    /// True for infinite live streams (internet radio): the DIDL-Lite `<res>`
+    /// must advertise a live/streaming source (DLNA.ORG_OP=00, senderPaced
+    /// flags, no size/duration) rather than a seekable file, otherwise some
+    /// renderers (Yamaha R-N2000A) accept SetAVTransportURI + Play but never
+    /// produce sound.
+    pub live_stream: bool,
 }
 
 impl Default for PlayMedia<'_> {
@@ -76,6 +82,7 @@ impl Default for PlayMedia<'_> {
             sample_rate: None,
             bit_depth: None,
             channels: None,
+            live_stream: false,
         }
     }
 }
