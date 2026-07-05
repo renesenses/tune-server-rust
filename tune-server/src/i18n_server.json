@@ -1,522 +1,922 @@
 {
-  "metafield.album_artist": {
-    "fr": "Artiste de l'album",
-    "en": "Album Artist",
-    "de": "Album-Interpret",
-    "es": "Artista del álbum",
-    "it": "Artista dell'album",
-    "zh": "专辑艺术家",
-    "ja": "アルバムアーティスト",
-    "ko": "앨범 아티스트"
-  },
-  "metafield.sort_artist": {
-    "fr": "Tri artiste",
-    "en": "Sort Artist",
-    "de": "Sortier-Interpret",
-    "es": "Ordenar por artista",
-    "it": "Ordina artista",
-    "zh": "艺术家排序",
-    "ja": "アーティスト並べ替え",
-    "ko": "아티스트 정렬"
-  },
-  "metafield.sort_album": {
-    "fr": "Tri album",
-    "en": "Sort Album",
-    "de": "Sortier-Album",
-    "es": "Ordenar por álbum",
-    "it": "Ordina album",
-    "zh": "专辑排序",
-    "ja": "アルバム並べ替え",
-    "ko": "앨범 정렬"
-  },
-  "metafield.disc_number": {
-    "fr": "N° disque",
-    "en": "Disc No.",
-    "de": "CD-Nr.",
-    "es": "N.º de disco",
-    "it": "N. disco",
-    "zh": "碟片编号",
-    "ja": "ディスク番号",
-    "ko": "디스크 번호"
-  },
-  "metafield.disc_subtitle": {
-    "fr": "Sous-titre disque",
-    "en": "Disc Subtitle",
-    "de": "CD-Untertitel",
-    "es": "Subtítulo del disco",
-    "it": "Sottotitolo disco",
-    "zh": "碟片副标题",
-    "ja": "ディスクサブタイトル",
-    "ko": "디스크 부제"
-  },
-  "metafield.track_number": {
-    "fr": "N° piste",
-    "en": "Track No.",
-    "de": "Titel-Nr.",
-    "es": "N.º de pista",
-    "it": "N. traccia",
-    "zh": "音轨编号",
-    "ja": "トラック番号",
-    "ko": "트랙 번호"
-  },
-  "metafield.genre": {
-    "fr": "Genre",
-    "en": "Genre",
-    "de": "Genre",
-    "es": "Género",
-    "it": "Genere",
-    "zh": "流派",
-    "ja": "ジャンル",
-    "ko": "장르"
-  },
-  "metafield.genres": {
-    "fr": "Genres (multi)",
-    "en": "Genres (multiple)",
-    "de": "Genres (mehrere)",
-    "es": "Géneros (varios)",
-    "it": "Generi (multipli)",
-    "zh": "流派（多个）",
-    "ja": "ジャンル（複数）",
-    "ko": "장르 (다중)"
-  },
-  "metafield.year": {
-    "fr": "Année",
-    "en": "Year",
-    "de": "Jahr",
-    "es": "Año",
-    "it": "Anno",
-    "zh": "年份",
-    "ja": "年",
-    "ko": "연도"
-  },
-  "metafield.composer": {
-    "fr": "Compositeur",
-    "en": "Composer",
-    "de": "Komponist",
-    "es": "Compositor",
-    "it": "Compositore",
-    "zh": "作曲",
-    "ja": "作曲者",
-    "ko": "작곡가"
-  },
-  "metafield.conductor": {
-    "fr": "Chef d'orchestre",
-    "en": "Conductor",
-    "de": "Dirigent",
-    "es": "Director de orquesta",
-    "it": "Direttore d'orchestra",
-    "zh": "指挥",
-    "ja": "指揮者",
-    "ko": "지휘자"
-  },
-  "metafield.lyricist": {
-    "fr": "Parolier",
-    "en": "Lyricist",
-    "de": "Texter",
-    "es": "Letrista",
-    "it": "Paroliere",
-    "zh": "作词",
-    "ja": "作詞者",
-    "ko": "작사가"
-  },
-  "metafield.performer": {
-    "fr": "Interprète",
-    "en": "Performer",
-    "de": "Interpret",
-    "es": "Intérprete",
-    "it": "Interprete",
-    "zh": "演奏者",
-    "ja": "演奏者",
-    "ko": "연주자"
-  },
-  "metafield.remixer": {
-    "fr": "Remixeur",
-    "en": "Remixer",
-    "de": "Remixer",
-    "es": "Remezclador",
-    "it": "Remixer",
-    "zh": "混音师",
-    "ja": "リミキサー",
-    "ko": "리믹서"
-  },
-  "metafield.label": {
-    "fr": "Label",
-    "en": "Label",
-    "de": "Label",
-    "es": "Sello",
-    "it": "Etichetta",
-    "zh": "唱片公司",
-    "ja": "レーベル",
-    "ko": "레이블"
-  },
-  "metafield.producer": {
-    "fr": "Producteur",
-    "en": "Producer",
-    "de": "Produzent",
-    "es": "Productor",
-    "it": "Produttore",
-    "zh": "制作人",
-    "ja": "プロデューサー",
-    "ko": "프로듀서"
-  },
-  "metafield.bpm": {
-    "fr": "BPM",
-    "en": "BPM",
-    "de": "BPM",
-    "es": "BPM",
-    "it": "BPM",
-    "zh": "BPM",
-    "ja": "BPM",
-    "ko": "BPM"
-  },
-  "metafield.mood": {
-    "fr": "Ambiance",
-    "en": "Mood",
-    "de": "Stimmung",
-    "es": "Ambiente",
-    "it": "Atmosfera",
-    "zh": "情绪",
-    "ja": "ムード",
-    "ko": "분위기"
-  },
-  "metafield.grouping": {
-    "fr": "Regroupement",
-    "en": "Grouping",
-    "de": "Gruppierung",
-    "es": "Agrupación",
-    "it": "Raggruppamento",
-    "zh": "分组",
-    "ja": "グループ",
-    "ko": "그룹"
-  },
-  "metafield.compilation": {
-    "fr": "Compilation",
-    "en": "Compilation",
-    "de": "Kompilation",
-    "es": "Recopilación",
-    "it": "Compilation",
-    "zh": "合辑",
-    "ja": "コンピレーション",
-    "ko": "컴필레이션"
-  },
-  "metafield.comment": {
-    "fr": "Commentaire",
-    "en": "Comment",
-    "de": "Kommentar",
-    "es": "Comentario",
-    "it": "Commento",
-    "zh": "备注",
-    "ja": "コメント",
-    "ko": "설명"
-  },
-  "metafield.lyrics": {
-    "fr": "Paroles",
-    "en": "Lyrics",
-    "de": "Liedtext",
-    "es": "Letra",
-    "it": "Testo",
-    "zh": "歌词",
-    "ja": "歌詞",
-    "ko": "가사"
-  },
-  "metafield.isrc": {
-    "fr": "ISRC",
-    "en": "ISRC",
-    "de": "ISRC",
-    "es": "ISRC",
-    "it": "ISRC",
-    "zh": "ISRC",
-    "ja": "ISRC",
-    "ko": "ISRC"
-  },
-  "metafield.barcode": {
-    "fr": "Code-barres",
-    "en": "Barcode",
-    "de": "Barcode",
-    "es": "Código de barras",
-    "it": "Codice a barre",
-    "zh": "条形码",
-    "ja": "バーコード",
-    "ko": "바코드"
-  },
-  "metafield.catalog_number": {
-    "fr": "Réf. catalogue",
-    "en": "Catalog No.",
-    "de": "Katalog-Nr.",
-    "es": "N.º de catálogo",
-    "it": "N. catalogo",
-    "zh": "目录编号",
-    "ja": "カタログ番号",
-    "ko": "카탈로그 번호"
-  },
-  "metafield.media_type": {
-    "fr": "Support",
-    "en": "Media Type",
-    "de": "Medientyp",
-    "es": "Tipo de soporte",
-    "it": "Tipo di supporto",
-    "zh": "介质类型",
-    "ja": "メディアタイプ",
-    "ko": "매체 종류"
-  },
-  "metafield.musicbrainz_recording_id": {
-    "fr": "MusicBrainz Recording ID",
-    "en": "MusicBrainz Recording ID",
-    "de": "MusicBrainz Recording ID",
-    "es": "MusicBrainz Recording ID",
-    "it": "MusicBrainz Recording ID",
-    "zh": "MusicBrainz Recording ID",
-    "ja": "MusicBrainz Recording ID",
-    "ko": "MusicBrainz Recording ID"
-  },
-  "metafield.musicbrainz_release_id": {
-    "fr": "MusicBrainz Release ID",
-    "en": "MusicBrainz Release ID",
-    "de": "MusicBrainz Release ID",
-    "es": "MusicBrainz Release ID",
-    "it": "MusicBrainz Release ID",
-    "zh": "MusicBrainz Release ID",
-    "ja": "MusicBrainz Release ID",
-    "ko": "MusicBrainz Release ID"
-  },
-  "metafield.musicbrainz_release_group_id": {
-    "fr": "MusicBrainz Release Group ID",
-    "en": "MusicBrainz Release Group ID",
-    "de": "MusicBrainz Release Group ID",
-    "es": "MusicBrainz Release Group ID",
-    "it": "MusicBrainz Release Group ID",
-    "zh": "MusicBrainz Release Group ID",
-    "ja": "MusicBrainz Release Group ID",
-    "ko": "MusicBrainz Release Group ID"
-  },
-  "metafield.release_date": {
-    "fr": "Date de sortie",
-    "en": "Release Date",
-    "de": "Veröffentlichungsdatum",
-    "es": "Fecha de lanzamiento",
-    "it": "Data di pubblicazione",
-    "zh": "发行日期",
-    "ja": "リリース日",
-    "ko": "발매일"
-  },
-  "metafield.original_date": {
-    "fr": "Date originale",
-    "en": "Original Date",
-    "de": "Originaldatum",
-    "es": "Fecha original",
-    "it": "Data originale",
-    "zh": "原始日期",
-    "ja": "オリジナル日付",
-    "ko": "원본 날짜"
-  },
-  "metafield.original_year": {
-    "fr": "Année originale",
-    "en": "Original Year",
-    "de": "Originaljahr",
-    "es": "Año original",
-    "it": "Anno originale",
-    "zh": "原始年份",
-    "ja": "オリジナル年",
-    "ko": "원본 연도"
-  },
-  "metafield.format": {
-    "fr": "Format audio",
-    "en": "Audio Format",
-    "de": "Audioformat",
-    "es": "Formato de audio",
-    "it": "Formato audio",
-    "zh": "音频格式",
-    "ja": "オーディオ形式",
-    "ko": "오디오 형식"
-  },
-  "metafield.sample_rate": {
-    "fr": "Fréquence d'échantillonnage",
-    "en": "Sample Rate",
-    "de": "Abtastrate",
-    "es": "Frecuencia de muestreo",
-    "it": "Frequenza di campionamento",
-    "zh": "采样率",
-    "ja": "サンプリングレート",
-    "ko": "샘플링 레이트"
-  },
-  "metafield.bit_depth": {
-    "fr": "Profondeur de bits",
-    "en": "Bit Depth",
-    "de": "Bittiefe",
-    "es": "Profundidad de bits",
-    "it": "Profondità di bit",
-    "zh": "位深度",
-    "ja": "ビット深度",
-    "ko": "비트 심도"
-  },
-  "metafield.channels": {
-    "fr": "Canaux",
-    "en": "Channels",
-    "de": "Kanäle",
-    "es": "Canales",
-    "it": "Canali",
-    "zh": "声道",
-    "ja": "チャンネル",
-    "ko": "채널"
-  },
-  "metafield.duration_ms": {
-    "fr": "Durée",
-    "en": "Duration",
-    "de": "Dauer",
-    "es": "Duración",
-    "it": "Durata",
-    "zh": "时长",
-    "ja": "再生時間",
-    "ko": "재생 시간"
-  },
-  "metafield.file_size": {
-    "fr": "Taille du fichier",
-    "en": "File Size",
-    "de": "Dateigröße",
-    "es": "Tamaño del archivo",
-    "it": "Dimensione del file",
-    "zh": "文件大小",
-    "ja": "ファイルサイズ",
-    "ko": "파일 크기"
-  },
-  "metafield.file_path": {
-    "fr": "Chemin du fichier",
-    "en": "File Path",
-    "de": "Dateipfad",
-    "es": "Ruta del archivo",
-    "it": "Percorso del file",
-    "zh": "文件路径",
-    "ja": "ファイルパス",
-    "ko": "파일 경로"
-  },
-  "metafield.encoder": {
-    "fr": "Encodeur",
-    "en": "Encoder",
-    "de": "Encoder",
-    "es": "Codificador",
-    "it": "Codificatore",
-    "zh": "编码器",
-    "ja": "エンコーダー",
-    "ko": "인코더"
-  },
-  "metafield.copyright": {
-    "fr": "Copyright",
-    "en": "Copyright",
-    "de": "Copyright",
-    "es": "Copyright",
-    "it": "Copyright",
-    "zh": "Copyright",
-    "ja": "Copyright",
-    "ko": "Copyright"
-  },
-  "metafield.language": {
-    "fr": "Langue",
-    "en": "Language",
-    "de": "Sprache",
-    "es": "Idioma",
-    "it": "Lingua",
-    "zh": "语言",
-    "ja": "言語",
-    "ko": "언어"
-  },
-  "metafield.rg_track_gain": {
-    "fr": "ReplayGain piste",
-    "en": "ReplayGain Track",
-    "de": "ReplayGain Titel",
-    "es": "ReplayGain de pista",
-    "it": "ReplayGain traccia",
-    "zh": "ReplayGain 音轨",
-    "ja": "ReplayGain トラック",
-    "ko": "ReplayGain 트랙"
-  },
-  "metafield.rg_album_gain": {
-    "fr": "ReplayGain album",
-    "en": "ReplayGain Album",
-    "de": "ReplayGain Album",
-    "es": "ReplayGain de álbum",
-    "it": "ReplayGain album",
-    "zh": "ReplayGain 专辑",
-    "ja": "ReplayGain アルバム",
-    "ko": "ReplayGain 앨범"
-  },
-  "metacat.Identification": {
-    "fr": "Identification",
-    "en": "Identification",
-    "de": "Identifikation",
-    "es": "Identificación",
-    "it": "Identificazione",
-    "zh": "标识",
-    "ja": "識別",
-    "ko": "식별"
-  },
-  "metacat.Crédits": {
-    "fr": "Crédits",
-    "en": "Credits",
-    "de": "Mitwirkende",
-    "es": "Créditos",
-    "it": "Crediti",
-    "zh": "参与者",
-    "ja": "クレジット",
-    "ko": "크레딧"
-  },
-  "metacat.Classification": {
-    "fr": "Classification",
-    "en": "Classification",
-    "de": "Klassifizierung",
-    "es": "Clasificación",
-    "it": "Classificazione",
-    "zh": "分类",
-    "ja": "分類",
-    "ko": "분류"
-  },
-  "metacat.Texte": {
-    "fr": "Texte",
-    "en": "Text",
-    "de": "Text",
-    "es": "Texto",
-    "it": "Testo",
-    "zh": "文本",
-    "ja": "テキスト",
-    "ko": "텍스트"
-  },
-  "metacat.Identifiants": {
-    "fr": "Identifiants",
-    "en": "Identifiers",
-    "de": "Bezeichner",
-    "es": "Identificadores",
-    "it": "Identificatori",
-    "zh": "标识符",
-    "ja": "識別子",
-    "ko": "식별자"
-  },
-  "metacat.Dates": {
-    "fr": "Dates",
-    "en": "Dates",
-    "de": "Daten",
-    "es": "Fechas",
-    "it": "Date",
-    "zh": "日期",
-    "ja": "日付",
-    "ko": "날짜"
-  },
-  "metacat.Technique": {
-    "fr": "Technique",
-    "en": "Technical",
-    "de": "Technik",
-    "es": "Técnica",
-    "it": "Tecnica",
-    "zh": "技术",
-    "ja": "技術",
-    "ko": "기술"
-  },
-  "metacat.ReplayGain": {
-    "fr": "ReplayGain",
-    "en": "ReplayGain",
-    "de": "ReplayGain",
-    "es": "ReplayGain",
-    "it": "ReplayGain",
-    "zh": "ReplayGain",
-    "ja": "ReplayGain",
-    "ko": "ReplayGain"
-  }
+ "metafield.album_artist": {
+  "fr": "Artiste de l'album",
+  "en": "Album Artist",
+  "de": "Album-Interpret",
+  "es": "Artista del álbum",
+  "it": "Artista dell'album",
+  "zh": "专辑艺术家",
+  "ja": "アルバムアーティスト",
+  "ko": "앨범 아티스트"
+ },
+ "metafield.sort_artist": {
+  "fr": "Tri artiste",
+  "en": "Sort Artist",
+  "de": "Sortier-Interpret",
+  "es": "Ordenar por artista",
+  "it": "Ordina artista",
+  "zh": "艺术家排序",
+  "ja": "アーティスト並べ替え",
+  "ko": "아티스트 정렬"
+ },
+ "metafield.sort_album": {
+  "fr": "Tri album",
+  "en": "Sort Album",
+  "de": "Sortier-Album",
+  "es": "Ordenar por álbum",
+  "it": "Ordina album",
+  "zh": "专辑排序",
+  "ja": "アルバム並べ替え",
+  "ko": "앨범 정렬"
+ },
+ "metafield.disc_number": {
+  "fr": "N° disque",
+  "en": "Disc No.",
+  "de": "CD-Nr.",
+  "es": "N.º de disco",
+  "it": "N. disco",
+  "zh": "碟片编号",
+  "ja": "ディスク番号",
+  "ko": "디스크 번호"
+ },
+ "metafield.disc_subtitle": {
+  "fr": "Sous-titre disque",
+  "en": "Disc Subtitle",
+  "de": "CD-Untertitel",
+  "es": "Subtítulo del disco",
+  "it": "Sottotitolo disco",
+  "zh": "碟片副标题",
+  "ja": "ディスクサブタイトル",
+  "ko": "디스크 부제"
+ },
+ "metafield.track_number": {
+  "fr": "N° piste",
+  "en": "Track No.",
+  "de": "Titel-Nr.",
+  "es": "N.º de pista",
+  "it": "N. traccia",
+  "zh": "音轨编号",
+  "ja": "トラック番号",
+  "ko": "트랙 번호"
+ },
+ "metafield.genre": {
+  "fr": "Genre",
+  "en": "Genre",
+  "de": "Genre",
+  "es": "Género",
+  "it": "Genere",
+  "zh": "流派",
+  "ja": "ジャンル",
+  "ko": "장르"
+ },
+ "metafield.genres": {
+  "fr": "Genres (multi)",
+  "en": "Genres (multiple)",
+  "de": "Genres (mehrere)",
+  "es": "Géneros (varios)",
+  "it": "Generi (multipli)",
+  "zh": "流派（多个）",
+  "ja": "ジャンル（複数）",
+  "ko": "장르 (다중)"
+ },
+ "metafield.year": {
+  "fr": "Année",
+  "en": "Year",
+  "de": "Jahr",
+  "es": "Año",
+  "it": "Anno",
+  "zh": "年份",
+  "ja": "年",
+  "ko": "연도"
+ },
+ "metafield.composer": {
+  "fr": "Compositeur",
+  "en": "Composer",
+  "de": "Komponist",
+  "es": "Compositor",
+  "it": "Compositore",
+  "zh": "作曲",
+  "ja": "作曲者",
+  "ko": "작곡가"
+ },
+ "metafield.conductor": {
+  "fr": "Chef d'orchestre",
+  "en": "Conductor",
+  "de": "Dirigent",
+  "es": "Director de orquesta",
+  "it": "Direttore d'orchestra",
+  "zh": "指挥",
+  "ja": "指揮者",
+  "ko": "지휘자"
+ },
+ "metafield.lyricist": {
+  "fr": "Parolier",
+  "en": "Lyricist",
+  "de": "Texter",
+  "es": "Letrista",
+  "it": "Paroliere",
+  "zh": "作词",
+  "ja": "作詞者",
+  "ko": "작사가"
+ },
+ "metafield.performer": {
+  "fr": "Interprète",
+  "en": "Performer",
+  "de": "Interpret",
+  "es": "Intérprete",
+  "it": "Interprete",
+  "zh": "演奏者",
+  "ja": "演奏者",
+  "ko": "연주자"
+ },
+ "metafield.remixer": {
+  "fr": "Remixeur",
+  "en": "Remixer",
+  "de": "Remixer",
+  "es": "Remezclador",
+  "it": "Remixer",
+  "zh": "混音师",
+  "ja": "リミキサー",
+  "ko": "리믹서"
+ },
+ "metafield.label": {
+  "fr": "Label",
+  "en": "Label",
+  "de": "Label",
+  "es": "Sello",
+  "it": "Etichetta",
+  "zh": "唱片公司",
+  "ja": "レーベル",
+  "ko": "레이블"
+ },
+ "metafield.producer": {
+  "fr": "Producteur",
+  "en": "Producer",
+  "de": "Produzent",
+  "es": "Productor",
+  "it": "Produttore",
+  "zh": "制作人",
+  "ja": "プロデューサー",
+  "ko": "프로듀서"
+ },
+ "metafield.bpm": {
+  "fr": "BPM",
+  "en": "BPM",
+  "de": "BPM",
+  "es": "BPM",
+  "it": "BPM",
+  "zh": "BPM",
+  "ja": "BPM",
+  "ko": "BPM"
+ },
+ "metafield.mood": {
+  "fr": "Ambiance",
+  "en": "Mood",
+  "de": "Stimmung",
+  "es": "Ambiente",
+  "it": "Atmosfera",
+  "zh": "情绪",
+  "ja": "ムード",
+  "ko": "분위기"
+ },
+ "metafield.grouping": {
+  "fr": "Regroupement",
+  "en": "Grouping",
+  "de": "Gruppierung",
+  "es": "Agrupación",
+  "it": "Raggruppamento",
+  "zh": "分组",
+  "ja": "グループ",
+  "ko": "그룹"
+ },
+ "metafield.compilation": {
+  "fr": "Compilation",
+  "en": "Compilation",
+  "de": "Kompilation",
+  "es": "Recopilación",
+  "it": "Compilation",
+  "zh": "合辑",
+  "ja": "コンピレーション",
+  "ko": "컴필레이션"
+ },
+ "metafield.comment": {
+  "fr": "Commentaire",
+  "en": "Comment",
+  "de": "Kommentar",
+  "es": "Comentario",
+  "it": "Commento",
+  "zh": "备注",
+  "ja": "コメント",
+  "ko": "설명"
+ },
+ "metafield.lyrics": {
+  "fr": "Paroles",
+  "en": "Lyrics",
+  "de": "Liedtext",
+  "es": "Letra",
+  "it": "Testo",
+  "zh": "歌词",
+  "ja": "歌詞",
+  "ko": "가사"
+ },
+ "metafield.isrc": {
+  "fr": "ISRC",
+  "en": "ISRC",
+  "de": "ISRC",
+  "es": "ISRC",
+  "it": "ISRC",
+  "zh": "ISRC",
+  "ja": "ISRC",
+  "ko": "ISRC"
+ },
+ "metafield.barcode": {
+  "fr": "Code-barres",
+  "en": "Barcode",
+  "de": "Barcode",
+  "es": "Código de barras",
+  "it": "Codice a barre",
+  "zh": "条形码",
+  "ja": "バーコード",
+  "ko": "바코드"
+ },
+ "metafield.catalog_number": {
+  "fr": "Réf. catalogue",
+  "en": "Catalog No.",
+  "de": "Katalog-Nr.",
+  "es": "N.º de catálogo",
+  "it": "N. catalogo",
+  "zh": "目录编号",
+  "ja": "カタログ番号",
+  "ko": "카탈로그 번호"
+ },
+ "metafield.media_type": {
+  "fr": "Support",
+  "en": "Media Type",
+  "de": "Medientyp",
+  "es": "Tipo de soporte",
+  "it": "Tipo di supporto",
+  "zh": "介质类型",
+  "ja": "メディアタイプ",
+  "ko": "매체 종류"
+ },
+ "metafield.musicbrainz_recording_id": {
+  "fr": "MusicBrainz Recording ID",
+  "en": "MusicBrainz Recording ID",
+  "de": "MusicBrainz Recording ID",
+  "es": "MusicBrainz Recording ID",
+  "it": "MusicBrainz Recording ID",
+  "zh": "MusicBrainz Recording ID",
+  "ja": "MusicBrainz Recording ID",
+  "ko": "MusicBrainz Recording ID"
+ },
+ "metafield.musicbrainz_release_id": {
+  "fr": "MusicBrainz Release ID",
+  "en": "MusicBrainz Release ID",
+  "de": "MusicBrainz Release ID",
+  "es": "MusicBrainz Release ID",
+  "it": "MusicBrainz Release ID",
+  "zh": "MusicBrainz Release ID",
+  "ja": "MusicBrainz Release ID",
+  "ko": "MusicBrainz Release ID"
+ },
+ "metafield.musicbrainz_release_group_id": {
+  "fr": "MusicBrainz Release Group ID",
+  "en": "MusicBrainz Release Group ID",
+  "de": "MusicBrainz Release Group ID",
+  "es": "MusicBrainz Release Group ID",
+  "it": "MusicBrainz Release Group ID",
+  "zh": "MusicBrainz Release Group ID",
+  "ja": "MusicBrainz Release Group ID",
+  "ko": "MusicBrainz Release Group ID"
+ },
+ "metafield.release_date": {
+  "fr": "Date de sortie",
+  "en": "Release Date",
+  "de": "Veröffentlichungsdatum",
+  "es": "Fecha de lanzamiento",
+  "it": "Data di pubblicazione",
+  "zh": "发行日期",
+  "ja": "リリース日",
+  "ko": "발매일"
+ },
+ "metafield.original_date": {
+  "fr": "Date originale",
+  "en": "Original Date",
+  "de": "Originaldatum",
+  "es": "Fecha original",
+  "it": "Data originale",
+  "zh": "原始日期",
+  "ja": "オリジナル日付",
+  "ko": "원본 날짜"
+ },
+ "metafield.original_year": {
+  "fr": "Année originale",
+  "en": "Original Year",
+  "de": "Originaljahr",
+  "es": "Año original",
+  "it": "Anno originale",
+  "zh": "原始年份",
+  "ja": "オリジナル年",
+  "ko": "원본 연도"
+ },
+ "metafield.format": {
+  "fr": "Format audio",
+  "en": "Audio Format",
+  "de": "Audioformat",
+  "es": "Formato de audio",
+  "it": "Formato audio",
+  "zh": "音频格式",
+  "ja": "オーディオ形式",
+  "ko": "오디오 형식"
+ },
+ "metafield.sample_rate": {
+  "fr": "Fréquence d'échantillonnage",
+  "en": "Sample Rate",
+  "de": "Abtastrate",
+  "es": "Frecuencia de muestreo",
+  "it": "Frequenza di campionamento",
+  "zh": "采样率",
+  "ja": "サンプリングレート",
+  "ko": "샘플링 레이트"
+ },
+ "metafield.bit_depth": {
+  "fr": "Profondeur de bits",
+  "en": "Bit Depth",
+  "de": "Bittiefe",
+  "es": "Profundidad de bits",
+  "it": "Profondità di bit",
+  "zh": "位深度",
+  "ja": "ビット深度",
+  "ko": "비트 심도"
+ },
+ "metafield.channels": {
+  "fr": "Canaux",
+  "en": "Channels",
+  "de": "Kanäle",
+  "es": "Canales",
+  "it": "Canali",
+  "zh": "声道",
+  "ja": "チャンネル",
+  "ko": "채널"
+ },
+ "metafield.duration_ms": {
+  "fr": "Durée",
+  "en": "Duration",
+  "de": "Dauer",
+  "es": "Duración",
+  "it": "Durata",
+  "zh": "时长",
+  "ja": "再生時間",
+  "ko": "재생 시간"
+ },
+ "metafield.file_size": {
+  "fr": "Taille du fichier",
+  "en": "File Size",
+  "de": "Dateigröße",
+  "es": "Tamaño del archivo",
+  "it": "Dimensione del file",
+  "zh": "文件大小",
+  "ja": "ファイルサイズ",
+  "ko": "파일 크기"
+ },
+ "metafield.file_path": {
+  "fr": "Chemin du fichier",
+  "en": "File Path",
+  "de": "Dateipfad",
+  "es": "Ruta del archivo",
+  "it": "Percorso del file",
+  "zh": "文件路径",
+  "ja": "ファイルパス",
+  "ko": "파일 경로"
+ },
+ "metafield.encoder": {
+  "fr": "Encodeur",
+  "en": "Encoder",
+  "de": "Encoder",
+  "es": "Codificador",
+  "it": "Codificatore",
+  "zh": "编码器",
+  "ja": "エンコーダー",
+  "ko": "인코더"
+ },
+ "metafield.copyright": {
+  "fr": "Copyright",
+  "en": "Copyright",
+  "de": "Copyright",
+  "es": "Copyright",
+  "it": "Copyright",
+  "zh": "Copyright",
+  "ja": "Copyright",
+  "ko": "Copyright"
+ },
+ "metafield.language": {
+  "fr": "Langue",
+  "en": "Language",
+  "de": "Sprache",
+  "es": "Idioma",
+  "it": "Lingua",
+  "zh": "语言",
+  "ja": "言語",
+  "ko": "언어"
+ },
+ "metafield.rg_track_gain": {
+  "fr": "ReplayGain piste",
+  "en": "ReplayGain Track",
+  "de": "ReplayGain Titel",
+  "es": "ReplayGain de pista",
+  "it": "ReplayGain traccia",
+  "zh": "ReplayGain 音轨",
+  "ja": "ReplayGain トラック",
+  "ko": "ReplayGain 트랙"
+ },
+ "metafield.rg_album_gain": {
+  "fr": "ReplayGain album",
+  "en": "ReplayGain Album",
+  "de": "ReplayGain Album",
+  "es": "ReplayGain de álbum",
+  "it": "ReplayGain album",
+  "zh": "ReplayGain 专辑",
+  "ja": "ReplayGain アルバム",
+  "ko": "ReplayGain 앨범"
+ },
+ "metacat.Identification": {
+  "fr": "Identification",
+  "en": "Identification",
+  "de": "Identifikation",
+  "es": "Identificación",
+  "it": "Identificazione",
+  "zh": "标识",
+  "ja": "識別",
+  "ko": "식별"
+ },
+ "metacat.Crédits": {
+  "fr": "Crédits",
+  "en": "Credits",
+  "de": "Mitwirkende",
+  "es": "Créditos",
+  "it": "Crediti",
+  "zh": "参与者",
+  "ja": "クレジット",
+  "ko": "크레딧"
+ },
+ "metacat.Classification": {
+  "fr": "Classification",
+  "en": "Classification",
+  "de": "Klassifizierung",
+  "es": "Clasificación",
+  "it": "Classificazione",
+  "zh": "分类",
+  "ja": "分類",
+  "ko": "분류"
+ },
+ "metacat.Texte": {
+  "fr": "Texte",
+  "en": "Text",
+  "de": "Text",
+  "es": "Texto",
+  "it": "Testo",
+  "zh": "文本",
+  "ja": "テキスト",
+  "ko": "텍스트"
+ },
+ "metacat.Identifiants": {
+  "fr": "Identifiants",
+  "en": "Identifiers",
+  "de": "Bezeichner",
+  "es": "Identificadores",
+  "it": "Identificatori",
+  "zh": "标识符",
+  "ja": "識別子",
+  "ko": "식별자"
+ },
+ "metacat.Dates": {
+  "fr": "Dates",
+  "en": "Dates",
+  "de": "Daten",
+  "es": "Fechas",
+  "it": "Date",
+  "zh": "日期",
+  "ja": "日付",
+  "ko": "날짜"
+ },
+ "metacat.Technique": {
+  "fr": "Technique",
+  "en": "Technical",
+  "de": "Technik",
+  "es": "Técnica",
+  "it": "Tecnica",
+  "zh": "技术",
+  "ja": "技術",
+  "ko": "기술"
+ },
+ "metacat.ReplayGain": {
+  "fr": "ReplayGain",
+  "en": "ReplayGain",
+  "de": "ReplayGain",
+  "es": "ReplayGain",
+  "it": "ReplayGain",
+  "zh": "ReplayGain",
+  "ja": "ReplayGain",
+  "ko": "ReplayGain"
+ },
+ "svctok.musicbrainz.purpose": {
+  "fr": "Années + crédits + couvertures (ID releases).",
+  "en": "Years + credits + covers (release IDs).",
+  "de": "Jahre + Credits + Cover (Release-IDs).",
+  "es": "Años + créditos + carátulas (ID de ediciones).",
+  "it": "Anni + crediti + copertine (ID delle release).",
+  "zh": "年份 + 制作人员 + 封面（release ID）。",
+  "ja": "年 + クレジット + カバー（release ID）。",
+  "ko": "연도 + 크레딧 + 커버(release ID)."
+ },
+ "svctok.musicbrainz.pricing": {
+  "fr": "100 % gratuit, base de données ouverte.",
+  "en": "100% free, open database.",
+  "de": "100 % kostenlos, offene Datenbank.",
+  "es": "100 % gratis, base de datos abierta.",
+  "it": "100% gratuito, database aperto.",
+  "zh": "100% 免费，开放数据库。",
+  "ja": "100% 無料、オープンデータベース。",
+  "ko": "100% 무료, 오픈 데이터베이스."
+ },
+ "svctok.musicbrainz.step1": {
+  "fr": "Aucun token requis — MusicBrainz est gratuit et anonyme.",
+  "en": "No token required — MusicBrainz is free and anonymous.",
+  "de": "Kein Token erforderlich — MusicBrainz ist kostenlos und anonym.",
+  "es": "No se requiere token — MusicBrainz es gratuito y anónimo.",
+  "it": "Nessun token richiesto — MusicBrainz è gratuito e anonimo.",
+  "zh": "无需 token — MusicBrainz 免费且匿名。",
+  "ja": "token は不要 — MusicBrainz は無料で匿名です。",
+  "ko": "token 불필요 — MusicBrainz는 무료이며 익명입니다."
+ },
+ "svctok.discogs.purpose": {
+  "fr": "Années + couvertures + crédits pour pressages obscurs.",
+  "en": "Years + covers + credits for obscure pressings.",
+  "de": "Jahre + Cover + Credits für seltene Pressungen.",
+  "es": "Años + carátulas + créditos para prensados poco conocidos.",
+  "it": "Anni + copertine + crediti per stampe rare.",
+  "zh": "年份 + 封面 + 制作人员，适用于冷门版本。",
+  "ja": "希少なプレスの年 + カバー + クレジット。",
+  "ko": "희귀 프레싱의 연도 + 커버 + 크레딧."
+ },
+ "svctok.discogs.pricing": {
+  "fr": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
+  "en": "Free account + personal token; free API with quota (60 req/min).",
+  "de": "Konto + persönliches Token kostenlos; kostenlose API mit Kontingent (60 req/min).",
+  "es": "Cuenta + token personal gratuitos; API gratuita con cuota (60 req/min).",
+  "it": "Account + token personale gratuiti; API gratuita con quota (60 req/min).",
+  "zh": "账户 + 个人 token 免费；API 免费但有配额（60 req/min）。",
+  "ja": "アカウント + 個人 token は無料。API は無料で上限あり（60 req/min）。",
+  "ko": "계정 + 개인 token 무료. 할당량이 있는 무료 API(60 req/min)."
+ },
+ "svctok.discogs.step1": {
+  "fr": "Connecte-toi sur discogs.com.",
+  "en": "Log in at discogs.com.",
+  "de": "Melde dich auf discogs.com an.",
+  "es": "Inicia sesión en discogs.com.",
+  "it": "Accedi su discogs.com.",
+  "zh": "登录 discogs.com。",
+  "ja": "discogs.com にログインします。",
+  "ko": "discogs.com에 로그인하세요."
+ },
+ "svctok.discogs.step2": {
+  "fr": "Va dans Settings → Developers.",
+  "en": "Go to Settings → Developers.",
+  "de": "Gehe zu Settings → Developers.",
+  "es": "Ve a Settings → Developers.",
+  "it": "Vai su Settings → Developers.",
+  "zh": "进入 Settings → Developers。",
+  "ja": "Settings → Developers に移動します。",
+  "ko": "Settings → Developers로 이동하세요."
+ },
+ "svctok.discogs.step3": {
+  "fr": "Clique 'Generate new token'.",
+  "en": "Click 'Generate new token'.",
+  "de": "Klicke auf 'Generate new token'.",
+  "es": "Haz clic en 'Generate new token'.",
+  "it": "Clicca 'Generate new token'.",
+  "zh": "点击 'Generate new token'。",
+  "ja": "'Generate new token' をクリックします。",
+  "ko": "'Generate new token'을 클릭하세요."
+ },
+ "svctok.discogs.step4": {
+  "fr": "Colle le token ici.",
+  "en": "Paste the token here.",
+  "de": "Füge das Token hier ein.",
+  "es": "Pega el token aquí.",
+  "it": "Incolla il token qui.",
+  "zh": "在此粘贴 token。",
+  "ja": "ここに token を貼り付けます。",
+  "ko": "여기에 token을 붙여넣으세요."
+ },
+ "svctok.lastfm.purpose": {
+  "fr": "Genres + scrobbling.",
+  "en": "Genres + scrobbling.",
+  "de": "Genres + Scrobbling.",
+  "es": "Géneros + scrobbling.",
+  "it": "Generi + scrobbling.",
+  "zh": "流派 + scrobbling。",
+  "ja": "ジャンル + scrobbling。",
+  "ko": "장르 + scrobbling."
+ },
+ "svctok.lastfm.pricing": {
+  "fr": "API gratuite pour usage non commercial.",
+  "en": "Free API for non-commercial use.",
+  "de": "Kostenlose API für nicht-kommerzielle Nutzung.",
+  "es": "API gratuita para uso no comercial.",
+  "it": "API gratuita per uso non commerciale.",
+  "zh": "非商业用途免费 API。",
+  "ja": "非商用利用向けの無料 API。",
+  "ko": "비상업적 용도의 무료 API."
+ },
+ "svctok.lastfm.step1": {
+  "fr": "Va sur last.fm/api/account/create",
+  "en": "Go to last.fm/api/account/create",
+  "de": "Gehe zu last.fm/api/account/create",
+  "es": "Ve a last.fm/api/account/create",
+  "it": "Vai su last.fm/api/account/create",
+  "zh": "前往 last.fm/api/account/create",
+  "ja": "last.fm/api/account/create にアクセスします",
+  "ko": "last.fm/api/account/create로 이동하세요"
+ },
+ "svctok.lastfm.step2": {
+  "fr": "Renseigne un nom d'application.",
+  "en": "Enter an application name.",
+  "de": "Gib einen Anwendungsnamen ein.",
+  "es": "Introduce un nombre de aplicación.",
+  "it": "Inserisci un nome per l'applicazione.",
+  "zh": "填写一个应用名称。",
+  "ja": "アプリケーション名を入力します。",
+  "ko": "애플리케이션 이름을 입력하세요."
+ },
+ "svctok.lastfm.step3": {
+  "fr": "Récupère 'API key' et 'Shared secret'.",
+  "en": "Get your 'API key' and 'Shared secret'.",
+  "de": "Hole dir 'API key' und 'Shared secret'.",
+  "es": "Obtén tu 'API key' y 'Shared secret'.",
+  "it": "Recupera 'API key' e 'Shared secret'.",
+  "zh": "获取 'API key' 和 'Shared secret'。",
+  "ja": "'API key' と 'Shared secret' を取得します。",
+  "ko": "'API key'와 'Shared secret'을 받으세요."
+ },
+ "svctok.lastfm.step4": {
+  "fr": "Colle ici puis Enregistrer.",
+  "en": "Paste here then Save.",
+  "de": "Hier einfügen, dann Speichern.",
+  "es": "Pega aquí y luego Guardar.",
+  "it": "Incolla qui e poi Salva.",
+  "zh": "在此粘贴后保存。",
+  "ja": "ここに貼り付けて保存します。",
+  "ko": "여기에 붙여넣은 후 저장하세요."
+ },
+ "svctok.lastfm.fieldApiSecret": {
+  "fr": "API Secret (pour scrobbling)",
+  "en": "API Secret (for scrobbling)",
+  "de": "API Secret (für Scrobbling)",
+  "es": "API Secret (para scrobbling)",
+  "it": "API Secret (per lo scrobbling)",
+  "zh": "API Secret（用于 scrobbling）",
+  "ja": "API Secret（scrobbling 用）",
+  "ko": "API Secret(scrobbling용)"
+ },
+ "svctok.genius.purpose": {
+  "fr": "Paroles.",
+  "en": "Lyrics.",
+  "de": "Songtexte.",
+  "es": "Letras.",
+  "it": "Testi.",
+  "zh": "歌词。",
+  "ja": "歌詞。",
+  "ko": "가사."
+ },
+ "svctok.genius.pricing": {
+  "fr": "API gratuite.",
+  "en": "Free API.",
+  "de": "Kostenlose API.",
+  "es": "API gratuita.",
+  "it": "API gratuita.",
+  "zh": "免费 API。",
+  "ja": "無料 API。",
+  "ko": "무료 API."
+ },
+ "svctok.genius.step1": {
+  "fr": "Crée un compte sur genius.com.",
+  "en": "Create an account at genius.com.",
+  "de": "Erstelle ein Konto auf genius.com.",
+  "es": "Crea una cuenta en genius.com.",
+  "it": "Crea un account su genius.com.",
+  "zh": "在 genius.com 创建账户。",
+  "ja": "genius.com でアカウントを作成します。",
+  "ko": "genius.com에서 계정을 만드세요."
+ },
+ "svctok.genius.step2": {
+  "fr": "Va dans API Clients.",
+  "en": "Go to API Clients.",
+  "de": "Gehe zu API Clients.",
+  "es": "Ve a API Clients.",
+  "it": "Vai su API Clients.",
+  "zh": "进入 API Clients。",
+  "ja": "API Clients に移動します。",
+  "ko": "API Clients로 이동하세요."
+ },
+ "svctok.genius.step3": {
+  "fr": "Crée une application et copie le token.",
+  "en": "Create an application and copy the token.",
+  "de": "Erstelle eine Anwendung und kopiere das Token.",
+  "es": "Crea una aplicación y copia el token.",
+  "it": "Crea un'applicazione e copia il token.",
+  "zh": "创建一个应用并复制 token。",
+  "ja": "アプリケーションを作成し、token をコピーします。",
+  "ko": "애플리케이션을 만들고 token을 복사하세요."
+ },
+ "svctok.tidal.purpose": {
+  "fr": "Streaming hi-res + années + couvertures.",
+  "en": "Hi-res streaming + years + covers.",
+  "de": "Hi-Res-Streaming + Jahre + Cover.",
+  "es": "Streaming hi-res + años + carátulas.",
+  "it": "Streaming hi-res + anni + copertine.",
+  "zh": "Hi-res 流媒体 + 年份 + 封面。",
+  "ja": "ハイレゾストリーミング + 年 + カバー。",
+  "ko": "Hi-res 스트리밍 + 연도 + 커버."
+ },
+ "svctok.tidal.pricing": {
+  "fr": "Abonnement Tidal HiFi requis (≈ 11€/mois).",
+  "en": "Tidal HiFi subscription required (≈ 11€/month).",
+  "de": "Tidal HiFi-Abonnement erforderlich (≈ 11€/Monat).",
+  "es": "Requiere suscripción Tidal HiFi (≈ 11€/mes).",
+  "it": "Richiesto abbonamento Tidal HiFi (≈ 11€/mese).",
+  "zh": "需要 Tidal HiFi 订阅（≈ 11€/月）。",
+  "ja": "Tidal HiFi の登録が必要（≈ 11€/月）。",
+  "ko": "Tidal HiFi 구독 필요(≈ 11€/월)."
+ },
+ "svctok.tidal.step1": {
+  "fr": "Tidal utilise OAuth — utilise la page Streaming → Tidal pour te connecter.",
+  "en": "Tidal uses OAuth — use the Streaming → Tidal page to connect.",
+  "de": "Tidal verwendet OAuth — nutze die Seite Streaming → Tidal zum Verbinden.",
+  "es": "Tidal usa OAuth — usa la página Streaming → Tidal para conectarte.",
+  "it": "Tidal usa OAuth — usa la pagina Streaming → Tidal per connetterti.",
+  "zh": "Tidal 使用 OAuth — 请使用 Streaming → Tidal 页面进行连接。",
+  "ja": "Tidal は OAuth を使用します — 接続には Streaming → Tidal ページを使用してください。",
+  "ko": "Tidal은 OAuth를 사용합니다 — 연결하려면 Streaming → Tidal 페이지를 사용하세요."
+ },
+ "svctok.qobuz.purpose": {
+  "fr": "Streaming hi-res + années + couvertures.",
+  "en": "Hi-res streaming + years + covers.",
+  "de": "Hi-Res-Streaming + Jahre + Cover.",
+  "es": "Streaming hi-res + años + carátulas.",
+  "it": "Streaming hi-res + anni + copertine.",
+  "zh": "Hi-res 流媒体 + 年份 + 封面。",
+  "ja": "ハイレゾストリーミング + 年 + カバー。",
+  "ko": "Hi-res 스트리밍 + 연도 + 커버."
+ },
+ "svctok.qobuz.pricing": {
+  "fr": "Abonnement Qobuz Studio requis (≈ 13€/mois).",
+  "en": "Qobuz Studio subscription required (≈ 13€/month).",
+  "de": "Qobuz Studio-Abonnement erforderlich (≈ 13€/Monat).",
+  "es": "Requiere suscripción Qobuz Studio (≈ 13€/mes).",
+  "it": "Richiesto abbonamento Qobuz Studio (≈ 13€/mese).",
+  "zh": "需要 Qobuz Studio 订阅（≈ 13€/月）。",
+  "ja": "Qobuz Studio の登録が必要（≈ 13€/月）。",
+  "ko": "Qobuz Studio 구독 필요(≈ 13€/월)."
+ },
+ "svctok.qobuz.step1": {
+  "fr": "Qobuz utilise login/password — utilise la page Streaming → Qobuz pour te connecter.",
+  "en": "Qobuz uses login/password — use the Streaming → Qobuz page to connect.",
+  "de": "Qobuz verwendet Login/Passwort — nutze die Seite Streaming → Qobuz zum Verbinden.",
+  "es": "Qobuz usa login/contraseña — usa la página Streaming → Qobuz para conectarte.",
+  "it": "Qobuz usa login/password — usa la pagina Streaming → Qobuz per connetterti.",
+  "zh": "Qobuz 使用登录名/密码 — 请使用 Streaming → Qobuz 页面进行连接。",
+  "ja": "Qobuz はログイン/パスワードを使用します — 接続には Streaming → Qobuz ページを使用してください。",
+  "ko": "Qobuz는 로그인/비밀번호를 사용합니다 — 연결하려면 Streaming → Qobuz 페이지를 사용하세요."
+ },
+ "svctok.spotify.purpose": {
+  "fr": "Streaming + connectivité.",
+  "en": "Streaming + connectivity.",
+  "de": "Streaming + Konnektivität.",
+  "es": "Streaming + conectividad.",
+  "it": "Streaming + connettività.",
+  "zh": "流媒体 + 连接。",
+  "ja": "ストリーミング + 接続。",
+  "ko": "스트리밍 + 연결."
+ },
+ "svctok.spotify.pricing": {
+  "fr": "Compte Spotify gratuit ou Premium (≈ 11€/mois).",
+  "en": "Free or Premium Spotify account (≈ 11€/month).",
+  "de": "Kostenloses oder Premium Spotify-Konto (≈ 11€/Monat).",
+  "es": "Cuenta Spotify gratuita o Premium (≈ 11€/mes).",
+  "it": "Account Spotify gratuito o Premium (≈ 11€/mese).",
+  "zh": "免费或 Premium Spotify 账户（≈ 11€/月）。",
+  "ja": "無料または Premium の Spotify アカウント（≈ 11€/月）。",
+  "ko": "무료 또는 Premium Spotify 계정(≈ 11€/월)."
+ },
+ "svctok.spotify.step1": {
+  "fr": "Spotify utilise OAuth — utilise la page Streaming → Spotify pour te connecter.",
+  "en": "Spotify uses OAuth — use the Streaming → Spotify page to connect.",
+  "de": "Spotify verwendet OAuth — nutze die Seite Streaming → Spotify zum Verbinden.",
+  "es": "Spotify usa OAuth — usa la página Streaming → Spotify para conectarte.",
+  "it": "Spotify usa OAuth — usa la pagina Streaming → Spotify per connetterti.",
+  "zh": "Spotify 使用 OAuth — 请使用 Streaming → Spotify 页面进行连接。",
+  "ja": "Spotify は OAuth を使用します — 接続には Streaming → Spotify ページを使用してください。",
+  "ko": "Spotify는 OAuth를 사용합니다 — 연결하려면 Streaming → Spotify 페이지를 사용하세요."
+ },
+ "svctok.deezer.purpose": {
+  "fr": "Streaming.",
+  "en": "Streaming.",
+  "de": "Streaming.",
+  "es": "Streaming.",
+  "it": "Streaming.",
+  "zh": "流媒体。",
+  "ja": "ストリーミング。",
+  "ko": "스트리밍."
+ },
+ "svctok.deezer.pricing": {
+  "fr": "Compte gratuit ou Deezer HiFi (≈ 12€/mois) pour FLAC.",
+  "en": "Free account or Deezer HiFi (≈ 12€/month) for FLAC.",
+  "de": "Kostenloses Konto oder Deezer HiFi (≈ 12€/Monat) für FLAC.",
+  "es": "Cuenta gratuita o Deezer HiFi (≈ 12€/mes) para FLAC.",
+  "it": "Account gratuito o Deezer HiFi (≈ 12€/mese) per FLAC.",
+  "zh": "免费账户或 Deezer HiFi（≈ 12€/月）以获取 FLAC。",
+  "ja": "FLAC には無料アカウントまたは Deezer HiFi（≈ 12€/月）。",
+  "ko": "FLAC를 위해 무료 계정 또는 Deezer HiFi(≈ 12€/월)."
+ },
+ "svctok.deezer.step1": {
+  "fr": "Connecte-toi sur deezer.com.",
+  "en": "Log in at deezer.com.",
+  "de": "Melde dich auf deezer.com an.",
+  "es": "Inicia sesión en deezer.com.",
+  "it": "Accedi su deezer.com.",
+  "zh": "登录 deezer.com。",
+  "ja": "deezer.com にログインします。",
+  "ko": "deezer.com에 로그인하세요."
+ },
+ "svctok.deezer.step2": {
+  "fr": "DevTools (F12) → Application → Cookies → cherche 'arl'.",
+  "en": "DevTools (F12) → Application → Cookies → look for 'arl'.",
+  "de": "DevTools (F12) → Application → Cookies → suche nach 'arl'.",
+  "es": "DevTools (F12) → Application → Cookies → busca 'arl'.",
+  "it": "DevTools (F12) → Application → Cookies → cerca 'arl'.",
+  "zh": "DevTools (F12) → Application → Cookies → 查找 'arl'。",
+  "ja": "DevTools (F12) → Application → Cookies → 'arl' を探します。",
+  "ko": "DevTools (F12) → Application → Cookies → 'arl'을 찾으세요."
+ },
+ "svctok.deezer.step3": {
+  "fr": "Colle le token ARL ici.",
+  "en": "Paste the ARL token here.",
+  "de": "Füge das ARL-Token hier ein.",
+  "es": "Pega el token ARL aquí.",
+  "it": "Incolla il token ARL qui.",
+  "zh": "在此粘贴 ARL token。",
+  "ja": "ここに ARL token を貼り付けます。",
+  "ko": "여기에 ARL token을 붙여넣으세요."
+ },
+ "svctok.deezer.fieldArl": {
+  "fr": "ARL token (depuis cookies deezer.com)",
+  "en": "ARL token (from deezer.com cookies)",
+  "de": "ARL token (aus deezer.com-Cookies)",
+  "es": "ARL token (desde cookies de deezer.com)",
+  "it": "ARL token (dai cookie di deezer.com)",
+  "zh": "ARL token（来自 deezer.com cookies）",
+  "ja": "ARL token（deezer.com の cookies から）",
+  "ko": "ARL token(deezer.com cookies에서)"
+ },
+ "svctok.err.discogsNotConfigured": {
+  "fr": "Token Discogs non configuré.",
+  "en": "Discogs token not configured.",
+  "de": "Discogs-Token nicht konfiguriert.",
+  "es": "Token de Discogs no configurado.",
+  "it": "Token Discogs non configurato.",
+  "zh": "Discogs token 未配置。",
+  "ja": "Discogs token が設定されていません。",
+  "ko": "Discogs token이 설정되지 않았습니다."
+ },
+ "svctok.err.lastfmNotConfigured": {
+  "fr": "API Key Last.fm non configurée.",
+  "en": "Last.fm API Key not configured.",
+  "de": "Last.fm API Key nicht konfiguriert.",
+  "es": "API Key de Last.fm no configurada.",
+  "it": "API Key Last.fm non configurata.",
+  "zh": "Last.fm API Key 未配置。",
+  "ja": "Last.fm API Key が設定されていません。",
+  "ko": "Last.fm API Key가 설정되지 않았습니다."
+ },
+ "svctok.err.tokenConfiguredNoValidation": {
+  "fr": "Token configuré (validation non disponible).",
+  "en": "Token configured (validation not available).",
+  "de": "Token konfiguriert (Validierung nicht verfügbar).",
+  "es": "Token configurado (validación no disponible).",
+  "it": "Token configurato (validazione non disponibile).",
+  "zh": "Token 已配置（验证不可用）。",
+  "ja": "token を設定しました（検証は利用できません）。",
+  "ko": "token이 설정되었습니다(검증 불가)."
+ },
+ "svctok.err.geniusNotConfigured": {
+  "fr": "Token Genius non configuré.",
+  "en": "Genius token not configured.",
+  "de": "Genius-Token nicht konfiguriert.",
+  "es": "Token de Genius no configurado.",
+  "it": "Token Genius non configurato.",
+  "zh": "Genius token 未配置。",
+  "ja": "Genius token が設定されていません。",
+  "ko": "Genius token이 설정되지 않았습니다."
+ }
 }
