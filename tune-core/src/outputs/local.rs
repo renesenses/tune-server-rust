@@ -1009,6 +1009,14 @@ impl OutputTarget for LocalOutput {
         "local"
     }
 
+    /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
+    /// that returns at EOF without consuming the staged `next_media`, so it
+    /// cannot chain internally — the poller must fall back to natural-end
+    /// advance. Only the shared cpal path performs internal gapless chaining.
+    fn supports_internal_gapless(&self) -> bool {
+        !self.exclusive_mode
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -93,6 +93,21 @@ pub trait OutputTarget: Send + Sync {
     fn device_id(&self) -> &str;
     fn output_type(&self) -> &str;
 
+    /// Whether this output can seamlessly chain a track staged via
+    /// `set_next_media()` from inside its own playback loop (true), or whether
+    /// it relies on the poller's natural-end fallback to advance the queue
+    /// (false).
+    ///
+    /// The poller must NOT arm gapless (`set_next_media` + the gapless guard)
+    /// for outputs that return false: the staged track would be orphaned and
+    /// the guard would suppress the natural-end advance, stalling playback —
+    /// e.g. a single-track Repeat queue never loops. Local outputs in
+    /// exclusive mode (ASIO / WASAPI exclusive) take a dedicated playback path
+    /// that never consumes `next_media`, so they return false.
+    fn supports_internal_gapless(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: not dowcastable. Implementations that need downcast override this.
         &()
