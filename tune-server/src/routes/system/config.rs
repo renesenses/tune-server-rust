@@ -711,15 +711,25 @@ fn read_visible_fields(settings: &SettingsRepo) -> Vec<String> {
         })
 }
 
-pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn get_metadata_fields(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    // Localize the field labels + category names to the client's selected UI
+    // language (sent in Accept-Language), falling back to French.
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled_keys: Vec<String> = read_visible_fields(&settings);
 
-    // Group fields by category, preserving catalog order
+    // Group fields by category (stable French key), preserving catalog order.
     let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
-    for &(key, label, category) in METADATA_FIELDS {
+    for &(key, _label, category) in METADATA_FIELDS {
         let enabled = enabled_keys.iter().any(|k| k == key);
-        let field = json!({ "key": key, "label": label, "enabled": enabled });
+        let field = json!({
+            "key": key,
+            "label": crate::i18n::t(&lang, &format!("metafield.{key}")),
+            "enabled": enabled,
+        });
 
         if let Some(cat) = categories.iter_mut().find(|(name, _)| *name == category) {
             cat.1.push(field);
@@ -730,7 +740,9 @@ pub(super) async fn get_metadata_fields(State(state): State<AppState>) -> Json<V
 
     let result: Vec<Value> = categories
         .into_iter()
-        .map(|(name, fields)| json!({ "name": name, "fields": fields }))
+        .map(|(name, fields)| {
+            json!({ "name": crate::i18n::t(&lang, &format!("metacat.{name}")), "fields": fields })
+        })
         .collect();
 
     Json(json!({ "categories": result }))
