@@ -778,7 +778,17 @@ impl AlbumRepo {
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
-            "added_at" => format!("a.id {dir}"),
+            // "Date added" must survive a full rescan. A full rescan does
+            // `DELETE FROM albums` + reinsert (track_repo::delete_all), so
+            // album ids are reassigned in filesystem-walk order — sorting by
+            // `a.id` then reflects the walk order, not when files were added
+            // (eric: "tri par date d'ajout fantaisiste après rescan"). Sort by
+            // the newest track file mtime instead, which is re-read from disk
+            // on every scan and so is stable across rescans. Streaming albums
+            // have no local file (mtime NULL) → NULLS LAST, id tiebreaker.
+            "added_at" => format!(
+                "(SELECT MAX(t.file_mtime) FROM tracks t WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
+            ),
             _ => format!("a.id {dir}"),
         };
 
@@ -1549,6 +1559,48 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn added_at_sorts_by_newest_track_mtime_not_id() {
+        // Regression (eric): a full rescan does DELETE FROM albums + reinsert,
+        // so album ids reflect filesystem-walk order, not add order. "Date
+        // added" must sort by the newest track file_mtime — which is re-read
+        // on every scan and survives the rescan — not by a.id. Here albums are
+        // created in id order A<B<C but given mtimes that invert it (A newest),
+        // so an id-based sort would fail this test.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+
+        for (album_id, path, mtime) in [
+            (a, "/a.flac", 3000.0),
+            (b, "/b.flac", 2000.0),
+            (c, "/c.flac", 1000.0),
+        ] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+
+        // desc = most recently added first → A (3000), B (2000), C (1000)
+        let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        assert_eq!(desc[0].title, "A");
+        assert_eq!(desc[1].title, "B");
+        assert_eq!(desc[2].title, "C");
+
+        // asc = oldest first → C, B, A
+        let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
+        assert_eq!(asc[0].title, "C");
+        assert_eq!(asc[2].title, "A");
     }
 
     #[test]
