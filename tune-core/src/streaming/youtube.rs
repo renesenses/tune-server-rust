@@ -37,15 +37,6 @@ const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
 /// poll with "Invalid grant_type", so device-code login never completes.
 const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Current Unix time in seconds, for the `X-Goog-Request-Time` header that
-/// OAuth-authenticated InnerTube requests must carry.
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 
@@ -363,55 +354,35 @@ impl YouTubeService {
     /// — this returns direct audio URLs without cipher. Without auth, falls
     /// back to the Android Music client (may return LOGIN_REQUIRED).
     async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
-        let has_auth = self.access_token.is_some();
-
-        let body = if has_auth {
-            json!({
-                "videoId": track_id,
-                "context": ytm_context(),
-                "playbackContext": {
-                    "contentPlaybackContext": {
-                        "signatureTimestamp": 20073
-                    }
+        // Always extract via the UNAUTHENTICATED ANDROID_MUSIC client. Attaching
+        // the OAuth Bearer poisons the /player InnerTube call exactly like it did
+        // browse/search — Fabien's log: `ytm_player_api_error status=400` on an
+        // authenticated /player, which then falls through to a yt-dlp binary
+        // that isn't installed, so playback 502'd. The ANDROID_MUSIC client
+        // returns direct audio URLs without a token (the yt-dlp-style path), so
+        // dropping the token fixes native playback and needs no yt-dlp fallback.
+        let body = json!({
+            "videoId": track_id,
+            "context": ytm_android_context(),
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "signatureTimestamp": 20073
                 }
-            })
-        } else {
-            json!({
-                "videoId": track_id,
-                "context": ytm_android_context(),
-                "playbackContext": {
-                    "contentPlaybackContext": {
-                        "signatureTimestamp": 20073
-                    }
-                }
-            })
-        };
+            }
+        });
 
-        // Bearer token alone — never combine `?key=` with an OAuth Bearer
-        // header (Google returns 400 "invalid argument"). Same fix as ytm_post;
-        // this path would otherwise break YouTube playback once authenticated.
         let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
 
-        let mut req = self
+        let resp = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/");
-
-        if let Some(ref token) = self.access_token {
-            // See ytm_post: OAuth calls need the request timestamp header.
-            req = req
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-Goog-Request-Time", unix_now_secs().to_string());
-        } else {
-            req = req.header(
+            .header("Referer", "https://music.youtube.com/")
+            .header(
                 "User-Agent",
                 "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
-            );
-        }
-
-        let resp = req
+            )
             .json(&body)
             .send()
             .await
