@@ -94,6 +94,32 @@ fn ytm_android_context() -> serde_json::Value {
     })
 }
 
+/// TV "embedded player" context for the `/player` endpoint.
+///
+/// This is the classic no-auth bypass for tracks the ANDROID_MUSIC client
+/// reports as `LOGIN_REQUIRED` ("Please sign in"). yt-dlp uses this same
+/// client (`TVHTML5_SIMPLY_EMBEDDED_PLAYER`) to reach age-/login-gated
+/// content without credentials — the embed surface has laxer playability
+/// gating than the mobile app client.
+fn ytm_tv_embedded_context() -> serde_json::Value {
+    json!({
+        "client": {
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientVersion": "2.0",
+            "clientScreen": "EMBED",
+            "hl": "en",
+            "gl": "US",
+            "platform": "TV"
+        },
+        "thirdParty": {
+            "embedUrl": "https://www.youtube.com"
+        },
+        "user": {
+            "lockedSafetyMode": false
+        }
+    })
+}
+
 /// Pending Google OAuth Device Code flow state.
 struct PendingDeviceAuth {
     device_code: String,
@@ -350,20 +376,58 @@ impl YouTubeService {
 
     /// Extract audio stream URL natively via the YouTube Music `/player` API.
     ///
-    /// When OAuth-authenticated, uses the WEB_REMIX client with a Bearer token
-    /// — this returns direct audio URLs without cipher. Without auth, falls
-    /// back to the Android Music client (may return LOGIN_REQUIRED).
+    /// Uses the UNAUTHENTICATED ANDROID_MUSIC client first (attaching the OAuth
+    /// Bearer poisons the /player InnerTube call → HTTP 400, exactly like it did
+    /// browse/search). The Android client returns direct audio URLs without a
+    /// token or cipher. When it reports `LOGIN_REQUIRED` ("Please sign in") on a
+    /// track, we retry with the TV embedded client, which reaches many
+    /// login-gated tracks without credentials (the yt-dlp bypass).
     async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
-        // Always extract via the UNAUTHENTICATED ANDROID_MUSIC client. Attaching
-        // the OAuth Bearer poisons the /player InnerTube call exactly like it did
-        // browse/search — Fabien's log: `ytm_player_api_error status=400` on an
-        // authenticated /player, which then falls through to a yt-dlp binary
-        // that isn't installed, so playback 502'd. The ANDROID_MUSIC client
-        // returns direct audio URLs without a token (the yt-dlp-style path), so
-        // dropping the token fixes native playback and needs no yt-dlp fallback.
+        // Fast path: ANDROID_MUSIC, direct URLs, no cipher, no yt-dlp needed.
+        match self
+            .try_player_client(
+                track_id,
+                ytm_android_context(),
+                "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
+                "https://music.youtube.com",
+            )
+            .await
+        {
+            Ok(url) => return Ok(url),
+            Err(e) => {
+                warn!(
+                    track_id,
+                    error = %e,
+                    "ytm_android_extract_failed_trying_tv_embedded"
+                );
+            }
+        }
+
+        // Fallback: the TV embedded surface bypasses LOGIN_REQUIRED on tracks
+        // the mobile app client refuses to serve unauthenticated.
+        self.try_player_client(
+            track_id,
+            ytm_tv_embedded_context(),
+            "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+            "https://www.youtube.com",
+        )
+        .await
+    }
+
+    /// Run one `/player` extraction attempt with a specific InnerTube client
+    /// context. Returns the best audio stream URL, or a descriptive error
+    /// (HTTP failure, `LOGIN_REQUIRED`/not-playable, or no suitable stream) so
+    /// the caller can decide whether to try another client.
+    async fn try_player_client(
+        &self,
+        track_id: &str,
+        context: serde_json::Value,
+        user_agent: &str,
+        origin: &str,
+    ) -> Result<String, String> {
         let body = json!({
             "videoId": track_id,
-            "context": ytm_android_context(),
+            "context": context,
             "playbackContext": {
                 "contentPlaybackContext": {
                     "signatureTimestamp": 20073
@@ -377,12 +441,9 @@ impl YouTubeService {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/")
-            .header(
-                "User-Agent",
-                "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
-            )
+            .header("Origin", origin)
+            .header("Referer", format!("{origin}/"))
+            .header("User-Agent", user_agent)
             .json(&body)
             .send()
             .await
