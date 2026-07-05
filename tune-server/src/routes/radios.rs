@@ -272,9 +272,11 @@ pub struct AddFromWebQuery {
 }
 
 async fn add_from_web(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<AddFromWebQuery>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
     let station = RadioStation {
         id: None,
@@ -299,19 +301,22 @@ async fn add_from_web(
                 "library.radios_changed",
                 json!({"action": "created", "id": id}),
             );
+            let title = crate::i18n::t(&lang, "radio.addedTitle");
+            let body_txt = crate::i18n::t(&lang, "radio.addedBody").replace("{name}", &q.name);
+            let close = crate::i18n::t(&lang, "radio.canCloseTab");
             format!(
                 r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
 <body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong> a été ajoutée à vos favoris Tune.</p><p style="color:#888;margin-top:2em">Vous pouvez fermer cet onglet.</p></div>
-</body></html>"#,
-                q.name
+<div style="text-align:center"><h1 style="color:#4ade80">{title}</h1><p>{body_txt}</p><p style="color:#888;margin-top:2em">{close}</p></div>
+</body></html>"#
             )
         }
         Err(e) => format!(
             r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
 <body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#f87171">Erreur</h1><p>{e}</p></div>
-</body></html>"#
+<div style="text-align:center"><h1 style="color:#f87171">{err_title}</h1><p>{e}</p></div>
+</body></html>"#,
+            err_title = crate::i18n::t(&lang, "radio.errorTitle")
         ),
     };
     axum::response::Html(html)

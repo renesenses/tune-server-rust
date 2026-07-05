@@ -201,7 +201,11 @@ async fn list_shares() -> Json<Value> {
 }
 
 /// Scan a specific host for SMB or NFS shares.
-async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
+async fn scan_host(
+    headers: axum::http::HeaderMap,
+    Query(q): Query<ScanHostQuery>,
+) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let host = &q.host;
     let protocol = q.protocol.as_deref().unwrap_or("smb");
 
@@ -310,11 +314,11 @@ async fn scan_host(Query(q): Query<ScanHostQuery>) -> impl IntoResponse {
                 || last_error.contains("auth")
                 || last_error.contains("STATUS_ACCESS_DENIED")
             {
-                format!(
-                    "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({last_error})"
-                )
+                crate::i18n::t(&lang, "net.smbAccessDenied").replace("{error}", &last_error)
             } else {
-                format!("Impossible de scanner {host}: {last_error}")
+                crate::i18n::t(&lang, "net.smbScanFailed")
+                    .replace("{host}", host)
+                    .replace("{error}", &last_error)
             };
             return (StatusCode::OK, Json(json!({ "shares": [], "error": msg }))).into_response();
         }
