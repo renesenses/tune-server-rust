@@ -57,9 +57,11 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn ai_query(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Json(body): Json<AiQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let zone_id = body.zone_id.unwrap_or(1);
 
@@ -72,7 +74,7 @@ async fn ai_query(
         .unwrap_or_default();
 
     if api_key.is_empty() {
-        return local_ai_query(state, &body.message, zone_id).await;
+        return local_ai_query(state, &body.message, zone_id, &lang).await;
     }
 
     let model = settings
@@ -278,7 +280,9 @@ async fn local_ai_query(
     state: AppState,
     message: &str,
     zone_id: i64,
+    lang: &str,
 ) -> Result<Json<Value>, AppError> {
+    let tr = |k: &str| crate::i18n::t(lang, k);
     let mut executor = ToolExecutor::with_backend(
         state.backend.clone(),
         state.orchestrator.clone(),
@@ -388,7 +392,7 @@ async fn local_ai_query(
         actions.push(json!({ "tool": "next_track", "result": result }));
         let title = result["track"].as_str().unwrap_or("piste suivante");
         return Ok(Json(json!({
-            "reply": format!("Piste suivante : {title}"),
+            "reply": tr("ai.nextTrack").replace("{title}", title),
             "actions": actions,
             "zone_id": executor.zone_id(),
         })));
@@ -401,7 +405,7 @@ async fn local_ai_query(
             .await;
         actions.push(json!({ "tool": "set_volume", "result": result }));
         return Ok(Json(json!({
-            "reply": format!("Volume réglé à {}%.", (vol * 100.0) as i32),
+            "reply": tr("ai.volumeSet").replace("{value}", &((vol * 100.0) as i32).to_string()),
             "actions": actions,
             "zone_id": executor.zone_id(),
         })));
@@ -444,10 +448,12 @@ async fn local_ai_query(
         let result = executor.execute("now_playing", json!({})).await;
         actions.push(json!({ "tool": "now_playing", "result": result }));
         let reply = if let Some(track) = result["track"].as_str() {
-            let artist = result["artist"].as_str().unwrap_or("Inconnu");
-            format!("En cours : {track} — {artist}")
+            let artist = result["artist"].as_str().unwrap_or("");
+            tr("ai.nowPlaying")
+                .replace("{track}", track)
+                .replace("{artist}", artist)
         } else {
-            "Rien ne joue actuellement.".into()
+            tr("ai.nothingPlaying")
         };
         return Ok(Json(json!({
             "reply": reply,
@@ -478,7 +484,7 @@ async fn local_ai_query(
                     let artist = result["artist"].as_str().unwrap_or("");
                     let count = result["track_count"].as_i64().unwrap_or(0);
                     return Ok(Json(json!({
-                        "reply": format!("▶ {title} — {artist} ({count} pistes)"),
+                        "reply": tr("ai.playingCount").replace("{title}", title).replace("{artist}", artist).replace("{count}", &count.to_string()),
                         "actions": actions,
                         "zone_id": executor.zone_id(),
                     })));
@@ -496,7 +502,7 @@ async fn local_ai_query(
                     actions.push(json!({ "tool": "play_track", "input": { "track_name": title }, "result": result }));
                     let artist = result["artist"].as_str().unwrap_or("");
                     return Ok(Json(json!({
-                        "reply": format!("▶ {title} — {artist}"),
+                        "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
                         "actions": actions,
                         "zone_id": executor.zone_id(),
                     })));
@@ -505,7 +511,7 @@ async fn local_ai_query(
         }
 
         return Ok(Json(json!({
-            "reply": format!("Je n'ai rien trouvé pour « {query} » dans la bibliothèque."),
+            "reply": tr("ai.notFoundLibrary").replace("{query}", query),
             "actions": actions,
             "zone_id": executor.zone_id(),
         })));
@@ -526,19 +532,21 @@ async fn local_ai_query(
         let n_tracks = result["tracks"].as_array().map(|a| a.len()).unwrap_or(0);
 
         let reply = if n_artists + n_albums + n_tracks == 0 {
-            format!("Aucun résultat pour « {query} ».")
+            tr("ai.noResults").replace("{query}", query)
         } else {
             let mut parts = Vec::new();
             if n_artists > 0 {
-                parts.push(format!("{n_artists} artiste(s)"));
+                parts.push(tr("ai.nArtists").replace("{n}", &n_artists.to_string()));
             }
             if n_albums > 0 {
-                parts.push(format!("{n_albums} album(s)"));
+                parts.push(tr("ai.nAlbums").replace("{n}", &n_albums.to_string()));
             }
             if n_tracks > 0 {
-                parts.push(format!("{n_tracks} piste(s)"));
+                parts.push(tr("ai.nTracks").replace("{n}", &n_tracks.to_string()));
             }
-            format!("Résultats pour « {query} » : {}", parts.join(", "))
+            tr("ai.resultsFor")
+                .replace("{query}", query)
+                .replace("{parts}", &parts.join(", "))
         };
 
         return Ok(Json(json!({
@@ -569,9 +577,9 @@ async fn local_ai_query(
         let reply = match zones {
             Some(z) => {
                 let names: Vec<&str> = z.iter().filter_map(|v| v["name"].as_str()).collect();
-                format!("Zones disponibles : {}", names.join(", "))
+                tr("ai.zonesAvailable").replace("{zones}", &names.join(", "))
             }
-            None => "Aucune zone trouvée.".into(),
+            None => tr("ai.noZone"),
         };
         return Ok(Json(json!({
             "reply": reply,
@@ -596,7 +604,7 @@ async fn local_ai_query(
                 actions.push(json!({ "tool": "play_album", "input": { "album_name": title }, "result": play }));
                 let artist = play["artist"].as_str().unwrap_or("");
                 return Ok(Json(json!({
-                    "reply": format!("▶ {title} — {artist}"),
+                    "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
                     "actions": actions,
                     "zone_id": executor.zone_id(),
                 })));
@@ -612,7 +620,7 @@ async fn local_ai_query(
                 actions.push(json!({ "tool": "play_track", "input": { "track_name": title }, "result": play }));
                 let artist = play["artist"].as_str().unwrap_or("");
                 return Ok(Json(json!({
-                    "reply": format!("▶ {title} — {artist}"),
+                    "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
                     "actions": actions,
                     "zone_id": executor.zone_id(),
                 })));
@@ -621,7 +629,7 @@ async fn local_ai_query(
     }
 
     Ok(Json(json!({
-        "reply": format!("Désolé, je n'ai pas compris « {} ». Essayez « joue [artiste/album] » ou « cherche [terme] ».", message),
+        "reply": tr("ai.notUnderstood").replace("{msg}", message),
         "actions": actions,
         "zone_id": executor.zone_id(),
     })))

@@ -918,5 +918,155 @@
   "zh": "Genius token 未配置。",
   "ja": "Genius token が設定されていません。",
   "ko": "Genius token이 설정되지 않았습니다."
+ },
+ "ai.nextTrack": {
+  "fr": "Piste suivante : {title}",
+  "en": "Next track: {title}",
+  "de": "Nächster Titel: {title}",
+  "es": "Siguiente pista: {title}",
+  "it": "Traccia successiva: {title}",
+  "zh": "下一首：{title}",
+  "ja": "次のトラック：{title}",
+  "ko": "다음 트랙: {title}"
+ },
+ "ai.volumeSet": {
+  "fr": "Volume réglé à {value}%.",
+  "en": "Volume set to {value}%.",
+  "de": "Lautstärke auf {value}% eingestellt.",
+  "es": "Volumen ajustado al {value}%.",
+  "it": "Volume impostato al {value}%.",
+  "zh": "音量已设为 {value}%。",
+  "ja": "音量を{value}%に設定しました。",
+  "ko": "볼륨을 {value}%로 설정했습니다."
+ },
+ "ai.nowPlaying": {
+  "fr": "En cours : {track} — {artist}",
+  "en": "Now playing: {track} — {artist}",
+  "de": "Läuft gerade: {track} — {artist}",
+  "es": "Reproduciendo: {track} — {artist}",
+  "it": "In riproduzione: {track} — {artist}",
+  "zh": "正在播放：{track} — {artist}",
+  "ja": "再生中：{track} — {artist}",
+  "ko": "재생 중: {track} — {artist}"
+ },
+ "ai.nothingPlaying": {
+  "fr": "Rien ne joue actuellement.",
+  "en": "Nothing is playing right now.",
+  "de": "Es wird gerade nichts abgespielt.",
+  "es": "No se está reproduciendo nada.",
+  "it": "Non è in riproduzione nulla al momento.",
+  "zh": "当前没有播放任何内容。",
+  "ja": "現在何も再生されていません。",
+  "ko": "지금 재생 중인 곡이 없습니다."
+ },
+ "ai.playingCount": {
+  "fr": "▶ {title} — {artist} ({count} pistes)",
+  "en": "▶ {title} — {artist} ({count} tracks)",
+  "de": "▶ {title} — {artist} ({count} Titel)",
+  "es": "▶ {title} — {artist} ({count} pistas)",
+  "it": "▶ {title} — {artist} ({count} tracce)",
+  "zh": "▶ {title} — {artist}（{count} 首）",
+  "ja": "▶ {title} — {artist}（{count} 曲）",
+  "ko": "▶ {title} — {artist} ({count}곡)"
+ },
+ "ai.playing": {
+  "fr": "▶ {title} — {artist}",
+  "en": "▶ {title} — {artist}",
+  "de": "▶ {title} — {artist}",
+  "es": "▶ {title} — {artist}",
+  "it": "▶ {title} — {artist}",
+  "zh": "▶ {title} — {artist}",
+  "ja": "▶ {title} — {artist}",
+  "ko": "▶ {title} — {artist}"
+ },
+ "ai.notFoundLibrary": {
+  "fr": "Je n'ai rien trouvé pour « {query} » dans la bibliothèque.",
+  "en": "I couldn't find anything for “{query}” in your library.",
+  "de": "Ich habe nichts für „{query}“ in der Bibliothek gefunden.",
+  "es": "No encontré nada para «{query}» en la biblioteca.",
+  "it": "Non ho trovato nulla per «{query}» nella libreria.",
+  "zh": "在音乐库中没有找到与“{query}”相关的内容。",
+  "ja": "ライブラリで「{query}」に該当するものが見つかりませんでした。",
+  "ko": "라이브러리에서 “{query}”에 대한 결과를 찾지 못했습니다."
+ },
+ "ai.noResults": {
+  "fr": "Aucun résultat pour « {query} ».",
+  "en": "No results for “{query}”.",
+  "de": "Keine Ergebnisse für „{query}“.",
+  "es": "Sin resultados para «{query}».",
+  "it": "Nessun risultato per «{query}».",
+  "zh": "没有找到“{query}”的结果。",
+  "ja": "「{query}」の結果はありません。",
+  "ko": "“{query}”에 대한 결과가 없습니다."
+ },
+ "ai.nArtists": {
+  "fr": "{n} artiste(s)",
+  "en": "{n} artist(s)",
+  "de": "{n} Künstler",
+  "es": "{n} artista(s)",
+  "it": "{n} artista/i",
+  "zh": "{n} 位艺术家",
+  "ja": "{n} 組のアーティスト",
+  "ko": "아티스트 {n}명"
+ },
+ "ai.nAlbums": {
+  "fr": "{n} album(s)",
+  "en": "{n} album(s)",
+  "de": "{n} Album/Alben",
+  "es": "{n} álbum(es)",
+  "it": "{n} album",
+  "zh": "{n} 张专辑",
+  "ja": "{n} 枚のアルバム",
+  "ko": "앨범 {n}개"
+ },
+ "ai.nTracks": {
+  "fr": "{n} piste(s)",
+  "en": "{n} track(s)",
+  "de": "{n} Titel",
+  "es": "{n} pista(s)",
+  "it": "{n} traccia/e",
+  "zh": "{n} 首",
+  "ja": "{n} 曲",
+  "ko": "{n}곡"
+ },
+ "ai.resultsFor": {
+  "fr": "Résultats pour « {query} » : {parts}",
+  "en": "Results for “{query}”: {parts}",
+  "de": "Ergebnisse für „{query}“: {parts}",
+  "es": "Resultados para «{query}»: {parts}",
+  "it": "Risultati per «{query}»: {parts}",
+  "zh": "“{query}”的结果：{parts}",
+  "ja": "「{query}」の結果：{parts}",
+  "ko": "“{query}” 검색 결과: {parts}"
+ },
+ "ai.zonesAvailable": {
+  "fr": "Zones disponibles : {zones}",
+  "en": "Available zones: {zones}",
+  "de": "Verfügbare Zonen: {zones}",
+  "es": "Zonas disponibles: {zones}",
+  "it": "Zone disponibili: {zones}",
+  "zh": "可用区域：{zones}",
+  "ja": "利用可能なゾーン：{zones}",
+  "ko": "사용 가능한 구역: {zones}"
+ },
+ "ai.noZone": {
+  "fr": "Aucune zone trouvée.",
+  "en": "No zones found.",
+  "de": "Keine Zonen gefunden.",
+  "es": "No se encontró ninguna zona.",
+  "it": "Nessuna zona trovata.",
+  "zh": "未找到任何区域。",
+  "ja": "ゾーンが見つかりませんでした。",
+  "ko": "구역을 찾을 수 없습니다."
+ },
+ "ai.notUnderstood": {
+  "fr": "Désolé, je n'ai pas compris « {msg} ». Essayez « joue [artiste/album] » ou « cherche [terme] ».",
+  "en": "Sorry, I didn't understand “{msg}”. Try “play [artist/album]” or “search [term]”.",
+  "de": "Entschuldigung, ich habe „{msg}“ nicht verstanden. Versuchen Sie „spiele [Künstler/Album]“ oder „suche [Begriff]“.",
+  "es": "Lo siento, no entendí «{msg}». Prueba «reproduce [artista/álbum]» o «busca [término]».",
+  "it": "Spiacente, non ho capito «{msg}». Prova «riproduci [artista/album]» o «cerca [termine]».",
+  "zh": "抱歉，我没有理解“{msg}”。试试“播放 [艺术家/专辑]”或“搜索 [关键词]”。",
+  "ja": "すみません、「{msg}」を理解できませんでした。「[アーティスト/アルバム] を再生」または「[キーワード] を検索」とお試しください。",
+  "ko": "죄송합니다, “{msg}”를 이해하지 못했습니다. “[아티스트/앨범] 재생” 또는 “[검색어] 검색”을 시도해 보세요."
  }
 }
