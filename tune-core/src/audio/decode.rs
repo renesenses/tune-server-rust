@@ -485,6 +485,7 @@ fn decode_to_pcm_streaming_inner(
             &data_ready,
             &levels_tx,
             &rt,
+            seek_s,
         );
     }
 
@@ -1126,6 +1127,7 @@ fn decode_dsd_streaming(
     data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
     levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::levels::AudioLevels>>,
     rt: &tokio::runtime::Handle,
+    seek_s: f64,
 ) -> Result<(u16, u32), String> {
     use super::dsd_to_pcm::DsdToPcmStreamer;
 
@@ -1196,6 +1198,20 @@ fn decode_dsd_streaming(
     if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        if seek_s > 0.0 {
+            // Block-aligned seek so DSD playback resumes at the requested
+            // position instead of restarting at 0 (Xavier). bytes-per-channel =
+            // seek_s × dsd_rate / 8.
+            let target_bpc = (seek_s * dsd_rate as f64 / 8.0) as usize;
+            let reached = reader.seek_to_bytes_per_channel(target_bpc)?;
+            tracing::info!(
+                seek_s,
+                dsd_rate,
+                target_bpc,
+                reached_bpc = reached,
+                "dsd_streaming_seek_block_aligned"
+            );
+        }
         while let Some(dsd_chunk) = reader.next_chunk()? {
             if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
                 return Ok((output_bd, output_rate));
@@ -1208,6 +1224,17 @@ fn decode_dsd_streaming(
         // enough to amortize I/O overhead.
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+        if seek_s > 0.0 {
+            let target = (seek_s * dsd_rate as f64 / 8.0) as usize * channels;
+            let reached = reader.seek_to_interleaved_byte(target, channels)?;
+            tracing::info!(
+                seek_s,
+                dsd_rate,
+                target,
+                reached,
+                "dsd_streaming_seek_block_aligned"
+            );
+        }
         while let Some(dsd_chunk) = reader.next_chunk()? {
             if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
                 return Ok((output_bd, output_rate));

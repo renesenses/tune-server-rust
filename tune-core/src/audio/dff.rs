@@ -252,6 +252,8 @@ pub struct DffStreamReader {
     file: File,
     remaining: usize,
     chunk_buf: Vec<u8>,
+    data_offset: u64,
+    data_size: usize,
 }
 
 impl DffStreamReader {
@@ -275,7 +277,26 @@ impl DffStreamReader {
             file,
             remaining: info.data_size as usize,
             chunk_buf: vec![0u8; read_chunk_size],
+            data_offset: info.data_offset,
+            data_size: info.data_size as usize,
         })
+    }
+
+    /// Seek to a `channels`-aligned interleaved byte offset. DFF stores DSD as
+    /// interleaved bytes (LR LR …), so aligning to a channel boundary keeps the
+    /// bit stream phased. Returns the byte offset actually reached. Enables DSD
+    /// seek in the streaming path (previously seek restarted at 0 — Xavier).
+    pub fn seek_to_interleaved_byte(
+        &mut self,
+        target: usize,
+        channels: usize,
+    ) -> Result<usize, String> {
+        let aligned = (target / channels * channels).min(self.data_size);
+        self.file
+            .seek(SeekFrom::Start(self.data_offset + aligned as u64))
+            .map_err(|e| format!("dff seek: {e}"))?;
+        self.remaining = self.data_size - aligned;
+        Ok(aligned)
     }
 
     /// Read the next chunk of byte-interleaved DSD data.

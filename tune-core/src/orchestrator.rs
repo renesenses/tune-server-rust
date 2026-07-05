@@ -3522,13 +3522,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
-                // Local output: the WAV stream is sequential (mpsc channel),
-                // so we must stop+replay from the seek position.
+                // Local + OAAT outputs consume a sequential HTTP transcode
+                // stream (mpsc / chunked), so we must stop+replay from the seek
+                // position rather than range-seek in place. OAAT DSD is served
+                // as a chunked WAV transcode that cannot be range-seeked — a raw
+                // Range request lands mid-DSD-block and plays WHITE NOISE
+                // (Xavier). Recreating with seek_ms restarts the transcode at
+                // the correct offset (paired with the DSD-decode seek fix).
                 let is_local_output =
                     zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
+                let is_oaat_output = zone_output_type.as_deref() == Some("oaat");
                 let has_track = state.now_playing.is_some();
 
-                if is_local_output && has_track {
+                if (is_local_output || is_oaat_output) && has_track {
                     info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                     self.playback.seek(zone_id, position_ms as i64).await;
 
@@ -3544,7 +3550,7 @@ impl PlaybackOrchestrator {
                             .flatten()
                             .and_then(|z| z.output_device_id)
                     }) {
-                        if did.starts_with("local:") {
+                        if did.starts_with("local:") || did.starts_with("oaat:") {
                             let outputs = self.outputs.lock().await;
                             if let Some(output) = outputs.get(did.as_str()) {
                                 let _ = output.lock().await.stop().await;
