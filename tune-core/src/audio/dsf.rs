@@ -256,6 +256,25 @@ impl DsfStreamReader {
         })
     }
 
+    /// Seek to the super-block whose start is at or before `target_bpc` bytes
+    /// (per channel) into the DSD stream. Super-block aligned (DSF stores data
+    /// as interleaved per-channel blocks), so playback resumes on a clean block
+    /// boundary — no bit-phase misalignment. Returns the bytes-per-channel
+    /// position actually reached. Enables DSD seek in the streaming path
+    /// (previously seek restarted decoding at 0 — Xavier).
+    pub fn seek_to_bytes_per_channel(&mut self, target_bpc: usize) -> Result<usize, String> {
+        let block_size = self.info.block_size as usize;
+        let channels = self.info.channels as usize;
+        let block_idx = (target_bpc / block_size).min(self.blocks_per_channel);
+        let byte_pos = block_idx * block_size * channels;
+        self.file
+            .seek(SeekFrom::Start(self.info.data_offset + byte_pos as u64))
+            .map_err(|e| format!("dsf seek: {e}"))?;
+        self.block_idx = block_idx;
+        self.bytes_read_total = byte_pos;
+        Ok(block_idx * block_size)
+    }
+
     /// Read the next chunk of byte-interleaved DSD data.
     ///
     /// Returns `Ok(Some(chunk))` with interleaved bytes, or `Ok(None)` at EOF.
