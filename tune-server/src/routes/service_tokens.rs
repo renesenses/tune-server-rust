@@ -10,7 +10,14 @@ use tune_core::services_manager::ServicesManager;
 
 use crate::state::AppState;
 
-pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn list(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    // Localize purposes / pricing / help steps to the client's selected UI
+    // language (Accept-Language), falling back to French.
+    let lang = crate::i18n::lang_from_header(&headers);
+    let tr = |k: &str| crate::i18n::t(&lang, k);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let registry = state.services.lock().await;
     let streaming_status = registry.status_all().await;
@@ -74,18 +81,18 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
     let services = vec![
         json!({
             "id": "musicbrainz", "name": "MusicBrainz", "kind": "no_auth",
-            "purpose": "Années + crédits + couvertures (ID releases).",
-            "pricing": "free", "pricing_note": "100 % gratuit, base de données ouverte.",
+            "purpose": tr("svctok.musicbrainz.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.musicbrainz.pricing"),
             "configured": true, "source": serde_json::Value::Null, "valid": true,
             "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
             "fields": [],
             "help_url": "https://musicbrainz.org/",
-            "help_steps": ["Aucun token requis — MusicBrainz est gratuit et anonyme."],
+            "help_steps": [tr("svctok.musicbrainz.step1")],
         }),
         json!({
             "id": "discogs", "name": "Discogs", "kind": "personal_token",
-            "purpose": "Années + couvertures + crédits pour pressages obscurs.",
-            "pricing": "free", "pricing_note": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
+            "purpose": tr("svctok.discogs.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.discogs.pricing"),
             "configured": discogs_configured,
             "source": if discogs_payload.is_some() { json!("db") } else if discogs_db_configured { json!("env") } else { serde_json::Value::Null },
             "valid": discogs_payload.as_ref().and_then(|p| p.valid),
@@ -93,12 +100,12 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             "validation_message": discogs_payload.as_ref().and_then(|p| p.validation_message.clone()),
             "fields": [{"key": "token", "label": "Personal Access Token", "type": "password"}],
             "help_url": "https://www.discogs.com/settings/developers",
-            "help_steps": ["Connecte-toi sur discogs.com.", "Va dans Settings → Developers.", "Clique 'Generate new token'.", "Colle le token ici."],
+            "help_steps": [tr("svctok.discogs.step1"), tr("svctok.discogs.step2"), tr("svctok.discogs.step3"), tr("svctok.discogs.step4")],
         }),
         json!({
             "id": "lastfm", "name": "Last.fm", "kind": "api_key",
-            "purpose": "Genres + scrobbling.",
-            "pricing": "free", "pricing_note": "API gratuite pour usage non commercial.",
+            "purpose": tr("svctok.lastfm.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.lastfm.pricing"),
             "configured": lastfm_configured || lastfm_payload.is_some(),
             "source": if lastfm_payload.is_some() { json!("db") } else if lastfm_configured { json!("env") } else { serde_json::Value::Null },
             "valid": lastfm_payload.as_ref().and_then(|p| p.valid),
@@ -109,15 +116,15 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             "lastfm_username": lastfm_username,
             "fields": [
                 {"key": "api_key", "label": "API Key", "type": "text"},
-                {"key": "api_secret", "label": "API Secret (pour scrobbling)", "type": "password"},
+                {"key": "api_secret", "label": tr("svctok.lastfm.fieldApiSecret"), "type": "password"},
             ],
             "help_url": "https://www.last.fm/api/account/create",
-            "help_steps": ["Va sur last.fm/api/account/create", "Renseigne un nom d'application.", "Récupère 'API key' et 'Shared secret'.", "Colle ici puis Enregistrer."],
+            "help_steps": [tr("svctok.lastfm.step1"), tr("svctok.lastfm.step2"), tr("svctok.lastfm.step3"), tr("svctok.lastfm.step4")],
         }),
         json!({
             "id": "genius", "name": "Genius", "kind": "api_key",
-            "purpose": "Paroles.",
-            "pricing": "free", "pricing_note": "API gratuite.",
+            "purpose": tr("svctok.genius.purpose"),
+            "pricing": "free", "pricing_note": tr("svctok.genius.pricing"),
             "configured": settings.get("genius_token").ok().flatten().is_some() || genius_payload.is_some(),
             "source": if genius_payload.is_some() { json!("db") } else if settings.get("genius_token").ok().flatten().is_some() { json!("env") } else { serde_json::Value::Null },
             "valid": genius_payload.as_ref().and_then(|p| p.valid),
@@ -125,52 +132,52 @@ pub async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
             "validation_message": genius_payload.as_ref().and_then(|p| p.validation_message.clone()),
             "fields": [{"key": "token", "label": "Access Token", "type": "password"}],
             "help_url": "https://genius.com/api-clients",
-            "help_steps": ["Crée un compte sur genius.com.", "Va dans API Clients.", "Crée une application et copie le token."],
+            "help_steps": [tr("svctok.genius.step1"), tr("svctok.genius.step2"), tr("svctok.genius.step3")],
         }),
         json!({
             "id": "tidal", "name": "Tidal", "kind": "oauth",
-            "purpose": "Streaming hi-res + années + couvertures.",
-            "pricing": "paid", "pricing_note": "Abonnement Tidal HiFi requis (≈ 11€/mois).",
+            "purpose": tr("svctok.tidal.purpose"),
+            "pricing": "paid", "pricing_note": tr("svctok.tidal.pricing"),
             "configured": tidal_auth, "source": if tidal_auth { json!("db") } else { serde_json::Value::Null },
             "valid": if tidal_auth { json!(true) } else { serde_json::Value::Null },
             "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
             "fields": [],
             "help_url": "/streaming/tidal",
-            "help_steps": ["Tidal utilise OAuth — utilise la page Streaming → Tidal pour te connecter."],
+            "help_steps": [tr("svctok.tidal.step1")],
         }),
         json!({
             "id": "qobuz", "name": "Qobuz", "kind": "login_password",
-            "purpose": "Streaming hi-res + années + couvertures.",
-            "pricing": "paid", "pricing_note": "Abonnement Qobuz Studio requis (≈ 13€/mois).",
+            "purpose": tr("svctok.qobuz.purpose"),
+            "pricing": "paid", "pricing_note": tr("svctok.qobuz.pricing"),
             "configured": qobuz_auth, "source": if qobuz_auth { json!("db") } else { serde_json::Value::Null },
             "valid": if qobuz_auth { json!(true) } else { serde_json::Value::Null },
             "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
             "fields": [],
             "help_url": "/streaming/qobuz",
-            "help_steps": ["Qobuz utilise login/password — utilise la page Streaming → Qobuz pour te connecter."],
+            "help_steps": [tr("svctok.qobuz.step1")],
         }),
         json!({
             "id": "spotify", "name": "Spotify", "kind": "oauth",
-            "purpose": "Streaming + connectivité.",
-            "pricing": "freemium", "pricing_note": "Compte Spotify gratuit ou Premium (≈ 11€/mois).",
+            "purpose": tr("svctok.spotify.purpose"),
+            "pricing": "freemium", "pricing_note": tr("svctok.spotify.pricing"),
             "configured": spotify_auth, "source": if spotify_auth { json!("db") } else { serde_json::Value::Null },
             "valid": if spotify_auth { json!(true) } else { serde_json::Value::Null },
             "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
             "fields": [],
             "help_url": "/streaming/spotify",
-            "help_steps": ["Spotify utilise OAuth — utilise la page Streaming → Spotify pour te connecter."],
+            "help_steps": [tr("svctok.spotify.step1")],
         }),
         json!({
             "id": "deezer", "name": "Deezer", "kind": "arl_token",
-            "purpose": "Streaming.",
-            "pricing": "freemium", "pricing_note": "Compte gratuit ou Deezer HiFi (≈ 12€/mois) pour FLAC.",
+            "purpose": tr("svctok.deezer.purpose"),
+            "pricing": "freemium", "pricing_note": tr("svctok.deezer.pricing"),
             "configured": deezer_auth,
             "source": if deezer_auth { json!("db") } else { serde_json::Value::Null },
             "valid": if deezer_auth { json!(true) } else { serde_json::Value::Null },
             "validated_at": serde_json::Value::Null, "validation_message": serde_json::Value::Null,
-            "fields": [{"key": "arl", "label": "ARL token (depuis cookies deezer.com)", "type": "password"}],
+            "fields": [{"key": "arl", "label": tr("svctok.deezer.fieldArl"), "type": "password"}],
             "help_url": "/streaming/deezer",
-            "help_steps": ["Connecte-toi sur deezer.com.", "DevTools (F12) → Application → Cookies → cherche 'arl'.", "Colle le token ARL ici."],
+            "help_steps": [tr("svctok.deezer.step1"), tr("svctok.deezer.step2"), tr("svctok.deezer.step3")],
         }),
     ];
     Json(json!(services))
