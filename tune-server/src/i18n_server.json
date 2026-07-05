@@ -1,0 +1,522 @@
+{
+  "metafield.album_artist": {
+    "fr": "Artiste de l'album",
+    "en": "Album Artist",
+    "de": "Album-Interpret",
+    "es": "Artista del álbum",
+    "it": "Artista dell'album",
+    "zh": "专辑艺术家",
+    "ja": "アルバムアーティスト",
+    "ko": "앨범 아티스트"
+  },
+  "metafield.sort_artist": {
+    "fr": "Tri artiste",
+    "en": "Sort Artist",
+    "de": "Sortier-Interpret",
+    "es": "Ordenar por artista",
+    "it": "Ordina artista",
+    "zh": "艺术家排序",
+    "ja": "アーティスト並べ替え",
+    "ko": "아티스트 정렬"
+  },
+  "metafield.sort_album": {
+    "fr": "Tri album",
+    "en": "Sort Album",
+    "de": "Sortier-Album",
+    "es": "Ordenar por álbum",
+    "it": "Ordina album",
+    "zh": "专辑排序",
+    "ja": "アルバム並べ替え",
+    "ko": "앨범 정렬"
+  },
+  "metafield.disc_number": {
+    "fr": "N° disque",
+    "en": "Disc No.",
+    "de": "CD-Nr.",
+    "es": "N.º de disco",
+    "it": "N. disco",
+    "zh": "碟片编号",
+    "ja": "ディスク番号",
+    "ko": "디스크 번호"
+  },
+  "metafield.disc_subtitle": {
+    "fr": "Sous-titre disque",
+    "en": "Disc Subtitle",
+    "de": "CD-Untertitel",
+    "es": "Subtítulo del disco",
+    "it": "Sottotitolo disco",
+    "zh": "碟片副标题",
+    "ja": "ディスクサブタイトル",
+    "ko": "디스크 부제"
+  },
+  "metafield.track_number": {
+    "fr": "N° piste",
+    "en": "Track No.",
+    "de": "Titel-Nr.",
+    "es": "N.º de pista",
+    "it": "N. traccia",
+    "zh": "音轨编号",
+    "ja": "トラック番号",
+    "ko": "트랙 번호"
+  },
+  "metafield.genre": {
+    "fr": "Genre",
+    "en": "Genre",
+    "de": "Genre",
+    "es": "Género",
+    "it": "Genere",
+    "zh": "流派",
+    "ja": "ジャンル",
+    "ko": "장르"
+  },
+  "metafield.genres": {
+    "fr": "Genres (multi)",
+    "en": "Genres (multiple)",
+    "de": "Genres (mehrere)",
+    "es": "Géneros (varios)",
+    "it": "Generi (multipli)",
+    "zh": "流派（多个）",
+    "ja": "ジャンル（複数）",
+    "ko": "장르 (다중)"
+  },
+  "metafield.year": {
+    "fr": "Année",
+    "en": "Year",
+    "de": "Jahr",
+    "es": "Año",
+    "it": "Anno",
+    "zh": "年份",
+    "ja": "年",
+    "ko": "연도"
+  },
+  "metafield.composer": {
+    "fr": "Compositeur",
+    "en": "Composer",
+    "de": "Komponist",
+    "es": "Compositor",
+    "it": "Compositore",
+    "zh": "作曲",
+    "ja": "作曲者",
+    "ko": "작곡가"
+  },
+  "metafield.conductor": {
+    "fr": "Chef d'orchestre",
+    "en": "Conductor",
+    "de": "Dirigent",
+    "es": "Director de orquesta",
+    "it": "Direttore d'orchestra",
+    "zh": "指挥",
+    "ja": "指揮者",
+    "ko": "지휘자"
+  },
+  "metafield.lyricist": {
+    "fr": "Parolier",
+    "en": "Lyricist",
+    "de": "Texter",
+    "es": "Letrista",
+    "it": "Paroliere",
+    "zh": "作词",
+    "ja": "作詞者",
+    "ko": "작사가"
+  },
+  "metafield.performer": {
+    "fr": "Interprète",
+    "en": "Performer",
+    "de": "Interpret",
+    "es": "Intérprete",
+    "it": "Interprete",
+    "zh": "演奏者",
+    "ja": "演奏者",
+    "ko": "연주자"
+  },
+  "metafield.remixer": {
+    "fr": "Remixeur",
+    "en": "Remixer",
+    "de": "Remixer",
+    "es": "Remezclador",
+    "it": "Remixer",
+    "zh": "混音师",
+    "ja": "リミキサー",
+    "ko": "리믹서"
+  },
+  "metafield.label": {
+    "fr": "Label",
+    "en": "Label",
+    "de": "Label",
+    "es": "Sello",
+    "it": "Etichetta",
+    "zh": "唱片公司",
+    "ja": "レーベル",
+    "ko": "레이블"
+  },
+  "metafield.producer": {
+    "fr": "Producteur",
+    "en": "Producer",
+    "de": "Produzent",
+    "es": "Productor",
+    "it": "Produttore",
+    "zh": "制作人",
+    "ja": "プロデューサー",
+    "ko": "프로듀서"
+  },
+  "metafield.bpm": {
+    "fr": "BPM",
+    "en": "BPM",
+    "de": "BPM",
+    "es": "BPM",
+    "it": "BPM",
+    "zh": "BPM",
+    "ja": "BPM",
+    "ko": "BPM"
+  },
+  "metafield.mood": {
+    "fr": "Ambiance",
+    "en": "Mood",
+    "de": "Stimmung",
+    "es": "Ambiente",
+    "it": "Atmosfera",
+    "zh": "情绪",
+    "ja": "ムード",
+    "ko": "분위기"
+  },
+  "metafield.grouping": {
+    "fr": "Regroupement",
+    "en": "Grouping",
+    "de": "Gruppierung",
+    "es": "Agrupación",
+    "it": "Raggruppamento",
+    "zh": "分组",
+    "ja": "グループ",
+    "ko": "그룹"
+  },
+  "metafield.compilation": {
+    "fr": "Compilation",
+    "en": "Compilation",
+    "de": "Kompilation",
+    "es": "Recopilación",
+    "it": "Compilation",
+    "zh": "合辑",
+    "ja": "コンピレーション",
+    "ko": "컴필레이션"
+  },
+  "metafield.comment": {
+    "fr": "Commentaire",
+    "en": "Comment",
+    "de": "Kommentar",
+    "es": "Comentario",
+    "it": "Commento",
+    "zh": "备注",
+    "ja": "コメント",
+    "ko": "설명"
+  },
+  "metafield.lyrics": {
+    "fr": "Paroles",
+    "en": "Lyrics",
+    "de": "Liedtext",
+    "es": "Letra",
+    "it": "Testo",
+    "zh": "歌词",
+    "ja": "歌詞",
+    "ko": "가사"
+  },
+  "metafield.isrc": {
+    "fr": "ISRC",
+    "en": "ISRC",
+    "de": "ISRC",
+    "es": "ISRC",
+    "it": "ISRC",
+    "zh": "ISRC",
+    "ja": "ISRC",
+    "ko": "ISRC"
+  },
+  "metafield.barcode": {
+    "fr": "Code-barres",
+    "en": "Barcode",
+    "de": "Barcode",
+    "es": "Código de barras",
+    "it": "Codice a barre",
+    "zh": "条形码",
+    "ja": "バーコード",
+    "ko": "바코드"
+  },
+  "metafield.catalog_number": {
+    "fr": "Réf. catalogue",
+    "en": "Catalog No.",
+    "de": "Katalog-Nr.",
+    "es": "N.º de catálogo",
+    "it": "N. catalogo",
+    "zh": "目录编号",
+    "ja": "カタログ番号",
+    "ko": "카탈로그 번호"
+  },
+  "metafield.media_type": {
+    "fr": "Support",
+    "en": "Media Type",
+    "de": "Medientyp",
+    "es": "Tipo de soporte",
+    "it": "Tipo di supporto",
+    "zh": "介质类型",
+    "ja": "メディアタイプ",
+    "ko": "매체 종류"
+  },
+  "metafield.musicbrainz_recording_id": {
+    "fr": "MusicBrainz Recording ID",
+    "en": "MusicBrainz Recording ID",
+    "de": "MusicBrainz Recording ID",
+    "es": "MusicBrainz Recording ID",
+    "it": "MusicBrainz Recording ID",
+    "zh": "MusicBrainz Recording ID",
+    "ja": "MusicBrainz Recording ID",
+    "ko": "MusicBrainz Recording ID"
+  },
+  "metafield.musicbrainz_release_id": {
+    "fr": "MusicBrainz Release ID",
+    "en": "MusicBrainz Release ID",
+    "de": "MusicBrainz Release ID",
+    "es": "MusicBrainz Release ID",
+    "it": "MusicBrainz Release ID",
+    "zh": "MusicBrainz Release ID",
+    "ja": "MusicBrainz Release ID",
+    "ko": "MusicBrainz Release ID"
+  },
+  "metafield.musicbrainz_release_group_id": {
+    "fr": "MusicBrainz Release Group ID",
+    "en": "MusicBrainz Release Group ID",
+    "de": "MusicBrainz Release Group ID",
+    "es": "MusicBrainz Release Group ID",
+    "it": "MusicBrainz Release Group ID",
+    "zh": "MusicBrainz Release Group ID",
+    "ja": "MusicBrainz Release Group ID",
+    "ko": "MusicBrainz Release Group ID"
+  },
+  "metafield.release_date": {
+    "fr": "Date de sortie",
+    "en": "Release Date",
+    "de": "Veröffentlichungsdatum",
+    "es": "Fecha de lanzamiento",
+    "it": "Data di pubblicazione",
+    "zh": "发行日期",
+    "ja": "リリース日",
+    "ko": "발매일"
+  },
+  "metafield.original_date": {
+    "fr": "Date originale",
+    "en": "Original Date",
+    "de": "Originaldatum",
+    "es": "Fecha original",
+    "it": "Data originale",
+    "zh": "原始日期",
+    "ja": "オリジナル日付",
+    "ko": "원본 날짜"
+  },
+  "metafield.original_year": {
+    "fr": "Année originale",
+    "en": "Original Year",
+    "de": "Originaljahr",
+    "es": "Año original",
+    "it": "Anno originale",
+    "zh": "原始年份",
+    "ja": "オリジナル年",
+    "ko": "원본 연도"
+  },
+  "metafield.format": {
+    "fr": "Format audio",
+    "en": "Audio Format",
+    "de": "Audioformat",
+    "es": "Formato de audio",
+    "it": "Formato audio",
+    "zh": "音频格式",
+    "ja": "オーディオ形式",
+    "ko": "오디오 형식"
+  },
+  "metafield.sample_rate": {
+    "fr": "Fréquence d'échantillonnage",
+    "en": "Sample Rate",
+    "de": "Abtastrate",
+    "es": "Frecuencia de muestreo",
+    "it": "Frequenza di campionamento",
+    "zh": "采样率",
+    "ja": "サンプリングレート",
+    "ko": "샘플링 레이트"
+  },
+  "metafield.bit_depth": {
+    "fr": "Profondeur de bits",
+    "en": "Bit Depth",
+    "de": "Bittiefe",
+    "es": "Profundidad de bits",
+    "it": "Profondità di bit",
+    "zh": "位深度",
+    "ja": "ビット深度",
+    "ko": "비트 심도"
+  },
+  "metafield.channels": {
+    "fr": "Canaux",
+    "en": "Channels",
+    "de": "Kanäle",
+    "es": "Canales",
+    "it": "Canali",
+    "zh": "声道",
+    "ja": "チャンネル",
+    "ko": "채널"
+  },
+  "metafield.duration_ms": {
+    "fr": "Durée",
+    "en": "Duration",
+    "de": "Dauer",
+    "es": "Duración",
+    "it": "Durata",
+    "zh": "时长",
+    "ja": "再生時間",
+    "ko": "재생 시간"
+  },
+  "metafield.file_size": {
+    "fr": "Taille du fichier",
+    "en": "File Size",
+    "de": "Dateigröße",
+    "es": "Tamaño del archivo",
+    "it": "Dimensione del file",
+    "zh": "文件大小",
+    "ja": "ファイルサイズ",
+    "ko": "파일 크기"
+  },
+  "metafield.file_path": {
+    "fr": "Chemin du fichier",
+    "en": "File Path",
+    "de": "Dateipfad",
+    "es": "Ruta del archivo",
+    "it": "Percorso del file",
+    "zh": "文件路径",
+    "ja": "ファイルパス",
+    "ko": "파일 경로"
+  },
+  "metafield.encoder": {
+    "fr": "Encodeur",
+    "en": "Encoder",
+    "de": "Encoder",
+    "es": "Codificador",
+    "it": "Codificatore",
+    "zh": "编码器",
+    "ja": "エンコーダー",
+    "ko": "인코더"
+  },
+  "metafield.copyright": {
+    "fr": "Copyright",
+    "en": "Copyright",
+    "de": "Copyright",
+    "es": "Copyright",
+    "it": "Copyright",
+    "zh": "Copyright",
+    "ja": "Copyright",
+    "ko": "Copyright"
+  },
+  "metafield.language": {
+    "fr": "Langue",
+    "en": "Language",
+    "de": "Sprache",
+    "es": "Idioma",
+    "it": "Lingua",
+    "zh": "语言",
+    "ja": "言語",
+    "ko": "언어"
+  },
+  "metafield.rg_track_gain": {
+    "fr": "ReplayGain piste",
+    "en": "ReplayGain Track",
+    "de": "ReplayGain Titel",
+    "es": "ReplayGain de pista",
+    "it": "ReplayGain traccia",
+    "zh": "ReplayGain 音轨",
+    "ja": "ReplayGain トラック",
+    "ko": "ReplayGain 트랙"
+  },
+  "metafield.rg_album_gain": {
+    "fr": "ReplayGain album",
+    "en": "ReplayGain Album",
+    "de": "ReplayGain Album",
+    "es": "ReplayGain de álbum",
+    "it": "ReplayGain album",
+    "zh": "ReplayGain 专辑",
+    "ja": "ReplayGain アルバム",
+    "ko": "ReplayGain 앨범"
+  },
+  "metacat.Identification": {
+    "fr": "Identification",
+    "en": "Identification",
+    "de": "Identifikation",
+    "es": "Identificación",
+    "it": "Identificazione",
+    "zh": "标识",
+    "ja": "識別",
+    "ko": "식별"
+  },
+  "metacat.Crédits": {
+    "fr": "Crédits",
+    "en": "Credits",
+    "de": "Mitwirkende",
+    "es": "Créditos",
+    "it": "Crediti",
+    "zh": "参与者",
+    "ja": "クレジット",
+    "ko": "크레딧"
+  },
+  "metacat.Classification": {
+    "fr": "Classification",
+    "en": "Classification",
+    "de": "Klassifizierung",
+    "es": "Clasificación",
+    "it": "Classificazione",
+    "zh": "分类",
+    "ja": "分類",
+    "ko": "분류"
+  },
+  "metacat.Texte": {
+    "fr": "Texte",
+    "en": "Text",
+    "de": "Text",
+    "es": "Texto",
+    "it": "Testo",
+    "zh": "文本",
+    "ja": "テキスト",
+    "ko": "텍스트"
+  },
+  "metacat.Identifiants": {
+    "fr": "Identifiants",
+    "en": "Identifiers",
+    "de": "Bezeichner",
+    "es": "Identificadores",
+    "it": "Identificatori",
+    "zh": "标识符",
+    "ja": "識別子",
+    "ko": "식별자"
+  },
+  "metacat.Dates": {
+    "fr": "Dates",
+    "en": "Dates",
+    "de": "Daten",
+    "es": "Fechas",
+    "it": "Date",
+    "zh": "日期",
+    "ja": "日付",
+    "ko": "날짜"
+  },
+  "metacat.Technique": {
+    "fr": "Technique",
+    "en": "Technical",
+    "de": "Technik",
+    "es": "Técnica",
+    "it": "Tecnica",
+    "zh": "技术",
+    "ja": "技術",
+    "ko": "기술"
+  },
+  "metacat.ReplayGain": {
+    "fr": "ReplayGain",
+    "en": "ReplayGain",
+    "de": "ReplayGain",
+    "es": "ReplayGain",
+    "it": "ReplayGain",
+    "zh": "ReplayGain",
+    "ja": "ReplayGain",
+    "ko": "ReplayGain"
+  }
+}
