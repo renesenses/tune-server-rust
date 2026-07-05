@@ -231,26 +231,33 @@ async fn sso_callback(
         .and_then(|row| row.first().and_then(|v| v.as_i64()));
 
     let profile_id = if let Some(id) = existing_id {
-        // Update display name / avatar from cloud profile
+        // Update display name from the cloud profile — but NOT avatar_path.
+        // The `avatar_path` column stores the profile's chosen avatar COLOR
+        // (hex), and the client fetches the cloud avatar image separately from
+        // /cloud/sso/status. Overwriting avatar_path with the SSO avatar URL
+        // destroyed the user's chosen colour on every SSO login (Bilou:
+        // "couleur de fond du profil non mémorisée après connexion").
         state
             .backend
             .execute(
-                "UPDATE profiles SET display_name = ?, avatar_path = ? WHERE id = ?",
+                "UPDATE profiles SET display_name = ? WHERE id = ?",
                 &[
                     &user.display_name as &dyn ToSqlValue,
-                    &user.avatar_url as &dyn ToSqlValue,
                     &id as &dyn ToSqlValue,
                 ],
             )
             .ok();
         id
     } else {
-        // Create new local profile from cloud user
+        // Create new local profile from cloud user. Seed avatar_path with a
+        // default colour (not the SSO URL) so the fallback avatar circle has a
+        // valid colour when disconnected; the cloud image is shown separately.
+        let default_color = "#6366f1";
         state
             .backend
             .execute(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &user.avatar_url as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
+                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
             )
             .ok();
         state.backend.last_insert_rowid()
