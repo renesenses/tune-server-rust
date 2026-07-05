@@ -1068,5 +1068,95 @@
   "zh": "抱歉，我没有理解“{msg}”。试试“播放 [艺术家/专辑]”或“搜索 [关键词]”。",
   "ja": "すみません、「{msg}」を理解できませんでした。「[アーティスト/アルバム] を再生」または「[キーワード] を検索」とお試しください。",
   "ko": "죄송합니다, “{msg}”를 이해하지 못했습니다. “[아티스트/앨범] 재생” 또는 “[검색어] 검색”을 시도해 보세요."
+ },
+ "svctok.test.musicbrainz": {
+  "fr": "MusicBrainz disponible (aucun token requis).",
+  "en": "MusicBrainz available (no token required).",
+  "de": "MusicBrainz verfügbar (kein Token erforderlich).",
+  "es": "MusicBrainz disponible (no se requiere token).",
+  "it": "MusicBrainz disponibile (nessun token richiesto).",
+  "zh": "MusicBrainz 可用（无需 token）。",
+  "ja": "MusicBrainz は利用可能です（token 不要）。",
+  "ko": "MusicBrainz 사용 가능 (token 불필요)."
+ },
+ "svctok.test.validationUnavailable": {
+  "fr": "Validation non disponible pour ce service.",
+  "en": "Validation not available for this service.",
+  "de": "Validierung für diesen Dienst nicht verfügbar.",
+  "es": "Validación no disponible para este servicio.",
+  "it": "Convalida non disponibile per questo servizio.",
+  "zh": "此服务无法进行验证。",
+  "ja": "このサービスでは検証を利用できません。",
+  "ko": "이 서비스에서는 검증을 사용할 수 없습니다."
+ },
+ "svctok.err.generic": {
+  "fr": "Erreur : {error}",
+  "en": "Error: {error}",
+  "de": "Fehler: {error}",
+  "es": "Error: {error}",
+  "it": "Errore: {error}",
+  "zh": "错误：{error}",
+  "ja": "エラー：{error}",
+  "ko": "오류: {error}"
+ },
+ "radio.addedTitle": {
+  "fr": "✓ Radio ajoutée",
+  "en": "✓ Radio added",
+  "de": "✓ Radio hinzugefügt",
+  "es": "✓ Radio añadida",
+  "it": "✓ Radio aggiunta",
+  "zh": "✓ 电台已添加",
+  "ja": "✓ ラジオを追加しました",
+  "ko": "✓ 라디오 추가됨"
+ },
+ "radio.addedBody": {
+  "fr": "{name} a été ajoutée à vos favoris Tune.",
+  "en": "{name} has been added to your Tune favorites.",
+  "de": "{name} wurde zu deinen Tune-Favoriten hinzugefügt.",
+  "es": "{name} se ha añadido a tus favoritos de Tune.",
+  "it": "{name} è stata aggiunta ai tuoi preferiti Tune.",
+  "zh": "{name} 已添加到你的 Tune 收藏。",
+  "ja": "{name} を Tune のお気に入りに追加しました。",
+  "ko": "{name}이(가) Tune 즐겨찾기에 추가되었습니다."
+ },
+ "radio.canCloseTab": {
+  "fr": "Vous pouvez fermer cet onglet.",
+  "en": "You can close this tab.",
+  "de": "Du kannst diesen Tab schließen.",
+  "es": "Puedes cerrar esta pestaña.",
+  "it": "Puoi chiudere questa scheda.",
+  "zh": "你可以关闭此标签页。",
+  "ja": "このタブを閉じてかまいません。",
+  "ko": "이 탭을 닫아도 됩니다."
+ },
+ "radio.errorTitle": {
+  "fr": "Erreur",
+  "en": "Error",
+  "de": "Fehler",
+  "es": "Error",
+  "it": "Errore",
+  "zh": "错误",
+  "ja": "エラー",
+  "ko": "오류"
+ },
+ "net.smbAccessDenied": {
+  "fr": "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({error})",
+  "en": "Access denied (guest). Try with a username/password. ({error})",
+  "de": "Zugriff verweigert (guest). Versuche es mit Benutzername/Passwort. ({error})",
+  "es": "Acceso denegado (guest). Prueba con un usuario/contraseña. ({error})",
+  "it": "Accesso negato (guest). Prova con nome utente/password. ({error})",
+  "zh": "访问被拒绝（guest）。请尝试使用用户名/密码。({error})",
+  "ja": "アクセスが拒否されました（guest）。ユーザー名／パスワードでお試しください。({error})",
+  "ko": "접근이 거부되었습니다 (guest). 아이디/비밀번호로 시도하세요. ({error})"
+ },
+ "net.smbScanFailed": {
+  "fr": "Impossible de scanner {host} : {error}",
+  "en": "Unable to scan {host}: {error}",
+  "de": "{host} kann nicht gescannt werden: {error}",
+  "es": "No se puede escanear {host}: {error}",
+  "it": "Impossibile scansionare {host}: {error}",
+  "zh": "无法扫描 {host}：{error}",
+  "ja": "{host} をスキャンできません：{error}",
+  "ko": "{host}을(를) 스캔할 수 없습니다: {error}"
  }
 }

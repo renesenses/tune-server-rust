@@ -184,10 +184,12 @@ pub async fn list(
 }
 
 pub async fn save(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
 
     // Also write fields to settings table for backward compat (lastfm_auth_token etc.)
@@ -239,20 +241,26 @@ pub async fn save(
             error!(service = %id, error = %e, "service_token_validate_failed");
             Json(json!({
                 "valid": false,
-                "validation_message": format!("Erreur: {e}"),
+                "validation_message": crate::i18n::t(&lang, "svctok.err.generic").replace("{error}", &e.to_string()),
             }))
         }
     }
 }
 
-pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn test(
+    headers: axum::http::HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
+    let tr = |k: &str| crate::i18n::t(&lang, k);
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let svc_mgr = ServicesManager::with_backend(state.backend.clone());
 
     match id.as_str() {
         "musicbrainz" => Json(json!({
             "valid": true,
-            "validation_message": "MusicBrainz disponible (aucun token requis).",
+            "validation_message": tr("svctok.test.musicbrainz"),
         })),
         "discogs" => {
             let token = svc_mgr
@@ -265,7 +273,7 @@ pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl
                     Json(json!({ "valid": valid, "validation_message": msg }))
                 }
                 None => Json(
-                    json!({ "valid": false, "validation_message": "Token Discogs non configuré." }),
+                    json!({ "valid": false, "validation_message": tr("svctok.err.discogsNotConfigured") }),
                 ),
             }
         }
@@ -279,7 +287,7 @@ pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl
                     Json(json!({ "valid": valid, "validation_message": msg }))
                 }
                 None => Json(
-                    json!({ "valid": false, "validation_message": "API Key Last.fm non configurée." }),
+                    json!({ "valid": false, "validation_message": tr("svctok.err.lastfmNotConfigured") }),
                 ),
             }
         }
@@ -288,12 +296,12 @@ pub async fn test(State(state): State<AppState>, Path(id): Path<String>) -> impl
                 || settings.get("genius_token").ok().flatten().is_some();
             Json(json!({
                 "valid": configured,
-                "validation_message": if configured { "Token configuré (validation non disponible)." } else { "Token Genius non configuré." },
+                "validation_message": if configured { tr("svctok.err.tokenConfiguredNoValidation") } else { tr("svctok.err.geniusNotConfigured") },
             }))
         }
         _ => Json(json!({
             "valid": serde_json::Value::Null,
-            "validation_message": "Validation non disponible pour ce service.",
+            "validation_message": tr("svctok.test.validationUnavailable"),
         })),
     }
 }
