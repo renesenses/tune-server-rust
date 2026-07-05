@@ -1495,6 +1495,19 @@ impl PositionPoller {
                 };
                 if let Some(output_arc) = output_arc {
                     let output = output_arc.lock().await;
+                    // Exclusive-mode local outputs (ASIO / WASAPI exclusive) take
+                    // a dedicated playback loop that returns at EOF without
+                    // consuming the staged next_media — they cannot chain
+                    // internally. Arming gapless for them orphans the staged
+                    // track AND arms the poller guard, which suppresses the
+                    // natural-end advance: a single-track Repeat queue never
+                    // loops, and multi-track albums stall after each track
+                    // (DEvir, ASIO Fireface USB). Skip arming; the natural-end
+                    // fallback advances the queue (a small gap, never a stall).
+                    if !output.supports_internal_gapless() {
+                        info!(zone_id, "gapless_skipped_exclusive_output");
+                        return false;
+                    }
                     // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
                     // Benjithom). They accept SetNextAVTransportURI for a DSD
                     // stream but never transition to it — the next stream is
