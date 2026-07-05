@@ -650,25 +650,41 @@ impl DlnaOutput {
             debug!(device = %self.name, mime, is_universal, "protocol_info_empty_sink");
             return is_universal;
         }
-        let mime_lower = mime.to_lowercase();
-        for proto in &protocols {
-            // Each entry: "http-get:*:audio/flac:*" or "http-get:*:audio/flac:DLNA..."
-            let fields: Vec<&str> = proto.split(':').collect();
-            if fields.len() >= 3 {
-                let proto_mime = fields[2].trim().to_lowercase();
-                if proto_mime == mime_lower {
-                    return true;
-                }
-                // Also match wildcard MIME ("*") — some renderers advertise
-                // "http-get:*:*:*" to indicate they accept anything.
-                if proto_mime == "*" {
-                    return true;
-                }
-            }
+        if protocol_sink_supports_mime(mime, &protocols) {
+            return true;
         }
         info!(device = %self.name, mime, protocols_count = protocols.len(), "dlna_mime_not_supported_by_renderer");
         false
     }
+}
+
+/// Whether a renderer's GetProtocolInfo `Sink` entries advertise support for
+/// `mime`. Each entry looks like `http-get:*:audio/flac:*` (the third
+/// colon-separated field is the MIME type).
+///
+/// Matches the exact MIME, a `*` wildcard, and the legacy `x-` variant: many
+/// renderers advertise `audio/x-flac` for `audio/flac` (Denon Ceol N12,
+/// Marco), and forcing WAV on those wastes bandwidth and loses bit-perfect
+/// FLAC the renderer could decode natively.
+fn protocol_sink_supports_mime(mime: &str, protocols: &[String]) -> bool {
+    let mime_lower = mime.to_lowercase();
+    let mime_alt = if let Some(rest) = mime_lower.strip_prefix("audio/x-") {
+        format!("audio/{rest}")
+    } else if let Some(rest) = mime_lower.strip_prefix("audio/") {
+        format!("audio/x-{rest}")
+    } else {
+        mime_lower.clone()
+    };
+    for proto in protocols {
+        let fields: Vec<&str> = proto.split(':').collect();
+        if fields.len() >= 3 {
+            let proto_mime = fields[2].trim().to_lowercase();
+            if proto_mime == mime_lower || proto_mime == mime_alt || proto_mime == "*" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
@@ -682,6 +698,25 @@ fn extract_tag(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_sink_matches_x_flac_variant() {
+        // Denon Ceol N12 (Marco) advertises FLAC as `audio/x-flac`. Asking for
+        // `audio/flac` must match it so we passthrough instead of forcing WAV.
+        let sink = vec![
+            "http-get:*:audio/x-flac:DLNA.ORG_PN=FLAC".to_string(),
+            "http-get:*:audio/mpeg:*".to_string(),
+        ];
+        assert!(protocol_sink_supports_mime("audio/flac", &sink));
+        assert!(protocol_sink_supports_mime("audio/x-flac", &sink));
+        // Exact and wildcard still work; an unadvertised format is rejected.
+        assert!(protocol_sink_supports_mime("audio/mpeg", &sink));
+        assert!(!protocol_sink_supports_mime("audio/aac", &sink));
+        assert!(protocol_sink_supports_mime(
+            "audio/flac",
+            &["http-get:*:*:*".to_string()]
+        ));
+    }
 
     #[test]
     fn parse_time_works() {
