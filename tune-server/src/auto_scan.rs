@@ -481,6 +481,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
 
         let report = serde_json::json!({
             "total_files": stats.total_files,
+            "missing_dirs": missing_dirs.clone(),
             "metadata_ok": stats.metadata_ok,
             "metadata_failed": stats.metadata_failed,
             "metadata_timeout": stats.metadata_timeout,

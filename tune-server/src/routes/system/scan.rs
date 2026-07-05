@@ -852,6 +852,7 @@ pub(super) async fn trigger_scan(
                 "scan_result",
                 &json!({
                     "total_files": total_discovered,
+                    "missing_dirs": missing_dirs.clone(),
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -870,6 +871,7 @@ pub(super) async fn trigger_scan(
             "library.scan.completed",
             json!({
                 "total_files": total_discovered,
+                "missing_dirs": missing_dirs.clone(),
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
@@ -887,6 +889,7 @@ pub(super) async fn trigger_scan(
         // Write scan report JSON for the /scan/report endpoint
         let report = serde_json::json!({
             "total_files": total_discovered,
+            "missing_dirs": missing_dirs.clone(),
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,
