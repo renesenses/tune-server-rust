@@ -146,11 +146,20 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
 
-        if !dir_path.exists() {
+        // Probe with read_dir instead of a bare exists(): on Windows a NAS path
+        // fails for several distinct reasons that exists() collapses to `false`
+        // (silent skip → "scan finds nothing", Alain Bonnel). read_dir surfaces
+        // the actual io::Error kind so the user learns WHY: NotFound = bad UNC /
+        // NAS unmounted, PermissionDenied = no SMB credentials for this session,
+        // and — the common Windows case — a mapped drive (Z:\) is invisible to
+        // an elevated / service token even though it works in Explorer.
+        if let Err(e) = std::fs::read_dir(dir_path) {
             warn!(
                 dir = %normalized,
                 original = %dir,
-                "scan_dir_not_found — directory does not exist, skipping"
+                error = %e,
+                kind = ?e.kind(),
+                "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
             missing_dirs.push(normalized);
             continue;
