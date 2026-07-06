@@ -557,11 +557,15 @@ impl YouTubeService {
             Duration::from_secs(YTDLP_TIMEOUT_SECS),
             tokio::process::Command::new(&ytdlp)
                 .args([
-                    // Prefer a non-segmented HTTPS stream (progressive download).
-                    // "bestaudio" alone often picks a DASH format whose URL only
-                    // covers the first segment (~50s).
+                    // Prefer m4a/AAC: the native decode pipeline (Symphonia)
+                    // cannot decode Opus/WebM (the ffmpeg fallback for it was
+                    // removed), so plain "bestaudio" — which picks Opus on
+                    // YouTube — plays back silent. m4a (itag 140, AAC) decodes
+                    // natively. Then fall back to a progressive HTTPS stream
+                    // ("bestaudio" alone often picks a DASH format whose URL
+                    // only covers the first segment ~50s), then anything.
                     "-f",
-                    "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
+                    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
                     "--get-url",
                     "--no-playlist",
                     "--no-warnings",
@@ -2209,6 +2213,19 @@ impl YouTubeService {
     }
 }
 
+/// Map a resolved YouTube stream URL to `(mime_type, codec)`. YouTube delivers
+/// either MP4/AAC (itag 140, "m4a") or WebM/Opus. The codec string becomes the
+/// transcode temp-file extension: "m4a" routes to the native Symphonia decoder,
+/// whereas "opus" would route to the removed ffmpeg path and play back silent.
+/// We request m4a in the yt-dlp selector, so this is normally the mp4/m4a branch.
+fn youtube_mime_codec(url: &str) -> (&'static str, &'static str) {
+    if url.contains("mime=audio%2Fmp4") || url.contains("mime=audio/mp4") || url.contains(".m4a") {
+        ("audio/mp4", "m4a")
+    } else {
+        ("audio/webm", "opus")
+    }
+}
+
 // ======================================================================
 // StreamingService trait implementation
 // ======================================================================
@@ -2474,11 +2491,12 @@ impl StreamingService for YouTubeService {
             let cache = self.url_cache.lock().await;
             if let Some(cached) = cache.get(track_id) {
                 debug!(track_id, "youtube_stream_url_cached");
+                let (mime_type, codec) = youtube_mime_codec(&cached.url);
                 return Ok(StreamUrl {
                     url: cached.url.clone(),
-                    mime_type: "audio/webm".into(),
+                    mime_type: mime_type.into(),
                     quality: StreamQuality {
-                        codec: "OPUS".into(),
+                        codec: codec.into(),
                         sample_rate: 48000,
                         bit_depth: 16,
                         bitrate: Some(128000),
@@ -2495,14 +2513,11 @@ impl StreamingService for YouTubeService {
             .await
             .map_err(|e| TuneError::Streaming(e))?;
 
-        // Determine MIME type from URL
-        let mime_type = if url.contains("mime=audio%2Fwebm") || url.contains(".webm") {
-            "audio/webm"
-        } else if url.contains("mime=audio%2Fmp4") || url.contains(".m4a") {
-            "audio/mp4"
-        } else {
-            "audio/webm" // Default for YouTube
-        };
+        // Determine MIME type + codec from the resolved URL. The codec label
+        // drives the temp-file extension used by the decoder: m4a/AAC routes to
+        // Symphonia, "opus"/webm to the (removed) ffmpeg path. We ask yt-dlp for
+        // m4a first (see the -f selector), so this is normally audio/mp4 + aac.
+        let (mime_type, codec) = youtube_mime_codec(&url);
 
         // Cache the URL
         {
@@ -2516,13 +2531,13 @@ impl StreamingService for YouTubeService {
             );
         }
 
-        info!(track_id, mime_type, "youtube_stream_url_resolved");
+        info!(track_id, mime_type, codec, "youtube_stream_url_resolved");
 
         Ok(StreamUrl {
             url,
             mime_type: mime_type.into(),
             quality: StreamQuality {
-                codec: "OPUS".into(),
+                codec: codec.into(),
                 sample_rate: 48000,
                 bit_depth: 16,
                 bitrate: Some(128000),
