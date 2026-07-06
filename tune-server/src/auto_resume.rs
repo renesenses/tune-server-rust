@@ -56,6 +56,16 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         _ => return false,
     };
 
+    // A live radio stream must never auto-restart on server boot. The user
+    // pressed stop (or simply quit), and re-launching a radio on every startup
+    // with no interaction is the "phantom playback that survives restart and
+    // can't be killed" bug: it comes back each boot on the local zone. Real
+    // tracks resume fine; radio is a continuous live source, so we don't.
+    if zone.last_track_source.as_deref() == Some("radio") {
+        debug!(zone_id, zone_name = %zone.name, "auto_resume_skip_radio");
+        return false;
+    }
+
     // Need at least a track id or a source+source_id to resume
     let has_track = zone.last_track_id.is_some();
     let has_streaming = zone.last_track_source.is_some() && zone.last_track_source_id.is_some();
