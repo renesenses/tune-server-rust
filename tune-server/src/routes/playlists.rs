@@ -507,8 +507,10 @@ struct TransferPlaylist {
 
 #[derive(Deserialize)]
 struct DiffPlaylists {
-    playlist_id_a: i64,
-    playlist_id_b: i64,
+    source_service: String,
+    source_playlist_id: String,
+    target_service: String,
+    target_playlist_id: String,
 }
 
 #[derive(Deserialize)]
@@ -666,33 +668,102 @@ async fn transfer_playlist(
     Json(json!({ "transferred": track_ids.len() })).into_response()
 }
 
+/// Fetch `(title, artist)` pairs for a playlist on a given service. Local reads
+/// the DB; streaming services go through the registry. Used by the cross-service
+/// diff, which matches on title+artist since the two sides share no track ids.
+async fn diff_playlist_tracks(
+    state: &AppState,
+    service: &str,
+    playlist_id: &str,
+) -> Vec<(String, String)> {
+    if service == "local" || service.is_empty() {
+        let pid: i64 = playlist_id.parse().unwrap_or(0);
+        let prepo = PlaylistRepo::with_backend(state.backend.clone());
+        let trepo = TrackRepo::with_backend(state.backend.clone());
+        prepo
+            .get_track_ids(pid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| trepo.get(id).ok().flatten())
+            .map(|t| (t.title, t.artist_name.unwrap_or_default()))
+            .collect()
+    } else {
+        let reg = state.services.lock().await;
+        reg.get_playlist_tracks(service, playlist_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| {
+                (
+                    v.get("title")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("artist")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
 async fn diff_playlists(
     State(state): State<AppState>,
     Json(body): Json<DiffPlaylists>,
 ) -> impl IntoResponse {
-    let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let ids_a: HashSet<i64> = repo
-        .get_track_ids(body.playlist_id_a)
-        .unwrap_or_default()
-        .into_iter()
+    let src = diff_playlist_tracks(&state, &body.source_service, &body.source_playlist_id).await;
+    let tgt = diff_playlist_tracks(&state, &body.target_service, &body.target_playlist_id).await;
+
+    let norm =
+        |t: &str, a: &str| format!("{}|{}", t.trim().to_lowercase(), a.trim().to_lowercase());
+    let src_keys: HashSet<String> = src.iter().map(|(t, a)| norm(t, a)).collect();
+    let tgt_keys: HashSet<String> = tgt.iter().map(|(t, a)| norm(t, a)).collect();
+
+    let entry = |t: &str, a: &str, in_s: bool, in_t: bool| {
+        json!({
+            "title": t, "artist_name": a,
+            "in_source": in_s, "in_target": in_t,
+            "match_quality": "exact",
+        })
+    };
+    let only_in_source: Vec<Value> = src
+        .iter()
+        .filter(|(t, a)| !tgt_keys.contains(&norm(t, a)))
+        .map(|(t, a)| entry(t, a, true, false))
         .collect();
-    let ids_b: HashSet<i64> = repo
-        .get_track_ids(body.playlist_id_b)
-        .unwrap_or_default()
-        .into_iter()
+    let in_both: Vec<Value> = src
+        .iter()
+        .filter(|(t, a)| tgt_keys.contains(&norm(t, a)))
+        .map(|(t, a)| entry(t, a, true, true))
+        .collect();
+    let only_in_target: Vec<Value> = tgt
+        .iter()
+        .filter(|(t, a)| !src_keys.contains(&norm(t, a)))
+        .map(|(t, a)| entry(t, a, false, true))
         .collect();
 
-    let only_a: Vec<i64> = ids_a.difference(&ids_b).copied().collect();
-    let only_b: Vec<i64> = ids_b.difference(&ids_a).copied().collect();
-    let common: Vec<i64> = ids_a.intersection(&ids_b).copied().collect();
+    // Best-effort display names: local playlists resolve to their name.
+    let name_of = |service: &str, id: &str| -> String {
+        if service == "local" || service.is_empty() {
+            let prepo = PlaylistRepo::with_backend(state.backend.clone());
+            id.parse::<i64>()
+                .ok()
+                .and_then(|pid| prepo.get(pid).ok().flatten())
+                .map(|p| p.name)
+                .unwrap_or_else(|| id.to_string())
+        } else {
+            service.to_string()
+        }
+    };
 
     Json(json!({
-        "only_in_a": only_a,
-        "only_in_b": only_b,
-        "common": common,
-        "count_only_a": only_a.len(),
-        "count_only_b": only_b.len(),
-        "count_common": common.len(),
+        "source_name": name_of(&body.source_service, &body.source_playlist_id),
+        "target_name": name_of(&body.target_service, &body.target_playlist_id),
+        "only_in_source": only_in_source,
+        "only_in_target": only_in_target,
+        "in_both": in_both,
     }))
     .into_response()
 }
