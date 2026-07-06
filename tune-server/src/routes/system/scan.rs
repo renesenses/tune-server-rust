@@ -172,6 +172,14 @@ pub(super) async fn trigger_scan(
             std::sync::Arc<tune_core::db::models::Album>,
         > = std::collections::HashMap::new();
 
+        // When a track has no album_artist tag, the album artist is pinned to
+        // the first track artist seen in that folder (see below). Without this,
+        // an album whose tracks have differing per-track artists (classical
+        // soloists, features) split into one album row per artist (Alain,
+        // Pierre: "same album appears 2-3 times"). Keyed by parent directory.
+        let mut dir_album_artist: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
         // Process files in batches: parse metadata in parallel, then insert in a transaction
@@ -235,10 +243,23 @@ pub(super) async fn trigger_scan(
 
                     let album_artist_name = if is_compilation {
                         "Various Artists"
+                    } else if let Some(aa) = meta.album_artist.as_deref() {
+                        aa
                     } else {
-                        meta.album_artist
-                            .as_deref()
-                            .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"))
+                        // No album_artist tag: pin the album artist to the first
+                        // track artist seen in this folder so all of the album's
+                        // tracks resolve to a single album row, instead of
+                        // splitting into one row per differing track artist
+                        // (classical soloists, features).
+                        let dir = std::path::Path::new(&sf.path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let track_a = meta.artist.as_deref().unwrap_or("Unknown Artist");
+                        dir_album_artist
+                            .entry(dir)
+                            .or_insert_with(|| track_a.to_string())
+                            .as_str()
                     };
 
                     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
