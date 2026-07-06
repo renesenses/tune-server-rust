@@ -4677,10 +4677,39 @@ mod tests {
             temp_file_path: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
-        // Proxying is now conditional: with no output device (and no DLNA
-        // renderer that needs transcoding), radio resolves to the direct URL.
+        // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
+        // extension-less) are ALWAYS proxied and transcoded to WAV, even
+        // without an output device: the advertised protocolInfo must match
+        // the bytes, or DLNA renderers play silence.
+        assert!(
+            resolved.stream_id.is_some(),
+            "ambiguous .aac radio must be proxied to WAV"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+    }
+
+    #[tokio::test]
+    async fn radio_reliable_mp3_passes_through_without_output_device() {
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some("http://stream.example.com/station.mp3".into()),
+            title: Some("MP3 Station".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
+        // proxy session, no transcode cost.
         assert!(resolved.stream_id.is_none());
-        assert_eq!(resolved.url, "http://icecast.radiofrance.fr/fip-hifi.aac");
+        assert_eq!(resolved.url, "http://stream.example.com/station.mp3");
     }
 
     #[tokio::test]
