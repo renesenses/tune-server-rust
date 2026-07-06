@@ -449,7 +449,8 @@ impl HistoryRepo {
             "AND h.source != 'radio' AND"
         };
         let albums_sql = format!(
-            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id
+            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id,
+                    MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
              LEFT JOIN albums a ON LOWER(a.title) = LOWER(h.album_title)
              {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
@@ -466,6 +467,8 @@ impl HistoryRepo {
                 cover_path: cols.get(2).and_then(|v| v.as_string()),
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 album_id: cols.get(4).and_then(|v| v.as_i64()),
+                source: cols.get(5).and_then(|v| v.as_string()),
+                source_id: cols.get(6).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -486,7 +489,8 @@ impl HistoryRepo {
                           AND LOWER(COALESCE(t2.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
                           AND a2.cover_path IS NOT NULL
                         LIMIT 1
-                    )) as cover_path
+                    )) as cover_path,
+                    MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
              {simple_where} {no_radio_and} lh.title IS NOT NULL
              GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
@@ -502,6 +506,8 @@ impl HistoryRepo {
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
                 cover_path: cols.get(5).and_then(|v| v.as_string()),
+                source: cols.get(6).and_then(|v| v.as_string()),
+                source_id: cols.get(7).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -885,6 +891,12 @@ pub struct TopAlbumEntry {
     pub artist_name: String,
     pub cover_path: Option<String>,
     pub plays: i64,
+    /// Streaming service ("qobuz"/"tidal"/"youtube"/…) or "local". Lets the UI
+    /// play a streaming top item that has no local album_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -896,6 +908,12 @@ pub struct TopTrackEntry {
     pub listening_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// Streaming service ("qobuz"/"tidal"/"youtube"/…) or "local". Lets the UI
+    /// play a streaming top item that has no local track_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
