@@ -512,20 +512,18 @@ impl HistoryRepo {
             .collect();
 
         // ── Top radios ──
-        let radio_and = if simple_where.is_empty() {
-            "WHERE source = 'radio' AND"
-        } else {
-            "AND source = 'radio' AND"
-        };
+        // Radio plays are NOT in listen_history (deliberately — see the
+        // record_history guard in the orchestrator: a frozen station title
+        // produces bogus rows on every replay). They live in radio_stations
+        // (record_play bumps play_count), so the top list comes from there.
+        // play_count is lifetime, so this ignores the period filter (radio
+        // listening is sparse; lifetime top is the useful view).
         let radios_sql = format!(
-            "SELECT lh.title as station_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
-                    MAX(lh.cover_url) as cover_url,
-                    MAX(r.id) as radio_id,
-                    MAX(r.cover_path) as cover_path
-             FROM listen_history lh
-             LEFT JOIN radios r ON LOWER(r.name) = LOWER(lh.title)
-             {simple_where} {radio_and} lh.title IS NOT NULL
-             GROUP BY lh.title ORDER BY plays DESC LIMIT {top_n}"
+            "SELECT name as station_name, play_count as plays, 0 as ms,
+                    logo_url as cover_url, id as radio_id, NULL as cover_path
+             FROM radio_stations
+             WHERE play_count > 0
+             ORDER BY play_count DESC LIMIT {top_n}"
         );
         let top_radios: Vec<TopRadioEntry> = self
             .db
