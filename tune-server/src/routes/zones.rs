@@ -57,6 +57,10 @@ struct PatchZone {
     autoplay_enabled: Option<bool>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,
+    /// Force native FLAC to a DLNA renderer even if it doesn't advertise FLAC
+    /// (empty/failed GetProtocolInfo Sink) — for renderers that decode FLAC but
+    /// under-report (Denon Ceol N12).
+    dlna_native_flac: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -606,6 +610,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             obj.insert("is_default".into(), json!(default_zone_id == Some(zone_id)));
             let zone_repo = ZoneRepo::with_backend(state.backend.clone());
             obj.insert("dsd_mode".into(), json!(zone_repo.get_dsd_mode(zone_id)));
+            obj.insert(
+                "dlna_native_flac".into(),
+                json!(zone_repo.get_dlna_native_flac(zone_id)),
+            );
             let online = match z.output_type.as_deref() {
                 Some("local") | Some("browser") => true,
                 _ => z
@@ -674,6 +682,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     build_signal_path(&ps, &zone, &state.backend, renderer_label, audio_backend);
                 obj.insert("signal_path".into(), json!(signal_path));
                 obj.insert("dsd_mode".into(), json!(repo.get_dsd_mode(id)));
+                obj.insert(
+                    "dlna_native_flac".into(),
+                    json!(repo.get_dlna_native_flac(id)),
+                );
                 let online = match zone.output_type.as_deref() {
                     Some("local") | Some("browser") => true,
                     _ => zone
@@ -773,6 +785,11 @@ async fn patch_zone(
     }
     if let Some(ref mode) = body.dsd_mode {
         if let Err(e) = repo.update_dsd_mode(id, mode) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(native_flac) = body.dlna_native_flac {
+        if let Err(e) = repo.update_dlna_native_flac(id, native_flac) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }

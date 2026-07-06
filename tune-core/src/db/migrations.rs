@@ -610,6 +610,11 @@ DELETE FROM smart_collections
 CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_collections_name ON smart_collections(name);
 ",
     },
+    Migration {
+        version: 50,
+        name: "add_zones_dlna_native_flac",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -918,6 +923,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 45 {
             add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
         }
+        if migration.version == 50 {
+            add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -957,6 +965,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
+    add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");

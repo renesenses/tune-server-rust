@@ -1102,10 +1102,16 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
                 .unwrap_or("");
-            if !did.is_empty() {
-                !self.dlna_supports_mime(did, "audio/flac").await
-            } else {
+            if did.is_empty() {
                 false
+            } else if ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id) {
+                // User forces native FLAC for this zone: some renderers decode
+                // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
+                // empty GetProtocolInfo Sink), so protocol negotiation wrongly
+                // falls back to WAV. Honour the override and send FLAC.
+                false
+            } else {
+                !self.dlna_supports_mime(did, "audio/flac").await
             }
         } else {
             false
