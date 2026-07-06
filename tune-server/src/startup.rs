@@ -20,6 +20,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     restore_queue_metadata(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
+    resolve_ytdlp(state).await;
     restore_convolvers(state).await;
     warm_sqlite_cache(state);
 
@@ -456,6 +457,18 @@ fn persist_initial_settings(state: &AppState, config: &TuneConfig) {
             settings.set("quality_split", "true").ok();
             info!("quality_split_default_seeded value=true");
         }
+    }
+}
+
+/// Resolve the managed `yt-dlp` binary at boot (from the `yt_dlp_path` setting,
+/// the auto-download location, or PATH) so YouTube playback works if it was
+/// previously enabled. Does not download anything — that's the opt-in button.
+async fn resolve_ytdlp(state: &AppState) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let configured = settings.get("yt_dlp_path").ok().flatten();
+    match tune_core::ytdlp::resolve(configured.as_deref()).await {
+        Some(path) => info!(path = %path.display(), "youtube_ytdlp_ready"),
+        None => info!("youtube_ytdlp_absent — YouTube playback not enabled"),
     }
 }
 

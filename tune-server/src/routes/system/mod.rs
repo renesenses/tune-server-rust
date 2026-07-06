@@ -13,6 +13,7 @@ mod remote;
 mod scan;
 mod tags;
 mod update;
+mod youtube;
 
 use axum::Router;
 use axum::routing::{get, post};
@@ -126,6 +127,8 @@ pub fn router() -> Router<AppState> {
         .route("/update/install", post(update::update_install))
         .route("/update/apply", post(update::update_apply))
         .route("/update/status", get(update::update_status))
+        .route("/youtube/status", get(youtube::youtube_status))
+        .route("/youtube/enable", post(youtube::enable_youtube_playback))
         .route(
             "/license",
             get(config::get_license)

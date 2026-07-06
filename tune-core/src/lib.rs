@@ -64,6 +64,7 @@ pub mod streaming;
 pub mod updater;
 pub mod upnp_server;
 pub mod user_profiles;
+pub mod ytdlp;
 pub mod zones;
 
 pub fn version() -> &'static str {
