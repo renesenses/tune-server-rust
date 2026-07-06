@@ -2222,19 +2222,21 @@ impl PlaybackOrchestrator {
 
                     // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
                     //    FLAC-rejecting renderer (Revox/Denon/Marantz).
-                    let rt = tokio::runtime::Handle::try_current()
-                        .map_err(|e| format!("no tokio runtime: {e}"))?;
-                    let encoded_data = rt.block_on(async {
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            aac_enc_format,
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        encoder.finish().await
-                    })?;
+                    //    Encoding is pure CPU work, so run it synchronously on
+                    //    this blocking thread. Previously this drove the async
+                    //    encoder via a nested `Handle::block_on`, which could
+                    //    deadlock the runtime and hang the transcode forever
+                    //    (no complete/failed log) — the "YouTube→DLNA does
+                    //    nothing" bug on small servers.
+                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                        aac_enc_format,
+                        decoded.sample_rate,
+                        actual_bd as u32,
+                        decoded.channels,
+                    );
+                    encoder.start_sync()?;
+                    encoder.write_sync(&pcm_bytes)?;
+                    let encoded_data = encoder.finish_sync()?;
 
                     std::fs::write(&tmp_flac_clone, &encoded_data)
                         .map_err(|e| format!("write flac: {e}"))?;
