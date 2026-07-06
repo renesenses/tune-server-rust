@@ -193,6 +193,12 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
                     if !entry.file_type().is_file() {
                         continue;
                     }
+                    // Skip macOS AppleDouble sidecar files (._foo.flac): they carry
+                    // the audio extension but are tiny resource-fork metadata, not
+                    // real tracks, and were being indexed as bogus duplicates (Elie).
+                    if entry.file_name().to_string_lossy().starts_with("._") {
+                        continue;
+                    }
                     let path = entry.path();
                     if let Some(ext) = path.extension().and_then(|e| e.to_str())
                         && extensions.contains(ext.to_lowercase().as_str())
