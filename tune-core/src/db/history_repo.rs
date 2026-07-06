@@ -518,12 +518,21 @@ impl HistoryRepo {
         // (record_play bumps play_count), so the top list comes from there.
         // play_count is lifetime, so this ignores the period filter (radio
         // listening is sparse; lifetime top is the useful view).
+        // CASTs keep this working on both backends: on Postgres radio_stations
+        // has drifted to play_count TEXT (pg_migrate) and a bare `NULL as
+        // cover_path` (untyped) makes sqlx fail to decode — either made the whole
+        // query error and return empty (Top Radios blank on the .15 PG server).
+        // Explicit integer/text types are identity on SQLite.
         let radios_sql = format!(
-            "SELECT name as station_name, play_count as plays, 0 as ms,
-                    logo_url as cover_url, id as radio_id, NULL as cover_path
+            "SELECT name as station_name,
+                    CAST(play_count AS INTEGER) as plays,
+                    CAST(0 AS BIGINT) as ms,
+                    logo_url as cover_url,
+                    id as radio_id,
+                    CAST(NULL AS TEXT) as cover_path
              FROM radio_stations
-             WHERE play_count > 0
-             ORDER BY play_count DESC LIMIT {top_n}"
+             WHERE CAST(play_count AS INTEGER) > 0
+             ORDER BY CAST(play_count AS INTEGER) DESC LIMIT {top_n}"
         );
         let top_radios: Vec<TopRadioEntry> = self
             .db
