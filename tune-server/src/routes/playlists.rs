@@ -640,13 +640,60 @@ async fn get_shared_playlist(
     .into_response()
 }
 
+/// Check availability of each track in a playlist ("vérifier la disponibilité").
+/// A local track is available when its file still exists on disk; a missing file
+/// (deleted/moved/unplugged drive) is reported unavailable. Previously this was
+/// a stub that returned the raw playlist, so the UI spun on "vérification…".
 async fn recover_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.get(id) {
-        Ok(Some(pl)) => Json(json!(pl)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let pl = match repo.get(id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    let trepo = TrackRepo::with_backend(state.backend.clone());
+    let mut tracks = Vec::with_capacity(track_ids.len());
+    let mut available = 0i64;
+    let mut unavailable = 0i64;
+
+    for tid in &track_ids {
+        let (title, artist, present) = match trepo.get(*tid) {
+            Ok(Some(t)) => {
+                let ok = t
+                    .file_path
+                    .as_deref()
+                    .map(|p| std::path::Path::new(p).exists())
+                    .unwrap_or(false);
+                (t.title, t.artist_name.unwrap_or_default(), ok)
+            }
+            _ => (String::new(), String::new(), false),
+        };
+        if present {
+            available += 1;
+        } else {
+            unavailable += 1;
+        }
+        tracks.push(json!({
+            "track_id": tid,
+            "title": title,
+            "artist_name": artist,
+            "status": if present { "available" } else { "unavailable" },
+            "original_source": "local",
+            "alternatives": [],
+        }));
     }
+
+    Json(json!({
+        "playlist_name": pl.name,
+        "total_tracks": track_ids.len(),
+        "available": available,
+        "unavailable": unavailable,
+        "recovered": 0,
+        "tracks": tracks,
+    }))
+    .into_response()
 }
 
 async fn transfer_playlist(
