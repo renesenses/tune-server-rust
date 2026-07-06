@@ -17,12 +17,28 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
 use super::local::RingBuf;
+
+/// Process-wide guard serializing access to the single ASIO device. ASIO
+/// forbids two concurrent streams on the same device — even within one
+/// process. When a track ends and the user force-plays another, a new stream
+/// used to be opened ~1 ms after the previous one was aborted, before the old
+/// instance's Drop had released the driver. That race crashed the Fireface
+/// ASIO driver natively (no Rust panic, process gone). Holding this lock for
+/// the whole session (acquired in `new`, released after Drop tears the driver
+/// down and settles) makes the new open WAIT for the old one instead.
+static ASIO_DEVICE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Time given to the ASIO driver to fully release the hardware after a stream
+/// is torn down, before the device lock is released and the next open runs.
+const ASIO_TEARDOWN_SETTLE: Duration = Duration::from_millis(200);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -44,6 +60,10 @@ pub struct AsioExclusiveOutput {
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
+    /// Held for the whole session so no other ASIO stream can open on the
+    /// device concurrently. Released (with a settle delay) in `Drop`.
+    #[allow(dead_code)]
+    device_guard: MutexGuard<'static, ()>,
 }
 
 /// Information about the currently-configured exclusive format.
@@ -73,6 +93,15 @@ impl AsioExclusiveOutput {
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        // Serialize device access process-wide BEFORE touching the driver: if
+        // the previous exclusive session is still tearing down, block here
+        // until its Drop releases the device (recovering from a poisoned lock
+        // if a prior holder panicked) instead of racing it and crashing the
+        // native ASIO driver.
+        let device_guard = ASIO_DEVICE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         ensure_com_initialized();
 
         // -- 1. Get the ASIO host -------------------------------------------
@@ -204,6 +233,7 @@ impl AsioExclusiveOutput {
             ring,
             volume,
             paused,
+            device_guard,
         })
     }
 
@@ -414,6 +444,12 @@ impl Drop for AsioExclusiveOutput {
         if let Err(e) = self.release() {
             warn!(error = %e, "asio_exclusive_drop_release_failed");
         }
+        // Let the driver fully release the hardware before `_device_guard`
+        // (dropped after this body) frees the lock and the next open runs.
+        // Opening while the driver is still busy returns DeviceBusy and, on the
+        // Fireface, crashes the process natively.
+        std::thread::sleep(ASIO_TEARDOWN_SETTLE);
+        debug!(device = %self.device_name, "asio_exclusive_device_lock_releasing");
     }
 }
 
