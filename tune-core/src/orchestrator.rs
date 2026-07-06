@@ -528,8 +528,10 @@ impl PlaybackOrchestrator {
             }
         }
 
-        // Probe the renderer
-        let supported = {
+        // Probe the renderer. None = inconclusive probe (SOAP failed / empty
+        // Sink) — fall back conservatively but do NOT cache, so one transient
+        // failure doesn't force WAV for the whole session (Marco's Denon).
+        let probe = {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(device_id) {
                 let locked = output.lock().await;
@@ -540,22 +542,33 @@ impl PlaybackOrchestrator {
                     dlna.supports_mime(mime).await
                 } else {
                     // Not a DLNA output — format negotiation doesn't apply
-                    true
+                    Some(true)
                 }
             } else {
-                true
+                Some(true)
             }
         };
 
-        if !supported {
-            let mut cache = self.dlna_unsupported_mimes.lock().await;
-            let entry = cache.entry(device_id.to_string()).or_default();
-            if !entry.iter().any(|m| m == mime) {
-                entry.push(mime.to_string());
+        match probe {
+            Some(true) => true,
+            Some(false) => {
+                // Renderer's Sink was read and genuinely lacks this MIME — cache.
+                let mut cache = self.dlna_unsupported_mimes.lock().await;
+                let entry = cache.entry(device_id.to_string()).or_default();
+                if !entry.iter().any(|m| m == mime) {
+                    entry.push(mime.to_string());
+                }
+                false
+            }
+            None => {
+                // Inconclusive — universal formats assumed OK, others not, but
+                // not cached so the next play re-probes.
+                matches!(
+                    mime.to_lowercase().as_str(),
+                    "audio/wav" | "audio/x-wav" | "audio/l16" | "audio/mpeg"
+                )
             }
         }
-
-        supported
     }
 
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {

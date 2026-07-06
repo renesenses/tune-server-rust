@@ -632,29 +632,29 @@ impl DlnaOutput {
     /// is supported.  Protocol info entries have the format:
     ///   `http-get:*:audio/flac:*`
     /// The third colon-separated field is the MIME type.
-    pub async fn supports_mime(&self, mime: &str) -> bool {
-        let is_universal = matches!(
-            mime.to_lowercase().as_str(),
-            "audio/wav" | "audio/x-wav" | "audio/l16" | "audio/mpeg"
-        );
+    /// `Some(true)`/`Some(false)` when the Sink was successfully probed;
+    /// `None` when the probe failed or the Sink was empty (inconclusive). The
+    /// caller falls back conservatively for `None` but must NOT cache it — a
+    /// transient GetProtocolInfo failure on a budget renderer (Marco's Denon
+    /// Ceol N12) must not poison FLAC support for the whole session, forcing a
+    /// WAV transcode on every track even though the renderer decodes FLAC.
+    pub async fn supports_mime(&self, mime: &str) -> Option<bool> {
         let protocols = match self.get_protocol_info().await {
             Ok(p) => p,
             Err(e) => {
-                // If we can't reach ConnectionManager, assume universal
-                // formats (WAV/MP3) are supported but not others (FLAC).
-                debug!(device = %self.name, error = %e, mime, is_universal, "protocol_info_unavailable");
-                return is_universal;
+                debug!(device = %self.name, error = %e, mime, "protocol_info_unavailable");
+                return None;
             }
         };
         if protocols.is_empty() {
-            debug!(device = %self.name, mime, is_universal, "protocol_info_empty_sink");
-            return is_universal;
+            debug!(device = %self.name, mime, "protocol_info_empty_sink");
+            return None;
         }
         if protocol_sink_supports_mime(mime, &protocols) {
-            return true;
+            return Some(true);
         }
         info!(device = %self.name, mime, protocols_count = protocols.len(), "dlna_mime_not_supported_by_renderer");
-        false
+        Some(false)
     }
 }
 
