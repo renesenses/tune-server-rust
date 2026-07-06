@@ -16,7 +16,7 @@ use axum::http::HeaderMap;
 
 /// Languages the UI ships with. Order is irrelevant; membership gates the
 /// `Accept-Language` parse so an unsupported browser locale falls back to fr.
-pub const SUPPORTED: &[&str] = &["fr", "en", "de", "es", "it", "zh", "ja", "ko"];
+pub const SUPPORTED: &[&str] = &["fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro"];
 
 const RAW: &str = include_str!("i18n_server.json");
 
