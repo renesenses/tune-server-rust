@@ -595,6 +595,21 @@ INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, d
         name: "smart_playlists_match_mode",
         up: "ALTER TABLE smart_playlists ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'all';",
     },
+    Migration {
+        // Migration 47 (reseed_smart_collections) re-inserted the 16 default
+        // collections with a bare `INSERT OR IGNORE ... VALUES`, but the table
+        // has no UNIQUE constraint on `name`, so OR IGNORE never fired and every
+        // default ended up duplicated (twice, or more across version jumps).
+        // Deduplicate keeping the oldest row per name, then add a UNIQUE index so
+        // any future re-seed is a genuine no-op.
+        version: 49,
+        name: "dedupe_smart_collections_unique_name",
+        up: "
+DELETE FROM smart_collections
+ WHERE id NOT IN (SELECT MIN(id) FROM smart_collections GROUP BY name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_collections_name ON smart_collections(name);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -1140,5 +1155,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, latest_version());
+    }
+
+    #[test]
+    fn default_smart_collections_are_not_duplicated() {
+        // Regression for migration 47 re-seeding without a UNIQUE guard: the
+        // default collections must appear exactly once after all migrations.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let max_dupe: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(c), 0) FROM \
+                 (SELECT COUNT(*) c FROM smart_collections GROUP BY name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_dupe, 1, "smart_collections has duplicate names");
+
+        // The UNIQUE index must reject a re-seed attempt (OR IGNORE => no-op).
+        drop(conn);
+        db.execute_batch(
+            "INSERT OR IGNORE INTO smart_collections (name, rules) VALUES ('🎷 Jazz', '[]');",
+        )
+        .unwrap();
+        let conn = db.connection().lock().unwrap();
+        let jazz: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM smart_collections WHERE name = '🎷 Jazz'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
     }
 }
