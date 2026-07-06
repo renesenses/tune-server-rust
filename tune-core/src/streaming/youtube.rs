@@ -544,11 +544,18 @@ impl YouTubeService {
     /// Used when native `/player` API extraction fails (e.g., geo-restricted
     /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
     async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<String, String> {
+        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
+        // playback" button). None means the user hasn't enabled it yet.
+        let ytdlp = crate::ytdlp::binary().ok_or_else(|| {
+            "YouTube playback is not enabled — turn it on in Settings \
+             (downloads the yt-dlp helper)"
+                .to_string()
+        })?;
         let video_url = format!("https://www.youtube.com/watch?v={track_id}");
 
         let output = tokio::time::timeout(
             Duration::from_secs(YTDLP_TIMEOUT_SECS),
-            tokio::process::Command::new("yt-dlp")
+            tokio::process::Command::new(&ytdlp)
                 .args([
                     // Prefer a non-segmented HTTPS stream (progressive download).
                     // "bestaudio" alone often picks a DASH format whose URL only
@@ -567,10 +574,7 @@ impl YouTubeService {
         .map_err(|_| format!("yt-dlp timeout for {track_id}"))?
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "yt-dlp not found — install it with 'pip install yt-dlp' \
-                     or 'brew install yt-dlp' for YouTube playback fallback"
-                )
+                "yt-dlp binary missing — re-enable YouTube playback in Settings".to_string()
             } else {
                 format!("yt-dlp exec error: {e}")
             }
