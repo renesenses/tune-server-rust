@@ -1969,8 +1969,18 @@ impl PlaybackOrchestrator {
                 })
                 .await;
 
-                // Clean up temp file
-                let _ = std::fs::remove_file(&tmp_file);
+                // Clean up the temp file — but ONLY if WE downloaded it. For a
+                // file:// DASH source, tmp_file IS the Tidal-cache-owned
+                // tune-dash-*.mp4 that is still referenced by the cached stream
+                // URL. Deleting it here made every subsequent re-resolution
+                // (repeat=one, or a seek that recreates the local stream) see the
+                // file gone, mark the cache stale, and re-download the whole
+                // ~54MB DASH — while concurrent transcodes raced on the emptied
+                // file (file_size=0 → decode failed). That was the ASIO "repeat"
+                // runaway (also on Qobuz). Leave cache-owned files alone.
+                if !is_dash_local {
+                    let _ = std::fs::remove_file(&tmp_file);
+                }
 
                 match decode_result {
                     Ok(Ok((_bit_depth, actual_rate))) => {

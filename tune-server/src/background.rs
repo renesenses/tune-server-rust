@@ -14,6 +14,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_squeezebox_poller(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
+    spawn_dash_temp_gc();
     spawn_position_poller(state);
     spawn_token_refresher(state);
     spawn_upnp_advertiser(state, config).await;
@@ -229,6 +230,46 @@ fn spawn_hqplayer_poller(state: &AppState) {
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Sweep leaked Tidal/Qobuz DASH temp files (`tune-dash-*.mp4`). The local
+/// transcode no longer deletes the tidal-cache-owned source right after decoding
+/// (that caused the ASIO repeat re-download runaway), so files older than well
+/// past the cache TTL — no longer served from cache nor being decoded — are
+/// removed here to avoid accumulating ~54MB files across a listening session.
+fn spawn_dash_temp_gc() {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            ticker.tick().await;
+            let dir = std::env::temp_dir();
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let now = std::time::SystemTime::now();
+            let mut removed = 0u32;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !(name.starts_with("tune-dash-") && name.ends_with(".mp4")) {
+                    continue;
+                }
+                let too_old = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .map(|age| age.as_secs() > 600) // 10 min ≫ 240s cache TTL
+                    .unwrap_or(false);
+                if too_old && std::fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                info!(removed, "dash_temp_gc_sweep");
+            }
         }
     });
 }
