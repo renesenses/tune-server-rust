@@ -492,7 +492,10 @@ fn build_album_query(
             "format" => "t.format",
             "source" => "t.source",
             "cover_path" => "al.cover_path",
-            "year" => "CAST(al.year AS INTEGER)",
+            // Fall back to the track year: many albums have a NULL al.year even
+            // though the tracks carry the year in their tags (Elie — genre, a
+            // track-level field, matched but year, album-level, didn't).
+            "year" => "CAST(COALESCE(al.year, t.year) AS INTEGER)",
             "sample_rate" => "CAST(t.sample_rate AS INTEGER)",
             "bit_depth" => "CAST(t.bit_depth AS INTEGER)",
             "track_count" => "al.track_count",
