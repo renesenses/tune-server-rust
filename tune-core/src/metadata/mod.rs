@@ -975,7 +975,9 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
 
 /// Fallback when lofty cannot parse the file at all (no audio properties).
 /// Extracts everything from the filesystem.
-fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
+/// Path/filename-only metadata (no file I/O). Used as a last resort when the
+/// tag reader fails or times out, so a file still appears in the library.
+pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
     let (track_number, title) = extract_title_from_filename(path);
     let parent = path.parent();
     let album = parent

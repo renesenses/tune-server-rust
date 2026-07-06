@@ -11,12 +11,16 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
-use crate::metadata::{TrackMetadata, try_read_metadata};
+use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadata};
 
 /// Maximum time allowed for reading metadata + computing hash for a single file.
 /// Files on NAS over a flaky network can hang indefinitely; this prevents the
 /// entire scan from stalling on a single corrupt or unreachable file.
-const FILE_TIMEOUT: Duration = Duration::from_secs(10);
+// Large Hi-Res FLAC (24/96, big embedded art) on slow/network storage can take
+// well over 10s just to read tags via lofty — 10s wrongly skipped them entirely
+// (Progman: files dropped from the library). Give more headroom, and on timeout
+// fall back to filename metadata instead of losing the file.
+const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
@@ -309,13 +313,16 @@ pub fn scan_files_parallel(
                     (meta, hash)
                 }
                 Err(ref reason) if reason == "timeout" => {
+                    // Don't drop the file — index it with filename-based metadata
+                    // so it still appears in the library. audio_hash stays None so
+                    // the next scan re-reads full tags once storage is responsive.
                     warn!(
                         path = %path_str,
                         timeout_secs = FILE_TIMEOUT.as_secs(),
-                        "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                        "scan_file_timeout — tag read timed out, indexing with filename metadata"
                     );
                     timeout_counter.fetch_add(1, Ordering::Relaxed);
-                    (None, None)
+                    (Some(tagless_fallback_no_props(path)), None)
                 }
                 Err(ref err) => {
                     warn!(
