@@ -7,7 +7,8 @@
   "it": "Artista dell'album",
   "zh": "专辑艺术家",
   "ja": "アルバムアーティスト",
-  "ko": "앨범 아티스트"
+  "ko": "앨범 아티스트",
+  "ro": "Artist album"
  },
  "metafield.sort_artist": {
   "fr": "Tri artiste",
@@ -17,7 +18,8 @@
   "it": "Ordina artista",
   "zh": "艺术家排序",
   "ja": "アーティスト並べ替え",
-  "ko": "아티스트 정렬"
+  "ko": "아티스트 정렬",
+  "ro": "Sortare artist"
  },
  "metafield.sort_album": {
   "fr": "Tri album",
@@ -27,7 +29,8 @@
   "it": "Ordina album",
   "zh": "专辑排序",
   "ja": "アルバム並べ替え",
-  "ko": "앨범 정렬"
+  "ko": "앨범 정렬",
+  "ro": "Sortare album"
  },
  "metafield.disc_number": {
   "fr": "N° disque",
@@ -37,7 +40,8 @@
   "it": "N. disco",
   "zh": "碟片编号",
   "ja": "ディスク番号",
-  "ko": "디스크 번호"
+  "ko": "디스크 번호",
+  "ro": "Nr. disc"
  },
  "metafield.disc_subtitle": {
   "fr": "Sous-titre disque",
@@ -47,7 +51,8 @@
   "it": "Sottotitolo disco",
   "zh": "碟片副标题",
   "ja": "ディスクサブタイトル",
-  "ko": "디스크 부제"
+  "ko": "디스크 부제",
+  "ro": "Subtitlu disc"
  },
  "metafield.track_number": {
   "fr": "N° piste",
@@ -57,7 +62,8 @@
   "it": "N. traccia",
   "zh": "音轨编号",
   "ja": "トラック番号",
-  "ko": "트랙 번호"
+  "ko": "트랙 번호",
+  "ro": "Nr. piesă"
  },
  "metafield.genre": {
   "fr": "Genre",
@@ -67,7 +73,8 @@
   "it": "Genere",
   "zh": "流派",
   "ja": "ジャンル",
-  "ko": "장르"
+  "ko": "장르",
+  "ro": "Gen"
  },
  "metafield.genres": {
   "fr": "Genres (multi)",
@@ -77,7 +84,8 @@
   "it": "Generi (multipli)",
   "zh": "流派（多个）",
   "ja": "ジャンル（複数）",
-  "ko": "장르 (다중)"
+  "ko": "장르 (다중)",
+  "ro": "Genuri (multiple)"
  },
  "metafield.year": {
   "fr": "Année",
@@ -87,7 +95,8 @@
   "it": "Anno",
   "zh": "年份",
   "ja": "年",
-  "ko": "연도"
+  "ko": "연도",
+  "ro": "An"
  },
  "metafield.composer": {
   "fr": "Compositeur",
@@ -97,7 +106,8 @@
   "it": "Compositore",
   "zh": "作曲",
   "ja": "作曲者",
-  "ko": "작곡가"
+  "ko": "작곡가",
+  "ro": "Compozitor"
  },
  "metafield.conductor": {
   "fr": "Chef d'orchestre",
@@ -107,7 +117,8 @@
   "it": "Direttore d'orchestra",
   "zh": "指挥",
   "ja": "指揮者",
-  "ko": "지휘자"
+  "ko": "지휘자",
+  "ro": "Dirijor"
  },
  "metafield.lyricist": {
   "fr": "Parolier",
@@ -117,7 +128,8 @@
   "it": "Paroliere",
   "zh": "作词",
   "ja": "作詞者",
-  "ko": "작사가"
+  "ko": "작사가",
+  "ro": "Textier"
  },
  "metafield.performer": {
   "fr": "Interprète",
@@ -127,7 +139,8 @@
   "it": "Interprete",
   "zh": "演奏者",
   "ja": "演奏者",
-  "ko": "연주자"
+  "ko": "연주자",
+  "ro": "Interpret"
  },
  "metafield.remixer": {
   "fr": "Remixeur",
@@ -137,7 +150,8 @@
   "it": "Remixer",
   "zh": "混音师",
   "ja": "リミキサー",
-  "ko": "리믹서"
+  "ko": "리믹서",
+  "ro": "Remixer"
  },
  "metafield.label": {
   "fr": "Label",
@@ -147,7 +161,8 @@
   "it": "Etichetta",
   "zh": "唱片公司",
   "ja": "レーベル",
-  "ko": "레이블"
+  "ko": "레이블",
+  "ro": "Casă de discuri"
  },
  "metafield.producer": {
   "fr": "Producteur",
@@ -157,7 +172,8 @@
   "it": "Produttore",
   "zh": "制作人",
   "ja": "プロデューサー",
-  "ko": "프로듀서"
+  "ko": "프로듀서",
+  "ro": "Producător"
  },
  "metafield.bpm": {
   "fr": "BPM",
@@ -167,7 +183,8 @@
   "it": "BPM",
   "zh": "BPM",
   "ja": "BPM",
-  "ko": "BPM"
+  "ko": "BPM",
+  "ro": "BPM"
  },
  "metafield.mood": {
   "fr": "Ambiance",
@@ -177,7 +194,8 @@
   "it": "Atmosfera",
   "zh": "情绪",
   "ja": "ムード",
-  "ko": "분위기"
+  "ko": "분위기",
+  "ro": "Atmosferă"
  },
  "metafield.grouping": {
   "fr": "Regroupement",
@@ -187,7 +205,8 @@
   "it": "Raggruppamento",
   "zh": "分组",
   "ja": "グループ",
-  "ko": "그룹"
+  "ko": "그룹",
+  "ro": "Grupare"
  },
  "metafield.compilation": {
   "fr": "Compilation",
@@ -197,7 +216,8 @@
   "it": "Compilation",
   "zh": "合辑",
   "ja": "コンピレーション",
-  "ko": "컴필레이션"
+  "ko": "컴필레이션",
+  "ro": "Compilație"
  },
  "metafield.comment": {
   "fr": "Commentaire",
@@ -207,7 +227,8 @@
   "it": "Commento",
   "zh": "备注",
   "ja": "コメント",
-  "ko": "설명"
+  "ko": "설명",
+  "ro": "Comentariu"
  },
  "metafield.lyrics": {
   "fr": "Paroles",
@@ -217,7 +238,8 @@
   "it": "Testo",
   "zh": "歌词",
   "ja": "歌詞",
-  "ko": "가사"
+  "ko": "가사",
+  "ro": "Versuri"
  },
  "metafield.isrc": {
   "fr": "ISRC",
@@ -227,7 +249,8 @@
   "it": "ISRC",
   "zh": "ISRC",
   "ja": "ISRC",
-  "ko": "ISRC"
+  "ko": "ISRC",
+  "ro": "ISRC"
  },
  "metafield.barcode": {
   "fr": "Code-barres",
@@ -237,7 +260,8 @@
   "it": "Codice a barre",
   "zh": "条形码",
   "ja": "バーコード",
-  "ko": "바코드"
+  "ko": "바코드",
+  "ro": "Cod de bare"
  },
  "metafield.catalog_number": {
   "fr": "Réf. catalogue",
@@ -247,7 +271,8 @@
   "it": "N. catalogo",
   "zh": "目录编号",
   "ja": "カタログ番号",
-  "ko": "카탈로그 번호"
+  "ko": "카탈로그 번호",
+  "ro": "Nr. catalog"
  },
  "metafield.media_type": {
   "fr": "Support",
@@ -257,7 +282,8 @@
   "it": "Tipo di supporto",
   "zh": "介质类型",
   "ja": "メディアタイプ",
-  "ko": "매체 종류"
+  "ko": "매체 종류",
+  "ro": "Tip de suport"
  },
  "metafield.musicbrainz_recording_id": {
   "fr": "MusicBrainz Recording ID",
@@ -267,7 +293,8 @@
   "it": "MusicBrainz Recording ID",
   "zh": "MusicBrainz Recording ID",
   "ja": "MusicBrainz Recording ID",
-  "ko": "MusicBrainz Recording ID"
+  "ko": "MusicBrainz Recording ID",
+  "ro": "MusicBrainz Recording ID"
  },
  "metafield.musicbrainz_release_id": {
   "fr": "MusicBrainz Release ID",
@@ -277,7 +304,8 @@
   "it": "MusicBrainz Release ID",
   "zh": "MusicBrainz Release ID",
   "ja": "MusicBrainz Release ID",
-  "ko": "MusicBrainz Release ID"
+  "ko": "MusicBrainz Release ID",
+  "ro": "MusicBrainz Release ID"
  },
  "metafield.musicbrainz_release_group_id": {
   "fr": "MusicBrainz Release Group ID",
@@ -287,7 +315,8 @@
   "it": "MusicBrainz Release Group ID",
   "zh": "MusicBrainz Release Group ID",
   "ja": "MusicBrainz Release Group ID",
-  "ko": "MusicBrainz Release Group ID"
+  "ko": "MusicBrainz Release Group ID",
+  "ro": "MusicBrainz Release Group ID"
  },
  "metafield.release_date": {
   "fr": "Date de sortie",
@@ -297,7 +326,8 @@
   "it": "Data di pubblicazione",
   "zh": "发行日期",
   "ja": "リリース日",
-  "ko": "발매일"
+  "ko": "발매일",
+  "ro": "Dată de lansare"
  },
  "metafield.original_date": {
   "fr": "Date originale",
@@ -307,7 +337,8 @@
   "it": "Data originale",
   "zh": "原始日期",
   "ja": "オリジナル日付",
-  "ko": "원본 날짜"
+  "ko": "원본 날짜",
+  "ro": "Dată originală"
  },
  "metafield.original_year": {
   "fr": "Année originale",
@@ -317,7 +348,8 @@
   "it": "Anno originale",
   "zh": "原始年份",
   "ja": "オリジナル年",
-  "ko": "원본 연도"
+  "ko": "원본 연도",
+  "ro": "An original"
  },
  "metafield.format": {
   "fr": "Format audio",
@@ -327,7 +359,8 @@
   "it": "Formato audio",
   "zh": "音频格式",
   "ja": "オーディオ形式",
-  "ko": "오디오 형식"
+  "ko": "오디오 형식",
+  "ro": "Format audio"
  },
  "metafield.sample_rate": {
   "fr": "Fréquence d'échantillonnage",
@@ -337,7 +370,8 @@
   "it": "Frequenza di campionamento",
   "zh": "采样率",
   "ja": "サンプリングレート",
-  "ko": "샘플링 레이트"
+  "ko": "샘플링 레이트",
+  "ro": "Frecvență de eșantionare"
  },
  "metafield.bit_depth": {
   "fr": "Profondeur de bits",
@@ -347,7 +381,8 @@
   "it": "Profondità di bit",
   "zh": "位深度",
   "ja": "ビット深度",
-  "ko": "비트 심도"
+  "ko": "비트 심도",
+  "ro": "Adâncime de biți"
  },
  "metafield.channels": {
   "fr": "Canaux",
@@ -357,7 +392,8 @@
   "it": "Canali",
   "zh": "声道",
   "ja": "チャンネル",
-  "ko": "채널"
+  "ko": "채널",
+  "ro": "Canale"
  },
  "metafield.duration_ms": {
   "fr": "Durée",
@@ -367,7 +403,8 @@
   "it": "Durata",
   "zh": "时长",
   "ja": "再生時間",
-  "ko": "재생 시간"
+  "ko": "재생 시간",
+  "ro": "Durată"
  },
  "metafield.file_size": {
   "fr": "Taille du fichier",
@@ -377,7 +414,8 @@
   "it": "Dimensione del file",
   "zh": "文件大小",
   "ja": "ファイルサイズ",
-  "ko": "파일 크기"
+  "ko": "파일 크기",
+  "ro": "Dimensiune fișier"
  },
  "metafield.file_path": {
   "fr": "Chemin du fichier",
@@ -387,7 +425,8 @@
   "it": "Percorso del file",
   "zh": "文件路径",
   "ja": "ファイルパス",
-  "ko": "파일 경로"
+  "ko": "파일 경로",
+  "ro": "Cale fișier"
  },
  "metafield.encoder": {
   "fr": "Encodeur",
@@ -397,7 +436,8 @@
   "it": "Codificatore",
   "zh": "编码器",
   "ja": "エンコーダー",
-  "ko": "인코더"
+  "ko": "인코더",
+  "ro": "Codificator"
  },
  "metafield.copyright": {
   "fr": "Copyright",
@@ -407,7 +447,8 @@
   "it": "Copyright",
   "zh": "Copyright",
   "ja": "Copyright",
-  "ko": "Copyright"
+  "ko": "Copyright",
+  "ro": "Copyright"
  },
  "metafield.language": {
   "fr": "Langue",
@@ -417,7 +458,8 @@
   "it": "Lingua",
   "zh": "语言",
   "ja": "言語",
-  "ko": "언어"
+  "ko": "언어",
+  "ro": "Limbă"
  },
  "metafield.rg_track_gain": {
   "fr": "ReplayGain piste",
@@ -427,7 +469,8 @@
   "it": "ReplayGain traccia",
   "zh": "ReplayGain 音轨",
   "ja": "ReplayGain トラック",
-  "ko": "ReplayGain 트랙"
+  "ko": "ReplayGain 트랙",
+  "ro": "ReplayGain piesă"
  },
  "metafield.rg_album_gain": {
   "fr": "ReplayGain album",
@@ -437,7 +480,8 @@
   "it": "ReplayGain album",
   "zh": "ReplayGain 专辑",
   "ja": "ReplayGain アルバム",
-  "ko": "ReplayGain 앨범"
+  "ko": "ReplayGain 앨범",
+  "ro": "ReplayGain album"
  },
  "metacat.Identification": {
   "fr": "Identification",
@@ -447,7 +491,8 @@
   "it": "Identificazione",
   "zh": "标识",
   "ja": "識別",
-  "ko": "식별"
+  "ko": "식별",
+  "ro": "Identificare"
  },
  "metacat.Crédits": {
   "fr": "Crédits",
@@ -457,7 +502,8 @@
   "it": "Crediti",
   "zh": "参与者",
   "ja": "クレジット",
-  "ko": "크레딧"
+  "ko": "크레딧",
+  "ro": "Credite"
  },
  "metacat.Classification": {
   "fr": "Classification",
@@ -467,7 +513,8 @@
   "it": "Classificazione",
   "zh": "分类",
   "ja": "分類",
-  "ko": "분류"
+  "ko": "분류",
+  "ro": "Clasificare"
  },
  "metacat.Texte": {
   "fr": "Texte",
@@ -477,7 +524,8 @@
   "it": "Testo",
   "zh": "文本",
   "ja": "テキスト",
-  "ko": "텍스트"
+  "ko": "텍스트",
+  "ro": "Text"
  },
  "metacat.Identifiants": {
   "fr": "Identifiants",
@@ -487,7 +535,8 @@
   "it": "Identificatori",
   "zh": "标识符",
   "ja": "識別子",
-  "ko": "식별자"
+  "ko": "식별자",
+  "ro": "Identificatori"
  },
  "metacat.Dates": {
   "fr": "Dates",
@@ -497,7 +546,8 @@
   "it": "Date",
   "zh": "日期",
   "ja": "日付",
-  "ko": "날짜"
+  "ko": "날짜",
+  "ro": "Date"
  },
  "metacat.Technique": {
   "fr": "Technique",
@@ -507,7 +557,8 @@
   "it": "Tecnica",
   "zh": "技术",
   "ja": "技術",
-  "ko": "기술"
+  "ko": "기술",
+  "ro": "Tehnic"
  },
  "metacat.ReplayGain": {
   "fr": "ReplayGain",
@@ -517,7 +568,8 @@
   "it": "ReplayGain",
   "zh": "ReplayGain",
   "ja": "ReplayGain",
-  "ko": "ReplayGain"
+  "ko": "ReplayGain",
+  "ro": "ReplayGain"
  },
  "svctok.musicbrainz.purpose": {
   "fr": "Années + crédits + couvertures (ID releases).",
@@ -527,7 +579,8 @@
   "it": "Anni + crediti + copertine (ID delle release).",
   "zh": "年份 + 制作人员 + 封面（release ID）。",
   "ja": "年 + クレジット + カバー（release ID）。",
-  "ko": "연도 + 크레딧 + 커버(release ID)."
+  "ko": "연도 + 크레딧 + 커버(release ID).",
+  "ro": "Ani + credite + coperți (ID-uri de lansare)."
  },
  "svctok.musicbrainz.pricing": {
   "fr": "100 % gratuit, base de données ouverte.",
@@ -537,7 +590,8 @@
   "it": "100% gratuito, database aperto.",
   "zh": "100% 免费，开放数据库。",
   "ja": "100% 無料、オープンデータベース。",
-  "ko": "100% 무료, 오픈 데이터베이스."
+  "ko": "100% 무료, 오픈 데이터베이스.",
+  "ro": "100% gratuit, bază de date deschisă."
  },
  "svctok.musicbrainz.step1": {
   "fr": "Aucun token requis — MusicBrainz est gratuit et anonyme.",
@@ -547,7 +601,8 @@
   "it": "Nessun token richiesto — MusicBrainz è gratuito e anonimo.",
   "zh": "无需 token — MusicBrainz 免费且匿名。",
   "ja": "token は不要 — MusicBrainz は無料で匿名です。",
-  "ko": "token 불필요 — MusicBrainz는 무료이며 익명입니다."
+  "ko": "token 불필요 — MusicBrainz는 무료이며 익명입니다.",
+  "ro": "Niciun token necesar — MusicBrainz este gratuit și anonim."
  },
  "svctok.discogs.purpose": {
   "fr": "Années + couvertures + crédits pour pressages obscurs.",
@@ -557,7 +612,8 @@
   "it": "Anni + copertine + crediti per stampe rare.",
   "zh": "年份 + 封面 + 制作人员，适用于冷门版本。",
   "ja": "希少なプレスの年 + カバー + クレジット。",
-  "ko": "희귀 프레싱의 연도 + 커버 + 크레딧."
+  "ko": "희귀 프레싱의 연도 + 커버 + 크레딧.",
+  "ro": "Ani + coperți + credite pentru presaje obscure."
  },
  "svctok.discogs.pricing": {
   "fr": "Compte + token personnel gratuits ; API gratuite avec quota (60 req/min).",
@@ -567,7 +623,8 @@
   "it": "Account + token personale gratuiti; API gratuita con quota (60 req/min).",
   "zh": "账户 + 个人 token 免费；API 免费但有配额（60 req/min）。",
   "ja": "アカウント + 個人 token は無料。API は無料で上限あり（60 req/min）。",
-  "ko": "계정 + 개인 token 무료. 할당량이 있는 무료 API(60 req/min)."
+  "ko": "계정 + 개인 token 무료. 할당량이 있는 무료 API(60 req/min).",
+  "ro": "Cont + token personal gratuite; API gratuit cu cotă (60 req/min)."
  },
  "svctok.discogs.step1": {
   "fr": "Connecte-toi sur discogs.com.",
@@ -577,7 +634,8 @@
   "it": "Accedi su discogs.com.",
   "zh": "登录 discogs.com。",
   "ja": "discogs.com にログインします。",
-  "ko": "discogs.com에 로그인하세요."
+  "ko": "discogs.com에 로그인하세요.",
+  "ro": "Autentifică-te pe discogs.com."
  },
  "svctok.discogs.step2": {
   "fr": "Va dans Settings → Developers.",
@@ -587,7 +645,8 @@
   "it": "Vai su Settings → Developers.",
   "zh": "进入 Settings → Developers。",
   "ja": "Settings → Developers に移動します。",
-  "ko": "Settings → Developers로 이동하세요."
+  "ko": "Settings → Developers로 이동하세요.",
+  "ro": "Mergi la Settings → Developers."
  },
  "svctok.discogs.step3": {
   "fr": "Clique 'Generate new token'.",
@@ -597,7 +656,8 @@
   "it": "Clicca 'Generate new token'.",
   "zh": "点击 'Generate new token'。",
   "ja": "'Generate new token' をクリックします。",
-  "ko": "'Generate new token'을 클릭하세요."
+  "ko": "'Generate new token'을 클릭하세요.",
+  "ro": "Apasă „Generate new token”."
  },
  "svctok.discogs.step4": {
   "fr": "Colle le token ici.",
@@ -607,7 +667,8 @@
   "it": "Incolla il token qui.",
   "zh": "在此粘贴 token。",
   "ja": "ここに token を貼り付けます。",
-  "ko": "여기에 token을 붙여넣으세요."
+  "ko": "여기에 token을 붙여넣으세요.",
+  "ro": "Lipește token-ul aici."
  },
  "svctok.lastfm.purpose": {
   "fr": "Genres + scrobbling.",
@@ -617,7 +678,8 @@
   "it": "Generi + scrobbling.",
   "zh": "流派 + scrobbling。",
   "ja": "ジャンル + scrobbling。",
-  "ko": "장르 + scrobbling."
+  "ko": "장르 + scrobbling.",
+  "ro": "Genuri + scrobbling."
  },
  "svctok.lastfm.pricing": {
   "fr": "API gratuite pour usage non commercial.",
@@ -627,7 +689,8 @@
   "it": "API gratuita per uso non commerciale.",
   "zh": "非商业用途免费 API。",
   "ja": "非商用利用向けの無料 API。",
-  "ko": "비상업적 용도의 무료 API."
+  "ko": "비상업적 용도의 무료 API.",
+  "ro": "API gratuit pentru uz necomercial."
  },
  "svctok.lastfm.step1": {
   "fr": "Va sur last.fm/api/account/create",
@@ -637,7 +700,8 @@
   "it": "Vai su last.fm/api/account/create",
   "zh": "前往 last.fm/api/account/create",
   "ja": "last.fm/api/account/create にアクセスします",
-  "ko": "last.fm/api/account/create로 이동하세요"
+  "ko": "last.fm/api/account/create로 이동하세요",
+  "ro": "Mergi la last.fm/api/account/create"
  },
  "svctok.lastfm.step2": {
   "fr": "Renseigne un nom d'application.",
@@ -647,7 +711,8 @@
   "it": "Inserisci un nome per l'applicazione.",
   "zh": "填写一个应用名称。",
   "ja": "アプリケーション名を入力します。",
-  "ko": "애플리케이션 이름을 입력하세요."
+  "ko": "애플리케이션 이름을 입력하세요.",
+  "ro": "Introdu un nume de aplicație."
  },
  "svctok.lastfm.step3": {
   "fr": "Récupère 'API key' et 'Shared secret'.",
@@ -657,7 +722,8 @@
   "it": "Recupera 'API key' e 'Shared secret'.",
   "zh": "获取 'API key' 和 'Shared secret'。",
   "ja": "'API key' と 'Shared secret' を取得します。",
-  "ko": "'API key'와 'Shared secret'을 받으세요."
+  "ko": "'API key'와 'Shared secret'을 받으세요.",
+  "ro": "Obține „API key” și „Shared secret”."
  },
  "svctok.lastfm.step4": {
   "fr": "Colle ici puis Enregistrer.",
@@ -667,7 +733,8 @@
   "it": "Incolla qui e poi Salva.",
   "zh": "在此粘贴后保存。",
   "ja": "ここに貼り付けて保存します。",
-  "ko": "여기에 붙여넣은 후 저장하세요."
+  "ko": "여기에 붙여넣은 후 저장하세요.",
+  "ro": "Lipește aici, apoi Salvează."
  },
  "svctok.lastfm.fieldApiSecret": {
   "fr": "API Secret (pour scrobbling)",
@@ -677,7 +744,8 @@
   "it": "API Secret (per lo scrobbling)",
   "zh": "API Secret（用于 scrobbling）",
   "ja": "API Secret（scrobbling 用）",
-  "ko": "API Secret(scrobbling용)"
+  "ko": "API Secret(scrobbling용)",
+  "ro": "API Secret (pentru scrobbling)"
  },
  "svctok.genius.purpose": {
   "fr": "Paroles.",
@@ -687,7 +755,8 @@
   "it": "Testi.",
   "zh": "歌词。",
   "ja": "歌詞。",
-  "ko": "가사."
+  "ko": "가사.",
+  "ro": "Versuri."
  },
  "svctok.genius.pricing": {
   "fr": "API gratuite.",
@@ -697,7 +766,8 @@
   "it": "API gratuita.",
   "zh": "免费 API。",
   "ja": "無料 API。",
-  "ko": "무료 API."
+  "ko": "무료 API.",
+  "ro": "API gratuit."
  },
  "svctok.genius.step1": {
   "fr": "Crée un compte sur genius.com.",
@@ -707,7 +777,8 @@
   "it": "Crea un account su genius.com.",
   "zh": "在 genius.com 创建账户。",
   "ja": "genius.com でアカウントを作成します。",
-  "ko": "genius.com에서 계정을 만드세요."
+  "ko": "genius.com에서 계정을 만드세요.",
+  "ro": "Creează un cont pe genius.com."
  },
  "svctok.genius.step2": {
   "fr": "Va dans API Clients.",
@@ -717,7 +788,8 @@
   "it": "Vai su API Clients.",
   "zh": "进入 API Clients。",
   "ja": "API Clients に移動します。",
-  "ko": "API Clients로 이동하세요."
+  "ko": "API Clients로 이동하세요.",
+  "ro": "Mergi la API Clients."
  },
  "svctok.genius.step3": {
   "fr": "Crée une application et copie le token.",
@@ -727,7 +799,8 @@
   "it": "Crea un'applicazione e copia il token.",
   "zh": "创建一个应用并复制 token。",
   "ja": "アプリケーションを作成し、token をコピーします。",
-  "ko": "애플리케이션을 만들고 token을 복사하세요."
+  "ko": "애플리케이션을 만들고 token을 복사하세요.",
+  "ro": "Creează o aplicație și copiază token-ul."
  },
  "svctok.tidal.purpose": {
   "fr": "Streaming hi-res + années + couvertures.",
@@ -737,7 +810,8 @@
   "it": "Streaming hi-res + anni + copertine.",
   "zh": "Hi-res 流媒体 + 年份 + 封面。",
   "ja": "ハイレゾストリーミング + 年 + カバー。",
-  "ko": "Hi-res 스트리밍 + 연도 + 커버."
+  "ko": "Hi-res 스트리밍 + 연도 + 커버.",
+  "ro": "Streaming hi-res + ani + coperți."
  },
  "svctok.tidal.pricing": {
   "fr": "Abonnement Tidal HiFi requis (≈ 11€/mois).",
@@ -747,7 +821,8 @@
   "it": "Richiesto abbonamento Tidal HiFi (≈ 11€/mese).",
   "zh": "需要 Tidal HiFi 订阅（≈ 11€/月）。",
   "ja": "Tidal HiFi の登録が必要（≈ 11€/月）。",
-  "ko": "Tidal HiFi 구독 필요(≈ 11€/월)."
+  "ko": "Tidal HiFi 구독 필요(≈ 11€/월).",
+  "ro": "Este necesar un abonament Tidal HiFi (≈ 11€/lună)."
  },
  "svctok.tidal.step1": {
   "fr": "Tidal utilise OAuth — utilise la page Streaming → Tidal pour te connecter.",
@@ -757,7 +832,8 @@
   "it": "Tidal usa OAuth — usa la pagina Streaming → Tidal per connetterti.",
   "zh": "Tidal 使用 OAuth — 请使用 Streaming → Tidal 页面进行连接。",
   "ja": "Tidal は OAuth を使用します — 接続には Streaming → Tidal ページを使用してください。",
-  "ko": "Tidal은 OAuth를 사용합니다 — 연결하려면 Streaming → Tidal 페이지를 사용하세요."
+  "ko": "Tidal은 OAuth를 사용합니다 — 연결하려면 Streaming → Tidal 페이지를 사용하세요.",
+  "ro": "Tidal folosește OAuth — folosește pagina Streaming → Tidal pentru a te conecta."
  },
  "svctok.qobuz.purpose": {
   "fr": "Streaming hi-res + années + couvertures.",
@@ -767,7 +843,8 @@
   "it": "Streaming hi-res + anni + copertine.",
   "zh": "Hi-res 流媒体 + 年份 + 封面。",
   "ja": "ハイレゾストリーミング + 年 + カバー。",
-  "ko": "Hi-res 스트리밍 + 연도 + 커버."
+  "ko": "Hi-res 스트리밍 + 연도 + 커버.",
+  "ro": "Streaming hi-res + ani + coperți."
  },
  "svctok.qobuz.pricing": {
   "fr": "Abonnement Qobuz Studio requis (≈ 13€/mois).",
@@ -777,7 +854,8 @@
   "it": "Richiesto abbonamento Qobuz Studio (≈ 13€/mese).",
   "zh": "需要 Qobuz Studio 订阅（≈ 13€/月）。",
   "ja": "Qobuz Studio の登録が必要（≈ 13€/月）。",
-  "ko": "Qobuz Studio 구독 필요(≈ 13€/월)."
+  "ko": "Qobuz Studio 구독 필요(≈ 13€/월).",
+  "ro": "Este necesar un abonament Qobuz Studio (≈ 13€/lună)."
  },
  "svctok.qobuz.step1": {
   "fr": "Qobuz utilise login/password — utilise la page Streaming → Qobuz pour te connecter.",
@@ -787,7 +865,8 @@
   "it": "Qobuz usa login/password — usa la pagina Streaming → Qobuz per connetterti.",
   "zh": "Qobuz 使用登录名/密码 — 请使用 Streaming → Qobuz 页面进行连接。",
   "ja": "Qobuz はログイン/パスワードを使用します — 接続には Streaming → Qobuz ページを使用してください。",
-  "ko": "Qobuz는 로그인/비밀번호를 사용합니다 — 연결하려면 Streaming → Qobuz 페이지를 사용하세요."
+  "ko": "Qobuz는 로그인/비밀번호를 사용합니다 — 연결하려면 Streaming → Qobuz 페이지를 사용하세요.",
+  "ro": "Qobuz folosește login/parolă — folosește pagina Streaming → Qobuz pentru a te conecta."
  },
  "svctok.spotify.purpose": {
   "fr": "Streaming + connectivité.",
@@ -797,7 +876,8 @@
   "it": "Streaming + connettività.",
   "zh": "流媒体 + 连接。",
   "ja": "ストリーミング + 接続。",
-  "ko": "스트리밍 + 연결."
+  "ko": "스트리밍 + 연결.",
+  "ro": "Streaming + conectivitate."
  },
  "svctok.spotify.pricing": {
   "fr": "Compte Spotify gratuit ou Premium (≈ 11€/mois).",
@@ -807,7 +887,8 @@
   "it": "Account Spotify gratuito o Premium (≈ 11€/mese).",
   "zh": "免费或 Premium Spotify 账户（≈ 11€/月）。",
   "ja": "無料または Premium の Spotify アカウント（≈ 11€/月）。",
-  "ko": "무료 또는 Premium Spotify 계정(≈ 11€/월)."
+  "ko": "무료 또는 Premium Spotify 계정(≈ 11€/월).",
+  "ro": "Cont Spotify gratuit sau Premium (≈ 11€/lună)."
  },
  "svctok.spotify.step1": {
   "fr": "Spotify utilise OAuth — utilise la page Streaming → Spotify pour te connecter.",
@@ -817,7 +898,8 @@
   "it": "Spotify usa OAuth — usa la pagina Streaming → Spotify per connetterti.",
   "zh": "Spotify 使用 OAuth — 请使用 Streaming → Spotify 页面进行连接。",
   "ja": "Spotify は OAuth を使用します — 接続には Streaming → Spotify ページを使用してください。",
-  "ko": "Spotify는 OAuth를 사용합니다 — 연결하려면 Streaming → Spotify 페이지를 사용하세요."
+  "ko": "Spotify는 OAuth를 사용합니다 — 연결하려면 Streaming → Spotify 페이지를 사용하세요.",
+  "ro": "Spotify folosește OAuth — folosește pagina Streaming → Spotify pentru a te conecta."
  },
  "svctok.deezer.purpose": {
   "fr": "Streaming.",
@@ -827,7 +909,8 @@
   "it": "Streaming.",
   "zh": "流媒体。",
   "ja": "ストリーミング。",
-  "ko": "스트리밍."
+  "ko": "스트리밍.",
+  "ro": "Streaming."
  },
  "svctok.deezer.pricing": {
   "fr": "Compte gratuit ou Deezer HiFi (≈ 12€/mois) pour FLAC.",
@@ -837,7 +920,8 @@
   "it": "Account gratuito o Deezer HiFi (≈ 12€/mese) per FLAC.",
   "zh": "免费账户或 Deezer HiFi（≈ 12€/月）以获取 FLAC。",
   "ja": "FLAC には無料アカウントまたは Deezer HiFi（≈ 12€/月）。",
-  "ko": "FLAC를 위해 무료 계정 또는 Deezer HiFi(≈ 12€/월)."
+  "ko": "FLAC를 위해 무료 계정 또는 Deezer HiFi(≈ 12€/월).",
+  "ro": "Cont gratuit sau Deezer HiFi (≈ 12€/lună) pentru FLAC."
  },
  "svctok.deezer.step1": {
   "fr": "Connecte-toi sur deezer.com.",
@@ -847,7 +931,8 @@
   "it": "Accedi su deezer.com.",
   "zh": "登录 deezer.com。",
   "ja": "deezer.com にログインします。",
-  "ko": "deezer.com에 로그인하세요."
+  "ko": "deezer.com에 로그인하세요.",
+  "ro": "Autentifică-te pe deezer.com."
  },
  "svctok.deezer.step2": {
   "fr": "DevTools (F12) → Application → Cookies → cherche 'arl'.",
@@ -857,7 +942,8 @@
   "it": "DevTools (F12) → Application → Cookies → cerca 'arl'.",
   "zh": "DevTools (F12) → Application → Cookies → 查找 'arl'。",
   "ja": "DevTools (F12) → Application → Cookies → 'arl' を探します。",
-  "ko": "DevTools (F12) → Application → Cookies → 'arl'을 찾으세요."
+  "ko": "DevTools (F12) → Application → Cookies → 'arl'을 찾으세요.",
+  "ro": "DevTools (F12) → Application → Cookies → caută „arl”."
  },
  "svctok.deezer.step3": {
   "fr": "Colle le token ARL ici.",
@@ -867,7 +953,8 @@
   "it": "Incolla il token ARL qui.",
   "zh": "在此粘贴 ARL token。",
   "ja": "ここに ARL token を貼り付けます。",
-  "ko": "여기에 ARL token을 붙여넣으세요."
+  "ko": "여기에 ARL token을 붙여넣으세요.",
+  "ro": "Lipește token-ul ARL aici."
  },
  "svctok.deezer.fieldArl": {
   "fr": "ARL token (depuis cookies deezer.com)",
@@ -877,7 +964,8 @@
   "it": "ARL token (dai cookie di deezer.com)",
   "zh": "ARL token（来自 deezer.com cookies）",
   "ja": "ARL token（deezer.com の cookies から）",
-  "ko": "ARL token(deezer.com cookies에서)"
+  "ko": "ARL token(deezer.com cookies에서)",
+  "ro": "ARL token (din cookie-urile deezer.com)"
  },
  "svctok.err.discogsNotConfigured": {
   "fr": "Token Discogs non configuré.",
@@ -887,7 +975,8 @@
   "it": "Token Discogs non configurato.",
   "zh": "Discogs token 未配置。",
   "ja": "Discogs token が設定されていません。",
-  "ko": "Discogs token이 설정되지 않았습니다."
+  "ko": "Discogs token이 설정되지 않았습니다.",
+  "ro": "Token Discogs neconfigurat."
  },
  "svctok.err.lastfmNotConfigured": {
   "fr": "API Key Last.fm non configurée.",
@@ -897,7 +986,8 @@
   "it": "API Key Last.fm non configurata.",
   "zh": "Last.fm API Key 未配置。",
   "ja": "Last.fm API Key が設定されていません。",
-  "ko": "Last.fm API Key가 설정되지 않았습니다."
+  "ko": "Last.fm API Key가 설정되지 않았습니다.",
+  "ro": "API Key Last.fm neconfigurat."
  },
  "svctok.err.tokenConfiguredNoValidation": {
   "fr": "Token configuré (validation non disponible).",
@@ -907,7 +997,8 @@
   "it": "Token configurato (validazione non disponibile).",
   "zh": "Token 已配置（验证不可用）。",
   "ja": "token を設定しました（検証は利用できません）。",
-  "ko": "token이 설정되었습니다(검증 불가)."
+  "ko": "token이 설정되었습니다(검증 불가).",
+  "ro": "Token configurat (validare indisponibilă)."
  },
  "svctok.err.geniusNotConfigured": {
   "fr": "Token Genius non configuré.",
@@ -917,7 +1008,8 @@
   "it": "Token Genius non configurato.",
   "zh": "Genius token 未配置。",
   "ja": "Genius token が設定されていません。",
-  "ko": "Genius token이 설정되지 않았습니다."
+  "ko": "Genius token이 설정되지 않았습니다.",
+  "ro": "Token Genius neconfigurat."
  },
  "ai.nextTrack": {
   "fr": "Piste suivante : {title}",
@@ -927,7 +1019,8 @@
   "it": "Traccia successiva: {title}",
   "zh": "下一首：{title}",
   "ja": "次のトラック：{title}",
-  "ko": "다음 트랙: {title}"
+  "ko": "다음 트랙: {title}",
+  "ro": "Piesa următoare: {title}"
  },
  "ai.volumeSet": {
   "fr": "Volume réglé à {value}%.",
@@ -937,7 +1030,8 @@
   "it": "Volume impostato al {value}%.",
   "zh": "音量已设为 {value}%。",
   "ja": "音量を{value}%に設定しました。",
-  "ko": "볼륨을 {value}%로 설정했습니다."
+  "ko": "볼륨을 {value}%로 설정했습니다.",
+  "ro": "Volum setat la {value}%."
  },
  "ai.nowPlaying": {
   "fr": "En cours : {track} — {artist}",
@@ -947,7 +1041,8 @@
   "it": "In riproduzione: {track} — {artist}",
   "zh": "正在播放：{track} — {artist}",
   "ja": "再生中：{track} — {artist}",
-  "ko": "재생 중: {track} — {artist}"
+  "ko": "재생 중: {track} — {artist}",
+  "ro": "Se redă acum: {track} — {artist}"
  },
  "ai.nothingPlaying": {
   "fr": "Rien ne joue actuellement.",
@@ -957,7 +1052,8 @@
   "it": "Non è in riproduzione nulla al momento.",
   "zh": "当前没有播放任何内容。",
   "ja": "現在何も再生されていません。",
-  "ko": "지금 재생 중인 곡이 없습니다."
+  "ko": "지금 재생 중인 곡이 없습니다.",
+  "ro": "Nu se redă nimic în acest moment."
  },
  "ai.playingCount": {
   "fr": "▶ {title} — {artist} ({count} pistes)",
@@ -967,7 +1063,8 @@
   "it": "▶ {title} — {artist} ({count} tracce)",
   "zh": "▶ {title} — {artist}（{count} 首）",
   "ja": "▶ {title} — {artist}（{count} 曲）",
-  "ko": "▶ {title} — {artist} ({count}곡)"
+  "ko": "▶ {title} — {artist} ({count}곡)",
+  "ro": "▶ {title} — {artist} ({count} piese)"
  },
  "ai.playing": {
   "fr": "▶ {title} — {artist}",
@@ -977,7 +1074,8 @@
   "it": "▶ {title} — {artist}",
   "zh": "▶ {title} — {artist}",
   "ja": "▶ {title} — {artist}",
-  "ko": "▶ {title} — {artist}"
+  "ko": "▶ {title} — {artist}",
+  "ro": "▶ {title} — {artist}"
  },
  "ai.notFoundLibrary": {
   "fr": "Je n'ai rien trouvé pour « {query} » dans la bibliothèque.",
@@ -987,7 +1085,8 @@
   "it": "Non ho trovato nulla per «{query}» nella libreria.",
   "zh": "在音乐库中没有找到与“{query}”相关的内容。",
   "ja": "ライブラリで「{query}」に該当するものが見つかりませんでした。",
-  "ko": "라이브러리에서 “{query}”에 대한 결과를 찾지 못했습니다."
+  "ko": "라이브러리에서 “{query}”에 대한 결과를 찾지 못했습니다.",
+  "ro": "Nu am găsit nimic pentru „{query}” în biblioteca ta."
  },
  "ai.noResults": {
   "fr": "Aucun résultat pour « {query} ».",
@@ -997,7 +1096,8 @@
   "it": "Nessun risultato per «{query}».",
   "zh": "没有找到“{query}”的结果。",
   "ja": "「{query}」の結果はありません。",
-  "ko": "“{query}”에 대한 결과가 없습니다."
+  "ko": "“{query}”에 대한 결과가 없습니다.",
+  "ro": "Niciun rezultat pentru „{query}”."
  },
  "ai.nArtists": {
   "fr": "{n} artiste(s)",
@@ -1007,7 +1107,8 @@
   "it": "{n} artista/i",
   "zh": "{n} 位艺术家",
   "ja": "{n} 組のアーティスト",
-  "ko": "아티스트 {n}명"
+  "ko": "아티스트 {n}명",
+  "ro": "{n} artist/artiști"
  },
  "ai.nAlbums": {
   "fr": "{n} album(s)",
@@ -1017,7 +1118,8 @@
   "it": "{n} album",
   "zh": "{n} 张专辑",
   "ja": "{n} 枚のアルバム",
-  "ko": "앨범 {n}개"
+  "ko": "앨범 {n}개",
+  "ro": "{n} album(e)"
  },
  "ai.nTracks": {
   "fr": "{n} piste(s)",
@@ -1027,7 +1129,8 @@
   "it": "{n} traccia/e",
   "zh": "{n} 首",
   "ja": "{n} 曲",
-  "ko": "{n}곡"
+  "ko": "{n}곡",
+  "ro": "{n} piesă/piese"
  },
  "ai.resultsFor": {
   "fr": "Résultats pour « {query} » : {parts}",
@@ -1037,7 +1140,8 @@
   "it": "Risultati per «{query}»: {parts}",
   "zh": "“{query}”的结果：{parts}",
   "ja": "「{query}」の結果：{parts}",
-  "ko": "“{query}” 검색 결과: {parts}"
+  "ko": "“{query}” 검색 결과: {parts}",
+  "ro": "Rezultate pentru „{query}”: {parts}"
  },
  "ai.zonesAvailable": {
   "fr": "Zones disponibles : {zones}",
@@ -1047,7 +1151,8 @@
   "it": "Zone disponibili: {zones}",
   "zh": "可用区域：{zones}",
   "ja": "利用可能なゾーン：{zones}",
-  "ko": "사용 가능한 구역: {zones}"
+  "ko": "사용 가능한 구역: {zones}",
+  "ro": "Zone disponibile: {zones}"
  },
  "ai.noZone": {
   "fr": "Aucune zone trouvée.",
@@ -1057,7 +1162,8 @@
   "it": "Nessuna zona trovata.",
   "zh": "未找到任何区域。",
   "ja": "ゾーンが見つかりませんでした。",
-  "ko": "구역을 찾을 수 없습니다."
+  "ko": "구역을 찾을 수 없습니다.",
+  "ro": "Nu s-a găsit nicio zonă."
  },
  "ai.notUnderstood": {
   "fr": "Désolé, je n'ai pas compris « {msg} ». Essayez « joue [artiste/album] » ou « cherche [terme] ».",
@@ -1067,7 +1173,8 @@
   "it": "Spiacente, non ho capito «{msg}». Prova «riproduci [artista/album]» o «cerca [termine]».",
   "zh": "抱歉，我没有理解“{msg}”。试试“播放 [艺术家/专辑]”或“搜索 [关键词]”。",
   "ja": "すみません、「{msg}」を理解できませんでした。「[アーティスト/アルバム] を再生」または「[キーワード] を検索」とお試しください。",
-  "ko": "죄송합니다, “{msg}”를 이해하지 못했습니다. “[아티스트/앨범] 재생” 또는 “[검색어] 검색”을 시도해 보세요."
+  "ko": "죄송합니다, “{msg}”를 이해하지 못했습니다. “[아티스트/앨범] 재생” 또는 “[검색어] 검색”을 시도해 보세요.",
+  "ro": "Îmi pare rău, nu am înțeles „{msg}”. Încearcă „redă [artist/album]” sau „caută [termen]”."
  },
  "svctok.test.musicbrainz": {
   "fr": "MusicBrainz disponible (aucun token requis).",
@@ -1077,7 +1184,8 @@
   "it": "MusicBrainz disponibile (nessun token richiesto).",
   "zh": "MusicBrainz 可用（无需 token）。",
   "ja": "MusicBrainz は利用可能です（token 不要）。",
-  "ko": "MusicBrainz 사용 가능 (token 불필요)."
+  "ko": "MusicBrainz 사용 가능 (token 불필요).",
+  "ro": "MusicBrainz disponibil (niciun token necesar)."
  },
  "svctok.test.validationUnavailable": {
   "fr": "Validation non disponible pour ce service.",
@@ -1087,7 +1195,8 @@
   "it": "Convalida non disponibile per questo servizio.",
   "zh": "此服务无法进行验证。",
   "ja": "このサービスでは検証を利用できません。",
-  "ko": "이 서비스에서는 검증을 사용할 수 없습니다."
+  "ko": "이 서비스에서는 검증을 사용할 수 없습니다.",
+  "ro": "Validare indisponibilă pentru acest serviciu."
  },
  "svctok.err.generic": {
   "fr": "Erreur : {error}",
@@ -1097,7 +1206,8 @@
   "it": "Errore: {error}",
   "zh": "错误：{error}",
   "ja": "エラー：{error}",
-  "ko": "오류: {error}"
+  "ko": "오류: {error}",
+  "ro": "Eroare: {error}"
  },
  "radio.addedTitle": {
   "fr": "✓ Radio ajoutée",
@@ -1107,7 +1217,8 @@
   "it": "✓ Radio aggiunta",
   "zh": "✓ 电台已添加",
   "ja": "✓ ラジオを追加しました",
-  "ko": "✓ 라디오 추가됨"
+  "ko": "✓ 라디오 추가됨",
+  "ro": "✓ Radio adăugat"
  },
  "radio.addedBody": {
   "fr": "{name} a été ajoutée à vos favoris Tune.",
@@ -1117,7 +1228,8 @@
   "it": "{name} è stata aggiunta ai tuoi preferiti Tune.",
   "zh": "{name} 已添加到你的 Tune 收藏。",
   "ja": "{name} を Tune のお気に入りに追加しました。",
-  "ko": "{name}이(가) Tune 즐겨찾기에 추가되었습니다."
+  "ko": "{name}이(가) Tune 즐겨찾기에 추가되었습니다.",
+  "ro": "{name} a fost adăugat la favoritele tale Tune."
  },
  "radio.canCloseTab": {
   "fr": "Vous pouvez fermer cet onglet.",
@@ -1127,7 +1239,8 @@
   "it": "Puoi chiudere questa scheda.",
   "zh": "你可以关闭此标签页。",
   "ja": "このタブを閉じてかまいません。",
-  "ko": "이 탭을 닫아도 됩니다."
+  "ko": "이 탭을 닫아도 됩니다.",
+  "ro": "Poți închide această filă."
  },
  "radio.errorTitle": {
   "fr": "Erreur",
@@ -1137,7 +1250,8 @@
   "it": "Errore",
   "zh": "错误",
   "ja": "エラー",
-  "ko": "오류"
+  "ko": "오류",
+  "ro": "Eroare"
  },
  "net.smbAccessDenied": {
   "fr": "Accès refusé (guest). Essayez avec un identifiant/mot de passe. ({error})",
@@ -1147,7 +1261,8 @@
   "it": "Accesso negato (guest). Prova con nome utente/password. ({error})",
   "zh": "访问被拒绝（guest）。请尝试使用用户名/密码。({error})",
   "ja": "アクセスが拒否されました（guest）。ユーザー名／パスワードでお試しください。({error})",
-  "ko": "접근이 거부되었습니다 (guest). 아이디/비밀번호로 시도하세요. ({error})"
+  "ko": "접근이 거부되었습니다 (guest). 아이디/비밀번호로 시도하세요. ({error})",
+  "ro": "Acces refuzat (guest). Încearcă cu un nume de utilizator/parolă. ({error})"
  },
  "net.smbScanFailed": {
   "fr": "Impossible de scanner {host} : {error}",
@@ -1157,6 +1272,7 @@
   "it": "Impossibile scansionare {host}: {error}",
   "zh": "无法扫描 {host}：{error}",
   "ja": "{host} をスキャンできません：{error}",
-  "ko": "{host}을(를) 스캔할 수 없습니다: {error}"
+  "ko": "{host}을(를) 스캔할 수 없습니다: {error}",
+  "ro": "Imposibil de scanat {host}: {error}"
  }
 }
