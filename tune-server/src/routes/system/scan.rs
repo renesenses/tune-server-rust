@@ -800,6 +800,20 @@ pub(super) async fn trigger_scan(
             }
         }
 
+        // Clean up orphan albums (album rows with no tracks). A full rescan
+        // after removing files from disk — or the duplicate-album grouping —
+        // can leave album rows behind that no track references. Without this
+        // they linger with their cover art and inflate the total album count
+        // even though they have no tracks (Alain: emptied library + full
+        // rescan still shows removed albums' covers in double/triple). The
+        // incremental auto-scan already purges these; the full scan did not.
+        let orphan_albums = tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+            .delete_orphans()
+            .unwrap_or(0);
+        if orphan_albums > 0 {
+            tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
+        }
+
         // Clean up orphan artists left behind after tag corrections
         let orphan_artists = ArtistRepo::with_backend(db.clone()).cleanup_orphans().unwrap_or(0);
         if orphan_artists > 0 {
