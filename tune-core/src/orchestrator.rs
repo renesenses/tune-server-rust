@@ -2068,12 +2068,21 @@ impl PlaybackOrchestrator {
             // Otherwise keep FLAC (smaller, Content-Length). Previously these
             // streaming paths always emitted audio/flac (Philippe / Revox S100).
             let dash_did = req.output_device_id.as_deref().unwrap_or("");
-            let dash_enc_format =
-                if dash_did.is_empty() || self.dlna_supports_mime(dash_did, "audio/flac").await {
-                    "flac"
-                } else {
-                    "wav"
-                };
+            // Honour the per-zone "native FLAC" override for streaming DASH too
+            // (Tidal/Qobuz Hi-Res), not just local files: some renderers decode
+            // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
+            // empty GetProtocolInfo Sink), so negotiation wrongly falls back to
+            // WAV. When the zone forces native FLAC, keep FLAC here as well.
+            let dash_force_flac =
+                ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+            let dash_enc_format = if dash_did.is_empty()
+                || dash_force_flac
+                || self.dlna_supports_mime(dash_did, "audio/flac").await
+            {
+                "flac"
+            } else {
+                "wav"
+            };
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
