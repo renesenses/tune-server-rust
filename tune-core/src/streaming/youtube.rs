@@ -19,8 +19,10 @@ const YTM_API_BASE: &str = "https://music.youtube.com/youtubei/v1";
 // Stream URL cache TTL — YouTube CDN URLs expire after ~6 hours, cache for 5h
 const STREAM_URL_TTL_SECS: u64 = 18_000;
 
-// yt-dlp subprocess timeout
-const YTDLP_TIMEOUT_SECS: u64 = 30;
+// yt-dlp subprocess timeout. YouTube extraction (nsig/format resolution,
+// slow on first run and on some networks) routinely exceeds 30s, which was
+// killing every fallback attempt when the native path is fully login-gated.
+const YTDLP_TIMEOUT_SECS: u64 = 90;
 
 // ---------------------------------------------------------------------------
 // Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
@@ -486,11 +488,13 @@ impl YouTubeService {
             .as_array()
             .ok_or_else(|| format!("no streaming data for {track_id}"))?;
 
-        // Find best audio format: prefer OPUS (audio/webm) at highest bitrate,
-        // then fall back to AAC (audio/mp4)
+        // Find best audio format: prefer AAC (audio/mp4, itag 140) at highest
+        // bitrate. Symphonia — our decode pipeline — can decode AAC but NOT
+        // Opus/WebM (the ffmpeg Opus fallback was removed), so an Opus stream
+        // plays back silent. Only fall back to Opus when no AAC is offered.
         let mut best_url: Option<&str> = None;
         let mut best_bitrate: u64 = 0;
-        let mut best_is_opus = false;
+        let mut best_is_aac = false;
 
         for fmt in formats {
             let mime = fmt["mimeType"].as_str().unwrap_or("");
@@ -500,13 +504,15 @@ impl YouTubeService {
             }
 
             let bitrate = fmt["bitrate"].as_u64().unwrap_or(0);
-            let is_opus = mime.contains("opus");
+            // AAC is delivered as audio/mp4 (codec mp4a); Opus as audio/webm.
+            let is_aac = mime.contains("mp4");
 
-            // Prefer OPUS; within same codec family, prefer higher bitrate
-            let dominated = if best_is_opus && !is_opus {
-                true // Don't replace opus with non-opus
-            } else if !best_is_opus && is_opus {
-                false // Always prefer opus
+            // Prefer AAC (decodable); within same codec family, prefer higher
+            // bitrate. Never replace an AAC pick with Opus.
+            let dominated = if best_is_aac && !is_aac {
+                true // Don't replace AAC with non-AAC (Opus)
+            } else if !best_is_aac && is_aac {
+                false // Always prefer AAC
             } else {
                 bitrate <= best_bitrate
             };
@@ -519,17 +525,25 @@ impl YouTubeService {
             if let Some(u) = fmt["url"].as_str() {
                 best_url = Some(u);
                 best_bitrate = bitrate;
-                best_is_opus = is_opus;
+                best_is_aac = is_aac;
             }
         }
 
         let stream_url =
             best_url.ok_or_else(|| format!("no suitable audio stream found for {track_id}"))?;
 
+        // If the only direct-URL audio the native path offers is Opus, it would
+        // decode to silence — defer to the yt-dlp fallback, which requests m4a.
+        if !best_is_aac {
+            return Err(format!(
+                "native path only offers Opus for {track_id} (undecodable), deferring to yt-dlp"
+            ));
+        }
+
         debug!(
             track_id,
             bitrate = best_bitrate,
-            opus = best_is_opus,
+            aac = best_is_aac,
             "ytm_native_url_extracted"
         );
         Ok(stream_url.to_string())
