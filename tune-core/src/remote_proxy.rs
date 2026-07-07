@@ -18,7 +18,7 @@ impl Default for RemoteProxy {
 impl RemoteProxy {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),

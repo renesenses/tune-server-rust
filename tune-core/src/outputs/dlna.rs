@@ -72,11 +72,11 @@ impl DlnaOutput {
             host,
             av_transport_url,
             rendering_control_url,
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
-            stop_client: Client::builder()
+            stop_client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_millis(
                     STOP_BEFORE_PLAY_TIMEOUT_MS,
                 ))

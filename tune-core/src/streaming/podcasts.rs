@@ -138,7 +138,7 @@ pub struct PodcastService {
 impl PodcastService {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(10))
                 .user_agent(USER_AGENT)
                 .redirect(reqwest::redirect::Policy::limited(10))

@@ -25,7 +25,7 @@ impl RelayClient {
         relay_url: String,
         local_port: u16,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = crate::http::client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("http client");

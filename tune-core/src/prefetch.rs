@@ -356,7 +356,7 @@ impl PrefetchEngine {
                     .to_string_lossy()
                     .to_string();
 
-                let resp = reqwest::blocking::Client::builder()
+                let resp = crate::http::client::blocking_builder()
                     .timeout(std::time::Duration::from_secs(120))
                     .build()
                     .and_then(|c| c.get(&upstream_url).send());

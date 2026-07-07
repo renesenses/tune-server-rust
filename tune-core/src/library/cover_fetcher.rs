@@ -19,7 +19,7 @@ pub async fn fetch_cover_from_caa(musicbrainz_release_id: &str, cache_dir: &str)
         return None;
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .ok()?;
@@ -56,7 +56,7 @@ pub async fn fetch_cover_from_discogs(
         return None;
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .ok()?;

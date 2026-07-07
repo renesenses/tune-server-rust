@@ -462,7 +462,7 @@ pub fn populate_changelog_after_scan(backend: &Arc<dyn DbBackend>) {
 /// Spawn the periodic cloud library sync task.  Runs every 5 minutes,
 /// gated behind Premium tier + SSO access token.
 pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseManager>) {
-    let client = match reqwest::Client::builder()
+    let client = match crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
         .build()

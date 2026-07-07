@@ -33,7 +33,7 @@ impl Default for SpotifyService {
 impl SpotifyService {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),

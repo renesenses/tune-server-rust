@@ -18,7 +18,7 @@ impl BluosOutput {
             device_id,
             host,
             port,
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
