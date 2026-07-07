@@ -2083,6 +2083,16 @@ impl PlaybackOrchestrator {
             } else {
                 "wav"
             };
+            // Make the streaming-DLNA format decision explicit in the log so we
+            // can tell why a renderer got WAV vs FLAC (Marco: multiple Denon
+            // zones — is the "native FLAC" toggle set on the ZONE being played?).
+            info!(
+                zone_id = req.zone_id,
+                device_id = %dash_did,
+                native_flac_override = dash_force_flac,
+                chosen_format = dash_enc_format,
+                "streaming_dash_dlna_format_decision"
+            );
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
