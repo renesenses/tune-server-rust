@@ -22,6 +22,12 @@ use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadat
 // fall back to filename metadata instead of losing the file.
 const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// The audio hash (duplicate detection) reads the whole file, separately from
+// the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
+// get hashed — but it's best-effort: on timeout the track keeps its real tags
+// and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
+const HASH_TIMEOUT: Duration = Duration::from_secs(120);
+
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
@@ -104,29 +110,38 @@ fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), String> {
-    let path = path.clone();
-    let (tx, rx) = mpsc::channel();
-
+    // Phase 1 — read the tags. This is fast even on a NAS (only the header /
+    // tag blocks are read), so FILE_TIMEOUT is plenty. A timeout here means the
+    // tags are genuinely unreadable → caller falls back to filename metadata.
+    let meta_path = path.clone();
+    let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
-        let metadata = match try_read_metadata(&path) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                // Send the error string through the channel so the caller
-                // can log it. We still return None for metadata.
-                let _ = tx.send(Err(e));
-                return;
-            }
-        };
-        let hash = if with_hash {
-            compute_audio_hash(&path)
-        } else {
-            None
-        };
-        let _ = tx.send(Ok((metadata, hash)));
+        let _ = mtx.send(try_read_metadata(&meta_path));
     });
+    let metadata = match mrx.recv_timeout(FILE_TIMEOUT) {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("timeout".to_string()),
+    };
 
-    rx.recv_timeout(FILE_TIMEOUT)
-        .map_err(|_| "timeout".to_string())?
+    if !with_hash {
+        return Ok((Some(metadata), None));
+    }
+
+    // Phase 2 — compute the audio hash (used only for duplicate detection). This
+    // reads the WHOLE file, which on very large Hi-Res files over a NAS can far
+    // exceed the tag-read budget (Progman: a 23-min FLAC 24/88.2 ≈ 1 GB). Make
+    // it best-effort: if it doesn't finish in HASH_TIMEOUT, keep the real tags
+    // and just skip the hash (audio_hash = None) instead of dropping the track
+    // to filename-only metadata. Dedup is degraded for that one file, nothing
+    // more.
+    let hash_path = path.clone();
+    let (htx, hrx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = htx.send(compute_audio_hash(&hash_path));
+    });
+    let hash = hrx.recv_timeout(HASH_TIMEOUT).unwrap_or(None);
+    Ok((Some(metadata), hash))
 }
 
 pub struct ListAudioResult {
