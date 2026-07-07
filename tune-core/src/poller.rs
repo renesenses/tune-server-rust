@@ -1089,7 +1089,24 @@ impl PositionPoller {
                                 );
                             }
                             if natural_end {
-                                if ps.gapless_sent {
+                                // Only DLNA renderers auto-transition after
+                                // SetNextAVTransportURI. For exclusive local
+                                // outputs (ASIO / WASAPI exclusive) the near-end
+                                // branch sets gapless_sent=true only to suppress
+                                // re-arming — no SetNext is ever sent — so the
+                                // "wait for transition" path below would hang
+                                // forever and repeat/advance would never fire
+                                // (DEvir: repeat fails on clean ASIO playback).
+                                // Only wait when the output can actually
+                                // transition internally; otherwise end normally.
+                                let awaiting_dlna_transition = ps.gapless_sent && {
+                                    let outputs = self.outputs.lock().await;
+                                    match outputs.get(&device_id) {
+                                        Some(arc) => arc.lock().await.supports_internal_gapless(),
+                                        None => false,
+                                    }
+                                };
+                                if awaiting_dlna_transition {
                                     // Gapless was prepared via SetNextAVTransportURI.
                                     // Don't advance metadata yet — wait for the
                                     // renderer to confirm the transition by starting
@@ -1108,6 +1125,7 @@ impl PositionPoller {
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
                                 } else {
+                                    ps.gapless_sent = false;
                                     track_ended = true;
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
