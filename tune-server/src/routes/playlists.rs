@@ -723,6 +723,34 @@ async fn diff_playlist_tracks(
     service: &str,
     playlist_id: &str,
 ) -> Vec<(String, String)> {
+    // Compare against a manual collection (Elie): a collection is a set of
+    // albums (stored in settings), so flatten its albums to their tracks.
+    if service == "collection" {
+        let cid: i64 = playlist_id.parse().unwrap_or(0);
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+        let collections: Vec<Value> = settings
+            .get("collections")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let album_ids: Vec<i64> = collections
+            .iter()
+            .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(cid))
+            .and_then(|c| c.get("album_ids"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+            .unwrap_or_default();
+        let trepo = TrackRepo::with_backend(state.backend.clone());
+        let mut out = Vec::new();
+        for aid in album_ids {
+            for t in trepo.list_by_album(aid).unwrap_or_default() {
+                out.push((t.title, t.artist_name.unwrap_or_default()));
+            }
+        }
+        return out;
+    }
     if service == "local" || service.is_empty() {
         let pid: i64 = playlist_id.parse().unwrap_or(0);
         let prepo = PlaylistRepo::with_backend(state.backend.clone());
