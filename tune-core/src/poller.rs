@@ -1326,9 +1326,31 @@ impl PositionPoller {
                     // tracks on DLNA renderers that report position slightly
                     // ahead of actual playback.
                     let end_margin_ms = 3000u64;
+                    let past_end_by_margin =
+                        status.position_ms >= track_duration_ms.saturating_add(end_margin_ms);
+                    // Exclusive local outputs (ASIO / WASAPI exclusive) cap the
+                    // reported position at exactly the track duration and keep
+                    // reporting Playing — their blocking HTTP read never sees a
+                    // clean EOF at the loop point, so the drain/stop never runs
+                    // and the position never exceeds duration+margin. For those
+                    // outputs, treat "reached the very end (within 250ms) and
+                    // held there for POSITION_PAST_END_TICKS ticks" as ended, so
+                    // repeat/advance fires (DEvir: ASIO Fireface repeat never
+                    // looped). Gated to exclusive outputs so DLNA — which can sit
+                    // near the end legitimately — keeps the +3s margin above.
+                    let reached_end_exclusive = !past_end_by_margin
+                        && track_duration_ms > 0
+                        && status.position_ms + 250 >= track_duration_ms
+                        && {
+                            let outputs = self.outputs.lock().await;
+                            match outputs.get(&device_id) {
+                                Some(arc) => !arc.lock().await.supports_internal_gapless(),
+                                None => false,
+                            }
+                        };
                     if track_duration_ms > end_margin_ms
                         && played_enough
-                        && status.position_ms >= track_duration_ms.saturating_add(end_margin_ms)
+                        && (past_end_by_margin || reached_end_exclusive)
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
@@ -1337,6 +1359,7 @@ impl PositionPoller {
                                 position_ms = status.position_ms,
                                 track_dur = track_duration_ms,
                                 past_end_ticks = ps.past_end_ticks,
+                                exclusive_end = reached_end_exclusive,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
