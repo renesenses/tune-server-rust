@@ -958,11 +958,14 @@ async fn queue_add_streaming_and_get() {
 }
 
 #[tokio::test]
-async fn queue_local_takes_priority_over_streaming() {
-    // Documented behaviour: when both subsets exist, GET /queue returns the
-    // LOCAL queue (streaming is the fallback only when local is empty).
+async fn queue_returns_combined_local_then_streaming() {
+    // Documented behaviour: when both subsets exist, GET /queue returns ONE
+    // combined list — local rows first, then streaming — matching the combined
+    // position space the poller/orchestrator advance through. (The old either/or
+    // logic hid streaming rows when a local queue was present, so an added Qobuz
+    // track was invisible and never played — Progman.)
     let (app, state) = make_app_with_state();
-    let tid = insert_track(&state, "LocalWins");
+    let tid = insert_track(&state, "LocalFirst");
     let zid = make_zone(&app, "Q-mixed").await;
 
     // Add a streaming track first…
@@ -985,10 +988,11 @@ async fn queue_local_takes_priority_over_streaming() {
     let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
     assert_eq!(status, StatusCode::OK);
     let tracks = body["tracks"].as_array().unwrap();
-    // Local wins: exactly the local track, streaming item hidden.
-    assert_eq!(tracks.len(), 1);
+    // Both are returned, local first then streaming.
+    assert_eq!(tracks.len(), 2);
     assert_eq!(tracks[0]["track_id"], tid);
     assert!(tracks[0].get("source_id").is_none() || tracks[0]["source_id"].is_null());
+    assert_eq!(tracks[1]["source_id"], "t1");
 }
 
 #[tokio::test]
