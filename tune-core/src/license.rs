@@ -145,7 +145,9 @@ pub struct LicenseState {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FREE_MAX_ZONES: i64 = 10;
+/// Free-tier zone cap when not overridden. Configurable at runtime via
+/// `TUNE_FREE_MAX_ZONES` (see `TuneConfig`); premium is always unlimited.
+const DEFAULT_FREE_MAX_ZONES: i64 = 3;
 const GRACE_PERIOD_DAYS: i64 = 30;
 
 // ---------------------------------------------------------------------------
@@ -155,13 +157,20 @@ const GRACE_PERIOD_DAYS: i64 = 30;
 pub struct LicenseManager {
     state: Arc<RwLock<LicenseState>>,
     db: Arc<dyn DbBackend>,
+    /// Max zones a free-tier instance may create. Set once at construction.
+    free_max_zones: i64,
 }
 
 impl LicenseManager {
+    /// Create a new LicenseManager with the default free-tier zone cap.
+    pub fn new(db: Arc<dyn DbBackend>) -> Self {
+        Self::new_with_limit(db, DEFAULT_FREE_MAX_ZONES)
+    }
+
     /// Create a new LicenseManager, loading cached state from the settings
     /// table.  If the tier is premium but the last validation is older than
     /// GRACE_PERIOD_DAYS, the tier is degraded to Free.
-    pub fn new(db: Arc<dyn DbBackend>) -> Self {
+    pub fn new_with_limit(db: Arc<dyn DbBackend>, free_max_zones: i64) -> Self {
         let settings = SettingsRepo::with_backend(db.clone());
 
         let license_key = settings.get("license_key").ok().flatten();
@@ -226,6 +235,7 @@ impl LicenseManager {
         Self {
             state: Arc::new(RwLock::new(state)),
             db,
+            free_max_zones,
         }
     }
 
@@ -247,11 +257,11 @@ impl LicenseManager {
     }
 
     /// Check whether adding a new zone is allowed.
-    /// Free tier: max FREE_MAX_ZONES.  Premium: unlimited.
+    /// Free tier: max `free_max_zones`.  Premium: unlimited.
     pub async fn check_zone_limit(&self, current_count: i64) -> bool {
         match effective_tier(&*self.state.read().await) {
             Tier::Premium => true,
-            Tier::Free => current_count < FREE_MAX_ZONES,
+            Tier::Free => current_count < self.free_max_zones,
         }
     }
 
@@ -377,8 +387,8 @@ impl LicenseManager {
     }
 
     /// Zone limit for the free tier (exposed for UI display).
-    pub fn free_zone_limit() -> i64 {
-        FREE_MAX_ZONES
+    pub fn free_zone_limit(&self) -> i64 {
+        self.free_max_zones
     }
 }
 
@@ -695,13 +705,24 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
-        let mgr = LicenseManager::new(backend);
+        let mgr = LicenseManager::new_with_limit(backend, 3);
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(!mgr.check_feature(Feature::DspEq).await);
-        // Free tier allows up to FREE_MAX_ZONES (10) zones.
-        assert!(mgr.check_zone_limit(9).await);
-        assert!(!mgr.check_zone_limit(10).await);
+        // Free tier is capped at the configured limit (3 here).
+        assert_eq!(mgr.free_zone_limit(), 3);
+        assert!(mgr.check_zone_limit(2).await);
+        assert!(!mgr.check_zone_limit(3).await);
+    }
+
+    #[tokio::test]
+    async fn free_zone_limit_defaults_to_three() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mgr = LicenseManager::new(backend);
+        assert_eq!(mgr.free_zone_limit(), 3);
     }
 
     #[tokio::test]

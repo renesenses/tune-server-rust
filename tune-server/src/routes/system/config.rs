@@ -165,7 +165,7 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     let zone_limit = if premium_tier == tune_core::license::Tier::Premium {
         serde_json::Value::Null
     } else {
-        json!(tune_core::license::LicenseManager::free_zone_limit())
+        json!(state.license.free_zone_limit())
     };
     let mut premium_features = serde_json::Map::new();
     for f in tune_core::license::Feature::all_premium() {
