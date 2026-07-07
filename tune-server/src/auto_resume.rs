@@ -89,8 +89,17 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         temp_file_path: None,
     };
 
-    match state.orchestrator.play(req).await {
-        Ok(_result) => {
+    // Auto-resume must not block on a slow track resolution. Login-gated
+    // YouTube falls back to yt-dlp (30-90s), so a resumed YouTube track would
+    // start audio long after boot — superimposing on whatever the user launched
+    // meanwhile ("lecture double", Jean Marie: a background zone's YouTube track
+    // resumed ~1 min late over a radio he'd started). Give resolution a short
+    // deadline; if the track can't start promptly, abandon the resume rather
+    // than fire it late. Local files and Tidal/Qobuz resolve in a few seconds.
+    const AUTO_RESUME_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    match tokio::time::timeout(AUTO_RESUME_RESOLVE_TIMEOUT, state.orchestrator.play(req)).await {
+        Ok(Ok(_result)) => {
             // Seek to the last known position
             let position_ms = zone.last_position_ms;
             if position_ms > 0 {
@@ -108,8 +117,17 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
             );
             true
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(zone_id, zone_name = %zone.name, error = %e, "auto_resume_zone_failed");
+            false
+        }
+        Err(_) => {
+            warn!(
+                zone_id,
+                zone_name = %zone.name,
+                timeout_secs = AUTO_RESUME_RESOLVE_TIMEOUT.as_secs(),
+                "auto_resume_resolve_timeout_abandoned"
+            );
             false
         }
     }
