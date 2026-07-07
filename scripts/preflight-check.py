@@ -104,16 +104,19 @@ def check_version_bump(tag: str) -> CheckResult:
         return CheckResult("version_bump", False, f"Cargo.toml version '{current}' is not semver")
     tag_tuple = parsed[:3]
     cur_tuple = cur_parsed[:3]
-    if tag_tuple <= cur_tuple:
+    # The standard flow (bump-all.sh) bumps Cargo.toml to the release version and
+    # tags the same version → tag == Cargo is the NORMAL case and must pass. Only
+    # fail if the tag is strictly BEHIND Cargo.toml (you forgot to bump the tag).
+    if tag_tuple < cur_tuple:
         return CheckResult(
             "version_bump",
             False,
-            f"tag {tag_tuple} must be greater than Cargo.toml version {cur_tuple}",
+            f"tag {tag_tuple} is behind Cargo.toml version {cur_tuple} (bump the tag)",
         )
     return CheckResult(
         "version_bump",
         True,
-        f"tag {tag_tuple} > Cargo.toml {cur_tuple}",
+        f"tag {tag_tuple} >= Cargo.toml {cur_tuple}",
     )
 
 
