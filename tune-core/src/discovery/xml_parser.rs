@@ -170,7 +170,7 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
 }
 
 pub async fn fetch_device_description(location: &str) -> Result<DeviceDescription, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;

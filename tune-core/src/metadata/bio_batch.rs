@@ -293,7 +293,7 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
 
     info!(count = artists.len(), "batch_artist_bio_enrichment_started");
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -404,7 +404,7 @@ pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::
         .or_else(|_| std::env::var("TUNE_LASTFM_KEY"))
         .unwrap_or_default();
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()

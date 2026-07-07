@@ -120,7 +120,7 @@ pub fn artwork_hash(file_path: &str) -> String {
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     let url = format!("https://coverartarchive.org/release/{mbid}/front-500");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -150,7 +150,7 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
         "https://musicbrainz.org/ws/2/release/?query={}&fmt=json&limit=1",
         urlencoding::encode(&query)
     );
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -295,7 +295,7 @@ pub async fn fetch_artist_image(
     artist_name: &str,
     discogs_token: Option<&str>,
 ) -> Option<Vec<u8>> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -630,7 +630,7 @@ pub async fn batch_enrich_artist_artwork(
                     Some(id) => id,
                     None => continue,
                 };
-                let client = reqwest::Client::builder()
+                let client = crate::http::client::builder()
                     .user_agent(MB_USER_AGENT)
                     .timeout(std::time::Duration::from_secs(15))
                     .build();
@@ -803,7 +803,7 @@ pub async fn batch_enrich_artist_artwork(
                 count = no_mbid_artists.len(),
                 "batch_artist_artwork_phase3_started"
             );
-            let client = reqwest::Client::builder()
+            let client = crate::http::client::builder()
                 .user_agent(MB_USER_AGENT)
                 .timeout(std::time::Duration::from_secs(15))
                 .build()

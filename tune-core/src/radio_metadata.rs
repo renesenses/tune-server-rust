@@ -69,7 +69,7 @@ fn radiofrance_channel_id(_station_name: &str, stream_url: &str) -> u32 {
 
 async fn fetch_radiofrance_metadata(station_name: &str, channel: u32) -> Option<IcyMetadata> {
     let url = format!("https://api.radiofrance.fr/livemeta/pull/{channel}");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .ok()?;
@@ -136,7 +136,7 @@ fn radioparadise_channel(stream_url: &str) -> u32 {
 
 async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<IcyMetadata> {
     let url = format!("https://api.radioparadise.com/api/now_playing?chan={chan}");
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .ok()?;
@@ -174,7 +174,7 @@ async fn fetch_radio_paradise_metadata(station_name: &str, chan: u32) -> Option<
 // ---------------------------------------------------------------------------
 
 async fn fetch_icy_metadata(stream_url: &str) -> Option<IcyMetadata> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .ok()?;

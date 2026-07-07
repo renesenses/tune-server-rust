@@ -1161,7 +1161,7 @@ impl OutputTarget for LocalOutput {
             // No total timeout — long tracks can stream for 30+ minutes.
             // The force_silent flag is checked at every loop iteration and
             // in feed_ring to abort promptly on stop().
-            let response = match reqwest::blocking::Client::builder()
+            let response = match crate::http::client::blocking_builder()
                 .timeout(None)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -2680,7 +2680,7 @@ impl OutputTarget for LocalOutput {
                 position_ms.store(0, Ordering::SeqCst);
 
                 // Fetch the next track's HTTP stream
-                let next_response = match reqwest::blocking::Client::builder()
+                let next_response = match crate::http::client::blocking_builder()
                     .timeout(None)
                     .connect_timeout(std::time::Duration::from_secs(10))
                     .build()

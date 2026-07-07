@@ -59,7 +59,7 @@ pub struct UpdateChecker {
 impl UpdateChecker {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(15))
                 .user_agent("tune-server")
                 .build()

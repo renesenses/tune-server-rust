@@ -4270,6 +4270,7 @@ dependencies = [
  "rubato",
  "rusqlite",
  "rust_cast",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4286,6 +4287,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+ "webpki-roots 0.26.11",
  "zip",
 ]
 

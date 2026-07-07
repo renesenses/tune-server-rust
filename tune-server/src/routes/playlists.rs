@@ -65,6 +65,7 @@ pub fn router() -> Router<AppState> {
         .route("/diff", post(diff_playlists))
         .route("/import/m3u", post(import_m3u_file))
         .route("/import/m3u-url", post(import_m3u_url))
+        .route("/import/linn", post(import_linn_file))
         .route(
             "/{id}",
             get(get_playlist)
@@ -488,6 +489,210 @@ async fn import_m3u_file(
                     "matched": matched,
                     "not_found": not_found_paths.len(),
                     "not_found_paths": not_found_paths,
+                    "track_count": track_ids.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// One track parsed out of a Linn `.dpl` playlist (DIDL-Lite per track).
+#[derive(Default)]
+struct LinnTrack {
+    title: String,
+    artist: String,
+    #[allow(dead_code)]
+    album: String,
+    res: String,
+}
+
+/// Parse a Linn `.dpl` playlist (`<linn:Playlist>` of DIDL-Lite `<item>`s) into
+/// a flat list of tracks. We only pull the fields we need to match against the
+/// local library: title, artist, album and the resource URL.
+fn parse_linn_playlist(xml: &str) -> Vec<LinnTrack> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    let mut tracks: Vec<LinnTrack> = Vec::new();
+    let mut cur: Option<LinnTrack> = None;
+    let mut tag = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if tag == "item" {
+                    cur = Some(LinnTrack::default());
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if String::from_utf8_lossy(e.local_name().as_ref()) == "item" {
+                    if let Some(t) = cur.take() {
+                        if !t.title.is_empty() || !t.res.is_empty() {
+                            tracks.push(t);
+                        }
+                    }
+                }
+                tag.clear();
+            }
+            Ok(Event::Text(ref e)) => {
+                let text = e.decode().map(|s| s.trim().to_string()).unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+                if let Some(ref mut t) = cur {
+                    match tag.as_str() {
+                        "title" if t.title.is_empty() => t.title = text,
+                        // dc:creator and the first upnp:artist both carry the
+                        // performer — keep whichever we see first.
+                        "creator" | "artist" if t.artist.is_empty() => t.artist = text,
+                        "album" if t.album.is_empty() => t.album = text,
+                        "res" if t.res.is_empty() => t.res = text,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    tracks
+}
+
+/// Decode Linn's `*HH` hex escapes (e.g. `*20` = space) and return the file
+/// stem of the last path segment of a `<res>` URL — used as a fallback match key.
+fn linn_res_filename_stem(res: &str) -> String {
+    let last = res.rsplit('/').next().unwrap_or(res);
+    let bytes = last.as_bytes();
+    let mut decoded = String::with_capacity(last.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'*' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&last[i + 1..i + 3], 16) {
+                decoded.push(b as char);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i] as char);
+        i += 1;
+    }
+    std::path::Path::new(&decoded)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&decoded)
+        .to_string()
+}
+
+/// Import a Linn `.dpl` playlist: parse it, match each track to the local
+/// library (by title+artist, falling back to the resource filename), and create
+/// a Tune playlist from the matches (Pierre Mack).
+async fn import_linn_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut file_content = String::new();
+    let mut playlist_name: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name().unwrap_or("") {
+            "file" => {
+                if playlist_name.is_none() {
+                    playlist_name = field
+                        .file_name()
+                        .map(|f| f.trim_end_matches(".dpl").to_string());
+                }
+                file_content = field.text().await.unwrap_or_default();
+            }
+            "name" => playlist_name = Some(field.text().await.unwrap_or_default()),
+            _ => {}
+        }
+    }
+
+    if file_content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no file provided"})),
+        )
+            .into_response();
+    }
+
+    let name = playlist_name
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Linn Playlist".into());
+
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let mut track_ids: Vec<i64> = Vec::new();
+    let mut total_entries = 0u32;
+    let mut matched = 0u32;
+    let mut not_found: Vec<String> = Vec::new();
+
+    for lt in parse_linn_playlist(&file_content) {
+        total_entries += 1;
+
+        let mut found: Option<i64> = None;
+
+        // 1) Match by title, preferring a result whose artist matches.
+        if !lt.title.is_empty() {
+            let results = track_repo.search_by_title(&lt.title, 8).unwrap_or_default();
+            let artist_lc = lt.artist.to_lowercase();
+            found = results
+                .iter()
+                .find(|t| {
+                    artist_lc.is_empty()
+                        || t.artist_name
+                            .as_deref()
+                            .map(|a| a.to_lowercase().contains(&artist_lc))
+                            .unwrap_or(false)
+                })
+                .or_else(|| results.first())
+                .and_then(|t| t.id);
+        }
+
+        // 2) Fallback: match by the resource filename stem.
+        if found.is_none() && !lt.res.is_empty() {
+            let stem = linn_res_filename_stem(&lt.res);
+            if !stem.is_empty() {
+                if let Ok(results) = track_repo.search(&stem, 1) {
+                    found = results.first().and_then(|t| t.id);
+                }
+            }
+        }
+
+        match found {
+            Some(id) => {
+                track_ids.push(id);
+                matched += 1;
+            }
+            None => not_found.push(if lt.title.is_empty() {
+                lt.res.clone()
+            } else {
+                lt.title.clone()
+            }),
+        }
+    }
+
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    match repo.create(&name, None) {
+        Ok(playlist_id) => {
+            if !track_ids.is_empty() {
+                repo.add_tracks(playlist_id, &track_ids, None).ok();
+            }
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id": playlist_id,
+                    "name": name,
+                    "total_entries": total_entries,
+                    "matched": matched,
+                    "not_found": not_found.len(),
+                    "not_found_titles": not_found,
                     "track_count": track_ids.len(),
                 })),
             )
@@ -1050,4 +1255,53 @@ async fn match_tracks(
     }
 
     Json(json!({ "results": results, "total": body.tracks.len() })).into_response()
+}
+
+#[cfg(test)]
+mod linn_tests {
+    use super::{linn_res_filename_stem, parse_linn_playlist};
+
+    const SAMPLE: &str = r#"<linn:Playlist version="3" xmlns:linn="urn:linn-co-uk/playlist">
+  <linn:Track>
+    <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">
+      <item id="x" parentID="y" restricted="False">
+        <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Look Sharp!</dc:title>
+        <dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">Joe Jackson</dc:creator>
+        <upnp:album xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">Live 1980/86</upnp:album>
+        <upnp:albumArtURI xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">http://x/art.jpg</upnp:albumArtURI>
+        <upnp:artist role="AlbumArtist" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">Joe Jackson</upnp:artist>
+        <res>http://10.0.0.1:9790/minimserver/*/Musique/CD/Joe*20Jackson/11*20Joe*20Jackson*20-*20Look*20Sharp!.flac</res>
+      </item>
+    </DIDL-Lite>
+  </linn:Track>
+  <linn:Track>
+    <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">
+      <item id="x2" parentID="y" restricted="False">
+        <dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Sunday Papers</dc:title>
+        <upnp:artist xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">Joe Jackson</upnp:artist>
+        <res>http://10.0.0.1:9790/minimserver/*/x/02*20Sunday*20Papers.flac</res>
+      </item>
+    </DIDL-Lite>
+  </linn:Track>
+</linn:Playlist>"#;
+
+    #[test]
+    fn parses_tracks_title_artist_album_res() {
+        let tracks = parse_linn_playlist(SAMPLE);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "Look Sharp!");
+        assert_eq!(tracks[0].artist, "Joe Jackson"); // dc:creator
+        assert_eq!(tracks[0].album, "Live 1980/86"); // NOT the albumArtURI
+        assert!(tracks[0].res.ends_with("Look*20Sharp!.flac"));
+        assert_eq!(tracks[1].title, "Sunday Papers");
+        assert_eq!(tracks[1].artist, "Joe Jackson"); // upnp:artist fallback
+    }
+
+    #[test]
+    fn decodes_linn_escapes_to_filename_stem() {
+        let stem = linn_res_filename_stem(
+            "http://10.0.0.1:9790/minimserver/*/x/11*20Joe*20Jackson*20-*20Look*20Sharp!.flac",
+        );
+        assert_eq!(stem, "11 Joe Jackson - Look Sharp!");
+    }
 }

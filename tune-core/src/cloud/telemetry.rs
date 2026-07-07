@@ -18,7 +18,7 @@ pub fn spawn_startup_ping(
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let Ok(client) = reqwest::Client::builder()
+        let Ok(client) = crate::http::client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
             .build()
@@ -123,7 +123,7 @@ impl TelemetryReporter {
             arch: std::env::consts::ARCH.to_string(),
         };
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::http::client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
             .build()

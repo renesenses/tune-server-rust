@@ -115,7 +115,7 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
         return;
     }
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
         .build()
@@ -194,7 +194,7 @@ pub async fn download_bios(db: &Arc<dyn DbBackend>) {
         return;
     }
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
         .build()

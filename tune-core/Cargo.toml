@@ -47,6 +47,11 @@ oaat-controller = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+# Shared HTTP client TLS: webpki roots via reqwest use_preconfigured_tls, so
+# Android never hits the uninitialised rustls-platform-verifier. Must track the
+# rustls version reqwest resolves (0.23).
+rustls = "0.23"
+webpki-roots = "0.26"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }

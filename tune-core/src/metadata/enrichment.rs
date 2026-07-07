@@ -58,7 +58,7 @@ pub struct MetadataEnricher {
 impl MetadataEnricher {
     pub fn new(db: SqliteDb) -> Self {
         Self {
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(15))
                 .user_agent(USER_AGENT)
                 .build()

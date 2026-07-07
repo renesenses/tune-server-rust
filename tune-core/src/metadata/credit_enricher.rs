@@ -49,7 +49,7 @@ pub struct EnrichResult {
 }
 
 fn mb_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(MB_UA)
         .build()
