@@ -82,7 +82,10 @@ impl AppState {
         // Clean up any leftover temp transcode files from a previous crash.
         tune_core::http::streamer::cleanup_leftover_transcode_files();
 
-        let license = Arc::new(tune_core::license::LicenseManager::new(backend.clone()));
+        let license = Arc::new(tune_core::license::LicenseManager::new_with_limit(
+            backend.clone(),
+            tune_config.free_max_zones,
+        ));
 
         let streamer = Arc::new(AudioStreamer::new(port));
         let playback = Arc::new(PlaybackManager::new());
