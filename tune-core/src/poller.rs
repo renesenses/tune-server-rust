@@ -1391,7 +1391,9 @@ impl PositionPoller {
                                             seek_ms: None,
                                             temp_file_path: None,
                                         };
-                                        match self.orchestrator.play(req).await {
+                                        // Reconnecting the *same* station — do
+                                        // not add a duplicate listen-history row.
+                                        match self.orchestrator.play_without_history(req).await {
                                             Ok(_) => {
                                                 info!(zone_id, "radio_auto_retry_success");
                                                 ps.radio_stopped_ticks = 0;
@@ -1494,8 +1496,13 @@ impl PositionPoller {
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
             if !zone_fixed_volume
                 && !in_vol_grace2
+                && status.volume > 0.001
                 && status.volume < 0.999
-                && (status.volume - zone_state.volume).abs() > 0.005
+                && decisions::should_adopt_device_volume(
+                    ps.last_device_volume,
+                    status.volume,
+                    zone_state.volume,
+                )
             {
                 self.playback.set_volume(zone_id, status.volume).await;
                 let vol_int = (status.volume * 100.0) as i32;
@@ -1504,6 +1511,13 @@ impl PositionPoller {
                     .update_volume(zone_id, vol_int)
                     .ok();
             }
+            // Edge-triggered like the stopped/radio paths: record the reported
+            // volume so a renderer stuck at a persistent default (HiFi Rose
+            // RS130 reporting 25) can't repeatedly clobber the saved volume.
+            // This normal-playing path was never migrated to the #358 predicate
+            // and still used level-triggered adoption → auto-reset to 25%
+            // (Philippe).
+            ps.last_device_volume = Some(status.volume);
 
             // --- Persist position to DB periodically ---
             ps.ticks_since_db_save += 1;
@@ -1798,7 +1812,24 @@ impl PositionPoller {
                                 );
                             }
                             if natural_end {
-                                if ps.gapless_sent {
+                                // Only DLNA renderers auto-transition after
+                                // SetNextAVTransportURI. For exclusive local
+                                // outputs (ASIO / WASAPI exclusive) the near-end
+                                // branch sets gapless_sent=true only to suppress
+                                // re-arming — no SetNext is ever sent — so the
+                                // "wait for transition" path below would hang
+                                // forever and repeat/advance would never fire
+                                // (DEvir: repeat fails on clean ASIO playback).
+                                // Only wait when the output can actually
+                                // transition internally; otherwise end normally.
+                                let awaiting_dlna_transition = ps.gapless_sent && {
+                                    let outputs = self.outputs.lock().await;
+                                    match outputs.get(&device_id) {
+                                        Some(arc) => arc.lock().await.supports_internal_gapless(),
+                                        None => false,
+                                    }
+                                };
+                                if awaiting_dlna_transition {
                                     fsm_actual =
                                         Some(fsm::StoppedOutcome::NaturalEndGaplessWaiting);
                                     // Gapless was prepared via SetNextAVTransportURI.
@@ -1820,6 +1851,7 @@ impl PositionPoller {
                                     ps.gapless_cooldown = 4;
                                 } else {
                                     fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
+                                    ps.gapless_sent = false;
                                     track_ended = true;
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
@@ -2016,10 +2048,34 @@ impl PositionPoller {
                         fsm_pin.gapless_enabled = gapless_enabled;
                         fsm_pact.arm_gapless = gapless_enabled;
                         if gapless_enabled {
-                            let ok = self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                            if ok {
-                                ps.gapless_sent_at = Some(Instant::now());
+                            // Exclusive-mode local outputs (ASIO / WASAPI
+                            // exclusive) can't chain internally. Detect that
+                            // BEFORE prepare_gapless resolves the next URL —
+                            // otherwise it downloads + transcodes the next track
+                            // then discards it, and because prepare_gapless
+                            // returns false, gapless_sent stays false and this
+                            // branch re-fires every tick, re-downloading the same
+                            // track in a tight loop (DEvir: repeat=one on ASIO
+                            // Fireface, 55 wasted Qobuz downloads/min). Mark
+                            // gapless_sent so we stop retrying; the natural-end
+                            // fallback advances/repeats the queue.
+                            let can_internal_gapless = {
+                                let outputs = self.outputs.lock().await;
+                                match outputs.get(&device_id) {
+                                    Some(arc) => arc.lock().await.supports_internal_gapless(),
+                                    None => true,
+                                }
+                            };
+                            if !can_internal_gapless {
+                                info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                            } else {
+                                let ok =
+                                    self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                                if ok {
+                                    ps.gapless_sent_at = Some(Instant::now());
+                                    ps.gapless_sent = true;
+                                }
                             }
                         } else {
                             debug!(zone_id, "gapless_disabled_for_zone");
@@ -2298,6 +2354,43 @@ impl PositionPoller {
                 };
                 if let Some(output_arc) = output_arc {
                     let output = output_arc.lock().await;
+                    // Exclusive-mode local outputs (ASIO / WASAPI exclusive) take
+                    // a dedicated playback loop that returns at EOF without
+                    // consuming the staged next_media — they cannot chain
+                    // internally. Arming gapless for them orphans the staged
+                    // track AND arms the poller guard, which suppresses the
+                    // natural-end advance: a single-track Repeat queue never
+                    // loops, and multi-track albums stall after each track
+                    // (DEvir, ASIO Fireface USB). Skip arming; the natural-end
+                    // fallback advances the queue (a small gap, never a stall).
+                    if !output.supports_internal_gapless() {
+                        info!(zone_id, "gapless_skipped_exclusive_output");
+                        return false;
+                    }
+                    // DSD gapless guard for DLNA renderers (HiFi Rose RS130,
+                    // Benjithom). They accept SetNextAVTransportURI for a DSD
+                    // stream but never transition to it — the next stream is
+                    // never consumed (bytes_sent stays 0) and the poller
+                    // force-stops the zone after STOPPED_FAILURE_THRESHOLD ticks,
+                    // i.e. "the album cuts after track 1". Don't arm gapless for a
+                    // DSD next on DLNA; handle_track_end plays it explicitly at
+                    // end-of-track instead (a small gap, never a cut). Local
+                    // output keeps its internal DSD gapless chain untouched.
+                    if output.output_type() == "dlna" {
+                        let url_lc = resolved.url.to_lowercase();
+                        let next_is_dsd = resolved.mime_type.contains("dsd")
+                            || resolved.mime_type.contains("dsf")
+                            || url_lc.ends_with(".dsf")
+                            || url_lc.ends_with(".dff");
+                        if next_is_dsd {
+                            info!(
+                                zone_id,
+                                mime = %resolved.mime_type,
+                                "gapless_skipped_dsd_next_dlna"
+                            );
+                            return false;
+                        }
+                    }
                     let media = crate::outputs::PlayMedia {
                         url: &resolved.url,
                         mime_type: &resolved.mime_type,

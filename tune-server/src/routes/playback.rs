@@ -1147,42 +1147,40 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let ps = state.playback.get_state(zone_id).await;
 
-    // A zone can hold BOTH a local play_queue and a streaming_queue at once.
-    // Returning the local one whenever it is non-empty hid the streaming queue
-    // when a Qobuz album was played on top of a leftover local queue — the
-    // album tracks were invisible and the playing album could not be found
-    // (Cyrille). Instead, return the queue that matches what's actually playing.
-    let playing_source = ps
-        .now_playing
-        .as_ref()
-        .map(|np| np.source.clone())
-        .unwrap_or_default();
-    let is_streaming =
-        !playing_source.is_empty() && playing_source != "local" && playing_source != "file";
+    // A zone can hold BOTH a local play_queue and a streaming_queue at once
+    // (a Qobuz track added while a local file plays). Return ONE combined list —
+    // local first (positions 0..L), then streaming (L..L+S) — matching the
+    // combined position space the poller and orchestrator advance through.
+    // The old either/or logic hid the streaming rows when a local queue was
+    // present (Progman: an added Qobuz track was invisible and never played).
+    // Playing a streaming album normally clears the local table via
+    // set_streaming_queue, so usually exactly one is populated; merging is safe
+    // and only surfaces genuine mixed queues.
+    let local = queue_repo.get_queue(zone_id).unwrap_or_default();
+    let local_count = local.len();
+    let streaming = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
 
-    if is_streaming {
-        let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-        if !streaming_items.is_empty() {
-            return Json(json!({
-                "tracks": streaming_items,
-                "position": ps.queue_position,
-                "length": streaming_items.len(),
-            }));
+    let mut tracks: Vec<Value> = Vec::with_capacity(local_count + streaming.len());
+    for it in &local {
+        tracks.push(serde_json::to_value(it).unwrap_or(Value::Null));
+    }
+    for (i, it) in streaming.iter().enumerate() {
+        let mut v = it.clone();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("position".into(), json!(local_count + i));
         }
+        tracks.push(v);
     }
 
-    let items = queue_repo.get_queue(zone_id).unwrap_or_default();
-    if !items.is_empty() {
-        let position = items.iter().position(|i| i.is_current).unwrap_or(0);
-        let length = items.len();
-        return Json(json!({ "tracks": items, "position": position, "length": length }));
-    }
-
-    // Fallback: a freshly-set streaming queue before playback state caught up.
-    let streaming_items = queue_repo.get_streaming_queue(zone_id).unwrap_or_default();
-    Json(
-        json!({ "tracks": streaming_items, "position": ps.queue_position, "length": streaming_items.len() }),
-    )
+    // Position: the current local item if one is marked current, otherwise the
+    // playback state's combined queue position (a streaming item is current).
+    let position = local
+        .iter()
+        .position(|i| i.is_current)
+        .map(|p| p as i64)
+        .unwrap_or(ps.queue_position);
+    let length = tracks.len();
+    Json(json!({ "tracks": tracks, "position": position, "length": length }))
 }
 
 async fn queue_add(

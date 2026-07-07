@@ -272,16 +272,19 @@ pub struct AddFromWebQuery {
 }
 
 async fn add_from_web(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<AddFromWebQuery>,
 ) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let repo = RadioRepo::with_backend(state.backend.clone());
     let station = RadioStation {
         id: None,
         name: q.name.clone(),
-        url: q.url,
+        url: q.url.clone(),
         homepage: None,
-        logo_url: q.logo_url,
+        // Fall back to the stream host favicon so a web-added radio shows art.
+        logo_url: q.logo_url.clone().or_else(|| favicon_from_url(&q.url)),
         country: q.country,
         language: None,
         genre: q.genre,
@@ -298,19 +301,22 @@ async fn add_from_web(
                 "library.radios_changed",
                 json!({"action": "created", "id": id}),
             );
+            let title = crate::i18n::t(&lang, "radio.addedTitle");
+            let body_txt = crate::i18n::t(&lang, "radio.addedBody").replace("{name}", &q.name);
+            let close = crate::i18n::t(&lang, "radio.canCloseTab");
             format!(
                 r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
 <body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#4ade80">✓ Radio ajoutée</h1><p><strong>{}</strong> a été ajoutée à vos favoris Tune.</p><p style="color:#888;margin-top:2em">Vous pouvez fermer cet onglet.</p></div>
-</body></html>"#,
-                q.name
+<div style="text-align:center"><h1 style="color:#4ade80">{title}</h1><p>{body_txt}</p><p style="color:#888;margin-top:2em">{close}</p></div>
+</body></html>"#
             )
         }
         Err(e) => format!(
             r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Tune</title></head>
 <body style="font-family:system-ui;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
-<div style="text-align:center"><h1 style="color:#f87171">Erreur</h1><p>{e}</p></div>
-</body></html>"#
+<div style="text-align:center"><h1 style="color:#f87171">{err_title}</h1><p>{e}</p></div>
+</body></html>"#,
+            err_title = crate::i18n::t(&lang, "radio.errorTitle")
         ),
     };
     axum::response::Html(html)
@@ -438,7 +444,7 @@ async fn import_radios(
             name: s.name.clone(),
             url: s.url.clone(),
             homepage: s.homepage.clone(),
-            logo_url: s.logo_url.clone(),
+            logo_url: s.logo_url.clone().or_else(|| favicon_from_url(&s.url)),
             country: s.country.clone(),
             language: s.language.clone(),
             genre: s.genre.clone(),
@@ -473,7 +479,16 @@ async fn import_radios_m3u(
             .clone()
             .or_else(|| entry.extra_attrs.get("tvg-name").cloned())
             .unwrap_or_else(|| entry.path.clone());
-        let logo = entry.extra_attrs.get("tvg-logo").cloned();
+        // Playlists use several logo attribute spellings (tvg-logo / url-logo /
+        // logo); PLS carries none. Fall back to the stream host favicon so every
+        // imported radio shows art (Bilou: "pourquoi ne pas les reprendre").
+        let logo = entry
+            .extra_attrs
+            .get("tvg-logo")
+            .or_else(|| entry.extra_attrs.get("url-logo"))
+            .or_else(|| entry.extra_attrs.get("logo"))
+            .cloned()
+            .or_else(|| favicon_from_url(&entry.path));
         let group = entry.extra_attrs.get("group-title").cloned();
         let station = RadioStation {
             id: None,

@@ -172,6 +172,14 @@ pub(super) async fn trigger_scan(
             std::sync::Arc<tune_core::db::models::Album>,
         > = std::collections::HashMap::new();
 
+        // When a track has no album_artist tag, the album artist is pinned to
+        // the first track artist seen in that folder (see below). Without this,
+        // an album whose tracks have differing per-track artists (classical
+        // soloists, features) split into one album row per artist (Alain,
+        // Pierre: "same album appears 2-3 times"). Keyed by parent directory.
+        let mut dir_album_artist: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
         // Process files in batches: parse metadata in parallel, then insert in a transaction
@@ -235,10 +243,23 @@ pub(super) async fn trigger_scan(
 
                     let album_artist_name = if is_compilation {
                         "Various Artists"
+                    } else if let Some(aa) = meta.album_artist.as_deref() {
+                        aa
                     } else {
-                        meta.album_artist
-                            .as_deref()
-                            .unwrap_or_else(|| meta.artist.as_deref().unwrap_or("Unknown Artist"))
+                        // No album_artist tag: pin the album artist to the first
+                        // track artist seen in this folder so all of the album's
+                        // tracks resolve to a single album row, instead of
+                        // splitting into one row per differing track artist
+                        // (classical soloists, features).
+                        let dir = std::path::Path::new(&sf.path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let track_a = meta.artist.as_deref().unwrap_or("Unknown Artist");
+                        dir_album_artist
+                            .entry(dir)
+                            .or_insert_with(|| track_a.to_string())
+                            .as_str()
                     };
 
                     let track_artist_name = meta.artist.as_deref().unwrap_or("Unknown Artist");
@@ -422,10 +443,25 @@ pub(super) async fn trigger_scan(
                                             .extension()
                                             .and_then(|e| e.to_str())
                                             .unwrap_or("jpg");
-                                        if let Ok(data) = std::fs::read(&candidate) {
+                                        // Only record the image in the DB if the
+                                        // cache write actually succeeded. Setting
+                                        // image_path after a failed read/save left
+                                        // the DB claiming "has image" with nothing
+                                        // on disk → grey square + permanent skip
+                                        // (Sandro, fresh install where the cache
+                                        // dir wasn't writable).
+                                        let saved = std::fs::read(&candidate).ok().and_then(|data| {
                                             tune_core::library::artwork::save_to_cache(
                                                 &data, &cache_dir, &hash, ext,
+                                            )
+                                        });
+                                        if saved.is_none() {
+                                            tracing::warn!(
+                                                artist = %art.name,
+                                                candidate = %candidate.display(),
+                                                "artist_image_cache_write_failed_not_recording"
                                             );
+                                            continue;
                                         }
                                         let mut updated_artist =
                                             tune_core::db::models::Artist::clone(art);
@@ -785,6 +821,20 @@ pub(super) async fn trigger_scan(
             }
         }
 
+        // Clean up orphan albums (album rows with no tracks). A full rescan
+        // after removing files from disk — or the duplicate-album grouping —
+        // can leave album rows behind that no track references. Without this
+        // they linger with their cover art and inflate the total album count
+        // even though they have no tracks (Alain: emptied library + full
+        // rescan still shows removed albums' covers in double/triple). The
+        // incremental auto-scan already purges these; the full scan did not.
+        let orphan_albums = tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+            .delete_orphans()
+            .unwrap_or(0);
+        if orphan_albums > 0 {
+            tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
+        }
+
         // Clean up orphan artists left behind after tag corrections
         let orphan_artists = ArtistRepo::with_backend(db.clone()).cleanup_orphans().unwrap_or(0);
         if orphan_artists > 0 {
@@ -837,6 +887,7 @@ pub(super) async fn trigger_scan(
                 "scan_result",
                 &json!({
                     "total_files": total_discovered,
+                    "missing_dirs": missing_dirs.clone(),
                     "parsed": scan_stats.total_files,
                     "metadata_ok": scan_stats.metadata_ok,
                     "metadata_failed": scan_stats.metadata_failed,
@@ -855,6 +906,7 @@ pub(super) async fn trigger_scan(
             "library.scan.completed",
             json!({
                 "total_files": total_discovered,
+                "missing_dirs": missing_dirs.clone(),
                 "parsed": scan_stats.total_files,
                 "metadata_ok": scan_stats.metadata_ok,
                 "metadata_timeout": scan_stats.metadata_timeout,
@@ -872,6 +924,7 @@ pub(super) async fn trigger_scan(
         // Write scan report JSON for the /scan/report endpoint
         let report = serde_json::json!({
             "total_files": total_discovered,
+            "missing_dirs": missing_dirs.clone(),
             "parsed": scan_stats.total_files,
             "metadata_ok": scan_stats.metadata_ok,
             "metadata_failed": scan_stats.metadata_failed,

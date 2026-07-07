@@ -3,7 +3,7 @@ members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.252"
+version = "0.8.279"
 edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
@@ -24,7 +24,7 @@ walkdir = "2"
 rayon = "1.10"
 notify = "7"
 md-5 = "0.10"
-quick-xml = "0.40"
+quick-xml = "0.41"
 mdns-sd = "0.20"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"

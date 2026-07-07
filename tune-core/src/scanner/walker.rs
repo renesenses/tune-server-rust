@@ -11,12 +11,22 @@ use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
 use super::hasher::compute_audio_hash;
-use crate::metadata::{TrackMetadata, try_read_metadata};
+use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadata};
 
 /// Maximum time allowed for reading metadata + computing hash for a single file.
 /// Files on NAS over a flaky network can hang indefinitely; this prevents the
 /// entire scan from stalling on a single corrupt or unreachable file.
-const FILE_TIMEOUT: Duration = Duration::from_secs(10);
+// Large Hi-Res FLAC (24/96, big embedded art) on slow/network storage can take
+// well over 10s just to read tags via lofty — 10s wrongly skipped them entirely
+// (Progman: files dropped from the library). Give more headroom, and on timeout
+// fall back to filename metadata instead of losing the file.
+const FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The audio hash (duplicate detection) reads the whole file, separately from
+// the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
+// get hashed — but it's best-effort: on timeout the track keeps its real tags
+// and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
+const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
@@ -100,29 +110,38 @@ fn read_file_with_timeout(
     path: &PathBuf,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), String> {
-    let path = path.clone();
-    let (tx, rx) = mpsc::channel();
-
+    // Phase 1 — read the tags. This is fast even on a NAS (only the header /
+    // tag blocks are read), so FILE_TIMEOUT is plenty. A timeout here means the
+    // tags are genuinely unreadable → caller falls back to filename metadata.
+    let meta_path = path.clone();
+    let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
-        let metadata = match try_read_metadata(&path) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                // Send the error string through the channel so the caller
-                // can log it. We still return None for metadata.
-                let _ = tx.send(Err(e));
-                return;
-            }
-        };
-        let hash = if with_hash {
-            compute_audio_hash(&path)
-        } else {
-            None
-        };
-        let _ = tx.send(Ok((metadata, hash)));
+        let _ = mtx.send(try_read_metadata(&meta_path));
     });
+    let metadata = match mrx.recv_timeout(FILE_TIMEOUT) {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("timeout".to_string()),
+    };
 
-    rx.recv_timeout(FILE_TIMEOUT)
-        .map_err(|_| "timeout".to_string())?
+    if !with_hash {
+        return Ok((Some(metadata), None));
+    }
+
+    // Phase 2 — compute the audio hash (used only for duplicate detection). This
+    // reads the WHOLE file, which on very large Hi-Res files over a NAS can far
+    // exceed the tag-read budget (Progman: a 23-min FLAC 24/88.2 ≈ 1 GB). Make
+    // it best-effort: if it doesn't finish in HASH_TIMEOUT, keep the real tags
+    // and just skip the hash (audio_hash = None) instead of dropping the track
+    // to filename-only metadata. Dedup is degraded for that one file, nothing
+    // more.
+    let hash_path = path.clone();
+    let (htx, hrx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = htx.send(compute_audio_hash(&hash_path));
+    });
+    let hash = hrx.recv_timeout(HASH_TIMEOUT).unwrap_or(None);
+    Ok((Some(metadata), hash))
 }
 
 pub struct ListAudioResult {
@@ -146,11 +165,20 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
         let normalized = normalize_path(dir);
         let dir_path = std::path::Path::new(&normalized);
 
-        if !dir_path.exists() {
+        // Probe with read_dir instead of a bare exists(): on Windows a NAS path
+        // fails for several distinct reasons that exists() collapses to `false`
+        // (silent skip → "scan finds nothing", Alain Bonnel). read_dir surfaces
+        // the actual io::Error kind so the user learns WHY: NotFound = bad UNC /
+        // NAS unmounted, PermissionDenied = no SMB credentials for this session,
+        // and — the common Windows case — a mapped drive (Z:\) is invisible to
+        // an elevated / service token even though it works in Explorer.
+        if let Err(e) = std::fs::read_dir(dir_path) {
             warn!(
                 dir = %normalized,
                 original = %dir,
-                "scan_dir_not_found — directory does not exist, skipping"
+                error = %e,
+                kind = ?e.kind(),
+                "scan_dir_unreadable — cannot open directory (unreachable NAS, mapped drive not visible to this session, or permission denied), skipping"
             );
             missing_dirs.push(normalized);
             continue;
@@ -182,6 +210,12 @@ pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
             match entry {
                 Ok(entry) => {
                     if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    // Skip macOS AppleDouble sidecar files (._foo.flac): they carry
+                    // the audio extension but are tiny resource-fork metadata, not
+                    // real tracks, and were being indexed as bogus duplicates (Elie).
+                    if entry.file_name().to_string_lossy().starts_with("._") {
                         continue;
                     }
                     let path = entry.path();
@@ -294,13 +328,16 @@ pub fn scan_files_parallel(
                     (meta, hash)
                 }
                 Err(ref reason) if reason == "timeout" => {
+                    // Don't drop the file — index it with filename-based metadata
+                    // so it still appears in the library. audio_hash stays None so
+                    // the next scan re-reads full tags once storage is responsive.
                     warn!(
                         path = %path_str,
                         timeout_secs = FILE_TIMEOUT.as_secs(),
-                        "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                        "scan_file_timeout — tag read timed out, indexing with filename metadata"
                     );
                     timeout_counter.fetch_add(1, Ordering::Relaxed);
-                    (None, None)
+                    (Some(tagless_fallback_no_props(path)), None)
                 }
                 Err(ref err) => {
                     warn!(

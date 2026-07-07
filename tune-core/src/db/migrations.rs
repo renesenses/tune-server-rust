@@ -596,7 +596,41 @@ INSERT OR IGNORE INTO smart_collections (name, rules, match_mode, icon, color, d
         up: "ALTER TABLE smart_playlists ADD COLUMN match_mode TEXT NOT NULL DEFAULT 'all';",
     },
     Migration {
+        // Migration 47 (reseed_smart_collections) re-inserted the 16 default
+        // collections with a bare `INSERT OR IGNORE ... VALUES`, but the table
+        // has no UNIQUE constraint on `name`, so OR IGNORE never fired and every
+        // default ended up duplicated (twice, or more across version jumps).
+        // Deduplicate keeping the oldest row per name, then add a UNIQUE index so
+        // any future re-seed is a genuine no-op.
         version: 49,
+        name: "dedupe_smart_collections_unique_name",
+        up: "
+DELETE FROM smart_collections
+ WHERE id NOT IN (SELECT MIN(id) FROM smart_collections GROUP BY name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_collections_name ON smart_collections(name);
+",
+    },
+    Migration {
+        version: 50,
+        name: "add_zones_dlna_native_flac",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
+    Migration {
+        version: 51,
+        name: "add_file_first_seen",
+        up: "
+CREATE TABLE IF NOT EXISTS file_first_seen (
+    file_path TEXT PRIMARY KEY,
+    first_seen_at REAL NOT NULL
+);
+",
+    },
+    Migration {
+        // v0.9 rc.2 — unified queue. Renumbered to 52 on the main→release/v0.9
+        // merge-forward to sit after main's migrations 49-51 (version numbers
+        // must stay unique & monotonic). The actual work is done idempotently by
+        // migrate_to_unified_queue(), so the marker number is free to move.
+        version: 52,
         name: "unified_queue_items",
         // Applied programmatically (create table + one-time copy) via
         // migrate_to_unified_queue so it is idempotent across re-runs and
@@ -968,6 +1002,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 45 {
             add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
         }
+        if migration.version == 50 {
+            add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -1007,6 +1044,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "fixed_volume", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
+    add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
@@ -1015,7 +1053,15 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
 
-    // v0.9 rc.2 — unify play_queue + streaming_queue into queue_items (v49).
+    // Persistent "date added" side table (survives full rescan). CREATE IF NOT
+    // EXISTS here too so DBs from any prior version get it regardless of which
+    // migration version they came from.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at REAL NOT NULL);",
+    )
+    .ok();
+
+    // v0.9 rc.2 — unify play_queue + streaming_queue into queue_items (v52).
     migrate_to_unified_queue(db);
 
     db.execute_batch("ANALYZE;").ok();
@@ -1208,5 +1254,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, latest_version());
+    }
+
+    #[test]
+    fn default_smart_collections_are_not_duplicated() {
+        // Regression for migration 47 re-seeding without a UNIQUE guard: the
+        // default collections must appear exactly once after all migrations.
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let conn = db.connection().lock().unwrap();
+        let max_dupe: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(c), 0) FROM \
+                 (SELECT COUNT(*) c FROM smart_collections GROUP BY name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_dupe, 1, "smart_collections has duplicate names");
+
+        // The UNIQUE index must reject a re-seed attempt (OR IGNORE => no-op).
+        drop(conn);
+        db.execute_batch(
+            "INSERT OR IGNORE INTO smart_collections (name, rules) VALUES ('🎷 Jazz', '[]');",
+        )
+        .unwrap();
+        let conn = db.connection().lock().unwrap();
+        let jazz: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM smart_collections WHERE name = '🎷 Jazz'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jazz, 1, "re-seed must not duplicate an existing collection");
     }
 }

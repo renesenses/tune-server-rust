@@ -19,8 +19,10 @@ const YTM_API_BASE: &str = "https://music.youtube.com/youtubei/v1";
 // Stream URL cache TTL — YouTube CDN URLs expire after ~6 hours, cache for 5h
 const STREAM_URL_TTL_SECS: u64 = 18_000;
 
-// yt-dlp subprocess timeout
-const YTDLP_TIMEOUT_SECS: u64 = 30;
+// yt-dlp subprocess timeout. YouTube extraction (nsig/format resolution,
+// slow on first run and on some networks) routinely exceeds 30s, which was
+// killing every fallback attempt when the native path is fully login-gated.
+const YTDLP_TIMEOUT_SECS: u64 = 90;
 
 // ---------------------------------------------------------------------------
 // Google OAuth 2.0 — Device Code Flow (YouTube TV client, publicly known)
@@ -37,25 +39,20 @@ const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
 /// poll with "Invalid grant_type", so device-code login never completes.
 const GOOGLE_DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
-/// Current Unix time in seconds, for the `X-Goog-Request-Time` header that
-/// OAuth-authenticated InnerTube requests must carry.
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Refresh the access token when less than this many seconds until expiry.
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 
 /// YouTube Music context body for internal API calls.
 /// This mimics the web client request format that YouTube Music expects.
 fn ytm_context() -> serde_json::Value {
+    // clientVersion must be recent — InnerTube rejects a stale WEB_REMIX version
+    // with 400 "invalid argument". ytmusicapi computes it as "1.<YYYYMMDD>.01.00"
+    // from the current date; a hardcoded ~1-year-old version silently rots.
+    let client_version = format!("1.{}.01.00", chrono::Utc::now().format("%Y%m%d"));
     json!({
         "client": {
             "clientName": "WEB_REMIX",
-            "clientVersion": "1.20250620.01.00",
+            "clientVersion": client_version,
             "hl": "en",
             "gl": "US",
             "experimentIds": [],
@@ -92,6 +89,32 @@ fn ytm_android_context() -> serde_json::Value {
             "osName": "Android",
             "osVersion": "11",
             "userAgent": "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip"
+        },
+        "user": {
+            "lockedSafetyMode": false
+        }
+    })
+}
+
+/// TV "embedded player" context for the `/player` endpoint.
+///
+/// This is the classic no-auth bypass for tracks the ANDROID_MUSIC client
+/// reports as `LOGIN_REQUIRED` ("Please sign in"). yt-dlp uses this same
+/// client (`TVHTML5_SIMPLY_EMBEDDED_PLAYER`) to reach age-/login-gated
+/// content without credentials — the embed surface has laxer playability
+/// gating than the mobile app client.
+fn ytm_tv_embedded_context() -> serde_json::Value {
+    json!({
+        "client": {
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientVersion": "2.0",
+            "clientScreen": "EMBED",
+            "hl": "en",
+            "gl": "US",
+            "platform": "TV"
+        },
+        "thirdParty": {
+            "embedUrl": "https://www.youtube.com"
         },
         "user": {
             "lockedSafetyMode": false
@@ -245,7 +268,7 @@ impl YouTubeService {
         // "erreur 502" on search in v0.8.251).
         let url = format!("{YTM_API_BASE}/{endpoint}?prettyPrint=false");
 
-        let mut req = self
+        let req = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -253,16 +276,18 @@ impl YouTubeService {
             .header("Referer", "https://music.youtube.com/")
             .header("X-Goog-Visitor-Id", "");
 
-        if let Some(ref token) = self.access_token {
-            // OAuth (device/TV client) InnerTube requests must carry a request
-            // timestamp. Google rejects an OAuth call without it as 400
-            // "Request contains an invalid argument" — this is the header
-            // ytmusicapi sets exclusively for its OAuth auth type, and its
-            // absence is why authenticated search/browse/player kept failing.
-            req = req
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-Goog-Request-Time", unix_now_secs().to_string());
-        }
+        // Do NOT attach the OAuth Bearer here. Every ytm_post endpoint (search,
+        // browse home/album/artist/playlist) is PUBLIC data, and the user-library
+        // endpoints that would need auth (get_user_playlists/albums/artists) are
+        // unimplemented (they return empty). So the token brings zero function
+        // here — it only poisons the call: this is the TV/device-code OAuth flow
+        // that Google deprecated for InnerTube (yt-dlp abandoned it; ytmusicapi
+        // OAuth still 400s). The 502 regression appeared exactly when #381 made
+        // login succeed and the Bearer began being attached (search/browse/home
+        // 502 for Bilou, Jean Marie, Fabien). Removing it restores the pre-#381
+        // working unauthenticated browse/search. #388 (?key=) and #394
+        // (X-Goog-Request-Time) were header-level guesses on this same poisoned
+        // authenticated path and could not help.
 
         let resp = req
             .json(&body)
@@ -353,59 +378,74 @@ impl YouTubeService {
 
     /// Extract audio stream URL natively via the YouTube Music `/player` API.
     ///
-    /// When OAuth-authenticated, uses the WEB_REMIX client with a Bearer token
-    /// — this returns direct audio URLs without cipher. Without auth, falls
-    /// back to the Android Music client (may return LOGIN_REQUIRED).
+    /// Uses the UNAUTHENTICATED ANDROID_MUSIC client first (attaching the OAuth
+    /// Bearer poisons the /player InnerTube call → HTTP 400, exactly like it did
+    /// browse/search). The Android client returns direct audio URLs without a
+    /// token or cipher. When it reports `LOGIN_REQUIRED` ("Please sign in") on a
+    /// track, we retry with the TV embedded client, which reaches many
+    /// login-gated tracks without credentials (the yt-dlp bypass).
     async fn extract_audio_url_native(&self, track_id: &str) -> Result<String, String> {
-        let has_auth = self.access_token.is_some();
+        // Fast path: ANDROID_MUSIC, direct URLs, no cipher, no yt-dlp needed.
+        match self
+            .try_player_client(
+                track_id,
+                ytm_android_context(),
+                "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
+                "https://music.youtube.com",
+            )
+            .await
+        {
+            Ok(url) => return Ok(url),
+            Err(e) => {
+                warn!(
+                    track_id,
+                    error = %e,
+                    "ytm_android_extract_failed_trying_tv_embedded"
+                );
+            }
+        }
 
-        let body = if has_auth {
-            json!({
-                "videoId": track_id,
-                "context": ytm_context(),
-                "playbackContext": {
-                    "contentPlaybackContext": {
-                        "signatureTimestamp": 20073
-                    }
-                }
-            })
-        } else {
-            json!({
-                "videoId": track_id,
-                "context": ytm_android_context(),
-                "playbackContext": {
-                    "contentPlaybackContext": {
-                        "signatureTimestamp": 20073
-                    }
-                }
-            })
-        };
+        // Fallback: the TV embedded surface bypasses LOGIN_REQUIRED on tracks
+        // the mobile app client refuses to serve unauthenticated.
+        self.try_player_client(
+            track_id,
+            ytm_tv_embedded_context(),
+            "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+            "https://www.youtube.com",
+        )
+        .await
+    }
 
-        // Bearer token alone — never combine `?key=` with an OAuth Bearer
-        // header (Google returns 400 "invalid argument"). Same fix as ytm_post;
-        // this path would otherwise break YouTube playback once authenticated.
+    /// Run one `/player` extraction attempt with a specific InnerTube client
+    /// context. Returns the best audio stream URL, or a descriptive error
+    /// (HTTP failure, `LOGIN_REQUIRED`/not-playable, or no suitable stream) so
+    /// the caller can decide whether to try another client.
+    async fn try_player_client(
+        &self,
+        track_id: &str,
+        context: serde_json::Value,
+        user_agent: &str,
+        origin: &str,
+    ) -> Result<String, String> {
+        let body = json!({
+            "videoId": track_id,
+            "context": context,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "signatureTimestamp": 20073
+                }
+            }
+        });
+
         let url = format!("{YTM_API_BASE}/player?prettyPrint=false");
 
-        let mut req = self
+        let resp = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Origin", "https://music.youtube.com")
-            .header("Referer", "https://music.youtube.com/");
-
-        if let Some(ref token) = self.access_token {
-            // See ytm_post: OAuth calls need the request timestamp header.
-            req = req
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-Goog-Request-Time", unix_now_secs().to_string());
-        } else {
-            req = req.header(
-                "User-Agent",
-                "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
-            );
-        }
-
-        let resp = req
+            .header("Origin", origin)
+            .header("Referer", format!("{origin}/"))
+            .header("User-Agent", user_agent)
             .json(&body)
             .send()
             .await
@@ -448,11 +488,13 @@ impl YouTubeService {
             .as_array()
             .ok_or_else(|| format!("no streaming data for {track_id}"))?;
 
-        // Find best audio format: prefer OPUS (audio/webm) at highest bitrate,
-        // then fall back to AAC (audio/mp4)
+        // Find best audio format: prefer AAC (audio/mp4, itag 140) at highest
+        // bitrate. Symphonia — our decode pipeline — can decode AAC but NOT
+        // Opus/WebM (the ffmpeg Opus fallback was removed), so an Opus stream
+        // plays back silent. Only fall back to Opus when no AAC is offered.
         let mut best_url: Option<&str> = None;
         let mut best_bitrate: u64 = 0;
-        let mut best_is_opus = false;
+        let mut best_is_aac = false;
 
         for fmt in formats {
             let mime = fmt["mimeType"].as_str().unwrap_or("");
@@ -462,13 +504,15 @@ impl YouTubeService {
             }
 
             let bitrate = fmt["bitrate"].as_u64().unwrap_or(0);
-            let is_opus = mime.contains("opus");
+            // AAC is delivered as audio/mp4 (codec mp4a); Opus as audio/webm.
+            let is_aac = mime.contains("mp4");
 
-            // Prefer OPUS; within same codec family, prefer higher bitrate
-            let dominated = if best_is_opus && !is_opus {
-                true // Don't replace opus with non-opus
-            } else if !best_is_opus && is_opus {
-                false // Always prefer opus
+            // Prefer AAC (decodable); within same codec family, prefer higher
+            // bitrate. Never replace an AAC pick with Opus.
+            let dominated = if best_is_aac && !is_aac {
+                true // Don't replace AAC with non-AAC (Opus)
+            } else if !best_is_aac && is_aac {
+                false // Always prefer AAC
             } else {
                 bitrate <= best_bitrate
             };
@@ -481,17 +525,25 @@ impl YouTubeService {
             if let Some(u) = fmt["url"].as_str() {
                 best_url = Some(u);
                 best_bitrate = bitrate;
-                best_is_opus = is_opus;
+                best_is_aac = is_aac;
             }
         }
 
         let stream_url =
             best_url.ok_or_else(|| format!("no suitable audio stream found for {track_id}"))?;
 
+        // If the only direct-URL audio the native path offers is Opus, it would
+        // decode to silence — defer to the yt-dlp fallback, which requests m4a.
+        if !best_is_aac {
+            return Err(format!(
+                "native path only offers Opus for {track_id} (undecodable), deferring to yt-dlp"
+            ));
+        }
+
         debug!(
             track_id,
             bitrate = best_bitrate,
-            opus = best_is_opus,
+            aac = best_is_aac,
             "ytm_native_url_extracted"
         );
         Ok(stream_url.to_string())
@@ -506,17 +558,28 @@ impl YouTubeService {
     /// Used when native `/player` API extraction fails (e.g., geo-restricted
     /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
     async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<String, String> {
+        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
+        // playback" button). None means the user hasn't enabled it yet.
+        let ytdlp = crate::ytdlp::binary().ok_or_else(|| {
+            "YouTube playback is not enabled — turn it on in Settings \
+             (downloads the yt-dlp helper)"
+                .to_string()
+        })?;
         let video_url = format!("https://www.youtube.com/watch?v={track_id}");
 
         let output = tokio::time::timeout(
             Duration::from_secs(YTDLP_TIMEOUT_SECS),
-            tokio::process::Command::new("yt-dlp")
+            tokio::process::Command::new(&ytdlp)
                 .args([
-                    // Prefer a non-segmented HTTPS stream (progressive download).
-                    // "bestaudio" alone often picks a DASH format whose URL only
-                    // covers the first segment (~50s).
+                    // Prefer m4a/AAC: the native decode pipeline (Symphonia)
+                    // cannot decode Opus/WebM (the ffmpeg fallback for it was
+                    // removed), so plain "bestaudio" — which picks Opus on
+                    // YouTube — plays back silent. m4a (itag 140, AAC) decodes
+                    // natively. Then fall back to a progressive HTTPS stream
+                    // ("bestaudio" alone often picks a DASH format whose URL
+                    // only covers the first segment ~50s), then anything.
                     "-f",
-                    "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
+                    "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
                     "--get-url",
                     "--no-playlist",
                     "--no-warnings",
@@ -529,10 +592,7 @@ impl YouTubeService {
         .map_err(|_| format!("yt-dlp timeout for {track_id}"))?
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                format!(
-                    "yt-dlp not found — install it with 'pip install yt-dlp' \
-                     or 'brew install yt-dlp' for YouTube playback fallback"
-                )
+                "yt-dlp binary missing — re-enable YouTube playback in Settings".to_string()
             } else {
                 format!("yt-dlp exec error: {e}")
             }
@@ -2167,6 +2227,19 @@ impl YouTubeService {
     }
 }
 
+/// Map a resolved YouTube stream URL to `(mime_type, codec)`. YouTube delivers
+/// either MP4/AAC (itag 140, "m4a") or WebM/Opus. The codec string becomes the
+/// transcode temp-file extension: "m4a" routes to the native Symphonia decoder,
+/// whereas "opus" would route to the removed ffmpeg path and play back silent.
+/// We request m4a in the yt-dlp selector, so this is normally the mp4/m4a branch.
+fn youtube_mime_codec(url: &str) -> (&'static str, &'static str) {
+    if url.contains("mime=audio%2Fmp4") || url.contains("mime=audio/mp4") || url.contains(".m4a") {
+        ("audio/mp4", "m4a")
+    } else {
+        ("audio/webm", "opus")
+    }
+}
+
 // ======================================================================
 // StreamingService trait implementation
 // ======================================================================
@@ -2432,11 +2505,12 @@ impl StreamingService for YouTubeService {
             let cache = self.url_cache.lock().await;
             if let Some(cached) = cache.get(track_id) {
                 debug!(track_id, "youtube_stream_url_cached");
+                let (mime_type, codec) = youtube_mime_codec(&cached.url);
                 return Ok(StreamUrl {
                     url: cached.url.clone(),
-                    mime_type: "audio/webm".into(),
+                    mime_type: mime_type.into(),
                     quality: StreamQuality {
-                        codec: "OPUS".into(),
+                        codec: codec.into(),
                         sample_rate: 48000,
                         bit_depth: 16,
                         bitrate: Some(128000),
@@ -2453,14 +2527,11 @@ impl StreamingService for YouTubeService {
             .await
             .map_err(|e| TuneError::Streaming(e))?;
 
-        // Determine MIME type from URL
-        let mime_type = if url.contains("mime=audio%2Fwebm") || url.contains(".webm") {
-            "audio/webm"
-        } else if url.contains("mime=audio%2Fmp4") || url.contains(".m4a") {
-            "audio/mp4"
-        } else {
-            "audio/webm" // Default for YouTube
-        };
+        // Determine MIME type + codec from the resolved URL. The codec label
+        // drives the temp-file extension used by the decoder: m4a/AAC routes to
+        // Symphonia, "opus"/webm to the (removed) ffmpeg path. We ask yt-dlp for
+        // m4a first (see the -f selector), so this is normally audio/mp4 + aac.
+        let (mime_type, codec) = youtube_mime_codec(&url);
 
         // Cache the URL
         {
@@ -2474,13 +2545,13 @@ impl StreamingService for YouTubeService {
             );
         }
 
-        info!(track_id, mime_type, "youtube_stream_url_resolved");
+        info!(track_id, mime_type, codec, "youtube_stream_url_resolved");
 
         Ok(StreamUrl {
             url,
             mime_type: mime_type.into(),
             quality: StreamQuality {
-                codec: "OPUS".into(),
+                codec: codec.into(),
                 sample_rate: 48000,
                 bit_depth: 16,
                 bitrate: Some(128000),

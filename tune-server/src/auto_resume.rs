@@ -56,6 +56,16 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         _ => return false,
     };
 
+    // A live radio stream must never auto-restart on server boot. The user
+    // pressed stop (or simply quit), and re-launching a radio on every startup
+    // with no interaction is the "phantom playback that survives restart and
+    // can't be killed" bug: it comes back each boot on the local zone. Real
+    // tracks resume fine; radio is a continuous live source, so we don't.
+    if zone.last_track_source.as_deref() == Some("radio") {
+        debug!(zone_id, zone_name = %zone.name, "auto_resume_skip_radio");
+        return false;
+    }
+
     // Need at least a track id or a source+source_id to resume
     let has_track = zone.last_track_id.is_some();
     let has_streaming = zone.last_track_source.is_some() && zone.last_track_source_id.is_some();
@@ -79,8 +89,17 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
         temp_file_path: None,
     };
 
-    match state.orchestrator.play(req).await {
-        Ok(_result) => {
+    // Auto-resume must not block on a slow track resolution. Login-gated
+    // YouTube falls back to yt-dlp (30-90s), so a resumed YouTube track would
+    // start audio long after boot — superimposing on whatever the user launched
+    // meanwhile ("lecture double", Jean Marie: a background zone's YouTube track
+    // resumed ~1 min late over a radio he'd started). Give resolution a short
+    // deadline; if the track can't start promptly, abandon the resume rather
+    // than fire it late. Local files and Tidal/Qobuz resolve in a few seconds.
+    const AUTO_RESUME_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    match tokio::time::timeout(AUTO_RESUME_RESOLVE_TIMEOUT, state.orchestrator.play(req)).await {
+        Ok(Ok(_result)) => {
             // Seek to the last known position
             let position_ms = zone.last_position_ms;
             if position_ms > 0 {
@@ -98,8 +117,17 @@ async fn try_auto_resume_zone(state: &AppState, zone_id: i64) -> bool {
             );
             true
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(zone_id, zone_name = %zone.name, error = %e, "auto_resume_zone_failed");
+            false
+        }
+        Err(_) => {
+            warn!(
+                zone_id,
+                zone_name = %zone.name,
+                timeout_secs = AUTO_RESUME_RESOLVE_TIMEOUT.as_secs(),
+                "auto_resume_resolve_timeout_abandoned"
+            );
             false
         }
     }

@@ -449,7 +449,8 @@ impl HistoryRepo {
             "AND h.source != 'radio' AND"
         };
         let albums_sql = format!(
-            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id
+            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id,
+                    MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
              LEFT JOIN albums a ON LOWER(a.title) = LOWER(h.album_title)
              {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
@@ -466,6 +467,8 @@ impl HistoryRepo {
                 cover_path: cols.get(2).and_then(|v| v.as_string()),
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 album_id: cols.get(4).and_then(|v| v.as_i64()),
+                source: cols.get(5).and_then(|v| v.as_string()),
+                source_id: cols.get(6).and_then(|v| v.as_string()),
             })
             .collect();
 
@@ -486,7 +489,8 @@ impl HistoryRepo {
                           AND LOWER(COALESCE(t2.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
                           AND a2.cover_path IS NOT NULL
                         LIMIT 1
-                    )) as cover_path
+                    )) as cover_path,
+                    MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
              {simple_where} {no_radio_and} lh.title IS NOT NULL
              GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
@@ -502,24 +506,33 @@ impl HistoryRepo {
                 plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
                 cover_path: cols.get(5).and_then(|v| v.as_string()),
+                source: cols.get(6).and_then(|v| v.as_string()),
+                source_id: cols.get(7).and_then(|v| v.as_string()),
             })
             .collect();
 
         // ── Top radios ──
-        let radio_and = if simple_where.is_empty() {
-            "WHERE source = 'radio' AND"
-        } else {
-            "AND source = 'radio' AND"
-        };
+        // Radio plays are NOT in listen_history (deliberately — see the
+        // record_history guard in the orchestrator: a frozen station title
+        // produces bogus rows on every replay). They live in radio_stations
+        // (record_play bumps play_count), so the top list comes from there.
+        // play_count is lifetime, so this ignores the period filter (radio
+        // listening is sparse; lifetime top is the useful view).
+        // CASTs keep this working on both backends: on Postgres radio_stations
+        // has drifted to play_count TEXT (pg_migrate) and a bare `NULL as
+        // cover_path` (untyped) makes sqlx fail to decode — either made the whole
+        // query error and return empty (Top Radios blank on the .15 PG server).
+        // Explicit integer/text types are identity on SQLite.
         let radios_sql = format!(
-            "SELECT lh.title as station_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
-                    MAX(lh.cover_url) as cover_url,
-                    MAX(r.id) as radio_id,
-                    MAX(r.cover_path) as cover_path
-             FROM listen_history lh
-             LEFT JOIN radios r ON LOWER(r.name) = LOWER(lh.title)
-             {simple_where} {radio_and} lh.title IS NOT NULL
-             GROUP BY lh.title ORDER BY plays DESC LIMIT {top_n}"
+            "SELECT name as station_name,
+                    CAST(play_count AS INTEGER) as plays,
+                    CAST(0 AS BIGINT) as ms,
+                    logo_url as cover_url,
+                    id as radio_id,
+                    CAST(NULL AS TEXT) as cover_path
+             FROM radio_stations
+             WHERE CAST(play_count AS INTEGER) > 0
+             ORDER BY CAST(play_count AS INTEGER) DESC LIMIT {top_n}"
         );
         let top_radios: Vec<TopRadioEntry> = self
             .db
@@ -885,6 +898,12 @@ pub struct TopAlbumEntry {
     pub artist_name: String,
     pub cover_path: Option<String>,
     pub plays: i64,
+    /// Streaming service ("qobuz"/"tidal"/"youtube"/…) or "local". Lets the UI
+    /// play a streaming top item that has no local album_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -896,6 +915,12 @@ pub struct TopTrackEntry {
     pub listening_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    /// Streaming service ("qobuz"/"tidal"/"youtube"/…) or "local". Lets the UI
+    /// play a streaming top item that has no local track_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

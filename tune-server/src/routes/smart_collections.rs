@@ -113,55 +113,46 @@ async fn list_collections(State(state): State<AppState>) -> Result<Json<Value>, 
                 .get(2)
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into());
-            let sc_json = serde_json::json!({
-                "name": col["name"],
-                "rules": serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([])),
-                "match_mode": col["match_mode"],
-                "sort_by": col["sort_by"],
-                "sort_order": col["sort_order"],
-                "limit": col["max_limit"],
-            });
-            tracing::info!(name = %col["name"], json = %sc_json, "smart_collection_compiling");
-            match serde_json::from_str::<tune_core::library::smart_collections::SmartCollection>(
-                &sc_json.to_string(),
-            ) {
-                Err(e) => {
-                    tracing::warn!(name = %col["name"], error = %e, json = %sc_json, "smart_collection_compile_failed");
-                }
-                Ok(sc) => {
-                let (sql, params) = sc.compile_sql();
-                let track_count_sql = format!("SELECT COUNT(*) FROM ({sql})");
-                let album_count_sql = format!(
-                    "SELECT COUNT(DISTINCT t.album_id) FROM tracks t \
-                     LEFT JOIN albums al ON t.album_id = al.id \
-                     LEFT JOIN artists ar ON t.artist_id = ar.id \
-                     WHERE t.id IN ({sql})"
+            // Count with the SAME album-query engine as resolve_albums so the
+            // count is always produced and matches the album view. The old
+            // SmartCollection::compile_sql path silently failed to deserialize
+            // richer rule operators (>=, <=, in, is_null…) and then dropped
+            // album_count entirely, so a collection using those showed no count
+            // (Jean Marie). build_album_query inlines escaped values → no bound
+            // params (mirrors execute_album_query). max_limit=None reports the
+            // full membership, not the capped view.
+            let match_mode = col["match_mode"].as_str().unwrap_or("all");
+            let sort_by = col["sort_by"].as_str().unwrap_or("title");
+            let sort_order = col["sort_order"].as_str().unwrap_or("asc");
+            let (where_clause, _order, _limit) =
+                build_album_query(&rules_str, match_mode, sort_by, sort_order, None);
+
+            let album_count_sql = format!(
+                "SELECT COUNT(DISTINCT al.id) FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+            );
+            if let Ok(rs) = state.backend.query_many(&album_count_sql, &[]) {
+                col["album_count"] = json!(
+                    rs.first()
+                        .and_then(|r| r.first())
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
                 );
-                let param_refs: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
-                    .iter()
-                    .map(|p| p as &dyn tune_core::db::backend::ToSqlValue)
-                    .collect();
-                if let Ok(count_rows) = state.backend.query_many(&track_count_sql, &param_refs) {
-                    let count = count_rows
-                        .first()
+            }
+            let track_count_sql = format!(
+                "SELECT COUNT(DISTINCT t.id) FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+            );
+            if let Ok(rs) = state.backend.query_many(&track_count_sql, &[]) {
+                col["track_count"] = json!(
+                    rs.first()
                         .and_then(|r| r.first())
                         .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    col["track_count"] = json!(count);
-                }
-                let param_refs2: Vec<&dyn tune_core::db::backend::ToSqlValue> = params
-                    .iter()
-                    .map(|p| p as &dyn tune_core::db::backend::ToSqlValue)
-                    .collect();
-                if let Ok(count_rows) = state.backend.query_many(&album_count_sql, &param_refs2) {
-                    let count = count_rows
-                        .first()
-                        .and_then(|r| r.first())
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    col["album_count"] = json!(count);
-                }
-            }}
+                        .unwrap_or(0)
+                );
+            }
             col
         })
         .collect();
@@ -512,7 +503,10 @@ fn build_album_query(
             "format" => "t.format",
             "source" => "t.source",
             "cover_path" => "al.cover_path",
-            "year" => "CAST(al.year AS INTEGER)",
+            // Fall back to the track year: many albums have a NULL al.year even
+            // though the tracks carry the year in their tags (Elie — genre, a
+            // track-level field, matched but year, album-level, didn't).
+            "year" => "CAST(COALESCE(al.year, t.year) AS INTEGER)",
             "sample_rate" => "CAST(t.sample_rate AS INTEGER)",
             "bit_depth" => "CAST(t.bit_depth AS INTEGER)",
             "track_count" => "al.track_count",

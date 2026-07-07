@@ -376,6 +376,11 @@ CREATE TABLE IF NOT EXISTS album_ratings (
     UNIQUE(album_id, profile_id)
 );
 
+CREATE TABLE IF NOT EXISTS file_first_seen (
+    file_path TEXT PRIMARY KEY,
+    first_seen_at DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS smart_playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -426,7 +431,9 @@ CREATE TABLE IF NOT EXISTS alarms (
     skip_holidays TEXT DEFAULT 0,
     source_name TEXT,
     fade_duration_s TEXT DEFAULT 60,
-    last_fired_at TEXT
+    last_fired_at TEXT,
+    days_of_week TEXT DEFAULT '1111111',
+    multi_zone_ids TEXT
 );
 
 CREATE TABLE IF NOT EXISTS network_mounts (

@@ -140,7 +140,25 @@ impl PlaybackOrchestrator {
         })
     }
 
-    pub async fn play(&self, mut req: PlayRequest) -> Result<PlayResult, String> {
+    pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        // Public entry point: this is a *new* logical play, so it is recorded
+        // in the listen history.
+        self.play_inner(req, true).await
+    }
+
+    /// Like `play`, but does NOT write a listen-history row.  Used for internal
+    /// stream re-creations of a track that is *already* being played (seek,
+    /// radio auto-retry, reconnect) so a single logical play is not counted
+    /// multiple times in the "Historique de lecture".
+    pub async fn play_without_history(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        self.play_inner(req, false).await
+    }
+
+    async fn play_inner(
+        &self,
+        mut req: PlayRequest,
+        record_history: bool,
+    ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
         // Ensure output_device_id is populated: if the caller didn't provide
         // it (e.g. web client sends only zone_id + track_id), look it up from
@@ -424,23 +442,36 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.record_listen(
-            &resolved.title,
-            resolved.artist.as_deref(),
-            album.as_deref(),
-            &resolved.source,
-            req.source_id.as_deref(),
-            req.track_id.and_then(|tid| {
-                TrackRepo::with_backend(self.db.clone())
-                    .get(tid)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| t.album_id)
-            }),
-            resolved.duration_ms.unwrap_or(0),
-            req.zone_id,
-            cover_path.as_deref(),
-        );
+        // Only record a listen-history row for genuinely new plays.  Seek and
+        // radio auto-retry re-create the stream for a track that is already
+        // playing (via play_without_history) and must not add duplicate rows.
+        //
+        // Skip live radio entirely: the title/artist supplied at play time is a
+        // frozen snapshot (station name, or a stale song copied from a history
+        // line when replaying) and never describes what the station is actually
+        // streaming now, so recording it produces listen_history rows with no
+        // relation to what was heard, plus a fresh bogus row on every replay
+        // click (Bilou). Station plays are already tracked in the radio_stations
+        // table (record_play), so nothing is lost.
+        if record_history && resolved.source != "radio" {
+            self.record_listen(
+                &resolved.title,
+                resolved.artist.as_deref(),
+                album.as_deref(),
+                &resolved.source,
+                req.source_id.as_deref(),
+                req.track_id.and_then(|tid| {
+                    TrackRepo::with_backend(self.db.clone())
+                        .get(tid)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.album_id)
+                }),
+                resolved.duration_ms.unwrap_or(0),
+                req.zone_id,
+                cover_path.as_deref(),
+            );
+        }
 
         info!(
             zone_id = req.zone_id,
@@ -497,8 +528,10 @@ impl PlaybackOrchestrator {
             }
         }
 
-        // Probe the renderer
-        let supported = {
+        // Probe the renderer. None = inconclusive probe (SOAP failed / empty
+        // Sink) — fall back conservatively but do NOT cache, so one transient
+        // failure doesn't force WAV for the whole session (Marco's Denon).
+        let probe = {
             let outputs = self.outputs.lock().await;
             if let Some(output) = outputs.get(device_id) {
                 let locked = output.lock().await;
@@ -509,22 +542,33 @@ impl PlaybackOrchestrator {
                     dlna.supports_mime(mime).await
                 } else {
                     // Not a DLNA output — format negotiation doesn't apply
-                    true
+                    Some(true)
                 }
             } else {
-                true
+                Some(true)
             }
         };
 
-        if !supported {
-            let mut cache = self.dlna_unsupported_mimes.lock().await;
-            let entry = cache.entry(device_id.to_string()).or_default();
-            if !entry.iter().any(|m| m == mime) {
-                entry.push(mime.to_string());
+        match probe {
+            Some(true) => true,
+            Some(false) => {
+                // Renderer's Sink was read and genuinely lacks this MIME — cache.
+                let mut cache = self.dlna_unsupported_mimes.lock().await;
+                let entry = cache.entry(device_id.to_string()).or_default();
+                if !entry.iter().any(|m| m == mime) {
+                    entry.push(mime.to_string());
+                }
+                false
+            }
+            None => {
+                // Inconclusive — universal formats assumed OK, others not, but
+                // not cached so the next play re-probes.
+                matches!(
+                    mime.to_lowercase().as_str(),
+                    "audio/wav" | "audio/x-wav" | "audio/l16" | "audio/mpeg"
+                )
             }
         }
-
-        supported
     }
 
     async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
@@ -662,6 +706,19 @@ impl PlaybackOrchestrator {
         if let Some(ref source) = req.source
             && source != "local"
         {
+            // An out-of-library file dragged into the queue is stored as
+            // source="upload" with source_id = the uploaded temp file path (see
+            // queue_add). Every advance/jump/repeat funnels through resolve_stream,
+            // so resolve it here — not only via the one-shot temp_file_path field —
+            // otherwise it plays once but fails on queue advance (Sergio:
+            // glisser-lire un fichier hors bibliothèque).
+            if source == "upload" {
+                let path = req
+                    .source_id
+                    .as_deref()
+                    .ok_or("upload source requires source_id (file path)")?;
+                return self.resolve_uploaded_file(path, req).await;
+            }
             if source == "podcast" || source == "radio" || source == "upnp" {
                 return self.resolve_direct_url(req).await;
             }
@@ -756,11 +813,26 @@ impl PlaybackOrchestrator {
                 // Network outputs (DLNA): check if the renderer supports the
                 // radio stream format (typically AAC). If not, proxy + transcode
                 // to WAV so the renderer can play it.
+                // Passthrough ONLY when the URL carries an unambiguous,
+                // renderer-supported extension (.mp3/.flac/.wav). Extension-less
+                // Icecast mounts fall through guess_mime_from_url() to the default
+                // "audio/mpeg", and .aac (ADTS) maps to "audio/mp4" — both are
+                // mislabels. The renderer then opens a stream whose bytes don't
+                // match the advertised protocolInfo, reports PLAYING and emits
+                // SILENCE (Cyrille, Yamaha R-N2000A). Transcode every ambiguous
+                // codec (.aac/.ogg/.opus/HLS/extension-less) to WAV so sound is
+                // guaranteed; explicit .mp3/.flac stations still pass through with
+                // no CPU/bandwidth cost.
+                let url_path = audio_url.split(['?', '#']).next().unwrap_or(audio_url);
+                let reliable_ext = {
+                    let p = url_path.to_lowercase();
+                    p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
+                };
                 let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
                     let radio_mime = guess_mime_from_url(audio_url);
-                    !self.dlna_supports_mime(device_id, &radio_mime).await
+                    !reliable_ext || !self.dlna_supports_mime(device_id, &radio_mime).await
                 } else {
-                    false
+                    !reliable_ext
                 };
 
                 if needs_proxy {
@@ -848,8 +920,20 @@ impl PlaybackOrchestrator {
         let file_path = track.file_path.ok_or("track has no file_path")?;
         let fmt = track.format.unwrap_or_else(|| "flac".into());
         let source_format = AudioFormat::from_extension(&fmt);
-        let sample_rate = track.sample_rate.unwrap_or(44100) as u32;
-        let bit_depth = track.bit_depth.unwrap_or(16) as u16;
+        // DSD is 1-bit at MHz rates. When the DB row is missing audio props
+        // (lofty returns None for many .dsf/.dff files), fall back to DSD64
+        // defaults, NOT the PCM 44100/16 defaults — otherwise a native-DSD track
+        // played to a DSD-capable renderer shows "44.1 kHz / 16 bit" in the
+        // signal path / now-playing chip (Benjithom, HiFi Rose RS130), and the
+        // DSD→PCM transcode-fallback rate math is fed the wrong input rate.
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        let sample_rate = track
+            .sample_rate
+            .unwrap_or(if is_dsd_source { 2_822_400 } else { 44100 })
+            as u32;
+        let bit_depth = track
+            .bit_depth
+            .unwrap_or(if is_dsd_source { 1 } else { 16 }) as u16;
         let channels = track.channels as u16;
 
         // Determine the output type and max_sample_rate for this zone.
@@ -1018,10 +1102,16 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
                 .unwrap_or("");
-            if !did.is_empty() {
-                !self.dlna_supports_mime(did, "audio/flac").await
-            } else {
+            if did.is_empty() {
                 false
+            } else if ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id) {
+                // User forces native FLAC for this zone: some renderers decode
+                // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
+                // empty GetProtocolInfo Sink), so protocol negotiation wrongly
+                // falls back to WAV. Honour the override and send FLAC.
+                false
+            } else {
+                !self.dlna_supports_mime(did, "audio/flac").await
             }
         } else {
             false
@@ -1898,8 +1988,18 @@ impl PlaybackOrchestrator {
                 })
                 .await;
 
-                // Clean up temp file
-                let _ = std::fs::remove_file(&tmp_file);
+                // Clean up the temp file — but ONLY if WE downloaded it. For a
+                // file:// DASH source, tmp_file IS the Tidal-cache-owned
+                // tune-dash-*.mp4 that is still referenced by the cached stream
+                // URL. Deleting it here made every subsequent re-resolution
+                // (repeat=one, or a seek that recreates the local stream) see the
+                // file gone, mark the cache stale, and re-download the whole
+                // ~54MB DASH — while concurrent transcodes raced on the emptied
+                // file (file_size=0 → decode failed). That was the ASIO "repeat"
+                // runaway (also on Qobuz). Leave cache-owned files alone.
+                if !is_dash_local {
+                    let _ = std::fs::remove_file(&tmp_file);
+                }
 
                 match decode_result {
                     Ok(Ok((_bit_depth, actual_rate))) => {
@@ -1962,6 +2062,28 @@ impl PlaybackOrchestrator {
                 "streaming_dash_pre_transcode_to_flac"
             );
 
+            // Strict DLNA renderers (Revox, Denon, Marantz) reject FLAC — their
+            // Sink doesn't advertise audio/flac, so they fetch the file but play
+            // nothing. Serve them LPCM/WAV instead, like the local-file path.
+            // Otherwise keep FLAC (smaller, Content-Length). Previously these
+            // streaming paths always emitted audio/flac (Philippe / Revox S100).
+            let dash_did = req.output_device_id.as_deref().unwrap_or("");
+            // Honour the per-zone "native FLAC" override for streaming DASH too
+            // (Tidal/Qobuz Hi-Res), not just local files: some renderers decode
+            // FLAC but never advertise it (Marco's Denon Ceol N12 returns an
+            // empty GetProtocolInfo Sink), so negotiation wrongly falls back to
+            // WAV. When the zone forces native FLAC, keep FLAC here as well.
+            let dash_force_flac =
+                ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
+            let dash_enc_format = if dash_did.is_empty()
+                || dash_force_flac
+                || self.dlna_supports_mime(dash_did, "audio/flac").await
+            {
+                "flac"
+            } else {
+                "wav"
+            };
+
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
             let eq_profile_pretranscode = self.load_eq_processor(req.zone_id, sr, 2);
@@ -1985,7 +2107,7 @@ impl PlaybackOrchestrator {
                     .map_err(|e| format!("no tokio runtime: {e}"))?;
                 let encoded_data = rt.block_on(async {
                     let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                        "flac",
+                        dash_enc_format,
                         decoded.sample_rate,
                         actual_bd as u32,
                         decoded.channels,
@@ -2014,9 +2136,14 @@ impl PlaybackOrchestrator {
                         "streaming_dash_pre_transcode_complete"
                     );
 
+                    let dash_mime = if dash_enc_format == "flac" {
+                        "audio/flac"
+                    } else {
+                        "audio/wav"
+                    };
                     let file_info = StreamInfo {
-                        format: "flac".into(),
-                        mime_type: "audio/flac".into(),
+                        format: dash_enc_format.into(),
+                        mime_type: dash_mime.into(),
                         sample_rate: sr,
                         bit_depth: bd,
                         channels: 2,
@@ -2030,13 +2157,13 @@ impl PlaybackOrchestrator {
                         .await;
 
                     let server_ip = self.server_ip();
-                    let url = self
-                        .streamer
-                        .get_stream_url(&session_id, &server_ip, "flac");
+                    let url =
+                        self.streamer
+                            .get_stream_url(&session_id, &server_ip, dash_enc_format);
                     (
                         url,
                         Some(session_id),
-                        "audio/flac".to_string(),
+                        dash_mime.to_string(),
                         Some(file_size),
                     )
                 }
@@ -2081,6 +2208,15 @@ impl PlaybackOrchestrator {
                     "streaming_aac_pre_transcode_to_wav_for_dlna"
                 );
 
+                // FLAC-rejecting DLNA renderers (Revox/Denon/Marantz) get WAV.
+                let aac_did = req.output_device_id.as_deref().unwrap_or("");
+                let aac_enc_format =
+                    if aac_did.is_empty() || self.dlna_supports_mime(aac_did, "audio/flac").await {
+                        "flac"
+                    } else {
+                        "wav"
+                    };
+
                 let upstream_url = stream_data.url.clone();
                 let codec = codec_lower.clone();
                 let tmp_dl = std::env::temp_dir()
@@ -2088,7 +2224,11 @@ impl PlaybackOrchestrator {
                     .to_string_lossy()
                     .to_string();
                 let tmp_flac = std::env::temp_dir()
-                    .join(format!("tune-aac-transcode-{}.wav", uuid::Uuid::new_v4()))
+                    .join(format!(
+                        "tune-aac-transcode-{}.{}",
+                        uuid::Uuid::new_v4(),
+                        aac_enc_format
+                    ))
                     .to_string_lossy()
                     .to_string();
 
@@ -2118,20 +2258,23 @@ impl PlaybackOrchestrator {
                     let pcm_bytes = decoded.pcm_bytes();
                     let actual_bd = decoded.bit_depth;
 
-                    // 3. Encode to FLAC (lossless, with Content-Length)
-                    let rt = tokio::runtime::Handle::try_current()
-                        .map_err(|e| format!("no tokio runtime: {e}"))?;
-                    let encoded_data = rt.block_on(async {
-                        let mut encoder = crate::audio::encoder::AudioEncoder::new(
-                            "flac",
-                            decoded.sample_rate,
-                            actual_bd as u32,
-                            decoded.channels,
-                        );
-                        encoder.start().await?;
-                        encoder.write(&pcm_bytes).await?;
-                        encoder.finish().await
-                    })?;
+                    // 3. Encode: FLAC (Content-Length), or WAV/LPCM for a
+                    //    FLAC-rejecting renderer (Revox/Denon/Marantz).
+                    //    Encoding is pure CPU work, so run it synchronously on
+                    //    this blocking thread. Previously this drove the async
+                    //    encoder via a nested `Handle::block_on`, which could
+                    //    deadlock the runtime and hang the transcode forever
+                    //    (no complete/failed log) — the "YouTube→DLNA does
+                    //    nothing" bug on small servers.
+                    let mut encoder = crate::audio::encoder::AudioEncoder::new(
+                        aac_enc_format,
+                        decoded.sample_rate,
+                        actual_bd as u32,
+                        decoded.channels,
+                    );
+                    encoder.start_sync()?;
+                    encoder.write_sync(&pcm_bytes)?;
+                    let encoded_data = encoder.finish_sync()?;
 
                     std::fs::write(&tmp_flac_clone, &encoded_data)
                         .map_err(|e| format!("write flac: {e}"))?;
@@ -2151,9 +2294,16 @@ impl PlaybackOrchestrator {
                             "streaming_aac_pre_transcode_complete"
                         );
 
+                        // Label consistently with what was actually encoded
+                        // (previously said audio/wav while emitting FLAC bytes).
+                        let aac_mime = if aac_enc_format == "flac" {
+                            "audio/flac"
+                        } else {
+                            "audio/wav"
+                        };
                         let file_info = StreamInfo {
-                            format: "wav".into(),
-                            mime_type: "audio/wav".into(),
+                            format: aac_enc_format.into(),
+                            mime_type: aac_mime.into(),
                             sample_rate: sr,
                             bit_depth: bd,
                             channels: 2,
@@ -2167,15 +2317,10 @@ impl PlaybackOrchestrator {
                             .await;
 
                         let server_ip = self.server_ip();
-                        let url = self
-                            .streamer
-                            .get_stream_url(&session_id, &server_ip, "flac");
-                        (
-                            url,
-                            Some(session_id),
-                            "audio/flac".to_string(),
-                            Some(file_size),
-                        )
+                        let url =
+                            self.streamer
+                                .get_stream_url(&session_id, &server_ip, aac_enc_format);
+                        (url, Some(session_id), aac_mime.to_string(), Some(file_size))
                     }
                     Ok(Err(e)) => {
                         warn!(error = %e, "streaming_aac_pre_transcode_failed");
@@ -3375,7 +3520,7 @@ impl PlaybackOrchestrator {
                         temp_file_path: None,
                     };
 
-                    match self.play(req).await {
+                    match self.play_without_history(req).await {
                         Ok(_) => {
                             // play() cleared last_seek_at — re-set it immediately
                             // so the poller's seek grace covers the buffering window.
@@ -3417,13 +3562,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
-                // Local output: the WAV stream is sequential (mpsc channel),
-                // so we must stop+replay from the seek position.
+                // Local + OAAT outputs consume a sequential HTTP transcode
+                // stream (mpsc / chunked), so we must stop+replay from the seek
+                // position rather than range-seek in place. OAAT DSD is served
+                // as a chunked WAV transcode that cannot be range-seeked — a raw
+                // Range request lands mid-DSD-block and plays WHITE NOISE
+                // (Xavier). Recreating with seek_ms restarts the transcode at
+                // the correct offset (paired with the DSD-decode seek fix).
                 let is_local_output =
                     zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
+                let is_oaat_output = zone_output_type.as_deref() == Some("oaat");
                 let has_track = state.now_playing.is_some();
 
-                if is_local_output && has_track {
+                if (is_local_output || is_oaat_output) && has_track {
                     info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                     self.playback.seek(zone_id, position_ms as i64).await;
 
@@ -3439,7 +3590,7 @@ impl PlaybackOrchestrator {
                             .flatten()
                             .and_then(|z| z.output_device_id)
                     }) {
-                        if did.starts_with("local:") {
+                        if did.starts_with("local:") || did.starts_with("oaat:") {
                             let outputs = self.outputs.lock().await;
                             if let Some(output) = outputs.get(did.as_str()) {
                                 let _ = output.lock().await.stop().await;
@@ -3470,7 +3621,7 @@ impl PlaybackOrchestrator {
                         temp_file_path: None,
                     };
 
-                    match self.play(req).await {
+                    match self.play_without_history(req).await {
                         Ok(_) => {
                             self.playback.seek(zone_id, position_ms as i64).await;
                             info!(
@@ -3620,10 +3771,17 @@ impl PlaybackOrchestrator {
             return Ok(result);
         }
 
-        // Fallback to streaming queue
+        // Fallback to streaming queue. A zone can hold BOTH a local play_queue
+        // and a streaming_queue at once (a Qobuz track added while a local file
+        // plays), and the poller advances through a COMBINED position space:
+        // local items occupy 0..L, streaming items L..L+S. Index the streaming
+        // vec by the offset within its own 0-based table, not the raw combined
+        // position (Progman: the added Qobuz track never played because
+        // streaming.get(1) was None for 1 local + 1 streaming).
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
         let item = streaming
-            .get(position as usize)
+            .get((position - local_count).max(0) as usize)
             .ok_or("no queue item at position")?;
 
         let source_id = item["source_id"].as_str().unwrap_or("").to_string();
@@ -3684,7 +3842,7 @@ impl PlaybackOrchestrator {
 
         let result = self.play(req).await?;
         self.playback
-            .update_queue_info(zone_id, position, streaming.len() as i64)
+            .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
             .await;
         Ok(result)
     }
@@ -3730,8 +3888,9 @@ impl PlaybackOrchestrator {
             return Ok(());
         }
 
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        if let Some(item) = streaming.get(position as usize) {
+        if let Some(item) = streaming.get((position - local_count).max(0) as usize) {
             let title = item["title"].as_str().unwrap_or("").to_string();
             let artist = item["artist_name"].as_str().map(String::from);
             let album = item["album_title"].as_str().map(String::from);
@@ -3765,7 +3924,7 @@ impl PlaybackOrchestrator {
             self.playback.update_position(zone_id, 0).await;
             self.playback.emit_position(zone_id, 0);
             self.playback
-                .update_queue_info(zone_id, position, streaming.len() as i64)
+                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
                 .await;
             return Ok(());
         }
@@ -3827,10 +3986,13 @@ impl PlaybackOrchestrator {
             });
         }
 
-        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.)
+        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.). Combined
+        // position space: local 0..L, streaming L..L+S — index by the offset
+        // within the streaming table.
+        let local_count = queue.len() as i64;
         let streaming = queue_repo.get_streaming_queue(zone_id)?;
         let item = streaming
-            .get(position as usize)
+            .get((position - local_count).max(0) as usize)
             .ok_or("no queue item at position (local or streaming)")?;
         let source_id = item["source_id"].as_str().unwrap_or("").to_string();
         let title = item["title"].as_str().map(String::from);
@@ -4555,10 +4717,39 @@ mod tests {
             temp_file_path: None,
         };
         let resolved = orch.resolve_direct_url(&req).await.unwrap();
-        // Proxying is now conditional: with no output device (and no DLNA
-        // renderer that needs transcoding), radio resolves to the direct URL.
+        // Since the Cyrille/Yamaha fix, ambiguous codecs (.aac/.ogg/HLS/
+        // extension-less) are ALWAYS proxied and transcoded to WAV, even
+        // without an output device: the advertised protocolInfo must match
+        // the bytes, or DLNA renderers play silence.
+        assert!(
+            resolved.stream_id.is_some(),
+            "ambiguous .aac radio must be proxied to WAV"
+        );
+        assert_eq!(resolved.mime_type, "audio/wav");
+    }
+
+    #[tokio::test]
+    async fn radio_reliable_mp3_passes_through_without_output_device() {
+        let orch = test_orchestrator();
+        let req = super::PlayRequest {
+            zone_id: 1,
+            output_device_id: None,
+            track_id: None,
+            source: Some("radio".into()),
+            source_id: Some("http://stream.example.com/station.mp3".into()),
+            title: Some("MP3 Station".into()),
+            artist_name: None,
+            album_title: None,
+            cover_url: None,
+            duration_ms: None,
+            seek_ms: None,
+            temp_file_path: None,
+        };
+        let resolved = orch.resolve_direct_url(&req).await.unwrap();
+        // Reliable extensions (.mp3/.flac/.wav) pass through untouched: no
+        // proxy session, no transcode cost.
         assert!(resolved.stream_id.is_none());
-        assert_eq!(resolved.url, "http://icecast.radiofrance.fr/fip-hifi.aac");
+        assert_eq!(resolved.url, "http://stream.example.com/station.mp3");
     }
 
     #[tokio::test]

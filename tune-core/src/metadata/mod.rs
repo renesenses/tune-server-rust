@@ -397,24 +397,51 @@ fn syncsafe_to_u32(bytes: &[u8]) -> u32 {
 /// Supports ID3v2.3 and ID3v2.4 text frames (TIT2, TPE1, TALB, etc.)
 /// and TXXX user-defined text frames. Skips binary frames (APIC, etc.)
 /// but notes their presence.
+/// Map an ID3v2.2 three-character frame id to its v2.3/v2.4 four-character
+/// equivalent so the rest of the reader (which keys on `TIT2`, `TPE1`, …) works.
+/// DSD/DSF files are frequently tagged with ID3v2.2 (Benjithom: the title showed
+/// as the filename because v2.2 was skipped entirely).
+fn map_id3v22_frame(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "TT2" => "TIT2", // title
+        "TT1" => "TIT1",
+        "TT3" => "TIT3",
+        "TP1" => "TPE1", // artist
+        "TP2" => "TPE2", // album artist
+        "TP3" => "TPE3",
+        "TAL" => "TALB", // album
+        "TRK" => "TRCK", // track number
+        "TPA" => "TPOS", // disc number
+        "TYE" => "TYER", // year
+        "TCO" => "TCON", // genre
+        "TCM" => "TCOM", // composer
+        "TCP" => "TCMP", // compilation flag
+        "TOR" => "TORY",
+        "TDA" => "TDAT",
+        "TXX" => "TXXX", // user-defined text
+        "PIC" => "APIC", // attached picture
+        _ => return None,
+    })
+}
+
 fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     if data.len() < 10 || &data[0..3] != b"ID3" {
         return None;
     }
 
-    let major_version = data[3]; // 3 = ID3v2.3, 4 = ID3v2.4
+    let major_version = data[3]; // 2 = ID3v2.2, 3 = ID3v2.3, 4 = ID3v2.4
     let _minor_version = data[4];
     let flags = data[5];
     let tag_size = syncsafe_to_u32(&data[6..10]) as usize;
 
-    // We only handle ID3v2.3 and ID3v2.4
-    if major_version < 3 || major_version > 4 {
+    // We handle ID3v2.2, v2.3 and v2.4.
+    if major_version < 2 || major_version > 4 {
         return None;
     }
 
-    // Check for extended header
+    // Extended header (v2.3/v2.4 only — in v2.2 that flag bit means compression).
     let mut pos = 10;
-    if flags & 0x40 != 0 {
+    if major_version >= 3 && flags & 0x40 != 0 {
         // Extended header present, skip it
         if pos + 4 > data.len() {
             return None;
@@ -430,28 +457,43 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     let tag_end = (10 + tag_size).min(data.len());
     let mut tags = Id3v2Tags::default();
 
-    while pos + 10 <= tag_end {
-        // Frame header: 4 bytes ID, 4 bytes size, 2 bytes flags
-        let frame_id = match std::str::from_utf8(&data[pos..pos + 4]) {
+    // v2.2 frames: 3-char id + 3-byte size, no flags (6-byte header).
+    // v2.3/v2.4 frames: 4-char id + 4-byte size + 2-byte flags (10-byte header).
+    let (id_len, header_len) = if major_version == 2 { (3, 6) } else { (4, 10) };
+
+    while pos + header_len <= tag_end {
+        let raw_id = match std::str::from_utf8(&data[pos..pos + id_len]) {
             Ok(s) => s.to_string(),
             Err(_) => break,
         };
 
         // Stop on padding (null bytes)
-        if frame_id.starts_with('\0') {
+        if raw_id.starts_with('\0') {
             break;
         }
 
-        let frame_size = if major_version == 4 {
-            syncsafe_to_u32(&data[pos + 4..pos + 8]) as usize
-        } else {
-            // ID3v2.3 uses regular big-endian u32 for frame size
-            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize
+        let frame_size = match major_version {
+            4 => syncsafe_to_u32(&data[pos + 4..pos + 8]) as usize,
+            3 => u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize,
+            // v2.2: 3-byte big-endian size.
+            _ => {
+                ((data[pos + 3] as usize) << 16)
+                    | ((data[pos + 4] as usize) << 8)
+                    | (data[pos + 5] as usize)
+            }
         };
 
-        let _frame_flags = u16::from_be_bytes([data[pos + 8], data[pos + 9]]);
-        pos += 10; // skip frame header
+        pos += header_len; // skip frame header
+
+        // Normalize v2.2 3-char ids to their v2.3/v2.4 equivalents.
+        let frame_id = if major_version == 2 {
+            map_id3v22_frame(&raw_id)
+                .map(|s| s.to_string())
+                .unwrap_or(raw_id)
+        } else {
+            raw_id
+        };
 
         if frame_size == 0 || pos + frame_size > tag_end {
             break;
@@ -975,7 +1017,9 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
 
 /// Fallback when lofty cannot parse the file at all (no audio properties).
 /// Extracts everything from the filesystem.
-fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
+/// Path/filename-only metadata (no file I/O). Used as a last resort when the
+/// tag reader fails or times out, so a file still appears in the library.
+pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
     let (track_number, title) = extract_title_from_filename(path);
     let parent = path.parent();
     let album = parent
@@ -2127,6 +2171,46 @@ mod tests {
         assert_eq!(tags.title(), Some("Test Title"));
         assert_eq!(tags.artist(), Some("Test Artist"));
         assert_eq!(tags.album(), Some("Test Album"));
+    }
+
+    #[test]
+    fn parse_id3v22_maps_three_char_frames() {
+        // ID3v2.2 tag (3-char frame ids, 6-byte frame header) as used by many
+        // DSD/DSF files — previously skipped, so the title fell back to filename.
+        let build_frame = |id: &[u8; 3], text: &str| {
+            let body_len = 1 + text.len(); // encoding byte + text
+            let mut f = Vec::new();
+            f.extend_from_slice(id);
+            f.extend_from_slice(&[
+                (body_len >> 16) as u8,
+                (body_len >> 8) as u8,
+                body_len as u8,
+            ]);
+            f.push(0x00); // ISO-8859-1
+            f.extend_from_slice(text.as_bytes());
+            f
+        };
+        let mut frames = Vec::new();
+        frames.extend(build_frame(b"TT2", "The Beat Goes On"));
+        frames.extend(build_frame(b"TP1", "Sonny & Cher"));
+        frames.extend(build_frame(b"TAL", "Best Of"));
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[0x02, 0x00, 0x00]); // v2.2.0, no flags
+        let size = frames.len();
+        tag.extend_from_slice(&[
+            (size >> 21) as u8 & 0x7f,
+            (size >> 14) as u8 & 0x7f,
+            (size >> 7) as u8 & 0x7f,
+            size as u8 & 0x7f,
+        ]);
+        tag.extend_from_slice(&frames);
+
+        let tags = parse_id3v2_tag(&tag).unwrap();
+        assert_eq!(tags.title(), Some("The Beat Goes On"));
+        assert_eq!(tags.artist(), Some("Sonny & Cher"));
+        assert_eq!(tags.album(), Some("Best Of"));
     }
 
     #[test]

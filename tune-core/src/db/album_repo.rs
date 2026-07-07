@@ -778,7 +778,21 @@ impl AlbumRepo {
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
-            "added_at" => format!("a.id {dir}"),
+            // "Date added" must survive a full rescan. A full rescan does
+            // `DELETE FROM albums` + reinsert (track_repo::delete_all), so
+            // album ids are reassigned in filesystem-walk order — sorting by
+            // `a.id` reflects the walk order, not when files were added, and
+            // file mtime is unreliable for bulk-copied NAS libraries (eric:
+            // "tri par date d'ajout fantaisiste après rescan"). Use the
+            // persistent `file_first_seen` timestamp (recorded once per path,
+            // never purged by delete_all), falling back to file mtime for any
+            // track not yet recorded. Streaming albums have no local file →
+            // NULLS LAST, id tiebreaker.
+            "added_at" => format!(
+                "(SELECT MAX(COALESCE(ffs.first_seen_at, t.file_mtime)) \
+                  FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
+                  WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
+            ),
             _ => format!("a.id {dir}"),
         };
 
@@ -1549,6 +1563,90 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn added_at_sorts_by_persistent_first_seen_not_id_or_mtime() {
+        // Regression (eric): a full rescan does DELETE FROM albums + reinsert,
+        // so album ids reflect filesystem-walk order, not add order; file mtime
+        // is also unreliable for bulk-copied NAS libraries. "Date added" sorts
+        // by the persistent `file_first_seen` timestamp (survives full rescan).
+        // Here ids are A<B<C and mtimes make C newest, but first_seen makes A
+        // newest — so the sort must follow first_seen, overriding both.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+
+        // mtimes deliberately opposite to the desired order (C newest by mtime).
+        for (album_id, path, mtime) in [
+            (a, "/a.flac", 1000.0),
+            (b, "/b.flac", 2000.0),
+            (c, "/c.flac", 3000.0),
+        ] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+
+        // Persistent first-seen makes A newest, C oldest (opposite of mtime/id).
+        for (path, seen) in [
+            ("/a.flac", 3000.0f64),
+            ("/b.flac", 2000.0),
+            ("/c.flac", 1000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen} WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        // desc = most recently added first → A (3000), B (2000), C (1000)
+        let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        assert_eq!(desc[0].title, "A");
+        assert_eq!(desc[1].title, "B");
+        assert_eq!(desc[2].title, "C");
+
+        // asc = oldest first → C, B, A
+        let asc = arepo.list_sorted(100, 0, "added_at", "asc").unwrap();
+        assert_eq!(asc[0].title, "C");
+        assert_eq!(asc[2].title, "A");
+    }
+
+    #[test]
+    fn added_at_falls_back_to_mtime_without_first_seen() {
+        // When a track has no file_first_seen row yet (e.g. legacy row inserted
+        // outside create()), the sort falls back to file mtime via COALESCE.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+
+        for (album_id, path, mtime) in [(a, "/a.flac", 3000.0), (b, "/b.flac", 1000.0)] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+
+        // Remove the auto-recorded first_seen rows so the fallback path is used.
+        db.execute_batch("DELETE FROM file_first_seen;").unwrap();
+
+        let desc = arepo.list_sorted(100, 0, "added_at", "desc").unwrap();
+        assert_eq!(desc[0].title, "A"); // mtime 3000 newest
+        assert_eq!(desc[1].title, "B");
     }
 
     #[test]

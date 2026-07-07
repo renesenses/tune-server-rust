@@ -1009,6 +1009,14 @@ impl OutputTarget for LocalOutput {
         "local"
     }
 
+    /// Exclusive-mode playback (ASIO / WASAPI exclusive) uses a dedicated loop
+    /// that returns at EOF without consuming the staged `next_media`, so it
+    /// cannot chain internally — the poller must fall back to natural-end
+    /// advance. Only the shared cpal path performs internal gapless chaining.
+    fn supports_internal_gapless(&self) -> bool {
+        !self.exclusive_mode
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1746,6 +1754,7 @@ impl OutputTarget for LocalOutput {
                 }
 
                 let mut http_eof_asio = false;
+                let mut last_data_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1760,11 +1769,33 @@ impl OutputTarget for LocalOutput {
                             http_eof_asio = true;
                             break;
                         }
-                        Ok(n) => n,
+                        Ok(n) => {
+                            last_data_at = std::time::Instant::now();
+                            n
+                        }
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::TimedOut
                                 || e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
+                            // A streaming HTTP source (transcoded WAV over a
+                            // keep-alive connection) may never return a clean
+                            // EOF: after the last byte it just keeps timing out.
+                            // Once the whole track has been fed AND the ring has
+                            // fully drained (everything played), a sustained read
+                            // idle means the track ended — signal EOF so the
+                            // orchestrator can advance/repeat. Without this, the
+                            // loop spins forever and end-of-track is never
+                            // detected on exclusive ASIO outputs (DEvir: repeat
+                            // never fired on a clean playthrough).
+                            if total_frames_fed > 0
+                                && leftover.is_empty()
+                                && ring.available() == 0
+                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
+                            {
+                                info!("local_audio_asio_exclusive_stream_idle_eof");
+                                http_eof_asio = true;
+                                break;
+                            }
                             continue;
                         }
                         Err(e) => {
@@ -2073,6 +2104,40 @@ impl OutputTarget for LocalOutput {
                         device_default_sr = ?default_sr,
                         "local_audio_open_at_source_rate_supported"
                     );
+                    // macOS: cpal's CoreAudio backend does NOT switch the device's
+                    // hardware nominal rate for output streams (see the note
+                    // above), so opening the cpal stream "at the source rate"
+                    // leaves the DAC clocked at the OS rate and CoreAudio silently
+                    // converts — which yields SILENCE for high-rate DSD→PCM
+                    // (DSD128/256/512 all decode to 352.8kHz; only DSD64's 176.4k
+                    // survived). We reach this branch precisely when the device
+                    // SUPPORTS the source rate but its default differs, so set the
+                    // hardware nominal rate explicitly (what the exclusive/hog path
+                    // already does) — the DAC then actually clocks at 352.8kHz.
+                    // Best-effort: if the device can't be resolved/set we fall
+                    // through to today's behavior (no regression). Cyrille: iFi
+                    // Neo iDSD / FiiO K3, DSD128+ silent.
+                    #[cfg(target_os = "macos")]
+                    {
+                        use coreaudio::audio_unit::macos_helpers;
+                        if let Some(dev_id) =
+                            macos_helpers::get_device_id_from_name(&device_name, false)
+                        {
+                            let want = cfg.sample_rate as f64;
+                            match macos_helpers::set_device_sample_rate(dev_id, want) {
+                                Ok(_) => info!(
+                                    device = %device_name,
+                                    to = cfg.sample_rate,
+                                    "local_audio_coreaudio_nominal_rate_set_shared"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    wanted = cfg.sample_rate,
+                                    "local_audio_coreaudio_set_rate_failed"
+                                ),
+                            }
+                        }
+                    }
                     cfg
                 } else if let Some(cfg) = default_cfg {
                     // Device does not support the source rate — open at device

@@ -228,6 +228,16 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         set_phase("extracting");
 
         let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+        // Sweep leftover tune-update-* dirs from earlier updates. The success
+        // path used to never remove the extraction dir, so one accumulated per
+        // version (Benjithom, Windows: a new folder on every update).
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with("tune-update-") {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         if tmp_dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
@@ -302,6 +312,12 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
             return;
         }
 
+        // Success: install_windows/install_unix have copied the binary + web/
+        // into the install dir (the Windows .bat swap works entirely within
+        // exe_dir), so the extraction dir is no longer needed. Removing it here
+        // stops the per-version accumulation.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
         info!(
             from = %tune_core::version(),
             to = %version,
@@ -315,23 +331,39 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         info!("update_restarting");
 
         // Spawn the updated binary before exiting. On systemd (Restart=always)
-        // this is redundant but harmless. On macOS/Windows without a service
-        // manager, this ensures the server comes back up after the update.
-        let exe = current_exe.clone();
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        match std::process::Command::new(&exe)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => {
-                info!(pid = child.id(), exe = %exe.display(), "update_new_process_spawned");
+        // this is redundant but harmless. On macOS without a service manager
+        // this ensures the server comes back up after the update.
+        //
+        // On WINDOWS we must NOT spawn here. The Windows binary is swapped by
+        // tune-update.bat, which first waits for THIS process (tune-server.exe)
+        // to exit. Spawning current_exe now would start a *second*
+        // tune-server.exe from the still-old binary, keeping the image name
+        // alive forever — so the .bat's wait_loop never completes, the swap
+        // never runs, and the restarted server is still the old version.
+        // Christophe's log showed exactly this: `update_installed to=0.8.261`
+        // then a restart as `version=0.8.260`. Just exit; the .bat swaps the
+        // binary and starts the new one.
+        if !cfg!(windows) {
+            let exe = current_exe.clone();
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            match std::process::Command::new(&exe)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => {
+                    info!(pid = child.id(), exe = %exe.display(), "update_new_process_spawned");
+                }
+                Err(e) => {
+                    warn!(error = %e, "update_restart_spawn_failed — manual restart required");
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "update_restart_spawn_failed — manual restart required");
-            }
+        } else {
+            info!(
+                "update_windows_exiting_for_bat_swap — tune-update.bat will swap the binary and restart"
+            );
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

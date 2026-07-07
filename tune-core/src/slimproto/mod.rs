@@ -441,8 +441,69 @@ impl SlimProtoServer {
 
     /// Handle a single client connection.
     async fn handle_client(&self, mut stream: TcpStream, peer: SocketAddr) -> Result<(), String> {
-        // The first message from a Squeezelite client should be HELO.
-        let first_msg = read_message(&mut stream).await?;
+        // Non-destructively peek the first bytes so an unusual handshake framing
+        // is visible in the log. Tune expects `[len:2][tag:4][payload]`; if a
+        // client (Progman's slim2diretta) uses a different framing, read_message
+        // would misread the length and block. Logging the raw hex/ASCII of the
+        // first bytes lets us identify the actual framing from a user's log.
+        {
+            let mut peek_buf = [0u8; 16];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stream.peek(&mut peek_buf),
+            )
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    let hex: String = peek_buf[..n]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let ascii: String = peek_buf[..n]
+                        .iter()
+                        .map(|&b| {
+                            if (0x20..0x7f).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    info!(peer = %peer, bytes = n, hex = %hex, ascii = %ascii, "slimproto_first_bytes");
+                }
+                Ok(Ok(_)) => {
+                    warn!(peer = %peer, "slimproto_peer_closed_before_handshake");
+                }
+                Ok(Err(e)) => {
+                    warn!(peer = %peer, error = %e, "slimproto_peek_failed");
+                }
+                Err(_) => {
+                    warn!(peer = %peer, "slimproto_no_bytes_within_10s — client connected but sent nothing");
+                }
+            }
+        }
+
+        // The first message from a Squeezelite client should be HELO. Bound the
+        // read: a client that connects but never sends a parseable HELO (or uses
+        // a different framing) would otherwise hang read_message forever with no
+        // log and never register a zone (Progman's slim2diretta — TCP connects,
+        // then silence). Time out so the issue surfaces and the socket is freed.
+        let first_msg = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            read_message(&mut stream),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                warn!(
+                    peer = %peer,
+                    "slimproto_helo_timeout — no HELO within 15s (client connected but sent no parseable handshake)"
+                );
+                return Err("HELO read timed out".into());
+            }
+        };
         let mac_str = match first_msg {
             ClientMessage::Helo {
                 device_type,

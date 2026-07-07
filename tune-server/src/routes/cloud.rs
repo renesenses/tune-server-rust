@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -71,20 +71,38 @@ fn get_mozaik_auth(settings: &SettingsRepo) -> Option<MozaikAuth> {
     Some(MozaikAuth::new(client_id, Some(&base_url)))
 }
 
-/// Loopback redirect URI (RFC 8252 §7.3, Option A). Uses the literal loopback
-/// address `127.0.0.1` on the variable listening port; Passport registers
-/// `http://127.0.0.1` and accepts any loopback port. Overridable via the
-/// `mozaik_redirect_uri` setting.
-fn redirect_uri(state: &AppState) -> String {
+/// OAuth redirect URI for the SSO round-trip.
+///
+/// Precedence: explicit `mozaik_redirect_uri` setting → the address the browser
+/// actually used to reach Tune (the request `Host` header) → the RFC 8252
+/// loopback default `127.0.0.1:{port}`.
+///
+/// The loopback default (RFC 8252 §7.3) only works when the browser and server
+/// share a machine. When Tune runs on a remote box reached over the LAN
+/// (`192.168.x.x:8888`), a `127.0.0.1` redirect lands on the *browser's* own
+/// loopback and the login "spins" (Fabien). Deriving the host from the request
+/// keeps that case working — provided the OAuth server (Passport) accepts the
+/// resulting non-loopback redirect URI.
+fn redirect_uri(state: &AppState, headers: Option<&HeaderMap>) -> String {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings
+    if let Some(explicit) = settings
         .get("mozaik_redirect_uri")
         .ok()
         .flatten()
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}/api/v1/cloud/sso/callback", state.port))
+        .filter(|s| !s.is_empty())
+    {
+        return explicit;
+    }
+    let host = headers
+        .and_then(|h| h.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| format!("127.0.0.1:{}", state.port));
+    format!("http://{host}/api/v1/cloud/sso/callback")
 }
 
-async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
+async fn sso_authorize(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -112,7 +130,10 @@ async fn sso_authorize(State(state): State<AppState>) -> impl IntoResponse {
         )
         .ok();
 
-    let uri = redirect_uri(&state);
+    let uri = redirect_uri(&state, Some(&headers));
+    // Persist the exact redirect_uri: OAuth requires the token exchange in the
+    // callback to present an identical value.
+    settings.set("mozaik_redirect_uri_pending", &uri).ok();
     let url = auth.authorize_url(&uri, &pkce.challenge, &pkce.state);
     Redirect::temporary(&url).into_response()
 }
@@ -126,6 +147,7 @@ struct CallbackQuery {
 
 async fn sso_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
     if let Some(err) = q.error {
@@ -178,7 +200,15 @@ async fn sso_callback(
             .into_response();
     }
 
-    let uri = redirect_uri(&state);
+    // Reuse the exact redirect_uri minted at authorize time (must match); fall
+    // back to deriving it from this request's Host if the pending value is gone.
+    let uri = settings
+        .get("mozaik_redirect_uri_pending")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| redirect_uri(&state, Some(&headers)));
+    settings.set("mozaik_redirect_uri_pending", "").ok();
 
     let token = match auth.exchange_code(&code, &uri, &pkce.verifier).await {
         Ok(t) => t,
@@ -231,26 +261,33 @@ async fn sso_callback(
         .and_then(|row| row.first().and_then(|v| v.as_i64()));
 
     let profile_id = if let Some(id) = existing_id {
-        // Update display name / avatar from cloud profile
+        // Update display name from the cloud profile — but NOT avatar_path.
+        // The `avatar_path` column stores the profile's chosen avatar COLOR
+        // (hex), and the client fetches the cloud avatar image separately from
+        // /cloud/sso/status. Overwriting avatar_path with the SSO avatar URL
+        // destroyed the user's chosen colour on every SSO login (Bilou:
+        // "couleur de fond du profil non mémorisée après connexion").
         state
             .backend
             .execute(
-                "UPDATE profiles SET display_name = ?, avatar_path = ? WHERE id = ?",
+                "UPDATE profiles SET display_name = ? WHERE id = ?",
                 &[
                     &user.display_name as &dyn ToSqlValue,
-                    &user.avatar_url as &dyn ToSqlValue,
                     &id as &dyn ToSqlValue,
                 ],
             )
             .ok();
         id
     } else {
-        // Create new local profile from cloud user
+        // Create new local profile from cloud user. Seed avatar_path with a
+        // default colour (not the SSO URL) so the fallback avatar circle has a
+        // valid colour when disconnected; the cloud image is shown separately.
+        let default_color = "#6366f1";
         state
             .backend
             .execute(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &user.avatar_url as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
+                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &user.is_admin as &dyn ToSqlValue],
             )
             .ok();
         state.backend.last_insert_rowid()
