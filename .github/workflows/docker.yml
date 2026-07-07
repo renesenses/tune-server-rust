@@ -58,9 +58,11 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          # RC tags (v*-rc*) publish their versioned image but NOT :latest, so
+          # `docker pull renesenses/tune:latest` stays on the stable channel.
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE_NAME }}:latest
+            ${{ !contains(github.ref_name, '-') && format('{0}:latest', env.IMAGE_NAME) || '' }}
           labels: |
             org.opencontainers.image.title=Tune Server
             org.opencontainers.image.description=Music server for audiophiles — DLNA, Chromecast, streaming services
