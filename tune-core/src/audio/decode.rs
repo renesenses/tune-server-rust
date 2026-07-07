@@ -285,11 +285,14 @@ pub fn decode_to_pcm(
         );
     }
 
-    // Opus/Ogg-Vorbis (and the WebM container YouTube delivers Opus in) are
-    // routed through ffmpeg rather than symphonia: ffmpeg demuxes the WebM
-    // container that symphonia does not handle, sniffing by content so a file
-    // named ".opus" that actually holds WebM still decodes correctly.
-    if ext == "opus" || ext == "ogg" || ext == "oga" || ext == "webm" || ext == "weba" {
+    // Ogg-Vorbis (.ogg / .oga) is decoded NATIVELY by symphonia (the "ogg"
+    // demuxer + "vorbis" codec features are enabled), so it must NOT be routed
+    // to the ffmpeg fallback — ffmpeg was removed from the project (v0.8.46), so
+    // that path always fails now and would break .ogg playback entirely.
+    // Only Opus and the WebM container (which symphonia can't demux/decode)
+    // still hit the fallback — that path is effectively unsupported without
+    // ffmpeg, but it's the pre-existing Opus limitation, not a regression.
+    if ext == "opus" || ext == "webm" || ext == "weba" {
         return decode_via_ffmpeg(
             file_path,
             target_sample_rate,
