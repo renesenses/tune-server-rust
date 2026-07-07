@@ -1264,10 +1264,34 @@ impl PositionPoller {
                             .map(|z| z.gapless_enabled)
                             .unwrap_or(true);
                         if gapless_enabled {
-                            let ok = self.prepare_gapless(zone_id, zone_state, &device_id).await;
-                            if ok {
-                                ps.gapless_sent_at = Some(Instant::now());
+                            // Exclusive-mode local outputs (ASIO / WASAPI
+                            // exclusive) can't chain internally. Detect that
+                            // BEFORE prepare_gapless resolves the next URL —
+                            // otherwise it downloads + transcodes the next track
+                            // then discards it, and because prepare_gapless
+                            // returns false, gapless_sent stays false and this
+                            // branch re-fires every tick, re-downloading the same
+                            // track in a tight loop (DEvir: repeat=one on ASIO
+                            // Fireface, 55 wasted Qobuz downloads/min). Mark
+                            // gapless_sent so we stop retrying; the natural-end
+                            // fallback advances/repeats the queue.
+                            let can_internal_gapless = {
+                                let outputs = self.outputs.lock().await;
+                                match outputs.get(&device_id) {
+                                    Some(arc) => arc.lock().await.supports_internal_gapless(),
+                                    None => true,
+                                }
+                            };
+                            if !can_internal_gapless {
+                                info!(zone_id, "gapless_skipped_exclusive_output");
                                 ps.gapless_sent = true;
+                            } else {
+                                let ok =
+                                    self.prepare_gapless(zone_id, zone_state, &device_id).await;
+                                if ok {
+                                    ps.gapless_sent_at = Some(Instant::now());
+                                    ps.gapless_sent = true;
+                                }
                             }
                         } else {
                             debug!(zone_id, "gapless_disabled_for_zone");
