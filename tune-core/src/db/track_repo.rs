@@ -329,6 +329,30 @@ impl TrackRepo {
             &track.comments,
         ];
         self.db.execute(&sql, &params).map_err(TuneError::Db)?;
+
+        // Record the library "first seen" timestamp for local files, keyed by
+        // path in a side table that survives a full rescan (delete_all wipes
+        // tracks/albums but not file_first_seen). Best-effort: never fail track
+        // creation over this. Streaming tracks (http URLs / no path) are skipped.
+        if let Some(path) = track.file_path.as_deref() {
+            if !path.is_empty() && !path.starts_with("http") {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let fs_sql = match self.db.engine() {
+                    Engine::Postgres => {
+                        "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
+                    }
+                    Engine::Sqlite => {
+                        "INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) VALUES (?, ?)"
+                    }
+                };
+                let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
+                let _ = self.db.execute(fs_sql, &fs_params);
+            }
+        }
+
         Ok(self.db.last_insert_rowid())
     }
 

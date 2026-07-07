@@ -347,6 +347,11 @@ CREATE TABLE IF NOT EXISTS album_ratings (
     UNIQUE(album_id, profile_id)
 );
 
+CREATE TABLE IF NOT EXISTS file_first_seen (
+    file_path TEXT PRIMARY KEY,
+    first_seen_at DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS smart_playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

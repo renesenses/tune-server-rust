@@ -615,6 +615,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_smart_collections_name ON smart_collection
         name: "add_zones_dlna_native_flac",
         up: "", // Applied programmatically via add_column_if_missing
     },
+    Migration {
+        version: 51,
+        name: "add_file_first_seen",
+        up: "
+CREATE TABLE IF NOT EXISTS file_first_seen (
+    file_path TEXT PRIMARY KEY,
+    first_seen_at REAL NOT NULL
+);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -973,6 +983,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");
+
+    // Persistent "date added" side table (survives full rescan). CREATE IF NOT
+    // EXISTS here too so DBs from any prior version get it regardless of which
+    // migration version they came from.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at REAL NOT NULL);",
+    )
+    .ok();
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");

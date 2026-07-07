@@ -259,6 +259,16 @@ CREATE TABLE IF NOT EXISTS track_credits (
     position INTEGER DEFAULT 0
 );
 
+-- Persistent per-file first-seen-in-library timestamp, keyed by path.
+-- Deliberately NOT a column on tracks/albums: a full rescan does
+-- DELETE FROM tracks/albums (ids reassigned in walk order), which would reset
+-- any timestamp there. This side table is never purged by delete_all, so the
+-- date-added sort survives a full rescan. Populated INSERT-OR-IGNORE at scan.
+CREATE TABLE IF NOT EXISTS file_first_seen (
+    file_path TEXT PRIMARY KEY,
+    first_seen_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
