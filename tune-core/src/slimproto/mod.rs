@@ -26,6 +26,11 @@ use tracing::{debug, info, warn};
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PORT: u16 = 3483;
+
+/// Sanity cap on a client message payload length (SqueezeBox control messages
+/// are tiny — HELO ~172 bytes). Rejects a mis-framed/huge length before we try
+/// to allocate for it.
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
@@ -97,28 +102,32 @@ pub enum ServerMessage {
 
 /// Read one client→server message from the TCP stream.
 ///
-/// Wire format: `[2 bytes: length BE] [4 bytes: tag] [N bytes: payload]`
-/// where length = 4 (tag) + N (payload).
+/// Wire format (client → server): `[4 bytes: tag] [4 bytes: length BE] [N bytes:
+/// payload]` where length = N (payload only). This is the standard
+/// SlimProto/SqueezeBox client framing — e.g. a `HELO` from slim2diretta:
+/// `48 45 4c 4f | 00 00 00 ac | …` (Progman). The previous code read
+/// `[2-byte length][4-byte tag]` (the *server → client* framing), which
+/// misparsed every client message and hung the handshake.
 pub async fn read_message(stream: &mut TcpStream) -> Result<ClientMessage, String> {
-    // 1. Read 2-byte length prefix (big-endian).
-    let len = stream
-        .read_u16()
-        .await
-        .map_err(|e| format!("read length: {e}"))? as usize;
-
-    if len < 4 {
-        return Err(format!("message too short: len={len}"));
-    }
-
-    // 2. Read 4-byte command tag.
+    // 1. Read the 4-byte command tag.
     let mut tag = [0u8; 4];
     stream
         .read_exact(&mut tag)
         .await
         .map_err(|e| format!("read tag: {e}"))?;
 
-    // 3. Read remaining payload.
-    let payload_len = len - 4;
+    // 2. Read the 4-byte big-endian payload length.
+    let payload_len = stream
+        .read_u32()
+        .await
+        .map_err(|e| format!("read length: {e}"))? as usize;
+
+    // Guard against an absurd allocation from a mis-framed / hostile client.
+    if payload_len > MAX_MESSAGE_LEN {
+        return Err(format!("payload too large: {payload_len} bytes"));
+    }
+
+    // 3. Read the payload.
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
         stream
