@@ -145,7 +145,7 @@ pub struct LicenseState {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FREE_MAX_ZONES: i64 = 10;
+const FREE_MAX_ZONES: i64 = 3;
 const GRACE_PERIOD_DAYS: i64 = 30;
 
 // ---------------------------------------------------------------------------
@@ -699,9 +699,9 @@ mod tests {
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(!mgr.check_feature(Feature::DspEq).await);
-        // Free tier allows up to FREE_MAX_ZONES (10) zones.
-        assert!(mgr.check_zone_limit(9).await);
-        assert!(!mgr.check_zone_limit(10).await);
+        // Free tier allows up to FREE_MAX_ZONES (3) zones.
+        assert!(mgr.check_zone_limit(2).await);
+        assert!(!mgr.check_zone_limit(3).await);
     }
 
     #[tokio::test]
