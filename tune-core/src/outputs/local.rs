@@ -1754,6 +1754,7 @@ impl OutputTarget for LocalOutput {
                 }
 
                 let mut http_eof_asio = false;
+                let mut last_data_at = std::time::Instant::now();
                 loop {
                     if stop_rx.try_recv().is_ok() {
                         break;
@@ -1768,11 +1769,33 @@ impl OutputTarget for LocalOutput {
                             http_eof_asio = true;
                             break;
                         }
-                        Ok(n) => n,
+                        Ok(n) => {
+                            last_data_at = std::time::Instant::now();
+                            n
+                        }
                         Err(ref e)
                             if e.kind() == std::io::ErrorKind::TimedOut
                                 || e.kind() == std::io::ErrorKind::WouldBlock =>
                         {
+                            // A streaming HTTP source (transcoded WAV over a
+                            // keep-alive connection) may never return a clean
+                            // EOF: after the last byte it just keeps timing out.
+                            // Once the whole track has been fed AND the ring has
+                            // fully drained (everything played), a sustained read
+                            // idle means the track ended — signal EOF so the
+                            // orchestrator can advance/repeat. Without this, the
+                            // loop spins forever and end-of-track is never
+                            // detected on exclusive ASIO outputs (DEvir: repeat
+                            // never fired on a clean playthrough).
+                            if total_frames_fed > 0
+                                && leftover.is_empty()
+                                && ring.available() == 0
+                                && last_data_at.elapsed() > std::time::Duration::from_secs(5)
+                            {
+                                info!("local_audio_asio_exclusive_stream_idle_eof");
+                                http_eof_asio = true;
+                                break;
+                            }
                             continue;
                         }
                         Err(e) => {
