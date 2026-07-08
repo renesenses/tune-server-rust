@@ -2624,22 +2624,45 @@ impl PlaybackOrchestrator {
             .clone()
             .or_else(|| prefetched.cover_url.clone());
 
+        // Duration can also be missing from the prefetch buffer (metadata not
+        // resolved at prefetch time → `prefetched.duration_ms == 0`). Serving a
+        // zero duration is worse than a blank title: on an exclusive output the
+        // poller's position-based end detection needs duration > 0, so a
+        // 0-duration repeat can only advance via the 45 s load-grace timeout —
+        // and since the next repeat inherits 0 again, playback falls into an
+        // infinite 45 s silent loading loop (DEvir: seek under Repeat One).
+        // Prefer the prefetch value, fall back to the request, then recover from
+        // the service metadata below alongside the title.
+        let mut duration_ms: u64 = if prefetched.duration_ms > 0 {
+            prefetched.duration_ms
+        } else {
+            req.duration_ms
+                .filter(|d| *d > 0)
+                .map(|d| d as u64)
+                .unwrap_or(0)
+        };
+
         // Both the request and the prefetch buffer can carry an empty title when
         // the streaming_queue row was persisted without metadata (DEvir: Repeat
         // All on a single-track queue prefetches itself, then re-plays via this
         // prefetched path with `title=""` — auto_next logs the right title but
-        // orchestrator_play/Now Playing go blank). When that happens, refetch the
-        // real metadata from the service so Now Playing is never blanked. Fires
-        // only when the title is missing, so the normal path is untouched.
-        if title.is_empty() {
+        // orchestrator_play/Now Playing go blank). When that (or a missing
+        // duration) happens, refetch the real metadata from the service so Now
+        // Playing is never blanked and end detection has a duration.
+        if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
                 let svc = svc.lock().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
-                    title = track.title;
-                    artist = artist.or(Some(track.artist));
-                    album = album.or(track.album);
-                    cover_url = cover_url.or(track.cover_path);
+                    if title.is_empty() {
+                        title = track.title;
+                        artist = artist.or(Some(track.artist));
+                        album = album.or(track.album);
+                        cover_url = cover_url.or(track.cover_path);
+                    }
+                    if duration_ms == 0 && track.duration_ms > 0 {
+                        duration_ms = track.duration_ms;
+                    }
                 }
             }
         }
@@ -2767,7 +2790,7 @@ impl PlaybackOrchestrator {
                 bit_depth: out_bd,
                 channels: ch,
                 file_size: Some(file_size),
-                duration_ms: Some(prefetched.duration_ms),
+                duration_ms: Some(duration_ms),
                 ..Default::default()
             };
 
@@ -2787,7 +2810,7 @@ impl PlaybackOrchestrator {
                 title: title.clone(),
                 artist: artist.clone(),
                 album: None,
-                duration_ms: Some(prefetched.duration_ms as i64),
+                duration_ms: Some(duration_ms as i64),
                 source: prefetched.source,
                 mime_type: "audio/flac".into(),
                 sample_rate: Some(sr),
@@ -2805,7 +2828,7 @@ impl PlaybackOrchestrator {
             bit_depth: out_bd,
             channels: ch,
             file_size: None,
-            duration_ms: Some(prefetched.duration_ms),
+            duration_ms: Some(duration_ms),
             ..Default::default()
         };
 
@@ -2855,7 +2878,7 @@ impl PlaybackOrchestrator {
             title: title.clone(),
             artist: artist.clone(),
             album: album.clone(),
-            duration_ms: Some(prefetched.duration_ms as i64),
+            duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
             cover_url: cover_url.clone(),
             stream_id: Some(session_id),
