@@ -413,8 +413,8 @@ impl PlaybackOrchestrator {
                 let zone_id = req.zone_id;
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let outputs = outputs.lock().await;
-                    if let Some(output) = outputs.get(&did) {
+                    let arc = { outputs.lock().await.get(&did) };
+                    if let Some(output) = arc {
                         let vol_clamped = zone_volume.clamp(0.0, 1.0);
                         if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
                             warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
@@ -532,8 +532,8 @@ impl PlaybackOrchestrator {
         // Sink) — fall back conservatively but do NOT cache, so one transient
         // failure doesn't force WAV for the whole session (Marco's Denon).
         let probe = {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(device_id) {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(output) = arc {
                 let locked = output.lock().await;
                 if let Some(dlna) = locked
                     .as_any()
@@ -583,8 +583,8 @@ impl PlaybackOrchestrator {
                     return cap.supports_dsf || cap.supports_dff;
                 }
                 let cap = {
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(device_id) {
+                    let arc = { self.outputs.lock().await.get(device_id) };
+                    if let Some(output) = arc {
                         let locked = output.lock().await;
                         if let Some(dlna) = locked
                             .as_any()
@@ -2932,8 +2932,8 @@ impl PlaybackOrchestrator {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
         }
-        let outputs = self.outputs.lock().await;
-        if let Some(arc) = outputs.get(device_id) {
+        let arc = { self.outputs.lock().await.get(device_id) };
+        if let Some(arc) = arc {
             let output = arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
@@ -3311,8 +3311,11 @@ impl PlaybackOrchestrator {
             .ok();
         self.playback.pause(zone_id).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            // Snapshot the output Arc under a short lock, then release the
+            // registry lock BEFORE the SOAP call: holding it across per-device
+            // network I/O lets one slow/offline renderer freeze all playback.
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.pause().await {
                     warn!(zone_id, error = %e, "device_pause_failed");
                 }
@@ -3328,8 +3331,8 @@ impl PlaybackOrchestrator {
 
         let Some(did) = device_id else { return };
         let output_type = {
-            let outputs = self.outputs.lock().await;
-            let Some(output) = outputs.get(did) else {
+            let arc = { self.outputs.lock().await.get(did) };
+            let Some(output) = arc else {
                 return;
             };
             let out = output.lock().await;
@@ -3347,8 +3350,8 @@ impl PlaybackOrchestrator {
         // the wait so other zones aren't blocked.
         if (output_type == "dlna" || output_type == "openhome") && position_ms > 3000 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 match output.lock().await.seek(position_ms).await {
                     Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
                     Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
@@ -3381,19 +3384,27 @@ impl PlaybackOrchestrator {
                 .and_then(|z| z.output_device_id),
         };
         if let Some(ref did) = resolved_did {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.stop().await {
                     warn!(zone_id, error = %e, "device_stop_failed");
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback
-            let outputs = self.outputs.lock().await;
-            for did in outputs.list() {
-                if let Some(output) = outputs.get(&did) {
-                    let _ = output.lock().await.stop().await;
-                }
+            // No device_id found — stop ALL registered outputs as fallback.
+            // Snapshot the Arcs first and release the registry lock, so a slow
+            // or offline renderer's stop() SOAP timeout can't hold the lock and
+            // starve concurrent playback for ~100s (send_to_output_lock_contention).
+            let arcs: Vec<_> = {
+                let outputs = self.outputs.lock().await;
+                outputs
+                    .list()
+                    .iter()
+                    .filter_map(|did| outputs.get(did))
+                    .collect()
+            };
+            for output in arcs {
+                let _ = output.lock().await.stop().await;
             }
             warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
         }
@@ -3499,8 +3510,8 @@ impl PlaybackOrchestrator {
                         "seek_streaming_direct_on_seekable_session"
                     );
 
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(did) {
+                    let arc = { self.outputs.lock().await.get(did) };
+                    if let Some(output) = arc {
                         if let Err(e) = output.lock().await.seek(position_ms).await {
                             warn!(zone_id, error = %e, "device_seek_on_seekable_session_failed");
                         }
@@ -3562,8 +3573,8 @@ impl PlaybackOrchestrator {
                             // Stream is now fresh — issue the seek on the output.
                             // Small delay to let the renderer start buffering.
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did) {
+                            let arc = { self.outputs.lock().await.get(did) };
+                            if let Some(output) = arc {
                                 if let Err(e) = output.lock().await.seek(position_ms).await {
                                     warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
                                 }
@@ -3585,8 +3596,8 @@ impl PlaybackOrchestrator {
                             // misinterpret the Stopped state as a playback failure.
                             self.playback.seek(zone_id, position_ms as i64).await;
                             // Fall back to direct seek (best effort)
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did) {
+                            let arc = { self.outputs.lock().await.get(did) };
+                            if let Some(output) = arc {
                                 if let Err(e) = output.lock().await.seek(position_ms).await {
                                     warn!(zone_id, error = %e, "device_seek_fallback_failed");
                                 }
@@ -3624,11 +3635,10 @@ impl PlaybackOrchestrator {
                             .and_then(|z| z.output_device_id)
                     }) {
                         if did.starts_with("local:") || did.starts_with("oaat:") {
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did.as_str()) {
+                            let arc = { self.outputs.lock().await.get(did.as_str()) };
+                            if let Some(output) = arc {
                                 let _ = output.lock().await.stop().await;
                             }
-                            drop(outputs);
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         }
                     }
@@ -3670,8 +3680,8 @@ impl PlaybackOrchestrator {
                         }
                     }
                 } else {
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(did) {
+                    let arc = { self.outputs.lock().await.get(did) };
+                    if let Some(output) = arc {
                         if let Err(e) = output.lock().await.seek(position_ms).await {
                             warn!(zone_id, error = %e, "device_seek_failed");
                         }
@@ -3696,8 +3706,8 @@ impl PlaybackOrchestrator {
         self.playback.set_volume(zone_id, volume).await;
         self.playback.mark_volume_changed(zone_id).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 info!(
                     zone_id,
                     volume,
@@ -3722,8 +3732,8 @@ impl PlaybackOrchestrator {
     pub async fn set_mute(&self, zone_id: i64, muted: bool, device_id: Option<&str>) {
         self.playback.set_mute(zone_id, muted).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.set_mute(muted).await {
                     warn!(zone_id, error = %e, "device_set_mute_failed");
                 }
