@@ -37,7 +37,10 @@ jobs:
 
       - name: Build web client
         run: |
-          git clone --depth 1 https://github.com/renesenses/tune-web-client.git _web
+          # Mirror the server branch topology: RC tags build the web client's
+          # release/v0.9 (0.9.x), everything else its main (v0.8.x).
+          WEB_BRANCH="${{ contains(github.ref_name, '-rc') && 'release/v0.9' || 'main' }}"
+          git clone --depth 1 -b "$WEB_BRANCH" https://github.com/renesenses/tune-web-client.git _web
           cd _web && npm ci && npm run build && cd ..
           rm -rf web && mv _web/dist web
           rm -rf _web
