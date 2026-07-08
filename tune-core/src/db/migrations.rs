@@ -625,6 +625,16 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
 );
 ",
     },
+    Migration {
+        version: 52,
+        name: "add_streaming_auth",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_auth (
+    service TEXT PRIMARY KEY,
+    token_data TEXT NOT NULL
+);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {

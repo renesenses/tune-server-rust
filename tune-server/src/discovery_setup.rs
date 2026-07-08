@@ -597,7 +597,7 @@ async fn probe_airplay_for_bluos(
         return;
     }
 
-    let client = reqwest::Client::builder()
+    let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();

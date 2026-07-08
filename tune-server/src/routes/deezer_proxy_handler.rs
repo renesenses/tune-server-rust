@@ -56,7 +56,7 @@ pub async fn handle_deezer_proxy(
         }
     };
 
-    let client = reqwest::Client::builder()
+    let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(900))
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()
