@@ -140,7 +140,7 @@ impl AppState {
 
         let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
 
-        let http_client = reqwest::Client::builder()
+        let http_client = tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
             .build()

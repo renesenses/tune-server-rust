@@ -352,6 +352,11 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
     first_seen_at DOUBLE PRECISION NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS streaming_auth (
+    service TEXT PRIMARY KEY,
+    token_data TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS smart_playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

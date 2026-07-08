@@ -644,7 +644,7 @@ pub(super) async fn changelog() -> Json<Value> {
 }
 
 async fn fetch_github_changelog() -> Result<Value, String> {
-    let client = reqwest::Client::builder()
+    let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("Tune/2.0")
         .build()

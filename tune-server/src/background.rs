@@ -426,7 +426,7 @@ fn spawn_heartbeat(state: &AppState) {
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| gethostname().unwrap_or_else(|| "unknown".into()));
 
-        let client = match reqwest::Client::builder()
+        let client = match tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
             .build()

@@ -59,7 +59,7 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
         let total = track_rows.len();
 
         // Build a dedicated HTTP client with proper UA for MusicBrainz
-        let mb_client = reqwest::Client::builder()
+        let mb_client = tune_core::http::client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent(MB_USER_AGENT)
             .build()
