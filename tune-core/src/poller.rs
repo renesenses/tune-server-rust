@@ -73,6 +73,13 @@ const GAPLESS_GUARD_SECS: u64 = 15;
 /// renderer (e.g. DMP-A8) reports state changes immediately after
 /// SetNextAVTransportURI.
 const MIN_PLAYED_FRACTION: f64 = 0.80;
+/// A renderer's `ended_naturally` signal is only trusted once at least this
+/// fraction of the (known) track duration has elapsed in WALL-CLOCK time — a
+/// track physically cannot end at 1x playback before then. Guards against
+/// renderers (Eversolo DMP-A8) that falsely report ended_naturally seconds into
+/// a multi-minute track when their internal player chokes (Lavf range-hunting a
+/// large FLAC), which would advance the queue prematurely.
+const MIN_WALL_FRACTION_FOR_NATURAL_END: f64 = 0.5;
 /// Minimum wall-clock seconds a track must have been playing before we accept
 /// a gapless transition. Prevents false skips when a renderer fails to decode
 /// and reports STOPPED after only a few seconds.
@@ -130,6 +137,7 @@ fn rand_pos(queue_length: i64, current: i64) -> i64 {
 pub(crate) mod decisions {
     use super::{
         GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END,
     };
 
     /// Margin (ms) added to the track duration before position-based
@@ -161,6 +169,20 @@ pub(crate) mod decisions {
         }
     }
 
+    /// Whether a renderer's `ended_naturally` signal is plausible given elapsed
+    /// wall-clock time. For a known-duration track it must have been playing at
+    /// least `MIN_WALL_FRACTION_FOR_NATURAL_END` of its duration (you cannot end
+    /// a 4-minute track in 35 seconds at 1x). Unknown duration keeps the original
+    /// modest 5-second floor. Rejects the DMP-A8's spurious early ended_naturally.
+    pub fn ended_naturally_wall_ok(wall_elapsed: u64, track_duration_ms: u64) -> bool {
+        if track_duration_ms == 0 {
+            wall_elapsed >= 5
+        } else {
+            wall_elapsed as f64 * 1000.0
+                >= track_duration_ms as f64 * MIN_WALL_FRACTION_FOR_NATURAL_END
+        }
+    }
+
     /// Position dropped from `>30s` to `<5s` while a gapless transition was
     /// armed — a strong signal the renderer auto-advanced to the next track.
     pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
@@ -183,7 +205,7 @@ pub(crate) mod decisions {
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
             || repeat_end
-            || (ended_naturally && wall_elapsed >= 5)
+            || (ended_naturally && ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
 
@@ -340,6 +362,7 @@ pub mod fsm {
         pub gapless_stuck_ticks: u8,
         pub ended_naturally: bool,
         pub wall_elapsed: u64,
+        pub track_duration_ms: u64,
         pub stopped_ticks: u8,
         pub natural_end: bool,
         pub gapless_sent: bool,
@@ -376,7 +399,10 @@ pub mod fsm {
                 StuckWaiting
             };
         }
-        if i.ended_naturally && (i.played_enough || i.wall_elapsed >= 5) {
+        if i.ended_naturally
+            && (i.played_enough
+                || decisions::ended_naturally_wall_ok(i.wall_elapsed, i.track_duration_ms))
+        {
             return LocalEndedNaturally;
         }
         // Fallthrough: the arm increments stopped_ticks, then branches on it.
@@ -484,6 +510,7 @@ pub mod fsm {
                 gapless_stuck_ticks: 0,
                 ended_naturally: false,
                 wall_elapsed: 0,
+                track_duration_ms: 0,
                 stopped_ticks: 0,
                 natural_end: false,
                 gapless_sent: false,
@@ -651,6 +678,34 @@ pub mod fsm {
                 classify_stopped(&StoppedInput {
                     ended_naturally: true,
                     wall_elapsed: 4,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+        }
+
+        #[test]
+        fn dmp_a8_false_ended_naturally_rejected() {
+            // DMP-A8 regression: renderer falsely reports ended_naturally ~35s
+            // into a 4-minute (240s) track (played_enough false). Wall-clock is
+            // far below MIN_WALL_FRACTION_FOR_NATURAL_END·duration → NOT an end.
+            assert_ne!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 35,
+                    track_duration_ms: 240_000,
+                    ..base()
+                }),
+                StoppedOutcome::LocalEndedNaturally
+            );
+            // A genuine end near the track duration is still trusted.
+            assert_eq!(
+                classify_stopped(&StoppedInput {
+                    ended_naturally: true,
+                    played_enough: false,
+                    wall_elapsed: 200,
+                    track_duration_ms: 240_000,
                     ..base()
                 }),
                 StoppedOutcome::LocalEndedNaturally
@@ -1673,6 +1728,7 @@ impl PositionPoller {
                         gapless_stuck_ticks: ps.gapless_stuck_ticks,
                         ended_naturally: status.ended_naturally,
                         wall_elapsed,
+                        track_duration_ms,
                         stopped_ticks: ps.stopped_ticks,
                         natural_end: decisions::natural_end(
                             played_enough,
@@ -1765,7 +1821,10 @@ impl PositionPoller {
                                 "gapless_advance_waiting_for_renderer"
                             );
                         }
-                    } else if status.ended_naturally && (played_enough || wall_elapsed >= 5) {
+                    } else if status.ended_naturally
+                        && (played_enough
+                            || decisions::ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
+                    {
                         fsm_actual = Some(fsm::StoppedOutcome::LocalEndedNaturally);
                         // Local outputs (WASAPI/ALSA/CoreAudio) signal
                         // ended_naturally when the audio stream reaches EOF.
@@ -2812,9 +2871,16 @@ mod tests {
     }
 
     #[test]
-    fn natural_end_ended_naturally_after_5s() {
-        assert!(decisions::natural_end(false, false, 0, true, 5, 300_000));
-        assert!(!decisions::natural_end(false, false, 0, true, 4, 300_000));
+    fn natural_end_ended_naturally_needs_proportional_wall() {
+        // ended_naturally is trusted only once >= MIN_WALL_FRACTION of the known
+        // duration has elapsed in wall time — a 5:00 track cannot end at 5s
+        // (DMP-A8 spurious ended_naturally). 50% of 300s = 150s.
+        assert!(!decisions::natural_end(false, false, 0, true, 5, 300_000));
+        assert!(!decisions::natural_end(false, false, 0, true, 149, 300_000));
+        assert!(decisions::natural_end(false, false, 0, true, 150, 300_000));
+        // Unknown duration (0) keeps the original modest 5s floor.
+        assert!(decisions::natural_end(false, false, 0, true, 5, 0));
+        assert!(!decisions::natural_end(false, false, 0, true, 4, 0));
     }
 
     #[test]
