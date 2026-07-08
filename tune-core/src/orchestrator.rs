@@ -1067,6 +1067,7 @@ impl PlaybackOrchestrator {
                 | Some("chromecast")
                 | Some("bluos")
                 | Some("squeezebox")
+                | Some("slimproto")
         );
 
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
@@ -3471,6 +3472,7 @@ impl PlaybackOrchestrator {
                     | Some("chromecast")
                     | Some("bluos")
                     | Some("squeezebox")
+                    | Some("slimproto")
             );
 
             if is_streaming_source && is_network {

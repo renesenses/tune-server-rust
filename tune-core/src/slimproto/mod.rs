@@ -347,6 +347,45 @@ fn strm_status_query() -> ServerMessage {
     }
 }
 
+/// Build a `strm s` (start-stream) message telling the player to fetch and play
+/// an HTTP stream from this server. `server_ip = 0` tells the player to reuse the
+/// server IP of its control connection (i.e. Tune), so we only need the HTTP port
+/// and the request path. FLAC is self-describing, so the PCM fields are `'?'`.
+pub fn build_strm_start(server_port: u16, http_path: &str) -> ServerMessage {
+    let mut p = Vec::with_capacity(23 + http_path.len() + 20);
+    p.push(b'1'); // autostart: play as soon as buffered
+    p.push(b'f'); // format: FLAC
+    p.push(b'?'); // pcm_sample_size (self-describing)
+    p.push(b'?'); // pcm_sample_rate
+    p.push(b'?'); // pcm_channels
+    p.push(b'?'); // pcm_endian
+    p.push(0); // threshold (KB) before autostart
+    p.push(0); // spdif_enable
+    p.push(0); // transition_period
+    p.push(b'0'); // transition_type: none
+    p.push(0); // flags
+    p.push(0); // output_threshold
+    p.push(0); // slaves_flag
+    p.extend_from_slice(&0u32.to_be_bytes()); // replay_gain
+    p.extend_from_slice(&server_port.to_be_bytes()); // server_port
+    p.extend_from_slice(&0u32.to_be_bytes()); // server_ip = 0 → reuse control server
+    // The HTTP request the player issues to fetch the stream.
+    p.extend_from_slice(format!("GET {http_path} HTTP/1.0\r\n\r\n").as_bytes());
+    ServerMessage::Strm {
+        command: b's',
+        payload: p,
+    }
+}
+
+/// Build a simple `strm` control message (pause `p`, unpause `u`, stop `q`).
+/// These carry the same 23-byte fixed header (zeroed) as the status query.
+pub fn strm_control(command: u8) -> ServerMessage {
+    ServerMessage::Strm {
+        command,
+        payload: vec![0u8; 23],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Player registry
 // ---------------------------------------------------------------------------
@@ -402,7 +441,13 @@ pub struct SlimProtoState {
     pub outputs: Arc<Mutex<crate::outputs::OutputRegistry>>,
     /// Local server IP advertised to players in the `strm s` HTTP request.
     pub server_ip: String,
+    /// Per-player command senders (keyed by MAC) so [`crate::outputs::slimproto::SlimProtoOutput`]
+    /// can push `strm`/`audg` commands into a specific connected player's writer task.
+    pub command_channels: CommandChannels,
 }
+
+/// Map of connected player MAC → command sender into that player's writer task.
+pub type CommandChannels = Arc<Mutex<HashMap<String, tokio::sync::mpsc::Sender<ServerMessage>>>>;
 
 /// The SlimProto TCP server that accepts connections from Squeezelite players.
 pub struct SlimProtoServer {
@@ -441,6 +486,7 @@ impl SlimProtoServer {
                 event_bus,
                 outputs,
                 server_ip,
+                command_channels: Arc::new(Mutex::new(HashMap::new())),
             })),
         }
     }
@@ -610,6 +656,18 @@ impl SlimProtoServer {
 
         // Spawn a heartbeat task that sends `strm t` periodically.
         let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<ServerMessage>(16);
+
+        // Publish this player's command channel so its output can push
+        // strm/audg commands to the writer task. Uses the same channel the
+        // heartbeat drains (the writer serialises both).
+        if let Some(state) = self.state.clone() {
+            state
+                .command_channels
+                .lock()
+                .await
+                .insert(mac_str.clone(), heartbeat_tx.clone());
+        }
+
         let heartbeat_handle = {
             let tx = heartbeat_tx.clone();
             tokio::spawn(async move {
@@ -799,6 +857,7 @@ impl SlimProtoServer {
             device_id,
             mac_str.to_string(),
             Arc::clone(&self.players),
+            Arc::clone(&state.command_channels),
         );
         state.outputs.lock().await.register(Box::new(output));
     }
@@ -816,6 +875,7 @@ impl SlimProtoServer {
             serde_json::json!({ "device_id": device_id.clone(), "online": false }),
         );
         state.outputs.lock().await.remove(&device_id);
+        state.command_channels.lock().await.remove(mac_str);
         info!(mac = %mac_str, device_id = %device_id, "slimproto_zone_offline");
     }
 }
