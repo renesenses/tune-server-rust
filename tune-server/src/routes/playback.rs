@@ -1511,32 +1511,71 @@ struct SleepRequest {
     minutes: u64,
 }
 
+/// Per-zone sleep-timer remaining seconds. Counts down only while the zone is
+/// actually playing (pause-aware), so a paused zone doesn't burn its timer.
+/// A single ticker task per zone owns the countdown and stops playback at 0.
+static SLEEP_TIMERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 async fn set_sleep(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Json(body): Json<SleepRequest>,
 ) -> Json<Value> {
     if body.minutes == 0 {
+        SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
         return Json(json!({ "sleep_timer": null, "zone_id": zone_id }));
     }
 
-    let playback = state.playback.clone();
-    let minutes = body.minutes;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(minutes * 60)).await;
-        playback.stop(zone_id).await;
-    });
+    let remaining = body.minutes * 60;
+    // Insert/refresh the remaining seconds. `starting` is true only when no
+    // ticker is currently running for this zone, so we never spawn duplicates.
+    let starting = {
+        let mut timers = SLEEP_TIMERS.lock().unwrap();
+        let existed = timers.contains_key(&zone_id);
+        timers.insert(zone_id, remaining);
+        !existed
+    };
+
+    if starting {
+        let playback = state.playback.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let playing = playback.get_state(zone_id).await.state
+                    == tune_core::playback::PlayState::Playing;
+                let left = {
+                    let mut timers = SLEEP_TIMERS.lock().unwrap();
+                    match timers.get_mut(&zone_id) {
+                        None => break, // cancelled
+                        Some(secs) => {
+                            if playing && *secs > 0 {
+                                *secs -= 1;
+                            }
+                            *secs
+                        }
+                    }
+                };
+                if left == 0 {
+                    playback.stop(zone_id).await;
+                    SLEEP_TIMERS.lock().unwrap().remove(&zone_id);
+                    break;
+                }
+            }
+        });
+    }
 
     Json(json!({
-        "sleep_timer": { "minutes": minutes, "zone_id": zone_id },
+        "sleep_timer": { "minutes": body.minutes, "zone_id": zone_id },
     }))
 }
 
 async fn get_sleep(State(_state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+    let remaining = SLEEP_TIMERS.lock().unwrap().get(&zone_id).copied();
     Json(json!({
         "zone_id": zone_id,
-        "active": false,
-        "remaining_seconds": null,
+        "active": remaining.is_some(),
+        "remaining_seconds": remaining,
     }))
 }
 

@@ -836,7 +836,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     let zone_limit = if ls.tier == tune_core::license::Tier::Premium {
         None
     } else {
-        Some(tune_core::license::LicenseManager::free_zone_limit())
+        Some(state.license.free_zone_limit())
     };
 
     Json(json!({

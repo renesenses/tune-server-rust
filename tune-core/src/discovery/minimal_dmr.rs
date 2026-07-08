@@ -59,7 +59,7 @@ pub async fn probe_minimal_dmr(
     description_url: Option<&str>,
     fallback_name: &str,
 ) -> Option<ProbeResult> {
-    let client = Client::builder()
+    let client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
@@ -92,7 +92,7 @@ async fn try_xml_description(
     desc_url: &str,
     name: &mut String,
 ) -> Option<ProbeResult> {
-    let generous_client = Client::builder()
+    let generous_client = crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .ok()?;

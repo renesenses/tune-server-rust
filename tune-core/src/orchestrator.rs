@@ -1928,7 +1928,7 @@ impl PlaybackOrchestrator {
                     let tmp_path_clone = tmp_path.clone();
                     let upstream = upstream_url.clone();
                     let download_result = tokio::task::spawn_blocking(move || {
-                        let resp = reqwest::blocking::Client::builder()
+                        let resp = crate::http::client::blocking_builder()
                             .timeout(std::time::Duration::from_secs(120))
                             .build()
                             .and_then(|c| c.get(&upstream).send());
@@ -2083,6 +2083,16 @@ impl PlaybackOrchestrator {
             } else {
                 "wav"
             };
+            // Make the streaming-DLNA format decision explicit in the log so we
+            // can tell why a renderer got WAV vs FLAC (Marco: multiple Denon
+            // zones — is the "native FLAC" toggle set on the ZONE being played?).
+            info!(
+                zone_id = req.zone_id,
+                device_id = %dash_did,
+                native_flac_override = dash_force_flac,
+                chosen_format = dash_enc_format,
+                "streaming_dash_dlna_format_decision"
+            );
 
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
@@ -2236,7 +2246,7 @@ impl PlaybackOrchestrator {
                 let tmp_flac_clone = tmp_flac.clone();
                 let transcode_result = tokio::task::spawn_blocking(move || {
                     // 1. Download
-                    let resp = reqwest::blocking::Client::builder()
+                    let resp = crate::http::client::blocking_builder()
                         .timeout(std::time::Duration::from_secs(120))
                         .build()
                         .and_then(|c| c.get(&upstream_url).send())
@@ -2397,7 +2407,7 @@ impl PlaybackOrchestrator {
                     let tmp_wav_clone = tmp_wav.clone();
                     let transcode_result = tokio::task::spawn_blocking(move || {
                         // 1. Download
-                        let resp = reqwest::blocking::Client::builder()
+                        let resp = crate::http::client::blocking_builder()
                             .timeout(std::time::Duration::from_secs(120))
                             .build()
                             .and_then(|c| c.get(&upstream_url).send())
@@ -4166,7 +4176,7 @@ fn decode_radio_stream_to_pcm(
             String,
         > {
             // No total timeout for infinite radio streams
-            let response = reqwest::blocking::Client::builder()
+            let response = crate::http::client::blocking_builder()
                 .timeout(None)
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()

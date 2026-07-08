@@ -140,7 +140,7 @@ pub async fn download() -> Result<(PathBuf, String), String> {
         )
     })?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client::builder()
         .user_agent("tune-server")
         .timeout(Duration::from_secs(600))
         .build()

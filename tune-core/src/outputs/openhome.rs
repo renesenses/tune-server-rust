@@ -59,7 +59,7 @@ impl OpenHomeOutput {
             event_listener,
             event_state: Arc::new(tokio::sync::Mutex::new(EventState::default())),
             event_sub_ids: tokio::sync::Mutex::new(Vec::new()),
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),

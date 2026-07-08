@@ -292,7 +292,7 @@ impl OutputTarget for OaatMultiroomOutput {
             }
 
             // Fetch audio stream
-            let http_client = reqwest::Client::builder()
+            let http_client = crate::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default();

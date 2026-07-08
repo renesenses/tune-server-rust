@@ -227,7 +227,7 @@ impl YouTubeService {
             .filter(|k| !k.is_empty());
 
         Self {
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(45))
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
                 .build()

@@ -58,7 +58,7 @@ pub async fn scan_new_releases(
     ).map_err(|e| format!("query: {e}"))?;
 
     let mut releases = Vec::new();
-    let mb_client = reqwest::Client::builder()
+    let mb_client = crate::http::client::builder()
         .user_agent("TuneServer/1.0 (contact@mozaiklabs.fr)")
         .timeout(std::time::Duration::from_secs(15))
         .build()

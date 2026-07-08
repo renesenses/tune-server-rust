@@ -41,7 +41,7 @@ pub async fn generate_recommendations(
 
     // 2. For each top artist, find similar artists via MusicBrainz tags
     let mut recommendations = Vec::new();
-    let mb_client = reqwest::Client::builder()
+    let mb_client = crate::http::client::builder()
         .user_agent("TuneServer/1.0 (contact@mozaiklabs.fr)")
         .timeout(std::time::Duration::from_secs(15))
         .build()

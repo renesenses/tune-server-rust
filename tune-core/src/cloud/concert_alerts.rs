@@ -89,7 +89,7 @@ pub async fn get_upcoming_concerts(
 /// 24 hours and is gated behind the `community_sync_enabled` setting
 /// (piggy-backs on the same toggle as community metadata sync).
 pub fn spawn(backend: Arc<dyn DbBackend>) {
-    let client = match reqwest::Client::builder()
+    let client = match crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
         .build()

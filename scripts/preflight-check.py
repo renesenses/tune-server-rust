@@ -104,16 +104,19 @@ def check_version_bump(tag: str) -> CheckResult:
         return CheckResult("version_bump", False, f"Cargo.toml version '{current}' is not semver")
     tag_tuple = parsed[:3]
     cur_tuple = cur_parsed[:3]
-    if tag_tuple <= cur_tuple:
+    # The standard flow (bump-all.sh) bumps Cargo.toml to the release version and
+    # tags the same version → tag == Cargo is the NORMAL case and must pass. Only
+    # fail if the tag is strictly BEHIND Cargo.toml (you forgot to bump the tag).
+    if tag_tuple < cur_tuple:
         return CheckResult(
             "version_bump",
             False,
-            f"tag {tag_tuple} must be greater than Cargo.toml version {cur_tuple}",
+            f"tag {tag_tuple} is behind Cargo.toml version {cur_tuple} (bump the tag)",
         )
     return CheckResult(
         "version_bump",
         True,
-        f"tag {tag_tuple} > Cargo.toml {cur_tuple}",
+        f"tag {tag_tuple} >= Cargo.toml {cur_tuple}",
     )
 
 
@@ -127,7 +130,13 @@ def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e.code}")
     except Exception as e:
         return CheckResult("no_p0_issues", False, f"GitHub API error: {e}")
-    open_p0 = [i for i in issues if "pull_request" not in i]
+    # Epics are tracking umbrellas, not single actionable blockers — an open
+    # P0 epic shouldn't gate every release. Its child P0 issues are counted
+    # individually and still block.
+    def is_epic(issue: dict) -> bool:
+        return any(lbl.get("name") == "epic" for lbl in issue.get("labels", []))
+
+    open_p0 = [i for i in issues if "pull_request" not in i and not is_epic(i)]
     if open_p0:
         nums = ", ".join(f"#{i['number']}" for i in open_p0[:10])
         return CheckResult(
@@ -135,14 +144,15 @@ def check_no_p0_issues(repo: str, token: Optional[str]) -> CheckResult:
             False,
             f"{len(open_p0)} P0 issues open: {nums}",
         )
-    return CheckResult("no_p0_issues", True, "0 open P0 issues")
+    return CheckResult("no_p0_issues", True, "0 open P0 issues (epics excluded)")
 
 
 def check_no_release_todos() -> CheckResult:
     """Grep for TODO(release) markers in source code.
 
-    The docs/ tree is excluded — those mentions describe the marker
-    convention itself and shouldn't block a release.
+    The docs/ tree, this script, and .github/ are excluded — those mentions
+    describe the marker convention itself (e.g. the preflight.yml comment
+    documenting this very check) and shouldn't block a release.
     """
     try:
         proc = subprocess.run(
@@ -155,6 +165,7 @@ def check_no_release_todos() -> CheckResult:
                 "--",
                 ":(exclude)docs/",
                 ":(exclude)scripts/preflight-check.py",
+                ":(exclude).github/",
             ],
             cwd=REPO_ROOT,
             capture_output=True,
@@ -252,10 +263,19 @@ def check_cargo_deny() -> CheckResult:
     except FileNotFoundError:
         return CheckResult("cargo_deny", True, "cargo binary missing, skipping")
     if proc.returncode != 0:
+        # Surface the actual advisory/license/ban so the failure is diagnosable
+        # (previously swallowed — a red cargo_deny gave no clue what broke).
+        detail = (proc.stderr or proc.stdout or "").strip()
+        deny_lines = [
+            ln
+            for ln in detail.splitlines()
+            if any(k in ln for k in ("error[", "warning[", "RUSTSEC", "= note", "denied"))
+        ]
+        snippet = " | ".join(deny_lines[:5]) or detail[-300:]
         return CheckResult(
             "cargo_deny",
             False,
-            f"cargo deny check failed (exit {proc.returncode})",
+            f"cargo deny check failed (exit {proc.returncode}): {snippet}",
         )
     return CheckResult("cargo_deny", True, "licenses + duplicates clean")
 

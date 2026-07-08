@@ -840,7 +840,7 @@ async fn create_zone(
         .count_online()
         .unwrap_or(0);
     if !state.license.check_zone_limit(zone_count).await {
-        let limit = tune_core::license::LicenseManager::free_zone_limit();
+        let limit = state.license.free_zone_limit();
         info!(zone_count, limit, "zone_creation_blocked_free_tier");
         return (
             StatusCode::PAYMENT_REQUIRED,

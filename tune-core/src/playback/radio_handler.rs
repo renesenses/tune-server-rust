@@ -18,7 +18,7 @@ impl RadioMetadataHandler {
     pub fn new(playback: Arc<PlaybackManager>) -> Self {
         Self {
             playback,
-            client: Client::builder()
+            client: crate::http::client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),

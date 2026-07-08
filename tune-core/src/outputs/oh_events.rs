@@ -94,7 +94,7 @@ impl OpenHomeEventListener {
         let subscriptions: Arc<RwLock<HashMap<String, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let client = Client::builder()
+        let client = crate::http::client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| format!("client: {e}"))?;

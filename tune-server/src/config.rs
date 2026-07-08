@@ -45,6 +45,14 @@ pub struct TuneConfig {
     /// Defaults to "HI_RES_LOSSLESS" (FLAC 24-bit up to 192kHz).
     #[serde(default = "default_tidal_quality")]
     pub tidal_quality: String,
+    /// Free-tier zone cap. Premium instances are unlimited regardless.
+    /// Overridable via `TUNE_FREE_MAX_ZONES`. Default 3.
+    #[serde(default = "default_free_max_zones")]
+    pub free_max_zones: i64,
+}
+
+fn default_free_max_zones() -> i64 {
+    3
 }
 
 fn default_audio_backend() -> String {
@@ -89,6 +97,7 @@ impl Default for TuneConfig {
             local_audio_backend: "auto".into(),
             local_exclusive_mode: false,
             tidal_quality: "HI_RES_LOSSLESS".into(),
+            free_max_zones: default_free_max_zones(),
         }
     }
 }
@@ -145,6 +154,12 @@ impl TuneConfig {
         }
         if let Ok(v) = std::env::var("TUNE_DB_PATH") {
             config.db_path = v;
+        }
+        if let Ok(v) = std::env::var("TUNE_FREE_MAX_ZONES")
+            && let Ok(n) = v.parse::<i64>()
+            && n > 0
+        {
+            config.free_max_zones = n;
         }
 
         // On Windows, resolve relative db_path to a writable location

@@ -141,7 +141,7 @@ pub async fn pull_community_enrichments(
 /// Spawn the periodic community sync task. Runs every 30 minutes,
 /// gated behind the `community_sync_enabled` setting.
 pub fn spawn(backend: Arc<dyn DbBackend>) {
-    let client = match reqwest::Client::builder()
+    let client = match crate::http::client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
         .build()
