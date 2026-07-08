@@ -394,25 +394,62 @@ pub fn new_player_registry() -> PlayerRegistry {
 // SlimProto TCP server
 // ---------------------------------------------------------------------------
 
+/// Server state needed to bridge a connected player into a Tune zone + playback.
+/// Optional so the server can still be constructed bare in unit tests.
+pub struct SlimProtoState {
+    pub db: Arc<dyn crate::db::backend::DbBackend>,
+    pub event_bus: Arc<crate::event_bus::EventBus>,
+    pub outputs: Arc<Mutex<crate::outputs::OutputRegistry>>,
+    /// Local server IP advertised to players in the `strm s` HTTP request.
+    pub server_ip: String,
+}
+
 /// The SlimProto TCP server that accepts connections from Squeezelite players.
 pub struct SlimProtoServer {
     port: u16,
     players: PlayerRegistry,
+    /// Zone/playback bridge state. `None` in unit tests (server accepts
+    /// connections but does not register zones).
+    state: Option<Arc<SlimProtoState>>,
 }
 
 impl SlimProtoServer {
     /// Create a new server. The port defaults to 3483 but can be overridden
-    /// via the `TUNE_SLIMPROTO_PORT` environment variable.
+    /// via the `TUNE_SLIMPROTO_PORT` environment variable. No zone bridging
+    /// (used by unit tests) — prefer [`new_with_state`] in production.
     pub fn new() -> Self {
-        let port = std::env::var("TUNE_SLIMPROTO_PORT")
+        Self {
+            port: Self::resolve_port(),
+            players: new_player_registry(),
+            state: None,
+        }
+    }
+
+    /// Create a server wired to the app state so connected players are
+    /// registered as zones and can be driven for playback.
+    pub fn new_with_state(
+        db: Arc<dyn crate::db::backend::DbBackend>,
+        event_bus: Arc<crate::event_bus::EventBus>,
+        outputs: Arc<Mutex<crate::outputs::OutputRegistry>>,
+        server_ip: String,
+    ) -> Self {
+        Self {
+            port: Self::resolve_port(),
+            players: new_player_registry(),
+            state: Some(Arc::new(SlimProtoState {
+                db,
+                event_bus,
+                outputs,
+                server_ip,
+            })),
+        }
+    }
+
+    fn resolve_port() -> u16 {
+        std::env::var("TUNE_SLIMPROTO_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_PORT);
-
-        Self {
-            port,
-            players: new_player_registry(),
-        }
+            .unwrap_or(DEFAULT_PORT)
     }
 
     /// Return a reference to the player registry (for use by other subsystems).
@@ -567,6 +604,10 @@ impl SlimProtoServer {
             }
         };
 
+        // Bridge the connected player into a Tune zone + register its output so
+        // it appears in the UI and can be selected for playback.
+        self.register_player_zone(&mac_str).await;
+
         // Spawn a heartbeat task that sends `strm t` periodically.
         let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::channel::<ServerMessage>(16);
         let heartbeat_handle = {
@@ -687,6 +728,9 @@ impl SlimProtoServer {
         drop(heartbeat_tx);
         writer_handle.abort();
 
+        // Mark the zone offline and drop its output before removing the player.
+        self.unregister_player_zone(&mac_str).await;
+
         // Unregister the player.
         {
             let mut reg = self.players.lock().await;
@@ -700,6 +744,79 @@ impl SlimProtoServer {
         }
 
         reader_result
+    }
+
+    /// Create (or online) a Tune zone for a connected player and register its
+    /// native SlimProto output. No-op when the server has no app state (tests)
+    /// or when the zone was soft-deleted by the user (respects `is_hidden`).
+    async fn register_player_zone(&self, mac_str: &str) {
+        let Some(state) = self.state.clone() else {
+            return;
+        };
+        let device_id = format!("slimproto-{mac_str}");
+        let player_name = {
+            let reg = self.players.lock().await;
+            match reg.get(mac_str) {
+                Some(p) => p.name.clone(),
+                None => return,
+            }
+        };
+
+        let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(state.db.clone());
+        // Respect a user deletion: a hidden zone must not reappear on reconnect.
+        if zone_repo.is_device_hidden(&device_id) {
+            debug!(mac = %mac_str, "slimproto_zone_hidden_skipping");
+            return;
+        }
+
+        match zone_repo.get_or_create(&player_name, Some("slimproto"), &device_id) {
+            Ok((zone_id, created)) => {
+                if created {
+                    state.event_bus.emit_typed(
+                        crate::event_types::EventType::ZoneCreated,
+                        serde_json::json!({
+                            "zone_id": zone_id,
+                            "name": player_name.clone(),
+                            "device_id": device_id.clone(),
+                            "type": "slimproto",
+                        }),
+                    );
+                } else {
+                    let _ = zone_repo.set_online_by_device(&device_id, true);
+                    state.event_bus.emit_typed(
+                        crate::event_types::EventType::ZoneUpdated,
+                        serde_json::json!({ "device_id": device_id.clone(), "online": true }),
+                    );
+                }
+                info!(mac = %mac_str, zone_id, device_id = %device_id, "slimproto_zone_registered");
+            }
+            Err(e) => warn!(mac = %mac_str, error = %e, "slimproto_zone_create_failed"),
+        }
+
+        // Register the native output so the orchestrator can route to it.
+        let output = crate::outputs::slimproto::SlimProtoOutput::new(
+            player_name,
+            device_id,
+            mac_str.to_string(),
+            Arc::clone(&self.players),
+        );
+        state.outputs.lock().await.register(Box::new(output));
+    }
+
+    /// Mark the zone offline and remove its output when a player disconnects.
+    async fn unregister_player_zone(&self, mac_str: &str) {
+        let Some(state) = self.state.clone() else {
+            return;
+        };
+        let device_id = format!("slimproto-{mac_str}");
+        let zone_repo = crate::db::zone_repo::ZoneRepo::with_backend(state.db.clone());
+        let _ = zone_repo.set_online_by_device(&device_id, false);
+        state.event_bus.emit_typed(
+            crate::event_types::EventType::ZoneUpdated,
+            serde_json::json!({ "device_id": device_id.clone(), "online": false }),
+        );
+        state.outputs.lock().await.remove(&device_id);
+        info!(mac = %mac_str, device_id = %device_id, "slimproto_zone_offline");
     }
 }
 

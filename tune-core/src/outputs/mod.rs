@@ -21,6 +21,7 @@ pub mod oaat;
 pub mod oh_events;
 pub mod openhome;
 pub mod registry;
+pub mod slimproto;
 pub mod squeezebox;
 pub mod traits;
 #[cfg(all(target_os = "windows", feature = "local-audio"))]
