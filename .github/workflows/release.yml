@@ -23,13 +23,17 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # Compare the base X.Y.Z only: a pre-release tag (v0.9.0-rc1) ships the
+          # 0.9.0 web client — bump-all.sh keeps package.json at plain X.Y.Z, the
+          # -rcN suffix lives on the git tag alone.
+          TAG_BASE="${TAG_VERSION%%-*}"
           WEB_VERSION="$(grep -m1 '"version"' package.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-          if [ "$TAG_VERSION" != "$WEB_VERSION" ]; then
-            echo "::error::tune-web-client package.json is $WEB_VERSION but the release tag is $TAG_VERSION."
+          if [ "$TAG_BASE" != "$WEB_VERSION" ]; then
+            echo "::error::tune-web-client package.json is $WEB_VERSION but the release tag base is $TAG_BASE."
             echo "::error::Push the tune-web-client version bump to main BEFORE tagging the server, then re-run this release."
             exit 1
           fi
-          echo "web-client version $WEB_VERSION matches release tag $TAG_VERSION"
+          echo "web-client version $WEB_VERSION matches release tag base $TAG_BASE"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
