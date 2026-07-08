@@ -419,6 +419,9 @@ pub struct SlimProtoPlayer {
     pub elapsed_ms: u32,
     /// Last reported bytes received.
     pub bytes_received: u64,
+    /// Last STAT event code (e.g. `STMt` timer, `STMd` decoder-ready/track-end,
+    /// `STMu` underrun). Kept for diagnostics and end-of-track heuristics.
+    pub last_event: [u8; 4],
 }
 
 /// Thread-safe registry of connected players, keyed by MAC string.
@@ -634,6 +637,7 @@ impl SlimProtoServer {
                             last_stat: Instant::now(),
                             elapsed_ms: 0,
                             bytes_received: 0,
+                            last_event: [0u8; 4],
                         },
                     );
                 }
@@ -736,6 +740,7 @@ impl SlimProtoServer {
                             player.last_stat = Instant::now();
                             player.elapsed_ms = elapsed_ms;
                             player.bytes_received = bytes_received;
+                            player.last_event = event;
                         }
                     }
                     Ok(ClientMessage::Bye) => {
@@ -1137,6 +1142,7 @@ mod tests {
                     last_stat: Instant::now(),
                     elapsed_ms: 0,
                     bytes_received: 0,
+                    last_event: [0u8; 4],
                 },
             );
             assert_eq!(reg.len(), 1);

@@ -189,4 +189,25 @@ impl OutputTarget for SlimProtoOutput {
         let reg = self.players.lock().await;
         reg.contains_key(&self.mac_str)
     }
+
+    /// Best-effort diagnostics for remote debugging of a tester's player
+    /// (Sandro): last STAT event, position, bytes and staleness. Uses a
+    /// non-blocking `try_lock` so it never stalls a status call.
+    fn diagnostics_json(&self) -> Option<serde_json::Value> {
+        let reg = self.players.try_lock().ok()?;
+        let p = reg.get(&self.mac_str)?;
+        Some(serde_json::json!({
+            "mac": self.mac_str,
+            "transport": match self.transport() {
+                TransportState::Playing => "playing",
+                TransportState::Paused => "paused",
+                TransportState::Transitioning => "transitioning",
+                TransportState::Stopped => "stopped",
+            },
+            "elapsed_ms": p.elapsed_ms,
+            "bytes_received": p.bytes_received,
+            "last_stat_event": String::from_utf8_lossy(&p.last_event).trim_end_matches('\0'),
+            "last_stat_secs_ago": p.last_stat.elapsed().as_secs(),
+        }))
+    }
 }
