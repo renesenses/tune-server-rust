@@ -436,11 +436,28 @@ async fn proxy_stream(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // DMP-A8 (Lavf) sends rapid micro-Range requests for FLAC header parsing.
-    // Forwarding each one to the CDN hammers Akamai and causes drops.
-    // User-initiated seeks go through the orchestrator (stream recreation),
-    // so we never need to forward Range to the CDN for proxy sessions.
-    let upstream_req = client.get(upstream_url);
+    // DLNA renderers (Eversolo DMP-A8 with Lavf) seek by issuing mid-file Range
+    // requests (bytes=N-). Forward the requested start offset to the CDN and pass
+    // its 206 straight through, so the renderer gets exactly the bytes it asked
+    // for. Previously the Range was dropped and a non-zero range fell through to
+    // a 200 full-from-0 body: the renderer never found its offset, re-requested
+    // in a loop, and each loop re-fetched the whole FLAC from Qobuz until the CDN
+    // dropped the body ("error decoding response body"). Radio is infinite and
+    // not seekable, so we never forward a range for it.
+    let range_start: Option<u64> = if is_radio {
+        None
+    } else {
+        range_value
+            .as_deref()
+            .and_then(|r| r.strip_prefix("bytes="))
+            .and_then(|r| r.split('-').next())
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+
+    let mut upstream_req = client.get(upstream_url);
+    if let Some(start) = range_start {
+        upstream_req = upstream_req.header("Range", format!("bytes={start}-"));
+    }
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -449,6 +466,13 @@ async fn proxy_stream(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+
+    let upstream_status = upstream_resp.status();
+    let upstream_content_range = upstream_resp
+        .headers()
+        .get("Content-Range")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let upstream_content_type = upstream_resp
         .headers()
@@ -479,11 +503,6 @@ async fn proxy_stream(
         HeaderValue::from_static("Streaming"),
     );
 
-    // DLNA renderers (e.g. Eversolo DMP-A8 with Lavf) send Range: bytes=0-
-    // and expect 206 Partial Content with Content-Range header.
-    // Returning 200 OK causes them to abort after ~31 seconds.
-    let range_requested = range_value.as_deref().filter(|r| r.starts_with("bytes=0-"));
-
     // Radio streams are infinite — no Content-Length is possible.
     // The DMP-A8 sends Range: bytes=0- initially, then reconnects with
     // bytes=N- (resume). Both must return 206 with an open-ended
@@ -513,6 +532,37 @@ async fn proxy_stream(
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
+    // The CDN honoured our forwarded Range: pass its 206 (with the CDN's own
+    // Content-Range) straight through so the renderer gets the requested offset.
+    if range_start.is_some() && upstream_status == StatusCode::PARTIAL_CONTENT {
+        if let Some(ref cr) = upstream_content_range {
+            if let Ok(v) = HeaderValue::from_str(cr) {
+                headers.insert("Content-Range", v);
+            }
+        }
+        if let Some(cl) = content_length {
+            headers.insert("Content-Length", HeaderValue::from(cl));
+        }
+        let body = Body::from_stream(async_stream::stream! {
+            let mut stream = upstream_resp.bytes_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
+                    Err(e) => {
+                        warn!(error = %e, "proxy_chunk_error");
+                        break;
+                    }
+                }
+            }
+        });
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
+
+    // Fallback: a Range was requested but the CDN returned a full 200 (didn't
+    // honour it). DLNA renderers reject a 200 for a Range request and stop after
+    // ~31s, so synthesize a 206 spanning the whole file.
+    let range_requested = range_value.as_deref().filter(|r| r.starts_with("bytes=0-"));
     if let (Some(_), Some(cl)) = (range_requested, content_length) {
         headers.insert("Content-Length", HeaderValue::from(cl));
         headers.insert(
