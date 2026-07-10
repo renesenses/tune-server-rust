@@ -660,6 +660,11 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 );
 ",
     },
+    Migration {
+        version: 54,
+        name: "bio_provenance",
+        up: "", // Applied programmatically via add_column_if_missing
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -970,6 +975,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         }
         if migration.version == 50 {
             add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+        }
+        if migration.version == 54 {
+            // Bio provenance/attribution (CC BY-SA) + freshness, on both tables.
+            for table in ["artists", "albums"] {
+                add_column_if_missing(db, table, "bio_source", "TEXT");
+                add_column_if_missing(db, table, "bio_source_url", "TEXT");
+                add_column_if_missing(db, table, "bio_license", "TEXT");
+                add_column_if_missing(db, table, "bio_lang", "TEXT");
+                add_column_if_missing(db, table, "bio_fetched_at", "TEXT");
+            }
         }
 
         db.execute(

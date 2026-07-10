@@ -188,6 +188,11 @@ CREATE TABLE IF NOT EXISTS artists (
     musicbrainz_id TEXT,
     discogs_id TEXT,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     image_path TEXT,
     image_source TEXT
 );
@@ -212,6 +217,11 @@ CREATE TABLE IF NOT EXISTS albums (
     sample_rate INTEGER,
     bit_depth INTEGER,
     bio TEXT,
+    bio_source TEXT,
+    bio_source_url TEXT,
+    bio_license TEXT,
+    bio_lang TEXT,
+    bio_fetched_at TEXT,
     musicbrainz_release_id TEXT,
     musicbrainz_release_group_id TEXT,
     release_date TEXT,

@@ -2,16 +2,25 @@ use tracing::{debug, info, warn};
 
 const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 
+/// A fetched bio together with its provenance, for CC BY-SA attribution.
+pub struct BioResult {
+    pub text: String,
+    pub source: String, // "wikipedia" | "lastfm"
+    pub source_url: Option<String>,
+    pub license: String, // e.g. "CC-BY-SA-4.0"
+    pub lang: String,    // "fr" | "en"
+}
+
 /// Fetch artist bio from Wikipedia FR via Wikidata, with Last.fm fallback.
 pub async fn fetch_artist_bio(
     client: &reqwest::Client,
     mbid: &str,
     artist_name: &str,
     lastfm_key: &str,
-) -> Option<String> {
+) -> Option<BioResult> {
     // 1. Wikipedia FR via MusicBrainz → Wikidata → sitelinks
     if let Some(bio) = fetch_bio_via_wikidata(client, mbid).await {
-        if bio.len() > 50 {
+        if bio.text.len() > 50 {
             return Some(bio);
         }
     }
@@ -19,7 +28,7 @@ pub async fn fetch_artist_bio(
     // 2. Last.fm fallback
     if !lastfm_key.is_empty() {
         if let Some(bio) = fetch_bio_lastfm(client, artist_name, lastfm_key).await {
-            if bio.len() > 50 {
+            if bio.text.len() > 50 {
                 return Some(bio);
             }
         }
@@ -29,7 +38,7 @@ pub async fn fetch_artist_bio(
 }
 
 /// MusicBrainz → Wikidata QID → French Wikipedia extract.
-async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<String> {
+async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<BioResult> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -89,7 +98,16 @@ async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<
     if extract.len() < 50 {
         return None;
     }
-    Some(extract.trim().to_string())
+    Some(BioResult {
+        text: extract.trim().to_string(),
+        source: "wikipedia".to_string(),
+        source_url: Some(format!(
+            "https://{wiki_lang}.wikipedia.org/wiki/{}",
+            urlencoding::encode(&wiki_title)
+        )),
+        license: "CC-BY-SA-4.0".to_string(),
+        lang: wiki_lang.to_string(),
+    })
 }
 
 /// Last.fm artist.getInfo → bio summary.
@@ -97,7 +115,7 @@ async fn fetch_bio_lastfm(
     client: &reqwest::Client,
     artist_name: &str,
     api_key: &str,
-) -> Option<String> {
+) -> Option<BioResult> {
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
         .query(&[
@@ -122,7 +140,17 @@ async fn fetch_bio_lastfm(
     if clean.len() < 50 {
         return None;
     }
-    Some(clean)
+    let source_url = data
+        .pointer("/artist/url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(BioResult {
+        text: clean,
+        source: "lastfm".to_string(),
+        source_url,
+        license: "CC-BY-SA-3.0".to_string(),
+        lang: "fr".to_string(),
+    })
 }
 
 /// Fetch album bio: Wikipedia FR → Wikipedia EN → Last.fm fallback.
@@ -131,17 +159,17 @@ pub async fn fetch_album_bio(
     artist_name: &str,
     album_title: &str,
     lastfm_key: &str,
-) -> Option<String> {
+) -> Option<BioResult> {
     // 1. Wikipedia FR search
     if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "fr").await {
-        if bio.len() > 50 {
+        if bio.text.len() > 50 {
             return Some(bio);
         }
     }
 
     // 2. Wikipedia EN fallback
     if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await {
-        if bio.len() > 50 {
+        if bio.text.len() > 50 {
             return Some(bio);
         }
     }
@@ -151,7 +179,7 @@ pub async fn fetch_album_bio(
         if let Some(bio) =
             fetch_album_bio_lastfm(client, artist_name, album_title, lastfm_key).await
         {
-            if bio.len() > 50 {
+            if bio.text.len() > 50 {
                 return Some(bio);
             }
         }
@@ -166,7 +194,7 @@ async fn fetch_album_bio_wikipedia(
     album_title: &str,
     artist_name: &str,
     lang: &str,
-) -> Option<String> {
+) -> Option<BioResult> {
     // Search for "{album_title} {artist_name} album"
     let query = format!("{album_title} {artist_name} album");
     let search_url = format!(
@@ -231,7 +259,16 @@ async fn fetch_album_bio_wikipedia(
     if extract.len() < 50 {
         return None;
     }
-    Some(extract.trim().to_string())
+    Some(BioResult {
+        text: extract.trim().to_string(),
+        source: "wikipedia".to_string(),
+        source_url: Some(format!(
+            "https://{lang}.wikipedia.org/wiki/{}",
+            urlencoding::encode(&title)
+        )),
+        license: "CC-BY-SA-4.0".to_string(),
+        lang: lang.to_string(),
+    })
 }
 
 /// Last.fm album.getInfo → wiki summary.
@@ -240,7 +277,7 @@ async fn fetch_album_bio_lastfm(
     artist_name: &str,
     album_title: &str,
     api_key: &str,
-) -> Option<String> {
+) -> Option<BioResult> {
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
         .query(&[
@@ -266,7 +303,17 @@ async fn fetch_album_bio_lastfm(
     if clean.len() < 50 {
         return None;
     }
-    Some(clean)
+    let source_url = data
+        .pointer("/album/url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(BioResult {
+        text: clean,
+        source: "lastfm".to_string(),
+        source_url,
+        license: "CC-BY-SA-3.0".to_string(),
+        lang: "fr".to_string(),
+    })
 }
 
 fn strip_html(s: &str) -> String {
@@ -328,12 +375,22 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
 
         match fetch_artist_bio(&client, mbid, name, &lastfm_key).await {
             Some(bio) => {
-                artist_repo.update_bio(*artist_id, &bio).ok();
+                artist_repo
+                    .update_bio_full(
+                        *artist_id,
+                        &bio.text,
+                        &bio.source,
+                        bio.source_url.clone(),
+                        &bio.license,
+                        &bio.lang,
+                    )
+                    .ok();
                 enriched += 1;
                 info!(
                     artist_id,
                     artist = %name,
-                    bio_len = bio.len(),
+                    bio_len = bio.text.len(),
+                    source = %bio.source,
                     "batch_artist_bio_enriched"
                 );
 
@@ -342,7 +399,7 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
                     let mbid = mbid.clone();
                     let name = name.clone();
                     let instance_id = instance_id.clone();
-                    let bio = bio.clone();
+                    let bio = bio.text.clone();
                     tokio::spawn(async move {
                         submit_artist_bio(
                             "https://mozaiklabs.fr",
@@ -423,13 +480,23 @@ pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::
 
         match result {
             Some(bio) => {
-                album_repo.update_bio(*album_id, &bio).ok();
+                album_repo
+                    .update_bio_full(
+                        *album_id,
+                        &bio.text,
+                        &bio.source,
+                        bio.source_url.clone(),
+                        &bio.license,
+                        &bio.lang,
+                    )
+                    .ok();
                 enriched += 1;
                 info!(
                     album_id,
                     album = %title,
                     artist = %artist,
-                    bio_len = bio.len(),
+                    bio_len = bio.text.len(),
+                    source = %bio.source,
                     "batch_album_bio_enriched"
                 );
             }
