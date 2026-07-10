@@ -159,7 +159,7 @@ async fn add_tracks(
     Json(body): Json<AddTracks>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.add_tracks(id, &body.track_ids, body.position) {
+    match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
         Ok(ids) => (StatusCode::CREATED, Json(json!({ "added": ids.len() }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -478,7 +478,7 @@ async fn import_m3u_file(
     match repo.create(&name, None) {
         Ok(playlist_id) => {
             if !track_ids.is_empty() {
-                repo.add_tracks(playlist_id, &track_ids, None).ok();
+                repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
             }
             (
                 StatusCode::CREATED,
@@ -682,7 +682,7 @@ async fn import_linn_file(
     match repo.create(&name, None) {
         Ok(playlist_id) => {
             if !track_ids.is_empty() {
-                repo.add_tracks(playlist_id, &track_ids, None).ok();
+                repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
             }
             (
                 StatusCode::CREATED,
@@ -756,7 +756,7 @@ async fn import_m3u_url(
         if let Ok(Some(track)) = track_repo.get_by_path(line)
             && let Some(id) = track.id
         {
-            repo.add_tracks(playlist_id, &[id], None).ok();
+            repo.add_tracks_deduped(playlist_id, &[id], None).ok();
             matched += 1;
         }
     }
