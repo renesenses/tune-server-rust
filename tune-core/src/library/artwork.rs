@@ -44,28 +44,33 @@ const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    let tagged = match lofty::read_from_path(audio_path) {
-        Ok(t) => t,
+    match lofty::read_from_path(audio_path) {
+        Ok(tagged) => {
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                if let Some(pic) = tag.pictures().first() {
+                    let mime = match pic.mime_type() {
+                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                        Some(lofty::picture::MimeType::Png) => "image/png",
+                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                        _ => "image/jpeg",
+                    };
+                    return Some((pic.data().to_vec(), mime.to_string()));
+                }
+            }
+        }
         Err(e) => {
             debug!(
                 path = %audio_path.display(),
                 error = %e,
                 "artwork_lofty_read_failed"
             );
-            return None;
         }
-    };
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-    let pic = tag.pictures().first()?;
+    }
 
-    let mime = match pic.mime_type() {
-        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-        Some(lofty::picture::MimeType::Png) => "image/png",
-        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-        _ => "image/jpeg",
-    };
-
-    Some((pic.data().to_vec(), mime.to_string()))
+    // DSF files store their ID3v2 tag — including embedded APIC artwork — at
+    // an offset that lofty does not read, so the path above finds no picture.
+    // Fall back to reading the cover directly from the DSF metadata chunk.
+    crate::metadata::extract_dsf_cover(audio_path)
 }
 
 pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
