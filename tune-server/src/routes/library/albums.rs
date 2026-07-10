@@ -314,6 +314,19 @@ pub(super) async fn album_bio(
         Ok(Some(a)) => a,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    // Prefer a locally-enriched bio (with provenance/attribution) over the
+    // community proxy.
+    if let Some(ref bio) = album.bio {
+        if !bio.is_empty() {
+            let prov = album_repo.bio_provenance(id).ok().flatten();
+            return Json(json!({
+                "album": album.title,
+                "bio": bio,
+                "bio_provenance": prov,
+            }))
+            .into_response();
+        }
+    }
     // Resolve artist MBID for the API call
     let mbid = if let Some(aid) = album.artist_id {
         let artist_repo = ArtistRepo::with_backend(state.backend.clone());
