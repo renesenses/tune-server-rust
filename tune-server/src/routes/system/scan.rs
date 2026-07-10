@@ -841,6 +841,22 @@ pub(super) async fn trigger_scan(
             tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
         }
 
+        // Backfill embedded cover art for local albums still missing a cover.
+        // The incremental scan only extracts covers from files it re-processed;
+        // unchanged files are skipped, so an improved embedded-art extractor
+        // (e.g. DSF ID3v2 covers — Thibaud) never reaches an existing library.
+        // Re-extract embedded art (local only, never the network) so those
+        // albums self-heal without a forced full rescan.
+        let covers_backfilled =
+            tune_core::library::artwork::backfill_embedded_covers(&db, &cache_dir);
+        if covers_backfilled > 0 {
+            tracing::info!(covers_backfilled, "post_scan_embedded_covers_backfilled");
+            event_bus.emit(
+                "library.scan.progress",
+                json!({ "artwork_backfilled": covers_backfilled }),
+            );
+        }
+
         // Rebuild FTS indexes so search reflects the current library state.
         // The FTS tables are contentless (content='') and rely on triggers,
         // but manual DB edits or batch operations can leave them stale.
