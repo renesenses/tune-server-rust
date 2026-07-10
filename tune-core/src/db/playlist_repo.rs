@@ -205,6 +205,32 @@ impl PlaylistRepo {
         Ok(inserted)
     }
 
+    /// Like `add_tracks` but skips tracks already in the playlist and repeats
+    /// within the batch, so a playlist never holds the same track twice. This
+    /// is the path for user "add to playlist" actions (duplicates also made
+    /// "remove" look broken — removing one position left the other copy behind,
+    /// Elie). Raw `add_tracks` is kept for flows that intentionally preserve
+    /// duplicates (e.g. merge-without-dedup).
+    pub fn add_tracks_deduped(
+        &self,
+        playlist_id: i64,
+        track_ids: &[i64],
+        position: Option<i64>,
+    ) -> Result<Vec<i64>, String> {
+        let existing: std::collections::HashSet<i64> =
+            self.get_track_ids(playlist_id)?.into_iter().collect();
+        let mut batch_seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let to_add: Vec<i64> = track_ids
+            .iter()
+            .copied()
+            .filter(|tid| !existing.contains(tid) && batch_seen.insert(*tid))
+            .collect();
+        if to_add.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.add_tracks(playlist_id, &to_add, position)
+    }
+
     pub fn remove_tracks_at_positions(
         &self,
         playlist_id: i64,
@@ -405,6 +431,33 @@ mod tests {
 
         let pl = repo.get(plid).unwrap().unwrap();
         assert_eq!(pl.track_count, 3);
+    }
+
+    #[test]
+    fn playlist_add_tracks_skips_duplicates() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+
+        let mut t1 = TrackModel::new("A".into());
+        t1.file_path = Some("/a.flac".into());
+        let mut t2 = TrackModel::new("B".into());
+        t2.file_path = Some("/b.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+        let tid2 = track_repo.create(&t2).unwrap();
+
+        let plid = repo.create("Test", None).unwrap();
+        // Duplicate within a single batch → inserted once.
+        let added = repo
+            .add_tracks_deduped(plid, &[tid1, tid1, tid2], None)
+            .unwrap();
+        assert_eq!(added, vec![tid1, tid2]);
+        // Re-adding an existing track → skipped; only the new one lands.
+        let added2 = repo.add_tracks_deduped(plid, &[tid1, tid2], None).unwrap();
+        assert!(added2.is_empty());
+        let pl = repo.get(plid).unwrap().unwrap();
+        assert_eq!(pl.track_count, 2);
+        assert_eq!(repo.get_track_ids(plid).unwrap(), vec![tid1, tid2]);
     }
 
     #[test]
