@@ -8,6 +8,19 @@ struct Migration {
     up: &'static str,
 }
 
+/// v0.9 — collapse the two per-source position spaces into ONE contiguous space
+/// per zone. After the unified copy (v52), local rows sit at 0..L-1 and
+/// streaming rows at 0..S-1 (overlapping); shift streaming rows up by the zone's
+/// local count so the whole queue is one ordered sequence 0..L+S-1, which the
+/// unified repo/orchestrator expect. Runs exactly once via version tracking, so
+/// it can't double-shift an already-unified queue.
+const RENUMBER_QUEUE_POSITIONS_SQL: &str = "UPDATE queue_items \
+    SET position = position + ( \
+        SELECT COUNT(*) FROM queue_items q2 \
+        WHERE q2.zone_id = queue_items.zone_id AND q2.track_id IS NOT NULL \
+    ) \
+    WHERE track_id IS NULL;";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -637,6 +650,13 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
         // tolerant of the lazily-created streaming_queue table.
         up: "",
     },
+    Migration {
+        // v0.9 — one contiguous position space per zone (streaming rows move
+        // from 0..S-1 to L..L+S-1). Runs after init_schema's unified copy.
+        version: 53,
+        name: "unify_queue_positions",
+        up: RENUMBER_QUEUE_POSITIONS_SQL,
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1062,6 +1082,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     .ok();
 
     // v0.9 rc.2 — unify play_queue + streaming_queue into queue_items (v52).
+    // The one-time position renumbering (two per-source spaces → one contiguous
+    // space per zone) is applied as versioned migration 53 in run_migrations,
+    // which runs after init_schema, so the copy above is already in place.
     migrate_to_unified_queue(db);
 
     db.execute_batch("ANALYZE;").ok();
@@ -1241,6 +1264,43 @@ mod tests {
         run_migrations(&db).unwrap();
         run_migrations(&db).unwrap();
         assert_eq!(current_version(&db).unwrap(), latest_version());
+    }
+
+    #[test]
+    fn renumber_queue_positions_sql_unifies_position_space() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        // Pre-unification layout: local rows at 0,1 and streaming rows at 0,1
+        // (overlapping) for one zone.
+        let conn = db.connection().lock().unwrap();
+        // Isolated SQL test: no real zones/tracks, so relax FK enforcement.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 0, 101, 'local');
+             INSERT INTO queue_items (zone_id, position, track_id, source) VALUES (1, 1, 102, 'local');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 0, 'q1', 'qobuz');
+             INSERT INTO queue_items (zone_id, position, source_id, source) VALUES (1, 1, 'q2', 'qobuz');",
+        )
+        .unwrap();
+        // The v53 renumber SQL: streaming rows shift to L..L+S-1.
+        conn.execute_batch(RENUMBER_QUEUE_POSITIONS_SQL).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT track_id, position FROM queue_items WHERE zone_id = 1 ORDER BY position",
+            )
+            .unwrap();
+        let rows: Vec<(Option<i64>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Local stays 0,1; streaming now 2,3 → one contiguous space, no collisions.
+        assert_eq!(
+            rows,
+            vec![(Some(101), 0), (Some(102), 1), (None, 2), (None, 3)]
+        );
     }
 
     #[test]
