@@ -447,6 +447,36 @@ impl ArtistRepo {
         Ok(())
     }
 
+    /// Bio provenance (source, url, license, lang, fetched_at) for the
+    /// artist-detail endpoint. Returns None when no sourced bio is recorded.
+    pub fn bio_provenance(&self, id: i64) -> Result<Option<serde_json::Value>, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "SELECT bio_source, bio_source_url, bio_license, bio_lang, bio_fetched_at \
+                 FROM artists WHERE id = ?"
+            }
+            Engine::Postgres => {
+                "SELECT bio_source, bio_source_url, bio_license, bio_lang, bio_fetched_at \
+                 FROM artists WHERE id = $1"
+            }
+        };
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        let row = self.db.query_one(sql, &params)?;
+        Ok(row.and_then(|cols| {
+            let source = cols
+                .first()
+                .and_then(|v| v.as_string())
+                .filter(|s| !s.is_empty())?;
+            Some(serde_json::json!({
+                "source": source,
+                "source_url": cols.get(1).and_then(|v| v.as_string()),
+                "license": cols.get(2).and_then(|v| v.as_string()),
+                "lang": cols.get(3).and_then(|v| v.as_string()),
+                "fetched_at": cols.get(4).and_then(|v| v.as_string()),
+            }))
+        }))
+    }
+
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;

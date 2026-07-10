@@ -197,7 +197,13 @@ pub(super) async fn get_album(
 ) -> impl IntoResponse {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(album)) => Json(album.to_json()).into_response(),
+        Ok(Some(album)) => {
+            let mut j = album.to_json();
+            if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
+                obj.insert("bio_provenance".into(), prov);
+            }
+            Json(j).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

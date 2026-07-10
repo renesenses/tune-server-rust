@@ -52,7 +52,13 @@ pub(super) async fn get_artist(
 ) -> impl IntoResponse {
     let repo = ArtistRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(artist)) => Json(json!(artist)).into_response(),
+        Ok(Some(artist)) => {
+            let mut j = json!(artist);
+            if let (Some(obj), Ok(Some(prov))) = (j.as_object_mut(), repo.bio_provenance(id)) {
+                obj.insert("bio_provenance".into(), prov);
+            }
+            Json(j).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
