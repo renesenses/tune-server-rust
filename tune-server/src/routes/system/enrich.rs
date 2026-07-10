@@ -1,5 +1,6 @@
 use axum::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
@@ -112,7 +113,11 @@ pub(super) async fn system_enrich(State(state): State<AppState>) -> impl IntoRes
 // POST /system/enrich-bios — bio enrichment
 // ---------------------------------------------------------------------------
 
-pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn enrich_bios(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let lang = crate::i18n::lang_from_header(&headers);
     let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -141,12 +146,13 @@ pub(super) async fn enrich_bios(State(state): State<AppState>) -> impl IntoRespo
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
 
+    let lang_artist = lang.clone();
     tokio::spawn(async move {
-        tune_core::metadata::bio_batch::batch_enrich_artist_bios(artist_db).await;
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios(artist_db, &lang_artist).await;
     });
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        tune_core::metadata::bio_batch::batch_enrich_album_bios(album_db).await;
+        tune_core::metadata::bio_batch::batch_enrich_album_bios(album_db, &lang).await;
     });
 
     (
@@ -368,7 +374,11 @@ fn now_utc_str() -> String {
 // POST /system/enrichment/run — trigger full enrichment run
 // ---------------------------------------------------------------------------
 
-pub(super) async fn enrichment_run(State(state): State<AppState>) -> impl IntoResponse {
+pub(super) async fn enrichment_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let bio_lang = crate::i18n::lang_from_header(&headers);
     let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -417,9 +427,9 @@ pub(super) async fn enrichment_run(State(state): State<AppState>) -> impl IntoRe
     let bio_album_db = state.backend.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-        tune_core::metadata::bio_batch::batch_enrich_artist_bios(bio_artist_db).await;
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios(bio_artist_db, &bio_lang).await;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        tune_core::metadata::bio_batch::batch_enrich_album_bios(bio_album_db).await;
+        tune_core::metadata::bio_batch::batch_enrich_album_bios(bio_album_db, &bio_lang).await;
     });
 
     // 4. Extended file metadata

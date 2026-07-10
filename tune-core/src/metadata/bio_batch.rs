@@ -17,9 +17,10 @@ pub async fn fetch_artist_bio(
     mbid: &str,
     artist_name: &str,
     lastfm_key: &str,
+    lang: &str,
 ) -> Option<BioResult> {
-    // 1. Wikipedia FR via MusicBrainz → Wikidata → sitelinks
-    if let Some(bio) = fetch_bio_via_wikidata(client, mbid).await {
+    // 1. Wikipedia in the preferred language via MusicBrainz → Wikidata → sitelinks
+    if let Some(bio) = fetch_bio_via_wikidata(client, mbid, lang).await {
         if bio.text.len() > 50 {
             return Some(bio);
         }
@@ -27,7 +28,7 @@ pub async fn fetch_artist_bio(
 
     // 2. Last.fm fallback
     if !lastfm_key.is_empty() {
-        if let Some(bio) = fetch_bio_lastfm(client, artist_name, lastfm_key).await {
+        if let Some(bio) = fetch_bio_lastfm(client, artist_name, lastfm_key, lang).await {
             if bio.text.len() > 50 {
                 return Some(bio);
             }
@@ -38,7 +39,11 @@ pub async fn fetch_artist_bio(
 }
 
 /// MusicBrainz → Wikidata QID → French Wikipedia extract.
-async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<BioResult> {
+async fn fetch_bio_via_wikidata(
+    client: &reqwest::Client,
+    mbid: &str,
+    lang: &str,
+) -> Option<BioResult> {
     let url = format!("https://musicbrainz.org/ws/2/artist/{mbid}?inc=url-rels&fmt=json");
     let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
@@ -69,16 +74,20 @@ async fn fetch_bio_via_wikidata(client: &reqwest::Client, mbid: &str) -> Option<
     }
     let wd_data: serde_json::Value = wd_resp.json().await.ok()?;
 
-    let (wiki_lang, wiki_title) = wd_data
-        .pointer(&format!("/entities/{qid}/sitelinks/frwiki/title"))
+    // Prefer the user's language, fall back to English.
+    let (wiki_lang, wiki_title): (String, String) = if let Some(t) = wd_data
+        .pointer(&format!("/entities/{qid}/sitelinks/{lang}wiki/title"))
         .and_then(|v| v.as_str())
-        .map(|t| ("fr", t.to_string()))
-        .or_else(|| {
-            wd_data
-                .pointer(&format!("/entities/{qid}/sitelinks/enwiki/title"))
-                .and_then(|v| v.as_str())
-                .map(|t| ("en", t.to_string()))
-        })?;
+    {
+        (lang.to_string(), t.to_string())
+    } else if let Some(t) = wd_data
+        .pointer(&format!("/entities/{qid}/sitelinks/enwiki/title"))
+        .and_then(|v| v.as_str())
+    {
+        ("en".to_string(), t.to_string())
+    } else {
+        return None;
+    };
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -115,6 +124,7 @@ async fn fetch_bio_lastfm(
     client: &reqwest::Client,
     artist_name: &str,
     api_key: &str,
+    lang: &str,
 ) -> Option<BioResult> {
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
@@ -123,7 +133,7 @@ async fn fetch_bio_lastfm(
             ("artist", artist_name),
             ("api_key", api_key),
             ("format", "json"),
-            ("lang", "fr"),
+            ("lang", lang),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -159,25 +169,28 @@ pub async fn fetch_album_bio(
     artist_name: &str,
     album_title: &str,
     lastfm_key: &str,
+    lang: &str,
 ) -> Option<BioResult> {
-    // 1. Wikipedia FR search
-    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "fr").await {
+    // 1. Wikipedia in the preferred language
+    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, lang).await {
         if bio.text.len() > 50 {
             return Some(bio);
         }
     }
 
     // 2. Wikipedia EN fallback
-    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await {
-        if bio.text.len() > 50 {
-            return Some(bio);
+    if lang != "en" {
+        if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await {
+            if bio.text.len() > 50 {
+                return Some(bio);
+            }
         }
     }
 
     // 3. Last.fm fallback
     if !lastfm_key.is_empty() {
         if let Some(bio) =
-            fetch_album_bio_lastfm(client, artist_name, album_title, lastfm_key).await
+            fetch_album_bio_lastfm(client, artist_name, album_title, lastfm_key, lang).await
         {
             if bio.text.len() > 50 {
                 return Some(bio);
@@ -277,6 +290,7 @@ async fn fetch_album_bio_lastfm(
     artist_name: &str,
     album_title: &str,
     api_key: &str,
+    lang: &str,
 ) -> Option<BioResult> {
     let resp = client
         .get("https://ws.audioscrobbler.com/2.0/")
@@ -286,7 +300,7 @@ async fn fetch_album_bio_lastfm(
             ("album", album_title),
             ("api_key", api_key),
             ("format", "json"),
-            ("lang", "fr"),
+            ("lang", lang),
         ])
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -323,7 +337,11 @@ fn strip_html(s: &str) -> String {
 
 /// Batch enrich artist bios: Wikipedia FR via Wikidata + Last.fm fallback.
 /// Submits each bio to mozaiklabs.fr community API.
-pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) {
+pub async fn batch_enrich_artist_bios(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    lang: &str,
+) {
+    let lang = if lang.is_empty() { "fr" } else { lang };
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
     let artists = match artist_repo.list_without_bio() {
         Ok(a) => a,
@@ -373,7 +391,7 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
             tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         }
 
-        match fetch_artist_bio(&client, mbid, name, &lastfm_key).await {
+        match fetch_artist_bio(&client, mbid, name, &lastfm_key, lang).await {
             Some(bio) => {
                 artist_repo
                     .update_bio_full(
@@ -440,7 +458,11 @@ pub async fn batch_enrich_artist_bios(db: std::sync::Arc<dyn crate::db::backend:
 
 /// Batch enrich album bios: Wikipedia FR → Wikipedia EN → Last.fm fallback.
 /// Processes 4 albums concurrently for speed.
-pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::DbBackend>) {
+pub async fn batch_enrich_album_bios(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    lang: &str,
+) {
+    let lang = if lang.is_empty() { "fr" } else { lang };
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
     let albums = match album_repo.list_without_bio() {
         Ok(a) => a,
@@ -476,7 +498,7 @@ pub async fn batch_enrich_album_bios(db: std::sync::Arc<dyn crate::db::backend::
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
         let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
-        let result = fetch_album_bio(&client, artist, title, &lastfm_key).await;
+        let result = fetch_album_bio(&client, artist, title, &lastfm_key, lang).await;
 
         match result {
             Some(bio) => {
