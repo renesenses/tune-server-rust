@@ -1279,4 +1279,34 @@ mod tests {
             assert_eq!(e.position, i as i64);
         }
     }
+
+    #[test]
+    fn unified_get_at_resolves_local_after_streaming_s2() {
+        // Sandro S2: a Qobuz track is current, a local track is added "next".
+        // get_at must resolve the LOCAL track at the next position. The old code
+        // offset into the streaming table (position - local_count) and never
+        // found the local "next", so the zone froze on manual Next.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut t = Track::new("Local Next".into());
+        t.file_path = Some("/n.flac".into());
+        let tid = track_repo.create(&t).unwrap();
+
+        // Queue: [qobuz@0 (current), local@1].
+        repo.append(1, &[streaming("q1", "Q Now")]).unwrap();
+        repo.set_current_pos(1, 0).unwrap();
+        repo.insert_at(1, &[local(tid)], Some(1)).unwrap();
+
+        assert_eq!(repo.count_all(1).unwrap(), 2);
+        let at1 = repo.get_at(1, 1).unwrap().unwrap();
+        assert!(
+            at1.is_local(),
+            "position 1 must resolve to the local next track"
+        );
+        assert_eq!(at1.track_id, Some(tid));
+        let at0 = repo.get_at(1, 0).unwrap().unwrap();
+        assert!(!at0.is_local());
+        assert_eq!(at0.source_id.as_deref(), Some("q1"));
+    }
 }
