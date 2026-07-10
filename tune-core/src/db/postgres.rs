@@ -56,7 +56,17 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS autoplay_enabled TEXT DEFAULT '0';\
 ALTER TABLE zones ADD COLUMN IF NOT EXISTS last_play_state TEXT DEFAULT 'stopped';\
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS source_id TEXT;\
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_id TEXT;\
-ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;";
+ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS profile_id TEXT;\
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source TEXT;\
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_source_url TEXT;\
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_license TEXT;\
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_lang TEXT;\
+ALTER TABLE artists ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;\
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source TEXT;\
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source_url TEXT;\
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;\
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;\
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;";
         if let Err(e) = sqlx::raw_sql(ENSURE_COLUMNS).execute(&self.pool).await {
             warn!(error = %e, "pg_ensure_schema_failed");
         }

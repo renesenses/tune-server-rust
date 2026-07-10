@@ -421,6 +421,32 @@ impl ArtistRepo {
         Ok(())
     }
 
+    /// Update bio together with its provenance (source, URL, license, lang) and
+    /// stamp the fetch time. Needed for CC BY-SA attribution and freshness.
+    pub fn update_bio_full(
+        &self,
+        id: i64,
+        bio: &str,
+        source: &str,
+        source_url: Option<String>,
+        license: &str,
+        lang: &str,
+    ) -> Result<(), TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Sqlite => {
+                "UPDATE artists SET bio = ?, bio_source = ?, bio_source_url = ?, \
+                 bio_license = ?, bio_lang = ?, bio_fetched_at = CURRENT_TIMESTAMP WHERE id = ?"
+            }
+            Engine::Postgres => {
+                "UPDATE artists SET bio = $1, bio_source = $2, bio_source_url = $3, \
+                 bio_license = $4, bio_lang = $5, bio_fetched_at = CURRENT_TIMESTAMP WHERE id = $6"
+            }
+        };
+        let params: [&dyn ToSqlValue; 6] = [&bio, &source, &source_url, &license, &lang, &id];
+        self.db.execute(sql, &params)?;
+        Ok(())
+    }
+
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
