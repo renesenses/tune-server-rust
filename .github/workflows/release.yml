@@ -58,6 +58,17 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
+            features: oaat,postgres
+          # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
+          # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
+          # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
+          # installs use SQLite; dropping postgres also avoids libpq static-link.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            platform: linux-aarch64-musl
+            ext: tar.gz
+            cross: true
+            features: oaat
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -99,7 +110,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"

@@ -63,6 +63,13 @@ const GAPLESS_GUARD_SECS: u64 = 15;
 /// renderer (e.g. DMP-A8) reports state changes immediately after
 /// SetNextAVTransportURI.
 const MIN_PLAYED_FRACTION: f64 = 0.80;
+/// A renderer's `ended_naturally` signal is only trusted once at least this
+/// fraction of the (known) track duration has elapsed in WALL-CLOCK time — a
+/// track physically cannot end at 1x playback before then. Guards against
+/// renderers (Eversolo DMP-A8) that falsely report ended_naturally seconds into
+/// a multi-minute track when their internal player chokes (Lavf range-hunting a
+/// large FLAC), which would advance the queue prematurely.
+const MIN_WALL_FRACTION_FOR_NATURAL_END: f64 = 0.5;
 /// Minimum wall-clock seconds a track must have been playing before we accept
 /// a gapless transition. Prevents false skips when a renderer fails to decode
 /// and reports STOPPED after only a few seconds.
@@ -118,7 +125,10 @@ fn rand_pos(queue_length: i64, current: i64) -> i64 {
 /// faithful and seeds the future poller state machine (Axe 2): the FSM
 /// `transition` will call exactly these functions.
 pub(crate) mod decisions {
-    use super::{MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS};
+    use super::{
+        MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
+        MIN_WALL_FRACTION_FOR_NATURAL_END,
+    };
 
     /// Has enough of the current track been played to accept a track-end or
     /// gapless transition?
@@ -144,6 +154,20 @@ pub(crate) mod decisions {
         }
     }
 
+    /// Whether a renderer's `ended_naturally` signal is plausible given elapsed
+    /// wall-clock time. For a known-duration track it must have been playing at
+    /// least `MIN_WALL_FRACTION_FOR_NATURAL_END` of its duration (you cannot end
+    /// a 4-minute track in 35 seconds at 1x). Unknown duration keeps the original
+    /// modest 5-second floor. Rejects the DMP-A8's spurious early ended_naturally.
+    pub fn ended_naturally_wall_ok(wall_elapsed: u64, track_duration_ms: u64) -> bool {
+        if track_duration_ms == 0 {
+            wall_elapsed >= 5
+        } else {
+            wall_elapsed as f64 * 1000.0
+                >= track_duration_ms as f64 * MIN_WALL_FRACTION_FOR_NATURAL_END
+        }
+    }
+
     /// Position dropped from `>30s` to `<5s` while a gapless transition was
     /// armed — a strong signal the renderer auto-advanced to the next track.
     pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bool) -> bool {
@@ -166,7 +190,7 @@ pub(crate) mod decisions {
         let repeat_end = repeat_active && peak_position_ms > 5_000;
         played_enough
             || repeat_end
-            || (ended_naturally && wall_elapsed >= 5)
+            || (ended_naturally && ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
             || (is_short_track && peak_position_ms as f64 >= track_duration_ms as f64 * 0.5)
     }
 }
@@ -1046,7 +1070,10 @@ impl PositionPoller {
                                 "gapless_advance_waiting_for_renderer"
                             );
                         }
-                    } else if status.ended_naturally && (played_enough || wall_elapsed >= 5) {
+                    } else if status.ended_naturally
+                        && (played_enough
+                            || decisions::ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
+                    {
                         // Local outputs (WASAPI/ALSA/CoreAudio) signal
                         // ended_naturally when the audio stream reaches EOF.
                         // Skip the STOPPED_TICKS_THRESHOLD wait — we know
@@ -1979,9 +2006,16 @@ mod tests {
     }
 
     #[test]
-    fn natural_end_ended_naturally_after_5s() {
-        assert!(decisions::natural_end(false, false, 0, true, 5, 300_000));
-        assert!(!decisions::natural_end(false, false, 0, true, 4, 300_000));
+    fn natural_end_ended_naturally_needs_proportional_wall() {
+        // ended_naturally is trusted only once >= MIN_WALL_FRACTION of the known
+        // duration has elapsed in wall time — a 5:00 track cannot end at 5s
+        // (DMP-A8 spurious ended_naturally). 50% of 300s = 150s.
+        assert!(!decisions::natural_end(false, false, 0, true, 5, 300_000));
+        assert!(!decisions::natural_end(false, false, 0, true, 149, 300_000));
+        assert!(decisions::natural_end(false, false, 0, true, 150, 300_000));
+        // Unknown duration (0) keeps the original modest 5s floor.
+        assert!(decisions::natural_end(false, false, 0, true, 5, 0));
+        assert!(!decisions::natural_end(false, false, 0, true, 4, 0));
     }
 
     #[test]

@@ -595,11 +595,12 @@ fn decode_utf16(data: &[u8], little_endian: bool) -> String {
     String::from_utf16_lossy(&code_units)
 }
 
-/// Read and parse the ID3v2 metadata chunk from a DSF file.
+/// Read the raw ID3v2 tag bytes from a DSF file's metadata chunk.
 ///
 /// DSF files store an ID3v2 tag at the byte offset specified in the DSD
-/// chunk header (bytes 20-27).
-fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v2Tags> {
+/// chunk header (bytes 20-27). Returns the tag as a contiguous buffer
+/// (ID3v2 header + body), or `None` if there is no tag or it looks invalid.
+fn read_dsf_id3v2_raw(path: &Path, metadata_offset: Option<u64>) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let offset = metadata_offset?;
@@ -636,7 +637,39 @@ fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v
     tag_data[..10].copy_from_slice(&header);
     f.read_exact(&mut tag_data[10..]).ok()?;
 
+    Some(tag_data)
+}
+
+/// Read and parse the ID3v2 metadata chunk from a DSF file.
+fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v2Tags> {
+    let tag_data = read_dsf_id3v2_raw(path, metadata_offset)?;
     parse_id3v2_tag(&tag_data)
+}
+
+/// Extract the embedded cover art (APIC) from a DSF file's ID3v2 chunk.
+///
+/// lofty does not read the ID3v2 tag stored at the DSF metadata offset, so
+/// embedded artwork is invisible to the generic `lofty::read_from_path`
+/// cover-extraction path used by [`crate::library::artwork::extract_cover_art`].
+/// This reads the tag directly and returns the first picture's raw bytes and
+/// MIME type. Non-`.dsf` paths (and files without embedded art) return `None`.
+pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext != "dsf" {
+        return None;
+    }
+
+    let info = parse_dsf_header_full(path).ok()?;
+    let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset)?;
+
+    let tag = id3::Tag::read_from2(std::io::Cursor::new(tag_data)).ok()?;
+    let pic = tag.pictures().next()?;
+    let mime = if pic.mime_type.is_empty() {
+        "image/jpeg".to_string()
+    } else {
+        pic.mime_type.clone()
+    };
+    Some((pic.data.clone(), mime))
 }
 
 /// Fallback metadata extraction for DSF/DFF files when lofty fails.
