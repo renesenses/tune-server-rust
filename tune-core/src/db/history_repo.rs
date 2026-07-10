@@ -311,7 +311,7 @@ impl HistoryRepo {
     /// `now_iso8601`) so the same SQL emission paths work on both
     /// SQLite and Postgres.
     ///
-    /// `period`: "7d", "30d", "90d", "all" (default 30d).
+    /// `period`: "today", "7d", "30d", "90d", "all" (default 30d).
     /// `zone_id`: optional filter.
     /// `top_n`: how many items per top list.
     pub fn full_dashboard(
@@ -322,6 +322,12 @@ impl HistoryRepo {
         top_n: i64,
     ) -> Result<DashboardData, String> {
         let days: Option<i64> = match period {
+            // "today" is sent by the UI's first period chip. Without this arm it
+            // fell through to `other`, where "today".parse::<i64>() fails → None
+            // → the whole history was returned, so the button appeared to do
+            // nothing (Elie). Map it to the last day, consistent with the other
+            // relative-day windows (7d/30d).
+            "today" => Some(1),
             "7d" => Some(7),
             "30d" => Some(30),
             "90d" => Some(90),
