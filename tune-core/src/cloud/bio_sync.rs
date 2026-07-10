@@ -12,6 +12,12 @@ const UPLOAD_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios";
 const DOWNLOAD_ARTIST_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios/artists";
 const DOWNLOAD_ALBUM_URL: &str = "https://mozaiklabs.fr/api/v1/community/bios/albums";
 const BATCH_SIZE: usize = 100;
+// The by-title phase packs a URL-encoded JSON array of {title, artist_name}
+// into a GET query string, which is far longer per item than the 36-char MBIDs
+// the other phases send. At BATCH_SIZE=100 the URI blew past the server limit →
+// HTTP 414 "URI Too Long" on every batch (bio_download_albums_by_title_rejected,
+// looping forever). Use a much smaller batch just for this phase.
+const TITLE_BATCH_SIZE: usize = 20;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
 // ── Upload payload ────────────────────────────────────────────────────────────
@@ -356,7 +362,7 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         return;
     }
 
-    for chunk in title_candidates.chunks(BATCH_SIZE) {
+    for chunk in title_candidates.chunks(TITLE_BATCH_SIZE) {
         // Build JSON array of {title, artist_name} for the VPS endpoint
         let titles_json: Vec<serde_json::Value> = chunk
             .iter()
