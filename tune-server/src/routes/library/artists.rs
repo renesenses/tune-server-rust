@@ -74,6 +74,20 @@ pub(super) async fn artist_bio(
     let Some(artist) = artist else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Prefer a locally-enriched bio (with provenance/attribution) over the
+    // community proxy — this surfaces the sourced Wikipedia/Last.fm/Qobuz/
+    // TheAudioDB bio and its licence to the client.
+    if let Some(ref bio) = artist.bio {
+        if !bio.is_empty() {
+            let prov = repo.bio_provenance(id).ok().flatten();
+            return Json(json!({
+                "artist": artist.name,
+                "bio": bio,
+                "bio_provenance": prov,
+            }))
+            .into_response();
+        }
+    }
     let Some(ref mbid) = artist.musicbrainz_id else {
         return Json(json!({"artist": artist.name, "bio": null, "error": "no MusicBrainz ID"}))
             .into_response();
