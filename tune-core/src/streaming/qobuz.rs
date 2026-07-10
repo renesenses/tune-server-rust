@@ -810,6 +810,10 @@ impl StreamingService for QobuzService {
         // We cap at MAX and the app offers a text filter over the loaded set.
         const MAX: usize = 500;
         const PAGE: usize = 50;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut albums: Vec<StreamAlbum> = Vec::new();
         let mut offset: usize = 0;
         loop {
@@ -831,13 +835,18 @@ impl StreamingService for QobuzService {
                 .cloned()
                 .unwrap_or_default();
             let n = items.len();
-            // Skip albums Qobuz marks as non-streamable — a label's full
-            // catalogue includes purchase-only / region-locked releases whose
-            // tracks resolve to "no url" (502) on playback.
+            // A label's full catalogue includes not-yet-released pre-orders
+            // (streamable=true but a future release date) whose tracks resolve
+            // to "no url" (502) on playback. Keep only released + streamable
+            // albums (mirrors the LMS plugin's `_isReleased` check).
             albums.extend(
                 items
                     .iter()
-                    .filter(|it| it["streamable"].as_bool() != Some(false))
+                    .filter(|it| {
+                        let streamable = it["streamable"].as_bool() != Some(false);
+                        let released = it["released_at"].as_u64().map_or(true, |ts| ts <= now);
+                        streamable && released
+                    })
                     .map(Self::map_album),
             );
             let total = data["albums"]["total"].as_u64().unwrap_or(0) as usize;
