@@ -95,23 +95,32 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
         "queue_position": zone_state.queue_position,
         "muted": zone_state.muted,
     });
-    // Include stream_url for browser playback zones so the web client
-    // can feed it to an HTML5 <audio> element.
-    if let Some(ref np) = zone_state.now_playing {
-        if let Some(ref stream_id) = np.stream_id {
-            let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
-                tune_core::discovery::ssdp::get_local_ip()
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".into())
-            });
-            let ext = "flac";
-            let stream_url = format!(
-                "http://{}:{}/stream/{}.{}",
-                server_ip, state.port, stream_id, ext
-            );
-            v.as_object_mut()
-                .unwrap()
-                .insert("stream_url".into(), json!(stream_url));
+    // Include stream_url ONLY for browser playback zones, so the web client can
+    // feed it to an HTML5 <audio> element. For a network output (DLNA / Chromecast
+    // / AirPlay / SlimProto / local), an open web-client tab that fetched this URL
+    // would consume the SAME single-consumer stream (streamer.rs mpsc) as the
+    // renderer and starve it — playback stalled or skipped after a few tracks
+    // until the tab was closed (forum: eric, #954; matches "close the tab and the
+    // sound comes back").
+    let is_browser_zone =
+        zone_db.as_ref().and_then(|z| z.output_type.as_deref()) == Some("browser");
+    if is_browser_zone {
+        if let Some(ref np) = zone_state.now_playing {
+            if let Some(ref stream_id) = np.stream_id {
+                let server_ip = state.config.advertised_ip.clone().unwrap_or_else(|| {
+                    tune_core::discovery::ssdp::get_local_ip()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "127.0.0.1".into())
+                });
+                let ext = "flac";
+                let stream_url = format!(
+                    "http://{}:{}/stream/{}.{}",
+                    server_ip, state.port, stream_id, ext
+                );
+                v.as_object_mut()
+                    .unwrap()
+                    .insert("stream_url".into(), json!(stream_url));
+            }
         }
     }
     v
