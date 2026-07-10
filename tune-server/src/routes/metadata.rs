@@ -584,6 +584,18 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                 let mut bio = clean(content);
                 let bio_summary = clean(summary);
 
+                // Track the provenance of the winning bio (Last.fm by default).
+                let mut bio_source = String::new();
+                let mut bio_license = String::new();
+                let mut bio_lang = String::new();
+                let mut bio_url: Option<String> = None;
+                if !bio.is_empty() {
+                    bio_source = "lastfm".to_string();
+                    bio_license = "CC-BY-SA-3.0".to_string();
+                    bio_lang = "fr".to_string();
+                    bio_url = data["artist"]["url"].as_str().map(String::from);
+                }
+
                 // Fallback to Wikipedia if Last.fm bio is empty
                 if bio.is_empty() || bio.len() < 20 {
                     if let Ok(wiki) = client
@@ -599,6 +611,12 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                             if let Some(extract) = wd["extract"].as_str() {
                                 if extract.len() > bio.len() {
                                     bio = extract.to_string();
+                                    bio_source = "wikipedia".to_string();
+                                    bio_license = "CC-BY-SA-4.0".to_string();
+                                    bio_lang = "en".to_string();
+                                    bio_url = wd["content_urls"]["desktop"]["page"]
+                                        .as_str()
+                                        .map(String::from);
                                 }
                             }
                         }
@@ -618,6 +636,12 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
                                 if let Some(extract) = wd["extract"].as_str() {
                                     if extract.len() > bio.len() {
                                         bio = extract.to_string();
+                                        bio_source = "wikipedia".to_string();
+                                        bio_license = "CC-BY-SA-4.0".to_string();
+                                        bio_lang = "fr".to_string();
+                                        bio_url = wd["content_urls"]["desktop"]["page"]
+                                            .as_str()
+                                            .map(String::from);
                                     }
                                 }
                             }
@@ -627,7 +651,18 @@ async fn enrich_artist(State(state): State<AppState>, Path(id): Path<i64>) -> im
 
                 // Update artist bio in DB if content is richer
                 if bio.len() > artist.bio.as_deref().unwrap_or("").len() {
-                    let _ = repo.update_bio(id, &bio);
+                    if bio_source.is_empty() {
+                        let _ = repo.update_bio(id, &bio);
+                    } else {
+                        let _ = repo.update_bio_full(
+                            id,
+                            &bio,
+                            &bio_source,
+                            bio_url.clone(),
+                            &bio_license,
+                            &bio_lang,
+                        );
+                    }
                 }
 
                 return Json(json!({
