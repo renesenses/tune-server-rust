@@ -435,4 +435,75 @@ mod tests {
         let current = repo.get_current(1).unwrap().unwrap();
         assert_eq!(current.position, 1);
     }
+
+    #[test]
+    fn save_and_restore_mixed_queue() {
+        use crate::db::play_queue_repo::QueueInput;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let db: std::sync::Arc<dyn crate::db::backend::DbBackend> = std::sync::Arc::new(sqlite);
+        db.execute(
+            "INSERT INTO zones (id, name, output_type) VALUES (1, 'Main', 'local')",
+            &[],
+        )
+        .unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms) VALUES (1, 'Local', 1, 1, 180000)",
+            &[],
+        )
+        .unwrap();
+
+        let repo = PlayQueueRepo::with_backend(db.clone());
+        // Mixed queue: local@0, streaming@1 — the interleaved order must survive
+        // a save + restore round-trip via the unified `items` snapshot field.
+        repo.append(
+            1,
+            &[
+                QueueInput::Local { track_id: 1 },
+                QueueInput::Streaming {
+                    source: "qobuz".into(),
+                    source_id: "q1".into(),
+                    title: "Q1".into(),
+                    artist: "A".into(),
+                    album: None,
+                    cover_url: None,
+                    duration_ms: 100,
+                },
+            ],
+        )
+        .unwrap();
+
+        let zone_state = ZoneState {
+            zone_id: 1,
+            queue_position: 0,
+            queue_length: 2,
+            ..Default::default()
+        };
+        save_queue(&db, db_path_str, 1, &zone_state);
+        repo.clear(1).unwrap();
+        assert_eq!(repo.count_all(1).unwrap(), 0);
+
+        restore_all_queues(&db, db_path_str);
+
+        let restored = repo.get_ordered(1).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].track_id, Some(1), "local first");
+        assert!(!restored[1].is_local(), "streaming second");
+        assert_eq!(restored[1].source_id.as_deref(), Some("q1"));
+        for (i, e) in restored.iter().enumerate() {
+            assert_eq!(e.position, i as i64);
+        }
+    }
 }
