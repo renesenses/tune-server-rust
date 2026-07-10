@@ -237,6 +237,7 @@ impl AmazonMusicService {
                 .unwrap_or("Unknown")
                 .to_string(),
             image_path: data["artworkUrl"].as_str().map(Into::into),
+            bio: None,
         }
     }
 

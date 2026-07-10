@@ -482,7 +482,18 @@ impl QobuzService {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             name: item["name"].as_str().unwrap_or("").into(),
             image_path: item["image"]["large"].as_str().map(Into::into),
+            bio: item["biography"]["content"]
+                .as_str()
+                .or_else(|| item["biography"]["summary"].as_str())
+                .map(Self::strip_html_tags)
+                .filter(|s| !s.is_empty()),
         }
+    }
+
+    /// Strip HTML tags from Qobuz editorial text (biography content is HTML).
+    fn strip_html_tags(s: &str) -> String {
+        let re = regex::Regex::new(r"<[^>]+>").unwrap();
+        re.replace_all(s, "").trim().to_string()
     }
 }
 
@@ -657,7 +668,10 @@ impl StreamingService for QobuzService {
 
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self
-            .api_get("/artist/get", &[("artist_id", artist_id)])
+            .api_get(
+                "/artist/get",
+                &[("artist_id", artist_id), ("extra", "biography")],
+            )
             .await?;
         Ok(Self::map_artist(&data))
     }

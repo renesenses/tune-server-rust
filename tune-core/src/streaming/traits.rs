@@ -39,6 +39,10 @@ pub struct StreamArtist {
     pub id: String,
     pub name: String,
     pub image_path: Option<String>,
+    /// Artist biography as plain text. Currently populated by Qobuz editorial;
+    /// other services leave it None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +365,7 @@ mod tests {
             id: "42".into(),
             name: "Miles Davis".into(),
             image_path: Some("http://img.jpg".into()),
+            bio: None,
         };
         let json = serde_json::to_value(&artist).unwrap();
         assert_eq!(json["id"], "42");
