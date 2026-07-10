@@ -28,7 +28,23 @@ ALTER TABLE zones ADD COLUMN IF NOT EXISTS max_sample_rate INTEGER;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS password_hash_v2 TEXT;
 
--- ── smart_collections: extra display columns ────────────────────────
+-- ── smart_collections: base table + extra display columns ───────────
+-- The base table is created by SQLite migrations but was never ported to
+-- PG, so the ALTERs below failed on a fresh database (ADD COLUMN IF NOT
+-- EXISTS guards the column, not the table). Create it first; on existing
+-- databases the IF NOT EXISTS makes it a no-op.
+
+CREATE TABLE IF NOT EXISTS smart_collections (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    rules TEXT NOT NULL DEFAULT '[]',
+    match_mode TEXT NOT NULL DEFAULT '"all"',
+    sort_by TEXT,
+    sort_order TEXT NOT NULL DEFAULT '"asc"',
+    max_limit INTEGER,
+    created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    updated_at TEXT DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
 
 ALTER TABLE smart_collections ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE smart_collections ADD COLUMN IF NOT EXISTS icon TEXT;

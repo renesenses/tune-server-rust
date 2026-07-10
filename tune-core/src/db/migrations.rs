@@ -1104,6 +1104,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "podcast_subscriptions",
         include_str!("../../migrations/postgres/007_podcast_subscriptions.sql"),
     ),
+    (
+        8,
+        "schema_sync",
+        include_str!("../../migrations/postgres/008_schema_sync.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
