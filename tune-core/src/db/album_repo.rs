@@ -234,7 +234,7 @@ pub mod sql {
     }
 
     pub fn list_with_bio() -> &'static str {
-        "SELECT a.id, a.title, ar.name, a.musicbrainz_release_group_id, a.bio FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE a.bio IS NOT NULL AND a.bio != '' ORDER BY a.id"
+        "SELECT a.id, a.title, ar.name, a.musicbrainz_release_group_id, a.bio, a.bio_source, a.bio_source_url, a.bio_license, a.bio_lang FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE a.bio IS NOT NULL AND a.bio != '' ORDER BY a.id"
     }
 
     pub fn list_without_bio_with_mbid() -> &'static str {
@@ -659,9 +659,22 @@ impl AlbumRepo {
     /// Return all albums that have a non-empty bio, regardless of MBID.
     /// Each entry is (title, artist_name, musicbrainz_release_group_id, bio).
     /// The MBID may be None for albums without a MusicBrainz ID.
+    #[allow(clippy::type_complexity)]
     pub fn albums_with_bio(
         &self,
-    ) -> Result<Vec<(String, Option<String>, Option<String>, String)>, TuneError> {
+    ) -> Result<
+        Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        TuneError,
+    > {
         let rows = self.db.query_many(sql::list_with_bio(), &[])?;
         Ok(rows
             .into_iter()
@@ -671,6 +684,10 @@ impl AlbumRepo {
                     cols.get(2).and_then(|v| v.as_string()),
                     cols.get(3).and_then(|v| v.as_string()),
                     cols.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(5).and_then(|v| v.as_string()),
+                    cols.get(6).and_then(|v| v.as_string()),
+                    cols.get(7).and_then(|v| v.as_string()),
+                    cols.get(8).and_then(|v| v.as_string()),
                 )
             })
             .collect())

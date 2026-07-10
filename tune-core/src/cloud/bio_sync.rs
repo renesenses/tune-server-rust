@@ -21,6 +21,14 @@ struct ArtistBioEntry {
     name: String,
     musicbrainz_id: String,
     bio: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +39,14 @@ struct AlbumBioEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     musicbrainz_id: Option<String>,
     bio: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    license: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,12 +62,28 @@ struct BioUploadPayload {
 struct ArtistBioResponse {
     musicbrainz_id: String,
     bio: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AlbumBioResponse {
     musicbrainz_id: String,
     bio: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +103,23 @@ struct AlbumByTitleBioResponse {
     title: String,
     artist_name: Option<String>,
     bio: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    lang: Option<String>,
+}
+
+/// Source label for a downloaded community bio — defaults to "community"
+/// when the payload carries no explicit source.
+fn bio_source(source: &Option<String>) -> &str {
+    match source.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => "community",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,26 +184,46 @@ pub async fn upload_bios(db: &Arc<dyn DbBackend>) {
     for i in 0..batch_count {
         let artist_batch: Vec<ArtistBioEntry> = artist_chunks
             .get(i)
-            .unwrap_or(&(&[] as &[(String, String, String)]))
-            .iter()
-            .map(|(name, mbid, bio)| ArtistBioEntry {
-                name: name.clone(),
-                musicbrainz_id: mbid.clone(),
-                bio: bio.clone(),
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(
+                        |(name, mbid, bio, source, source_url, license, lang)| ArtistBioEntry {
+                            name: name.clone(),
+                            musicbrainz_id: mbid.clone(),
+                            bio: bio.clone(),
+                            source: source.clone(),
+                            source_url: source_url.clone(),
+                            license: license.clone(),
+                            lang: lang.clone(),
+                        },
+                    )
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         let album_batch: Vec<AlbumBioEntry> = album_chunks
             .get(i)
-            .unwrap_or(&(&[] as &[(String, Option<String>, Option<String>, String)]))
-            .iter()
-            .map(|(title, artist_name, mbid, bio)| AlbumBioEntry {
-                title: title.clone(),
-                artist_name: artist_name.clone(),
-                musicbrainz_id: mbid.clone(),
-                bio: bio.clone(),
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(
+                        |(title, artist_name, mbid, bio, source, source_url, license, lang)| {
+                            AlbumBioEntry {
+                                title: title.clone(),
+                                artist_name: artist_name.clone(),
+                                musicbrainz_id: mbid.clone(),
+                                bio: bio.clone(),
+                                source: source.clone(),
+                                source_url: source_url.clone(),
+                                license: license.clone(),
+                                lang: lang.clone(),
+                            }
+                        },
+                    )
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         if artist_batch.is_empty() && album_batch.is_empty() {
             continue;
@@ -265,7 +334,14 @@ async fn download_artist_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client)
         let mut applied = 0usize;
         for entry in &wrapper.artists {
             if let Some(&artist_id) = id_map.get(entry.musicbrainz_id.as_str()) {
-                if let Err(e) = artist_repo.update_bio(artist_id, &entry.bio) {
+                if let Err(e) = artist_repo.update_bio_full(
+                    artist_id,
+                    &entry.bio,
+                    bio_source(&entry.source),
+                    entry.source_url.clone(),
+                    entry.license.as_deref().unwrap_or(""),
+                    entry.lang.as_deref().unwrap_or(""),
+                ) {
                     warn!(artist_id, error = %e, "bio_download_artist_update_failed");
                 } else {
                     applied += 1;
@@ -330,7 +406,14 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         let mut applied = 0usize;
         for entry in &wrapper.albums {
             if let Some(&album_id) = id_map.get(entry.musicbrainz_id.as_str()) {
-                if let Err(e) = album_repo.update_bio(album_id, &entry.bio) {
+                if let Err(e) = album_repo.update_bio_full(
+                    album_id,
+                    &entry.bio,
+                    bio_source(&entry.source),
+                    entry.source_url.clone(),
+                    entry.license.as_deref().unwrap_or(""),
+                    entry.lang.as_deref().unwrap_or(""),
+                ) {
                     warn!(album_id, error = %e, "bio_download_album_update_failed");
                 } else {
                     applied += 1;
@@ -406,7 +489,14 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         for entry in &wrapper.albums {
             let key = (entry.title.as_str(), entry.artist_name.as_deref());
             if let Some(&album_id) = id_map.get(&key) {
-                if let Err(e) = album_repo.update_bio(album_id, &entry.bio) {
+                if let Err(e) = album_repo.update_bio_full(
+                    album_id,
+                    &entry.bio,
+                    bio_source(&entry.source),
+                    entry.source_url.clone(),
+                    entry.license.as_deref().unwrap_or(""),
+                    entry.lang.as_deref().unwrap_or(""),
+                ) {
                     warn!(album_id, error = %e, "bio_download_album_by_title_update_failed");
                 } else {
                     applied += 1;

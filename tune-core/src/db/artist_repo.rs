@@ -117,7 +117,7 @@ pub mod sql {
     }
 
     pub fn list_with_bio_and_mbid() -> &'static str {
-        "SELECT id, name, musicbrainz_id, bio FROM artists WHERE bio IS NOT NULL AND bio != '' AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+        "SELECT id, name, musicbrainz_id, bio, bio_source, bio_source_url, bio_license, bio_lang FROM artists WHERE bio IS NOT NULL AND bio != '' AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
     pub fn list_without_bio_with_mbid() -> &'static str {
@@ -297,7 +297,21 @@ impl ArtistRepo {
 
     /// Return all artists that have both a bio and a MusicBrainz ID.
     /// Each entry is (name, musicbrainz_id, bio).
-    pub fn artists_with_bio_and_mbid(&self) -> Result<Vec<(String, String, String)>, TuneError> {
+    #[allow(clippy::type_complexity)]
+    pub fn artists_with_bio_and_mbid(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        TuneError,
+    > {
         let rows = self.db.query_many(sql::list_with_bio_and_mbid(), &[])?;
         Ok(rows
             .into_iter()
@@ -306,6 +320,10 @@ impl ArtistRepo {
                     cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                     cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                     cols.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(4).and_then(|v| v.as_string()),
+                    cols.get(5).and_then(|v| v.as_string()),
+                    cols.get(6).and_then(|v| v.as_string()),
+                    cols.get(7).and_then(|v| v.as_string()),
                 )
             })
             .collect())
