@@ -158,6 +158,119 @@ pub mod sql {
             d.placeholder(1)
         )
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Unified single-position-space API (Lot 1 of the queue unification).
+    // These builders treat the whole zone queue as ONE ordered sequence,
+    // regardless of source (local `track_id` set, streaming `track_id` NULL).
+    // Display fields COALESCE the joined track/album/artist (local) with the
+    // inline columns (streaming). Added alongside the legacy split builders;
+    // callers switch over in Lot 2.
+    // ─────────────────────────────────────────────────────────────────────
+
+    pub fn unified_select_base() -> &'static str {
+        "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, q.source, \
+                COALESCE(t.title, q.title), COALESCE(ar.name, q.artist), \
+                COALESCE(al.title, q.album), q.source_id, \
+                COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
+                COALESCE(al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth \
+         FROM queue_items q \
+         LEFT JOIN tracks t ON q.track_id = t.id \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         LEFT JOIN artists ar ON t.artist_id = ar.id"
+    }
+
+    pub fn get_ordered<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE q.zone_id = {} ORDER BY q.position",
+            unified_select_base(),
+            d.placeholder(1)
+        )
+    }
+
+    pub fn get_at<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE q.zone_id = {} AND q.position = {} ORDER BY q.position LIMIT 1",
+            unified_select_base(),
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn count_all<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM queue_items WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn max_position_any<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COALESCE(MAX(position), -1) FROM queue_items WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// Shift positions of every row at/after `from` up by `by`, to open a gap
+    /// for an insertion. Placeholders: 1=by, 2=zone_id, 3=from.
+    pub fn shift_positions<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET position = position + {} WHERE zone_id = {} AND position >= {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    pub fn insert_local_at<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO queue_items (zone_id, track_id, position, is_current, source) VALUES ({}, {}, {}, 0, 'local')",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
+        )
+    }
+
+    // insert_streaming (position-explicit) is reused from the legacy builder.
+
+    pub fn delete_at_any<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM queue_items WHERE zone_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn reindex_after_delete_any<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET position = position - 1 WHERE zone_id = {} AND position > {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn unset_current_any<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET is_current = 0 WHERE zone_id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn set_current_at_any<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET is_current = 1 WHERE zone_id = {} AND position = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn set_position_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET position = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +289,53 @@ pub struct QueueItem {
     pub format: Option<String>,
     pub sample_rate: Option<i64>,
     pub bit_depth: Option<i64>,
+}
+
+/// A queue row in the unified single-position-space model. Unlike `QueueItem`
+/// (local-only, `track_id: i64`), this represents BOTH local and streaming
+/// items: `track_id`/`file_path` are set for local, `source_id` for streaming,
+/// and the display fields are already COALESCE-d from the right origin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueEntry {
+    pub id: i64,
+    pub zone_id: i64,
+    pub track_id: Option<i64>,
+    pub position: i64,
+    pub is_current: bool,
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub file_path: Option<String>,
+    pub cover_path: Option<String>,
+    pub format: Option<String>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+}
+
+impl QueueEntry {
+    pub fn is_local(&self) -> bool {
+        self.track_id.is_some()
+    }
+}
+
+/// An item to enqueue, source-agnostic. Used by the unified `insert_at`/`append`.
+#[derive(Debug, Clone)]
+pub enum QueueInput {
+    Local {
+        track_id: i64,
+    },
+    Streaming {
+        source: String,
+        source_id: String,
+        title: String,
+        artist: String,
+        album: Option<String>,
+        cover_url: Option<String>,
+        duration_ms: i64,
+    },
 }
 
 pub struct PlayQueueRepo {
@@ -350,6 +510,172 @@ impl PlayQueueRepo {
         Ok(())
     }
 
+    // ── Unified single-position-space API (Lot 1) ─────────────────────────
+    // Added alongside the legacy split methods; route/orchestrator callers
+    // switch to these in Lot 2 (with the position-renumbering migration).
+
+    /// Total number of items in the zone queue (local + streaming).
+    pub fn count_all(&self, zone_id: i64) -> Result<i64, String> {
+        let sql = self.dialect_sql(sql::count_all, sql::count_all);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let n = self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        Ok(n)
+    }
+
+    /// The whole zone queue as ONE ordered sequence (local + streaming).
+    pub fn get_ordered(&self, zone_id: i64) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(sql::get_ordered, sql::get_ordered);
+        let params: [&dyn ToSqlValue; 1] = [&zone_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        if !rows.is_empty() {
+            return Ok(rows.iter().map(row_to_queue_entry).collect());
+        }
+        let strong = self.db.query_many_strong(&sql, &params)?;
+        Ok(strong.iter().map(row_to_queue_entry).collect())
+    }
+
+    /// The single queue entry at `position` (source-agnostic), if any.
+    pub fn get_at(&self, zone_id: i64, position: i64) -> Result<Option<QueueEntry>, String> {
+        let sql = self.dialect_sql(sql::get_at, sql::get_at);
+        let params: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .as_ref()
+            .map(row_to_queue_entry))
+    }
+
+    /// Insert items at `position` (or append when None) in the unified space,
+    /// shifting every existing row at/after the insert point up to make room.
+    /// This is the basis of "Play Next" (position = current + 1): a streaming
+    /// item added while a local album plays now lands right after the current
+    /// track instead of at the end of the album (Sandro S1).
+    pub fn insert_at(
+        &self,
+        zone_id: i64,
+        items: &[QueueInput],
+        position: Option<i64>,
+    ) -> Result<(), String> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let max_pos_sql = self.dialect_sql(sql::max_position_any, sql::max_position_any);
+        let shift_sql = self.dialect_sql(sql::shift_positions, sql::shift_positions);
+        let insert_local_sql = self.dialect_sql(sql::insert_local_at, sql::insert_local_at);
+        let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
+        let n = items.len() as i64;
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 1] = [&zone_id];
+            let max_pos: i64 = tx
+                .query_one(&max_pos_sql, &p)?
+                .as_ref()
+                .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+                .unwrap_or(-1);
+            let start = position.unwrap_or(max_pos + 1).clamp(0, max_pos + 1);
+            // Open a gap of `n` at `start` (no-op when appending at the end).
+            let sp: [&dyn ToSqlValue; 3] = [&n, &zone_id, &start];
+            tx.execute(&shift_sql, &sp)?;
+            for (i, item) in items.iter().enumerate() {
+                let pos = start + i as i64;
+                match item {
+                    QueueInput::Local { track_id } => {
+                        let p: [&dyn ToSqlValue; 3] = [&zone_id, track_id, &pos];
+                        tx.execute(&insert_local_sql, &p)?;
+                    }
+                    QueueInput::Streaming {
+                        source,
+                        source_id,
+                        title,
+                        artist,
+                        album,
+                        cover_url,
+                        duration_ms,
+                    } => {
+                        let p: [&dyn ToSqlValue; 9] = [
+                            &zone_id,
+                            &pos,
+                            source_id,
+                            title,
+                            artist,
+                            album,
+                            cover_url,
+                            duration_ms,
+                            source,
+                        ];
+                        tx.execute(&insert_streaming_sql, &p)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Append items at the end of the unified queue.
+    pub fn append(&self, zone_id: i64, items: &[QueueInput]) -> Result<(), String> {
+        self.insert_at(zone_id, items, None)
+    }
+
+    /// Remove the item at `position` (source-agnostic) and close the gap.
+    pub fn remove_pos(&self, zone_id: i64, position: i64) -> Result<bool, String> {
+        let delete_sql = self.dialect_sql(sql::delete_at_any, sql::delete_at_any);
+        let reindex_sql =
+            self.dialect_sql(sql::reindex_after_delete_any, sql::reindex_after_delete_any);
+        let mut deleted = 0usize;
+        let deleted_ref = &mut deleted;
+        self.db.write_tx(&mut |tx| {
+            let p: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+            *deleted_ref = tx.execute(&delete_sql, &p)?;
+            if *deleted_ref > 0 {
+                tx.execute(&reindex_sql, &p)?;
+            }
+            Ok(())
+        })?;
+        Ok(deleted > 0)
+    }
+
+    /// Mark the item at `position` as current (source-agnostic). Unlike the
+    /// legacy `set_current` (local rows only), a streaming item can be current.
+    pub fn set_current_pos(&self, zone_id: i64, position: i64) -> Result<(), String> {
+        let unset_sql = self.dialect_sql(sql::unset_current_any, sql::unset_current_any);
+        let set_sql = self.dialect_sql(sql::set_current_at_any, sql::set_current_at_any);
+        self.db.write_tx(&mut |tx| {
+            let p1: [&dyn ToSqlValue; 1] = [&zone_id];
+            tx.execute(&unset_sql, &p1)?;
+            let p2: [&dyn ToSqlValue; 2] = [&zone_id, &position];
+            tx.execute(&set_sql, &p2)?;
+            Ok(())
+        })
+    }
+
+    /// Move the item at `from` to `to` within the unified space, renumbering
+    /// the affected rows so positions stay contiguous (0..N-1).
+    pub fn move_pos(&self, zone_id: i64, from: i64, to: i64) -> Result<(), String> {
+        if from == to {
+            return Ok(());
+        }
+        let mut entries = self.get_ordered(zone_id)?;
+        let len = entries.len() as i64;
+        if from < 0 || from >= len || to < 0 || to >= len {
+            return Ok(());
+        }
+        let item = entries.remove(from as usize);
+        entries.insert(to as usize, item);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            for (i, e) in entries.iter().enumerate() {
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 2] = [&pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+            }
+            Ok(())
+        })
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn set_streaming_queue(
         &self,
@@ -491,6 +817,28 @@ fn row_to_queue_item(cols: &Vec<SqlValue>) -> QueueItem {
         format: cols.get(11).and_then(|v| v.as_string()),
         sample_rate: cols.get(12).and_then(|v| v.as_i64()),
         bit_depth: cols.get(13).and_then(|v| v.as_i64()),
+    }
+}
+
+/// Maps a row from `sql::unified_select_base()` (16 columns) to a QueueEntry.
+fn row_to_queue_entry(cols: &Vec<SqlValue>) -> QueueEntry {
+    QueueEntry {
+        id: cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+        zone_id: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
+        track_id: cols.get(2).and_then(|v| v.as_i64()),
+        position: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+        is_current: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        source: cols.get(5).and_then(|v| v.as_string()),
+        title: cols.get(6).and_then(|v| v.as_string()),
+        artist_name: cols.get(7).and_then(|v| v.as_string()),
+        album_title: cols.get(8).and_then(|v| v.as_string()),
+        source_id: cols.get(9).and_then(|v| v.as_string()),
+        duration_ms: cols.get(10).and_then(|v| v.as_i64()),
+        file_path: cols.get(11).and_then(|v| v.as_string()),
+        cover_path: cols.get(12).and_then(|v| v.as_string()),
+        format: cols.get(13).and_then(|v| v.as_string()),
+        sample_rate: cols.get(14).and_then(|v| v.as_i64()),
+        bit_depth: cols.get(15).and_then(|v| v.as_i64()),
     }
 }
 
@@ -802,5 +1150,133 @@ mod tests {
         let repo = PlayQueueRepo::with_backend(backend);
         repo.set_queue(1, &[tid]).unwrap();
         assert_eq!(repo.count(1).unwrap(), 1);
+    }
+
+    // ── Unified single-position-space API (Lot 1) ─────────────────────────
+
+    fn local(track_id: i64) -> QueueInput {
+        QueueInput::Local { track_id }
+    }
+    fn streaming(id: &str, title: &str) -> QueueInput {
+        QueueInput::Streaming {
+            source: "qobuz".into(),
+            source_id: id.into(),
+            title: title.into(),
+            artist: "Artist".into(),
+            album: Some("Album".into()),
+            cover_url: None,
+            duration_ms: 200_000,
+        }
+    }
+
+    #[test]
+    fn unified_append_and_get_ordered_mixed() {
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut t1 = Track::new("L1".into());
+        t1.file_path = Some("/1.flac".into());
+        let tid1 = track_repo.create(&t1).unwrap();
+
+        repo.append(1, &[local(tid1), streaming("q1", "Q One")])
+            .unwrap();
+        assert_eq!(repo.count_all(1).unwrap(), 2);
+
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].position, 0);
+        assert!(q[0].is_local());
+        assert_eq!(q[0].track_id, Some(tid1));
+        assert_eq!(q[0].title.as_deref(), Some("L1"));
+        assert_eq!(q[1].position, 1);
+        assert!(!q[1].is_local());
+        assert_eq!(q[1].source_id.as_deref(), Some("q1"));
+        assert_eq!(q[1].title.as_deref(), Some("Q One"));
+        assert_eq!(q[1].source.as_deref(), Some("qobuz"));
+    }
+
+    #[test]
+    fn unified_play_next_inserts_after_current_s1() {
+        // Sandro S1: a local album is playing; adding a Qobuz track via
+        // "Play Next" (position = current + 1) must land right after the
+        // current track, NOT at the end of the album.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut t = Track::new(format!("L{i}"));
+            t.file_path = Some(format!("/{i}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        let locals: Vec<QueueInput> = ids.iter().map(|id| local(*id)).collect();
+        repo.append(1, &locals).unwrap();
+        // current = position 0 → "Play Next" inserts at position 1.
+        repo.insert_at(1, &[streaming("q1", "Q One")], Some(1))
+            .unwrap();
+
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 4);
+        assert_eq!(repo.count_all(1).unwrap(), 4);
+        assert_eq!(q[0].track_id, Some(ids[0]));
+        assert!(!q[1].is_local(), "Qobuz track must sit right after current");
+        assert_eq!(q[1].source_id.as_deref(), Some("q1"));
+        assert_eq!(q[2].track_id, Some(ids[1]));
+        assert_eq!(q[3].track_id, Some(ids[2]));
+        for (i, e) in q.iter().enumerate() {
+            assert_eq!(e.position, i as i64, "positions must stay contiguous");
+        }
+    }
+
+    #[test]
+    fn unified_get_at_remove_move_set_current() {
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut t = Track::new("L0".into());
+        t.file_path = Some("/0.flac".into());
+        let tid = track_repo.create(&t).unwrap();
+        repo.append(
+            1,
+            &[local(tid), streaming("q1", "Q1"), streaming("q2", "Q2")],
+        )
+        .unwrap();
+
+        // get_at resolves any position, source-agnostic.
+        assert_eq!(repo.get_at(1, 0).unwrap().unwrap().track_id, Some(tid));
+        assert_eq!(
+            repo.get_at(1, 2).unwrap().unwrap().source_id.as_deref(),
+            Some("q2")
+        );
+        assert!(repo.get_at(1, 9).unwrap().is_none());
+
+        // set_current can mark a streaming item (position 1).
+        repo.set_current_pos(1, 1).unwrap();
+        let cur = repo
+            .get_ordered(1)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.is_current)
+            .unwrap();
+        assert_eq!(cur.source_id.as_deref(), Some("q1"));
+
+        // remove middle → gap closes, positions stay contiguous.
+        assert!(repo.remove_pos(1, 1).unwrap());
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].track_id, Some(tid));
+        assert_eq!(q[1].source_id.as_deref(), Some("q2"));
+        for (i, e) in q.iter().enumerate() {
+            assert_eq!(e.position, i as i64);
+        }
+
+        // move the streaming item to the front.
+        repo.move_pos(1, 1, 0).unwrap();
+        let q2 = repo.get_ordered(1).unwrap();
+        assert_eq!(q2[0].source_id.as_deref(), Some("q2"));
+        assert_eq!(q2[1].track_id, Some(tid));
+        for (i, e) in q2.iter().enumerate() {
+            assert_eq!(e.position, i as i64);
+        }
     }
 }
