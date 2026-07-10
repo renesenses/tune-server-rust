@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::db::backend::DbBackend;
-use crate::db::play_queue_repo::PlayQueueRepo;
+use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use crate::db::zone_repo::ZoneRepo;
 use crate::playback::ZoneState;
 
@@ -20,14 +20,34 @@ pub struct QueueSnapshot {
     pub local_track_ids: Vec<i64>,
     /// Current track position index.
     pub current_position: i64,
-    /// Streaming queue items (for Tidal/Qobuz/Deezer/etc).
+    /// Streaming queue items (for Tidal/Qobuz/Deezer/etc). Legacy field kept
+    /// for rollback compatibility with servers that predate `items`.
     pub streaming_tracks: Vec<StreamingQueueEntry>,
+    /// The whole queue as ONE ordered list (unified position space). Preferred
+    /// on restore; falls back to local_track_ids + streaming_tracks when empty
+    /// (snapshots written before the unification).
+    #[serde(default)]
+    pub items: Vec<QueueSnapshotItem>,
     /// Repeat mode: "off", "one", or "all".
     pub repeat_mode: String,
     /// Whether shuffle is enabled.
     pub shuffle: bool,
     /// Playback position in milliseconds within the current track.
     pub position_ms: i64,
+}
+
+/// One entry of the ordered unified queue snapshot (local or streaming).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueSnapshotItem {
+    pub track_id: Option<i64>,
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub duration_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,6 +108,29 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         })
         .collect();
 
+    // The authoritative ordered unified list (local + streaming interleaved by
+    // position). Preferred on restore.
+    let entries = repo.get_ordered(zone_id).unwrap_or_default();
+    let items: Vec<QueueSnapshotItem> = entries
+        .iter()
+        .map(|e| QueueSnapshotItem {
+            track_id: e.track_id,
+            source: e.source.clone(),
+            source_id: e.source_id.clone(),
+            title: e.title.clone(),
+            artist_name: e.artist_name.clone(),
+            album_title: e.album_title.clone(),
+            cover_url: e.cover_path.clone(),
+            duration_ms: e.duration_ms.unwrap_or(0),
+        })
+        .collect();
+    // Current position from the unified list (a streaming item can be current).
+    let current_position = entries
+        .iter()
+        .position(|e| e.is_current)
+        .map(|p| p as i64)
+        .unwrap_or(current_position);
+
     let repeat_mode = match zone_state.repeat {
         crate::playback::RepeatMode::Off => "off",
         crate::playback::RepeatMode::One => "one",
@@ -99,6 +142,7 @@ pub fn save_queue(db: &Arc<dyn DbBackend>, db_path: &str, zone_id: i64, zone_sta
         local_track_ids,
         current_position,
         streaming_tracks,
+        items,
         repeat_mode: repeat_mode.to_string(),
         shuffle: zone_state.shuffle,
         position_ms: zone_state.position_ms,
@@ -174,69 +218,59 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) {
             continue;
         }
 
-        // Restore local queue — filter out track IDs that no longer exist in DB
-        if !snapshot.local_track_ids.is_empty() {
-            let track_repo = crate::db::track_repo::TrackRepo::with_backend(db.clone());
-            let valid_ids: Vec<i64> = snapshot
-                .local_track_ids
-                .iter()
-                .copied()
-                .filter(|id| track_repo.get(*id).ok().flatten().is_some())
-                .collect();
-            if valid_ids.is_empty() {
-                debug!(
-                    zone_id,
-                    original = snapshot.local_track_ids.len(),
-                    "queue_restore_all_tracks_gone"
-                );
-                continue;
+        // Rebuild the queue as ONE ordered unified list. Prefer the snapshot's
+        // `items` (unified); fall back to the legacy local-then-streaming fields
+        // for snapshots written before the unification. Stale local track IDs
+        // (deleted from the library) are filtered out.
+        let track_repo = crate::db::track_repo::TrackRepo::with_backend(db.clone());
+        let mut inputs: Vec<QueueInput> = Vec::new();
+        if !snapshot.items.is_empty() {
+            for it in &snapshot.items {
+                if let Some(tid) = it.track_id {
+                    if track_repo.get(tid).ok().flatten().is_some() {
+                        inputs.push(QueueInput::Local { track_id: tid });
+                    }
+                } else if let Some(sid) = &it.source_id {
+                    inputs.push(QueueInput::Streaming {
+                        source: it.source.clone().unwrap_or_else(|| "streaming".into()),
+                        source_id: sid.clone(),
+                        title: it.title.clone().unwrap_or_default(),
+                        artist: it.artist_name.clone().unwrap_or_default(),
+                        album: it.album_title.clone(),
+                        cover_url: it.cover_url.clone(),
+                        duration_ms: it.duration_ms,
+                    });
+                }
             }
-            if valid_ids.len() < snapshot.local_track_ids.len() {
-                debug!(
-                    zone_id,
-                    original = snapshot.local_track_ids.len(),
-                    valid = valid_ids.len(),
-                    "queue_restore_filtered_stale_tracks"
-                );
+        } else {
+            for id in &snapshot.local_track_ids {
+                if track_repo.get(*id).ok().flatten().is_some() {
+                    inputs.push(QueueInput::Local { track_id: *id });
+                }
             }
-            if let Err(e) = repo.set_queue(zone_id, &valid_ids) {
-                warn!(zone_id, error = %e, "queue_restore_set_queue_failed");
-                continue;
-            }
-            if snapshot.current_position > 0 {
-                repo.set_current(zone_id, snapshot.current_position).ok();
+            for t in &snapshot.streaming_tracks {
+                inputs.push(QueueInput::Streaming {
+                    source: t.source.clone().unwrap_or_else(|| "streaming".into()),
+                    source_id: t.source_id.clone(),
+                    title: t.title.clone(),
+                    artist: t.artist_name.clone(),
+                    album: t.album_title.clone(),
+                    cover_url: t.cover_url.clone(),
+                    duration_ms: t.duration_ms,
+                });
             }
         }
-
-        // Restore streaming queue
-        if !snapshot.streaming_tracks.is_empty() {
-            let tracks: Vec<(
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                i64,
-                Option<String>,
-            )> = snapshot
-                .streaming_tracks
-                .iter()
-                .map(|t| {
-                    (
-                        t.source_id.clone(),
-                        t.title.clone(),
-                        t.artist_name.clone(),
-                        t.album_title.clone(),
-                        t.cover_url.clone(),
-                        t.duration_ms,
-                        t.source.clone(),
-                    )
-                })
-                .collect();
-            if let Err(e) = repo.set_streaming_queue(zone_id, &tracks) {
-                warn!(zone_id, error = %e, "queue_restore_streaming_failed");
-                continue;
-            }
+        if inputs.is_empty() {
+            debug!(zone_id, "queue_restore_nothing_valid");
+            continue;
+        }
+        if let Err(e) = repo.append(zone_id, &inputs) {
+            warn!(zone_id, error = %e, "queue_restore_append_failed");
+            continue;
+        }
+        if snapshot.current_position > 0 {
+            repo.set_current_pos(zone_id, snapshot.current_position)
+                .ok();
         }
 
         restored += 1;
@@ -309,6 +343,7 @@ mod tests {
                 duration_ms: 200_000,
                 source: Some("tidal".into()),
             }],
+            items: vec![],
             repeat_mode: "all".into(),
             shuffle: true,
             position_ms: 45_000,

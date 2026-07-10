@@ -3756,123 +3756,120 @@ impl PlaybackOrchestrator {
             .flatten()
             .and_then(|z| z.output_device_id);
 
-        // Try local queue first
-        queue_repo.set_current(zone_id, position).ok();
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.is_current) {
-            let req = PlayRequest {
-                zone_id,
-                output_device_id,
-                track_id: Some(item.track_id),
-                source: None,
-                source_id: None,
-                title: item.title.clone(),
-                artist_name: item.artist_name.clone(),
-                album_title: item.album_title.clone(),
-                cover_url: item.cover_path.clone(),
-                duration_ms: item.duration_ms,
-                seek_ms: None,
-                temp_file_path: None,
-            };
-            let result = self.play(req).await?;
-            self.playback
-                .update_queue_info(zone_id, position, queue.len() as i64)
-                .await;
-            return Ok(result);
-        }
-
-        // Fallback to streaming queue. A zone can hold BOTH a local play_queue
-        // and a streaming_queue at once (a Qobuz track added while a local file
-        // plays), and the poller advances through a COMBINED position space:
-        // local items occupy 0..L, streaming items L..L+S. Index the streaming
-        // vec by the offset within its own 0-based table, not the raw combined
-        // position (Progman: the added Qobuz track never played because
-        // streaming.get(1) was None for 1 local + 1 streaming).
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        let item = streaming
-            .get((position - local_count).max(0) as usize)
+        // Unified single-position-space resolution: `position` indexes ONE
+        // ordered queue (local + streaming). Look the row up directly — no more
+        // "try local, then offset into streaming by position - local_count",
+        // which broke manual Next across a source boundary (Sandro S2: the local
+        // "next" was never found after a Qobuz track, so the zone froze).
+        queue_repo.set_current_pos(zone_id, position).ok();
+        let total = queue_repo.count_all(zone_id)?;
+        let entry = queue_repo
+            .get_at(zone_id, position)?
             .ok_or("no queue item at position")?;
 
-        let source_id = item["source_id"].as_str().unwrap_or("").to_string();
-        let mut title = item["title"].as_str().map(String::from);
-        let mut artist = item["artist_name"].as_str().map(String::from);
-        let mut album = item["album_title"].as_str().map(String::from);
-        let mut cover = item["cover_path"].as_str().map(String::from);
-        let duration = item["duration_ms"].as_i64();
-
-        let current_state = self.playback.get_state(zone_id).await;
-
-        // Repeat on a single-track queue re-plays the SAME position, but the
-        // streaming_queue row can carry an empty title (persisted without
-        // metadata). play() would then hand an empty title down the prefetched
-        // path and blank Now Playing (DEvir: auto_next title=CHANGGWI followed by
-        // orchestrator_play title=). When the row title is empty AND now_playing
-        // is still the very same track (same source_id), reuse its metadata
-        // synchronously — no network round-trip, and it can't mislabel a
-        // different track because the source_id must match.
-        let title_empty = title.as_deref().unwrap_or("").is_empty();
-        if title_empty
-            && let Some(np) = current_state.now_playing.as_ref()
-            && np.source_id.as_deref() == Some(source_id.as_str())
-            && !np.title.is_empty()
-        {
-            title = Some(np.title.clone());
-            artist = artist.or_else(|| np.artist_name.clone());
-            album = album.or_else(|| np.album_title.clone());
-            cover = cover.or_else(|| np.cover_path.clone());
-        }
-
-        // Use the stored source from the streaming_queue, falling back to
-        // the current now_playing source (handles old DB rows without source).
-        let source = if let Some(s) = item["source"].as_str() {
-            s.to_string()
+        let req = if let Some(track_id) = entry.track_id {
+            // Local track.
+            PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: Some(track_id),
+                source: None,
+                source_id: None,
+                title: entry.title.clone(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
+                cover_url: entry.cover_path.clone(),
+                duration_ms: entry.duration_ms,
+                seek_ms: None,
+                temp_file_path: None,
+            }
         } else {
-            current_state
-                .now_playing
-                .as_ref()
-                .map(|np| np.source.clone())
-                .unwrap_or_else(|| "tidal".into())
-        };
+            // Streaming track.
+            let source_id = entry.source_id.clone().unwrap_or_default();
+            let mut title = entry.title.clone();
+            let mut artist = entry.artist_name.clone();
+            let mut album = entry.album_title.clone();
+            let mut cover = entry.cover_path.clone();
 
-        let req = PlayRequest {
-            zone_id,
-            output_device_id,
-            track_id: None,
-            source: Some(source),
-            source_id: Some(source_id),
-            title,
-            artist_name: artist,
-            album_title: album,
-            cover_url: cover,
-            duration_ms: duration,
-            seek_ms: None,
-            temp_file_path: None,
+            let current_state = self.playback.get_state(zone_id).await;
+
+            // Repeat on a single-track queue re-plays the SAME position, but the
+            // streaming row can carry an empty title (persisted without
+            // metadata). play() would then hand an empty title down the
+            // prefetched path and blank Now Playing (DEvir). When the row title
+            // is empty AND now_playing is still the very same track (same
+            // source_id), reuse its metadata synchronously — no network
+            // round-trip, and it can't mislabel a different track since the
+            // source_id must match.
+            let title_empty = title.as_deref().unwrap_or("").is_empty();
+            if title_empty
+                && let Some(np) = current_state.now_playing.as_ref()
+                && np.source_id.as_deref() == Some(source_id.as_str())
+                && !np.title.is_empty()
+            {
+                title = Some(np.title.clone());
+                artist = artist.or_else(|| np.artist_name.clone());
+                album = album.or_else(|| np.album_title.clone());
+                cover = cover.or_else(|| np.cover_path.clone());
+            }
+
+            // Use the stored source, falling back to the current now_playing
+            // source (handles old DB rows without a source value).
+            let source = entry
+                .source
+                .clone()
+                .filter(|s| !s.is_empty() && s != "local")
+                .unwrap_or_else(|| {
+                    current_state
+                        .now_playing
+                        .as_ref()
+                        .map(|np| np.source.clone())
+                        .unwrap_or_else(|| "tidal".into())
+                });
+
+            PlayRequest {
+                zone_id,
+                output_device_id,
+                track_id: None,
+                source: Some(source),
+                source_id: Some(source_id),
+                title,
+                artist_name: artist,
+                album_title: album,
+                cover_url: cover,
+                duration_ms: entry.duration_ms,
+                seek_ms: None,
+                temp_file_path: None,
+            }
         };
 
         let result = self.play(req).await?;
         self.playback
-            .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
+            .update_queue_info(zone_id, position, total)
             .await;
         Ok(result)
     }
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
-        queue_repo.set_current(zone_id, position).ok();
+        queue_repo.set_current_pos(zone_id, position).ok();
 
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.is_current) {
+        let total = queue_repo.count_all(zone_id)?;
+        let entry = queue_repo
+            .get_at(zone_id, position)?
+            .ok_or("no queue item at position")?;
+
+        let np = if let Some(track_id) = entry.track_id {
             let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
-            let track = track_repo.get(item.track_id).ok().flatten();
+            let track = track_repo.get(track_id).ok().flatten();
             let cover_path = track.as_ref().and_then(|t| t.cover_path.clone());
-            let np = crate::playback::NowPlaying {
-                track_id: Some(item.track_id),
-                title: item.title.clone().unwrap_or_default(),
-                artist_name: item.artist_name.clone(),
-                album_title: item.album_title.clone(),
+            crate::playback::NowPlaying {
+                track_id: Some(track_id),
+                title: entry.title.clone().unwrap_or_default(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
                 cover_path: self.resolve_cover_url(cover_path.as_deref()),
-                duration_ms: item.duration_ms.unwrap_or(0),
+                duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
                 stream_id: None,
@@ -3881,65 +3878,47 @@ impl PlaybackOrchestrator {
                 bit_depth: track.as_ref().and_then(|t| t.bit_depth.map(|v| v as u32)),
                 genre: track.as_ref().and_then(|t| t.genre.clone()),
                 year: track.as_ref().and_then(|t| t.year),
-            };
-            // Use update_now_playing (not play) to avoid bumping
-            // track_generation — the poller must keep its gapless_cooldown
-            // intact so it doesn't falsely detect track-end on renderers
-            // that briefly report Stopped during gapless transitions.
-            self.playback.update_now_playing(zone_id, np).await;
-            // Reset position to 0 — the new track starts from the beginning.
-            // Without this, the UI shows the cumulative position from the
-            // previous track until the next poller tick overwrites it.
-            self.playback.update_position(zone_id, 0).await;
-            self.playback.emit_position(zone_id, 0);
-            self.playback
-                .update_queue_info(zone_id, position, queue.len() as i64)
-                .await;
-            return Ok(());
-        }
-
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        if let Some(item) = streaming.get((position - local_count).max(0) as usize) {
-            let title = item["title"].as_str().unwrap_or("").to_string();
-            let artist = item["artist_name"].as_str().map(String::from);
-            let album = item["album_title"].as_str().map(String::from);
-            let cover = item["cover_path"].as_str().map(String::from);
-            let duration = item["duration_ms"].as_i64().unwrap_or(0);
-            let source = if let Some(s) = item["source"].as_str() {
-                s.to_string()
-            } else {
+            }
+        } else {
+            let source = entry
+                .source
+                .clone()
+                .filter(|s| !s.is_empty() && s != "local")
+                .unwrap_or_else(|| "streaming".into());
+            let source = if source == "streaming" {
                 let cs = self.playback.get_state(zone_id).await;
                 cs.now_playing
                     .as_ref()
                     .map(|np| np.source.clone())
                     .unwrap_or_else(|| "streaming".into())
+            } else {
+                source
             };
-            let np = crate::playback::NowPlaying {
+            crate::playback::NowPlaying {
                 track_id: None,
-                title,
-                artist_name: artist,
-                album_title: album,
-                cover_path: self.resolve_cover_url(cover.as_deref()),
-                duration_ms: duration,
+                title: entry.title.clone().unwrap_or_default(),
+                artist_name: entry.artist_name.clone(),
+                album_title: entry.album_title.clone(),
+                cover_path: self.resolve_cover_url(entry.cover_path.as_deref()),
+                duration_ms: entry.duration_ms.unwrap_or(0),
                 source,
-                source_id: item["source_id"].as_str().map(String::from),
+                source_id: entry.source_id.clone(),
                 stream_id: None,
                 ..Default::default()
-            };
-            // Same rationale: gapless metadata-only advance must not
-            // bump track_generation — but position MUST reset to 0
-            // because the new track starts from the beginning.
-            self.playback.update_now_playing(zone_id, np).await;
-            self.playback.update_position(zone_id, 0).await;
-            self.playback.emit_position(zone_id, 0);
-            self.playback
-                .update_queue_info(zone_id, position, local_count + streaming.len() as i64)
-                .await;
-            return Ok(());
-        }
+            }
+        };
 
-        Err("no queue item at position".into())
+        // Use update_now_playing (not play) to avoid bumping track_generation —
+        // the poller must keep its gapless_cooldown intact so it doesn't falsely
+        // detect track-end on renderers that briefly report Stopped during
+        // gapless transitions. Position MUST reset to 0 (new track from start).
+        self.playback.update_now_playing(zone_id, np).await;
+        self.playback.update_position(zone_id, 0).await;
+        self.playback.emit_position(zone_id, 0);
+        self.playback
+            .update_queue_info(zone_id, position, total)
+            .await;
+        Ok(())
     }
 
     pub async fn resolve_queue_item_url(
@@ -3953,22 +3932,26 @@ impl PlaybackOrchestrator {
 
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
-        // Try local queue first
-        let queue = queue_repo.get_queue(zone_id)?;
-        if let Some(item) = queue.iter().find(|i| i.position == position) {
-            let album = item.album_title.clone();
-            let cover = item.cover_path.clone();
+        // Unified single-position-space lookup (local or streaming).
+        let entry = queue_repo
+            .get_at(zone_id, position)?
+            .ok_or("no queue item at position (local or streaming)")?;
+
+        // Local track.
+        if let Some(track_id) = entry.track_id {
+            let album = entry.album_title.clone();
+            let cover = entry.cover_path.clone();
             let req = PlayRequest {
                 zone_id,
                 output_device_id: None,
-                track_id: Some(item.track_id),
+                track_id: Some(track_id),
                 source: None,
                 source_id: None,
-                title: item.title.clone(),
-                artist_name: item.artist_name.clone(),
+                title: entry.title.clone(),
+                artist_name: entry.artist_name.clone(),
                 album_title: album.clone(),
                 cover_url: cover.clone(),
-                duration_ms: item.duration_ms,
+                duration_ms: entry.duration_ms,
                 seek_ms: None,
                 temp_file_path: None,
             };
@@ -3996,28 +3979,26 @@ impl PlaybackOrchestrator {
             });
         }
 
-        // Fallback to streaming queue (Tidal, Qobuz, Deezer, etc.). Combined
-        // position space: local 0..L, streaming L..L+S — index by the offset
-        // within the streaming table.
-        let local_count = queue.len() as i64;
-        let streaming = queue_repo.get_streaming_queue(zone_id)?;
-        let item = streaming
-            .get((position - local_count).max(0) as usize)
-            .ok_or("no queue item at position (local or streaming)")?;
-        let source_id = item["source_id"].as_str().unwrap_or("").to_string();
-        let title = item["title"].as_str().map(String::from);
-        let artist = item["artist_name"].as_str().map(String::from);
-        let album = item["album_title"].as_str().map(String::from);
-        let cover = item["cover_path"].as_str().map(String::from);
-        let duration = item["duration_ms"].as_i64();
-        let source = if let Some(s) = item["source"].as_str() {
-            s.to_string()
-        } else {
-            let cs = self.playback.get_state(zone_id).await;
-            cs.now_playing
-                .as_ref()
-                .map(|np| np.source.clone())
-                .unwrap_or_else(|| "tidal".into())
+        // Streaming track (Tidal, Qobuz, Deezer, etc.).
+        let source_id = entry.source_id.clone().unwrap_or_default();
+        let title = entry.title.clone();
+        let artist = entry.artist_name.clone();
+        let album = entry.album_title.clone();
+        let cover = entry.cover_path.clone();
+        let duration = entry.duration_ms;
+        let source = match entry
+            .source
+            .clone()
+            .filter(|s| !s.is_empty() && s != "local")
+        {
+            Some(s) => s,
+            None => {
+                let cs = self.playback.get_state(zone_id).await;
+                cs.now_playing
+                    .as_ref()
+                    .map(|np| np.source.clone())
+                    .unwrap_or_else(|| "tidal".into())
+            }
         };
         let output_device_id = ZoneRepo::with_backend(self.db.clone())
             .get(zone_id)
