@@ -198,7 +198,39 @@ async fn service_artist(
     State(state): State<AppState>,
     Path((service, artist_id)): Path<(String, String)>,
 ) -> Response {
-    with_svc!(&state, &service, |svc| svc.get_artist(&artist_id).await)
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let result = {
+        let svc = arc.lock().await;
+        svc.get_artist(&artist_id).await
+    };
+
+    // Best-effort: persist a streaming editorial bio (e.g. Qobuz) into a
+    // name-matched local artist that has none yet, so the library keeps it.
+    // Fire-and-forget so the browse response is never delayed.
+    if let Ok(ref artist) = result {
+        if let Some(bio) = artist.bio.clone() {
+            if bio.len() > 50 {
+                let backend = state.backend.clone();
+                let name = artist.name.clone();
+                let svc_name = service.clone();
+                tokio::spawn(async move {
+                    let repo = tune_core::db::artist_repo::ArtistRepo::with_backend(backend);
+                    if let Ok(Some(local)) = repo.get_by_name(&name) {
+                        if let Some(id) = local.id {
+                            if local.bio.as_deref().unwrap_or("").is_empty() {
+                                let _ = repo.update_bio_full(id, &bio, &svc_name, None, "", "");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    svc_response(result)
 }
 
 async fn service_artist_albums(
