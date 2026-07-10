@@ -635,6 +635,31 @@ CREATE TABLE IF NOT EXISTS streaming_auth (
 );
 ",
     },
+    // Create streaming_queue eagerly. It used to be created lazily on first
+    // write in play_queue_repo, so on a FRESH database any code that READS it
+    // before the first write — the startup orphan cleanup (startup.rs) and the
+    // Deezer/streaming connect path — hit \"no such table: streaming_queue\"
+    // (forum: Yan Tasset, Bilou; Dominique's log). Schema mirrors
+    // play_queue_repo::sql::CREATE_STREAMING_QUEUE_SQLITE; IF NOT EXISTS makes
+    // it a no-op on DBs where the table already exists.
+    Migration {
+        version: 53,
+        name: "create_streaming_queue_table",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms INTEGER DEFAULT 0
+);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
