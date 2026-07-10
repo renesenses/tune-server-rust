@@ -35,6 +35,13 @@ pub async fn fetch_artist_bio(
         }
     }
 
+    // 3. TheAudioDB fallback (niche artists Wikipedia/Last.fm miss)
+    if let Some(bio) = fetch_artist_bio_theaudiodb(client, mbid, lang).await {
+        if bio.text.len() > 50 {
+            return Some(bio);
+        }
+    }
+
     None
 }
 
@@ -198,6 +205,13 @@ pub async fn fetch_album_bio(
         }
     }
 
+    // 4. TheAudioDB fallback (niche albums Wikipedia/Last.fm miss)
+    if let Some(bio) = fetch_album_bio_theaudiodb(client, artist_name, album_title, lang).await {
+        if bio.text.len() > 50 {
+            return Some(bio);
+        }
+    }
+
     None
 }
 
@@ -333,6 +347,109 @@ async fn fetch_album_bio_lastfm(
 fn strip_html(s: &str) -> String {
     let re = regex::Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(s, "").trim().to_string()
+}
+
+/// TheAudioDB API key. Defaults to the public test key ("2"); production
+/// installs can override with a Patreon key via env.
+fn theaudiodb_key() -> String {
+    std::env::var("THEAUDIODB_API_KEY")
+        .or_else(|_| std::env::var("TUNE_THEAUDIODB_KEY"))
+        .unwrap_or_else(|_| "2".to_string())
+}
+
+/// Pick a per-language field from a TheAudioDB object (e.g. `strBiography` +
+/// `FR`/`EN`), preferring `lang`, then English. Returns (text, resolved_lang).
+fn pick_lang_field(obj: &serde_json::Value, prefix: &str, lang: &str) -> Option<(String, String)> {
+    let try_lang = |l: &str| {
+        let key = format!("{prefix}{l}");
+        obj.get(key.as_str())
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(v) = try_lang(&lang.to_uppercase()) {
+        return Some((v, lang.to_lowercase()));
+    }
+    try_lang("EN").map(|v| (v, "en".to_string()))
+}
+
+/// TheAudioDB artist biography by MusicBrainz ID (fallback for niche artists
+/// that Wikipedia/Last.fm miss). Honors `lang`.
+async fn fetch_artist_bio_theaudiodb(
+    client: &reqwest::Client,
+    mbid: &str,
+    lang: &str,
+) -> Option<BioResult> {
+    if mbid.is_empty() {
+        return None;
+    }
+    let key = theaudiodb_key();
+    let url = format!("https://www.theaudiodb.com/api/v1/json/{key}/artist-mb.php?i={mbid}");
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let artist = data["artists"].as_array()?.first()?;
+    let (bio, bio_lang) = pick_lang_field(artist, "strBiography", lang)?;
+    if bio.len() < 50 {
+        return None;
+    }
+    let source_url = artist["idArtist"]
+        .as_str()
+        .map(|id| format!("https://www.theaudiodb.com/artist/{id}"));
+    Some(BioResult {
+        text: bio,
+        source: "theaudiodb".to_string(),
+        source_url,
+        license: "TheAudioDB".to_string(),
+        lang: bio_lang,
+    })
+}
+
+/// TheAudioDB album description by artist + title. Honors `lang`.
+async fn fetch_album_bio_theaudiodb(
+    client: &reqwest::Client,
+    artist_name: &str,
+    album_title: &str,
+    lang: &str,
+) -> Option<BioResult> {
+    let key = theaudiodb_key();
+    let url = format!(
+        "https://www.theaudiodb.com/api/v1/json/{key}/searchalbum.php?s={}&a={}",
+        urlencoding::encode(artist_name),
+        urlencoding::encode(album_title)
+    );
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let album = data["album"].as_array()?.first()?;
+    let (bio, bio_lang) = pick_lang_field(album, "strDescription", lang)?;
+    if bio.len() < 50 {
+        return None;
+    }
+    let source_url = album["idAlbum"]
+        .as_str()
+        .map(|id| format!("https://www.theaudiodb.com/album/{id}"));
+    Some(BioResult {
+        text: bio,
+        source: "theaudiodb".to_string(),
+        source_url,
+        license: "TheAudioDB".to_string(),
+        lang: bio_lang,
+    })
 }
 
 /// Batch enrich artist bios: Wikipedia FR via Wikidata + Last.fm fallback.
