@@ -186,6 +186,7 @@ impl SpotifyService {
                 .and_then(|i| i.first())
                 .and_then(|i| i["url"].as_str())
                 .map(Into::into),
+            bio: None,
         }
     }
 

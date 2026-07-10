@@ -952,6 +952,7 @@ impl TidalService {
                     p.replace('-', "/")
                 )
             }),
+            bio: None,
         }
     }
 }

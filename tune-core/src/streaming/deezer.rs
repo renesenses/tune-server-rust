@@ -297,6 +297,7 @@ impl DeezerService {
                 .as_str()
                 .or_else(|| item["picture_medium"].as_str())
                 .map(Into::into),
+            bio: None,
         }
     }
 

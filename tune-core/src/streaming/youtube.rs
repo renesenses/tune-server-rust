@@ -1084,6 +1084,7 @@ impl YouTubeService {
             id: item["id"].as_str().unwrap_or("").into(),
             name: snippet["title"].as_str().unwrap_or("").into(),
             image_path: Self::best_thumbnail(&snippet["thumbnails"]),
+            bio: None,
         }
     }
 
@@ -1349,6 +1350,7 @@ impl YouTubeService {
                         id: browse_id.to_string(),
                         name: title_text.to_string(),
                         image_path: thumb,
+                        bio: None,
                     });
                 } else if page_type.contains("ALBUM") || subtitle.to_lowercase().contains("album") {
                     albums.push(StreamAlbum {
@@ -1576,6 +1578,7 @@ impl YouTubeService {
                             id: browse_id.into(),
                             name: name.into(),
                             image_path: image,
+                            bio: None,
                         });
                     }
                 } else if section_type.contains("playlist") {
@@ -1909,6 +1912,7 @@ impl YouTubeService {
             id: String::new(), // Caller sets this
             name: name.into(),
             image_path: image,
+            bio: None,
         })
     }
 
@@ -2430,6 +2434,7 @@ impl StreamingService for YouTubeService {
                             id: item["id"]["channelId"].as_str().unwrap_or("").into(),
                             name: title.into(),
                             image_path: cover,
+                            bio: None,
                         });
                     }
                     _ => {}
