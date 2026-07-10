@@ -414,6 +414,18 @@ async fn serve_file(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Parse the start byte of an HTTP `Range` header value like `bytes=N-` or
+/// `bytes=N-M`. Returns `None` for an open `bytes=-N` (suffix) range or a
+/// malformed value.
+fn parse_range_start(range: &str) -> Option<u64> {
+    let spec = range.strip_prefix("bytes=")?;
+    let start = spec.split('-').next()?.trim();
+    if start.is_empty() {
+        return None;
+    }
+    start.parse::<u64>().ok()
+}
+
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
 
 async fn proxy_stream(
@@ -440,7 +452,27 @@ async fn proxy_stream(
     // Forwarding each one to the CDN hammers Akamai and causes drops.
     // User-initiated seeks go through the orchestrator (stream recreation),
     // so we never need to forward Range to the CDN for proxy sessions.
-    let upstream_req = client.get(upstream_url);
+    // A resume Range `bytes=N-` with a large N means the renderer is
+    // reconnecting after the proxied CDN connection dropped mid-track: the
+    // DMP-A8 (Lavf) buffers ~30s, pauses reading, Akamai drops the idle
+    // upstream, and reqwest then reports `proxy_chunk_error: error decoding
+    // response body`. The renderer reconnects with `bytes=N-` (N ≈ where it
+    // stopped). The old code ignored that Range and re-served from byte 0, so
+    // the track restarted from the beginning (.18/.15 Qobuz → DMP-A8). Forward
+    // the resume to the CDN so playback continues from N. Small/near-zero
+    // ranges (FLAC header parsing) are NOT forwarded — forwarding every
+    // micro-range hammers Akamai and itself causes the drops.
+    const RESUME_RANGE_THRESHOLD: u64 = 1_048_576; // 1 MiB
+    let resume_start = range_value
+        .as_deref()
+        .and_then(parse_range_start)
+        .filter(|&n| n >= RESUME_RANGE_THRESHOLD);
+
+    let mut upstream_req = client.get(upstream_url);
+    if let Some(start) = resume_start {
+        upstream_req = upstream_req.header("Range", format!("bytes={start}-"));
+        info!(url = upstream_url, start, "proxy_forward_resume_range");
+    }
 
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -448,6 +480,12 @@ async fn proxy_stream(
             warn!(error = %e, url = upstream_url, "proxy_upstream_error");
             return StatusCode::BAD_GATEWAY.into_response();
         }
+    };
+    // Only treat it as a real resume if the CDN honoured the Range (206).
+    let resume_start = if upstream_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        resume_start
+    } else {
+        None
     };
 
     let upstream_content_type = upstream_resp
@@ -462,6 +500,14 @@ async fn proxy_stream(
         .get("Content-Length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
+
+    // Preserve the CDN's Content-Range for a forwarded resume so we can pass
+    // the correct `bytes N-last/total` back to the renderer.
+    let upstream_content_range = upstream_resp
+        .headers()
+        .get("Content-Range")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -483,6 +529,37 @@ async fn proxy_stream(
     // and expect 206 Partial Content with Content-Range header.
     // Returning 200 OK causes them to abort after ~31 seconds.
     let range_requested = range_value.as_deref().filter(|r| r.starts_with("bytes=0-"));
+
+    // Resume: the CDN honoured a forwarded `bytes=N-` Range. Pass the 206
+    // through with the CDN's Content-Range so the renderer continues from N
+    // instead of restarting the track from byte 0.
+    if let Some(start) = resume_start {
+        if let Some(cr) = upstream_content_range.clone().or_else(|| {
+            content_length.map(|cl| format!("bytes {start}-{}/{}", start + cl - 1, start + cl))
+        }) {
+            headers.insert("Content-Range", HeaderValue::from_str(&cr).unwrap());
+        }
+        if let Some(cl) = content_length {
+            headers.insert("Content-Length", HeaderValue::from(cl));
+        }
+        info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
+
+        let body = Body::from_stream(async_stream::stream! {
+            let mut stream = upstream_resp.bytes_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
+                    Err(e) => {
+                        warn!(error = %e, "proxy_chunk_error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
 
     // Radio streams are infinite — no Content-Length is possible.
     // The DMP-A8 sends Range: bytes=0- initially, then reconnects with
@@ -565,4 +642,21 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
             axum::routing::get(handle_stream).head(handle_head),
         )
         .with_state(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range_start;
+
+    #[test]
+    fn parse_range_start_cases() {
+        // Resume from a byte offset (DMP-A8 reconnect after a CDN drop).
+        assert_eq!(parse_range_start("bytes=26590644-"), Some(26_590_644));
+        assert_eq!(parse_range_start("bytes=0-"), Some(0));
+        assert_eq!(parse_range_start("bytes=100-200"), Some(100));
+        // Suffix range and malformed values yield no start.
+        assert_eq!(parse_range_start("bytes=-500"), None);
+        assert_eq!(parse_range_start("bytes=abc-"), None);
+        assert_eq!(parse_range_start("chunks=0-"), None);
+    }
 }
