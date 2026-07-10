@@ -22,6 +22,15 @@ use crate::metadata::{TrackMetadata, tagless_fallback_no_props, try_read_metadat
 // fall back to filename metadata instead of losing the file.
 const FILE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Slow network storage (a NAS, or an SSD hanging off a UPnP streamer accessed
+// over the LAN — Pierre M's NAS, Philippe Landes' Hifi Rose RS130) regularly
+// exceeds FILE_TIMEOUT on the *first* tag read but succeeds with more headroom.
+// Falling straight back to filename-only metadata left those tracks with
+// duration = 0, which breaks gapless end-detection (the track is cut short or
+// the queue stops advancing). Retry once with a much larger budget before
+// giving up, so the real duration/tags are recovered.
+const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
+
 // The audio hash (duplicate detection) reads the whole file, separately from
 // the tags. Give it its own, larger budget so big Hi-Res files over a NAS still
 // get hashed — but it's best-effort: on timeout the track keeps its real tags
@@ -106,19 +115,37 @@ pub struct ScanStats {
 ///
 /// We spawn a real OS thread because the metadata/hash reads are blocking I/O
 /// that can hang on NAS mounts — `rayon` tasks must not block indefinitely.
-fn read_file_with_timeout(
+/// Read tags (and optionally the audio hash), retrying once with a larger tag
+/// budget on timeout. On slow network storage the first `FILE_TIMEOUT` read
+/// often times out but a second, longer read succeeds — recovering the real
+/// duration instead of leaving the track at duration 0. (Pierre M's NAS,
+/// Philippe Landes' RS130 SSD)
+fn read_file_with_retry(
     path: &PathBuf,
     with_hash: bool,
 ) -> Result<(Option<TrackMetadata>, Option<String>), String> {
+    match read_file_with_timeout(path, with_hash, FILE_TIMEOUT) {
+        Err(ref reason) if reason == "timeout" => {
+            read_file_with_timeout(path, with_hash, RETRY_FILE_TIMEOUT)
+        }
+        other => other,
+    }
+}
+
+fn read_file_with_timeout(
+    path: &PathBuf,
+    with_hash: bool,
+    tag_timeout: Duration,
+) -> Result<(Option<TrackMetadata>, Option<String>), String> {
     // Phase 1 — read the tags. This is fast even on a NAS (only the header /
-    // tag blocks are read), so FILE_TIMEOUT is plenty. A timeout here means the
+    // tag blocks are read), so `tag_timeout` is plenty. A timeout here means the
     // tags are genuinely unreadable → caller falls back to filename metadata.
     let meta_path = path.clone();
     let (mtx, mrx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = mtx.send(try_read_metadata(&meta_path));
     });
-    let metadata = match mrx.recv_timeout(FILE_TIMEOUT) {
+    let metadata = match mrx.recv_timeout(tag_timeout) {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err("timeout".to_string()),
@@ -317,7 +344,7 @@ pub fn scan_files_parallel(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            let (metadata, audio_hash) = match read_file_with_timeout(path, with_hash) {
+            let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                 Ok((meta, hash)) => {
                     if meta.is_none() {
                         warn!(
@@ -458,7 +485,7 @@ pub fn scan_files_batched(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                let (metadata, audio_hash) = match read_file_with_timeout(path, with_hash) {
+                let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
                     Ok((meta, hash)) => (meta, hash),
                     Err(ref reason) if reason == "timeout" => {
                         warn!(
