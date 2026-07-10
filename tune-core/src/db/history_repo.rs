@@ -846,6 +846,83 @@ impl HistoryRepo {
             on_this_day,
         })
     }
+
+    /// Tracks listened during a single weekday×hour cell of the heatmap, within
+    /// `period`. `weekday` is ISO 1=Mon..7=Sun (matching the heatmap grid);
+    /// `hour` is 0..23. Grouped by track, most-played first. Powers the
+    /// drill-down when a heatmap cell is clicked (Elie).
+    pub fn history_at_slot(
+        &self,
+        period: &str,
+        weekday: i64,
+        hour: i64,
+        limit: i64,
+    ) -> Result<Vec<SlotTrack>, String> {
+        let days: Option<i64> = match period {
+            "today" => Some(1),
+            "7d" => Some(7),
+            "30d" => Some(30),
+            "90d" => Some(90),
+            "all" => None,
+            other => other.trim_end_matches('d').parse::<i64>().ok(),
+        };
+        let extract_dow = match self.db.engine() {
+            Engine::Sqlite => "CAST(strftime('%w', listened_at) AS INTEGER)".to_string(),
+            Engine::Postgres => "EXTRACT(DOW FROM listened_at::timestamp)::int".to_string(),
+        };
+        let hour_expr = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.extract_hour("listened_at"),
+            Engine::Postgres => PostgresDialect.extract_hour("listened_at"),
+        };
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(d) = days {
+            conditions.push(match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.since_days("listened_at", d),
+                Engine::Postgres => PostgresDialect.since_days("listened_at", d),
+            });
+        }
+        // weekday/hour/limit are i64 and inlined like the rest of this module.
+        conditions.push(format!(
+            "(CASE WHEN {extract_dow} = 0 THEN 7 ELSE {extract_dow} END) = {weekday}"
+        ));
+        conditions.push(format!("{hour_expr} = {hour}"));
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT track_id, title, artist_name, album_title, album_id, source, \
+                    source_id, COUNT(*) as plays, MAX(listened_at) as last_at \
+             FROM listen_history {where_clause} \
+             GROUP BY track_id, title, artist_name, album_title, album_id, source, source_id \
+             ORDER BY plays DESC, last_at DESC LIMIT {limit}"
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| SlotTrack {
+                track_id: cols.first().and_then(|v| v.as_i64()),
+                title: cols.get(1).and_then(|v| v.as_string()),
+                artist_name: cols.get(2).and_then(|v| v.as_string()),
+                album_title: cols.get(3).and_then(|v| v.as_string()),
+                album_id: cols.get(4).and_then(|v| v.as_i64()),
+                source: cols.get(5).and_then(|v| v.as_string()),
+                source_id: cols.get(6).and_then(|v| v.as_string()),
+                plays: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(0),
+                last_listened_at: cols.get(8).and_then(|v| v.as_string()),
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotTrack {
+    pub track_id: Option<i64>,
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub album_id: Option<i64>,
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    pub plays: i64,
+    pub last_listened_at: Option<String>,
 }
 
 fn is_consecutive_days_str(a: &str, b: &str) -> bool {
