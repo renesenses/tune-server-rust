@@ -43,14 +43,17 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
         // Find tracks with missing metadata: no MB ID OR missing genre/year/label
         let track_rows: Vec<Vec<tune_core::db::backend::SqlValue>> = backend2
             .query_many(
-                "SELECT id, title, artist_name, album_title, file_path, \
-                 musicbrainz_recording_id, genre, year, label, composer, album_id \
-                 FROM tracks \
-                 WHERE file_path IS NOT NULL AND ( \
-                   musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '' \
-                   OR genre IS NULL OR genre = '' \
-                   OR year IS NULL \
-                   OR label IS NULL OR label = '' \
+                "SELECT t.id, t.title, t.artist_name, t.album_title, t.file_path, \
+                 t.musicbrainz_recording_id, t.genre, t.year, t.label, t.composer, t.album_id, \
+                 t.artist_id, a.musicbrainz_id \
+                 FROM tracks t \
+                 LEFT JOIN artists a ON a.id = t.artist_id \
+                 WHERE t.file_path IS NOT NULL AND ( \
+                   t.musicbrainz_recording_id IS NULL OR t.musicbrainz_recording_id = '' \
+                   OR t.genre IS NULL OR t.genre = '' \
+                   OR t.year IS NULL \
+                   OR t.label IS NULL OR t.label = '' \
+                   OR (t.artist_id IS NOT NULL AND (a.musicbrainz_id IS NULL OR a.musicbrainz_id = '')) \
                  )",
                 &[],
             )
@@ -67,6 +70,10 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
         let mut enriched = 0i32;
         let mut errors = 0i32;
+        // Artists whose MBID we've already backfilled this run, so we don't
+        // re-fetch recording details once per track for the same artist.
+        let mut artists_mbid_done: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
 
         for row in &track_rows {
             let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -91,12 +98,24 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                 .get(9)
                 .and_then(|v| v.as_string())
                 .filter(|s| !s.is_empty());
+            let artist_id = row.get(11).and_then(|v| v.as_i64());
+            let existing_artist_mbid = row
+                .get(12)
+                .and_then(|v| v.as_string())
+                .filter(|s| !s.is_empty());
+            // The artist row lacks a MusicBrainz ID and we haven't filled it yet
+            // this run — fetching it unlocks Wikipedia/Wikidata artist bios.
+            let artist_needs_mbid = match artist_id {
+                Some(aid) => existing_artist_mbid.is_none() && !artists_mbid_done.contains(&aid),
+                None => false,
+            };
 
-            // If track already has all fields, skip
+            // If track already has all fields (and the artist MBID too), skip
             if existing_mb_id.is_some()
                 && existing_genre.is_some()
                 && existing_year.is_some()
                 && existing_label.is_some()
+                && !artist_needs_mbid
             {
                 continue;
             }
@@ -130,8 +149,10 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
             };
 
             // Fetch recording details if we're missing genre/year/label
-            let needs_details =
-                existing_genre.is_none() || existing_year.is_none() || existing_label.is_none();
+            let needs_details = existing_genre.is_none()
+                || existing_year.is_none()
+                || existing_label.is_none()
+                || artist_needs_mbid;
 
             let details = if needs_details {
                 match mb_fetch_recording_details(&mb_client, &mb_id).await {
@@ -207,6 +228,24 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
                         ],
                     )
                     .ok();
+            }
+
+            // Backfill the artist's MusicBrainz ID (unlocks Wikipedia/Wikidata
+            // bios). COALESCE so an existing value is never overwritten.
+            if artist_needs_mbid {
+                if let (Some(aid), Some(artist_mbid)) =
+                    (artist_id, details.musicbrainz_artist_id.as_ref())
+                {
+                    let ambid_val: Option<String> = Some(artist_mbid.clone());
+                    backend2
+                        .execute(
+                            "UPDATE artists SET musicbrainz_id = COALESCE(musicbrainz_id, ?) \
+                             WHERE id = ?",
+                            &[&ambid_val as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                        )
+                        .ok();
+                    artists_mbid_done.insert(aid);
+                }
             }
 
             match result {
@@ -337,7 +376,7 @@ async fn mb_fetch_recording_details(
     let url = format!("{MUSICBRAINZ_API}/recording/{recording_id}");
     let resp = client
         .get(&url)
-        .query(&[("inc", "releases+tags"), ("fmt", "json")])
+        .query(&[("inc", "releases+tags+artist-credits"), ("fmt", "json")])
         .send()
         .await
         .map_err(|e| format!("mb details: {e}"))?;
