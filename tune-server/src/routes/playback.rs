@@ -378,7 +378,10 @@ async fn play(
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
                         let local_c = qr.count(zone_id).unwrap_or(0);
                         let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        let q_len = if local_c > 0 { local_c } else { stream_c };
+                        // Combined length: a zone can hold a local queue AND a
+                        // streaming queue at once. Sum them so queue-end detection
+                        // doesn't drop the streaming tail → silence (Sandro S1b).
+                        let q_len = local_c + stream_c;
                         if q_len > 0 {
                             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                             state
@@ -396,7 +399,10 @@ async fn play(
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
                         let local_c = qr.count(zone_id).unwrap_or(0);
                         let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                        let q_len = if local_c > 0 { local_c } else { stream_c };
+                        // Combined length: a zone can hold a local queue AND a
+                        // streaming queue at once. Sum them so queue-end detection
+                        // doesn't drop the streaming tail → silence (Sandro S1b).
+                        let q_len = local_c + stream_c;
                         if q_len > 0 {
                             let pos = current.queue_position.min(q_len - 1);
                             state.playback.update_queue_info(zone_id, pos, q_len).await;
@@ -418,7 +424,10 @@ async fn play(
                 let qr = PlayQueueRepo::with_backend(state.backend.clone());
                 let local_c = qr.count(zone_id).unwrap_or(0);
                 let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                let q_len = if local_c > 0 { local_c } else { stream_c };
+                // Combined length: a zone can hold a local queue AND a
+                // streaming queue at once. Sum them so queue-end detection
+                // doesn't drop the streaming tail → silence (Sandro S1b).
+                let q_len = local_c + stream_c;
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
@@ -774,7 +783,10 @@ async fn play(
         let qr_fallback = PlayQueueRepo::with_backend(state.backend.clone());
         let local_c = qr_fallback.count(zone_id).unwrap_or(0);
         let stream_c = qr_fallback.count_streaming(zone_id).unwrap_or(0);
-        let q_len = if local_c > 0 { local_c } else { stream_c };
+        // Combined length: a zone can hold a local queue AND a
+        // streaming queue at once. Sum them so queue-end detection
+        // doesn't drop the streaming tail → silence (Sandro S1b).
+        let q_len = local_c + stream_c;
         if q_len > 0 {
             let current = state.playback.get_state(zone_id).await;
             let pos = current.queue_position.min(q_len - 1);
@@ -853,7 +865,10 @@ async fn play(
             let qr = PlayQueueRepo::with_backend(state.backend.clone());
             let local_c = qr.count(zone_id).unwrap_or(0);
             let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-            let q_len = if local_c > 0 { local_c } else { stream_c };
+            // Combined length: a zone can hold a local queue AND a
+            // streaming queue at once. Sum them so queue-end detection
+            // doesn't drop the streaming tail → silence (Sandro S1b).
+            let q_len = local_c + stream_c;
             let q_len = if q_len > 0 {
                 q_len
             } else {
@@ -911,7 +926,10 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
                     let qr = PlayQueueRepo::with_backend(state.backend.clone());
                     let local_c = qr.count(zone_id).unwrap_or(0);
                     let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-                    let q_len = if local_c > 0 { local_c } else { stream_c };
+                    // Combined length: a zone can hold a local queue AND a
+                    // streaming queue at once. Sum them so queue-end detection
+                    // doesn't drop the streaming tail → silence (Sandro S1b).
+                    let q_len = local_c + stream_c;
                     if q_len > 0 {
                         let cur_pos = state.playback.get_state(zone_id).await.queue_position;
                         state
@@ -1026,7 +1044,10 @@ async fn resume(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl
         let qr = PlayQueueRepo::with_backend(state.backend.clone());
         let local_c = qr.count(zone_id).unwrap_or(0);
         let stream_c = qr.count_streaming(zone_id).unwrap_or(0);
-        let q_len = if local_c > 0 { local_c } else { stream_c };
+        // Combined length: a zone can hold a local queue AND a
+        // streaming queue at once. Sum them so queue-end detection
+        // doesn't drop the streaming tail → silence (Sandro S1b).
+        let q_len = local_c + stream_c;
         if q_len > 0 {
             let cur_pos = state.playback.get_state(zone_id).await.queue_position;
             state
@@ -1435,7 +1456,8 @@ async fn queue_remove(
     // Try the local play_queue first.
     match queue_repo.remove_at(zone_id, position) {
         Ok(true) => {
-            let new_length = queue_repo.count(zone_id).unwrap_or(0);
+            let new_length = queue_repo.count(zone_id).unwrap_or(0)
+                + queue_repo.count_streaming(zone_id).unwrap_or(0);
             let current_pos = state.playback.get_state(zone_id).await.queue_position;
             let adjusted_pos = if position < current_pos {
                 current_pos - 1
@@ -1460,7 +1482,8 @@ async fn queue_remove(
     // Fall back to the streaming_queue (Tidal, Qobuz, Deezer, etc.).
     match queue_repo.remove_streaming_at(zone_id, position) {
         Ok(true) => {
-            let new_length = queue_repo.count_streaming(zone_id).unwrap_or(0);
+            let new_length = queue_repo.count(zone_id).unwrap_or(0)
+                + queue_repo.count_streaming(zone_id).unwrap_or(0);
             let current_pos = state.playback.get_state(zone_id).await.queue_position;
             let adjusted_pos = if position < current_pos {
                 current_pos - 1
