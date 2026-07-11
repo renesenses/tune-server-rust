@@ -128,6 +128,9 @@ async fn main() {
     // journalctl didn't apply exported an empty log.
     let log_file = {
         let path = config::default_log_file_path();
+        // Cap the log at 10 MiB (keeping one .1 backup) so it doesn't grow
+        // without bound on a long-running server.
+        config::rotate_log_file(&path, 10 * 1024 * 1024);
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
