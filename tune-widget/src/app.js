@@ -157,7 +157,10 @@ $('volume-slider').oninput = () => {
 
 $('zone-select').onchange = () => {
   state.zone_id = parseInt($('zone-select').value);
-  init();
+  // Apply the picked zone directly. Do NOT call init() — it re-picks the
+  // "best" playing/paused zone and would immediately clobber the user's
+  // selection. refresh() just re-renders now-playing for the chosen zone.
+  refresh();
 };
 
 // Search
@@ -168,9 +171,12 @@ $('search-input').oninput = () => {
   searchTimeout = setTimeout(async () => {
     try {
       const data = await apiGet(`/api/v1/search?q=${encodeURIComponent(q)}&limit=8`);
+      // The search endpoint nests results under `local` ({local:{tracks,albums,artists}}).
+      // Reading data.tracks/data.albums (top-level) always came back empty → no results.
+      const local = data.local || data;
       const items = [];
-      (data.tracks || []).slice(0, 4).forEach(t => items.push({ title: t.title, artist: t.artist_name, type: 'track', id: t.id }));
-      (data.albums || []).slice(0, 4).forEach(a => items.push({ title: a.title, artist: a.artist_name, type: 'album', id: a.id }));
+      (local.tracks || []).slice(0, 4).forEach(t => items.push({ title: t.title, artist: t.artist_name, type: 'track', id: t.id }));
+      (local.albums || []).slice(0, 4).forEach(a => items.push({ title: a.title, artist: a.artist_name, type: 'album', id: a.id }));
       if (!items.length) { $('search-results').className = ''; return; }
       $('search-results').innerHTML = items.map(i => `
         <div class="search-item" data-type="${i.type}" data-id="${i.id}">
