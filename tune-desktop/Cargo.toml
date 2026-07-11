@@ -6,7 +6,7 @@
 [package]
 name = "tune-desktop"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 authors = ["Bertrand Clech <bertrand.clech@orange.fr>"]
 repository = "https://github.com/renesenses/tune-server-rust"

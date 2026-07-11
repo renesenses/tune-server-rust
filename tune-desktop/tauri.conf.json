@@ -4,7 +4,7 @@
   "version": "0.8.176",
   "identifier": "fr.mozaiklabs.tune-desktop",
   "build": {
-    "frontendDist": "../web"
+    "frontendDist": "web"
   },
   "app": {
     "windows": [
