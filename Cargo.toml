@@ -1,10 +1,10 @@
 [workspace]
 members = ["tune-core", "tune-server", "tune-cli", "tune-ffi", "tune-bridge"]
-# tune-widget is a Tauri desktop app with its own workspace + release
-# pipeline (.github/workflows/widget.yml). It is deliberately kept out of
-# the server workspace so its GUI/webkit deps never enter the server CI
+# tune-desktop and tune-widget are Tauri apps, each with its own workspace and
+# release pipeline (.github/workflows/widget.yml). They are kept out of the
+# server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-widget"]
+exclude = ["tune-desktop", "tune-widget"]
 resolver = "2"
 
 [workspace.package]
