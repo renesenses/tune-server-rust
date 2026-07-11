@@ -255,6 +255,11 @@ struct ZonePollState {
     gapless_stuck_ticks: u8,
     last_bytes_sent: u64,
     radio_stopped_ticks: u8,
+    /// Last position (ms) the renderer reported on the previous radio poll.
+    /// An advancing position means the renderer is actually streaming even
+    /// when it (mis)reports TransportState=Stopped for a live source — the
+    /// Yamaha R-N2000A does this on MP3 ICEcast streams (AAC plays fine).
+    last_radio_position_ms: u64,
     /// Last volume the renderer reported (0.0–1.0) on a previous poll. Used to
     /// distinguish a real external volume change (the value moved) from a
     /// renderer that persistently reports a stale default (e.g. Devialet at
@@ -486,6 +491,7 @@ impl PositionPoller {
                 gapless_stuck_ticks: 0,
                 last_bytes_sent: 0,
                 radio_stopped_ticks: 0,
+                last_radio_position_ms: 0,
                 last_device_volume: None,
             });
 
@@ -607,7 +613,17 @@ impl PositionPoller {
             // Skip position tracking, gapless logic, and track-end detection
             // — none of that applies to infinite streams.
             if is_radio {
-                let radio_stopped = status.state == TransportState::Stopped;
+                // A renderer that is truly streaming reports an advancing
+                // position even when it (mis)reports Stopped for a live source
+                // — the Yamaha R-N2000A does this on MP3 ICEcast streams (AAC
+                // plays fine). Only treat the radio as stopped if it's Stopped
+                // AND the position is NOT advancing; otherwise the auto-retry
+                // below keeps restarting a stream the renderer is happily
+                // playing (Cyrille: TSF Jazz / Radio Classique cut every ~45s).
+                let radio_position_advancing = status.position_ms > ps.last_radio_position_ms;
+                ps.last_radio_position_ms = status.position_ms;
+                let radio_stopped =
+                    status.state == TransportState::Stopped && !radio_position_advancing;
 
                 if !radio_stopped {
                     ps.radio_stopped_ticks = 0;
@@ -1721,6 +1737,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
             last_device_volume: None,
         };
 
@@ -1768,6 +1785,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
             last_device_volume: None,
         };
 
@@ -1867,6 +1885,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
             last_device_volume: None,
         };
 
@@ -2103,6 +2122,7 @@ mod tests {
             gapless_stuck_ticks: 0,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
             last_device_volume: None,
         };
 
@@ -2157,6 +2177,7 @@ mod tests {
             gapless_stuck_ticks: 3,
             last_bytes_sent: 0,
             radio_stopped_ticks: 0,
+            last_radio_position_ms: 0,
             last_device_volume: None,
         };
 
