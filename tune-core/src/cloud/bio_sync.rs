@@ -557,6 +557,16 @@ mod tests {
     }
 
     #[test]
+    fn bio_source_defaults_to_community_when_absent() {
+        // A downloaded community bio with no explicit source is attributed to
+        // the community; a real source is passed through unchanged.
+        assert_eq!(bio_source(&None), "community");
+        assert_eq!(bio_source(&Some(String::new())), "community");
+        assert_eq!(bio_source(&Some("wikipedia".to_string())), "wikipedia");
+        assert_eq!(bio_source(&Some("qobuz".to_string())), "qobuz");
+    }
+
+    #[test]
     fn artists_with_bio_and_mbid_empty() {
         let db = fresh_db();
         let repo = ArtistRepo::with_backend(db);
