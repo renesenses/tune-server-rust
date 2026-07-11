@@ -1124,6 +1124,11 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "schema_sync",
         include_str!("../../migrations/postgres/008_schema_sync.sql"),
     ),
+    (
+        9,
+        "smart_playlists_match_mode",
+        include_str!("../../migrations/postgres/009_smart_playlists_match_mode.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
