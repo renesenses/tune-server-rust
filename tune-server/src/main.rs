@@ -345,9 +345,14 @@ async fn main() {
         });
     }
 
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        // ConnectInfo<SocketAddr> lets handlers see the client IP (used to
+        // disambiguate browser zones created by different machines — Bertrand).
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         tracing::error!(error = %e, "server_fatal_error");
         #[cfg(windows)]
