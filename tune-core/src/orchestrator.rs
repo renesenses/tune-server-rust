@@ -728,6 +728,25 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
+    /// Some radio servers (Icecast) answer HEAD with 400 Bad Request. A DLNA
+    /// renderer that HEAD-probes the stream URL before playback then refuses to
+    /// play it (Cyrille's Yamaha R-N2000A: the MP3 Icecast stations Radio
+    /// Classique / TSF Jazz stay silent while AAC stations work). Returns false
+    /// ONLY on a confirmed non-success HEAD, so we proxy just those; a transient
+    /// network error stays `true` to avoid needlessly proxying working stations.
+    async fn radio_head_ok(&self, url: &str) -> bool {
+        let probe = url.replacen("https://", "http://", 1);
+        match crate::http::client::shared()
+            .head(&probe)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => true,
+        }
+    }
+
     async fn resolve_direct_url(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let audio_url = req
             .source_id
@@ -830,7 +849,13 @@ impl PlaybackOrchestrator {
                 };
                 let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
                     let radio_mime = guess_mime_from_url(audio_url);
-                    !reliable_ext || !self.dlna_supports_mime(device_id, &radio_mime).await
+                    !reliable_ext
+                        || !self.dlna_supports_mime(device_id, &radio_mime).await
+                        // Icecast answers HEAD with 400; a renderer that HEAD-probes
+                        // the URL before playback then refuses to play it (Cyrille's
+                        // Yamaha R-N2000A on Radio Classique / TSF Jazz — MP3 Icecast,
+                        // while AAC stations work). Proxy so the HEAD hits Tune (200).
+                        || !self.radio_head_ok(audio_url).await
                 } else {
                     !reliable_ext
                 };
