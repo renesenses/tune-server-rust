@@ -1081,6 +1081,14 @@ fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
+    // Copy embedded cover art. Pictures are NOT ItemKeys — lofty stores them
+    // in a separate list, so the tag-item loop above misses them entirely and
+    // the converted file ends up with no cover (Scordia, #999). Copy every
+    // source picture across.
+    for pic in src_tag.pictures() {
+        dst_tag.push_picture(pic.clone());
+    }
+
     dst_tag
         .save_to_path(dest, lofty::config::WriteOptions::default())
         .map_err(|e| format!("lofty save: {e}"))?;
