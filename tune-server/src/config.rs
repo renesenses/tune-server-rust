@@ -439,3 +439,24 @@ pub fn default_log_file_path() -> std::path::PathBuf {
     }
     path
 }
+
+/// Rotate the log file at `path` when it grows past `max_bytes`: the current
+/// file is moved to `<path>.1` (replacing any previous backup) so a fresh file
+/// starts. Keeps at most the current file plus one backup, bounding disk use to
+/// ~2× `max_bytes` across restarts instead of growing forever — the file logger
+/// is append-only and, before this, never rotated on any platform.
+///
+/// Called at startup, before the logger opens the file. `/system/logs` keeps
+/// reading the current path unchanged.
+pub fn rotate_log_file(path: &std::path::Path, max_bytes: u64) {
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > max_bytes)
+        .unwrap_or(false);
+    if too_big {
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".1");
+        if let Err(e) = std::fs::rename(path, &backup) {
+            info!(error = %e, path = %path.display(), "log_rotate_failed");
+        }
+    }
+}
