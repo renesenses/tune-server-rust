@@ -194,7 +194,10 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::add_favorite, sql::add_favorite);
-        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        // Bind ids as strings: the Postgres mirror stores these columns as TEXT,
+        // so binding i64 made `text = bigint` / int-into-text errors → 500.
+        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
+        let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -206,7 +209,8 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::remove_favorite, sql::remove_favorite);
-        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
+        let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -218,7 +222,8 @@ impl ProfileRepo {
         item_id: i64,
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::count_favorite, sql::count_favorite);
-        let params: [&dyn ToSqlValue; 3] = [&profile_id, &item_type, &item_id];
+        let (pid, iid) = (profile_id.to_string(), item_id.to_string());
+        let params: [&dyn ToSqlValue; 3] = [&pid, &item_type, &iid];
         match self.db.query_one(&sql, &params)? {
             None => Ok(false),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0) > 0),
@@ -237,13 +242,14 @@ impl ProfileRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<Favorite>, String> {
+        let pid = profile_id.to_string();
         let rows = if let Some(t) = item_type {
             let sql = self.dialect_sql(sql::list_favorites_by_type, sql::list_favorites_by_type);
-            let params: [&dyn ToSqlValue; 2] = [&profile_id, &t];
+            let params: [&dyn ToSqlValue; 2] = [&pid, &t];
             self.db.query_many(&sql, &params)?
         } else {
             let sql = self.dialect_sql(sql::list_favorites_all, sql::list_favorites_all);
-            let params: [&dyn ToSqlValue; 1] = [&profile_id];
+            let params: [&dyn ToSqlValue; 1] = [&pid];
             self.db.query_many(&sql, &params)?
         };
         Ok(rows.iter().map(row_to_favorite).collect())

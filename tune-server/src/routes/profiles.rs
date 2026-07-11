@@ -250,8 +250,10 @@ async fn add_favorite(
 ) -> impl IntoResponse {
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.add_favorite(id, &body.item_type, body.item_id) {
-        Ok(_) => StatusCode::CREATED.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        // Return a JSON body: web clients call response.json() and an empty
+        // 201/204 body threw "Invalid JSON response". (Elie)
+        Ok(_) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
@@ -262,8 +264,8 @@ async fn remove_favorite(
 ) -> impl IntoResponse {
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.remove_favorite(id, &body.item_type, body.item_id) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
 }
 
