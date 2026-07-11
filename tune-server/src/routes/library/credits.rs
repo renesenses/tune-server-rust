@@ -13,11 +13,16 @@ pub(super) async fn track_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
+    // On Postgres the mirror schema stores integer-semantic columns as TEXT, so
+    // binding an i64 here made the comparison `text = bigint`, which Postgres
+    // rejects ("operator does not exist: text = bigint") → 500. Bind the id as a
+    // string: `text = text` on PG, and SQLite numeric affinity handles it too.
+    let id_str = id.to_string();
     let rows = state
         .backend
         .query_many(
             "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
-            &[&id as &dyn ToSqlValue],
+            &[&id_str as &dyn ToSqlValue],
         )
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
@@ -42,6 +47,8 @@ pub(super) async fn artist_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
+    // Bind as string — see track_credits above (Postgres TEXT columns vs bigint).
+    let id_str = id.to_string();
     let rows = state
         .backend
         .query_many(
@@ -49,7 +56,7 @@ pub(super) async fn artist_credits(
              FROM track_credits tc \
              WHERE tc.artist_id = ? OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
              ORDER BY tc.track_id, tc.position",
-            &[&id as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            &[&id_str as &dyn ToSqlValue, &id_str as &dyn ToSqlValue],
         )
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
