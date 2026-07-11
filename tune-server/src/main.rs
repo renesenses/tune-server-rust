@@ -267,7 +267,22 @@ async fn main() {
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
-                Err(e) => panic!("failed to bind {addr} after 10 attempts: {e}"),
+                Err(e) => {
+                    // Another tune-server is already listening on this port
+                    // (e.g. an old instance that wasn't stopped before an
+                    // update/restart — Elie). Exit cleanly with an actionable
+                    // message instead of panicking, which dumped core and
+                    // spammed the journal on every restart of the crash loop.
+                    tracing::error!(
+                        %addr,
+                        error = %e,
+                        "failed to bind after 10 attempts — another tune-server \
+                         instance is probably already bound to this port. Stop \
+                         it before starting a new one \
+                         (e.g. `systemctl stop tune-server` or `pkill -f tune-server`)."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         socket.listen(128).expect("failed to listen");
