@@ -241,6 +241,20 @@ async fn handle_ssdp_discovered(
         } else {
             short_name.to_string()
         };
+
+        // Persisted name dedup: a device exposing several UPnP services (a Sonos
+        // is both a DLNA MediaRenderer and OpenHome) can be rediscovered under a
+        // NEW device_id after a restart. get_by_device_id above misses it and
+        // the per-pass seen_hosts is empty, so a duplicate zone with the SAME
+        // disambiguated name (which includes the renderer UUID) gets created
+        // (Bertrand: "Chambre - Sonos … RINCON…" ×2). Same full name = same
+        // physical device → skip the duplicate; its live device_id reconnects
+        // via the get_by_device_id path.
+        if existing_zones.iter().any(|z| z.name == zone_name) {
+            tracing::debug!(name = %zone_name, id = %dev.id, host = %dev.host, "ssdp_zone_name_exists_skipping_duplicate");
+            return;
+        }
+
         let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
             "openhome"
         } else {

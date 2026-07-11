@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
@@ -258,8 +258,19 @@ async fn network_health(State(state): State<AppState>, Path(id): Path<i64>) -> J
 
 pub async fn create_zone_handler(
     state: State<AppState>,
-    body: Json<CreateZone>,
+    ConnectInfo(client_addr): ConnectInfo<std::net::SocketAddr>,
+    mut body: Json<CreateZone>,
 ) -> impl IntoResponse {
+    // Every web client creates its browser-output zone under the same generic
+    // name ("Cet ordinateur"), so several clients show up as indistinguishable
+    // duplicates in the zone list (Bertrand). Append the client IP so each
+    // machine is identifiable. Guarded to avoid doubling the suffix on retries.
+    if body.output_type.as_deref() == Some("browser") {
+        let ip = client_addr.ip().to_string();
+        if !body.name.contains(&ip) {
+            body.name = format!("{} ({ip})", body.name.trim());
+        }
+    }
     create_zone(state, body).await
 }
 
