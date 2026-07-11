@@ -54,13 +54,18 @@ pub mod sql {
 
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
         format!(
+            // track_id: many history rows have a null track_id, so resolve it by
+            // title (t3) as a fallback. Without this the client can't play a top
+            // track directly (it fell back to a fragile title search that failed),
+            // so tapping a track on the home screen did nothing.
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
-             COALESCE(t.id, h.track_id) as track_id, \
+             COALESCE(t.id, MAX(t3.id), h.track_id) as track_id, \
              COALESCE(al.cover_path, al2.cover_path, MAX(h.cover_url)) as cover_path, \
              COALESCE(al.title, h.album_title) as album_title, \
              h.source \
              FROM listen_history h \
              LEFT JOIN tracks t ON h.track_id = t.id \
+             LEFT JOIN tracks t3 ON t3.title = h.title \
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN albums al2 ON al2.title = h.album_title AND al2.cover_path IS NOT NULL \
              WHERE h.source != 'radio' \
