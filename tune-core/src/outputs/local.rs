@@ -2705,20 +2705,37 @@ impl OutputTarget for LocalOutput {
                     }
                 };
 
-                // Read header bytes from the next track
+                // Read header bytes from the next track.
+                // The next track's transcode session may have only just
+                // been started, so its very first read can time out before
+                // the WAV header is available. Retry on TimedOut/WouldBlock —
+                // mirroring the initial-track header read above — instead of
+                // aborting the gapless chain, which would skip the track.
                 let mut next_reader = next_response;
                 let mut next_header = vec![0u8; 4096];
-                let nh_read = match next_reader.read(&mut next_header) {
-                    Ok(n) if n > 0 => n,
-                    Ok(_) => {
-                        warn!("local_audio_gapless_header_read_empty");
-                        break;
+                let nh_read = loop {
+                    if force_silent.load(Ordering::Relaxed) {
+                        break 0;
                     }
-                    Err(e) => {
-                        warn!(error = %e, "local_audio_gapless_header_read_failed");
-                        break;
+                    match next_reader.read(&mut next_header) {
+                        Ok(n) => break n,
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::WouldBlock =>
+                        {
+                            // Stream not ready yet — wait for the producer.
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "local_audio_gapless_header_read_failed");
+                            break 0;
+                        }
                     }
                 };
+                if nh_read == 0 {
+                    warn!("local_audio_gapless_header_read_empty");
+                    break;
+                }
                 next_header.truncate(nh_read);
 
                 // Parse the WAV header of the next track
