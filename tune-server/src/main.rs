@@ -120,20 +120,14 @@ async fn main() {
         .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
         .add_directive(format!("tune_core={}", config.log_level).parse().unwrap());
 
-    // On macOS/Windows, also write logs to a file so the Diagnostics
-    // "Export logs" button works even when not launched from a terminal.
-    let log_file = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        let log_dir = if cfg!(target_os = "macos") {
-            std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join("Library/Logs"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        } else {
-            std::env::var("LOCALAPPDATA")
-                .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("C:\\ProgramData\\TuneServer"))
-        };
-        std::fs::create_dir_all(&log_dir).ok();
-        let path = log_dir.join("tune-server.log");
+    // Write logs to a file on every platform (Linux included) so the
+    // Diagnostics "Export logs" button and /system/logs work even when not
+    // launched from a terminal — systemd/journald, Docker, or a double-clicked
+    // .app. The path is shared with the reader via config::default_log_file_path()
+    // so both always agree. Previously Linux wrote no file, so any launch where
+    // journalctl didn't apply exported an empty log.
+    let log_file = {
+        let path = config::default_log_file_path();
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -143,8 +137,6 @@ async fn main() {
                 eprintln!("Logging to {}", path.display());
                 f
             })
-    } else {
-        None
     };
 
     if let Some(file) = log_file {

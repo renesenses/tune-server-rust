@@ -379,3 +379,63 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
 
     cwd_web
 }
+
+/// Path of the server's own log file, written on every platform (not just
+/// macOS/Windows) so the Diagnostics "Export logs" button and `/system/logs`
+/// return real logs regardless of how the server was launched — terminal,
+/// systemd/journald, Docker, or a double-clicked .app. Before this, Linux never
+/// wrote a file, so any launch where journalctl didn't apply (Docker, a bare
+/// terminal, a non-matching unit name) exported an empty log.
+///
+/// Both the writer (main) and the reader (`/system/logs`) call this, so they
+/// always agree on the path.
+///
+/// Resolution order:
+///   1. `TUNE_LOG_FILE` — honored verbatim.
+///   2. Windows: `%LOCALAPPDATA%\TuneServer\tune-server.log`.
+///   3. macOS: `$HOME/Library/Logs/tune-server.log`.
+///   4. Linux/other: `$XDG_STATE_HOME/tune/`, else `$HOME/.local/state/tune/`,
+///      else `/tmp/` — the first user-writable location, never `/var/log`
+///      (a `User=` service or a container can't write there).
+///
+/// Creates the parent directory. Note: append-only, no rotation (same as the
+/// pre-existing macOS/Windows behavior); rotation is a separate follow-up.
+pub fn default_log_file_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    if let Ok(custom) = std::env::var("TUNE_LOG_FILE") {
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+
+    let path = if cfg!(target_os = "windows") {
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+        PathBuf::from(base)
+            .join("TuneServer")
+            .join("tune-server.log")
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        PathBuf::from(home)
+            .join("Library/Logs")
+            .join("tune-server.log")
+    } else {
+        let base = std::env::var("XDG_STATE_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local/state"))
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("tune").join("tune-server.log")
+    };
+
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    path
+}

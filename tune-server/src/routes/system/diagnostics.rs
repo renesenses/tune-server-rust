@@ -245,16 +245,13 @@ pub(super) struct LogsQuery {
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
     let max_lines = q.lines.unwrap_or(1000);
 
-    // Try log file first
-    let log_path = std::env::var("TUNE_LOG_FILE").unwrap_or_else(|_| {
-        if cfg!(target_os = "windows") {
-            let appdata =
-                std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
-            format!("{appdata}\\TuneServer\\tune-server.log")
-        } else {
-            "/var/log/tune-server.log".into()
-        }
-    });
+    // Try the server's own log file first — same path the writer uses (main),
+    // resolved via the shared helper so reader and writer always agree. This is
+    // what makes "Export logs" work on Linux under Docker / a bare terminal,
+    // where journalctl doesn't apply and no file existed before.
+    let log_path = crate::config::default_log_file_path()
+        .to_string_lossy()
+        .into_owned();
 
     // Try reading log file
     if let Ok(content) = std::fs::read_to_string(&log_path) {
