@@ -728,25 +728,6 @@ impl PlaybackOrchestrator {
         self.resolve_local_track(req).await
     }
 
-    /// Some radio servers (Icecast) answer HEAD with 400 Bad Request. A DLNA
-    /// renderer that HEAD-probes the stream URL before playback then refuses to
-    /// play it (Cyrille's Yamaha R-N2000A: the MP3 Icecast stations Radio
-    /// Classique / TSF Jazz stay silent while AAC stations work). Returns false
-    /// ONLY on a confirmed non-success HEAD, so we proxy just those; a transient
-    /// network error stays `true` to avoid needlessly proxying working stations.
-    async fn radio_head_ok(&self, url: &str) -> bool {
-        let probe = url.replacen("https://", "http://", 1);
-        match crate::http::client::shared()
-            .head(&probe)
-            .timeout(std::time::Duration::from_secs(4))
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => true,
-        }
-    }
-
     async fn resolve_direct_url(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let audio_url = req
             .source_id
@@ -847,15 +828,18 @@ impl PlaybackOrchestrator {
                     let p = url_path.to_lowercase();
                     p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
                 };
-                let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
-                    let radio_mime = guess_mime_from_url(audio_url);
-                    !reliable_ext
-                        || !self.dlna_supports_mime(device_id, &radio_mime).await
-                        // Icecast answers HEAD with 400; a renderer that HEAD-probes
-                        // the URL before playback then refuses to play it (Cyrille's
-                        // Yamaha R-N2000A on Radio Classique / TSF Jazz — MP3 Icecast,
-                        // while AAC stations work). Proxy so the HEAD hits Tune (200).
-                        || !self.radio_head_ok(audio_url).await
+                // A radio stream bound to a specific DLNA renderer is ALWAYS
+                // proxied+transcoded to WAV. Direct passthrough of an infinite
+                // Icecast stream is unreliable: it carries no Content-Length and
+                // may use ICY framing, so the renderer HEAD-probes, reports
+                // PLAYING, then emits silence — even for an explicit .mp3 whose
+                // HEAD returns 200 (Cyrille, Yamaha R-N2000A: Radio Classique
+                // proxied → sound, TSF Jazz sent direct → silent + retry loop).
+                // WAV is universally supported, so proxying guarantees sound at
+                // low CPU/LAN cost. Only device-less network resolves (no HEAD to
+                // gamble on) keep the extension-based passthrough.
+                let needs_proxy = if req.output_device_id.is_some() {
+                    true
                 } else {
                     !reliable_ext
                 };
