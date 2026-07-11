@@ -1,0 +1,104 @@
+name: Widget Release
+
+# Tune Widget is a Tauri desktop mini-player, isolated from the server
+# workspace (root Cargo.toml `exclude = ["tune-widget"]`). It ships on its
+# own cadence, NOT with every server `v*` tag — trigger with a `widget-v*`
+# tag or run manually. Reuses the same Apple signing/notarization secrets as
+# release.yml.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["widget-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tune-widget/src-tauri
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tune-widget/src-tauri
+
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@^2
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
+
+      - name: Build signed + notarized bundle
+        env:
+          # Tauri v2 signs with this identity and — because the notarization
+          # trio below is set — notarizes and staples the DMG automatically.
+          APPLE_SIGNING_IDENTITY: "Developer ID Application: Bertrand Clech (${{ secrets.APPLE_TEAM_ID }})"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Collect DMG
+        run: |
+          mkdir -p ../../dist
+          cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg ../../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tune-widget-${{ matrix.target }}
+          path: dist/*.dmg
+          retention-days: 3
+
+  release:
+    name: Publish Widget Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/widget-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          find . -name '*.dmg' -exec sha256sum {} \; > ../SHA256SUMS-widget
+          cd ..
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.dmg
+            SHA256SUMS-widget
+          generate_release_notes: true
