@@ -90,7 +90,13 @@ pub fn router() -> Router<AppState> {
 
 async fn list_profiles(State(state): State<AppState>) -> Json<Value> {
     let repo = ProfileRepo::with_backend(state.backend.clone());
-    let items = repo.list().unwrap_or_default();
+    // Don't swallow a DB error as an empty list: the web client would then
+    // auto-create "Default" and mask real profiles with no visible error.
+    // Log it so a schema/column drift on an older DB is diagnosable.
+    let items = repo.list().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "list_profiles: repo.list() failed, returning empty");
+        Vec::new()
+    });
     Json(json!(items))
 }
 
