@@ -697,7 +697,13 @@ async fn resolve_albums(
         build_album_query(&rules_json, &match_mode, &sort_by, &sort_order, max_limit);
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
 
-    Ok(Json(json!({"albums": albums, "total": albums.len()})).into_response())
+    // Return a bare array, matching the regular collections endpoint
+    // (GET /library/collections/{id}/albums). The previous {"albums":[…],
+    // "total":N} wrapper made the iOS client fail to decode
+    // (DecodingError.typeMismatch: expected Array, found dictionary) when
+    // opening a smart collection in remote mode; the web client already
+    // accepts either shape.
+    Ok(Json(albums).into_response())
 }
 
 async fn preview_albums(
