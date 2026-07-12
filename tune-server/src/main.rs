@@ -118,7 +118,21 @@ async fn main() {
 
     let env_filter = EnvFilter::from_default_env()
         .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
-        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap());
+        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap())
+        // Cap chatty dependencies so a `debug` level (config or RUST_LOG=debug)
+        // doesn't drown the useful lines. At debug, sqlx::query logs every SQL
+        // statement and reqwest/hyper log every outbound connection: Elie's
+        // 1000-line "Export logs" covered barely 7 seconds, ~95% of it sqlx +
+        // reqwest::connect noise, burying the playback events we actually needed.
+        // These crates are never useful for diagnosing Tune. Target-specific
+        // directives win over the global level, so this holds even at RUST_LOG=debug.
+        .add_directive("sqlx=warn".parse().unwrap())
+        .add_directive("reqwest=info".parse().unwrap())
+        .add_directive("hyper=info".parse().unwrap())
+        .add_directive("hyper_util=info".parse().unwrap())
+        .add_directive("h2=info".parse().unwrap())
+        .add_directive("rustls=info".parse().unwrap())
+        .add_directive("mio=info".parse().unwrap());
 
     // Write logs to a file on every platform (Linux included) so the
     // Diagnostics "Export logs" button and /system/logs work even when not
