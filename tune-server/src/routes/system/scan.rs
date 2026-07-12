@@ -19,13 +19,20 @@ pub(super) struct ScanQuery {
     /// track's album_id points at a wrong same-titled album. Slower (re-reads
     /// every file's metadata); default false keeps the fast incremental scan.
     force: Option<bool>,
+    /// Alias for `force` sent by the clients' "Full scan / Scan complet" button.
+    /// The web/Flutter clients pass `?full=true`; without this field serde
+    /// silently dropped it, so "Scan complet" behaved like an ordinary
+    /// incremental scan and could never re-resolve broken album/artist links —
+    /// a rescan then skipped every unchanged file, so only "Vider la
+    /// bibliothèque" + cold scan repaired the DB (Yacine, Synology ARM64).
+    full: Option<bool>,
 }
 
 pub(super) async fn trigger_scan(
     State(state): State<AppState>,
     Query(q): Query<ScanQuery>,
 ) -> impl IntoResponse {
-    let force = q.force.unwrap_or(false);
+    let force = q.force.unwrap_or(false) || q.full.unwrap_or(false);
     if force {
         tracing::info!("scan_force_full_reresolve — bypassing unchanged-file skip");
     }
