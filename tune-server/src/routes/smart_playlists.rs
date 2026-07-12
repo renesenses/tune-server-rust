@@ -323,8 +323,8 @@ fn build_smart_query(
             .and_then(|v| v.as_str())
             .unwrap_or("contains");
         let op = match raw_op {
-            "greater_than" => "gte",
-            "less_than" => "lte",
+            "greater_than" | ">=" | "gte" => "gte",
+            "less_than" | "<=" | "lte" => "lte",
             "equals" => "eq",
             "not_equals" => "neq",
             other => other,
@@ -369,6 +369,11 @@ fn build_smart_query(
             ("sample_rate", "eq") => {
                 format!("t.sample_rate = {}", value.parse::<i32>().unwrap_or(0))
             }
+            ("bit_depth", "gte") => format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "lte") => format!("t.bit_depth <= {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "gt") => format!("t.bit_depth > {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "lt") => format!("t.bit_depth < {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "eq") => format!("t.bit_depth = {}", value.parse::<i32>().unwrap_or(0)),
             ("duration_ms", "gte") => {
                 format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0))
             }
