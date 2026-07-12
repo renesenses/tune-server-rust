@@ -271,6 +271,10 @@ pub mod sql {
             d.placeholder(2)
         )
     }
+
+    pub fn delete_by_id<D: SqlDialect>(d: &D) -> String {
+        format!("DELETE FROM queue_items WHERE id = {}", d.placeholder(1))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,20 +626,37 @@ impl PlayQueueRepo {
 
     /// Remove the item at `position` (source-agnostic) and close the gap.
     pub fn remove_pos(&self, zone_id: i64, position: i64) -> Result<bool, String> {
-        let delete_sql = self.dialect_sql(sql::delete_at_any, sql::delete_at_any);
-        let reindex_sql =
-            self.dialect_sql(sql::reindex_after_delete_any, sql::reindex_after_delete_any);
-        let mut deleted = 0usize;
-        let deleted_ref = &mut deleted;
+        // `position` from the client is an ORDINAL into the displayed queue
+        // (the get_ordered order), not necessarily the stored `position` column.
+        // Those diverge when local and streaming rows were inserted through
+        // different code paths, leaving gaps/overlaps in the position space —
+        // a plain `DELETE WHERE position = ?` then matches the wrong row or none
+        // at all, so the item (e.g. a stray Qobuz "Piste inconnue") can't be
+        // removed. Resolve the Nth row, delete it by id, and renumber the rest
+        // to a contiguous 0..N-1 space so the queue self-heals (same strategy
+        // as move_pos).
+        let entries = self.get_ordered(zone_id)?;
+        if position < 0 || position as usize >= entries.len() {
+            return Ok(false);
+        }
+        let target_id = entries[position as usize].id;
+        let delete_sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
         self.db.write_tx(&mut |tx| {
-            let p: [&dyn ToSqlValue; 2] = [&zone_id, &position];
-            *deleted_ref = tx.execute(&delete_sql, &p)?;
-            if *deleted_ref > 0 {
-                tx.execute(&reindex_sql, &p)?;
+            let dp: [&dyn ToSqlValue; 1] = [&target_id];
+            tx.execute(&delete_sql, &dp)?;
+            let mut new_pos = 0i64;
+            for e in entries.iter() {
+                if e.id == target_id {
+                    continue;
+                }
+                let p: [&dyn ToSqlValue; 2] = [&new_pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+                new_pos += 1;
             }
             Ok(())
         })?;
-        Ok(deleted > 0)
+        Ok(true)
     }
 
     /// Mark the item at `position` as current (source-agnostic). Unlike the
@@ -1094,6 +1115,59 @@ mod tests {
         repo.clear(1).unwrap();
         assert_eq!(repo.count(1).unwrap(), 0);
         assert_eq!(repo.count_streaming(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_pos_deletes_by_ordinal_with_noncontiguous_positions() {
+        // Reproduces Cyrille's .15 bug: a stray Qobuz row ("Piste inconnue")
+        // that couldn't be deleted. When local and streaming rows end up with a
+        // non-contiguous position space, the client's ordinal (Nth visible row)
+        // no longer equals the stored `position` column, so the old
+        // `DELETE WHERE position = ?` was a no-op.
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db.clone());
+
+        let mut ids = Vec::new();
+        for name in ["A", "B", "C"] {
+            let mut t = Track::new(name.into());
+            t.file_path = Some(format!("/{name}.flac"));
+            ids.push(track_repo.create(&t).unwrap());
+        }
+        repo.set_queue(1, &ids).unwrap(); // local rows at positions 0,1,2
+
+        // Stray streaming row with a position that doesn't continue the space.
+        db.execute(
+            "INSERT INTO queue_items (zone_id, position, source_id, title, source, is_current) \
+             VALUES (1, 99, 'qobuz-x', '', 'qobuz', 0)",
+            &[],
+        )
+        .unwrap();
+
+        // Ordered queue: [A(0), B(1), C(2), stray(99)] — stray is ordinal 3.
+        let ordered = repo.get_ordered(1).unwrap();
+        assert_eq!(ordered.len(), 4);
+        assert!(ordered[3].track_id.is_none(), "stray streaming row is last");
+
+        // Removing ordinal 3 must delete the stray row (old code deleted nothing
+        // because no row had position == 3).
+        assert!(repo.remove_pos(1, 3).unwrap());
+
+        let after = repo.get_ordered(1).unwrap();
+        assert_eq!(after.len(), 3);
+        assert!(
+            after.iter().all(|e| e.track_id.is_some()),
+            "stray streaming row gone"
+        );
+        // Positions renumbered contiguous so future ordinal ops stay correct.
+        assert_eq!(
+            after.iter().map(|e| e.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        // Out-of-range ordinal is a safe no-op.
+        assert!(!repo.remove_pos(1, 9).unwrap());
+        assert_eq!(repo.get_ordered(1).unwrap().len(), 3);
     }
 
     #[test]
