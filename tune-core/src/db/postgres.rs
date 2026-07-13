@@ -41,6 +41,20 @@ impl PostgresDb {
     /// at runtime. `days_of_week`/`multi_zone_ids` were missing on .15 prod →
     /// the alarm scheduler failed every 30s with `column ... does not exist`.
     async fn ensure_schema(&self) {
+        // Whole TABLES added to PG_FULL_SCHEMA after a DB was first migrated:
+        // PG_FULL_SCHEMA only runs during the one-time SQLite→PG migration, so a
+        // table introduced later (e.g. `file_first_seen`, #473) never lands on an
+        // already-migrated DB. The albums list sorts "added_at" via a LEFT JOIN
+        // on file_first_seen, so its absence made the query fail on .15 prod
+        // (`relation "file_first_seen" does not exist`) → empty library → the
+        // "black screen" reported on the iOS/Android clients. CREATE TABLE IF NOT
+        // EXISTS is idempotent; add new tables here like the columns below.
+        const ENSURE_TABLES: &str = "\
+CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL);";
+        if let Err(e) = sqlx::raw_sql(ENSURE_TABLES).execute(&self.pool).await {
+            warn!(error = %e, "pg_ensure_tables_failed");
+        }
+
         // Every column SQLite gains via `add_column_if_missing` that the
         // hand-written PG schema omits. All idempotent (ADD COLUMN IF NOT
         // EXISTS) and TEXT-typed to match this codebase's TEXT-based PG schema.

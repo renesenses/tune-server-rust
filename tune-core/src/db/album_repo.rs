@@ -806,7 +806,14 @@ impl AlbumRepo {
             // track not yet recorded. Streaming albums have no local file →
             // NULLS LAST, id tiebreaker.
             "added_at" => format!(
-                "(SELECT MAX(COALESCE(ffs.first_seen_at, t.file_mtime)) \
+                // file_first_seen.first_seen_at is DOUBLE, but tracks.file_mtime
+                // is TEXT in the Postgres schema — a bare COALESCE(double, text)
+                // is a hard error on PG ("types double precision and text cannot
+                // be matched"), so the sort silently returned no albums on .15
+                // (empty library → "black screen" on the clients). Cast the
+                // fallback to a number; NULLIF guards against empty strings.
+                // Valid on SQLite too (REAL affinity).
+                "(SELECT MAX(COALESCE(ffs.first_seen_at, CAST(NULLIF(t.file_mtime, '') AS DOUBLE PRECISION))) \
                   FROM tracks t LEFT JOIN file_first_seen ffs ON ffs.file_path = t.file_path \
                   WHERE t.album_id = a.id) {dir} NULLS LAST, a.id {dir}"
             ),
