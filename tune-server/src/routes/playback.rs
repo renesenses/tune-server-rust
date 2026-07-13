@@ -123,6 +123,34 @@ async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             }
         }
     }
+    // Include signal_path (the bit-perfect indicator) so the play / next /
+    // previous / resume responses carry it, matching GET /zones/{id}. Without
+    // it the indicator was absent on the FIRST track — playAndSync renders this
+    // play response — and only appeared from the SECOND track on, because
+    // nextAndSync refreshes via GET /zones/{id}, which does include it
+    // (forum #1012, Bilou).
+    if let Some(ref zone) = zone_db {
+        let devices = state.scanner.lock().await.devices().await;
+        let renderer_label = zone
+            .output_device_id
+            .as_deref()
+            .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+        #[cfg(feature = "local-audio")]
+        let audio_backend =
+            tune_core::outputs::local::active_backend_name(&state.config.local_audio_backend);
+        #[cfg(not(feature = "local-audio"))]
+        let audio_backend = "none";
+        let signal_path = crate::routes::zones::build_signal_path_pub(
+            &zone_state,
+            zone,
+            &state.backend,
+            renderer_label,
+            audio_backend,
+        );
+        v.as_object_mut()
+            .unwrap()
+            .insert("signal_path".into(), json!(signal_path));
+    }
     v
 }
 
