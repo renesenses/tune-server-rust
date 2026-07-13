@@ -100,6 +100,10 @@ pub mod sql {
         "SELECT id, name, musicbrainz_id FROM artists WHERE (image_path IS NULL OR image_path = '') AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    pub fn list_with_image_and_mbid() -> &'static str {
+        "SELECT id, name, musicbrainz_id, image_path FROM artists WHERE image_path IS NOT NULL AND image_path != '' AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
     pub fn list_without_mbid() -> &'static str {
         "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
@@ -382,6 +386,28 @@ impl ArtistRepo {
                     cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                     cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                     cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Artists that have an image_path AND an MBID. Used to detect the case
+    /// where the DB column is set but the cache file is missing (a scan set the
+    /// column while the cache write failed, or the cache was later cleared), so
+    /// those artists can be re-enriched instead of showing a grey square forever.
+    /// Each entry is (artist_id, name, musicbrainz_id, image_path).
+    pub fn list_with_image_and_mbid(
+        &self,
+    ) -> Result<Vec<(i64, String, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_image_and_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
                 )
             })
             .collect())

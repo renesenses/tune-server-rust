@@ -666,13 +666,35 @@ pub async fn batch_enrich_artist_artwork(
     }
 
     // --- Phase 2: Fetch from external sources for remaining artists ---
-    let artists = match artist_repo.list_without_image() {
+    let mut artists = match artist_repo.list_without_image() {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artist_artwork_list_failed");
             return;
         }
     };
+
+    // Re-queue artists whose image_path is set in the DB but whose cache file is
+    // actually missing. list_without_image only checks the column, so a scan
+    // that set image_path while the cache write failed (or a cache that was
+    // later cleared/moved) leaves a grey square that would be skipped forever
+    // (Fabien: "j'ai pas les images d'artistes" despite a full scan + premium).
+    // This extends the Phase-1 cache-existence guard (Sandro) to Phase 2.
+    match artist_repo.list_with_image_and_mbid() {
+        Ok(with_image) => {
+            let before = artists.len();
+            for (id, name, mbid, image_path) in with_image {
+                if !cached_artwork_exists(&cache_dir, &image_path) {
+                    artists.push((id, name, mbid));
+                }
+            }
+            let requeued = artists.len() - before;
+            if requeued > 0 {
+                info!(requeued, "batch_artist_artwork_missing_cache_requeued");
+            }
+        }
+        Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
+    }
 
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
