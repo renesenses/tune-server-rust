@@ -36,6 +36,33 @@ use super::local::RingBuf;
 /// down and settles) makes the new open WAIT for the old one instead.
 static ASIO_DEVICE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Run `f` while holding the process-wide ASIO device lock **only if it is
+/// free**. Returns `None` — without running `f` — when the lock is currently
+/// held, i.e. an exclusive playback session is active (or still settling in
+/// `Drop`).
+///
+/// This is what enumeration must use. `AsioExclusiveOutput::new` holds
+/// [`ASIO_DEVICE_LOCK`] for the whole playback session, but device *listing*
+/// (Settings, the Diagnostics page, the `/devices/audio*` API) used to call
+/// `supported_output_configs()` on the driver without any lock — opening the
+/// single-instance ASIO driver a second time. On drivers like SOtM Diretta or
+/// RME Fireface that concurrent open churns the driver so it never finishes
+/// locking (observed: endless connect → getBufferSize → disconnect cycles,
+/// never reaching `createBuffers`/`start`). Probing through this guard makes
+/// enumeration back off to cached data instead of racing an active stream.
+pub fn try_with_asio_device_lock<R>(f: impl FnOnce() -> R) -> Option<R> {
+    match ASIO_DEVICE_LOCK.try_lock() {
+        Ok(_guard) => Some(f()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        // A prior holder panicked; the driver state is still consistent enough
+        // to enumerate, so recover the guard and proceed.
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            let _guard = p.into_inner();
+            Some(f())
+        }
+    }
+}
+
 /// Base time given to the ASIO driver to fully release the hardware after a
 /// stream is torn down, before the device lock is released and the next open
 /// runs.
