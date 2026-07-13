@@ -98,7 +98,10 @@ jobs:
           context: .
           file: Dockerfile.dist
           platforms: linux/amd64,linux/arm64
-          push: true
+          # Only push on a real tag. A manual workflow_dispatch (e.g. to validate
+          # the multi-arch build) still builds BOTH platforms but doesn't push,
+          # so it can't clobber the `latest` tag with a "dev" image.
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.IMAGE_NAME }}:latest
