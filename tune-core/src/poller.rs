@@ -1638,11 +1638,25 @@ impl PositionPoller {
             // Detect position reset: position drops from >30s to <5s.
             // This is a strong signal that the renderer performed a gapless
             // transition (the new track starts from 0).
-            let position_reset = decisions::position_reset(
-                ps.last_position_ms,
-                status.position_ms,
-                ps.gapless_sent_at.is_some(),
-            );
+            //
+            // Arm on `gapless_sent` (the boolean), NOT `gapless_sent_at`
+            // (the timestamp). SetNextAVTransportURI is sent GAPLESS_WINDOW_MS
+            // (30s) before the end, but `gapless_sent_at` expires after
+            // GAPLESS_GUARD_SECS (15s) — i.e. ~15s BEFORE the track actually
+            // ends. Using the timestamp therefore disarmed this detection for
+            // the entire final stretch of every track, so a renderer that
+            // transitions seamlessly (continuous Playing, no Stopped blip) and
+            // plays consecutive tracks of similar duration was caught by
+            // NEITHER position_reset (disarmed) NOR the duration_changed path
+            // (needs >2s duration difference). Tune then stayed one track
+            // behind: its UI showed track N restarting while the renderer
+            // played track N+1, and when the phantom track N passed its
+            // duration handle_track_end re-issued play → track N+1 restarted on
+            // the renderer (forum #1019, Marantz ND8006). `gapless_sent` stays
+            // true from SetNext until the transition is detected or the track
+            // generation changes, so it covers the whole window.
+            let position_reset =
+                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
@@ -2870,6 +2884,26 @@ mod tests {
         assert!(!decisions::position_reset(40_000, 8_000, true));
         // Previous position not above the 30s ceiling → not a reset.
         assert!(!decisions::position_reset(20_000, 2_000, true));
+    }
+
+    #[test]
+    fn position_reset_armed_by_gapless_sent_after_guard_expiry() {
+        // #1019: SetNext is sent 30s before end (GAPLESS_WINDOW_MS) but
+        // gapless_sent_at expires after 15s (GAPLESS_GUARD_SECS), so at the
+        // real transition the *timestamp* is already None while the *boolean*
+        // gapless_sent is still true. The caller now arms position_reset on
+        // the boolean, so a same-duration seamless gapless transition is still
+        // detected in the final 15s of the track.
+        let gapless_sent = true; // boolean stays armed until transition
+        let gapless_sent_at_is_some = false; // 15s guard already expired
+        assert!(
+            decisions::position_reset(238_000, 1_500, gapless_sent),
+            "must detect the transition using the boolean arm"
+        );
+        assert!(
+            !decisions::position_reset(238_000, 1_500, gapless_sent_at_is_some),
+            "the expired timestamp would have missed it (the old bug)"
+        );
     }
 
     #[test]
