@@ -1026,6 +1026,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
     add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+    // Physical host (IP) of the renderer, used to dedup DLNA zones across
+    // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
+    // N12 after a restart) must reconnect to its existing zone instead of
+    // spawning a duplicate (forum #942).
+    add_column_if_missing(db, "zones", "host", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");

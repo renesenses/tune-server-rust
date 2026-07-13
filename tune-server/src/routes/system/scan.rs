@@ -11,6 +11,12 @@ use tune_core::db::settings_repo::SettingsRepo;
 
 use crate::state::AppState;
 
+/// True when an `album_artist` value denotes a various-artists compilation.
+fn is_various_artists(s: &str) -> bool {
+    let l = s.trim().to_lowercase();
+    l == "various artists" || l == "various" || l == "va" || l == "compilations"
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScanQuery {
     /// When true, re-process ALL discovered files (bypass the unchanged-file
@@ -210,6 +216,48 @@ pub(super) async fn trigger_scan(
                     }
                 }
 
+                // Decide compilation status per (folder, album title) for this
+                // batch so every track of an album agrees on the album artist,
+                // regardless of inconsistent per-track album_artist tags. A real
+                // single-artist album has one consistent album_artist; if it
+                // varies within the same (folder, album) — or any track carries
+                // the compilation flag or a "Various Artists" album_artist — the
+                // whole album is treated as a compilation. Without this, a
+                // compilation whose tracks each carry their own artist as
+                // album_artist split into one album (and cover) per artist
+                // (Bilou: pochettes multipliées). Files are walked in directory
+                // order so an album's tracks are contiguous and land in the same
+                // batch (SCAN_BATCH_SIZE = 500).
+                let comp_decision: std::collections::HashMap<(String, String), bool> = {
+                    let mut acc: std::collections::HashMap<
+                        (String, String),
+                        (bool, std::collections::HashSet<String>),
+                    > = std::collections::HashMap::new();
+                    for sf in &batch {
+                        let Some(ref meta) = sf.metadata else { continue };
+                        let Some(ref album) = meta.album else { continue };
+                        let dir = std::path::Path::new(&sf.path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let entry = acc.entry((dir, album.to_lowercase())).or_default();
+                        let aa = meta
+                            .album_artist
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+                        if meta.compilation || aa.map(is_various_artists).unwrap_or(false) {
+                            entry.0 = true;
+                        }
+                        if let Some(aa) = aa {
+                            entry.1.insert(aa.to_lowercase());
+                        }
+                    }
+                    acc.into_iter()
+                        .map(|(k, (flag, artists))| (k, flag || artists.len() >= 2))
+                        .collect()
+                };
+
                 for sf in &batch {
                     let Some(ref meta) = sf.metadata else {
                         continue;
@@ -234,19 +282,33 @@ pub(super) async fn trigger_scan(
                         }
                     }
 
-                    // Determine if this is a compilation (Various Artists)
-                    let is_compilation = meta.compilation
-                        || meta
-                            .album_artist
-                            .as_deref()
-                            .map(|s| s.to_lowercase())
-                            .map(|s| {
-                                s == "various artists"
-                                    || s == "various"
-                                    || s == "va"
-                                    || s == "compilations"
-                            })
-                            .unwrap_or(false);
+                    // Compilation status: prefer the per-(folder,album) batch
+                    // decision so every track of the album agrees; fall back to
+                    // this track's own signal if the album was not seen whole in
+                    // this batch (rare: album straddles a batch boundary, or an
+                    // incremental scan touches a single track). The fallback
+                    // equals the old per-track behaviour, so incremental scans
+                    // are no worse.
+                    let album_dir = std::path::Path::new(&sf.path)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let is_compilation = meta
+                        .album
+                        .as_ref()
+                        .and_then(|a| {
+                            comp_decision
+                                .get(&(album_dir.clone(), a.to_lowercase()))
+                                .copied()
+                        })
+                        .unwrap_or_else(|| {
+                            meta.compilation
+                                || meta
+                                    .album_artist
+                                    .as_deref()
+                                    .map(is_various_artists)
+                                    .unwrap_or(false)
+                        });
 
                     let album_artist_name = if is_compilation {
                         "Various Artists"
@@ -258,13 +320,9 @@ pub(super) async fn trigger_scan(
                         // tracks resolve to a single album row, instead of
                         // splitting into one row per differing track artist
                         // (classical soloists, features).
-                        let dir = std::path::Path::new(&sf.path)
-                            .parent()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default();
                         let track_a = meta.artist.as_deref().unwrap_or("Unknown Artist");
                         dir_album_artist
-                            .entry(dir)
+                            .entry(album_dir.clone())
                             .or_insert_with(|| track_a.to_string())
                             .as_str()
                     };
