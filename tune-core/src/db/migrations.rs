@@ -1047,6 +1047,29 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    // streaming_queue is created by migration v53, but that only runs when a DB
+    // upgrades THROUGH v53 — and on Windows a migration can fail silently (file
+    // locking) or the tracking row can be written without the CREATE taking.
+    // Re-create it unconditionally here (IF NOT EXISTS = no-op otherwise) so the
+    // Deezer/streaming connect path never hits "no such table: streaming_queue"
+    // again (forum #951: Bilou/Yan still saw it in v0.8.287+ despite the v53
+    // fix). Schema mirrors migration v53 / play_queue_repo.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_queue (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            zone_id INTEGER NOT NULL,\
+            position INTEGER NOT NULL,\
+            source TEXT,\
+            source_id TEXT,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            duration_ms INTEGER DEFAULT 0\
+        );",
+    )
+    .ok();
+
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
 
