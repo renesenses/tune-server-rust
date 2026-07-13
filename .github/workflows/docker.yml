@@ -11,14 +11,28 @@ env:
 
 jobs:
   build-and-push:
-    name: Build & Push
-    runs-on: ubuntu-latest
+    name: Build & Push (multi-arch)
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
 
+      # Compile the binaries on the host, not inside an emulated arm64 image:
+      # amd64 native + arm64 via `cross` (same proven path as release.yml). QEMU
+      # is only needed for the light apt/pip runtime steps in Dockerfile.dist.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-multiarch
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -35,6 +49,9 @@ jobs:
             echo "version=dev" >> $GITHUB_OUTPUT
           fi
 
+      - name: Set TUNE_VERSION from git tag
+        run: echo "TUNE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Build web client
         run: |
           git clone --depth 1 https://github.com/renesenses/tune-web-client.git _web
@@ -42,21 +59,36 @@ jobs:
           rm -rf web && mv _web/dist web
           rm -rf _web
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      # tune-server: same feature set as the previous container image (SQLite,
+      # no local-audio — a container has no sound card).
+      - name: Build tune-server (amd64, native)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libasound2-dev
+          cargo build --release --package tune-server --no-default-features --features oaat
+          mkdir -p dist/amd64 && cp target/release/tune-server dist/amd64/tune-server
+
+      - name: Build tune-server (arm64, cross)
+        run: |
+          cross build --release --package tune-server \
+            --target aarch64-unknown-linux-gnu --no-default-features --features oaat
+          mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-gnu/release/tune-server dist/arm64/tune-server
+
+      # librespot (Spotify Connect): real binary on amd64, empty placeholder on
+      # arm64 (best-effort — the previous image also fell back to an empty file).
+      - name: Build librespot (amd64)
+        run: |
+          if cargo install librespot --no-default-features --features alsa-backend --root /tmp/lr; then
+            cp /tmp/lr/bin/librespot dist/amd64/librespot
+          else
+            touch dist/amd64/librespot
+          fi
+          touch dist/arm64/librespot
 
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          file: Dockerfile.dist
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}

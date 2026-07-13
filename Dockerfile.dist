@@ -1,0 +1,57 @@
+# Multi-arch runtime image built from PREBUILT binaries.
+#
+# The Rust binaries are compiled on the CI host (amd64 native + arm64 via
+# `cross`) and staged into dist/<arch>/ before this build — so the heavy Rust
+# compile is NEVER re-run under QEMU emulation (which would take hours). Only the
+# light runtime setup (apt/pip) runs per-arch. `docker buildx` selects the right
+# binary via TARGETARCH. See .github/workflows/docker.yml.
+#
+# The source-compiling Dockerfile is kept for local single-arch dev builds.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl libasound2 python3-pip && \
+    pip3 install --break-system-packages yt-dlp && \
+    rm -rf /var/lib/apt/lists/*
+
+# Non-root runtime user
+RUN groupadd -g 1000 tune && \
+    useradd -u 1000 -g tune -m -s /bin/false tune
+
+WORKDIR /app
+
+# Prebuilt, arch-specific binaries staged by CI (dist/amd64, dist/arm64).
+# librespot (Spotify Connect) is a real binary on amd64 and an empty placeholder
+# on arm64 for now — same best-effort behavior as the previous single-arch image.
+COPY dist/${TARGETARCH}/tune-server /app/tune-server
+COPY dist/${TARGETARCH}/librespot /usr/local/bin/librespot
+COPY web/ /app/web/
+
+RUN chmod +x /app/tune-server /usr/local/bin/librespot && \
+    chown -R root:root /app && chmod -R 755 /app
+
+# Data + artwork cache owned by the tune user
+RUN mkdir -p /data/artwork_cache && chown -R tune:tune /data
+
+ENV TUNE_PORT=8888 \
+    TUNE_DB_PATH=/data/tune.db \
+    TUNE_ARTWORK_DIR=/data/artwork_cache \
+    TUNE_WEB_DIR=/app/web \
+    TUNE_MUSIC_DIRS='["/music"]' \
+    TUNE_LOG_LEVEL=info \
+    TUNE_AUTO_SCAN=true \
+    LIBRESPOT_NAME=Tune \
+    LIBRESPOT_BITRATE=320
+
+EXPOSE 8888
+
+VOLUME ["/data", "/music"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:8888/api/v1/system/stats || exit 1
+
+USER tune
+
+ENTRYPOINT ["/app/tune-server"]
