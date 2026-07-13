@@ -480,6 +480,54 @@ impl ZoneRepo {
         }
     }
 
+    /// Persist the renderer's host (IP) on the zone, for host-based dedup.
+    /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
+    pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("host");
+        let params: [&dyn ToSqlValue; 2] = [&host, &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "zone_host_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Re-point a zone to a new `output_device_id`. Used when a renderer comes
+    /// back with a new UPnP UUID: host-based dedup keeps the existing zone (and
+    /// its per-zone settings: native FLAC, volume…) instead of spawning a
+    /// duplicate, so the device_id is refreshed to the live one.
+    pub fn update_device_id(&self, id: i64, device_id: &str) -> Result<(), String> {
+        let sql = self.update_field_sql("output_device_id");
+        let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
+        self.db.execute(&sql, &params).map(|_| ())
+    }
+
+    /// Find an existing (non-hidden) DLNA/OpenHome zone by physical host (IP),
+    /// for dedup across rediscovery. Returns the zone id, or None if none — or
+    /// if the `host` column is missing on a pre-migration DB (graceful).
+    pub fn zone_id_by_host(&self, host: &str) -> Option<i64> {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id FROM zones WHERE host = {placeholder} \
+             AND output_type IN ('dlna', 'openhome') \
+             AND COALESCE(is_hidden, 0) = 0 ORDER BY id LIMIT 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&host];
+        // Strong read so a zone created moments ago in this session is visible
+        // (avoids a duplicate slipping through a lagging WAL snapshot).
+        self.db
+            .query_many_strong(&sql, &params)
+            .ok()?
+            .first()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+    }
+
     pub fn set_online_by_device(&self, device_id: &str, online: bool) -> Result<usize, String> {
         let val: String = if online { "1".into() } else { "0".into() };
         let sql = self.dialect_sql(sql::set_online_by_device, sql::set_online_by_device);
@@ -880,6 +928,44 @@ mod tests {
         assert_eq!(found_b.name, "Zone B");
 
         assert!(repo.get_by_device_id("uuid:nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn zone_dedup_by_host_reconnects_on_new_uuid() {
+        // #942: a Denon-like renderer comes back with a NEW UPnP UUID but the
+        // same host — it must reconnect to its existing zone, not duplicate.
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        let zid = repo
+            .create("Denon", Some("dlna"), Some("uuid:old"))
+            .unwrap();
+        repo.set_host(zid, "192.168.1.28").unwrap();
+
+        // Found by host; a different host is not.
+        assert_eq!(repo.zone_id_by_host("192.168.1.28"), Some(zid));
+        assert_eq!(repo.zone_id_by_host("192.168.1.99"), None);
+
+        // Re-point the existing zone to the live UUID instead of creating a dup.
+        repo.update_device_id(zid, "uuid:new").unwrap();
+        assert_eq!(
+            repo.get_by_device_id("uuid:new").unwrap().unwrap().id,
+            Some(zid)
+        );
+        assert!(repo.get_by_device_id("uuid:old").unwrap().is_none());
+        assert_eq!(repo.list().unwrap().len(), 1, "must stay a single zone");
+    }
+
+    #[test]
+    fn zone_id_by_host_only_matches_network_renderers() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+        let local = repo
+            .create("Speakers", Some("local"), Some("local:x"))
+            .unwrap();
+        repo.set_host(local, "192.168.1.5").unwrap();
+        // A local (non-DLNA) zone must never be reconnected via host dedup.
+        assert_eq!(repo.zone_id_by_host("192.168.1.5"), None);
     }
 
     #[test]
