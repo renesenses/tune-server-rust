@@ -318,7 +318,8 @@ CREATE TABLE IF NOT EXISTS zones (
     is_hidden INTEGER DEFAULT 0,
     last_play_state TEXT DEFAULT 'stopped',
     dsd_mode TEXT DEFAULT 'auto',
-    dlna_native_flac INTEGER DEFAULT 0
+    dlna_native_flac INTEGER DEFAULT 0,
+    host TEXT
 );
 
 CREATE TABLE IF NOT EXISTS play_queue (
