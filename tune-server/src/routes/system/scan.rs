@@ -17,6 +17,39 @@ fn is_various_artists(s: &str) -> bool {
     l == "various artists" || l == "various" || l == "va" || l == "compilations"
 }
 
+/// Decide, per `(folder, album title)`, whether that album is a various-artists
+/// compilation, from the metadata of a set of scanned tracks.
+///
+/// A genuine single-artist album has one consistent `album_artist`. An album is
+/// treated as a compilation when any of its tracks carries the compilation flag
+/// or a "Various Artists" album_artist, OR when the `album_artist` value varies
+/// across the tracks of the same `(folder, album)` — the tell-tale of a
+/// compilation whose tracks were each tagged with their own artist as the
+/// album_artist, which otherwise splits into one album (and cover) per artist.
+///
+/// Keys are `(folder, album_title.to_lowercase())`.
+fn decide_compilation_albums<'a>(
+    items: impl Iterator<Item = (String, &'a str, Option<&'a str>, bool)>,
+) -> std::collections::HashMap<(String, String), bool> {
+    let mut acc: std::collections::HashMap<
+        (String, String),
+        (bool, std::collections::HashSet<String>),
+    > = std::collections::HashMap::new();
+    for (dir, album, album_artist, comp_flag) in items {
+        let entry = acc.entry((dir, album.to_lowercase())).or_default();
+        let aa = album_artist.map(|s| s.trim()).filter(|s| !s.is_empty());
+        if comp_flag || aa.map(is_various_artists).unwrap_or(false) {
+            entry.0 = true;
+        }
+        if let Some(aa) = aa {
+            entry.1.insert(aa.to_lowercase());
+        }
+    }
+    acc.into_iter()
+        .map(|(k, (flag, artists))| (k, flag || artists.len() >= 2))
+        .collect()
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScanQuery {
     /// When true, re-process ALL discovered files (bypass the unchanged-file
@@ -228,35 +261,15 @@ pub(super) async fn trigger_scan(
                 // (Bilou: pochettes multipliées). Files are walked in directory
                 // order so an album's tracks are contiguous and land in the same
                 // batch (SCAN_BATCH_SIZE = 500).
-                let comp_decision: std::collections::HashMap<(String, String), bool> = {
-                    let mut acc: std::collections::HashMap<
-                        (String, String),
-                        (bool, std::collections::HashSet<String>),
-                    > = std::collections::HashMap::new();
-                    for sf in &batch {
-                        let Some(ref meta) = sf.metadata else { continue };
-                        let Some(ref album) = meta.album else { continue };
-                        let dir = std::path::Path::new(&sf.path)
-                            .parent()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        let entry = acc.entry((dir, album.to_lowercase())).or_default();
-                        let aa = meta
-                            .album_artist
-                            .as_deref()
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty());
-                        if meta.compilation || aa.map(is_various_artists).unwrap_or(false) {
-                            entry.0 = true;
-                        }
-                        if let Some(aa) = aa {
-                            entry.1.insert(aa.to_lowercase());
-                        }
-                    }
-                    acc.into_iter()
-                        .map(|(k, (flag, artists))| (k, flag || artists.len() >= 2))
-                        .collect()
-                };
+                let comp_decision = decide_compilation_albums(batch.iter().filter_map(|sf| {
+                    let meta = sf.metadata.as_ref()?;
+                    let album = meta.album.as_deref()?;
+                    let dir = std::path::Path::new(&sf.path)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Some((dir, album, meta.album_artist.as_deref(), meta.compilation))
+                }));
 
                 for sf in &batch {
                     let Some(ref meta) = sf.metadata else {
@@ -1176,5 +1189,128 @@ pub(super) async fn scan_report() -> impl IntoResponse {
             Err(_) => Json(json!({"error": "invalid report file"})).into_response(),
         },
         Err(_) => Json(json!({"error": "no scan report available yet"})).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_compilation_albums, is_various_artists};
+
+    fn decide<'a>(
+        tracks: &'a [(&'a str, &'a str, Option<&'a str>, bool)],
+    ) -> std::collections::HashMap<(String, String), bool> {
+        decide_compilation_albums(
+            tracks
+                .iter()
+                .map(|(dir, album, aa, flag)| (dir.to_string(), *album, *aa, *flag)),
+        )
+    }
+
+    fn is_comp(
+        m: &std::collections::HashMap<(String, String), bool>,
+        dir: &str,
+        album: &str,
+    ) -> bool {
+        *m.get(&(dir.to_string(), album.to_lowercase())).unwrap()
+    }
+
+    #[test]
+    fn va_sentinels() {
+        for s in [
+            "Various Artists",
+            "various",
+            "VA",
+            "Compilations",
+            "  various artists  ",
+        ] {
+            assert!(is_various_artists(s), "{s} should be VA");
+        }
+        for s in ["The Beatles", "Various State", "AC/DC"] {
+            assert!(!is_various_artists(s), "{s} should not be VA");
+        }
+    }
+
+    #[test]
+    fn single_artist_album_is_not_compilation() {
+        // Consistent album_artist across the album -> not a compilation.
+        let m = decide(&[
+            ("/m/beatles/abbey", "Abbey Road", Some("The Beatles"), false),
+            ("/m/beatles/abbey", "Abbey Road", Some("The Beatles"), false),
+        ]);
+        assert!(!is_comp(&m, "/m/beatles/abbey", "Abbey Road"));
+    }
+
+    #[test]
+    fn per_track_album_artist_variance_is_compilation() {
+        // The reported bug: a compilation whose tracks each carry their own
+        // artist as the album_artist (no flag, no "Various Artists").
+        let m = decide(&[
+            ("/m/comp/jazz", "Best of Jazz", Some("Miles Davis"), false),
+            ("/m/comp/jazz", "Best of Jazz", Some("John Coltrane"), false),
+            ("/m/comp/jazz", "Best of Jazz", Some("Bill Evans"), false),
+        ]);
+        assert!(is_comp(&m, "/m/comp/jazz", "Best of Jazz"));
+    }
+
+    #[test]
+    fn explicit_va_album_artist_is_compilation() {
+        let m = decide(&[
+            ("/m/comp/hits", "Now 100", Some("Various Artists"), false),
+            ("/m/comp/hits", "Now 100", Some("Various Artists"), false),
+        ]);
+        assert!(is_comp(&m, "/m/comp/hits", "Now 100"));
+    }
+
+    #[test]
+    fn compilation_flag_wins_even_with_consistent_artist() {
+        let m = decide(&[
+            ("/m/comp/ost", "OST", Some("Hans Zimmer"), true),
+            ("/m/comp/ost", "OST", Some("Hans Zimmer"), false),
+        ]);
+        assert!(is_comp(&m, "/m/comp/ost", "OST"));
+    }
+
+    #[test]
+    fn features_with_consistent_album_artist_not_compilation() {
+        // Guests on some tracks, but album_artist stays the main artist -> the
+        // album must not be flagged as a compilation.
+        let m = decide(&[
+            ("/m/drake/album", "Scorpion", Some("Drake"), false),
+            ("/m/drake/album", "Scorpion", Some("Drake"), false),
+        ]);
+        assert!(!is_comp(&m, "/m/drake/album", "Scorpion"));
+    }
+
+    #[test]
+    fn distinct_albums_same_folder_decided_independently() {
+        // Two different single-artist albums sharing a folder must not be merged
+        // into a compilation just because two album_artists appear in the dir.
+        let m = decide(&[
+            ("/m/singles", "Album A", Some("Artist A"), false),
+            ("/m/singles", "Album B", Some("Artist B"), false),
+        ]);
+        assert!(!is_comp(&m, "/m/singles", "Album A"));
+        assert!(!is_comp(&m, "/m/singles", "Album B"));
+    }
+
+    #[test]
+    fn no_album_artist_is_not_flagged_compilation() {
+        // Missing album_artist is left to the folder-first-artist heuristic in
+        // the scan loop, not treated as a compilation here.
+        let m = decide(&[
+            ("/m/x/rec", "Recital", None, false),
+            ("/m/x/rec", "Recital", None, false),
+        ]);
+        assert!(!is_comp(&m, "/m/x/rec", "Recital"));
+    }
+
+    #[test]
+    fn same_album_title_different_folders_are_separate() {
+        let m = decide(&[
+            ("/m/a/greatest", "Greatest Hits", Some("Queen"), false),
+            ("/m/b/greatest", "Greatest Hits", Some("ABBA"), false),
+        ]);
+        assert!(!is_comp(&m, "/m/a/greatest", "Greatest Hits"));
+        assert!(!is_comp(&m, "/m/b/greatest", "Greatest Hits"));
     }
 }
