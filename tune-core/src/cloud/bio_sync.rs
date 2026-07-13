@@ -374,6 +374,8 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
     };
 
     for chunk in mbid_candidates.chunks(BATCH_SIZE) {
+        // Pace requests so we don't trip the cloud rate limit.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let ids: Vec<&str> = chunk.iter().map(|(_, mbid)| mbid.as_str()).collect();
         let query = ids.join(",");
 
@@ -393,6 +395,14 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_rejected");
+            // Stop hammering the cloud when it rate-limits (429) or errors (5xx):
+            // the old `continue` fired every batch back-to-back with no delay,
+            // producing dozens of rejected requests/sec (Fabien). Retry happens
+            // on the next scan-completed event / daily cycle.
+            if status.as_u16() == 429 || status.is_server_error() {
+                warn!("bio_download_backoff — cloud rate-limited, stopping run");
+                break;
+            }
             continue;
         }
 
@@ -446,6 +456,8 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
     }
 
     for chunk in title_candidates.chunks(TITLE_BATCH_SIZE) {
+        // Pace requests so we don't trip the cloud rate limit.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         // Build JSON array of {title, artist_name} for the VPS endpoint
         let titles_json: Vec<serde_json::Value> = chunk
             .iter()
@@ -474,6 +486,12 @@ async fn download_album_bios(db: &Arc<dyn DbBackend>, client: &reqwest::Client) 
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(status = %status, "bio_download_albums_by_title_rejected");
+            // Stop hammering the cloud on 429 / 5xx instead of firing the next
+            // batch immediately (Fabien: dozens of by-title 429s per second).
+            if status.as_u16() == 429 || status.is_server_error() {
+                warn!("bio_download_albums_by_title_backoff — cloud rate-limited, stopping run");
+                break;
+            }
             continue;
         }
 
