@@ -19,6 +19,9 @@ pub(super) struct WriteTagsRequest {
     pub only_missing: bool,
     /// Specific track IDs to process. `None` means all tracks.
     pub track_ids: Option<Vec<i64>>,
+    /// Restrict to a single album's tracks. Ignored when `track_ids` is set.
+    /// Lets the per-album "write tags" button target one album.
+    pub album_id: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -49,6 +52,7 @@ pub(super) async fn write_tags_to_files(
     let task_id_clone = task_id.clone();
     let only_missing = body.only_missing;
     let track_ids = body.track_ids;
+    let album_id = body.album_id;
 
     tokio::spawn(async move {
         // Build the SQL query based on whether specific track IDs were given
@@ -72,6 +76,19 @@ pub(super) async fn write_tags_to_files(
                 let param_refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
                 backend2.query_many(&sql, &param_refs).unwrap_or_default()
             }
+        } else if let Some(aid) = album_id {
+            // Single album: write tags for that album's tracks only.
+            let params: Vec<Box<dyn ToSqlValue>> = vec![Box::new(aid) as Box<dyn ToSqlValue>];
+            let param_refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+            backend2
+                .query_many(
+                    "SELECT id, file_path, title, artist_name, album_title, \
+                     track_number, disc_number, genre, composer, year, label, \
+                     comment \
+                     FROM tracks WHERE file_path IS NOT NULL AND album_id = ?",
+                    &param_refs,
+                )
+                .unwrap_or_default()
         } else {
             backend2
                 .query_many(
