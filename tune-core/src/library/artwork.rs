@@ -611,6 +611,25 @@ pub async fn batch_enrich_artist_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
 ) {
+    batch_enrich_artist_artwork_inner(db, cache_dir, false).await
+}
+
+/// Force variant: re-fetch artwork for EVERY artist with an MBID, ignoring the
+/// "already has an image" guard. Fixes libraries where `image_path` is set to
+/// stale/broken entries that never render (Fabien: full scan + premium, still
+/// no artist images — the normal pass skips because the DB claims images exist).
+pub async fn batch_refetch_artist_artwork(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+) {
+    batch_enrich_artist_artwork_inner(db, cache_dir, true).await
+}
+
+async fn batch_enrich_artist_artwork_inner(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    force: bool,
+) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
@@ -624,10 +643,13 @@ pub async fn batch_enrich_artist_artwork(
             // a scan can set image_path while the cache write failed, leaving a
             // grey square that would otherwise be skipped forever (Sandro).
             if let Ok(Some(artist)) = artist_repo.get_by_musicbrainz_id(&img.mbid) {
-                if artist
-                    .image_path
-                    .as_deref()
-                    .is_some_and(|ip| cached_artwork_exists(&cache_dir, ip))
+                // In force mode, re-apply even if the DB claims a cached image
+                // (the point is to overwrite stale/broken entries).
+                if !force
+                    && artist
+                        .image_path
+                        .as_deref()
+                        .is_some_and(|ip| cached_artwork_exists(&cache_dir, ip))
                 {
                     continue;
                 }
@@ -665,14 +687,23 @@ pub async fn batch_enrich_artist_artwork(
         }
     }
 
-    // --- Phase 2: Fetch from external sources for remaining artists ---
-    let mut artists = match artist_repo.list_without_image() {
+    // --- Phase 2: Fetch from external sources ---
+    // Force mode re-fetches EVERY artist with an MBID (overwriting stale
+    // entries); normal mode only targets artists without an image.
+    let mut artists = match if force {
+        artist_repo.list_with_mbid()
+    } else {
+        artist_repo.list_without_image()
+    } {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artist_artwork_list_failed");
             return;
         }
     };
+    if force {
+        info!(count = artists.len(), "batch_artist_artwork_force_refetch");
+    }
 
     // Re-queue artists whose image_path is set in the DB but whose cache file is
     // actually missing. list_without_image only checks the column, so a scan
@@ -680,20 +711,23 @@ pub async fn batch_enrich_artist_artwork(
     // later cleared/moved) leaves a grey square that would be skipped forever
     // (Fabien: "j'ai pas les images d'artistes" despite a full scan + premium).
     // This extends the Phase-1 cache-existence guard (Sandro) to Phase 2.
-    match artist_repo.list_with_image_and_mbid() {
-        Ok(with_image) => {
-            let before = artists.len();
-            for (id, name, mbid, image_path) in with_image {
-                if !cached_artwork_exists(&cache_dir, &image_path) {
-                    artists.push((id, name, mbid));
+    // Skipped in force mode, which already includes every MBID artist.
+    if !force {
+        match artist_repo.list_with_image_and_mbid() {
+            Ok(with_image) => {
+                let before = artists.len();
+                for (id, name, mbid, image_path) in with_image {
+                    if !cached_artwork_exists(&cache_dir, &image_path) {
+                        artists.push((id, name, mbid));
+                    }
+                }
+                let requeued = artists.len() - before;
+                if requeued > 0 {
+                    info!(requeued, "batch_artist_artwork_missing_cache_requeued");
                 }
             }
-            let requeued = artists.len() - before;
-            if requeued > 0 {
-                info!(requeued, "batch_artist_artwork_missing_cache_requeued");
-            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
         }
-        Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
     }
 
     if artists.is_empty() {

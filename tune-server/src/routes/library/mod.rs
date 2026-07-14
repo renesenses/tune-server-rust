@@ -234,6 +234,10 @@ pub fn router() -> Router<AppState> {
             post(artwork::batch_enrich_artist_artwork),
         )
         .route(
+            "/artwork/enrich-artists/force",
+            post(artwork::force_refetch_artist_artwork),
+        )
+        .route(
             "/artwork/enrich-artists/status",
             get(artwork::batch_enrich_artist_artwork_status),
         )
