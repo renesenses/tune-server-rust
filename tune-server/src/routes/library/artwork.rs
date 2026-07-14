@@ -435,6 +435,52 @@ pub(super) async fn batch_enrich_artist_artwork(
         .into_response()
 }
 
+/// Force re-fetch of artist images for EVERY artist with an MBID, ignoring the
+/// "already has an image" guard. For libraries where image_path is set to
+/// stale/broken entries that never render, so the normal pass skips them.
+pub(super) async fn force_refetch_artist_artwork(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.backend.clone();
+
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
+    let with_mbid = artist_repo.list_with_mbid().unwrap_or_default().len();
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("artist_artwork_enrich_status", "running").ok();
+    settings
+        .set(
+            "artist_artwork_enrich_result",
+            &json!({"total": with_mbid, "enriched": 0, "status": "running", "force": true})
+                .to_string(),
+        )
+        .ok();
+
+    let task_guard = state.background_tasks.begin(
+        "artist_artwork",
+        "Récupération forcée des images d'artistes…",
+        "enrichment",
+    );
+    tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
+        // Phase 1: ensure MBIDs are matched, then force re-fetch everyone.
+        let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
+        tracing::info!(matched, "force_artist_mbid_phase_complete");
+        tune_core::library::artwork::batch_refetch_artist_artwork(db, cache_dir).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "message": "forced artist artwork re-fetch started (all artists with MBID)",
+            "artists_with_mbid": with_mbid,
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn batch_enrich_artist_artwork_status(
     State(state): State<AppState>,
 ) -> Json<Value> {
