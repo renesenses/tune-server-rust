@@ -34,8 +34,11 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let s = ctx.get::<String>(0)?;
-            Ok(crate::db::engine::fold_diacritics(&s))
+            // NULL in → NULL out (matches PostgreSQL's unaccent, and lets
+            // `LOWER(unaccent(col)) LIKE …` skip rows with a NULL genre/
+            // composer instead of erroring). Only TEXT columns are wrapped.
+            let s: Option<String> = ctx.get(0)?;
+            Ok(s.map(|v| crate::db::engine::fold_diacritics(&v)))
         },
     )
     .map_err(|e| format!("register unaccent: {e}"))
