@@ -445,14 +445,17 @@ pub(super) async fn force_refetch_artist_artwork(
     let db = state.backend.clone();
 
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
-    let with_mbid = artist_repo.list_with_mbid().unwrap_or_default().len();
+    let total_artists = artist_repo
+        .list_all_id_name_mbid()
+        .unwrap_or_default()
+        .len();
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("artist_artwork_enrich_status", "running").ok();
     settings
         .set(
             "artist_artwork_enrich_result",
-            &json!({"total": with_mbid, "enriched": 0, "status": "running", "force": true})
+            &json!({"total": total_artists, "enriched": 0, "status": "running", "force": true})
                 .to_string(),
         )
         .ok();
@@ -474,8 +477,8 @@ pub(super) async fn force_refetch_artist_artwork(
         StatusCode::ACCEPTED,
         Json(json!({
             "status": "accepted",
-            "message": "forced artist artwork re-fetch started (all artists with MBID)",
-            "artists_with_mbid": with_mbid,
+            "message": "forced artist artwork re-fetch started (all artists)",
+            "artists": total_artists,
         })),
     )
         .into_response()

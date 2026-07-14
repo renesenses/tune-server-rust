@@ -108,6 +108,10 @@ pub mod sql {
         "SELECT id, name, musicbrainz_id FROM artists WHERE musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    pub fn list_all_id_name_mbid() -> &'static str {
+        "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists ORDER BY id"
+    }
+
     pub fn list_without_mbid() -> &'static str {
         "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
@@ -401,6 +405,23 @@ impl ArtistRepo {
     /// render). Each entry is (artist_id, name, musicbrainz_id).
     pub fn list_with_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
         let rows = self.db.query_many(sql::list_with_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// All artists as (id, name, mbid) — mbid is `""` when unknown. Used by the
+    /// force re-fetch so artists without an MBID are also re-tried (mozaiklabs
+    /// by-name + other by-name sources).
+    pub fn list_all_id_name_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_all_id_name_mbid(), &[])?;
         Ok(rows
             .into_iter()
             .map(|cols| {
