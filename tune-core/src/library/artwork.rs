@@ -704,6 +704,8 @@ pub async fn batch_enrich_artist_artwork(
             .set(
                 "artist_artwork_enrich_result",
                 &serde_json::json!({
+                    "status": "done",
+                    "phase": "done",
                     "total": 0,
                     "enriched": 0,
                     "failed": 0,
@@ -747,8 +749,9 @@ pub async fn batch_enrich_artist_artwork(
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
+    let total_images = artists.len();
 
-    for (artist_id, name, mbid) in &artists {
+    for (i, (artist_id, name, mbid)) in artists.iter().enumerate() {
         // Rate limit: short delay between community lookups (no rate limit),
         // longer delay only when hitting external APIs (MusicBrainz etc.)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -798,6 +801,25 @@ pub async fn batch_enrich_artist_artwork(
                 failed += 1;
                 debug!(artist_id, artist = %name, mbid = %mbid, "batch_artist_artwork_not_found");
             }
+        }
+
+        // Publish live progress for the UI (Fabien: enrichment looked frozen).
+        if (i + 1) % 5 == 0 || i + 1 == total_images {
+            settings
+                .set(
+                    "artist_artwork_enrich_result",
+                    &serde_json::json!({
+                        "status": "running",
+                        "phase": "images",
+                        "processed": i + 1,
+                        "total": total_images,
+                        "enriched": enriched,
+                        "failed": failed,
+                        "community_applied": community_applied,
+                    })
+                    .to_string(),
+                )
+                .ok();
         }
     }
 
@@ -893,6 +915,8 @@ pub async fn batch_enrich_artist_artwork(
         .set(
             "artist_artwork_enrich_result",
             &serde_json::json!({
+                "status": "done",
+                "phase": "done",
                 "total": artists.len(),
                 "enriched": total_enriched,
                 "phase2_enriched": enriched,
