@@ -33,16 +33,21 @@ pub mod sql {
         )
     }
 
+    // The play-history LIST excludes radio: since v0.8.258 the orchestrator no
+    // longer records radio plays (a live stream's title is a frozen snapshot
+    // that never matches what's actually on air), but pre-existing radio rows
+    // still surfaced here (Bilou: "la radio est toujours ajoutée à l'historique").
+    // Stats already filter `source != 'radio'`; align the list with them.
     pub fn recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {}",
+            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {} OFFSET {}",
+            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {} OFFSET {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -50,6 +55,12 @@ pub mod sql {
 
     pub fn count_all() -> &'static str {
         "SELECT COUNT(*) FROM listen_history"
+    }
+
+    /// Total excluding radio — the pagination total for the history list, which
+    /// hides radio rows.
+    pub fn count_non_radio() -> &'static str {
+        "SELECT COUNT(*) FROM listen_history WHERE source != 'radio'"
     }
 
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
@@ -186,7 +197,7 @@ impl HistoryRepo {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ListenRecord>, i64), String> {
-        let total = match self.db.query_one(sql::count_all(), &[])? {
+        let total = match self.db.query_one(sql::count_non_radio(), &[])? {
             None => 0,
             Some(cols) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         };
