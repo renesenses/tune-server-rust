@@ -39,7 +39,13 @@ pub(super) async fn enrich_all_library(State(state): State<AppState>) -> impl In
 
     let backend2 = backend.clone();
     let task_id_clone = task_id.clone();
+    let task_guard = state.background_tasks.begin(
+        "enrich_all",
+        "Enrichissement des métadonnées…",
+        "enrichment",
+    );
     tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
         // Find tracks with missing metadata: no MB ID OR missing genre/year/label
         let track_rows: Vec<Vec<tune_core::db::backend::SqlValue>> = backend2
             .query_many(

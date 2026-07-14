@@ -14,6 +14,14 @@ use tune_core::license::Feature;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// GET /system/background-tasks — current in-progress background tasks
+/// (enrichment, artwork, bios) for the UI indicator. The live truth is pushed
+/// over the `system.background_tasks` WebSocket event; this endpoint provides
+/// the initial snapshot for a client that connects mid-task.
+pub(super) async fn background_tasks_status(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "tasks": state.background_tasks.snapshot() }))
+}
+
 // ---------------------------------------------------------------------------
 // Free-tier daily enrichment limit
 // ---------------------------------------------------------------------------
@@ -146,11 +154,23 @@ pub(super) async fn enrich_bios(
     let without_artist_bio = artist_repo.list_without_bio().unwrap_or_default().len();
     let without_album_bio = album_repo.list_without_bio().unwrap_or_default().len();
 
+    // One task registered for both bio passes; it clears when the last of the
+    // two spawned futures drops its Arc clone of the guard.
+    let task_guard = std::sync::Arc::new(state.background_tasks.begin(
+        "bios",
+        "Récupération des biographies…",
+        "enrichment",
+    ));
+
     let lang_artist = lang.clone();
+    let guard_artist = task_guard.clone();
     tokio::spawn(async move {
+        let _guard = guard_artist;
         tune_core::metadata::bio_batch::batch_enrich_artist_bios(artist_db, &lang_artist).await;
     });
+    let guard_album = task_guard;
     tokio::spawn(async move {
+        let _guard = guard_album;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         tune_core::metadata::bio_batch::batch_enrich_album_bios(album_db, &lang).await;
     });
