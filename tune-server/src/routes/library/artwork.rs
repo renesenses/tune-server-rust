@@ -305,7 +305,13 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
         )
         .ok();
 
+    let task_guard = state.background_tasks.begin(
+        "artwork",
+        "Récupération des pochettes d'albums…",
+        "enrichment",
+    );
     tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
         tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
 
@@ -369,7 +375,13 @@ pub(super) async fn batch_enrich_artist_artwork(
         )
         .ok();
 
+    let task_guard = state.background_tasks.begin(
+        "artist_artwork",
+        "Récupération des images d'artistes…",
+        "enrichment",
+    );
     tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
         // Phase 1: Match artists without MBID by searching MusicBrainz
         let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
         tracing::info!(matched, "batch_artist_mbid_phase_complete");

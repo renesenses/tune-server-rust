@@ -247,7 +247,7 @@ pub mod sql {
 
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
+            "{} WHERE ({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({}))) LIMIT {}",
             select_album(),
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),

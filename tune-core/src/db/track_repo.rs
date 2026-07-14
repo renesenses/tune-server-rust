@@ -231,7 +231,7 @@ pub mod sql {
     /// Engine-agnostic search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(t.genre) LIKE LOWER({}) OR LOWER(t.composer) LIKE LOWER({}) OR CAST(al.year AS TEXT) = {} LIMIT {}",
+            "{} WHERE {} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {} LIMIT {}",
             select_track(),
             d.fts_where("tracks", "t", &d.placeholder(1)),
             d.placeholder(2),
@@ -535,7 +535,7 @@ impl TrackRepo {
         if let Some(query) = q {
             let like = format!("%{}%", query);
             conditions.push(format!(
-                "(LOWER(t.title) LIKE LOWER({p}) OR LOWER(ar.name) LIKE LOWER({p}))",
+                "(LOWER(unaccent(t.title)) LIKE LOWER(unaccent({p})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({p})))",
                 p = make_ph(idx)
             ));
             owned_params.push(SqlValue::Text(like));
@@ -682,7 +682,7 @@ impl TrackRepo {
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "{} WHERE LOWER(t.title) LIKE LOWER({}) LIMIT {}",
+            "{} WHERE LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})) LIMIT {}",
             sql::select_track(),
             make_ph(1),
             make_ph(2)
