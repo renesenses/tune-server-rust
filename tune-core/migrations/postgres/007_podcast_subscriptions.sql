@@ -31,4 +31,10 @@ CREATE TABLE IF NOT EXISTS radio_favorites (
     saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Record the version. Without this the runner's MAX(version) stayed at 6,
+-- so this migration re-ran on every boot — dropping podcast_subscriptions
+-- each time until a later migration bumped the max past 7.
+INSERT INTO schema_version (version, name) VALUES (7, 'podcast_subscriptions')
+    ON CONFLICT (version) DO NOTHING;
+
 COMMIT;

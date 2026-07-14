@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tune</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0d0d0f;
+        color: #e7e7ea;
+        font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+      }
+      .box { max-width: 420px; padding: 2rem; }
+      h1 { font-weight: 600; margin: 0 0 .5rem; }
+      p { opacity: .7; margin: .25rem 0; }
+      code { background: #1c1c20; padding: .1rem .4rem; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Placeholder frontend. The desktop window is configured (tauri.conf.json)
+      to load the live server UI at http://localhost:8888 directly, so this
+      page is only shown if the window falls back to the bundled dist — e.g.
+      when no server is reachable. It exists so `cargo tauri build` has a
+      frontendDist to bundle.
+    -->
+    <div class="box">
+      <h1>Tune Desktop</h1>
+      <p>Connecting to your Tune server…</p>
+      <p>Make sure <code>tune-server</code> is running on this machine.</p>
+    </div>
+    <script>
+      // If a server is reachable on the default port, jump to its UI.
+      fetch("http://localhost:8888/api/v1/system/version", { mode: "no-cors" })
+        .then(() => { location.href = "http://localhost:8888"; })
+        .catch(() => {});
+    </script>
+  </body>
+</html>

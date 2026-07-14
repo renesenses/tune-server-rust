@@ -66,6 +66,17 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
+            features: oaat,postgres
+          # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
+          # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
+          # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
+          # installs use SQLite; dropping postgres also avoids libpq static-link.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            platform: linux-aarch64-musl
+            ext: tar.gz
+            cross: true
+            features: oaat
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -107,7 +118,7 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,postgres
+        run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
       - name: Install ALSA dev (Linux)
         if: "!matrix.cross && runner.os == 'Linux'"
@@ -362,9 +373,11 @@ jobs:
             artifacts/**/*.exe
             SHA256SUMS
           generate_release_notes: true
-          # Pre-release tags (v0.9.0-rc1, …) are marked prerelease so they never
-          # become the "latest" GitHub release and stay off the stable channel.
+          # Pre-release tags carry a suffix (e.g. v0.9.0-rc2); stable tags are
+          # plain vX.Y.Z. Mark suffixed tags as pre-releases and keep them off
+          # the "Latest" slot so stable clients' auto-update never picks up an RC.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
 
   # ─── Release autonomy phase 4 — Homebrew + forum auto-publish ──────
   # Docker Hub publication is handled separately by docker.yml on the
@@ -373,8 +386,8 @@ jobs:
   homebrew:
     name: Update Homebrew tap
     needs: release
-    # Skip pre-releases (v*-rc*): the tap is the STABLE channel; bumping it would
-    # auto-update every stable user to a release candidate.
+    # Stable tags only — never push a pre-release (vX.Y.Z-rc*) to the tap,
+    # or `brew upgrade` would move stable users onto an RC.
     if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
@@ -460,7 +473,8 @@ jobs:
   notify-website:
     name: Update mozaiklabs.fr/download
     needs: [release, homebrew]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Stable tags only — a pre-release must not update the public download page.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
       - name: Notify mozaiklabs.fr webhook

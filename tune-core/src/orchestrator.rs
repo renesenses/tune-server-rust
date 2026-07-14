@@ -413,8 +413,8 @@ impl PlaybackOrchestrator {
                 let zone_id = req.zone_id;
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let outputs = outputs.lock().await;
-                    if let Some(output) = outputs.get(&did) {
+                    let arc = { outputs.lock().await.get(&did) };
+                    if let Some(output) = arc {
                         let vol_clamped = zone_volume.clamp(0.0, 1.0);
                         if let Err(e) = output.lock().await.set_volume(vol_clamped).await {
                             warn!(zone_id, volume = %vol_clamped, error = %e, "play_initial_volume_failed");
@@ -532,8 +532,8 @@ impl PlaybackOrchestrator {
         // Sink) — fall back conservatively but do NOT cache, so one transient
         // failure doesn't force WAV for the whole session (Marco's Denon).
         let probe = {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(device_id) {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(output) = arc {
                 let locked = output.lock().await;
                 if let Some(dlna) = locked
                     .as_any()
@@ -583,8 +583,8 @@ impl PlaybackOrchestrator {
                     return cap.supports_dsf || cap.supports_dff;
                 }
                 let cap = {
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(device_id) {
+                    let arc = { self.outputs.lock().await.get(device_id) };
+                    if let Some(output) = arc {
                         let locked = output.lock().await;
                         if let Some(dlna) = locked
                             .as_any()
@@ -847,15 +847,18 @@ impl PlaybackOrchestrator {
                     let p = url_path.to_lowercase();
                     p.ends_with(".mp3") || p.ends_with(".flac") || p.ends_with(".wav")
                 };
-                let needs_proxy = if let Some(device_id) = req.output_device_id.as_deref() {
-                    let radio_mime = guess_mime_from_url(audio_url);
-                    !reliable_ext
-                        || !self.dlna_supports_mime(device_id, &radio_mime).await
-                        // Icecast answers HEAD with 400; a renderer that HEAD-probes
-                        // the URL before playback then refuses to play it (Cyrille's
-                        // Yamaha R-N2000A on Radio Classique / TSF Jazz — MP3 Icecast,
-                        // while AAC stations work). Proxy so the HEAD hits Tune (200).
-                        || !self.radio_head_ok(audio_url).await
+                // A radio stream bound to a specific DLNA renderer is ALWAYS
+                // proxied+transcoded to WAV. Direct passthrough of an infinite
+                // Icecast stream is unreliable: it carries no Content-Length and
+                // may use ICY framing, so the renderer HEAD-probes, reports
+                // PLAYING, then emits silence — even for an explicit .mp3 whose
+                // HEAD returns 200 (Cyrille, Yamaha R-N2000A: Radio Classique
+                // proxied → sound, TSF Jazz sent direct → silent + retry loop).
+                // WAV is universally supported, so proxying guarantees sound at
+                // low CPU/LAN cost. Only device-less network resolves (no HEAD to
+                // gamble on) keep the extension-based passthrough.
+                let needs_proxy = if req.output_device_id.is_some() {
+                    true
                 } else {
                     !reliable_ext
                 };
@@ -1092,6 +1095,7 @@ impl PlaybackOrchestrator {
                 | Some("chromecast")
                 | Some("bluos")
                 | Some("squeezebox")
+                | Some("slimproto")
         );
 
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
@@ -2649,22 +2653,45 @@ impl PlaybackOrchestrator {
             .clone()
             .or_else(|| prefetched.cover_url.clone());
 
+        // Duration can also be missing from the prefetch buffer (metadata not
+        // resolved at prefetch time → `prefetched.duration_ms == 0`). Serving a
+        // zero duration is worse than a blank title: on an exclusive output the
+        // poller's position-based end detection needs duration > 0, so a
+        // 0-duration repeat can only advance via the 45 s load-grace timeout —
+        // and since the next repeat inherits 0 again, playback falls into an
+        // infinite 45 s silent loading loop (DEvir: seek under Repeat One).
+        // Prefer the prefetch value, fall back to the request, then recover from
+        // the service metadata below alongside the title.
+        let mut duration_ms: u64 = if prefetched.duration_ms > 0 {
+            prefetched.duration_ms
+        } else {
+            req.duration_ms
+                .filter(|d| *d > 0)
+                .map(|d| d as u64)
+                .unwrap_or(0)
+        };
+
         // Both the request and the prefetch buffer can carry an empty title when
         // the streaming_queue row was persisted without metadata (DEvir: Repeat
         // All on a single-track queue prefetches itself, then re-plays via this
         // prefetched path with `title=""` — auto_next logs the right title but
-        // orchestrator_play/Now Playing go blank). When that happens, refetch the
-        // real metadata from the service so Now Playing is never blanked. Fires
-        // only when the title is missing, so the normal path is untouched.
-        if title.is_empty() {
+        // orchestrator_play/Now Playing go blank). When that (or a missing
+        // duration) happens, refetch the real metadata from the service so Now
+        // Playing is never blanked and end detection has a duration.
+        if title.is_empty() || duration_ms == 0 {
             let registry = self.services.lock().await;
             if let Some(svc) = registry.get(&prefetched.source) {
                 let svc = svc.lock().await;
                 if let Ok(track) = svc.get_track(&prefetched.source_id).await {
-                    title = track.title;
-                    artist = artist.or(Some(track.artist));
-                    album = album.or(track.album);
-                    cover_url = cover_url.or(track.cover_path);
+                    if title.is_empty() {
+                        title = track.title;
+                        artist = artist.or(Some(track.artist));
+                        album = album.or(track.album);
+                        cover_url = cover_url.or(track.cover_path);
+                    }
+                    if duration_ms == 0 && track.duration_ms > 0 {
+                        duration_ms = track.duration_ms;
+                    }
                 }
             }
         }
@@ -2792,7 +2819,7 @@ impl PlaybackOrchestrator {
                 bit_depth: out_bd,
                 channels: ch,
                 file_size: Some(file_size),
-                duration_ms: Some(prefetched.duration_ms),
+                duration_ms: Some(duration_ms),
                 ..Default::default()
             };
 
@@ -2812,7 +2839,7 @@ impl PlaybackOrchestrator {
                 title: title.clone(),
                 artist: artist.clone(),
                 album: None,
-                duration_ms: Some(prefetched.duration_ms as i64),
+                duration_ms: Some(duration_ms as i64),
                 source: prefetched.source,
                 mime_type: "audio/flac".into(),
                 sample_rate: Some(sr),
@@ -2830,7 +2857,7 @@ impl PlaybackOrchestrator {
             bit_depth: out_bd,
             channels: ch,
             file_size: None,
-            duration_ms: Some(prefetched.duration_ms),
+            duration_ms: Some(duration_ms),
             ..Default::default()
         };
 
@@ -2880,7 +2907,7 @@ impl PlaybackOrchestrator {
             title: title.clone(),
             artist: artist.clone(),
             album: album.clone(),
-            duration_ms: Some(prefetched.duration_ms as i64),
+            duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
             cover_url: cover_url.clone(),
             stream_id: Some(session_id),
@@ -2934,8 +2961,8 @@ impl PlaybackOrchestrator {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
         }
-        let outputs = self.outputs.lock().await;
-        if let Some(arc) = outputs.get(device_id) {
+        let arc = { self.outputs.lock().await.get(device_id) };
+        if let Some(arc) = arc {
             let output = arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
@@ -3313,8 +3340,11 @@ impl PlaybackOrchestrator {
             .ok();
         self.playback.pause(zone_id).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            // Snapshot the output Arc under a short lock, then release the
+            // registry lock BEFORE the SOAP call: holding it across per-device
+            // network I/O lets one slow/offline renderer freeze all playback.
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.pause().await {
                     warn!(zone_id, error = %e, "device_pause_failed");
                 }
@@ -3330,8 +3360,8 @@ impl PlaybackOrchestrator {
 
         let Some(did) = device_id else { return };
         let output_type = {
-            let outputs = self.outputs.lock().await;
-            let Some(output) = outputs.get(did) else {
+            let arc = { self.outputs.lock().await.get(did) };
+            let Some(output) = arc else {
                 return;
             };
             let out = output.lock().await;
@@ -3349,8 +3379,8 @@ impl PlaybackOrchestrator {
         // the wait so other zones aren't blocked.
         if (output_type == "dlna" || output_type == "openhome") && position_ms > 3000 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 match output.lock().await.seek(position_ms).await {
                     Ok(()) => info!(zone_id, position_ms, "dlna_resume_seek"),
                     Err(e) => warn!(zone_id, position_ms, error = %e, "dlna_resume_seek_failed"),
@@ -3383,19 +3413,27 @@ impl PlaybackOrchestrator {
                 .and_then(|z| z.output_device_id),
         };
         if let Some(ref did) = resolved_did {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.stop().await {
                     warn!(zone_id, error = %e, "device_stop_failed");
                 }
             }
         } else {
-            // No device_id found — stop ALL registered outputs as fallback
-            let outputs = self.outputs.lock().await;
-            for did in outputs.list() {
-                if let Some(output) = outputs.get(&did) {
-                    let _ = output.lock().await.stop().await;
-                }
+            // No device_id found — stop ALL registered outputs as fallback.
+            // Snapshot the Arcs first and release the registry lock, so a slow
+            // or offline renderer's stop() SOAP timeout can't hold the lock and
+            // starve concurrent playback for ~100s (send_to_output_lock_contention).
+            let arcs: Vec<_> = {
+                let outputs = self.outputs.lock().await;
+                outputs
+                    .list()
+                    .iter()
+                    .filter_map(|did| outputs.get(did))
+                    .collect()
+            };
+            for output in arcs {
+                let _ = output.lock().await.stop().await;
             }
             warn!(zone_id, "stop_fallback_all_outputs_no_device_id");
         }
@@ -3473,6 +3511,7 @@ impl PlaybackOrchestrator {
                     | Some("chromecast")
                     | Some("bluos")
                     | Some("squeezebox")
+                    | Some("slimproto")
             );
 
             if is_streaming_source && is_network {
@@ -3501,8 +3540,8 @@ impl PlaybackOrchestrator {
                         "seek_streaming_direct_on_seekable_session"
                     );
 
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(did) {
+                    let arc = { self.outputs.lock().await.get(did) };
+                    if let Some(output) = arc {
                         if let Err(e) = output.lock().await.seek(position_ms).await {
                             warn!(zone_id, error = %e, "device_seek_on_seekable_session_failed");
                         }
@@ -3564,8 +3603,8 @@ impl PlaybackOrchestrator {
                             // Stream is now fresh — issue the seek on the output.
                             // Small delay to let the renderer start buffering.
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did) {
+                            let arc = { self.outputs.lock().await.get(did) };
+                            if let Some(output) = arc {
                                 if let Err(e) = output.lock().await.seek(position_ms).await {
                                     warn!(zone_id, error = %e, "device_seek_after_stream_recreate_failed");
                                 }
@@ -3587,8 +3626,8 @@ impl PlaybackOrchestrator {
                             // misinterpret the Stopped state as a playback failure.
                             self.playback.seek(zone_id, position_ms as i64).await;
                             // Fall back to direct seek (best effort)
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did) {
+                            let arc = { self.outputs.lock().await.get(did) };
+                            if let Some(output) = arc {
                                 if let Err(e) = output.lock().await.seek(position_ms).await {
                                     warn!(zone_id, error = %e, "device_seek_fallback_failed");
                                 }
@@ -3626,11 +3665,10 @@ impl PlaybackOrchestrator {
                             .and_then(|z| z.output_device_id)
                     }) {
                         if did.starts_with("local:") || did.starts_with("oaat:") {
-                            let outputs = self.outputs.lock().await;
-                            if let Some(output) = outputs.get(did.as_str()) {
+                            let arc = { self.outputs.lock().await.get(did.as_str()) };
+                            if let Some(output) = arc {
                                 let _ = output.lock().await.stop().await;
                             }
-                            drop(outputs);
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         }
                     }
@@ -3672,8 +3710,8 @@ impl PlaybackOrchestrator {
                         }
                     }
                 } else {
-                    let outputs = self.outputs.lock().await;
-                    if let Some(output) = outputs.get(did) {
+                    let arc = { self.outputs.lock().await.get(did) };
+                    if let Some(output) = arc {
                         if let Err(e) = output.lock().await.seek(position_ms).await {
                             warn!(zone_id, error = %e, "device_seek_failed");
                         }
@@ -3698,8 +3736,8 @@ impl PlaybackOrchestrator {
         self.playback.set_volume(zone_id, volume).await;
         self.playback.mark_volume_changed(zone_id).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 info!(
                     zone_id,
                     volume,
@@ -3724,8 +3762,8 @@ impl PlaybackOrchestrator {
     pub async fn set_mute(&self, zone_id: i64, muted: bool, device_id: Option<&str>) {
         self.playback.set_mute(zone_id, muted).await;
         if let Some(did) = device_id {
-            let outputs = self.outputs.lock().await;
-            if let Some(output) = outputs.get(did) {
+            let arc = { self.outputs.lock().await.get(did) };
+            if let Some(output) = arc {
                 if let Err(e) = output.lock().await.set_mute(muted).await {
                     warn!(zone_id, error = %e, "device_set_mute_failed");
                 }

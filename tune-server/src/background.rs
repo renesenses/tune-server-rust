@@ -426,7 +426,7 @@ fn spawn_heartbeat(state: &AppState) {
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| gethostname().unwrap_or_else(|| "unknown".into()));
 
-        let client = match reqwest::Client::builder()
+        let client = match tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
             .build()
@@ -702,18 +702,24 @@ fn gethostname() -> Option<String> {
 }
 
 fn spawn_slimproto_server(state: &AppState) {
-    let _state = state.clone();
+    let local_ip = tune_core::discovery::ssdp::get_local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // Wire the server to app state so connected players register as zones and
+    // can be driven for playback.
+    let db = state.backend.clone();
+    let event_bus = state.event_bus.clone();
+    let outputs = state.outputs.clone();
+    let server_ip = local_ip.clone();
     tokio::spawn(async move {
-        let server = Arc::new(tune_core::slimproto::SlimProtoServer::new());
+        let server = Arc::new(tune_core::slimproto::SlimProtoServer::new_with_state(
+            db, event_bus, outputs, server_ip,
+        ));
         if let Err(e) = server.spawn().await {
             error!(error = %e, "slimproto_server_failed");
         }
     });
-
-    // Start the LMS CLI telnet bridge (port 9090) for Squeeze-LX compatibility
-    let local_ip = tune_core::discovery::ssdp::get_local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
     let cli_state = Arc::new(tune_core::slimproto::cli_server::CliState {
         players: tune_core::slimproto::new_player_registry(),
         server_name: "Tune".to_string(),

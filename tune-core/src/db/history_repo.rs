@@ -54,13 +54,18 @@ pub mod sql {
 
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
         format!(
+            // track_id: many history rows have a null track_id, so resolve it by
+            // title (t3) as a fallback. Without this the client can't play a top
+            // track directly (it fell back to a fragile title search that failed),
+            // so tapping a track on the home screen did nothing.
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
-             COALESCE(t.id, h.track_id) as track_id, \
+             COALESCE(t.id, MAX(t3.id), h.track_id) as track_id, \
              COALESCE(al.cover_path, al2.cover_path, MAX(h.cover_url)) as cover_path, \
              COALESCE(al.title, h.album_title) as album_title, \
              h.source \
              FROM listen_history h \
              LEFT JOIN tracks t ON h.track_id = t.id \
+             LEFT JOIN tracks t3 ON t3.title = h.title \
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN albums al2 ON al2.title = h.album_title AND al2.cover_path IS NOT NULL \
              WHERE h.source != 'radio' \
@@ -311,7 +316,7 @@ impl HistoryRepo {
     /// `now_iso8601`) so the same SQL emission paths work on both
     /// SQLite and Postgres.
     ///
-    /// `period`: "7d", "30d", "90d", "all" (default 30d).
+    /// `period`: "today", "7d", "30d", "90d", "all" (default 30d).
     /// `zone_id`: optional filter.
     /// `top_n`: how many items per top list.
     pub fn full_dashboard(
@@ -322,6 +327,12 @@ impl HistoryRepo {
         top_n: i64,
     ) -> Result<DashboardData, String> {
         let days: Option<i64> = match period {
+            // "today" is sent by the UI's first period chip. Without this arm it
+            // fell through to `other`, where "today".parse::<i64>() fails → None
+            // → the whole history was returned, so the button appeared to do
+            // nothing (Elie). Map it to the last day, consistent with the other
+            // relative-day windows (7d/30d).
+            "today" => Some(1),
             "7d" => Some(7),
             "30d" => Some(30),
             "90d" => Some(90),
@@ -840,6 +851,83 @@ impl HistoryRepo {
             on_this_day,
         })
     }
+
+    /// Tracks listened during a single weekday×hour cell of the heatmap, within
+    /// `period`. `weekday` is ISO 1=Mon..7=Sun (matching the heatmap grid);
+    /// `hour` is 0..23. Grouped by track, most-played first. Powers the
+    /// drill-down when a heatmap cell is clicked (Elie).
+    pub fn history_at_slot(
+        &self,
+        period: &str,
+        weekday: i64,
+        hour: i64,
+        limit: i64,
+    ) -> Result<Vec<SlotTrack>, String> {
+        let days: Option<i64> = match period {
+            "today" => Some(1),
+            "7d" => Some(7),
+            "30d" => Some(30),
+            "90d" => Some(90),
+            "all" => None,
+            other => other.trim_end_matches('d').parse::<i64>().ok(),
+        };
+        let extract_dow = match self.db.engine() {
+            Engine::Sqlite => "CAST(strftime('%w', listened_at) AS INTEGER)".to_string(),
+            Engine::Postgres => "EXTRACT(DOW FROM listened_at::timestamp)::int".to_string(),
+        };
+        let hour_expr = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.extract_hour("listened_at"),
+            Engine::Postgres => PostgresDialect.extract_hour("listened_at"),
+        };
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(d) = days {
+            conditions.push(match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.since_days("listened_at", d),
+                Engine::Postgres => PostgresDialect.since_days("listened_at", d),
+            });
+        }
+        // weekday/hour/limit are i64 and inlined like the rest of this module.
+        conditions.push(format!(
+            "(CASE WHEN {extract_dow} = 0 THEN 7 ELSE {extract_dow} END) = {weekday}"
+        ));
+        conditions.push(format!("{hour_expr} = {hour}"));
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT track_id, title, artist_name, album_title, album_id, source, \
+                    source_id, COUNT(*) as plays, MAX(listened_at) as last_at \
+             FROM listen_history {where_clause} \
+             GROUP BY track_id, title, artist_name, album_title, album_id, source, source_id \
+             ORDER BY plays DESC, last_at DESC LIMIT {limit}"
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| SlotTrack {
+                track_id: cols.first().and_then(|v| v.as_i64()),
+                title: cols.get(1).and_then(|v| v.as_string()),
+                artist_name: cols.get(2).and_then(|v| v.as_string()),
+                album_title: cols.get(3).and_then(|v| v.as_string()),
+                album_id: cols.get(4).and_then(|v| v.as_i64()),
+                source: cols.get(5).and_then(|v| v.as_string()),
+                source_id: cols.get(6).and_then(|v| v.as_string()),
+                plays: cols.get(7).and_then(|v| v.as_i64()).unwrap_or(0),
+                last_listened_at: cols.get(8).and_then(|v| v.as_string()),
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlotTrack {
+    pub track_id: Option<i64>,
+    pub title: Option<String>,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+    pub album_id: Option<i64>,
+    pub source: Option<String>,
+    pub source_id: Option<String>,
+    pub plays: i64,
+    pub last_listened_at: Option<String>,
 }
 
 fn is_consecutive_days_str(a: &str, b: &str) -> bool {

@@ -132,82 +132,116 @@ pub fn asio_available() -> bool {
 pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
-        super::asio_exclusive::ensure_com_initialized();
-        let host = match cpal::host_from_id(cpal::HostId::Asio) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "asio_device_enumeration_failed — no ASIO host available");
-                return Vec::new();
-            }
-        };
+        use std::sync::Mutex as StdMutex;
 
-        let default_name = host
-            .default_output_device()
-            .and_then(|d| d.description().ok())
-            .map(|desc| desc.name().to_string())
-            .unwrap_or_default();
+        // Last successful enumeration. Served verbatim while an exclusive stream
+        // owns the ASIO device, so listing never re-opens a driver that is
+        // already locked for playback.
+        static ASIO_DEVICE_CACHE: StdMutex<Option<Vec<AsioDeviceInfo>>> = StdMutex::new(None);
 
-        let mut devices = Vec::new();
-        match host.output_devices() {
-            Ok(output_devices) => {
-                for device in output_devices {
-                    let name = device
-                        .description()
-                        .map(|desc| desc.name().to_string())
-                        .unwrap_or_else(|_| "Unknown ASIO Device".into());
+        let enumerate = || -> Vec<AsioDeviceInfo> {
+            super::asio_exclusive::ensure_com_initialized();
+            let host = match cpal::host_from_id(cpal::HostId::Asio) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(error = %e, "asio_device_enumeration_failed — no ASIO host available");
+                    return Vec::new();
+                }
+            };
 
-                    let is_default = name == default_name;
+            let default_name = host
+                .default_output_device()
+                .and_then(|d| d.description().ok())
+                .map(|desc| desc.name().to_string())
+                .unwrap_or_default();
 
-                    let (max_channels, sample_rates) = match device.supported_output_configs() {
-                        Ok(configs) => {
-                            let mut max_ch = 0u16;
-                            let mut rates = Vec::new();
-                            for config in configs {
-                                max_ch = max_ch.max(config.channels());
-                                let min = config.min_sample_rate();
-                                let max = config.max_sample_rate();
-                                for &rate in &[
-                                    44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
-                                    705600, 768000,
-                                ] {
-                                    if rate >= min && rate <= max && !rates.contains(&rate) {
-                                        rates.push(rate);
+            let mut devices = Vec::new();
+            match host.output_devices() {
+                Ok(output_devices) => {
+                    for device in output_devices {
+                        let name = device
+                            .description()
+                            .map(|desc| desc.name().to_string())
+                            .unwrap_or_else(|_| "Unknown ASIO Device".into());
+
+                        let is_default = name == default_name;
+
+                        let (max_channels, sample_rates) = match device.supported_output_configs() {
+                            Ok(configs) => {
+                                let mut max_ch = 0u16;
+                                let mut rates = Vec::new();
+                                for config in configs {
+                                    max_ch = max_ch.max(config.channels());
+                                    let min = config.min_sample_rate();
+                                    let max = config.max_sample_rate();
+                                    for &rate in &[
+                                        44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000,
+                                        705600, 768000,
+                                    ] {
+                                        if rate >= min && rate <= max && !rates.contains(&rate) {
+                                            rates.push(rate);
+                                        }
                                     }
                                 }
+                                rates.sort();
+                                (max_ch, rates)
                             }
-                            rates.sort();
-                            (max_ch, rates)
-                        }
-                        Err(_) => {
-                            // ASIO drivers usually enumerate correctly, but fall
-                            // back to conservative defaults if they don't.
-                            (2, vec![44100, 48000, 96000, 192000])
-                        }
-                    };
+                            Err(_) => {
+                                // ASIO drivers usually enumerate correctly, but fall
+                                // back to conservative defaults if they don't.
+                                (2, vec![44100, 48000, 96000, 192000])
+                            }
+                        };
 
-                    info!(
-                        name = %name,
-                        is_default,
-                        max_channels,
-                        sample_rates = ?sample_rates,
-                        "asio_device_found"
-                    );
+                        info!(
+                            name = %name,
+                            is_default,
+                            max_channels,
+                            sample_rates = ?sample_rates,
+                            "asio_device_found"
+                        );
 
-                    devices.push(AsioDeviceInfo {
-                        name,
-                        is_default,
-                        max_channels,
-                        sample_rates,
-                        exclusive: true, // ASIO is always exclusive
-                    });
+                        devices.push(AsioDeviceInfo {
+                            name,
+                            is_default,
+                            max_channels,
+                            sample_rates,
+                            exclusive: true, // ASIO is always exclusive
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "asio_output_devices_enumeration_failed");
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "asio_output_devices_enumeration_failed");
+
+            devices
+        };
+
+        // Probe the driver ONLY when no exclusive stream currently owns it.
+        // Re-opening the single-instance ASIO driver while a zone is playing
+        // churns it — on SOtM Diretta it never finishes locking (endless
+        // connect → getBufferSize → disconnect cycles, never reaching
+        // createBuffers/start). When the device is busy, serve the cache.
+        match super::asio_exclusive::try_with_asio_device_lock(enumerate) {
+            Some(devices) => {
+                *ASIO_DEVICE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(devices.clone());
+                devices
+            }
+            None => {
+                let cached = ASIO_DEVICE_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_default();
+                debug!(
+                    cached_devices = cached.len(),
+                    "asio_device_enumeration_skipped_playback_active"
+                );
+                cached
             }
         }
-
-        devices
     }
 
     #[cfg(not(all(target_os = "windows", feature = "asio")))]

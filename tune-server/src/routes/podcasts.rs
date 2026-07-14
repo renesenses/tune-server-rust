@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
 use tune_core::streaming::podcasts::PodcastService;
+use tune_core::streaming::radiofrance::{RadioFranceApi, RfStation};
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
@@ -64,6 +65,9 @@ pub fn router() -> Router<AppState> {
         .route("/subscriptions", get(list_subscriptions).post(subscribe))
         .route("/subscriptions/{id}", axum::routing::delete(unsubscribe))
         .route("/radiofrance", get(radiofrance_podcasts))
+        .route("/radiofrance/shows", get(rf_shows))
+        .route("/radiofrance/shows/search", get(rf_search_shows))
+        .route("/radiofrance/episodes", get(rf_episodes))
         .route("/discover", get(discover_podcasts))
         .route("/top", get(top_podcasts))
         .route("/genres", get(list_genres))
@@ -340,6 +344,90 @@ async fn play_episode(
     let zone_state = state.playback.get_state(zone_id).await;
     Json(json!({"zone_id": zone_id, "title": title, "podcast": podcast_name, "audio_url": body.audio_url, "mime_type": mime_type, "output_sent": output_sent, "error": output_error, "state": zone_state})).into_response()
 }
+// ─── Radio France GraphQL API ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RfShowsQuery {
+    station: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RfSearchQuery {
+    q: String,
+}
+
+#[derive(Deserialize)]
+struct RfEpisodesQuery {
+    show_url: String,
+    #[serde(default = "default_episode_limit")]
+    limit: usize,
+}
+
+fn get_rf_api_key(state: &AppState) -> Option<String> {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .get("radiofrance_api_key")
+        .ok()
+        .flatten()
+        .filter(|k| !k.is_empty())
+}
+
+async fn rf_shows(
+    State(state): State<AppState>,
+    Query(q): Query<RfShowsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let api_key = get_rf_api_key(&state)
+        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+    let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
+    let code = q.station.as_deref().unwrap_or("FRANCEINTER");
+    let station = RfStation::from_code(code)
+        .ok_or_else(|| AppError::bad_request(&format!("unknown station: {code}")))?;
+    match api.list_shows(station).await {
+        Ok(shows) => Ok(Json(
+            json!({"station": station.label(), "count": shows.len(), "shows": shows}),
+        )),
+        Err(e) => {
+            warn!(station = code, error = %e, "rf_shows_failed");
+            Err(AppError::internal(e))
+        }
+    }
+}
+
+async fn rf_search_shows(
+    State(state): State<AppState>,
+    Query(q): Query<RfSearchQuery>,
+) -> Result<Json<Value>, AppError> {
+    let api_key = get_rf_api_key(&state)
+        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+    let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
+    match api.search_shows(&q.q).await {
+        Ok(shows) => Ok(Json(
+            json!({"query": q.q, "count": shows.len(), "shows": shows}),
+        )),
+        Err(e) => {
+            warn!(query = %q.q, error = %e, "rf_search_failed");
+            Err(AppError::internal(e))
+        }
+    }
+}
+
+async fn rf_episodes(
+    State(state): State<AppState>,
+    Query(q): Query<RfEpisodesQuery>,
+) -> Result<Json<Value>, AppError> {
+    let api_key = get_rf_api_key(&state)
+        .ok_or_else(|| AppError::bad_request("radiofrance_api_key not configured"))?;
+    let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
+    match api.get_episodes(&q.show_url, q.limit as u32).await {
+        Ok(episodes) => Ok(Json(
+            json!({"show_url": q.show_url, "count": episodes.len(), "episodes": episodes}),
+        )),
+        Err(e) => {
+            warn!(show = %q.show_url, error = %e, "rf_episodes_failed");
+            Err(AppError::internal(e))
+        }
+    }
+}
+
 fn guess_audio_mime(url: &str) -> &'static str {
     let lower = url.to_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);

@@ -639,15 +639,11 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
 ",
     },
     Migration {
-        // v0.9 rc.2 — unified queue. Renumbered to 52 on the main→release/v0.9
-        // merge-forward to sit after main's migrations 49-51 (version numbers
-        // must stay unique & monotonic). The actual work is done idempotently by
-        // migrate_to_unified_queue(), so the marker number is free to move.
+        // v0.9 — unified queue (kept at 52; existing release/v0.9 DBs already
+        // applied it here). The actual work is done idempotently by
+        // migrate_to_unified_queue() in init_schema, so the marker is a no-op.
         version: 52,
         name: "unified_queue_items",
-        // Applied programmatically (create table + one-time copy) via
-        // migrate_to_unified_queue so it is idempotent across re-runs and
-        // tolerant of the lazily-created streaming_queue table.
         up: "",
     },
     Migration {
@@ -661,6 +657,38 @@ CREATE TABLE IF NOT EXISTS file_first_seen (
         version: 54,
         name: "bio_provenance",
         up: "", // Applied programmatically via add_column_if_missing
+    },
+    // Brought over from main in the main→release/v0.9 merge (numbered 55/56 so
+    // they run on existing release/v0.9 DBs, whose highest applied version is 54).
+    Migration {
+        version: 55,
+        name: "add_streaming_auth",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_auth (
+    service TEXT PRIMARY KEY,
+    token_data TEXT NOT NULL
+);
+",
+    },
+    // streaming_queue is also created unconditionally in init_schema (the
+    // idempotent guarantee); this numbered marker mirrors main. IF NOT EXISTS.
+    Migration {
+        version: 56,
+        name: "create_streaming_queue_table",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    zone_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    duration_ms INTEGER DEFAULT 0
+);
+",
     },
 ];
 
@@ -1080,6 +1108,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
     add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+    // Physical host (IP) of the renderer, used to dedup DLNA zones across
+    // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
+    // N12 after a restart) must reconnect to its existing zone instead of
+    // spawning a duplicate (forum #942).
+    add_column_if_missing(db, "zones", "host", "TEXT");
 
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
@@ -1096,10 +1129,32 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
-    // v0.9 rc.2 — unify play_queue + streaming_queue into queue_items (v52).
-    // The one-time position renumbering (two per-source spaces → one contiguous
-    // space per zone) is applied as versioned migration 53 in run_migrations,
-    // which runs after init_schema, so the copy above is already in place.
+    // Ensure streaming_queue exists BEFORE the unified-queue copy reads it. It
+    // used to be created lazily on first write, so on a fresh DB the unified
+    // migration and the Deezer/streaming connect path could hit "no such table:
+    // streaming_queue" (forum #951: Bilou/Yan, still seen in v0.8.287+ on Windows
+    // where a numbered migration can fail silently). IF NOT EXISTS = no-op
+    // otherwise. Runs every startup, so it is the idempotent guarantee across the
+    // main↔release/v0.9 merge (the numbered migrations may collide/skip).
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_queue (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            zone_id INTEGER NOT NULL,\
+            position INTEGER NOT NULL,\
+            source TEXT,\
+            source_id TEXT,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            duration_ms INTEGER DEFAULT 0\
+        );",
+    )
+    .ok();
+
+    // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
+    // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
+    // on DBs that skipped the numbered unified-queue migration.
     migrate_to_unified_queue(db);
 
     db.execute_batch("ANALYZE;").ok();
@@ -1178,6 +1233,16 @@ const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         7,
         "podcast_subscriptions",
         include_str!("../../migrations/postgres/007_podcast_subscriptions.sql"),
+    ),
+    (
+        8,
+        "schema_sync",
+        include_str!("../../migrations/postgres/008_schema_sync.sql"),
+    ),
+    (
+        9,
+        "smart_playlists_match_mode",
+        include_str!("../../migrations/postgres/009_smart_playlists_match_mode.sql"),
     ),
 ];
 

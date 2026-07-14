@@ -36,9 +36,54 @@ use super::local::RingBuf;
 /// down and settles) makes the new open WAIT for the old one instead.
 static ASIO_DEVICE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Time given to the ASIO driver to fully release the hardware after a stream
-/// is torn down, before the device lock is released and the next open runs.
-const ASIO_TEARDOWN_SETTLE: Duration = Duration::from_millis(200);
+/// Run `f` while holding the process-wide ASIO device lock **only if it is
+/// free**. Returns `None` — without running `f` — when the lock is currently
+/// held, i.e. an exclusive playback session is active (or still settling in
+/// `Drop`).
+///
+/// This is what enumeration must use. `AsioExclusiveOutput::new` holds
+/// [`ASIO_DEVICE_LOCK`] for the whole playback session, but device *listing*
+/// (Settings, the Diagnostics page, the `/devices/audio*` API) used to call
+/// `supported_output_configs()` on the driver without any lock — opening the
+/// single-instance ASIO driver a second time. On drivers like SOtM Diretta or
+/// RME Fireface that concurrent open churns the driver so it never finishes
+/// locking (observed: endless connect → getBufferSize → disconnect cycles,
+/// never reaching `createBuffers`/`start`). Probing through this guard makes
+/// enumeration back off to cached data instead of racing an active stream.
+pub fn try_with_asio_device_lock<R>(f: impl FnOnce() -> R) -> Option<R> {
+    match ASIO_DEVICE_LOCK.try_lock() {
+        Ok(_guard) => Some(f()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        // A prior holder panicked; the driver state is still consistent enough
+        // to enumerate, so recover the guard and proceed.
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            let _guard = p.into_inner();
+            Some(f())
+        }
+    }
+}
+
+/// Base time given to the ASIO driver to fully release the hardware after a
+/// stream is torn down, before the device lock is released and the next open
+/// runs.
+const ASIO_TEARDOWN_SETTLE_BASE: Duration = Duration::from_millis(200);
+
+/// Settle time before releasing the device lock, scaled with the stream's
+/// sample rate. High-rate streams (e.g. 176.4 / 192 kHz) need a longer clock
+/// re-lock/release on the driver: with a flat 200 ms, a rapid Repeat-One /
+/// next transition on a 176.4 kHz stream reopened the exclusive device before
+/// the driver had fully released it, and the new stream got `frames=0` — which
+/// forced an expensive full network re-download (DEvir, RME Fireface USB,
+/// Repeat One 176.4 kHz). +100 ms per 48 kHz step above 48 kHz, capped at
+/// +400 ms (→ 600 ms at 192 kHz).
+fn teardown_settle_for(sample_rate: u32) -> Duration {
+    if sample_rate <= 48_000 {
+        ASIO_TEARDOWN_SETTLE_BASE
+    } else {
+        let steps = (u64::from(sample_rate) / 48_000).min(4);
+        ASIO_TEARDOWN_SETTLE_BASE + Duration::from_millis(steps * 100)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -447,8 +492,10 @@ impl Drop for AsioExclusiveOutput {
         // Let the driver fully release the hardware before `_device_guard`
         // (dropped after this body) frees the lock and the next open runs.
         // Opening while the driver is still busy returns DeviceBusy and, on the
-        // Fireface, crashes the process natively.
-        std::thread::sleep(ASIO_TEARDOWN_SETTLE);
+        // Fireface, crashes the process natively. Scale the wait with the
+        // sample rate — high rates need longer to release (fixes frames=0 on
+        // 176.4 kHz Repeat-One transitions).
+        std::thread::sleep(teardown_settle_for(self.current_sample_rate));
         debug!(device = %self.device_name, "asio_exclusive_device_lock_releasing");
     }
 }

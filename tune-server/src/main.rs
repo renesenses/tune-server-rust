@@ -118,22 +118,33 @@ async fn main() {
 
     let env_filter = EnvFilter::from_default_env()
         .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
-        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap());
+        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap())
+        // Cap chatty dependencies so a `debug` level (config or RUST_LOG=debug)
+        // doesn't drown the useful lines. At debug, sqlx::query logs every SQL
+        // statement and reqwest/hyper log every outbound connection: Elie's
+        // 1000-line "Export logs" covered barely 7 seconds, ~95% of it sqlx +
+        // reqwest::connect noise, burying the playback events we actually needed.
+        // These crates are never useful for diagnosing Tune. Target-specific
+        // directives win over the global level, so this holds even at RUST_LOG=debug.
+        .add_directive("sqlx=warn".parse().unwrap())
+        .add_directive("reqwest=info".parse().unwrap())
+        .add_directive("hyper=info".parse().unwrap())
+        .add_directive("hyper_util=info".parse().unwrap())
+        .add_directive("h2=info".parse().unwrap())
+        .add_directive("rustls=info".parse().unwrap())
+        .add_directive("mio=info".parse().unwrap());
 
-    // On macOS/Windows, also write logs to a file so the Diagnostics
-    // "Export logs" button works even when not launched from a terminal.
-    let log_file = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        let log_dir = if cfg!(target_os = "macos") {
-            std::env::var("HOME")
-                .map(|h| std::path::PathBuf::from(h).join("Library/Logs"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        } else {
-            std::env::var("LOCALAPPDATA")
-                .map(|d| std::path::PathBuf::from(d).join("TuneServer"))
-                .unwrap_or_else(|_| std::path::PathBuf::from("C:\\ProgramData\\TuneServer"))
-        };
-        std::fs::create_dir_all(&log_dir).ok();
-        let path = log_dir.join("tune-server.log");
+    // Write logs to a file on every platform (Linux included) so the
+    // Diagnostics "Export logs" button and /system/logs work even when not
+    // launched from a terminal — systemd/journald, Docker, or a double-clicked
+    // .app. The path is shared with the reader via config::default_log_file_path()
+    // so both always agree. Previously Linux wrote no file, so any launch where
+    // journalctl didn't apply exported an empty log.
+    let log_file = {
+        let path = config::default_log_file_path();
+        // Cap the log at 10 MiB (keeping one .1 backup) so it doesn't grow
+        // without bound on a long-running server.
+        config::rotate_log_file(&path, 10 * 1024 * 1024);
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -143,8 +154,6 @@ async fn main() {
                 eprintln!("Logging to {}", path.display());
                 f
             })
-    } else {
-        None
     };
 
     if let Some(file) = log_file {
@@ -267,7 +276,22 @@ async fn main() {
                     tracing::warn!(%addr, attempt, error = %e, "bind failed, retrying in 2s");
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
-                Err(e) => panic!("failed to bind {addr} after 10 attempts: {e}"),
+                Err(e) => {
+                    // Another tune-server is already listening on this port
+                    // (e.g. an old instance that wasn't stopped before an
+                    // update/restart — Elie). Exit cleanly with an actionable
+                    // message instead of panicking, which dumped core and
+                    // spammed the journal on every restart of the crash loop.
+                    tracing::error!(
+                        %addr,
+                        error = %e,
+                        "failed to bind after 10 attempts — another tune-server \
+                         instance is probably already bound to this port. Stop \
+                         it before starting a new one \
+                         (e.g. `systemctl stop tune-server` or `pkill -f tune-server`)."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         socket.listen(128).expect("failed to listen");
@@ -330,9 +354,14 @@ async fn main() {
         });
     }
 
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    if let Err(e) = axum::serve(
+        listener,
+        // ConnectInfo<SocketAddr> lets handlers see the client IP (used to
+        // disambiguate browser zones created by different machines — Bertrand).
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         tracing::error!(error = %e, "server_fatal_error");
         #[cfg(windows)]

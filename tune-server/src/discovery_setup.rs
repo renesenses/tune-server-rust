@@ -191,8 +191,46 @@ async fn handle_ssdp_discovered(
         if let Some(zone_id) = zone.id {
             let vol = zone.volume as f64 / 100.0;
             playback.set_volume(zone_id, vol).await;
+            // Backfill the host on zones created before host-based dedup existed,
+            // so a later UUID change (Denon restart) can reconnect by host (#942).
+            let _ = zone_repo.set_host(zone_id, &dev.host);
         }
         info!(name = %dev.name, id = %dev.id, "zone_device_reconnected");
+        event_bus.emit(
+            "device.reconnected",
+            serde_json::json!({
+                "device_id": &dev.id,
+                "name": &dev.name,
+                "host": &dev.host,
+            }),
+        );
+    } else if let Some(existing_zone_id) = zone_repo.zone_id_by_host(&dev.host) {
+        // Same physical renderer, NEW UPnP UUID (e.g. Denon Ceol N12 after a
+        // restart, which changes its UUIDs): re-point the existing zone to the
+        // live device_id instead of spawning a duplicate. This keeps the zone's
+        // per-zone settings — crucially the "native FLAC" toggle and volume —
+        // on the one zone the user actually plays (forum #942: duplicate Denon
+        // zones meant the toggle was set on a zone that was never the one
+        // playing, so Tidal FLAC kept being transcoded to WAV).
+        seen_hosts.insert(dev.host.clone());
+        let _ = zone_repo.update_device_id(existing_zone_id, &dev.id);
+        let _ = zone_repo.set_host(existing_zone_id, &dev.host);
+        set_zone_online(event_bus, db, &dev.id, true);
+        let vol = zone_repo
+            .get(existing_zone_id)
+            .ok()
+            .flatten()
+            .map(|z| z.volume as f64 / 100.0);
+        if let Some(vol) = vol {
+            playback.set_volume(existing_zone_id, vol).await;
+        }
+        info!(
+            name = %dev.name,
+            id = %dev.id,
+            host = %dev.host,
+            zone_id = existing_zone_id,
+            "zone_device_reconnected_by_host"
+        );
         event_bus.emit(
             "device.reconnected",
             serde_json::json!({
@@ -241,6 +279,20 @@ async fn handle_ssdp_discovered(
         } else {
             short_name.to_string()
         };
+
+        // Persisted name dedup: a device exposing several UPnP services (a Sonos
+        // is both a DLNA MediaRenderer and OpenHome) can be rediscovered under a
+        // NEW device_id after a restart. get_by_device_id above misses it and
+        // the per-pass seen_hosts is empty, so a duplicate zone with the SAME
+        // disambiguated name (which includes the renderer UUID) gets created
+        // (Bertrand: "Chambre - Sonos … RINCON…" ×2). Same full name = same
+        // physical device → skip the duplicate; its live device_id reconnects
+        // via the get_by_device_id path.
+        if existing_zones.iter().any(|z| z.name == zone_name) {
+            tracing::debug!(name = %zone_name, id = %dev.id, host = %dev.host, "ssdp_zone_name_exists_skipping_duplicate");
+            return;
+        }
+
         let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
             "openhome"
         } else {
@@ -248,6 +300,8 @@ async fn handle_ssdp_discovered(
         };
         match zone_repo.get_or_create(&zone_name, Some(type_str), &dev.id) {
             Ok((zid, true)) => {
+                // Persist the host so a later UUID change reconnects here (#942).
+                let _ = zone_repo.set_host(zid, &dev.host);
                 event_bus.emit_typed(
                     EventType::ZoneCreated,
                     serde_json::json!({
@@ -260,6 +314,7 @@ async fn handle_ssdp_discovered(
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, r#type = type_str, "ssdp_zone_auto_created");
             }
             Ok((zid, false)) => {
+                let _ = zone_repo.set_host(zid, &dev.host);
                 set_zone_online(event_bus, db, &dev.id, true);
                 info!(name = %zone_name, zone_id = zid, device = %dev.id, "ssdp_zone_already_existed");
             }
@@ -597,7 +652,7 @@ async fn probe_airplay_for_bluos(
         return;
     }
 
-    let client = reqwest::Client::builder()
+    let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();

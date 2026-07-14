@@ -330,22 +330,52 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         info!("update_restarting");
 
-        // Spawn the updated binary before exiting. On systemd (Restart=always)
-        // this is redundant but harmless. On macOS without a service manager
-        // this ensures the server comes back up after the update.
+        // Restart into the freshly-installed binary.
         //
-        // On WINDOWS we must NOT spawn here. The Windows binary is swapped by
+        // UNIX (macOS/Linux): re-exec in place with execv. This replaces the
+        // current process image while keeping the SAME PID, so recovery does
+        // NOT depend on an external supervisor. It works identically under the
+        // macOS DMG (no launchd/LaunchAgent), inside Docker (PID 1 never dies →
+        // the container stays up), when launched from a terminal, and under
+        // systemd (no exit → no Restart cycle, no parasite child, no port race).
+        //
+        // The previous approach — spawn() a child, then exit(0) — only recovered
+        // when a supervisor happened to restart on exit (systemd Restart=always):
+        // the .18 journal proved the spawned child was itself killed by systemd's
+        // KillMode=control-group and did nothing (the process that came back had
+        // a different PID). Without a supervisor (Docker, the DMG) nothing
+        // restarted, so the server never came back — the reported bug.
+        //
+        // The listening socket is CLOEXEC (socket2 + std default), so exec()
+        // releases port 8888 and the new image rebinds cleanly (main.rs also
+        // retries bind). exec() only returns on failure — then we fall back to
+        // spawn()+exit(0) so a supervised deployment still recovers.
+        //
+        // WINDOWS: we must NOT spawn or exec here. The binary is swapped by
         // tune-update.bat, which first waits for THIS process (tune-server.exe)
-        // to exit. Spawning current_exe now would start a *second*
-        // tune-server.exe from the still-old binary, keeping the image name
-        // alive forever — so the .bat's wait_loop never completes, the swap
-        // never runs, and the restarted server is still the old version.
-        // Christophe's log showed exactly this: `update_installed to=0.8.261`
-        // then a restart as `version=0.8.260`. Just exit; the .bat swaps the
-        // binary and starts the new one.
-        if !cfg!(windows) {
+        // to exit. Starting another process from the still-old binary keeps the
+        // image name alive forever, so the .bat's wait_loop never completes
+        // (Christophe's log: `update_installed to=0.8.261` then a restart as
+        // `version=0.8.260`). Just exit; the .bat swaps the binary and starts it.
+        #[cfg(windows)]
+        {
+            info!(
+                "update_windows_exiting_for_bat_swap — tune-update.bat will swap the binary and restart"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::process::exit(0);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
             let exe = current_exe.clone();
             let args: Vec<String> = std::env::args().skip(1).collect();
+            // Let the final status-poll response flush before we swap the image.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            info!(exe = %exe.display(), "update_reexec");
+            // exec() replaces this process on success and never returns.
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            warn!(error = %err, "update_reexec_failed — falling back to spawn+exit");
             match std::process::Command::new(&exe)
                 .args(&args)
                 .stdin(std::process::Stdio::null())
@@ -360,14 +390,9 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
                     warn!(error = %e, "update_restart_spawn_failed — manual restart required");
                 }
             }
-        } else {
-            info!(
-                "update_windows_exiting_for_bat_swap — tune-update.bat will swap the binary and restart"
-            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::process::exit(0);
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        std::process::exit(0);
     });
 
     // Return immediately — client polls /system/update/status
@@ -644,7 +669,7 @@ pub(super) async fn changelog() -> Json<Value> {
 }
 
 async fn fetch_github_changelog() -> Result<Value, String> {
-    let client = reqwest::Client::builder()
+    let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent("Tune/2.0")
         .build()

@@ -44,28 +44,33 @@ const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    let tagged = match lofty::read_from_path(audio_path) {
-        Ok(t) => t,
+    match lofty::read_from_path(audio_path) {
+        Ok(tagged) => {
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                if let Some(pic) = tag.pictures().first() {
+                    let mime = match pic.mime_type() {
+                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                        Some(lofty::picture::MimeType::Png) => "image/png",
+                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                        _ => "image/jpeg",
+                    };
+                    return Some((pic.data().to_vec(), mime.to_string()));
+                }
+            }
+        }
         Err(e) => {
             debug!(
                 path = %audio_path.display(),
                 error = %e,
                 "artwork_lofty_read_failed"
             );
-            return None;
         }
-    };
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-    let pic = tag.pictures().first()?;
+    }
 
-    let mime = match pic.mime_type() {
-        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-        Some(lofty::picture::MimeType::Png) => "image/png",
-        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-        _ => "image/jpeg",
-    };
-
-    Some((pic.data().to_vec(), mime.to_string()))
+    // DSF files store their ID3v2 tag — including embedded APIC artwork — at
+    // an offset that lofty does not read, so the path above finds no picture.
+    // Fall back to reading the cover directly from the DSF metadata chunk.
+    crate::metadata::extract_dsf_cover(audio_path)
 }
 
 pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
@@ -661,13 +666,35 @@ pub async fn batch_enrich_artist_artwork(
     }
 
     // --- Phase 2: Fetch from external sources for remaining artists ---
-    let artists = match artist_repo.list_without_image() {
+    let mut artists = match artist_repo.list_without_image() {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artist_artwork_list_failed");
             return;
         }
     };
+
+    // Re-queue artists whose image_path is set in the DB but whose cache file is
+    // actually missing. list_without_image only checks the column, so a scan
+    // that set image_path while the cache write failed (or a cache that was
+    // later cleared/moved) leaves a grey square that would be skipped forever
+    // (Fabien: "j'ai pas les images d'artistes" despite a full scan + premium).
+    // This extends the Phase-1 cache-existence guard (Sandro) to Phase 2.
+    match artist_repo.list_with_image_and_mbid() {
+        Ok(with_image) => {
+            let before = artists.len();
+            for (id, name, mbid, image_path) in with_image {
+                if !cached_artwork_exists(&cache_dir, &image_path) {
+                    artists.push((id, name, mbid));
+                }
+            }
+            let requeued = artists.len() - before;
+            if requeued > 0 {
+                info!(requeued, "batch_artist_artwork_missing_cache_requeued");
+            }
+        }
+        Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
+    }
 
     if artists.is_empty() {
         info!("batch_artist_artwork_skip_all_have_images");
@@ -939,6 +966,48 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     None
 }
 
+/// Re-extract embedded cover art for local albums that still have no
+/// `cover_path`, reading directly from their track files (never the network).
+///
+/// The incremental scan only extracts covers from files it actually
+/// re-processes; unchanged files are skipped. So an improvement to embedded-art
+/// extraction (e.g. DSF ID3v2 covers stored at the DSF metadata offset that
+/// lofty ignores — Thibaud) never reaches a library whose files are unchanged.
+/// Running this at the end of a scan self-heals those albums: any local album
+/// with a missing cover gets its embedded art re-extracted from the first track
+/// that yields one. Returns the number of albums filled.
+pub fn backfill_embedded_covers(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: &Path,
+) -> usize {
+    use crate::db::album_repo::AlbumRepo;
+    use crate::db::track_repo::TrackRepo;
+
+    let album_repo = AlbumRepo::with_backend(db.clone());
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let coverless = album_repo.list_without_cover().unwrap_or_default();
+
+    let mut filled = 0usize;
+    for (album_id, _title, _artist, _mbid) in &coverless {
+        let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
+        for track in &tracks {
+            let Some(ref file_path) = track.file_path else {
+                continue;
+            };
+            if let Some(hash) = get_or_extract(Path::new(file_path), cache_dir) {
+                if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
+                    filled += 1;
+                }
+                break;
+            }
+        }
+    }
+    if filled > 0 {
+        info!(filled, "backfill_embedded_covers_done");
+    }
+    filled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1023,80 @@ mod tests {
     #[test]
     fn nonexistent_file_returns_none() {
         assert!(extract_cover_art(Path::new("/tmp/nonexistent.flac")).is_none());
+    }
+
+    #[test]
+    fn backfill_fills_missing_covers_then_is_idempotent() {
+        use crate::db::album_repo::AlbumRepo;
+        use crate::db::artist_repo::ArtistRepo;
+        use crate::db::backend::DbBackend;
+        use crate::db::models::{Artist, Track};
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::track_repo::TrackRepo;
+        use std::sync::Arc;
+
+        // Isolated temp dir: a track whose folder holds a cover.jpg. This
+        // exercises the backfill wiring end to end (list_without_cover →
+        // get_or_extract → force_update_cover_path); DSF ID3v2 extraction
+        // itself is covered by the metadata parser path.
+        let base = std::env::temp_dir().join(format!("tune_backfill_{}", std::process::id()));
+        let music = base.join("album");
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::write(music.join("cover.jpg"), b"\xff\xd8\xff\xe0dummyjpegdata").unwrap();
+        let track_path = music.join("01.flac");
+        std::fs::write(&track_path, b"not really flac").unwrap();
+        let cache_dir = base.join("cache");
+
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(sqlite);
+
+        let artist_repo = ArtistRepo::with_backend(backend.clone());
+        let album_repo = AlbumRepo::with_backend(backend.clone());
+        let track_repo = TrackRepo::with_backend(backend.clone());
+
+        let aid = artist_repo
+            .create(&Artist::new("Art Lande".into()))
+            .unwrap();
+        let alid = album_repo
+            .get_or_create("While She Sleeps", aid, Some(1990))
+            .unwrap()
+            .id
+            .unwrap();
+        let mut track = Track::new("Snow Dance".into());
+        track.artist_id = Some(aid);
+        track.album_id = Some(alid);
+        track.file_path = Some(track_path.to_string_lossy().into_owned());
+        track_repo.create(&track).unwrap();
+
+        // Album starts with no cover.
+        assert!(
+            album_repo
+                .get(alid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        );
+
+        let filled = backfill_embedded_covers(&backend, &cache_dir);
+        assert_eq!(filled, 1, "backfill should fill exactly one album");
+        let cover = album_repo.get(alid).unwrap().unwrap().cover_path;
+        assert!(
+            cover.as_deref().is_some_and(|c| !c.is_empty()),
+            "album cover_path should be set after backfill"
+        );
+
+        // Second run is a no-op: the album now has a cover.
+        let filled_again = backfill_embedded_covers(&backend, &cache_dir);
+        assert_eq!(
+            filled_again, 0,
+            "backfill must not re-process covered albums"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

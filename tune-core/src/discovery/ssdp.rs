@@ -619,6 +619,19 @@ async fn process_responses(
                             content_directory_url: full_cd_url,
                             host,
                         };
+                        // Record the media server as known so later SSDP cycles
+                        // skip it (see the `!known` gate above). Renderers are
+                        // recorded the same way further down; media servers were
+                        // omitted, so every ~2 min cycle re-fetched their
+                        // description and re-logged this INFO line — dozens of
+                        // duplicate `ssdp_media_server_discovered` entries that
+                        // drowned the playback traces in tester logs and made
+                        // DLNA issues undiagnosable (#954).
+                        state
+                            .lock()
+                            .await
+                            .known_locations
+                            .insert(dev_id.clone(), resp.location.clone());
                         info!(
                             id = %dev_id,
                             name = %ms.name,

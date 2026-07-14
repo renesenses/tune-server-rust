@@ -24,6 +24,14 @@ struct DashboardParams {
     top_n: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct SlotParams {
+    period: Option<String>,
+    weekday: i64,
+    hour: i64,
+    limit: Option<i64>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(recent_history).delete(clear_history))
@@ -31,7 +39,27 @@ pub fn router() -> Router<AppState> {
         .route("/top-artists", get(top_artists))
         .route("/top-albums", get(top_albums))
         .route("/dashboard", get(dashboard))
+        .route("/at", get(slot_tracks))
         .route("/export", get(export_csv))
+}
+
+/// Tracks listened during one weekday×hour heatmap cell (drill-down).
+async fn slot_tracks(State(state): State<AppState>, Query(p): Query<SlotParams>) -> Json<Value> {
+    let period = p.period.as_deref().unwrap_or("30d");
+    let limit = p.limit.unwrap_or(50).clamp(1, 500);
+    let repo = HistoryRepo::with_backend(state.backend.clone());
+    match repo.history_at_slot(period, p.weekday, p.hour, limit) {
+        Ok(items) => Json(json!({
+            "weekday": p.weekday,
+            "hour": p.hour,
+            "period": period,
+            "tracks": items,
+        })),
+        Err(e) => {
+            tracing::warn!(error = %e, weekday = p.weekday, hour = p.hour, "history_slot_failed");
+            Json(json!({ "weekday": p.weekday, "hour": p.hour, "period": period, "tracks": [] }))
+        }
+    }
 }
 
 async fn recent_history(

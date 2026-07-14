@@ -323,8 +323,8 @@ fn build_smart_query(
             .and_then(|v| v.as_str())
             .unwrap_or("contains");
         let op = match raw_op {
-            "greater_than" => "gte",
-            "less_than" => "lte",
+            "greater_than" | ">=" | "gte" => "gte",
+            "less_than" | "<=" | "lte" => "lte",
             "equals" => "eq",
             "not_equals" => "neq",
             other => other,
@@ -356,10 +356,41 @@ fn build_smart_query(
             ("artist", "contains") => {
                 format!("(ar.name LIKE '%{val_clean}%' OR ar.name LIKE '%{val_unaccented}%')")
             }
+            // Album rules were missing entirely, so "Album contient LUX" fell
+            // through to `_ => continue` and silently applied no filter — the
+            // playlist then returned every track (forum #1008, Sergio). al is
+            // joined in the query, so al.title is available here.
+            ("album", "eq") => {
+                if has_accents {
+                    format!("(al.title = '{val_clean}' OR al.title = '{val_unaccented}')")
+                } else {
+                    format!("(al.title = '{val_clean}' OR al.title LIKE '{val_clean}')")
+                }
+            }
+            ("album", "contains") => {
+                format!("(al.title LIKE '%{val_clean}%' OR al.title LIKE '%{val_unaccented}%')")
+            }
             ("year", "eq") => format!("t.year = {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "gte") => format!("t.year >= {}", value.parse::<i32>().unwrap_or(0)),
             ("year", "lte") => format!("t.year <= {}", value.parse::<i32>().unwrap_or(0)),
+            // "Année contient 2025": year is stored as an integer, so match on
+            // its text form (also lets "202" match a decade). Without this arm
+            // the rule was dropped (#1008).
+            ("year", "contains") => {
+                format!(
+                    "CAST(t.year AS TEXT) LIKE '%{}%'",
+                    value.replace('\'', "''")
+                )
+            }
             ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
+            // "Format contient FLAC": case-insensitive so "flac"/"FLAC"/"flc"
+            // all match. Was dropped before (#1008).
+            ("format", "contains") => {
+                format!(
+                    "UPPER(t.format) LIKE UPPER('%{}%')",
+                    value.replace('\'', "''")
+                )
+            }
             ("sample_rate", "gte") | ("sample_rate", "gt") => {
                 format!("t.sample_rate > {}", value.parse::<i32>().unwrap_or(0))
             }
@@ -369,6 +400,11 @@ fn build_smart_query(
             ("sample_rate", "eq") => {
                 format!("t.sample_rate = {}", value.parse::<i32>().unwrap_or(0))
             }
+            ("bit_depth", "gte") => format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "lte") => format!("t.bit_depth <= {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "gt") => format!("t.bit_depth > {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "lt") => format!("t.bit_depth < {}", value.parse::<i32>().unwrap_or(0)),
+            ("bit_depth", "eq") => format!("t.bit_depth = {}", value.parse::<i32>().unwrap_or(0)),
             ("duration_ms", "gte") => {
                 format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0))
             }
@@ -678,4 +714,56 @@ fn strip_accents(s: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_smart_query;
+
+    fn where_of(rules: &str) -> String {
+        let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None);
+        w
+    }
+
+    // #1008: "Album/Année/Format contient X" produced no WHERE at all (the
+    // (field, op) pairs were unhandled → `_ => continue`), so every rule was
+    // silently dropped and the playlist returned all tracks. Each must now
+    // build a real condition on the right column.
+    #[test]
+    fn album_contains_builds_condition() {
+        let w = where_of(r#"[{"field":"album","op":"contains","value":"LUX"}]"#);
+        assert!(w.contains("al.title LIKE '%LUX%'"), "got: {w}");
+    }
+
+    #[test]
+    fn year_contains_builds_condition() {
+        let w = where_of(r#"[{"field":"year","op":"contains","value":"2025"}]"#);
+        assert!(w.contains("CAST(t.year AS TEXT) LIKE '%2025%'"), "got: {w}");
+    }
+
+    #[test]
+    fn format_contains_is_case_insensitive() {
+        let w = where_of(r#"[{"field":"format","op":"contains","value":"flac"}]"#);
+        assert!(
+            w.contains("UPPER(t.format) LIKE UPPER('%flac%')"),
+            "got: {w}"
+        );
+    }
+
+    #[test]
+    fn three_contains_rules_are_all_applied_not_dropped() {
+        // The exact combination Sergio reported: three rules that previously
+        // all fell through to `continue`, yielding an empty WHERE. Now each
+        // contributes its own AND-ed condition.
+        let w = where_of(
+            r#"[{"field":"album","op":"contains","value":"LUX"},
+                {"field":"year","op":"contains","value":"2025"},
+                {"field":"format","op":"contains","value":"FLAC"}]"#,
+        );
+        assert!(
+            w.starts_with("WHERE"),
+            "expected a non-empty WHERE, got: {w}"
+        );
+        assert_eq!(w.matches(" AND ").count(), 2, "three rules → two ANDs: {w}");
+    }
 }
