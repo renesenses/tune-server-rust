@@ -174,18 +174,6 @@ pub(crate) mod decisions {
         last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
     }
 
-    /// The tracked peak position already reached (or exceeded) the track's
-    /// duration — definitive proof the track genuinely played to the end.
-    /// Used to override the `played_enough` guard on a position reset: a stale
-    /// peak that survived (e.g. a seek preserves peak, then the SAME track
-    /// repeats without a track_generation bump) would otherwise be kept and
-    /// trip a premature "past end" ~1.5s into the new cycle (DEvir bug-19:
-    /// repeat-one on ASIO Fireface). When the peak is beyond duration, a drop
-    /// back to ~0 can only be a real new cycle, so the reset is safe to accept.
-    pub fn peak_beyond_duration(peak_position_ms: u64, track_duration_ms: u64) -> bool {
-        track_duration_ms > 0 && peak_position_ms >= track_duration_ms
-    }
-
     /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
     /// treated as a natural track end (re-trigger play) rather than a playback
     /// failure (stop the zone)?
@@ -966,31 +954,7 @@ impl PositionPoller {
             ps.last_position_ms = status.position_ms;
 
             if position_reset {
-                if !played_enough
-                    && decisions::peak_beyond_duration(ps.peak_position_ms, track_duration_ms)
-                {
-                    // The `played_enough` guard says "not enough played" only
-                    // because wall-clock is short on this fresh cycle — but the
-                    // tracked peak already reached the track's end, so this is a
-                    // genuine new cycle (a seek preserved the stale peak, then
-                    // the same track repeated without a track_generation bump).
-                    // Clear the stale per-track position state so it can't trip
-                    // the "past end" detector ~1.5s in (DEvir bug-19: repeat-one
-                    // on ASIO Fireface stopped early). Do NOT advance the queue:
-                    // the repeat/auto_next already re-played the track; this only
-                    // clears the leftover state.
-                    info!(
-                        zone_id,
-                        peak_pos = ps.peak_position_ms,
-                        track_dur = track_duration_ms,
-                        "position_reset_clearing_stale_peak_beyond_duration"
-                    );
-                    ps.peak_position_ms = 0;
-                    ps.last_position_ms = 0;
-                    ps.past_end_ticks = 0;
-                    ps.stopped_ticks = 0;
-                    ps.track_started_at = Some(Instant::now());
-                } else if !played_enough {
+                if !played_enough {
                     warn!(
                         zone_id,
                         peak_pos = ps.peak_position_ms,
@@ -2055,18 +2019,6 @@ mod tests {
         assert!(!decisions::position_reset(40_000, 8_000, true));
         // Previous position not above the 30s ceiling → not a reset.
         assert!(!decisions::position_reset(20_000, 2_000, true));
-    }
-
-    #[test]
-    fn peak_beyond_duration_detects_stale_peak() {
-        // DEvir bug-19: peak reached the real audio end (258113) past the
-        // metadata duration (258000) → a repeat's position reset must clear it.
-        assert!(decisions::peak_beyond_duration(258_113, 258_000));
-        assert!(decisions::peak_beyond_duration(258_000, 258_000));
-        // Mid-track peak → not beyond duration (a real "not enough played").
-        assert!(!decisions::peak_beyond_duration(120_000, 258_000));
-        // Unknown duration must never qualify.
-        assert!(!decisions::peak_beyond_duration(999_999, 0));
     }
 
     #[test]
