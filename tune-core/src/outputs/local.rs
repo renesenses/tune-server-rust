@@ -322,37 +322,24 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
     let mut devices = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
+    // Signature = (raw name, caps). Windows WASAPI can list the same physical
+    // endpoint (onboard "HDA ..." codecs) more than once with an identical name
+    // AND identical capabilities; those true duplicates are collapsed so they
+    // don't spawn a phantom second zone (Elie).
+    let mut seen_signatures = std::collections::HashSet::new();
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
-                let name = device
+                let raw_name = device
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
 
                 // Skip ALSA null/dummy sinks that produce no audio
-                if name.contains("Discard all samples") || name.contains("Dummy") {
-                    debug!(device = %name, "local_audio_device_skipped_null_sink");
+                if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
+                    debug!(device = %raw_name, "local_audio_device_skipped_null_sink");
                     continue;
                 }
-
-                // Disambiguate duplicate device names (common on Windows WASAPI
-                // where multiple USB DACs all show as "Haut-Parleurs").
-                let name = if seen_names.contains(&name) {
-                    let mut n = 2;
-                    loop {
-                        let candidate = format!("{name} ({n})");
-                        if !seen_names.contains(&candidate) {
-                            break candidate;
-                        }
-                        n += 1;
-                    }
-                } else {
-                    name
-                };
-                seen_names.insert(name.clone());
-
-                let is_default = name == default_name;
 
                 let (max_channels, sample_rates) = match device.supported_output_configs() {
                     Ok(configs) => {
@@ -377,22 +364,50 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                         // through to the fallback probe below.
                         if max_ch == 0 || rates.is_empty() {
                             debug!(
-                                device = %name,
+                                device = %raw_name,
                                 "local_audio_device_supported_configs_empty"
                             );
-                            probe_device_fallback_caps(&device, &name)
+                            probe_device_fallback_caps(&device, &raw_name)
                         } else {
                             (max_ch, rates)
                         }
                     }
                     Err(_) => {
                         debug!(
-                            device = %name,
+                            device = %raw_name,
                             "local_audio_device_supported_configs_failed"
                         );
-                        probe_device_fallback_caps(&device, &name)
+                        probe_device_fallback_caps(&device, &raw_name)
                     }
                 };
+
+                // Collapse true duplicates (same name AND same caps = same
+                // physical device). Genuinely different devices that merely share
+                // a name (e.g. two USB DACs) differ in caps and fall through to
+                // the disambiguation below, staying individually selectable.
+                let signature = (raw_name.clone(), max_channels, sample_rates.clone());
+                if !seen_signatures.insert(signature) {
+                    debug!(device = %raw_name, "local_audio_device_skipped_duplicate");
+                    continue;
+                }
+
+                // Disambiguate duplicate device names (common on Windows WASAPI
+                // where multiple USB DACs all show as "Haut-Parleurs").
+                let name = if seen_names.contains(&raw_name) {
+                    let mut n = 2;
+                    loop {
+                        let candidate = format!("{raw_name} ({n})");
+                        if !seen_names.contains(&candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    raw_name.clone()
+                };
+                seen_names.insert(name.clone());
+
+                let is_default = raw_name == default_name;
 
                 info!(
                     device = %name,
