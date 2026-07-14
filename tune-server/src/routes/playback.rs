@@ -2270,7 +2270,12 @@ pub async fn shuffle_all(
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
             .unwrap_or_default()
     } else {
-        track_repo.random_ids(100).unwrap_or_default()
+        // Whole-library shuffle: queue every track, not just 100 (tester wanted
+        // to shuffle the entire library). Album/artist shuffles above are
+        // already uncapped, so this makes the no-filter case consistent. IDs are
+        // i64s so even a large library is cheap to hold; the Fisher-Yates below
+        // reshuffles them anyway.
+        track_repo.random_ids(i64::MAX).unwrap_or_default()
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();
