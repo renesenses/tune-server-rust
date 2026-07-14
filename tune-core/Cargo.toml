@@ -39,6 +39,7 @@ cbc = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
+audiopus = { workspace = true }
 rubato = { workspace = true }
 hound = { workspace = true }
 unicode-normalization = { workspace = true }
