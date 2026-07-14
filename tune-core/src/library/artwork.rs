@@ -306,26 +306,41 @@ pub async fn fetch_artist_image(
         .build()
         .ok()?;
 
-    // 1. Mozaiklabs community (fastest, no rate limit)
-    if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
-        return Some(bytes);
+    // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
+    if !mbid.is_empty() {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
+            return Some(bytes);
+        }
     }
 
-    // 2. Fanart.tv
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
-        return Some(bytes);
+    // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
+    // for artists without an MBID (which never reach the by-MBID lookup above),
+    // BEFORE falling back to any external source.
+    if !artist_name.is_empty() {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name).await {
+            return Some(bytes);
+        }
     }
 
-    // 3. TheAudioDB (free API, good coverage)
-    if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
-        return Some(bytes);
-    }
+    // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
+    // (avoids pointless requests + their rate-limit sleeps during a force pass).
+    if !mbid.is_empty() {
+        // 2. Fanart.tv
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
+            return Some(bytes);
+        }
 
-    // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
-        return Some(bytes);
+        // 3. TheAudioDB (free API, good coverage)
+        if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
+            return Some(bytes);
+        }
+
+        // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
+            return Some(bytes);
+        }
     }
 
     // 6. Discogs (if token configured, search by artist name)
@@ -385,6 +400,52 @@ async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> 
     if image_url.is_empty() {
         return None;
     }
+    let full_url = if image_url.starts_with('/') {
+        format!("https://mozaiklabs.fr{image_url}")
+    } else {
+        image_url.to_string()
+    };
+    download_image(client, &full_url).await
+}
+
+/// Fetch an artist image from mozaiklabs.fr by **name** (community metadata),
+/// via `GET /api/v1/artists/search?q=<name>`. Used as a fallback for artists
+/// without an MBID so mozaiklabs stays the priority source for them too.
+///
+/// Requires an exact (case-insensitive) name match on a result that actually
+/// has a non-empty `image_url`, to avoid grabbing the wrong artist from the
+/// substring (`ilike %q%`) search.
+async fn fetch_artist_image_mozaiklabs_by_name(
+    client: &reqwest::Client,
+    artist_name: &str,
+) -> Option<Vec<u8>> {
+    let q = artist_name.trim();
+    if q.len() < 2 {
+        return None;
+    }
+    let url = format!(
+        "https://mozaiklabs.fr/api/v1/artists/search?q={}",
+        urlencoding::encode(q)
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let results = data.get("data")?.as_array()?;
+    let want = q.to_lowercase();
+    let image_url = results
+        .iter()
+        .filter(|a| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.trim().to_lowercase() == want)
+        })
+        .find_map(|a| {
+            a.get("image_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })?;
     let full_url = if image_url.starts_with('/') {
         format!("https://mozaiklabs.fr{image_url}")
     } else {
@@ -688,10 +749,11 @@ async fn batch_enrich_artist_artwork_inner(
     }
 
     // --- Phase 2: Fetch from external sources ---
-    // Force mode re-fetches EVERY artist with an MBID (overwriting stale
-    // entries); normal mode only targets artists without an image.
+    // Force mode re-fetches EVERY artist (overwriting stale entries), including
+    // those without an MBID — mozaiklabs-by-name + other by-name sources can
+    // still find them. Normal mode only targets artists without an image.
     let mut artists = match if force {
-        artist_repo.list_with_mbid()
+        artist_repo.list_all_id_name_mbid()
     } else {
         artist_repo.list_without_image()
     } {
