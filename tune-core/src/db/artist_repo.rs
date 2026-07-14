@@ -139,7 +139,7 @@ pub mod sql {
     /// Engine-agnostic full-text search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(a.name) LIKE LOWER({}) LIMIT {}",
+            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({})) LIMIT {}",
             d.fts_where("artists", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3)
@@ -630,6 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn search_artist_accent_insensitive() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        repo.create(&Artist::new("Carlão".into())).unwrap();
+        repo.create(&Artist::new("Beyoncé".into())).unwrap();
+
+        // Query without accents finds the accented name…
+        assert_eq!(repo.search("carlao", 10).unwrap().len(), 1);
+        assert_eq!(repo.search("beyonce", 10).unwrap().len(), 1);
+        // …and querying WITH accents still works.
+        assert_eq!(repo.search("carlão", 10).unwrap().len(), 1);
+        // Uppercase accented query folds too (LOWER after unaccent).
+        assert_eq!(repo.search("CARLAO", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn artist_count() {
         let db = test_db();
         let repo = ArtistRepo::new(db.clone());
@@ -793,8 +809,8 @@ mod tests {
         );
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
-        assert!(s_sql.contains("LOWER(a.name) LIKE LOWER(?)"));
-        assert!(p_sql.contains("LOWER(a.name) LIKE LOWER($2)"));
+        assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
+        assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
     }
 
     #[test]

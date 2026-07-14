@@ -23,6 +23,24 @@ const PRAGMAS_BASE: &str = "PRAGMA journal_mode=WAL;
              PRAGMA mmap_size=268435456;
              PRAGMA analysis_limit=400;";
 
+/// Register the `unaccent(text)` scalar function so SQLite `LIKE` search can be
+/// accent-insensitive, matching PostgreSQL's `unaccent()` extension. Must be
+/// called on every connection (writer + each reader), since SQLite functions
+/// are per-connection.
+fn register_functions(conn: &Connection) -> Result<(), String> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "unaccent",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s = ctx.get::<String>(0)?;
+            Ok(crate::db::engine::fold_diacritics(&s))
+        },
+    )
+    .map_err(|e| format!("register unaccent: {e}"))
+}
+
 /// Build the full PRAGMA batch, including adaptive cache_size.
 /// Respects `TUNE_CACHE_SIZE` env override (value in negative KB, e.g. `-128000`).
 fn build_pragmas() -> String {
@@ -49,6 +67,7 @@ impl SqliteDb {
             .map_err(|e| format!("sqlite open {path}: {e}"))?;
         conn.execute_batch(&pragmas)
             .map_err(|e| format!("pragma: {e}"))?;
+        register_functions(&conn)?;
 
         // Checkpoint WAL before opening read connections so readers
         // see the latest committed data (prevents stale reads after
@@ -65,6 +84,7 @@ impl SqliteDb {
                 .map_err(|e| format!("pragma read[{i}]: {e}"))?;
             rc.execute_batch("PRAGMA query_only = ON;")
                 .map_err(|e| format!("pragma query_only read[{i}]: {e}"))?;
+            register_functions(&rc)?;
             read_pool.push(Arc::new(Mutex::new(rc)));
         }
 
@@ -82,6 +102,7 @@ impl SqliteDb {
 
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| format!("pragma: {e}"))?;
+        register_functions(&conn)?;
 
         // In-memory DBs: share the same connection for reads and writes
         // (separate in-memory connections don't share data)
