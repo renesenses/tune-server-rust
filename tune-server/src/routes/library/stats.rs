@@ -103,14 +103,33 @@ pub(super) async fn completeness_stats(
     let albums_with_year: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a JOIN tracks t ON t.album_id = a.id WHERE t.year IS NOT NULL AND t.year > 0", [], |row| row.get(0)).unwrap_or(0);
     drop(conn);
 
-    let total_artists: i64 = {
+    // Count only album-artists — the same set the library shows — so the
+    // completeness figures match the artist total elsewhere. Counting every row
+    // in `artists` over-counted by ~the number of compilation/track-only artists
+    // (Bilou: 1808 vs 1505 real artists).
+    let (total_artists, artists_without_image): (i64, i64) = {
         let conn = state
             .db
             .connection()
             .lock()
             .map_err(|e| AppError::internal(format!("{e}")))?;
-        conn.query_row("SELECT COUNT(*) FROM artists", [], |row| row.get(0))
-            .unwrap_or(0)
+        let total = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        // Real "without image" count over the same album-artist set — was
+        // previously just `total_artists`, i.e. every artist reported as missing.
+        let without_image = conn
+            .query_row(
+                "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) AND (image_path IS NULL OR image_path = '')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        (total, without_image)
     };
 
     let genre_pct = if total_tracks > 0 {
@@ -169,7 +188,7 @@ pub(super) async fn completeness_stats(
         "albums_without_genre": total_albums - albums_with_genre,
         "albums_without_year": total_albums - albums_with_year,
         "tracks_without_artist": total_tracks - with_artist,
-        "artists_without_image": total_artists,
+        "artists_without_image": artists_without_image,
         "genre_pct": genre_pct.round(),
         "year_pct": year_pct.round(),
         "artist_pct": artist_pct.round(),
