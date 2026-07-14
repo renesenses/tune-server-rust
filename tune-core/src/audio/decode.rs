@@ -339,7 +339,10 @@ pub fn decode_to_pcm(
     // still hit the fallback — that path is effectively unsupported without
     // ffmpeg, but it's the pre-existing Opus limitation, not a regression.
     if ext == "opus" || ext == "webm" || ext == "weba" {
-        return decode_via_ffmpeg(
+        // Opus-in-WebM (YouTube) / Ogg-Opus: symphonia demuxes the container
+        // (mkv/ogg features) but has no Opus decoder, so the packets are fed to
+        // libopus via audiopus. This restores YouTube→DLNA sound (forum #940).
+        return decode_opus_to_pcm(
             file_path,
             target_sample_rate,
             target_channels,
@@ -368,6 +371,114 @@ pub fn decode_to_pcm(
             Err(format!("decode panic ({ext}): {msg}"))
         }
     }
+}
+
+/// Decode Opus audio (Opus-in-WebM from YouTube, or Ogg-Opus) to PCM.
+///
+/// symphonia demuxes the WebM/Ogg container (the `mkv`/`ogg` features) but has
+/// no Opus codec, so we pull the raw Opus packets and decode them with libopus
+/// (audiopus). Opus is always 48 kHz internally; we return native 48 kHz / 16
+/// bit and let the caller's encoder follow that rate. Restores YouTube→DLNA
+/// audio (forum #940): before this, Opus streams decoded to silence.
+fn decode_opus_to_pcm(
+    file_path: &str,
+    _target_sample_rate: Option<u32>,
+    _target_channels: Option<u32>,
+    _seek_s: f64,
+    max_duration_s: f64,
+) -> Result<DecodedAudio, String> {
+    use audiopus::{
+        Channels, MutSignals, SampleRate, coder::Decoder as OpusDecoder,
+        packet::Packet as OpusPacket,
+    };
+
+    let file = File::open(file_path).map_err(|e| format!("open opus: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = Path::new(file_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("opus probe: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or("opus: no audio track")?;
+    let track_id = track.id;
+    let ch: usize = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => {
+            p.channels.as_ref().map(|c| c.count() as usize).unwrap_or(2)
+        }
+        _ => 2,
+    }
+    .clamp(1, 2); // libopus decoder: mono or stereo
+    let channels_enum = if ch == 1 {
+        Channels::Mono
+    } else {
+        Channels::Stereo
+    };
+
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, channels_enum)
+        .map_err(|e| format!("opus decoder init: {e}"))?;
+
+    // 120 ms is the largest Opus frame @ 48 kHz (5760 samples/channel).
+    let mut out_buf = vec![0i16; 5760 * ch];
+    let mut samples_i32: Vec<i32> = Vec::new();
+    let max_samples = if max_duration_s > 0.0 {
+        (max_duration_s * 48000.0) as usize * ch
+    } else {
+        usize::MAX
+    };
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        if packet.data.is_empty() {
+            continue;
+        }
+        let opus_pkt = match OpusPacket::try_from(&packet.data[..]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let sig = match MutSignals::try_from(&mut out_buf[..]) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("opus output buffer: {e}")),
+        };
+        match decoder.decode(Some(opus_pkt), sig, false) {
+            Ok(n) => {
+                let count = (n * ch).min(out_buf.len());
+                samples_i32.extend(out_buf[..count].iter().map(|&s| s as i32));
+            }
+            Err(_) => continue,
+        }
+        if samples_i32.len() >= max_samples {
+            break;
+        }
+    }
+
+    if samples_i32.is_empty() {
+        return Err("opus: decoded no audio".into());
+    }
+    let duration_s = (samples_i32.len() / ch) as f64 / 48000.0;
+    Ok(DecodedAudio {
+        samples_i32,
+        bit_depth: 16,
+        sample_rate: 48000,
+        channels: ch as u32,
+        duration_s,
+    })
 }
 
 /// Streaming decode: decodes a file packet-by-packet and sends PCM chunks
