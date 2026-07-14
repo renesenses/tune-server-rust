@@ -1732,13 +1732,23 @@ impl PlaybackOrchestrator {
             };
             let is_truncated = prefetch_buffer_truncated(buffered_ms, prefetched.duration_ms);
 
-            if is_network && is_truncated {
+            // Skip a truncated prefetch buffer for EVERY output, not just DLNA.
+            // The prefetch head-start is only ~30s; `serve_prefetched_pcm` feeds
+            // exactly that PCM into the session and then drops the sender. On a
+            // network output that meant a short file; on a LOCAL EXCLUSIVE output
+            // (ASIO) the blocking HTTP read never gets a clean EOF at the loop
+            // point, so once the 30s buffer is consumed the audio thread starves
+            // and freezes until the 20s watchdog resets the host to WASAPI
+            // (DEvir bug-20, repeat-one on a >30s track). Fetching the full
+            // stream instead keeps the exclusive read fed for the whole track.
+            if is_truncated {
                 info!(
                     service = service_name,
                     source_id = %source_id,
                     buffered_ms,
                     duration_ms = prefetched.duration_ms,
-                    "prefetch_skip_truncated_for_dlna"
+                    is_network,
+                    "prefetch_skip_truncated_serving_full_stream"
                 );
             } else {
                 info!(
