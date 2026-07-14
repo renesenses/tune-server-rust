@@ -4012,9 +4012,21 @@ impl PlaybackOrchestrator {
         if let Some(item) = queue.iter().find(|i| i.position == position) {
             let album = item.album_title.clone();
             let cover = item.cover_path.clone();
+            // Resolve a LOCAL output's gapless-next through its real device so the
+            // format matches a normal play (WAV). Passing None made resolve_stream
+            // serve FLAC direct, which the local gapless chain can't consume — it
+            // needs WAV, so the chain broke (gapless_next_not_wav_falling_back) and
+            // the track was skipped (forum #1037, Jean Valjean). Scoped to local
+            // outputs so DLNA/network gapless keeps its current working format.
+            let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+                .filter(|d| d.starts_with("local:"));
             let req = PlayRequest {
                 zone_id,
-                output_device_id: None,
+                output_device_id,
                 track_id: Some(item.track_id),
                 source: None,
                 source_id: None,
