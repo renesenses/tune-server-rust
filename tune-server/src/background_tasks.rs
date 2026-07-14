@@ -16,6 +16,17 @@ use serde::Serialize;
 use serde_json::json;
 use tune_core::event_bus::EventBus;
 
+/// Granular progress for a task, when the runner reports it (e.g. artist-image
+/// enrichment publishes "MusicBrainz 340/1183"). Omitted for tasks that only
+/// signal presence.
+#[derive(Clone, Serialize)]
+pub struct TaskProgress {
+    pub processed: u64,
+    pub total: u64,
+    /// Sub-phase label, e.g. `"MusicBrainz"` or `"Images"`.
+    pub detail: String,
+}
+
 /// A single background task currently in progress.
 #[derive(Clone, Serialize)]
 pub struct BackgroundTask {
@@ -25,6 +36,9 @@ pub struct BackgroundTask {
     pub label: String,
     /// Coarse category — e.g. `"enrichment"`.
     pub kind: String,
+    /// Optional granular progress; omitted from JSON when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TaskProgress>,
 }
 
 /// Registry of in-progress background tasks. Cheap to clone (shared `Arc`s).
@@ -71,6 +85,7 @@ impl BackgroundTasks {
                     id: id.clone(),
                     label: label.into(),
                     kind: kind.into(),
+                    progress: None,
                 },
             );
         }
@@ -79,6 +94,21 @@ impl BackgroundTasks {
             tasks: self.clone(),
             id,
         }
+    }
+
+    /// Attach/refresh granular progress on an already-registered task. No-op if
+    /// the task isn't currently active (e.g. it just finished and cleared).
+    pub fn update_progress(&self, id: &str, processed: u64, total: u64, detail: impl Into<String>) {
+        {
+            let mut map = self.inner.lock().unwrap();
+            let Some(task) = map.get_mut(id) else { return };
+            task.progress = Some(TaskProgress {
+                processed,
+                total,
+                detail: detail.into(),
+            });
+        }
+        self.emit();
     }
 
     /// Current tasks, sorted by id for a stable UI ordering.

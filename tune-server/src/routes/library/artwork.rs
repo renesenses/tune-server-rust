@@ -380,14 +380,47 @@ pub(super) async fn batch_enrich_artist_artwork(
         "Récupération des images d'artistes…",
         "enrichment",
     );
+    let bg_tasks = state.background_tasks.clone();
+    let poll_db = state.backend.clone();
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
+
+        // Mirror the enrichment's granular progress (written to the
+        // `artist_artwork_enrich_result` setting by the two phases) into the
+        // background-tasks registry, so the global indicator shows e.g.
+        // "MusicBrainz 340/1183" instead of a bare "in progress" (grafts the
+        // per-artist detail onto the presence-only task).
+        let progress_poller = tokio::spawn(async move {
+            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(poll_db);
+            for _ in 0..1200u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let Some(raw) = settings.get("artist_artwork_enrich_result").ok().flatten() else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if v.get("status").and_then(|s| s.as_str()) != Some("running") {
+                    break;
+                }
+                let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
+                let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
+                let detail = match v.get("phase").and_then(|s| s.as_str()) {
+                    Some("images") => "Images",
+                    _ => "MusicBrainz",
+                };
+                bg_tasks.update_progress("artist_artwork", processed, total, detail);
+            }
+        });
+
         // Phase 1: Match artists without MBID by searching MusicBrainz
         let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
         tracing::info!(matched, "batch_artist_mbid_phase_complete");
 
         // Phase 2: Fetch images for all artists with MBID but no image
         tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
+
+        progress_poller.abort();
     });
 
     (
