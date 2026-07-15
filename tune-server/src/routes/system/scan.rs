@@ -245,7 +245,15 @@ pub(super) async fn trigger_scan(
                 let is_pg = db.engine() == tune_core::db::engine::Engine::Postgres;
                 if !is_pg {
                     if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
+                        // A failed BEGIN means a transaction is already open on
+                        // the shared connection (a previous batch that didn't
+                        // commit). Roll it back and retry so the connection
+                        // recovers instead of staying poisoned — which would make
+                        // every playback set_queue fail for the rest of the
+                        // session (Yves: stuck on the last track during a scan).
                         tracing::warn!(error = %e, batch = batch_idx, "scan_batch_begin_failed");
+                        let _ = db.execute_batch("ROLLBACK");
+                        let _ = db.execute_batch("BEGIN IMMEDIATE");
                     }
                 }
 
@@ -708,6 +716,9 @@ pub(super) async fn trigger_scan(
                 if !is_pg {
                     if let Err(e) = db.execute_batch("COMMIT") {
                         tracing::warn!(error = %e, batch = batch_idx, "scan_batch_commit_failed");
+                        // Don't leave a half-open transaction poisoning the
+                        // shared connection for subsequent writes.
+                        let _ = db.execute_batch("ROLLBACK");
                     }
                 }
 
@@ -786,6 +797,8 @@ pub(super) async fn trigger_scan(
         if !is_pg {
             if let Err(e) = db.execute_batch("BEGIN IMMEDIATE") {
                 tracing::warn!(error = %e, "post_scan_begin_failed");
+                let _ = db.execute_batch("ROLLBACK");
+                let _ = db.execute_batch("BEGIN IMMEDIATE");
             }
         }
         {
@@ -896,6 +909,7 @@ pub(super) async fn trigger_scan(
         if !is_pg {
             if let Err(e) = db.execute_batch("COMMIT") {
                 tracing::warn!(error = %e, "post_scan_commit_failed");
+                let _ = db.execute_batch("ROLLBACK");
             }
         }
 
