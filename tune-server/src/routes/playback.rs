@@ -368,6 +368,38 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
     Json(v)
 }
 
+/// Replace a zone's queue, retrying briefly on the transient
+/// "cannot start a transaction within a transaction" error.
+///
+/// A library scan holds a per-batch write transaction on the shared SQLite
+/// connection (BEGIN IMMEDIATE … COMMIT) while releasing the connection mutex
+/// between statements, so a concurrent `set_queue` sees an open transaction and
+/// fails. Each scan batch commits within ~1–2 s, so a few short async waits let
+/// playback replace the queue instead of failing silently and leaving the user
+/// stuck on the current track (Yves: impossible de quitter le dernier MP3
+/// pendant qu'un scan tourne). Non-transient errors return immediately.
+async fn set_queue_retrying(
+    queue_repo: &PlayQueueRepo,
+    zone_id: i64,
+    track_ids: &[i64],
+) -> Result<(), String> {
+    const MAX_ATTEMPTS: usize = 12;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        match queue_repo.set_queue(zone_id, track_ids) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("within a transaction") => {
+                last_err = e;
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
+}
+
 async fn play(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
@@ -832,7 +864,7 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    if let Err(e) = queue_repo.set_queue(zone_id, &track_ids) {
+    if let Err(e) = set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
         warn!(zone_id, error = %e, "set_queue_failed");
     }
 
