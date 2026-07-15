@@ -95,7 +95,10 @@ impl UpdateChecker {
             if is_pre && !on_beta {
                 continue; // stable clients never see prereleases
             }
-            let version = rel["tag_name"].as_str().unwrap_or("").trim_start_matches('v');
+            let version = rel["tag_name"]
+                .as_str()
+                .unwrap_or("")
+                .trim_start_matches('v');
             if version.is_empty() || !is_newer(version, &best_version) {
                 continue;
             }
@@ -215,9 +218,9 @@ fn is_newer(remote: &str, current: &str) -> bool {
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => match (r_pre, c_pre) {
-            (None, None) => false,       // identical
-            (None, Some(_)) => true,     // final > prerelease of same version
-            (Some(_), None) => false,    // prerelease < its own final
+            (None, None) => false,    // identical
+            (None, Some(_)) => true,  // final > prerelease of same version
+            (Some(_), None) => false, // prerelease < its own final
             (Some(rp), Some(cp)) => cmp_nums(&rp, &cp) == Ordering::Greater,
         },
     }
