@@ -260,7 +260,7 @@ impl PlaybackOrchestrator {
         // Bump track_generation NOW so the poller resets its wall-clock
         // timer immediately. Without this, a long DASH transcode (20-30s)
         // can run into the 300s timeout from the previous track.
-        self.playback.bump_generation(req.zone_id).await;
+        let play_gen = self.playback.bump_generation(req.zone_id).await;
 
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
             self.resolve_uploaded_file(temp_path, &req).await?
@@ -268,6 +268,31 @@ impl PlaybackOrchestrator {
             self.resolve_stream(&req).await?
         };
         let resolve_ms = play_start.elapsed().as_millis();
+
+        // If a newer play for this zone started while we were resolving, abort
+        // before sending output. Resolving can take tens of seconds (a slow
+        // network-volume ALAC→FLAC transcode for a DLNA renderer), during which
+        // a user tapping play again — or the poller — stacks several plays; if
+        // each one pushed its stream to the renderer, the overlapping audio came
+        // out as noise (Yves, DMP-A10 over DLNA). Only the latest play should
+        // reach the device.
+        if self.playback.current_play_seq(req.zone_id).await != play_gen {
+            info!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                resolve_ms,
+                "orchestrator_play_superseded_skipping_output"
+            );
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            return Ok(PlayResult {
+                stream_url: None,
+                output_sent: false,
+                source: resolved.source,
+                error: Some("superseded by a newer play".into()),
+            });
+        }
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
         let album = req.album_title.clone().or(resolved.album.clone());

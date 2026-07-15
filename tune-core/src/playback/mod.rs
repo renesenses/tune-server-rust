@@ -56,6 +56,13 @@ pub struct ZoneState {
     /// previous track cannot trigger false advances.
     #[serde(default)]
     pub track_generation: u64,
+    /// Monotonic play-request counter, bumped only when a new play is issued
+    /// for this zone (`bump_generation`). Unlike `track_generation` — which the
+    /// poller also bumps on recovery — this changes ONLY on an actual new play,
+    /// so the orchestrator can detect that a newer play superseded an in-flight
+    /// one (slow resolve) and skip sending a second, overlapping stream.
+    #[serde(default)]
+    pub play_seq: u64,
     /// Timestamp of the last seek operation.  The poller checks this and
     /// suppresses stale position updates from the output for a brief grace
     /// period so the UI doesn't snap back to the pre-seek position.
@@ -90,6 +97,7 @@ impl Default for ZoneState {
             queue_position: 0,
             queue_length: 0,
             track_generation: 0,
+            play_seq: 0,
             last_seek_at: None,
             last_volume_set_at: None,
         }
@@ -153,13 +161,27 @@ impl PlaybackManager {
         zones.values().cloned().collect()
     }
 
-    pub async fn bump_generation(&self, zone_id: i64) {
+    pub async fn bump_generation(&self, zone_id: i64) -> u64 {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {
             zone_id,
             ..Default::default()
         });
         state.track_generation = state.track_generation.wrapping_add(1);
+        state.play_seq = state.play_seq.wrapping_add(1);
+        state.play_seq
+    }
+
+    /// Current play-request sequence for a zone (0 if never played). Compared
+    /// against the value captured at play start to detect that a newer play
+    /// superseded an in-flight one before it sends output.
+    pub async fn current_play_seq(&self, zone_id: i64) -> u64 {
+        self.zones
+            .lock()
+            .await
+            .get(&zone_id)
+            .map(|s| s.play_seq)
+            .unwrap_or(0)
     }
 
     pub async fn play(&self, zone_id: i64, np: NowPlaying) {
