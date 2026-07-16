@@ -1206,6 +1206,63 @@ pub(super) async fn scan_report() -> impl IntoResponse {
     }
 }
 
+/// GET /system/artist-split-preview — READ-ONLY dry-run of multi-artist credit
+/// splitting (Phase 0 telemetry). Reports how many `artists` rows would split,
+/// broken down by separator, plus example splits — WITHOUT changing anything.
+/// Used to size the change and tune the allowlist before touching scan/DB.
+pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<Value> {
+    use tune_core::metadata::artist_split::analyze_artist_credit;
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let extra: Vec<String> = settings
+        .get("artist_split_allowlist")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
+
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let artists = artist_repo.list_all_id_name_mbid().unwrap_or_default();
+
+    let total = artists.len();
+    let mut would_split = 0usize;
+    let mut would_split_no_mbid = 0usize;
+    let mut by_sep: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    let mut examples: Vec<Value> = Vec::new();
+
+    for (_id, name, mbid) in &artists {
+        let a = analyze_artist_credit(name, &extra, true);
+        if a.would_split() {
+            would_split += 1;
+            if mbid.is_empty() {
+                would_split_no_mbid += 1;
+            }
+            for s in &a.separators {
+                *by_sep.entry(s.as_str()).or_insert(0) += 1;
+            }
+            if examples.len() < 60 {
+                examples.push(json!({
+                    "original": a.original,
+                    "tokens": a.tokens,
+                    "separators": a.separators.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    "has_mbid": !mbid.is_empty(),
+                }));
+            }
+        }
+    }
+
+    Json(json!({
+        "total_artists": total,
+        "would_split": would_split,
+        "would_split_no_mbid": would_split_no_mbid,
+        "by_separator": by_sep,
+        "extra_allowlist_size": extra.len(),
+        "examples": examples,
+        "note": "dry-run, read-only — no data changed",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{decide_compilation_albums, is_various_artists};
