@@ -4319,6 +4319,7 @@ dependencies = [
  "lofty",
  "mdns-sd",
  "quick-xml",
+ "rayon",
  "reqwest",
  "rusqlite",
  "rustls",
