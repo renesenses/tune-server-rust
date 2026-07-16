@@ -311,7 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
 CREATE TABLE IF NOT EXISTS playlists (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    description TEXT
+    description TEXT,
+    profile_id INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (

@@ -13,6 +13,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
 pub(super) async fn version() -> Json<Value> {
@@ -209,7 +210,10 @@ pub(super) async fn get_config(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Object(config))
 }
 
-pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn get_settings(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let music_dirs: Vec<String> = settings
         .get("music_dirs")
@@ -224,7 +228,7 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    let theme = settings.get("theme").ok().flatten();
+    let theme = read_profile_pref(&settings, profile.id(), "theme");
 
     Json(json!({
         "music_dirs": music_dirs,
@@ -271,16 +275,17 @@ pub(super) struct ThemeRequest {
 
 pub(super) async fn set_theme(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<ThemeRequest>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    settings.set("theme", &body.theme).ok();
+    write_profile_pref(&settings, profile.id(), "theme", &body.theme);
     Json(json!({ "theme": body.theme }))
 }
 
-pub(super) async fn get_theme(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn get_theme(State(state): State<AppState>, profile: ActiveProfile) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let theme = settings.get("theme").ok().flatten();
+    let theme = read_profile_pref(&settings, profile.id(), "theme");
     Json(json!({ "theme": theme }))
 }
 
@@ -676,27 +681,30 @@ const DEFAULT_VISIBLE_FIELDS: &[&str] = &[
     "bit_depth",
 ];
 
-/// Active profile id (defaults to 1 = default profile) — the visible-metadata
-/// settings are scoped per profile (Bilou: "elles devraient être associées au
-/// profil"), reusing the same `active_profile_id` setting the orchestrator uses.
-fn active_profile_id(settings: &SettingsRepo) -> i64 {
-    settings
-        .get("active_profile_id")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-}
-
 fn metadata_fields_key(pid: i64) -> String {
     format!("metadata_visible_fields:{pid}")
+}
+
+/// Read a per-profile preference stored under `key:{pid}`, falling back to the
+/// legacy global `key` (installs from before per-profile prefs migrate
+/// transparently on first read) then `None`.
+fn read_profile_pref(settings: &SettingsRepo, pid: i64, key: &str) -> Option<String> {
+    settings
+        .get(&format!("{key}:{pid}"))
+        .ok()
+        .flatten()
+        .or_else(|| settings.get(key).ok().flatten())
+}
+
+/// Persist a per-profile preference under `key:{pid}`.
+fn write_profile_pref(settings: &SettingsRepo, pid: i64, key: &str, value: &str) {
+    settings.set(&format!("{key}:{pid}"), value).ok();
 }
 
 /// Read the profile-scoped visible fields, falling back to the legacy global
 /// key (pre-per-profile installs migrate transparently on first read) then the
 /// built-in defaults.
-fn read_visible_fields(settings: &SettingsRepo) -> Vec<String> {
-    let pid = active_profile_id(settings);
+fn read_visible_fields(settings: &SettingsRepo, pid: i64) -> Vec<String> {
     settings
         .get(&metadata_fields_key(pid))
         .ok()
@@ -713,13 +721,14 @@ fn read_visible_fields(settings: &SettingsRepo) -> Vec<String> {
 
 pub(super) async fn get_metadata_fields(
     headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
     State(state): State<AppState>,
 ) -> Json<Value> {
     // Localize the field labels + category names to the client's selected UI
     // language (sent in Accept-Language), falling back to French.
     let lang = crate::i18n::lang_from_header(&headers);
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let enabled_keys: Vec<String> = read_visible_fields(&settings);
+    let enabled_keys: Vec<String> = read_visible_fields(&settings, profile.id());
 
     // Group fields by category (stable French key), preserving catalog order.
     let mut categories: Vec<(&str, Vec<Value>)> = Vec::new();
@@ -755,6 +764,7 @@ pub(super) struct MetadataFieldsBody {
 
 pub(super) async fn set_metadata_fields(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<MetadataFieldsBody>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -772,8 +782,9 @@ pub(super) async fn set_metadata_fields(
     let json_val = serde_json::to_string(&valid_keys).unwrap_or_else(|_| "[]".into());
     // Persist under the profile-scoped key so different profiles keep separate
     // visible-field sets and an update never loses them.
-    let pid = active_profile_id(&settings);
-    settings.set(&metadata_fields_key(pid), &json_val).ok();
+    settings
+        .set(&metadata_fields_key(profile.id()), &json_val)
+        .ok();
     Json(json!({ "fields": valid_keys }))
 }
 

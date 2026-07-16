@@ -12,9 +12,10 @@ pub mod sql {
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO playlists (name, description) VALUES ({}, {})",
+            "INSERT INTO playlists (name, description, profile_id) VALUES ({}, {}, {})",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -27,9 +28,10 @@ pub mod sql {
 
     pub fn list<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
+            "SELECT p.id, p.name, p.description, (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id) FROM playlists p WHERE p.profile_id = {} ORDER BY LOWER(p.name) LIMIT {} OFFSET {}",
             d.placeholder(1),
-            d.placeholder(2)
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -83,8 +85,11 @@ pub mod sql {
         )
     }
 
-    pub fn count() -> &'static str {
-        "SELECT COUNT(*) FROM playlists"
+    pub fn count<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM playlists WHERE profile_id = {}",
+            d.placeholder(1)
+        )
     }
 }
 
@@ -120,9 +125,14 @@ impl PlaylistRepo {
         }
     }
 
-    pub fn create(&self, name: &str, description: Option<&str>) -> Result<i64, String> {
+    pub fn create(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        profile_id: i64,
+    ) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::create, sql::create);
-        let params: [&dyn ToSqlValue; 2] = [&name, &description];
+        let params: [&dyn ToSqlValue; 3] = [&name, &description, &profile_id];
         self.db.execute(&sql, &params)?;
         Ok(self.db.last_insert_rowid())
     }
@@ -137,9 +147,9 @@ impl PlaylistRepo {
             .map(row_to_playlist))
     }
 
-    pub fn list(&self, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
+    pub fn list(&self, profile_id: i64, limit: i64, offset: i64) -> Result<Vec<Playlist>, String> {
         let sql = self.dialect_sql(sql::list, sql::list);
-        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &limit, &offset];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_playlist).collect())
     }
@@ -282,8 +292,10 @@ impl PlaylistRepo {
         })
     }
 
-    pub fn count(&self) -> Result<i64, String> {
-        match self.db.query_one(sql::count(), &[])? {
+    pub fn count(&self, profile_id: i64) -> Result<i64, String> {
+        let sql = self.dialect_sql(sql::count, sql::count);
+        let params: [&dyn ToSqlValue; 1] = [&profile_id];
+        match self.db.query_one(&sql, &params)? {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
@@ -315,7 +327,7 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
 
-        let id = repo.create("My Playlist", Some("Test")).unwrap();
+        let id = repo.create("My Playlist", Some("Test"), 1).unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "My Playlist");
         assert_eq!(pl.track_count, 0);
@@ -341,7 +353,7 @@ mod tests {
         let tid1 = track_repo.create(&t1).unwrap();
         let tid2 = track_repo.create(&t2).unwrap();
 
-        let plid = repo.create("Test PL", None).unwrap();
+        let plid = repo.create("Test PL", None, 1).unwrap();
         repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
 
         let ids = repo.get_track_ids(plid).unwrap();
@@ -360,10 +372,10 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
 
-        assert_eq!(repo.count().unwrap(), 0);
-        repo.create("Playlist 1", None).unwrap();
-        repo.create("Playlist 2", None).unwrap();
-        assert_eq!(repo.count().unwrap(), 2);
+        assert_eq!(repo.count(1).unwrap(), 0);
+        repo.create("Playlist 1", None, 1).unwrap();
+        repo.create("Playlist 2", None, 1).unwrap();
+        assert_eq!(repo.count(1).unwrap(), 2);
     }
 
     #[test]
@@ -371,14 +383,33 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
 
-        repo.create("Zebra", None).unwrap();
-        repo.create("Alpha", None).unwrap();
-        repo.create("Middle", None).unwrap();
+        repo.create("Zebra", None, 1).unwrap();
+        repo.create("Alpha", None, 1).unwrap();
+        repo.create("Middle", None, 1).unwrap();
 
-        let all = repo.list(100, 0).unwrap();
+        let all = repo.list(1, 100, 0).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].name, "Alpha");
         assert_eq!(all[2].name, "Zebra");
+    }
+
+    #[test]
+    fn playlist_scoped_by_profile() {
+        let db = test_db();
+        let repo = PlaylistRepo::new(db);
+
+        repo.create("P1 only", None, 1).unwrap();
+        repo.create("P2 only", None, 2).unwrap();
+        repo.create("P2 second", None, 2).unwrap();
+
+        // list + count are scoped to the requesting profile.
+        assert_eq!(repo.count(1).unwrap(), 1);
+        assert_eq!(repo.count(2).unwrap(), 2);
+        let p1 = repo.list(1, 100, 0).unwrap();
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].name, "P1 only");
+        let p2 = repo.list(2, 100, 0).unwrap();
+        assert_eq!(p2.len(), 2);
     }
 
     #[test]
@@ -387,12 +418,12 @@ mod tests {
         let repo = PlaylistRepo::new(db);
 
         for i in 0..10 {
-            repo.create(&format!("PL {i:02}"), None).unwrap();
+            repo.create(&format!("PL {i:02}"), None, 1).unwrap();
         }
 
-        let page1 = repo.list(3, 0).unwrap();
+        let page1 = repo.list(1, 3, 0).unwrap();
         assert_eq!(page1.len(), 3);
-        let page2 = repo.list(3, 3).unwrap();
+        let page2 = repo.list(1, 3, 3).unwrap();
         assert_eq!(page2.len(), 3);
         assert_ne!(page1[0].name, page2[0].name);
     }
@@ -402,7 +433,7 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
 
-        let id = repo.create("Test", Some("Initial")).unwrap();
+        let id = repo.create("Test", Some("Initial"), 1).unwrap();
         repo.update(id, None, Some("Updated desc")).unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "Test");
@@ -425,7 +456,7 @@ mod tests {
         let tid2 = track_repo.create(&t2).unwrap();
         let tid3 = track_repo.create(&t3).unwrap();
 
-        let plid = repo.create("Test", None).unwrap();
+        let plid = repo.create("Test", None, 1).unwrap();
         repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
         repo.add_tracks(plid, &[tid3], Some(1)).unwrap();
 
@@ -446,7 +477,7 @@ mod tests {
         let tid1 = track_repo.create(&t1).unwrap();
         let tid2 = track_repo.create(&t2).unwrap();
 
-        let plid = repo.create("Test", None).unwrap();
+        let plid = repo.create("Test", None, 1).unwrap();
         // Duplicate within a single batch → inserted once.
         let added = repo
             .add_tracks_deduped(plid, &[tid1, tid1, tid2], None)
@@ -473,7 +504,7 @@ mod tests {
         let tid1 = track_repo.create(&t1).unwrap();
         let tid2 = track_repo.create(&t2).unwrap();
 
-        let plid = repo.create("Test", None).unwrap();
+        let plid = repo.create("Test", None, 1).unwrap();
         repo.add_tracks(plid, &[tid1, tid2], None).unwrap();
         repo.remove_track(plid, 0).unwrap();
 
@@ -498,7 +529,7 @@ mod tests {
         let tid2 = track_repo.create(&t2).unwrap();
         let tid3 = track_repo.create(&t3).unwrap();
 
-        let plid = repo.create("Test", None).unwrap();
+        let plid = repo.create("Test", None, 1).unwrap();
         repo.add_tracks(plid, &[tid1, tid2, tid3], None).unwrap();
         let removed = repo.remove_tracks_at_positions(plid, &[0, 2]).unwrap();
         assert_eq!(removed, 2);
@@ -512,7 +543,7 @@ mod tests {
     fn playlist_empty_name() {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
-        let id = repo.create("", None).unwrap();
+        let id = repo.create("", None, 1).unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "");
     }
@@ -522,7 +553,7 @@ mod tests {
         let db = test_db();
         let repo = PlaylistRepo::new(db);
         let id = repo
-            .create("Ma playlist preferee", Some("Musique francaise"))
+            .create("Ma playlist preferee", Some("Musique francaise"), 1)
             .unwrap();
         let pl = repo.get(id).unwrap().unwrap();
         assert_eq!(pl.name, "Ma playlist preferee");
@@ -538,7 +569,7 @@ mod tests {
         t.file_path = Some("/t.flac".into());
         let tid = track_repo.create(&t).unwrap();
 
-        let plid = repo.create("Test", None).unwrap();
+        let plid = repo.create("Test", None, 1).unwrap();
         repo.add_tracks(plid, &[tid], None).unwrap();
         repo.delete(plid).unwrap();
 
@@ -556,10 +587,12 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        assert!(sql::create(&s).contains("VALUES (?, ?)"));
-        assert!(sql::create(&p).contains("VALUES ($1, $2)"));
+        assert!(sql::create(&s).contains("VALUES (?, ?, ?)"));
+        assert!(sql::create(&p).contains("VALUES ($1, $2, $3)"));
+        assert!(sql::create(&s).contains("profile_id"));
         assert!(!sql::list(&p).contains("COLLATE"));
         assert!(sql::list(&p).contains("LOWER(p.name)"));
+        assert!(sql::list(&p).contains("profile_id ="));
     }
 
     #[test]
@@ -567,7 +600,7 @@ mod tests {
         let db = test_db();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = PlaylistRepo::with_backend(backend);
-        let id = repo.create("X", None).unwrap();
+        let id = repo.create("X", None, 1).unwrap();
         assert!(repo.get(id).unwrap().is_some());
     }
 }

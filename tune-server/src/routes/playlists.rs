@@ -14,6 +14,7 @@ use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
 
 use crate::state::AppState;
 
@@ -95,12 +96,16 @@ pub fn router() -> Router<AppState> {
         .route("/match", post(match_tracks))
 }
 
-async fn list_playlists(State(state): State<AppState>, Query(p): Query<Pagination>) -> Json<Value> {
+async fn list_playlists(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Query(p): Query<Pagination>,
+) -> Json<Value> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
-    let items = repo.list(limit, offset).unwrap_or_default();
-    let _total = repo.count().unwrap_or(0);
+    let items = repo.list(profile.id(), limit, offset).unwrap_or_default();
+    let _total = repo.count(profile.id()).unwrap_or(0);
     Json(json!(items))
 }
 
@@ -115,10 +120,11 @@ async fn get_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 
 async fn create_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<CreatePlaylist>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create(&body.name, body.description.as_deref()) {
+    match repo.create(&body.name, body.description.as_deref(), profile.id()) {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -203,6 +209,7 @@ async fn reorder_tracks(
 
 async fn duplicate_playlist(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
@@ -212,7 +219,7 @@ async fn duplicate_playlist(
     };
 
     let new_name = format!("{} (copy)", original.name);
-    let new_id = match repo.create(&new_name, None) {
+    let new_id = match repo.create(&new_name, None, profile.id()) {
         Ok(id) => id,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -393,6 +400,7 @@ async fn export_multi_format(
 
 async fn import_m3u_file(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_content = String::new();
@@ -475,7 +483,7 @@ async fn import_m3u_file(
 
     // Create playlist and add tracks
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create(&name, None) {
+    match repo.create(&name, None, profile.id()) {
         Ok(playlist_id) => {
             if !track_ids.is_empty() {
                 repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
@@ -595,6 +603,7 @@ fn linn_res_filename_stem(res: &str) -> String {
 /// a Tune playlist from the matches (Pierre Mack).
 async fn import_linn_file(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_content = String::new();
@@ -679,7 +688,7 @@ async fn import_linn_file(
     }
 
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.create(&name, None) {
+    match repo.create(&name, None, profile.id()) {
         Ok(playlist_id) => {
             if !track_ids.is_empty() {
                 repo.add_tracks_deduped(playlist_id, &track_ids, None).ok();
@@ -726,6 +735,7 @@ struct ImportM3uUrl {
 
 async fn import_m3u_url(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Json(body): Json<ImportM3uUrl>,
 ) -> impl IntoResponse {
     let m3u_content = match reqwest::get(&body.url).await {
@@ -740,7 +750,7 @@ async fn import_m3u_url(
 
     let name = body.name.unwrap_or_else(|| "Imported Playlist".into());
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let playlist_id = match repo.create(&name, None) {
+    let playlist_id = match repo.create(&name, None, profile.id()) {
         Ok(id) => id,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
@@ -774,9 +784,9 @@ async fn import_m3u_url(
 
 // --- Advanced playlist routes ---
 
-async fn list_all_playlists(State(state): State<AppState>) -> Json<Value> {
+async fn list_all_playlists(State(state): State<AppState>, profile: ActiveProfile) -> Json<Value> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    let items = repo.list(99999, 0).unwrap_or_default();
+    let items = repo.list(profile.id(), 99999, 0).unwrap_or_default();
     Json(json!(items))
 }
 
