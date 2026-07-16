@@ -10,7 +10,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use super::dsd_to_pcm::choose_output_rate;
 
@@ -255,7 +255,7 @@ fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
             Some(StagedFile { path: dst })
         }
         Err(e) => {
-            warn!(src = %src, error = %e, "decode_source_stage_failed_decoding_in_place");
+            tracing::warn!(src = %src, error = %e, "decode_source_stage_failed_decoding_in_place");
             None
         }
     }
