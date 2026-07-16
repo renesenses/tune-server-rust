@@ -1148,8 +1148,17 @@ impl PlaybackOrchestrator {
             false
         };
 
+        // ALAC native passthrough (opt-in per zone): serve the ALAC file
+        // straight to a renderer that decodes it, instead of transcoding to
+        // FLAC — bit-perfect and zero CPU. Off by default because ALAC and AAC
+        // share the audio/mp4 MIME, so it can't be auto-detected safely.
+        let alac_passthrough = source_format == Some(AudioFormat::Alac)
+            && is_network_output
+            && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
+            && !alac_passthrough
             && source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
