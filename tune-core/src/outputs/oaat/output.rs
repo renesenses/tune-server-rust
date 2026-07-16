@@ -515,6 +515,27 @@ impl OutputTarget for OaatOutput {
                         if stop_rx.try_recv().is_ok() {
                             break;
                         }
+                        // Unlike the HTTP-stream path (which polls command_rx in a
+                        // select!), this direct-file loop only reacts to stop/pause
+                        // via atomics. Drain command_rx here so live SetVolume/Mute
+                        // (which reach the endpoint only via send_volume/send_mute)
+                        // are actually forwarded — otherwise mid-track volume changes
+                        // have no audible effect on OAAT zones.
+                        while let Ok(cmd) = command_rx.try_recv() {
+                            match cmd {
+                                OaatCommand::SetVolume(level) => {
+                                    endpoint.send_volume(level).await.ok();
+                                }
+                                OaatCommand::Mute(muted) => {
+                                    endpoint.send_mute(muted).await.ok();
+                                }
+                                OaatCommand::Pause => paused.store(true, Ordering::SeqCst),
+                                OaatCommand::Resume => paused.store(false, Ordering::SeqCst),
+                                // Seek/PrepareNext/etc. are not handled on the
+                                // direct path (unchanged from prior behaviour).
+                                _ => {}
+                            }
+                        }
                         while paused.load(Ordering::Relaxed) {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             if stop_rx.try_recv().is_ok() {
