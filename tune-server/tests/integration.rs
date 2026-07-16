@@ -958,14 +958,16 @@ async fn queue_add_streaming_and_get() {
 }
 
 #[tokio::test]
-async fn queue_returns_combined_local_then_streaming() {
-    // Documented behaviour: when both subsets exist, GET /queue returns ONE
-    // combined list — local rows first, then streaming — matching the combined
-    // position space the poller/orchestrator advance through. (The old either/or
-    // logic hid streaming rows when a local queue was present, so an added Qobuz
-    // track was invisible and never played — Progman.)
+async fn queue_returns_combined_in_insertion_order() {
+    // Documented behaviour (v0.9 unified queue): local and streaming rows live
+    // in ONE `queue_items` table sharing a single position space, so GET /queue
+    // returns them in INSERTION order (ORDER BY position) — the exact order the
+    // poller/orchestrator advance through. Both subsets are always returned
+    // together (the old either/or logic hid streaming rows when a local queue
+    // was present, so an added Qobuz track was invisible and never played —
+    // Progman). Here the streaming track is added first, so it comes first.
     let (app, state) = make_app_with_state();
-    let tid = insert_track(&state, "LocalFirst");
+    let tid = insert_track(&state, "LocalSecond");
     let zid = make_zone(&app, "Q-mixed").await;
 
     // Add a streaming track first…
@@ -988,11 +990,12 @@ async fn queue_returns_combined_local_then_streaming() {
     let (status, body) = get(&app, &format!("/api/v1/zones/{zid}/queue")).await;
     assert_eq!(status, StatusCode::OK);
     let tracks = body["tracks"].as_array().unwrap();
-    // Both are returned, local first then streaming.
+    // Both are returned, in the order they were added: streaming (position 0)
+    // then local (position 1).
     assert_eq!(tracks.len(), 2);
-    assert_eq!(tracks[0]["track_id"], tid);
-    assert!(tracks[0].get("source_id").is_none() || tracks[0]["source_id"].is_null());
-    assert_eq!(tracks[1]["source_id"], "t1");
+    assert_eq!(tracks[0]["source_id"], "t1");
+    assert_eq!(tracks[1]["track_id"], tid);
+    assert!(tracks[1].get("source_id").is_none() || tracks[1]["source_id"].is_null());
 }
 
 #[tokio::test]
