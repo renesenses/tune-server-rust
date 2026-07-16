@@ -502,12 +502,16 @@ fn build_signal_path(
         "bit_perfect": true,
     })];
 
-    // Decoder step
-    steps.push(json!({
-        "name": "Decoder",
-        "description": format_name,
-        "bit_perfect": is_lossless,
-    }));
+    // Decoder step. Skipped for DSD: the Source already reads e.g.
+    // "DSD64 2.8 MHz" and the DSD→PCM/FLAC conversion is shown by the Transcoder
+    // step, so a bare "DSD64" decoder line was just a confusing duplicate.
+    if !is_dsd {
+        steps.push(json!({
+            "name": "Decoder",
+            "description": format_name,
+            "bit_perfect": is_lossless,
+        }));
+    }
 
     // Transcoding step (only if transcoding occurs)
     let transcode_active =
