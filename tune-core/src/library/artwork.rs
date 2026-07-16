@@ -699,9 +699,18 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
 /// re-fetch when the DB claims an image but the cache file is gone).
 /// A remote `http(s)` `image_path` is served by redirect, so treat it as
 /// present. Local paths are cache hashes → probe both `.jpg` and `.png`.
-fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> bool {
+/// Whether the artwork referenced by `image_path` exists **as a local cache
+/// file**. A remote `http(s)` URL counts as NOT cached: streaming services
+/// (Tidal, Deezer, Amazon) store the artist picture as a remote URL, which
+/// leaves no local file, is served only as a redirect that many renderers/
+/// clients can't load, and blocks enrichment from ever caching a real image
+/// (Fabien: full scan + Tidal premium, artwork_cache empty, no artist images).
+/// Returning false for URLs makes enrichment localize them into the cache.
+/// Also lets callers detect a stale DB `image_path` whose cache file is gone
+/// (moved/wiped `artwork_cache`).
+pub fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> bool {
     if image_path.starts_with("http") {
-        return true;
+        return false;
     }
     cache_dir.join(format!("{image_path}.jpg")).exists()
         || cache_dir.join(format!("{image_path}.png")).exists()

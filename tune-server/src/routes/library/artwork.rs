@@ -356,7 +356,21 @@ pub(super) async fn batch_enrich_artist_artwork(
     // Count artists missing images (Phase 2 candidates)
     let missing = artist_repo.list_without_image().unwrap_or_default();
 
-    if missing.is_empty() && without_mbid == 0 {
+    // Also count artists whose DB image_path is set but the cache file is gone
+    // (moved/wiped artwork_cache): the normal pass would otherwise skip because
+    // the DB "claims" every artist has an image, so the enrichment never runs
+    // and the folder stays empty (Fabien: full scan + premium, no artist
+    // images). Phase 1 already re-downloads these — we just must not skip.
+    let broken_cache = artist_repo
+        .list_with_image_and_mbid()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, image_path)| {
+            !tune_core::library::artwork::cached_artwork_exists(&cache_dir, image_path)
+        })
+        .count();
+
+    if missing.is_empty() && broken_cache == 0 && without_mbid == 0 {
         return Json(json!({
             "status": "skipped",
             "message": "all artists already have MBID and images",
