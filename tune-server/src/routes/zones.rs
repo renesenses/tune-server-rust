@@ -355,11 +355,31 @@ fn build_signal_path(
             r if r >= 5_000_000 => "DSD128",
             _ => "DSD64",
         }
+    } else if let Some(f) = source_format.as_ref() {
+        f.display_name()
     } else {
-        source_format
-            .as_ref()
-            .map(|f| f.display_name())
-            .unwrap_or("Unknown")
+        // A UPnP/NAS media-server source reports its codec as a MIME type or DLNA
+        // profile (e.g. "audio/mp4", "AAC_ISO_320"), not a file extension, so
+        // from_extension() returned None and the signal path showed "Unknown"
+        // (Yves: NAS as source). Recognize the codec from the raw string instead.
+        let l = fmt_str.to_lowercase();
+        if l.contains("aac") || l.contains("mp4") || l.contains("m4a") {
+            "AAC"
+        } else if l.contains("mp3") || l.contains("mpeg") {
+            "MP3"
+        } else if l.contains("flac") {
+            "FLAC"
+        } else if l.contains("alac") {
+            "ALAC"
+        } else if l.contains("wav") {
+            "WAV"
+        } else if l.contains("ogg") || l.contains("vorbis") {
+            "OGG"
+        } else if l.contains("opus") {
+            "OPUS"
+        } else {
+            "Unknown"
+        }
     };
     let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
 
