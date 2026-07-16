@@ -443,17 +443,19 @@ fn flac_finish(
     // use the actual block size
     if total_samples > 0 {
         let actual_max_block = FLAC_BLOCK_SIZE.min(total_samples as usize) as u16;
-        // For the last frame, min block size might be smaller
+        // Per the FLAC spec, STREAMINFO min block size is the smallest block
+        // *excluding the last block*. With a single frame, min = max = that
+        // frame. With several frames, every non-last block is FLAC_BLOCK_SIZE,
+        // so min = FLAC_BLOCK_SIZE even when the last frame is shorter.
+        // Reporting the short last block here made min != max, which strict
+        // decoders (symphonia, CoreAudio) read as a variable-block stream that
+        // conflicts with the fixed blocking-strategy flag → whole stream
+        // rejected ("unexpected end of file"), so the transcoded FLAC's final
+        // frame broke playback.
         let actual_min_block = if total_samples <= FLAC_BLOCK_SIZE as u64 {
             total_samples as u16
         } else {
-            // With FLAC_BLOCK_SIZE blocks + possibly shorter last block
-            let last_block = (total_samples as usize) % FLAC_BLOCK_SIZE;
-            if last_block == 0 {
-                FLAC_BLOCK_SIZE as u16
-            } else {
-                last_block as u16
-            }
+            FLAC_BLOCK_SIZE as u16
         };
         output[si..si + 2].copy_from_slice(&actual_min_block.to_be_bytes());
         output[si + 2..si + 4].copy_from_slice(&actual_max_block.to_be_bytes());
@@ -1088,11 +1090,15 @@ fn write_rice_signed(bw: &mut BitWriter, value: i64, k: u8) {
     let quotient = (mapped >> k) as u32;
     let remainder = mapped & ((1u64 << k) - 1);
 
-    // Unary code for quotient: `quotient` ones followed by a zero
+    // Unary code for quotient: `quotient` zeros followed by a terminating one.
+    // FLAC decoders read the quotient with read_unary_zeros() (count leading
+    // zeros up to the first 1), so writing ones-then-zero desynchronised every
+    // Rice-coded residual — corrupting all FIXED subframes (audible as noise on
+    // transcoded ALAC; CONSTANT subframes, which use no Rice coding, were fine).
     for _ in 0..quotient {
-        bw.write_bits(1, 1);
+        bw.write_bits(0, 1);
     }
-    bw.write_bits(0, 1);
+    bw.write_bits(1, 1);
 
     // Binary code for remainder: k bits
     if k > 0 {
@@ -1166,6 +1172,59 @@ fn flac_crc16(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode a known 24-bit signal to FLAC and decode it back: the stream must
+    /// be valid and bit-exact. Guards two encoder bugs that made transcoded
+    /// ALAC play as noise: (1) the Rice quotient was written as ones-then-zero
+    /// instead of the FLAC zeros-then-one convention, corrupting every FIXED
+    /// subframe; (2) STREAMINFO min_block_size reported the short final block,
+    /// making min != max so strict decoders rejected the whole stream. The
+    /// length (5000) is deliberately not a multiple of the 4096 block size so a
+    /// partial final frame is exercised.
+    #[test]
+    fn flac_24bit_roundtrip_is_bit_exact() {
+        let n = 5000usize;
+        let amp = 7_549_746i32; // 0.9 * (2^23 - 1)
+        let mono: Vec<i32> = (0..n)
+            .map(|i| {
+                (amp as f64 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48000.0).sin())
+                    as i32
+            })
+            .collect();
+
+        // Interleave to stereo, pack as 24-bit little-endian PCM.
+        let mut pcm = Vec::with_capacity(n * 2 * 3);
+        for &s in &mono {
+            let b = s.to_le_bytes();
+            for _ in 0..2 {
+                pcm.extend_from_slice(&b[..3]);
+            }
+        }
+
+        let mut enc = AudioEncoder::new("flac", 48000, 24, 2);
+        enc.start_sync().expect("start");
+        enc.write_sync(&pcm).expect("write");
+        let flac = enc.finish_sync().expect("finish");
+        assert!(flac.len() > 64, "flac output too small");
+
+        let tmp = std::env::temp_dir().join(format!("tune-flac-rt-{n}.flac"));
+        std::fs::write(&tmp, &flac).expect("write temp flac");
+        let decoded =
+            crate::audio::decode::decode_to_pcm(tmp.to_str().unwrap(), None, None, 0.0, 0.0)
+                .expect("decoding our own FLAC must succeed");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(decoded.bit_depth, 24, "bit depth preserved");
+        assert_eq!(decoded.sample_rate, 48000, "sample rate preserved");
+        assert_eq!(decoded.channels, 2, "channels preserved");
+        assert_eq!(decoded.samples_i32.len(), n * 2, "sample count preserved");
+
+        // Every decoded sample must equal the input (FLAC is lossless).
+        let expected: Vec<i32> = mono.iter().flat_map(|&s| [s, s]).collect();
+        for (i, (&e, &g)) in expected.iter().zip(decoded.samples_i32.iter()).enumerate() {
+            assert_eq!(e, g, "sample {i} mismatch: {e} != {g}");
+        }
+    }
 
     #[test]
     fn encoder_new() {
