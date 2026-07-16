@@ -580,6 +580,11 @@ fn build_signal_path(
 
     Some(json!({
         "bit_perfect": bit_perfect,
+        // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
+        // Distinct from bit_perfect: a lossless source transcoded to another
+        // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
+        // bit-perfect but is still lossless — the UI must not call it "lossy".
+        "lossless": is_lossless,
         "summary": summary,
         "steps": steps,
     }))
