@@ -600,7 +600,7 @@ fn decode_to_pcm_streaming_inner(
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk.to_vec()),
             )) {
                 Ok(Ok(())) => {}
@@ -815,7 +815,7 @@ fn decode_to_pcm_streaming_inner(
             // floating-point math) and was previously called before send(),
             // introducing micro-pauses that caused Squeezebox/LMS stuttering.
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk.clone()),
             )) {
                 Ok(Ok(())) => {}
@@ -851,7 +851,7 @@ fn decode_to_pcm_streaming_inner(
     // Flush remaining bytes
     if !pcm_buf.is_empty() {
         match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf),
         )) {
             Ok(Ok(())) => {}
@@ -1229,7 +1229,7 @@ fn decode_dsd_streaming(
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
                 match rt.block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(300),
                     tx.send(chunk.clone()),
                 )) {
                     Ok(Ok(())) => {}
@@ -1318,7 +1318,7 @@ fn decode_dsd_streaming(
     // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
         let send_ok = match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf.clone()),
         )) {
             Ok(Ok(())) => true,
@@ -1389,7 +1389,7 @@ pub fn decode_dsd_to_dop_streaming(
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk),
             )) {
                 Ok(Ok(())) => {}
@@ -1430,7 +1430,7 @@ pub fn decode_dsd_to_dop_streaming(
 
     if !pcm_buf.is_empty() {
         let _ = rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf),
         ));
     }
