@@ -854,8 +854,17 @@ async fn batch_enrich_artist_artwork_inner(
 
         match fetch_artist_image(mbid, name, discogs_token.as_deref()).await {
             Some(data) => {
-                // Use artist-specific hash key (same as manual upload)
-                let hash = artwork_hash(&format!("artist-mbid-{mbid}"));
+                // Cache key: by MBID when known, else by NAME. Keying by
+                // `artist-mbid-` with an EMPTY mbid made every artist without an
+                // MBID collide on the same file (md5("artist-mbid-")), so they
+                // overwrote each other's image (Keith Jarrett, Duke Ellington…
+                // all sharing one photo). By-name matches Phase 3's convention.
+                let key = if mbid.is_empty() {
+                    format!("artist-name-{name}")
+                } else {
+                    format!("artist-mbid-{mbid}")
+                };
+                let hash = artwork_hash(&key);
                 std::fs::create_dir_all(&cache_dir).ok();
                 if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
                     artist_repo.update_image(*artist_id, &hash, "auto").ok();
@@ -868,8 +877,10 @@ async fn batch_enrich_artist_artwork_inner(
                         "batch_artist_artwork_enriched"
                     );
 
-                    // Fire-and-forget: submit to community for sharing
-                    if !instance_id.is_empty() {
+                    // Fire-and-forget: submit to community for sharing.
+                    // Only when we have an MBID — the community store is keyed by
+                    // MBID, so submitting with an empty one is meaningless.
+                    if !instance_id.is_empty() && !mbid.is_empty() {
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
