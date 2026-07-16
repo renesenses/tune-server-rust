@@ -1,3 +1,4 @@
+pub mod active_profile;
 pub mod ai;
 pub mod archive;
 pub mod bandcamp;

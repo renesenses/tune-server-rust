@@ -4206,7 +4206,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bridge"
-version = "0.8.305"
+version = "0.9.0"
 dependencies = [
  "axum",
  "bytes",
@@ -4225,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.8.305"
+version = "0.9.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.8.305"
+version = "0.9.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4293,7 +4293,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.8.305"
+version = "0.9.0"
 dependencies = [
  "axum",
  "serde_json",
@@ -4306,7 +4306,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.8.305"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "async-stream",
