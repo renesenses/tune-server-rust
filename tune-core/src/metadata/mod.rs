@@ -197,6 +197,73 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Probe an M4A/MP4 file for its real codec **and** bit depth.
+///
+/// lofty reports neither for these files: it can't tell ALAC (lossless) from
+/// AAC (lossy) and never fills in the bit depth. symphonia's ISOMP4 demuxer
+/// also leaves `bits_per_sample` empty for ALAC, so the depth is read from the
+/// ALAC magic cookie in `extra_data` (bit depth at byte 5 of the 24-byte
+/// payload, after optional `frma`/`alac` atom prefixes) — the same layout the
+/// decoder uses. Returns `(format, bit_depth)`; bit depth is `None` for AAC.
+pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("m4a");
+    let format_reader = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = format_reader.default_track(symphonia::core::formats::TrackType::Audio)?;
+
+    // Match on the codec id (0x2003 for ALAC) rather than a Debug string — the
+    // Debug form of the codec parameters doesn't spell out "Alac".
+    let params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p,
+        _ => return Some(("aac".to_string(), None)),
+    };
+    if params.codec != CODEC_ID_ALAC {
+        return Some(("aac".to_string(), None));
+    }
+
+    let bit_depth = params
+        .bits_per_sample
+        .map(|b| b as u16)
+        .or_else(|| alac_bit_depth_from_cookie(params.extra_data.as_deref()));
+    Some(("alac".to_string(), bit_depth))
+}
+
+/// Extract the ALAC bit depth from the magic cookie (`extra_data`).
+/// Byte 5 of the 24-byte payload holds the bit depth, after optional 12-byte
+/// `frma` and `alac` atom prefixes.
+fn alac_bit_depth_from_cookie(extra: Option<&[u8]>) -> Option<u16> {
+    let mut buf = extra?;
+    if buf.len() >= 12 && &buf[4..8] == b"frma" {
+        buf = &buf[12..];
+    }
+    if buf.len() >= 12 && &buf[4..8] == b"alac" {
+        buf = &buf[12..];
+    }
+    if buf.len() >= 24 {
+        let bd = buf[5];
+        if bd > 0 && bd <= 32 {
+            return Some(bd as u16);
+        }
+    }
+    None
+}
+
 // ── DSF / DFF support ──────────────────────────────────────────────────
 
 /// Parsed DSF header information.
@@ -992,11 +1059,13 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         .and_then(|e| e.to_str())
         .unwrap_or("wav")
         .to_lowercase();
+    let mut probed_bit_depth: Option<u16> = None;
     let format = {
         let mut fmt = normalize_format(&ext, props.bit_depth());
         if fmt == "aac" && (ext == "m4a" || ext == "mp4") && props.bit_depth().is_none() {
-            if let Some(probed) = probe_m4a_codec(path) {
+            if let Some((probed, bd)) = probe_m4a_props(path) {
                 fmt = probed;
+                probed_bit_depth = bd;
             }
         }
         Some(fmt)
@@ -1032,7 +1101,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
         duration_ms: Some(props.duration().as_millis() as u64),
-        bit_depth: props.bit_depth().map(|b| b as u16),
+        bit_depth: props.bit_depth().map(|b| b as u16).or(probed_bit_depth),
         bpm: None,
         compilation: false,
         label: None,
@@ -1286,6 +1355,25 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         .unwrap_or_default();
     let genre = genres.first().cloned().or(raw_genre);
 
+    // lofty can't distinguish ALAC (lossless) from AAC (lossy) in an M4A/MP4
+    // container and reports no bit depth for either, so a tagged ALAC file was
+    // stored as "aac" with no bit depth — the signal path then showed the wrong
+    // format and a fabricated 16-bit (Yves: ALAC 24/96 shown as AAC/FLAC).
+    // Probe the real codec and, for ALAC, the true bit depth from the magic
+    // cookie. Only used for M4A containers with no lofty bit depth.
+    let file_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let m4a_probe = if (file_ext == "m4a" || file_ext == "mp4" || file_ext == "m4b")
+        && props.bit_depth().is_none()
+    {
+        probe_m4a_props(path)
+    } else {
+        None
+    };
+
     Ok(TrackMetadata {
         title: tag.title().map(|s| s.to_string()),
         artist: tag.artist().map(|s| s.to_string()),
@@ -1326,12 +1414,18 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
             }
         },
         sample_rate: props.sample_rate(),
-        bit_depth: props.bit_depth().map(|b| b as u16),
+        bit_depth: props
+            .bit_depth()
+            .map(|b| b as u16)
+            .or_else(|| m4a_probe.as_ref().and_then(|(_, bd)| *bd)),
         channels: props.channels().map(|c| c as u16),
-        format: Some(normalize_format(
-            &format!("{:?}", tagged.file_type()).to_lowercase(),
-            props.bit_depth(),
-        )),
+        format: Some(match m4a_probe.as_ref() {
+            Some((fmt, _)) => fmt.clone(),
+            None => normalize_format(
+                &format!("{:?}", tagged.file_type()).to_lowercase(),
+                props.bit_depth(),
+            ),
+        }),
         file_size: std::fs::metadata(path).ok().map(|m| m.len()),
         bpm,
         compilation,
@@ -1698,6 +1792,36 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alac_bit_depth_from_magic_cookie() {
+        // ALACSpecificConfig: bit depth lives at byte 5 of the 24-byte payload.
+        let mut cookie = [0u8; 24];
+        cookie[5] = 24;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&cookie)), Some(24));
+        cookie[5] = 16;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&cookie)), Some(16));
+
+        // With the optional `frma`/`alac` atom prefixes, the payload is offset.
+        let mut prefixed = Vec::new();
+        prefixed.extend_from_slice(&[0, 0, 0, 12]);
+        prefixed.extend_from_slice(b"frma");
+        prefixed.extend_from_slice(&[0, 0, 0, 0]);
+        prefixed.extend_from_slice(&[0, 0, 0, 12]);
+        prefixed.extend_from_slice(b"alac");
+        prefixed.extend_from_slice(&[0, 0, 0, 0]);
+        let mut payload = [0u8; 24];
+        payload[5] = 24;
+        prefixed.extend_from_slice(&payload);
+        assert_eq!(alac_bit_depth_from_cookie(Some(&prefixed)), Some(24));
+
+        // Missing / too-short / out-of-range depths yield None.
+        assert_eq!(alac_bit_depth_from_cookie(None), None);
+        assert_eq!(alac_bit_depth_from_cookie(Some(&[0u8; 10])), None);
+        let mut bad = [0u8; 24];
+        bad[5] = 99;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&bad)), None);
+    }
 
     #[test]
     fn nonexistent_file_returns_none() {
