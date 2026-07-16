@@ -124,23 +124,31 @@ pub fn artwork_hash(file_path: &str) -> String {
 
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
-    let url = format!("https://coverartarchive.org/release/{mbid}/front-500");
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if resp.status().is_success() {
-        let bytes = resp.bytes().await.ok()?;
-        // Reject tiny responses (likely error pages)
-        if bytes.len() < 1000 {
-            return None;
+    // Prefer the 1200px rendition for a crisp full-screen display (Now Playing
+    // on Retina). Fall back to 500px if the larger size isn't available for
+    // this release.
+    for size in ["front-1200", "front-500"] {
+        let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if resp.status().is_success() {
+            let Ok(bytes) = resp.bytes().await else {
+                continue;
+            };
+            // Reject tiny responses (likely error pages)
+            if bytes.len() < 1000 {
+                continue;
+            }
+            return Some(bytes.to_vec());
         }
-        Some(bytes.to_vec())
-    } else {
-        None
     }
+    None
 }
 
 /// Search MusicBrainz for a release MBID by artist name and album title.
