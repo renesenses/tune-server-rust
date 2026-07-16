@@ -52,6 +52,15 @@ pub const KNOWN_GROUP_NAMES: &[&str] = &[
     "joan jett & the blackhearts",
 ];
 
+/// Leading articles used to (a) undo the "sort form" `Beatles, The` → `The
+/// Beatles`, and (b) keep `X & The/His/Her Y` band names together instead of
+/// splitting off the ensemble. Measured on a real library, `, The` sort forms
+/// were ~49% of the comma "splits" (false positives).
+const ARTICLES: &[&str] = &[
+    "the", "his", "her", "their", "les", "los", "las", "die", "das", "der", "la", "le", "el", "il",
+    "gli", "i",
+];
+
 /// Strong separators — these essentially never occur inside a single legitimate
 /// artist name, so we always split on them (case-insensitive, space-padded so
 /// `ft.` doesn't match inside a word).
@@ -137,6 +146,59 @@ fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     out
 }
 
+/// Whether `s` begins with a leading article (`the`, `his`, `les`, …).
+fn starts_with_article(s: &str) -> bool {
+    let l = s.trim().to_lowercase();
+    ARTICLES
+        .iter()
+        .any(|a| l == *a || l.starts_with(&format!("{a} ")))
+}
+
+/// Undo a trailing "sort form": `"Beatles, The"` → `"The Beatles"`. Only fires
+/// when the text after the LAST comma is exactly an article.
+fn reorder_sort_form(name: &str) -> String {
+    if let Some((head, tail)) = name.rsplit_once(',') {
+        let t = tail.trim();
+        if !t.is_empty() && ARTICLES.contains(&t.to_lowercase().as_str()) {
+            return format!("{} {}", t, head.trim());
+        }
+    }
+    name.to_string()
+}
+
+/// Split on ` & ` / ` and `, but keep `X & The/His/Her Y` together (band name:
+/// "Count Basie & His Orchestra", "Art Blakey & The Jazz Messengers"). Returns
+/// `(parts, did_split)`.
+fn split_ampersand(s: &str) -> (Vec<String>, bool) {
+    let norm = replace_ci(s, " and ", " & ");
+    if !norm.contains(" & ") {
+        return (vec![s.trim().to_string()], false);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut did = false;
+    for part in norm.split(" & ") {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if starts_with_article(p) {
+                // Re-attach the ensemble to the leader: one performing entity.
+                *last = format!("{last} & {p}");
+                continue;
+            }
+        }
+        if !out.is_empty() {
+            did = true;
+        }
+        out.push(p.to_string());
+    }
+    if out.is_empty() {
+        out.push(s.trim().to_string());
+    }
+    (out, did)
+}
+
 /// Split a raw artist credit string into individual artist names, in credit
 /// order. Returns `[raw]` (unchanged) when it must not split. `extra_allowlist`
 /// comes from the `artist_split_allowlist` setting.
@@ -149,7 +211,9 @@ pub fn analyze_artist_credit(
     extra_allowlist: &[String],
     split_risky: bool,
 ) -> SplitAnalysis {
-    let original = raw.trim().to_string();
+    // Undo "Beatles, The" sort form up-front so the trailing article isn't
+    // mistaken for a separate artist (the dominant comma false positive).
+    let original = reorder_sort_form(raw.trim());
     let mut separators: Vec<Separator> = Vec::new();
 
     if original.is_empty() {
@@ -200,33 +264,38 @@ pub fn analyze_artist_credit(
         .filter(|t| !t.is_empty())
         .collect();
 
-    // 2) Risky split (comma / ampersand) on each piece, unless the piece itself
-    //    is an allowlisted legit name.
+    // 2) Risky split (comma, then article-aware ampersand) on each strong piece,
+    //    unless the piece itself is an allowlisted legit name.
     let mut tokens: Vec<String> = Vec::new();
     for piece in strong_pieces {
         if !split_risky || is_allowlisted(&piece, extra_allowlist) {
             tokens.push(piece);
             continue;
         }
-        let mut w = piece.clone();
-        if w.contains(',') {
+        let comma_parts: Vec<String> = if piece.contains(',') {
             separators.push(Separator::Comma);
-            w = w.replace(',', "\u{1}");
-        }
-        for amp in [" & ", " and "] {
-            let replaced = replace_ci(&w, amp, "\u{1}");
-            if replaced != w {
-                if !separators.contains(&Separator::Ampersand) {
-                    separators.push(Separator::Ampersand);
-                }
-                w = replaced;
+            piece
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![piece.clone()]
+        };
+        for cp in comma_parts {
+            if is_allowlisted(&cp, extra_allowlist) {
+                tokens.push(cp);
+                continue;
             }
-        }
-        for tok in w.split('\u{1}') {
-            let t = tok.trim();
-            // Drop empty / single-char noise tokens.
-            if t.chars().count() >= 2 {
-                tokens.push(t.to_string());
+            let (parts, did) = split_ampersand(&cp);
+            if did && !separators.contains(&Separator::Ampersand) {
+                separators.push(Separator::Ampersand);
+            }
+            for t in parts {
+                // Drop empty / single-char noise tokens.
+                if t.chars().count() >= 2 {
+                    tokens.push(t);
+                }
             }
         }
     }
@@ -402,5 +471,61 @@ mod tests {
     #[test]
     fn tokens_are_trimmed_and_deduped() {
         assert_eq!(split("Bill Evans; Bill Evans"), vec!["Bill Evans"]);
+    }
+
+    // --- Regression tests from the real .18 library dry-run (Phase 0) ---
+
+    #[test]
+    fn sort_form_comma_the_is_reordered_not_split() {
+        // "~49% of comma splits" were this pattern → junk "The" token.
+        assert_eq!(split("Delfonics, The"), vec!["The Delfonics"]);
+        assert_eq!(split("Grass Roots, The"), vec!["The Grass Roots"]);
+        assert_eq!(split("Brothers Johnson, The"), vec!["The Brothers Johnson"]);
+    }
+
+    #[test]
+    fn ampersand_ensemble_stays_together() {
+        // "X & His/Her/The <ensemble>" is one performing entity, not two.
+        assert_eq!(
+            split("Count Basie & His Orchestra"),
+            vec!["Count Basie & His Orchestra"]
+        );
+        assert_eq!(
+            split("Art Blakey & The Jazz Messengers"),
+            vec!["Art Blakey & The Jazz Messengers"]
+        );
+        assert_eq!(
+            split("Bob Marley & The Wailers"),
+            vec!["Bob Marley & The Wailers"]
+        );
+    }
+
+    #[test]
+    fn ampersand_two_people_still_splits() {
+        assert_eq!(
+            split("Ella Fitzgerald & Louis Armstrong"),
+            vec!["Ella Fitzgerald", "Louis Armstrong"]
+        );
+        assert_eq!(
+            split("Bill Evans & Jim Hall"),
+            vec!["Bill Evans", "Jim Hall"]
+        );
+        assert_eq!(
+            split("Duke Ellington & John Coltrane"),
+            vec!["Duke Ellington", "John Coltrane"]
+        );
+    }
+
+    #[test]
+    fn mixed_comma_and_article_ampersand() {
+        // Real: comma splits the leaders, ampersand-with-name splits the last two.
+        assert_eq!(
+            split("Jordi Savall, Les Musiciennes du Concert des Nations & Alfia Bakieva"),
+            vec![
+                "Jordi Savall",
+                "Les Musiciennes du Concert des Nations",
+                "Alfia Bakieva"
+            ]
+        );
     }
 }
