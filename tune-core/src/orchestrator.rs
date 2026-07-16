@@ -1,8 +1,22 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Error marker returned by `resolve_local_track` when a play was superseded by
+/// a newer tap before its transcode started; `play_inner` maps it to a quiet
+/// no-op result instead of a user-facing error.
+const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
+
+/// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
+/// concurrent plays, keyed by source path. A burst of play taps for a
+/// slow-to-decode NAS track otherwise kicks off one full transcode each
+/// (Yves: 6 concurrent transcodes of a single file in 20s → overlapping FLAC
+/// streams to the DLNA renderer = noise). The winner transcodes; every play a
+/// newer tap has already superseded skips it entirely.
+static TRANSCODE_GATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 use crate::audio::formats::AudioFormat;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
@@ -265,7 +279,25 @@ impl PlaybackOrchestrator {
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
             self.resolve_uploaded_file(temp_path, &req).await?
         } else {
-            self.resolve_stream(&req).await?
+            match self.resolve_stream(&req).await {
+                Ok(r) => r,
+                // A newer tap superseded this play before its transcode ran:
+                // yield quietly (the winning play drives the output) instead of
+                // surfacing an error for the redundant tap.
+                Err(e) if e == SUPERSEDED_BEFORE_TRANSCODE => {
+                    info!(
+                        zone_id = req.zone_id,
+                        "orchestrator_play_superseded_before_transcode"
+                    );
+                    return Ok(PlayResult {
+                        stream_url: None,
+                        output_sent: false,
+                        source: "local".into(),
+                        error: Some("superseded by a newer play".into()),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         };
         let resolve_ms = play_start.elapsed().as_millis();
 
@@ -1301,6 +1333,30 @@ impl PlaybackOrchestrator {
                     ))
                     .to_string_lossy()
                     .to_string();
+
+                // Serialize transcodes of this same source file and drop any
+                // play a newer tap has already superseded, so a burst of taps
+                // can't spawn overlapping ALAC→FLAC transcodes of one file
+                // (Yves, DMP-A10 over DLNA). Capture our own play seq, then
+                // wait our turn on the per-file gate; if a newer play bumped the
+                // generation while we waited, skip the transcode entirely.
+                let my_seq = self.playback.current_play_seq(req.zone_id).await;
+                let file_gate = {
+                    let mut gates = TRANSCODE_GATE.lock().await;
+                    gates
+                        .entry(file_path.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                };
+                let _file_hold = file_gate.lock().await;
+                if self.playback.current_play_seq(req.zone_id).await != my_seq {
+                    info!(
+                        zone_id = req.zone_id,
+                        file = %file_path,
+                        "transcode_skipped_superseded_burst"
+                    );
+                    return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
+                }
 
                 info!(
                     file = %fp,
