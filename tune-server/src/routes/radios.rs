@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 
 use crate::error::AppError;
+use crate::routes::active_profile::DEFAULT_PROFILE_ID;
 use crate::state::AppState;
 
 fn favicon_from_url(url: &str) -> Option<String> {
@@ -757,7 +758,7 @@ async fn create_playlist_from_favorites(
 
     let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
     let track_repo = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone());
-    let playlist_id = match repo.create(&name, None) {
+    let playlist_id = match repo.create(&name, None, DEFAULT_PROFILE_ID) {
         Ok(id) => id,
         Err(e) => {
             return Ok(

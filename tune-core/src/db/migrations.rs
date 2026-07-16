@@ -690,6 +690,14 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
 );
 ",
     },
+    Migration {
+        // Renumbered from 55 (its value on the main line): on release/v0.9,
+        // 55/56 are already taken by the streaming migrations that the
+        // main→v0.9 merge renumbered, so this lands at 57.
+        version: 57,
+        name: "add_profile_id_to_playlists",
+        up: "", // Applied programmatically via add_column_if_missing (existing rows → profile 1)
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -1068,6 +1076,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 add_column_if_missing(db, table, "bio_fetched_at", "TEXT");
             }
         }
+        if migration.version == 57 {
+            // Scope playlists per profile. Existing rows default to profile 1 (Default).
+            // (Version 57 on the v0.9 line; 55 on main — see the migration entry.)
+            add_column_if_missing(db, "playlists", "profile_id", "INTEGER NOT NULL DEFAULT 1");
+        }
 
         db.execute(
             "INSERT INTO _migrations (version, name) VALUES (?, ?)",
@@ -1117,6 +1130,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "listen_history", "source_id", "TEXT");
     add_column_if_missing(db, "listen_history", "album_id", "INTEGER");
     add_column_if_missing(db, "listen_history", "profile_id", "INTEGER");
+
+    // Playlists scoped per profile (migration v55). Safety pass so DBs from any
+    // prior version get the column regardless of which migration they came from.
+    add_column_if_missing(db, "playlists", "profile_id", "INTEGER NOT NULL DEFAULT 1");
 
     add_column_if_missing(db, "alarms", "days_of_week", "TEXT DEFAULT '1111111'");
     add_column_if_missing(db, "alarms", "multi_zone_ids", "TEXT");

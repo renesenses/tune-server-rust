@@ -81,7 +81,8 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source TEXT;\
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_source_url TEXT;\
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_license TEXT;\
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_lang TEXT;\
-ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;";
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;\
+ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id TEXT NOT NULL DEFAULT '1';";
         if let Err(e) = sqlx::raw_sql(ENSURE_COLUMNS).execute(&self.pool).await {
             warn!(error = %e, "pg_ensure_schema_failed");
         }
