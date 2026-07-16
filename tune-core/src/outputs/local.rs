@@ -305,6 +305,21 @@ pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
     result
 }
 
+/// Return the last cached device list WITHOUT triggering a fresh enumeration.
+///
+/// Enumerating WASAPI devices probes each device's supported formats, which can
+/// invalidate an active render stream and kill playback on Windows (DEvir). So
+/// while a local stream is playing we serve this cache instead of re-scanning.
+/// Returns an empty list if nothing has been enumerated yet this session.
+pub fn cached_audio_devices() -> Vec<AudioDevice> {
+    SCAN_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, devices)| devices.clone())
+        .unwrap_or_default()
+}
+
 fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     let host = select_host(backend);
     let host_name = host.id().name();
