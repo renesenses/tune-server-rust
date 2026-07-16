@@ -1227,7 +1227,8 @@ pub(super) async fn artist_split_preview(State(state): State<AppState>) -> Json<
     let total = artists.len();
     let mut would_split = 0usize;
     let mut would_split_no_mbid = 0usize;
-    let mut by_sep: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    let mut by_sep: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
     let mut examples: Vec<Value> = Vec::new();
 
     for (_id, name, mbid) in &artists {
