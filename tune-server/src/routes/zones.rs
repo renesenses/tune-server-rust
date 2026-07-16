@@ -538,7 +538,7 @@ fn build_signal_path(
     if !volume_full {
         steps.push(json!({
             "name": "Volume",
-            "description": format!("{}%", (ps.volume * 100.0).round() as i32),
+            "description": format!("Volume {}%", (ps.volume * 100.0).round() as i32),
             "bit_perfect": true,
         }));
     }
