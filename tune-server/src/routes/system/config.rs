@@ -283,7 +283,10 @@ pub(super) async fn set_theme(
     Json(json!({ "theme": body.theme }))
 }
 
-pub(super) async fn get_theme(State(state): State<AppState>, profile: ActiveProfile) -> Json<Value> {
+pub(super) async fn get_theme(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let theme = read_profile_pref(&settings, profile.id(), "theme");
     Json(json!({ "theme": theme }))

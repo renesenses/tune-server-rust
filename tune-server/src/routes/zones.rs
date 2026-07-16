@@ -61,6 +61,9 @@ struct PatchZone {
     /// (empty/failed GetProtocolInfo Sink) — for renderers that decode FLAC but
     /// under-report (Denon Ceol N12).
     dlna_native_flac: Option<bool>,
+    /// When enabled, serve ALAC straight to the renderer (bit-perfect, no FLAC
+    /// transcode). Only for renderers that decode ALAC natively.
+    alac_passthrough: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -657,6 +660,10 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_native_flac".into(),
                 json!(zone_repo.get_dlna_native_flac(zone_id)),
             );
+            obj.insert(
+                "alac_passthrough".into(),
+                json!(zone_repo.get_alac_passthrough(zone_id)),
+            );
             let online = match z.output_type.as_deref() {
                 Some("local") | Some("browser") => true,
                 _ => z
@@ -728,6 +735,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert(
                     "dlna_native_flac".into(),
                     json!(repo.get_dlna_native_flac(id)),
+                );
+                obj.insert(
+                    "alac_passthrough".into(),
+                    json!(repo.get_alac_passthrough(id)),
                 );
                 let online = match zone.output_type.as_deref() {
                     Some("local") | Some("browser") => true,
@@ -833,6 +844,11 @@ async fn patch_zone(
     }
     if let Some(native_flac) = body.dlna_native_flac {
         if let Err(e) = repo.update_dlna_native_flac(id, native_flac) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(passthrough) = body.alac_passthrough {
+        if let Err(e) = repo.update_alac_passthrough(id, passthrough) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
