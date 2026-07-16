@@ -170,6 +170,42 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
     first.get("id")?.as_str().map(|s| s.to_string())
 }
 
+/// Resolve an artist's MusicBrainz ID from its name (best match).
+///
+/// Libraries whose files carry no MusicBrainz tags leave artists without an
+/// MBID, so the rich MBID-based image sources (Fanart.tv / TheAudioDB /
+/// MusicBrainz) can never find them. Look the artist up by name and accept only
+/// a high-confidence match (MB returns a 0-100 score) to avoid mis-binding two
+/// artists that share a name.
+pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Unknown Artist") {
+        return None;
+    }
+    let query = format!("artist:\"{}\"", trimmed.replace('"', ""));
+    let url = format!(
+        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit=1",
+        urlencoding::encode(&query)
+    );
+    let client = crate::http::client::builder()
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let first = data.get("artists")?.as_array()?.first()?;
+    // Only accept a confident match; MB scores the query 0-100.
+    let score = first.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+    if score < 90 {
+        return None;
+    }
+    first.get("id")?.as_str().map(|s| s.to_string())
+}
+
 /// Run batch artwork enrichment for all albums missing cover art.
 ///
 /// Iterates over albums without a `cover_path`, tries Cover Art Archive
@@ -852,7 +888,23 @@ async fn batch_enrich_artist_artwork_inner(
         // longer delay only when hitting external APIs (MusicBrainz etc.)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        match fetch_artist_image(mbid, name, discogs_token.as_deref()).await {
+        // Resolve a MusicBrainz ID from the artist name when the files carried
+        // no MB tag. Without it the rich image sources (Fanart/TheAudioDB/
+        // MusicBrainz) and community matching can't find this artist — the whole
+        // reason untagged libraries end up with almost no artist images. Persist
+        // it so future runs and community lookups reuse it. MB asks for ~1 req/s,
+        // so only pay that extra delay for artists we actually have to look up.
+        let mut mbid = mbid.clone();
+        if mbid.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            if let Some(found) = search_musicbrainz_artist(name).await {
+                artist_repo.update_mbid(*artist_id, &found).ok();
+                info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
+                mbid = found;
+            }
+        }
+
+        match fetch_artist_image(&mbid, name, discogs_token.as_deref()).await {
             Some(data) => {
                 // Cache key: by MBID when known, else by NAME. Keying by
                 // `artist-mbid-` with an EMPTY mbid made every artist without an
