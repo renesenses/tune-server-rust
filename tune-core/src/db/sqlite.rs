@@ -15,13 +15,92 @@ pub struct SqliteDb {
     read_counter: Arc<AtomicUsize>,
 }
 
-const PRAGMAS_BASE: &str = "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA temp_store=MEMORY;
-             PRAGMA mmap_size=268435456;
-             PRAGMA analysis_limit=400;";
+/// Filesystem types that don't provide reliable POSIX file locking or WAL
+/// shared-memory (the `-shm` mmap). On these, SQLite in WAL mode can silently
+/// lose writes made from background connections — e.g. artist metadata that
+/// never persisted because the DB lived on an ntfs-3g (fuseblk) mount (Fabien).
+#[cfg(target_os = "linux")]
+const UNRELIABLE_FS: &[&str] = &[
+    "fuse", "fuseblk", "nfs", "cifs", "smb", "smbfs", "9p", "ntfs", "exfat", "vfat", "msdos",
+];
+
+/// Return the mounted filesystem type for `path` (via /proc/mounts), matching
+/// the longest mountpoint prefix.
+#[cfg(target_os = "linux")]
+fn linux_fstype_for_path(path: &str) -> Option<String> {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let canon = canon.to_string_lossy().to_string();
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let _dev = fields.next();
+        let (mp, fstype) = match (fields.next(), fields.next()) {
+            (Some(m), Some(t)) => (m, t),
+            _ => continue,
+        };
+        let under = canon == mp
+            || mp == "/"
+            || (canon.starts_with(mp) && canon.as_bytes().get(mp.len()) == Some(&b'/'));
+        let longer = match &best {
+            Some((len, _)) => mp.len() > *len,
+            None => true,
+        };
+        if under && longer {
+            best = Some((mp.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// Whether `path`'s filesystem is reliable for SQLite. Warns and returns false
+/// for FUSE/network/no-lock filesystems so the caller can fall back to a
+/// rollback journal instead of WAL. Always true on non-Linux (macOS/Windows
+/// put the DB on a native FS).
+fn db_filesystem_is_reliable(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(fstype) = linux_fstype_for_path(path) {
+        let lower = fstype.to_lowercase();
+        if UNRELIABLE_FS.iter().any(|b| lower.contains(b)) {
+            tracing::warn!(
+                db_path = path,
+                filesystem = %fstype,
+                "sqlite_db_on_unreliable_filesystem: this filesystem does not provide reliable \
+                 file locking / WAL shared memory — background writes (artist images, metadata) \
+                 can be silently lost. Falling back to a rollback journal; move TUNE_DB_PATH to a \
+                 native filesystem (e.g. ext4) for a proper fix."
+            );
+            return false;
+        }
+    }
+    let _ = path;
+    true
+}
+
+/// Build the PRAGMA batch. `reliable_fs=false` (FUSE/network mount) switches
+/// off WAL and mmap — both depend on facilities those filesystems don't provide
+/// coherently — so writes at least reach the database file.
+fn pragmas_base(reliable_fs: bool) -> String {
+    let (journal, mmap) = if reliable_fs {
+        ("WAL", 268_435_456u64)
+    } else {
+        ("DELETE", 0)
+    };
+    format!(
+        "PRAGMA journal_mode={journal};\n\
+         PRAGMA foreign_keys=ON;\n\
+         PRAGMA synchronous=NORMAL;\n\
+         PRAGMA busy_timeout=5000;\n\
+         PRAGMA temp_store=MEMORY;\n\
+         PRAGMA mmap_size={mmap};\n\
+         PRAGMA analysis_limit=400;"
+    )
+}
 
 /// Register the `unaccent(text)` scalar function so SQLite `LIKE` search can be
 /// accent-insensitive, matching PostgreSQL's `unaccent()` extension. Must be
@@ -46,12 +125,15 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
 
 /// Build the full PRAGMA batch, including adaptive cache_size.
 /// Respects `TUNE_CACHE_SIZE` env override (value in negative KB, e.g. `-128000`).
-fn build_pragmas() -> String {
+fn build_pragmas(reliable_fs: bool) -> String {
     let cache_size = std::env::var("TUNE_CACHE_SIZE")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(-64000); // default 64 MB
-    format!("{PRAGMAS_BASE}\nPRAGMA cache_size={cache_size};")
+    format!(
+        "{}\nPRAGMA cache_size={cache_size};",
+        pragmas_base(reliable_fs)
+    )
 }
 
 impl SqliteDb {
@@ -60,7 +142,8 @@ impl SqliteDb {
             return Self::open_in_memory();
         }
 
-        let pragmas = build_pragmas();
+        let reliable_fs = db_filesystem_is_reliable(path);
+        let pragmas = build_pragmas(reliable_fs);
 
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -91,7 +174,12 @@ impl SqliteDb {
             read_pool.push(Arc::new(Mutex::new(rc)));
         }
 
-        info!(path, readers = READ_POOL_SIZE, "sqlite_opened");
+        info!(
+            path,
+            readers = READ_POOL_SIZE,
+            journal = if reliable_fs { "WAL" } else { "DELETE" },
+            "sqlite_opened"
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
