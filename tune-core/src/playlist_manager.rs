@@ -47,7 +47,9 @@ impl PlaylistManager {
         let repo = PlaylistRepo::new(self.db.clone());
         let track_repo = TrackRepo::new(self.db.clone());
 
-        let playlist_id = repo.create(playlist_name, None)?;
+        // tune-core has no request context; server-side playlist creation
+        // belongs to the built-in Default profile (1).
+        let playlist_id = repo.create(playlist_name, None, 1)?;
         let mut matched = 0usize;
         let mut skipped = 0usize;
         let mut track_ids = Vec::new();
@@ -109,7 +111,7 @@ impl PlaylistManager {
         let repo = PlaylistRepo::new(self.db.clone());
         let original = repo.get(playlist_id)?.ok_or("playlist not found")?;
 
-        let new_id = repo.create(new_name, original.description.as_deref())?;
+        let new_id = repo.create(new_name, original.description.as_deref(), 1)?;
         let track_ids = repo.get_track_ids(playlist_id)?;
         if !track_ids.is_empty() {
             repo.add_tracks(new_id, &track_ids, None)?;
@@ -126,7 +128,7 @@ impl PlaylistManager {
         deduplicate: bool,
     ) -> Result<i64, String> {
         let repo = PlaylistRepo::new(self.db.clone());
-        let target_id = repo.create(target_name, None)?;
+        let target_id = repo.create(target_name, None, 1)?;
 
         let mut all_tracks = Vec::new();
         for &src_id in source_ids {
@@ -187,7 +189,7 @@ mod tests {
         let t2 = insert_track(&db, "Song Two", "/music/song2.flac");
 
         let repo = PlaylistRepo::new(db.clone());
-        let plid = repo.create("Test Export", None).unwrap();
+        let plid = repo.create("Test Export", None, 1).unwrap();
         repo.add_tracks(plid, &[t1, t2], None).unwrap();
 
         let mgr = PlaylistManager::new(db);
@@ -207,7 +209,7 @@ mod tests {
         let t2 = insert_track(&db, "Track B", "/b.flac");
 
         let repo = PlaylistRepo::new(db.clone());
-        let plid = repo.create("Original", Some("Desc")).unwrap();
+        let plid = repo.create("Original", Some("Desc"), 1).unwrap();
         repo.add_tracks(plid, &[t1, t2], None).unwrap();
 
         let mgr = PlaylistManager::new(db.clone());
@@ -229,9 +231,9 @@ mod tests {
         let t3 = insert_track(&db, "C", "/c.flac");
 
         let repo = PlaylistRepo::new(db.clone());
-        let pl1 = repo.create("PL1", None).unwrap();
+        let pl1 = repo.create("PL1", None, 1).unwrap();
         repo.add_tracks(pl1, &[t1, t2], None).unwrap();
-        let pl2 = repo.create("PL2", None).unwrap();
+        let pl2 = repo.create("PL2", None, 1).unwrap();
         repo.add_tracks(pl2, &[t2, t3], None).unwrap();
 
         let mgr = PlaylistManager::new(db.clone());
@@ -248,9 +250,9 @@ mod tests {
         let t1 = insert_track(&db, "A", "/a.flac");
 
         let repo = PlaylistRepo::new(db.clone());
-        let pl1 = repo.create("PL1", None).unwrap();
+        let pl1 = repo.create("PL1", None, 1).unwrap();
         repo.add_tracks(pl1, &[t1], None).unwrap();
-        let pl2 = repo.create("PL2", None).unwrap();
+        let pl2 = repo.create("PL2", None, 1).unwrap();
         repo.add_tracks(pl2, &[t1], None).unwrap();
 
         let mgr = PlaylistManager::new(db.clone());

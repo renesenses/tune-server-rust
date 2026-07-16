@@ -423,9 +423,11 @@ fn build_signal_path(
             }
         }
         "oaat" => {
-            // FLAC/WAV/DSD → WAV is lossless; only lossy sources lose quality
+            // Lossless PCM → WAV preserves every bit, but DSD → WAV is a domain
+            // conversion (1-bit sigma-delta decimated to multi-bit PCM), so it is
+            // NOT bit-perfect even though DSD counts as a lossless *format*.
             (
-                is_lossless || !oaat_transcodes,
+                (is_lossless && !is_dsd) || !oaat_transcodes,
                 "OAAT",
                 if oaat_transcodes { "WAV" } else { format_name },
             )
@@ -517,8 +519,9 @@ fn build_signal_path(
     let transcode_active =
         needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
     if transcode_active {
-        // OAAT lossless→WAV preserves all audio data
-        let transcode_lossless = is_oaat && is_lossless;
+        // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
+        // lossy domain conversion (see the "oaat" transport arm above).
+        let transcode_lossless = is_oaat && is_lossless && !is_dsd;
         steps.push(json!({
             "name": "Transcoder",
             "description": format!("{format_name} \u{2192} {output_format_name}"),

@@ -13,6 +13,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::PlayResult;
 
 use crate::error::AppError;
+use crate::routes::active_profile::DEFAULT_PROFILE_ID;
 use crate::state::AppState;
 
 /// Map an orchestrator play error to an appropriate HTTP status code.
@@ -1585,7 +1586,7 @@ async fn save_queue_as_playlist(
         .name
         .unwrap_or_else(|| format!("Queue - Zone {zone_id}"));
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
-    match playlist_repo.create(&name, None) {
+    match playlist_repo.create(&name, None, DEFAULT_PROFILE_ID) {
         Ok(id) => {
             playlist_repo.add_tracks(id, &track_ids, None).ok();
             (

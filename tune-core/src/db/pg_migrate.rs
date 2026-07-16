@@ -203,7 +203,8 @@ CREATE TABLE IF NOT EXISTS track_metadata (
 CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    description TEXT
+    description TEXT,
+    profile_id TEXT NOT NULL DEFAULT '1'
 );
 
 CREATE TABLE IF NOT EXISTS playlist_tracks (
