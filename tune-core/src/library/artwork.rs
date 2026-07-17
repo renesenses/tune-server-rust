@@ -1106,6 +1106,49 @@ async fn batch_enrich_artist_artwork_inner(
         .ok();
 }
 
+/// Save cover art bytes that were **already read during the metadata pass** into
+/// the artwork cache, without re-opening the audio file.
+///
+/// `get_or_extract` opens the file a *second* time through lofty to pull the
+/// embedded picture. On some Windows setups that second open fails with
+/// `os error 3` (path not found) on accented paths even though the metadata read
+/// moments earlier succeeded — so the album ends up with no cover although its
+/// tags carry one (Thibaud). When the scan already has the cover bytes from the
+/// metadata read, call this instead: same cache key as `get_or_extract`, so a
+/// later `get_or_extract` on the same file is a cache hit.
+pub fn save_embedded_cover(
+    audio_path: &Path,
+    cache_dir: &Path,
+    cover: &(Vec<u8>, String),
+) -> Option<String> {
+    let hash = artwork_hash(&audio_path.to_string_lossy());
+
+    // Already cached (from a previous scan or from get_or_extract): reuse it.
+    if cache_dir.join(format!("{hash}.jpg")).exists()
+        || cache_dir.join(format!("{hash}.png")).exists()
+    {
+        return Some(hash);
+    }
+
+    let (data, mime) = cover;
+    let ext = if mime.contains("png") {
+        "png"
+    } else if mime.contains("bmp") {
+        "bmp"
+    } else {
+        "jpg"
+    };
+    if save_to_cache(data, cache_dir, &hash, ext).is_some() {
+        return Some(hash);
+    }
+    warn!(
+        path = %audio_path.display(),
+        cache_dir = %cache_dir.display(),
+        "embedded_cover_from_tag_save_failed"
+    );
+    None
+}
+
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let hash = artwork_hash(&audio_path.to_string_lossy());
 

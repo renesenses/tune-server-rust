@@ -61,6 +61,12 @@ pub struct TrackMetadata {
     pub musicbrainz_release_group_id: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
+    /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
+    /// parsed the tags. Lets the scanner cache the cover without re-opening the
+    /// file — a second `lofty::read_from_path` failed with "path not found"
+    /// (os error 3) for some accented Windows paths even though the first read
+    /// succeeded (Thibaud: <1% of albums had no artwork).
+    pub cover_art: Option<(Vec<u8>, String)>,
     pub credits: Vec<TrackCredit>,
     pub comment: Option<String>,
 }
@@ -952,6 +958,7 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_release_group_id: mb_release_group_id,
         isrc,
         has_cover,
+        cover_art: None,
         credits,
         comment: None,
     })
@@ -1020,6 +1027,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     })
@@ -1113,6 +1121,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     }
@@ -1183,6 +1192,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     }
@@ -1438,6 +1448,16 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
+        // Capture the embedded cover from this same lofty pass so the scanner
+        // doesn't have to re-open the file to extract it.
+        cover_art: tag.pictures().first().map(|pic| {
+            let mime = match pic.mime_type() {
+                Some(lofty::picture::MimeType::Png) => "image/png",
+                Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                _ => "image/jpeg",
+            };
+            (pic.data().to_vec(), mime.to_string())
+        }),
         credits,
         comment: tag.comment().map(|s| s.to_string()),
     })
@@ -2192,6 +2212,7 @@ mod tests {
             bpm: Some(120.5),
             compilation: true,
             has_cover: true,
+            cover_art: None,
             genres: vec!["Jazz".into(), "Fusion".into()],
             ..Default::default()
         };
