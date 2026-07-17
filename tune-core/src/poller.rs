@@ -174,6 +174,22 @@ pub(crate) mod decisions {
         last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
     }
 
+    /// The peak position reached (near) the track's full duration, so the track
+    /// has demonstrably finished — independent of the wall clock.
+    ///
+    /// The wall-clock guards (`played_enough`, `ended_naturally_wall_ok`) reset
+    /// `track_started_at` on a gapless metadata advance, so when a local FLAC
+    /// track (whose gapless pre-arm falls back — the next stream isn't WAV) ends
+    /// a couple seconds later, `wall_elapsed` under-counts and those guards
+    /// wrongly reject the real end. That stalled auto-advance for ~30s, which
+    /// surfaced as tracks restarting/being skipped in a gapless album (Jean
+    /// Valjean, local FLAC on WASAPI). When the peak has reached the duration
+    /// the track is over regardless of the (unreliable) wall clock.
+    pub fn peak_reached_end(track_duration_ms: u64, peak_position_ms: u64) -> bool {
+        track_duration_ms > 0
+            && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
+    }
+
     /// After `STOPPED_TICKS_THRESHOLD` consecutive Stopped ticks, should this be
     /// treated as a natural track end (re-trigger play) rather than a playback
     /// failure (stop the zone)?
@@ -1102,6 +1118,7 @@ impl PositionPoller {
                         }
                     } else if status.ended_naturally
                         && (played_enough
+                            || decisions::peak_reached_end(track_duration_ms, ps.peak_position_ms)
                             || decisions::ended_naturally_wall_ok(wall_elapsed, track_duration_ms))
                     {
                         // Local outputs (WASAPI/ALSA/CoreAudio) signal
@@ -1954,6 +1971,30 @@ mod tests {
             !decisions::played_enough(300_000, 280_000, 10),
             "wall_elapsed < MIN_TRACK_WALL_SECS must reject even at high fraction"
         );
+    }
+
+    #[test]
+    fn peak_reached_end_bypasses_reset_wall_clock() {
+        // Jean Valjean, local FLAC on WASAPI: a gapless metadata advance reset
+        // track_started_at ~2s before the track actually ended, so wall_elapsed
+        // under-counted and played_enough rejected a track that had in fact
+        // finished (peak 719906 ms > duration 714906 ms). peak_reached_end must
+        // recognize the end from the peak alone, independent of the wall clock,
+        // so auto-advance is immediate instead of stalling ~30s.
+        let dur = 714_906u64;
+        let peak = 719_906u64; // peak overshot the duration
+        assert!(
+            !decisions::played_enough(dur, peak, 2),
+            "reset wall clock makes played_enough falsely reject the finished track"
+        );
+        assert!(
+            decisions::peak_reached_end(dur, peak),
+            "peak past the duration must count as ended regardless of wall time"
+        );
+        // A track barely started must NOT be treated as ended.
+        assert!(!decisions::peak_reached_end(dur, 30_000));
+        // Unknown duration: no false positive.
+        assert!(!decisions::peak_reached_end(0, 500_000));
     }
 
     #[test]
