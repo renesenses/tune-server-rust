@@ -50,7 +50,20 @@ impl PostgresDb {
         // "black screen" reported on the iOS/Android clients. CREATE TABLE IF NOT
         // EXISTS is idempotent; add new tables here like the columns below.
         const ENSURE_TABLES: &str = "\
-CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL);";
+CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL);\
+CREATE TABLE IF NOT EXISTS streaming_favorites (\
+    id TEXT PRIMARY KEY,\
+    profile_id TEXT NOT NULL DEFAULT '1',\
+    item_type TEXT NOT NULL,\
+    service TEXT NOT NULL,\
+    service_id TEXT NOT NULL,\
+    title TEXT,\
+    artist TEXT,\
+    album TEXT,\
+    cover_url TEXT,\
+    created_at TEXT,\
+    UNIQUE(profile_id, item_type, service, service_id)\
+);";
         if let Err(e) = sqlx::raw_sql(ENSURE_TABLES).execute(&self.pool).await {
             warn!(error = %e, "pg_ensure_tables_failed");
         }
