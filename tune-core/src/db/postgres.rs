@@ -51,8 +51,9 @@ impl PostgresDb {
         // EXISTS is idempotent; add new tables here like the columns below.
         const ENSURE_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL);\
+CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;\
 CREATE TABLE IF NOT EXISTS streaming_favorites (\
-    id TEXT PRIMARY KEY,\
+    id TEXT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq')::text,\
     profile_id TEXT NOT NULL DEFAULT '1',\
     item_type TEXT NOT NULL,\
     service TEXT NOT NULL,\
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (\
     cover_url TEXT,\
     created_at TEXT,\
     UNIQUE(profile_id, item_type, service, service_id)\
-);";
+);\
+ALTER TABLE streaming_favorites ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')::text;";
         if let Err(e) = sqlx::raw_sql(ENSURE_TABLES).execute(&self.pool).await {
             warn!(error = %e, "pg_ensure_tables_failed");
         }
