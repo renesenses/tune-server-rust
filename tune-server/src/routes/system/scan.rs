@@ -501,16 +501,32 @@ pub(super) async fn trigger_scan(
 
                     if let Some(aid) = album_id
                         && !albums_with_cover.contains(&aid)
-                        && let Some(hash) = tune_core::library::artwork::get_or_extract(
-                            std::path::Path::new(&sf.path),
-                            &cache_dir,
-                        )
                     {
-                        if let Err(e) = album_repo.update_cover_path(aid, &hash) {
-                            tracing::warn!(album_id = aid, error = %e, "cover_path_update_failed");
+                        // Prefer the embedded cover already read while parsing
+                        // the tags — re-opening the file to extract it failed
+                        // (os error 3, path not found) for some accented Windows
+                        // paths even though the first read had succeeded
+                        // (Thibaud). Fall back to a fresh extract (folder cover,
+                        // or files whose metadata came from a non-tag path).
+                        let cover_hash = match sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref())
+                        {
+                            Some(cover) => tune_core::library::artwork::save_embedded_cover(
+                                std::path::Path::new(&sf.path),
+                                &cache_dir,
+                                cover,
+                            ),
+                            None => tune_core::library::artwork::get_or_extract(
+                                std::path::Path::new(&sf.path),
+                                &cache_dir,
+                            ),
+                        };
+                        if let Some(hash) = cover_hash {
+                            if let Err(e) = album_repo.update_cover_path(aid, &hash) {
+                                tracing::warn!(album_id = aid, error = %e, "cover_path_update_failed");
+                            }
+                            albums_with_cover.insert(aid);
+                            artwork_extracted += 1;
                         }
-                        albums_with_cover.insert(aid);
-                        artwork_extracted += 1;
                     }
 
                     // Check for artist image if not already set
