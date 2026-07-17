@@ -67,8 +67,7 @@ pub mod sql {
         )
     }
 
-    const SELECT_COLS: &str =
-        "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at \
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at \
          FROM streaming_favorites";
 
     pub fn list_all<D: SqlDialect>(d: &D) -> String {
@@ -216,10 +215,28 @@ mod tests {
     #[test]
     fn add_list_remove() {
         let repo = fresh_repo();
-        repo.add(1, "track", "tidal", "t1", Some("Song"), Some("Artist"), Some("Album"), None)
-            .unwrap();
-        repo.add(1, "album", "qobuz", "q9", Some("Rec"), Some("Band"), None, None)
-            .unwrap();
+        repo.add(
+            1,
+            "track",
+            "tidal",
+            "t1",
+            Some("Song"),
+            Some("Artist"),
+            Some("Album"),
+            None,
+        )
+        .unwrap();
+        repo.add(
+            1,
+            "album",
+            "qobuz",
+            "q9",
+            Some("Rec"),
+            Some("Band"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let all = repo.list(1, None).unwrap();
         assert_eq!(all.len(), 2);
@@ -240,11 +257,14 @@ mod tests {
     #[test]
     fn add_is_idempotent_and_profile_scoped() {
         let repo = fresh_repo();
-        repo.add(1, "track", "tidal", "t1", None, None, None, None).unwrap();
-        repo.add(1, "track", "tidal", "t1", None, None, None, None).unwrap();
+        repo.add(1, "track", "tidal", "t1", None, None, None, None)
+            .unwrap();
+        repo.add(1, "track", "tidal", "t1", None, None, None, None)
+            .unwrap();
         assert_eq!(repo.list(1, None).unwrap().len(), 1);
         // Different profile is isolated.
-        repo.add(2, "track", "tidal", "t1", None, None, None, None).unwrap();
+        repo.add(2, "track", "tidal", "t1", None, None, None, None)
+            .unwrap();
         assert_eq!(repo.list(1, None).unwrap().len(), 1);
         assert_eq!(repo.list(2, None).unwrap().len(), 1);
     }
