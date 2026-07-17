@@ -15,6 +15,7 @@ pub mod postgres;
 mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
+pub mod streaming_favorites_repo;
 pub mod rating_repo;
 pub mod settings_repo;
 pub mod source_link_repo;

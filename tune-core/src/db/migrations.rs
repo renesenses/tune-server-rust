@@ -670,6 +670,31 @@ CREATE TABLE IF NOT EXISTS streaming_queue (
         name: "add_profile_id_to_playlists",
         up: "", // Applied programmatically via add_column_if_missing (existing rows → profile 1)
     },
+    // Streaming favorites: the local `favorites` table keys on an INTEGER
+    // item_id, so it can only hold local-library items. Streaming items
+    // (Tidal/Qobuz…) use string ids, so they get their own table here, mirroring
+    // the local/streaming_queue split. Metadata (title/artist/album/cover) is
+    // stored so the favorites list needs no per-item hydration for streaming.
+    Migration {
+        version: 56,
+        name: "add_streaming_favorites",
+        up: "
+CREATE TABLE IF NOT EXISTS streaming_favorites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    service TEXT NOT NULL,
+    service_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(profile_id, item_type, service, service_id)
+);
+CREATE INDEX IF NOT EXISTS idx_streaming_favorites_profile ON streaming_favorites(profile_id, item_type);
+",
+    },
 ];
 
 fn add_column_if_missing(db: &SqliteDb, table: &str, column: &str, col_type: &str) {
@@ -1083,6 +1108,25 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             album TEXT,\
             cover_url TEXT,\
             duration_ms INTEGER DEFAULT 0\
+        );",
+    )
+    .ok();
+
+    // Streaming favorites (migration v56); re-create unconditionally so DBs from
+    // any prior version get it regardless of which migration they came from.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS streaming_favorites (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            profile_id INTEGER NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            service TEXT NOT NULL,\
+            service_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\
+            UNIQUE(profile_id, item_type, service, service_id)\
         );",
     )
     .ok();
