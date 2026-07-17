@@ -46,6 +46,10 @@ pub struct StreamSession {
     _keep_alive_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
     pub file_path: Mutex<Option<String>>,
+    /// On-the-fly M4A faststart map: when set, the file is served as
+    /// `ftyp + patched-moov` (from memory) followed by the original mdat, so a
+    /// DLNA renderer gets the metadata up front without seeking to the file end.
+    pub faststart: std::sync::Mutex<Option<crate::audio::faststart::FaststartMap>>,
     pub proxy_url: Mutex<Option<String>>,
     pub track_title: Option<String>,
     pub track_artist: Option<String>,
@@ -71,6 +75,7 @@ impl StreamSession {
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),
             file_path: Mutex::new(None),
+            faststart: std::sync::Mutex::new(None),
             proxy_url: Mutex::new(None),
             track_title: None,
             track_artist: None,
@@ -175,6 +180,15 @@ impl AudioStreamer {
             .insert(id.clone(), Arc::new(session));
         info!(stream_id = %id, "file_session_created");
         id
+    }
+
+    /// Attach an on-the-fly M4A faststart map to a file session so it is served
+    /// as `ftyp + patched-moov + mdat` (moov relocated to the front). Must be
+    /// set before the renderer requests the stream.
+    pub async fn set_faststart(&self, id: &str, map: crate::audio::faststart::FaststartMap) {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            *s.faststart.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
+        }
     }
 
     /// Create a streaming session for a decoded radio stream (infinite,
@@ -343,6 +357,7 @@ pub fn cleanup_leftover_transcode_files() {
             if name.starts_with("tune-transcode-")
                 || name.starts_with("tune-aac-transcode-")
                 || name.starts_with("tune-dash-transcode-")
+                || name.starts_with("tune-faststart-")
             {
                 if std::fs::remove_file(entry.path()).is_ok() {
                     count += 1;
@@ -386,6 +401,7 @@ fn is_temp_transcode_file(path: &str) -> bool {
     file_name.starts_with("tune-transcode-")
         || file_name.starts_with("tune-aac-transcode-")
         || file_name.starts_with("tune-dash-transcode-")
+        || file_name.starts_with("tune-faststart-")
 }
 
 pub fn build_icy_metadata(

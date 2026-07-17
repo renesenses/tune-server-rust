@@ -1676,6 +1676,25 @@ impl PlaybackOrchestrator {
                 .create_file_session(info, file_path.clone(), false)
                 .await;
 
+            // For M4A/ALAC passthrough, attach an on-the-fly faststart map so the
+            // file is served as `ftyp + patched-moov + mdat` (moov relocated to
+            // the front). The renderer then reads its metadata up front and starts
+            // immediately instead of seeking to the END of the file first — a slow
+            // start + Range storm, esp. over a NAS mount (Yves, LHC-56, 192/24
+            // ALAC on SMB). This reads only ftyp+moov (never mdat), so it adds no
+            // copy latency, and falls back to the original file if not applicable.
+            if source_format == Some(AudioFormat::Alac) {
+                let fp = file_path.clone();
+                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
+                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                })
+                .await
+                {
+                    info!(file = %file_path, "m4a_faststart_applied");
+                    self.streamer.set_faststart(&session_id, map).await;
+                }
+            }
+
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
             // affect the actual audio stream served to the output device.
