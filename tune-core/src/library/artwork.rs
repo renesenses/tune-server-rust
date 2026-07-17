@@ -41,10 +41,52 @@ const FOLDER_COVER_NAMES: &[&str] = &[
 
 const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 
+/// Wrap an absolute Windows path for extended-length (`\\?\`) access.
+///
+/// The Win32 file APIs (used by `std::fs` and `lofty`) reject paths longer than
+/// MAX_PATH (260 chars) with "The system cannot find the path specified.
+/// (os error 3)" unless the path carries the extended-length `\\?\` prefix.
+/// This surfaced as missing cover art for albums whose folder/file names push
+/// the full path past 260 chars on Windows (Thibaud): the tracks scan fine but
+/// the artwork read on the full path fails.
+///
+/// Pure string transform, safe on every platform: it only rewrites paths that
+/// look like Windows absolute paths (drive `C:\…` or UNC `\\server\…`), so on
+/// Unix (paths starting with `/`) and for relative paths it is a no-op. Verbatim
+/// paths require `\` separators, so we normalize `/` and only touch already
+/// absolute paths.
+pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    let s = match path.to_str() {
+        Some(s) => s,
+        None => return Cow::Borrowed(path), // non-UTF-8: leave untouched
+    };
+    if s.starts_with("\\\\?\\") {
+        return Cow::Borrowed(path); // already verbatim
+    }
+    let b = s.as_bytes();
+    let is_drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    let is_unc = s.starts_with("\\\\") || s.starts_with("//");
+    if !is_drive && !is_unc {
+        return Cow::Borrowed(path); // Unix / relative path: no-op
+    }
+    let normalized = s.replace('/', "\\");
+    let prefixed = if is_unc {
+        // \\server\share\… -> \\?\UNC\server\share\…
+        format!("\\\\?\\UNC\\{}", normalized.trim_start_matches('\\'))
+    } else {
+        format!("\\\\?\\{normalized}")
+    };
+    Cow::Owned(std::path::PathBuf::from(prefixed))
+}
+
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    match lofty::read_from_path(audio_path) {
+    match lofty::read_from_path(&*extended_path(audio_path)) {
         Ok(tagged) => {
             if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
                 if let Some(pic) = tag.pictures().first() {
@@ -77,7 +119,7 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
     for name in FOLDER_COVER_NAMES {
         let candidate = dir.join(name);
-        if candidate.exists() {
+        if extended_path(&candidate).exists() {
             return Some(candidate);
         }
     }
@@ -1177,7 +1219,7 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
 
     // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.)
     if let Some(folder_cover) = find_folder_cover(audio_path) {
-        match std::fs::read(&folder_cover) {
+        match std::fs::read(&*extended_path(&folder_cover)) {
             Ok(data) => {
                 let ext = folder_cover
                     .extension()
@@ -1254,6 +1296,48 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_path_windows_and_noop() {
+        // Windows drive path -> verbatim prefix, separators normalized.
+        assert_eq!(
+            extended_path(Path::new("C:\\Music\\Long\\file.flac"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\C:\\Music\\Long\\file.flac"
+        );
+        assert_eq!(
+            extended_path(Path::new("C:/Music/Long/file.flac"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\C:\\Music\\Long\\file.flac"
+        );
+        // UNC (NAS) path -> \\?\UNC\server\share\…
+        assert_eq!(
+            extended_path(Path::new("\\\\nas\\music\\album\\cover.jpg"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\UNC\\nas\\music\\album\\cover.jpg"
+        );
+        // Already verbatim -> unchanged.
+        assert_eq!(
+            extended_path(Path::new("\\\\?\\C:\\a")).to_str().unwrap(),
+            "\\\\?\\C:\\a"
+        );
+        // Unix absolute and relative paths -> untouched no-op.
+        assert_eq!(
+            extended_path(Path::new("/home/user/music/x.flac"))
+                .to_str()
+                .unwrap(),
+            "/home/user/music/x.flac"
+        );
+        assert_eq!(
+            extended_path(Path::new("album/cover.jpg"))
+                .to_str()
+                .unwrap(),
+            "album/cover.jpg"
+        );
+    }
 
     #[test]
     fn artwork_hash_deterministic() {
