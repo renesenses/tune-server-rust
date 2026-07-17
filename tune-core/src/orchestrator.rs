@@ -4708,38 +4708,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_never_upsamples() {
-        // The Resampler enforces "never upsample": when target > source,
-        // the actual target is clamped to source rate/depth.
-        use crate::audio::resampler::Resampler;
-
-        // 44.1kHz source, 96kHz target requested -> should stay at 44.1kHz
-        let r = Resampler::new(44100, 96000, 16, 24, 2);
-        assert_eq!(r.output_rate(), 44100, "must not upsample rate");
-        assert_eq!(r.output_depth(), 16, "must not upsample bit depth");
-        assert!(
-            !r.needs_resample(),
-            "no resample needed when target > source"
-        );
-
-        // 96kHz source, 48kHz target -> should downsample to 48kHz
-        let r = Resampler::new(96000, 48000, 24, 16, 2);
-        assert_eq!(r.output_rate(), 48000);
-        assert_eq!(r.output_depth(), 16);
-        assert!(r.needs_resample(), "downsample should be flagged");
-
-        // Same rate -> no resample
-        let r = Resampler::new(48000, 48000, 24, 24, 2);
-        assert!(!r.needs_resample());
-
-        // Mixed: rate up but depth down -> rate clamped, depth reduced
-        let r = Resampler::new(44100, 96000, 24, 16, 2);
-        assert_eq!(r.output_rate(), 44100, "rate must not increase");
-        assert_eq!(r.output_depth(), 16, "depth correctly reduced");
-        assert!(r.needs_resample(), "bit depth change requires resample");
-    }
-
-    #[tokio::test]
     async fn test_persist_position_on_pause() {
         let orch = test_orchestrator();
 

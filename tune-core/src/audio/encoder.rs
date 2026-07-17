@@ -1,8 +1,6 @@
-use std::io::Cursor;
-
 use tracing::{debug, warn};
 
-/// Audio encoder that handles WAV (via hound) and FLAC (native pure-Rust).
+/// Audio encoder that handles WAV (native) and FLAC (native pure-Rust).
 /// MP3 and OGG requests are transparently encoded as FLAC with a warning,
 /// since pure-Rust encoders for those formats are not available.
 ///
@@ -14,7 +12,7 @@ pub struct AudioEncoder {
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
-    /// WAV-only: accumulates all PCM data (hound needs it all upfront).
+    /// WAV-only: accumulates all PCM data (the WAV writer needs it all upfront).
     pcm_buffer: Option<Vec<u8>>,
     /// FLAC streaming state (None when not started or after finish).
     flac_state: Option<FlacStreamState>,
@@ -69,7 +67,7 @@ impl AudioEncoder {
                     format = "wav",
                     sample_rate = self.sample_rate,
                     bit_depth = self.bit_depth,
-                    "encoder_start_hound"
+                    "encoder_start_wav"
                 );
                 self.pcm_buffer = Some(Vec::new());
             }
@@ -152,7 +150,7 @@ impl AudioEncoder {
         }
 
         match self.format.as_str() {
-            "wav" => encode_wav_hound(&pcm_data, self.sample_rate, self.bit_depth, self.channels),
+            "wav" => encode_wav(&pcm_data, self.sample_rate, self.bit_depth, self.channels),
             _ => {
                 // Should not reach here (FLAC uses flac_state), but as a fallback:
                 encode_flac_batch(&pcm_data, self.sample_rate, self.bit_depth, self.channels)
@@ -167,77 +165,43 @@ impl AudioEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// WAV encoder (hound)
+// WAV encoder (native)
 // ---------------------------------------------------------------------------
 
-fn encode_wav_hound(
+/// Encode interleaved little-endian integer PCM into a complete WAV file.
+///
+/// The input `pcm` is already in the on-disk sample layout (16/24/32-bit LE),
+/// so the encoder is a canonical 44-byte header followed by the PCM bytes
+/// verbatim — no per-sample rewrite. The trailing bytes of an incomplete final
+/// sample are dropped so the `data` chunk always covers whole samples.
+fn encode_wav(
     pcm: &[u8],
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
 ) -> Result<Vec<u8>, String> {
-    let spec = hound::WavSpec {
-        channels: channels as u16,
-        sample_rate,
-        bits_per_sample: bit_depth as u16,
-        sample_format: hound::SampleFormat::Int,
+    let bytes_per_sample = match bit_depth {
+        16 | 24 | 32 => (bit_depth / 8) as usize,
+        _ => return Err(format!("unsupported bit depth: {bit_depth}")),
     };
 
-    let mut cursor = Cursor::new(Vec::new());
-    let mut writer =
-        hound::WavWriter::new(&mut cursor, spec).map_err(|e| format!("hound init: {e}"))?;
+    let body_len = pcm.len() - (pcm.len() % bytes_per_sample);
+    let pcm = &pcm[..body_len];
+    let data_size = u32::try_from(body_len).map_err(|_| "wav: pcm exceeds 4 GiB".to_string())?;
 
-    write_pcm_samples(&mut writer, pcm, bit_depth)?;
-
-    writer
-        .finalize()
-        .map_err(|e| format!("hound finalize: {e}"))?;
-    debug!(
-        pcm_bytes = pcm.len(),
-        wav_bytes = cursor.get_ref().len(),
-        "wav_encoded_hound"
+    let header = crate::audio::wav::build_wav_header_with_data_size(
+        channels as u16,
+        sample_rate,
+        bit_depth as u16,
+        data_size,
     );
-    Ok(cursor.into_inner())
-}
 
-fn write_pcm_samples(
-    writer: &mut hound::WavWriter<&mut Cursor<Vec<u8>>>,
-    pcm: &[u8],
-    bit_depth: u32,
-) -> Result<(), String> {
-    match bit_depth {
-        16 => {
-            for chunk in pcm.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        24 => {
-            for chunk in pcm.chunks_exact(3) {
-                let sample = i32::from_le_bytes([
-                    chunk[0],
-                    chunk[1],
-                    chunk[2],
-                    if chunk[2] & 0x80 != 0 { 0xFF } else { 0 },
-                ]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        32 => {
-            for chunk in pcm.chunks_exact(4) {
-                let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        _ => return Err(format!("unsupported bit depth: {bit_depth}")),
-    }
-    Ok(())
+    let mut out = Vec::with_capacity(44 + body_len);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(pcm);
+
+    debug!(pcm_bytes = body_len, wav_bytes = out.len(), "wav_encoded");
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,7 +1213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wav_encode_hound() {
+    async fn wav_encode_via_api() {
         let mut enc = AudioEncoder::new("wav", 44100, 16, 2);
         enc.start().await.unwrap();
         // 100 frames of silence (stereo 16-bit = 400 bytes)
@@ -1263,11 +1227,16 @@ mod tests {
     }
 
     #[test]
-    fn wav_encode_24bit() {
-        let pcm = vec![0u8; 600]; // 100 frames * 2ch * 3 bytes
-        let wav = encode_wav_hound(&pcm, 96000, 24, 2).unwrap();
-        assert!(wav.len() > 44);
+    fn wav_encode_24bit_is_header_plus_pcm() {
+        let pcm: Vec<u8> = (0..600u16).map(|i| i as u8).collect(); // 100 frames * 2ch * 3 bytes
+        let wav = encode_wav(&pcm, 96000, 24, 2).unwrap();
+        // Output is exactly a 44-byte header followed by the PCM verbatim.
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(&wav[44..], &pcm[..]);
         assert_eq!(&wav[0..4], b"RIFF");
+        // data chunk size (bytes 40..44) equals the PCM length exactly.
+        let data_size = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
+        assert_eq!(data_size as usize, pcm.len());
     }
 
     #[tokio::test]

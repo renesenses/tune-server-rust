@@ -16,6 +16,5 @@ pub mod iso_sacd;
 pub mod levels;
 pub mod mixer;
 pub mod pipeline;
-pub mod resampler;
 pub mod wav;
 pub mod wavpack;

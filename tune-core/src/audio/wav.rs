@@ -11,14 +11,25 @@ pub fn build_wav_header_with_duration(
     bit_depth: u16,
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
-    let byte_rate = sample_rate * channels as u32 * (bit_depth as u32 / 8);
-    let block_align = channels * (bit_depth / 8);
     let data_size: u32 = if let Some(dur) = duration_ms {
         let bytes = dur * sample_rate as u64 * channels as u64 * (bit_depth as u64 / 8) / 1000;
         bytes.min(0x7FFF_FFFF) as u32
     } else {
         0x7FFF_FFFF
     };
+    build_wav_header_with_data_size(channels, sample_rate, bit_depth, data_size)
+}
+
+/// Build a 44-byte WAV header with an exact `data` chunk size, for complete
+/// (non-streaming) WAV files where the full PCM length is known upfront.
+pub fn build_wav_header_with_data_size(
+    channels: u16,
+    sample_rate: u32,
+    bit_depth: u16,
+    data_size: u32,
+) -> [u8; 44] {
+    let byte_rate = sample_rate * channels as u32 * (bit_depth as u32 / 8);
+    let block_align = channels * (bit_depth / 8);
     let file_size: u32 = data_size.wrapping_add(36);
 
     let mut header = [0u8; 44];
