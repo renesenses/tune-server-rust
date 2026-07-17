@@ -4102,9 +4102,20 @@ impl PlaybackOrchestrator {
         if let Some(item) = queue.iter().find(|i| i.position == position) {
             let album = item.album_title.clone();
             let cover = item.cover_path.clone();
+            // Resolve the gapless/prefetch stream FOR THE ACTUAL OUTPUT. Without
+            // the device id, resolve_stream doesn't apply the output's format
+            // rules, so a local output (which needs WAV/PCM) was pre-armed with
+            // the raw FLAC stream — the local gapless chain then hit a non-WAV
+            // header and fell back (local_audio_gapless_next_not_wav_falling_back),
+            // breaking seamless FLAC gapless (Jean Valjean).
+            let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
             let req = PlayRequest {
                 zone_id,
-                output_device_id: None,
+                output_device_id,
                 track_id: Some(item.track_id),
                 source: None,
                 source_id: None,
