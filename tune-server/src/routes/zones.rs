@@ -64,6 +64,10 @@ struct PatchZone {
     /// When enabled, serve ALAC straight to the renderer (bit-perfect, no FLAC
     /// transcode). Only for renderers that decode ALAC natively.
     alac_passthrough: Option<bool>,
+    /// When enabled, transcode lossless to WAV/LPCM (not FLAC) for this DLNA
+    /// renderer — skips the slow FLAC encoder for hi-res and avoids renderers
+    /// whose ALAC decoder pops at start (LHC-56). Overrides alac_passthrough.
+    dlna_lpcm: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -664,6 +668,7 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "alac_passthrough".into(),
                 json!(zone_repo.get_alac_passthrough(zone_id)),
             );
+            obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
             let online = match z.output_type.as_deref() {
                 Some("local") | Some("browser") => true,
                 _ => z
@@ -740,6 +745,7 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "alac_passthrough".into(),
                     json!(repo.get_alac_passthrough(id)),
                 );
+                obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 let online = match zone.output_type.as_deref() {
                     Some("local") | Some("browser") => true,
                     _ => zone
@@ -849,6 +855,11 @@ async fn patch_zone(
     }
     if let Some(passthrough) = body.alac_passthrough {
         if let Err(e) = repo.update_alac_passthrough(id, passthrough) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(lpcm) = body.dlna_lpcm {
+        if let Err(e) = repo.update_dlna_lpcm(id, lpcm) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }

@@ -512,6 +512,36 @@ impl ZoneRepo {
         }
     }
 
+    /// Whether to transcode lossless to WAV/LPCM (not FLAC) for this DLNA zone.
+    pub fn get_dlna_lpcm(&self, id: i64) -> bool {
+        let placeholder = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!("SELECT COALESCE(dlna_lpcm, 0) FROM zones WHERE id = {placeholder}");
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+            != 0
+    }
+
+    pub fn update_dlna_lpcm(&self, id: i64, enabled: bool) -> Result<(), String> {
+        let sql = self.update_field_sql("dlna_lpcm");
+        let params: [&dyn ToSqlValue; 2] = [&(enabled as i64), &id];
+        match self.db.execute(&sql, &params) {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("no such column") || e.contains("does not exist") => {
+                tracing::debug!(id, error = %e, "dlna_lpcm_column_missing_ignoring_update");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Persist the renderer's host (IP) on the zone, for host-based dedup.
     /// Best-effort: silently ignores a missing `host` column (pre-migration DB).
     pub fn set_host(&self, id: i64, host: &str) -> Result<(), String> {
