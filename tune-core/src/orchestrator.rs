@@ -1152,8 +1152,14 @@ impl PlaybackOrchestrator {
         // straight to a renderer that decodes it, instead of transcoding to
         // FLAC — bit-perfect and zero CPU. Off by default because ALAC and AAC
         // share the audio/mp4 MIME, so it can't be auto-detected safely.
+        // LPCM override: a zone set to serve WAV/LPCM must transcode (to strip
+        // the renderer's ALAC decoder quirks — e.g. LHC-56 pops at start), so it
+        // takes precedence over ALAC passthrough.
+        let dlna_lpcm =
+            is_network_output && ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id);
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
+            && !dlna_lpcm
             && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
 
         let needs_transcode_for_output = is_network_output
@@ -1178,7 +1184,13 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
                 .unwrap_or("");
-            if did.is_empty() {
+            if dlna_lpcm {
+                // User forces WAV/LPCM for this zone: skips the slow native FLAC
+                // encoder for hi-res AND avoids a renderer whose ALAC decoder
+                // pops at start (Yves, LHC-56). Takes precedence over the FLAC
+                // override below.
+                true
+            } else if did.is_empty() {
                 false
             } else if ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id) {
                 // User forces native FLAC for this zone: some renderers decode
