@@ -123,8 +123,12 @@ impl StreamingFavoritesRepo {
         cover_url: Option<&str>,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::add, sql::add);
+        // profile_id is bound as TEXT: PG's column is TEXT (so `= $1` with a
+        // bigint fails "operator does not exist: text = bigint"), and SQLite's
+        // INTEGER affinity coerces the string back. Mirrors ProfileRepo.
+        let pid = profile_id.to_string();
         let params: [&dyn ToSqlValue; 8] = [
-            &profile_id,
+            &pid,
             &item_type,
             &service,
             &service_id,
@@ -145,7 +149,8 @@ impl StreamingFavoritesRepo {
         service_id: &str,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::remove, sql::remove);
-        let params: [&dyn ToSqlValue; 4] = [&profile_id, &item_type, &service, &service_id];
+        let pid = profile_id.to_string();
+        let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -158,7 +163,8 @@ impl StreamingFavoritesRepo {
         service_id: &str,
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::count_one, sql::count_one);
-        let params: [&dyn ToSqlValue; 4] = [&profile_id, &item_type, &service, &service_id];
+        let pid = profile_id.to_string();
+        let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         let n = self
             .db
             .query_one(&sql, &params)?
@@ -172,13 +178,14 @@ impl StreamingFavoritesRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<StreamingFavorite>, String> {
+        let pid = profile_id.to_string();
         let rows = if let Some(t) = item_type {
             let sql = self.dialect_sql(sql::list_by_type, sql::list_by_type);
-            let params: [&dyn ToSqlValue; 2] = [&profile_id, &t];
+            let params: [&dyn ToSqlValue; 2] = [&pid, &t];
             self.db.query_many(&sql, &params)?
         } else {
             let sql = self.dialect_sql(sql::list_all, sql::list_all);
-            let params: [&dyn ToSqlValue; 1] = [&profile_id];
+            let params: [&dyn ToSqlValue; 1] = [&pid];
             self.db.query_many(&sql, &params)?
         };
         Ok(rows.iter().map(row_to_streaming_favorite).collect())
