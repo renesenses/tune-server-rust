@@ -186,7 +186,17 @@ impl ZoneRepo {
     pub fn get(&self, id: i64) -> Result<Option<Zone>, String> {
         let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
-        Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_zone))
+        // Strong read (write connection) so a lagging WAL read snapshot can't
+        // return a stale row. The track-resolve path reads per-zone playback
+        // settings here (max_sample_rate, dsd_mode, alac_passthrough…); with the
+        // weak pool read a value just changed via PATCH could be missed on the
+        // very next track — the setting appeared "not to persist" (JP: échantillonnage
+        // reset au morceau suivant). A weak-then-strong-on-empty fallback (as in
+        // get_by_device_id) does NOT help here: the row exists, only the field is
+        // stale, so the fallback never triggers. Mirror list()'s unconditional
+        // strong read. A single zone by id is a tiny query.
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.first().map(row_to_zone))
     }
 
     /// Look up a zone by its output device id.
