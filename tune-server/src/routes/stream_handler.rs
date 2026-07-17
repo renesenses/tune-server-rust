@@ -280,11 +280,20 @@ async fn serve_file(
     req_headers: &HeaderMap,
     session: std::sync::Arc<StreamSession>,
 ) -> Response {
+    // On-the-fly M4A faststart: when present, we serve a virtual file
+    // (ftyp + patched moov, from memory) followed by the original mdat, so the
+    // renderer reads metadata up front. The virtual size equals the real size.
+    let faststart = session
+        .faststart
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let file_path = std::path::Path::new(path);
-    let file_size = match tokio::fs::metadata(file_path).await {
+    let disk_size = match tokio::fs::metadata(file_path).await {
         Ok(m) => m.len(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
+    let file_size = faststart.as_ref().map(|m| m.total).unwrap_or(disk_size);
 
     let range_header = req_headers
         .get("Range")
@@ -324,44 +333,16 @@ async fn serve_file(
             ),
         );
 
-        let path_owned = path.to_string();
         // Track served bytes so the poller can tell an actively-fetching
         // renderer from a genuinely-stalled one (fixes false force-stop of
         // DLNA renderers that report Stopped while streaming — Linn, RS130).
-        let byte_counter = session.clone();
-        let body = Body::from_stream(async_stream::stream! {
-            match tokio::fs::File::open(&path_owned).await {
-                Ok(mut file) => {
-                    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-                    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
-                        warn!(error = %e, "file_seek_error");
-                        return;
-                    }
-                    let mut remaining = length;
-                    let mut buf = vec![0u8; 65536];
-                    while remaining > 0 {
-                        let to_read = (remaining as usize).min(buf.len());
-                        match file.read(&mut buf[..to_read]).await {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                remaining -= n as u64;
-                                byte_counter.bytes_sent.fetch_add(
-                                    n as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "file_read_error");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => warn!(error = %e, "file_open_error"),
-            }
-        });
-
+        let body = build_file_body(
+            faststart.clone(),
+            path.to_string(),
+            start,
+            length,
+            session.clone(),
+        );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -383,35 +364,89 @@ async fn serve_file(
         HeaderValue::from_static("DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
     );
 
-    let path_owned = path.to_string();
-    let byte_counter = session.clone();
-    let body = Body::from_stream(async_stream::stream! {
-        match tokio::fs::File::open(&path_owned).await {
-            Ok(mut file) => {
-                use tokio::io::AsyncReadExt;
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match file.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            byte_counter.bytes_sent.fetch_add(
-                                n as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+    let body = build_file_body(faststart, path.to_string(), 0, file_size, session.clone());
+    (StatusCode::OK, headers, body).into_response()
+}
+
+/// Stream `length` bytes starting at virtual offset `start` of a file session.
+/// With a faststart map the virtual file is `header (ftyp+moov, in memory)` then
+/// the original file's mdat body; without one it's the plain file. Byte counting
+/// feeds the poller's actively-fetching heuristic.
+fn build_file_body(
+    faststart: Option<tune_core::audio::faststart::FaststartMap>,
+    path: String,
+    start: u64,
+    length: u64,
+    byte_counter: std::sync::Arc<StreamSession>,
+) -> Body {
+    use std::sync::atomic::Ordering::Relaxed;
+    Body::from_stream(async_stream::stream! {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut remaining = length;
+        let mut vpos = start;
+
+        if let Some(map) = faststart {
+            let header_len = map.header.len() as u64;
+            // 1) Header region (ftyp + patched moov) served from memory.
+            while remaining > 0 && vpos < header_len {
+                let n = ((header_len - vpos).min(remaining)) as usize;
+                let s = vpos as usize;
+                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
+                vpos += n as u64;
+                remaining -= n as u64;
+            }
+            // 2) Body region (original file's mdat) mapped by offset.
+            if remaining > 0 {
+                match tokio::fs::File::open(&path).await {
+                    Ok(mut file) => {
+                        let file_off = map.body_src_start + (vpos - header_len);
+                        if let Err(e) = file.seek(std::io::SeekFrom::Start(file_off)).await {
+                            warn!(error = %e, "file_seek_error");
+                            return;
                         }
-                        Err(e) => {
-                            warn!(error = %e, "file_read_error");
-                            break;
+                        let mut buf = vec![0u8; 65536];
+                        while remaining > 0 {
+                            let to_read = (remaining as usize).min(buf.len());
+                            match file.read(&mut buf[..to_read]).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    remaining -= n as u64;
+                                    byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                                }
+                                Err(e) => { warn!(error = %e, "file_read_error"); break; }
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "file_open_error"),
+                }
+            }
+        } else {
+            match tokio::fs::File::open(&path).await {
+                Ok(mut file) => {
+                    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+                        warn!(error = %e, "file_seek_error");
+                        return;
+                    }
+                    let mut buf = vec![0u8; 65536];
+                    while remaining > 0 {
+                        let to_read = (remaining as usize).min(buf.len());
+                        match file.read(&mut buf[..to_read]).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                remaining -= n as u64;
+                                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
+                            }
+                            Err(e) => { warn!(error = %e, "file_read_error"); break; }
                         }
                     }
                 }
+                Err(e) => warn!(error = %e, "file_open_error"),
             }
-            Err(e) => warn!(error = %e, "file_open_error"),
         }
-    });
-
-    (StatusCode::OK, headers, body).into_response()
+    })
 }
 
 /// Parse the start byte of an HTTP `Range` header value like `bytes=N-` or
