@@ -353,6 +353,20 @@ CREATE TABLE IF NOT EXISTS favorites (
     UNIQUE(profile_id, item_type, item_id)
 );
 
+CREATE TABLE IF NOT EXISTS streaming_favorites (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    service TEXT NOT NULL,
+    service_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    UNIQUE(profile_id, item_type, service, service_id)
+);
+
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

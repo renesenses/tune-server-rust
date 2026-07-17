@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::streaming_favorites_repo::StreamingFavoritesRepo;
 use tune_core::license::Feature;
 
 use crate::state::AppState;
@@ -38,6 +39,31 @@ struct FavoriteAction {
 #[derive(Deserialize)]
 struct FavoritesQuery {
     item_type: Option<String>,
+}
+
+/// Add a streaming (Tidal/Qobuz/…) item to a profile's favorites. Metadata is
+/// stored alongside so the list needs no per-item hydration.
+#[derive(Deserialize)]
+struct StreamingFavoriteAdd {
+    item_type: String,
+    service: String,
+    #[serde(alias = "id")]
+    service_id: String,
+    title: Option<String>,
+    #[serde(alias = "artist_name")]
+    artist: Option<String>,
+    #[serde(alias = "album_title")]
+    album: Option<String>,
+    #[serde(alias = "cover_path", alias = "cover")]
+    cover_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamingFavoriteRemove {
+    item_type: String,
+    service: String,
+    #[serde(alias = "id")]
+    service_id: String,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +105,15 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/favorites", get(list_favorites))
         .route("/{id}/favorites/add", post(add_favorite))
         .route("/{id}/favorites/remove", post(remove_favorite))
+        .route("/{id}/favorites/streaming", get(list_streaming_favorites))
+        .route(
+            "/{id}/favorites/streaming/add",
+            post(add_streaming_favorite),
+        )
+        .route(
+            "/{id}/favorites/streaming/remove",
+            post(remove_streaming_favorite),
+        )
         .route(
             "/{id}/settings",
             get(profile_settings).post(update_profile_settings),
@@ -270,6 +305,52 @@ async fn remove_favorite(
 ) -> impl IntoResponse {
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.remove_favorite(id, &body.item_type, body.item_id) {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+// --- Streaming favorites (Tidal/Qobuz/… items, stored separately from the
+// integer-keyed local `favorites`) ---
+
+async fn list_streaming_favorites(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<FavoritesQuery>,
+) -> Json<Value> {
+    let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
+    let items = repo.list(id, q.item_type.as_deref()).unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn add_streaming_favorite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<StreamingFavoriteAdd>,
+) -> impl IntoResponse {
+    let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
+    match repo.add(
+        id,
+        &body.item_type,
+        &body.service,
+        &body.service_id,
+        body.title.as_deref(),
+        body.artist.as_deref(),
+        body.album.as_deref(),
+        body.cover_url.as_deref(),
+    ) {
+        Ok(_) => (StatusCode::CREATED, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+async fn remove_streaming_favorite(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<StreamingFavoriteRemove>,
+) -> impl IntoResponse {
+    let repo = StreamingFavoritesRepo::with_backend(state.backend.clone());
+    match repo.remove(id, &body.item_type, &body.service, &body.service_id) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
