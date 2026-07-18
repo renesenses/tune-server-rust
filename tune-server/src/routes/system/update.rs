@@ -352,11 +352,14 @@ pub(super) async fn update_install(State(state): State<AppState>) -> impl IntoRe
         // spawn()+exit(0) so a supervised deployment still recovers.
         //
         // WINDOWS: we must NOT spawn or exec here. The binary is swapped by
-        // tune-update.bat, which first waits for THIS process (tune-server.exe)
-        // to exit. Starting another process from the still-old binary keeps the
-        // image name alive forever, so the .bat's wait_loop never completes
-        // (Christophe's log: `update_installed to=0.8.261` then a restart as
-        // `version=0.8.260`). Just exit; the .bat swaps the binary and starts it.
+        // tune-update.bat, which first waits for THIS process to exit (matched by
+        // PID, with a 60s timeout backstop). Starting another process from the
+        // still-old binary here would race the swap and could re-lock the .exe, so
+        // we just exit; the .bat swaps the binary and starts the new one.
+        // (History: the wait used to match by image name, which hung forever when
+        // any second tune-server.exe was alive — Christophe's log
+        // `update_installed to=0.8.261` then a restart as `version=0.8.260`. The
+        // PID filter fixes that.)
         #[cfg(windows)]
         {
             info!(
@@ -517,16 +520,33 @@ fn install_windows(
 
     update_web_dir(exe_dir, tmp_dir)?;
 
+    // Wait for OUR specific PID to exit, not any process named tune-server.exe.
+    // Matching by image name hangs forever whenever a second tune-server.exe is
+    // alive (a lingering child, a double launch): the wait_loop never completes,
+    // the binary is never swapped, and the OLD version comes back — an
+    // intermittent "update did nothing" that reproduces only sometimes
+    // (Christophe/Bilou/Yves). A PID filter is immune to that. A 60s timeout is
+    // the backstop so the swap is never blocked indefinitely.
+    let pid = std::process::id();
+    let err_file = exe_dir.join("tune-update-failed.txt");
+
     let bat_path = exe_dir.join("tune-update.bat");
     let bat_content = format!(
         "@echo off\r\n\
-         echo Waiting for Tune server to stop...\r\n\
+         setlocal enabledelayedexpansion\r\n\
+         echo Waiting for Tune server (PID {pid}) to stop...\r\n\
+         set /a TRIES=0\r\n\
          :wait_loop\r\n\
-         tasklist /FI \"IMAGENAME eq {exe_name}\" 2>nul | find /I \"{exe_name}\" >nul\r\n\
-         if not errorlevel 1 (\r\n\
-           timeout /t 1 /nobreak >nul\r\n\
-           goto wait_loop\r\n\
+         tasklist /FI \"PID eq {pid}\" 2>nul | find /I \"{exe_name}\" >nul\r\n\
+         if errorlevel 1 goto do_swap\r\n\
+         set /a TRIES+=1\r\n\
+         if !TRIES! GEQ 60 (\r\n\
+           echo Timed out after 60s waiting for old process, proceeding anyway...\r\n\
+           goto do_swap\r\n\
          )\r\n\
+         timeout /t 1 /nobreak >nul\r\n\
+         goto wait_loop\r\n\
+         :do_swap\r\n\
          timeout /t 1 /nobreak >nul\r\n\
          echo Replacing binary...\r\n\
          del \"{exe}\"\r\n\
@@ -535,18 +555,34 @@ fn install_windows(
            timeout /t 3 /nobreak >nul\r\n\
            del \"{exe}\"\r\n\
          )\r\n\
+         if exist \"{exe}\" goto swap_failed\r\n\
          rename \"{new}\" \"{exe_name}\"\r\n\
          echo Starting updated server...\r\n\
          start \"\" \"{exe}\"\r\n\
-         del \"%~f0\"\r\n",
+         del \"%~f0\"\r\n\
+         goto :eof\r\n\
+         :swap_failed\r\n\
+         echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
+         echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
+         echo The new version is staged next to it as {exe_name_new} — close Tune>> \"{err_file}\"\r\n\
+         echo completely, delete {exe_name}, then rename {exe_name_new} to {exe_name}.>> \"{err_file}\"\r\n\
+         echo Update failed - old binary locked. Details written to {err_file}\r\n\
+         start \"\" \"{exe}\"\r\n",
         exe = current_exe.display(),
         new = new_staging.display(),
+        err_file = err_file.display(),
         exe_name = current_exe
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        exe_name_new = new_staging
             .file_name()
             .unwrap_or_default()
             .to_string_lossy(),
     );
 
+    // A stale failure marker from a previous attempt would be misleading — clear it.
+    let _ = std::fs::remove_file(&err_file);
     std::fs::write(&bat_path, bat_content).map_err(|e| format!("write update.bat: {e}"))?;
 
     std::process::Command::new("cmd")
