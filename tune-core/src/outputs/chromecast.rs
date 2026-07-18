@@ -391,6 +391,17 @@ impl OutputTarget for ChromecastOutput {
 
             let current_uri = entry.media.as_ref().map(|m| m.content_id.clone());
 
+            // The receiver reports `idle_reason = FINISHED` when a track played
+            // to its end (vs CANCELLED / INTERRUPTED / ERROR). Surface that as
+            // `ended_naturally` so the poller advances to the next track right
+            // away. Without it, every FINISHED looked like a plain Stopped state
+            // and the poller only advanced via its 30 s wall-clock fallback —
+            // Chromecast albums stalled 30-60 s between tracks (#1072, Rhorn).
+            let ended_naturally = matches!(
+                entry.idle_reason,
+                Some(rust_cast::channels::media::IdleReason::Finished)
+            );
+
             Ok(OutputStatus {
                 state,
                 position_ms,
@@ -400,7 +411,7 @@ impl OutputTarget for ChromecastOutput {
                 current_uri,
                 track_title: None,
                 track_artist: None,
-                ended_naturally: false,
+                ended_naturally,
             })
         })
         .await
