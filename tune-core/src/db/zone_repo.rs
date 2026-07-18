@@ -129,6 +129,15 @@ pub mod sql {
     pub fn count_online() -> &'static str {
         "SELECT COUNT(*) FROM zones WHERE online = 1 AND COALESCE(is_hidden, 0) = 0"
     }
+
+    /// Zones that have actually been used (played at least one track, i.e.
+    /// `last_track_id` is set) and are online. Auto-discovered but never-played
+    /// ("dormant") zones are excluded — they must not consume the free-tier
+    /// quota. `last_track_id` is a permanent activation marker: it is only ever
+    /// SET (save_playback_position), never cleared in practice.
+    pub fn count_active() -> &'static str {
+        "SELECT COUNT(*) FROM zones WHERE online = 1 AND COALESCE(is_hidden, 0) = 0 AND last_track_id IS NOT NULL"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,6 +720,16 @@ impl ZoneRepo {
         }
     }
 
+    /// Count of online zones that have been played at least once (see
+    /// `sql::count_active`). Used for the free-tier zone cap so dormant
+    /// auto-discovered zones don't count.
+    pub fn count_active(&self) -> Result<i64, String> {
+        match self.db.query_one(sql::count_active(), &[])? {
+            None => Ok(0),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
+        }
+    }
+
     /// Persist the play state ("playing", "paused", "stopped") for a zone.
     /// Silently ignores missing column (pre-v39 database).
     pub fn save_play_state(&self, id: i64, state: &str) -> Result<(), String> {
@@ -818,6 +837,39 @@ mod tests {
         repo.create("Zone A", None, None).unwrap();
         repo.create("Zone B", None, None).unwrap();
         assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn count_active_excludes_dormant_zones() {
+        let db = test_db();
+        let repo = ZoneRepo::new(db);
+
+        // Two auto-discovered zones: online but never played (dormant).
+        let a = repo
+            .create("Dormant A", Some("dlna"), Some("uuid:a"))
+            .unwrap();
+        let b = repo
+            .create("Dormant B", Some("dlna"), Some("uuid:b"))
+            .unwrap();
+        repo.update_online(a, true).unwrap();
+        repo.update_online(b, true).unwrap();
+
+        // Both online, none played → 0 active (dormant zones don't count).
+        assert_eq!(repo.count_online().unwrap(), 2);
+        assert_eq!(repo.count_active().unwrap(), 0);
+
+        // Playing a track on A activates it (last_track_id set).
+        repo.save_playback_position(a, 0, Some(42), Some("local"), None)
+            .unwrap();
+        assert_eq!(repo.count_active().unwrap(), 1);
+
+        repo.save_playback_position(b, 0, Some(7), Some("local"), None)
+            .unwrap();
+        assert_eq!(repo.count_active().unwrap(), 2);
+
+        // An offline (but previously played) zone no longer counts.
+        repo.update_online(b, false).unwrap();
+        assert_eq!(repo.count_active().unwrap(), 1);
     }
 
     #[test]

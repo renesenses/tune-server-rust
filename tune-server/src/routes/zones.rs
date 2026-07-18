@@ -905,26 +905,11 @@ async fn create_zone(
         }
     }
 
-    // Premium gate: Free tier is limited in zone count
-    let zone_count = ZoneRepo::with_backend(state.backend.clone())
-        .count_online()
-        .unwrap_or(0);
-    if !state.license.check_zone_limit(zone_count).await {
-        let limit = state.license.free_zone_limit();
-        info!(zone_count, limit, "zone_creation_blocked_free_tier");
-        return (
-            StatusCode::PAYMENT_REQUIRED,
-            Json(json!({
-                "error": "premium_required",
-                "feature": "Unlimited Zones",
-                "message": format!("Free tier is limited to {} zones. Upgrade to Tune Premium for unlimited zones.", limit),
-                "current_zones": zone_count,
-                "zone_limit": limit,
-                "upgrade_url": "https://mozaiklabs.fr/pricing"
-            })),
-        )
-            .into_response();
-    }
+    // The free-tier zone cap is enforced at *activation* (first play) in
+    // orchestrator.play(), not at creation: creating/discovering a zone is
+    // always allowed and the zone starts dormant. This avoids blocking a free
+    // user from creating their actual renderer just because auto-discovered
+    // zones filled the old count. See PlaybackOrchestrator::enforce_zone_cap.
 
     // For DLNA/OpenHome zones, ensure the output is registered before persisting
     if let Some(device_id) = output_device_id {

@@ -126,6 +126,7 @@ impl AppState {
             tune_config.advertised_ip.clone(),
         );
         orch.event_bus = Some(event_bus.clone());
+        orch.license = Some(license.clone());
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);

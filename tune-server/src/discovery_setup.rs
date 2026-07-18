@@ -101,7 +101,7 @@ async fn handle_ssdp_discovered(
     event_bus: &Arc<tune_core::event_bus::EventBus>,
     oh_listener: &Option<Arc<OpenHomeEventListener>>,
     playback: &Arc<tune_core::playback::PlaybackManager>,
-    license: &Arc<tune_core::license::LicenseManager>,
+    _license: &Arc<tune_core::license::LicenseManager>,
     seen_hosts: &mut std::collections::HashSet<String>,
 ) {
     let is_renderer = dev.device_type == tune_core::discovery::device::OutputType::Dlna
@@ -252,16 +252,8 @@ async fn handle_ssdp_discovered(
             return;
         }
 
-        // Premium gate: check zone limit before auto-creating
-        let zone_count = zone_repo.count_online().unwrap_or(0);
-        if !license.check_zone_limit(zone_count).await {
-            info!(
-                name = %dev.name,
-                zone_count,
-                "ssdp_zone_creation_blocked_free_tier_limit"
-            );
-            return;
-        }
+        // Auto-created zones start dormant; the free-tier cap is enforced at
+        // first play (orchestrator.play), so discovery always registers.
 
         // Dedup by host: skip if we already created a zone for this IP
         // (e.g. Denon AVR exposes 5 UPnP services with different UUIDs
@@ -356,7 +348,6 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let playback = state.playback.clone();
-    let license = state.license.clone();
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -563,15 +554,9 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                     if !auto_create {
                                         info!(name = %dev.name, id = %dev.id, "mdns_zone_auto_create_disabled_skipping");
                                     } else {
-                                        // Premium gate: check zone limit before auto-creating
-                                        let zone_count = zone_repo.count_online().unwrap_or(0);
-                                        if !license.check_zone_limit(zone_count).await {
-                                            info!(
-                                                name = %dev.name,
-                                                zone_count,
-                                                "mdns_zone_creation_blocked_free_tier_limit"
-                                            );
-                                        } else {
+                                        // Auto-created zones start dormant; the
+                                        // free-tier cap is enforced at first play.
+                                        {
                                             match zone_repo.get_or_create(
                                                 &dev.name,
                                                 Some(output_type_str),

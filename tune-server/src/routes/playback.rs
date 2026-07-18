@@ -22,7 +22,21 @@ use crate::state::AppState;
 /// and should be 502 Bad Gateway, not 500 Internal Server Error.
 /// Device-offline errors are 503 Service Unavailable.
 /// Everything else is 500.
-fn play_error_response(e: String) -> (StatusCode, String) {
+fn play_error_response(e: String) -> axum::response::Response {
+    // Free-tier zone cap sentinel from orchestrator.play() → clean 402 the
+    // web/app can render as an upgrade prompt.
+    if let Some(msg) = e.strip_prefix("premium_required:") {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(json!({
+                "error": "premium_required",
+                "feature": "Unlimited Zones",
+                "message": msg,
+                "upgrade_url": "https://mozaiklabs.fr/pricing",
+            })),
+        )
+            .into_response();
+    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
@@ -49,7 +63,7 @@ fn play_error_response(e: String) -> (StatusCode, String) {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (code, e)
+    (code, e).into_response()
 }
 
 /// Persist the queue state for a zone to disk (non-blocking).

@@ -39,6 +39,9 @@ pub struct PlaybackOrchestrator {
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub advertised_ip: Option<String>,
     pub event_bus: Option<Arc<EventBus>>,
+    /// Optional license manager for the free-tier zone cap (set in production,
+    /// left None in tests → no gating). Enforced at zone activation in `play`.
+    pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
     pub prefetch: Arc<PrefetchEngine>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
@@ -128,6 +131,7 @@ impl PlaybackOrchestrator {
             outputs,
             advertised_ip,
             event_bus: None,
+            license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
@@ -155,9 +159,45 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        // Free-tier zone cap, enforced at *activation* (a zone's first play).
+        // This is the single choke point for every play entry point (direct
+        // play, resume, streaming, transfer, alarms, AI) — gating here, rather
+        // than at zone creation, both fixes the false "premium required" when
+        // dormant auto-discovered zones filled the quota AND closes the "play a
+        // few zones at a time to stay free" loophole.
+        self.enforce_zone_cap(req.zone_id).await?;
         // Public entry point: this is a *new* logical play, so it is recorded
         // in the listen history.
         self.play_inner(req, true).await
+    }
+
+    /// Free-tier gate: block *activating* a brand-new zone once the free active
+    /// limit is reached. A zone that has already played (`last_track_id` set) is
+    /// unaffected, so replays / auto-advance / resume never trip the gate; only
+    /// the first play of an as-yet-unused zone counts. No license set (tests) or
+    /// Premium tier → always allowed.
+    async fn enforce_zone_cap(&self, zone_id: i64) -> Result<(), String> {
+        let Some(ref lic) = self.license else {
+            return Ok(());
+        };
+        let zrepo = ZoneRepo::with_backend(self.db.clone());
+        let already_active = zrepo
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.last_track_id)
+            .is_some();
+        if already_active || lic.is_premium().await {
+            return Ok(());
+        }
+        let active = zrepo.count_active().unwrap_or(0);
+        if active >= lic.free_zone_limit() {
+            return Err(format!(
+                "premium_required:Free tier is limited to {} active zones. Upgrade to Tune Premium for unlimited zones.",
+                lic.free_zone_limit()
+            ));
+        }
+        Ok(())
     }
 
     /// Like `play`, but does NOT write a listen-history row.  Used for internal

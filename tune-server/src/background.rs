@@ -286,21 +286,9 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     continue;
                 }
 
-                // Premium gate: check zone limit before auto-creating new zones.
-                // get_or_create returns (id, false) for existing zones, so we only
-                // need to check when the zone doesn't already exist.
-                if zone_repo.get_by_device_id(&d.id).ok().flatten().is_none() {
-                    let zone_count = zone_repo.count_online().unwrap_or(0);
-                    if !state.license.check_zone_limit(zone_count).await {
-                        info!(
-                            name = %d.name,
-                            zone_count,
-                            "ssdp_startup_zone_creation_blocked_free_tier_limit"
-                        );
-                        continue;
-                    }
-                }
-
+                // Auto-created zones start dormant and don't count against the
+                // free tier; the cap is enforced at first play in
+                // orchestrator.play(). So discovery may always register a device.
                 match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                     Ok((zid, true)) => {
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
