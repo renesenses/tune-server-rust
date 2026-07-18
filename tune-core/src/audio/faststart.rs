@@ -37,10 +37,12 @@ fn parse_top_level(data: &[u8]) -> Option<Vec<Atom>> {
         let size32 = be_u32(data, pos)? as usize;
         let kind: [u8; 4] = data.get(pos + 4..pos + 8)?.try_into().ok()?;
         let size = if size32 == 1 {
-            // 64-bit largesize follows the type.
-            let hi = be_u32(data, pos + 8)? as usize;
-            let lo = be_u32(data, pos + 12)? as usize;
-            (hi << 32) | lo
+            // 64-bit largesize follows the type. Combine in u64 so the shift
+            // is valid on 32-bit targets (usize is 32-bit on armv7), then fit
+            // back into usize — a >4 GB atom on a 32-bit host yields None.
+            let hi = be_u32(data, pos + 8)? as u64;
+            let lo = be_u32(data, pos + 12)? as u64;
+            usize::try_from((hi << 32) | lo).ok()?
         } else if size32 == 0 {
             // Extends to EOF.
             data.len() - pos
