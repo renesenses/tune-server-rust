@@ -29,10 +29,15 @@ pub mod sql {
     use super::SqlDialect;
 
     pub fn add<D: SqlDialect>(d: &D) -> String {
+        // created_at is filled with the engine's own "now" SQL expression
+        // (SQLite strftime / PG to_char) rather than a bound param or a column
+        // DEFAULT: the PG table created via ensure_schema (ENSURE_TABLES) has no
+        // DEFAULT on created_at, so without this the value was NULL and
+        // `ORDER BY created_at DESC` in list() was non-deterministic on PG.
         format!(
             "INSERT INTO streaming_favorites \
-             (profile_id, item_type, service, service_id, title, artist, album, cover_url) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}) \
+             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING",
             d.placeholder(1),
             d.placeholder(2),
@@ -42,6 +47,7 @@ pub mod sql {
             d.placeholder(6),
             d.placeholder(7),
             d.placeholder(8),
+            d.now_iso8601(),
         )
     }
 
