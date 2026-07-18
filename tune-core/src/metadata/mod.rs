@@ -182,7 +182,7 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
@@ -219,7 +219,7 @@ pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> 
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
@@ -286,7 +286,8 @@ struct DsfHeaderInfo {
 fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(path).map_err(|_| ())?;
+    let mut f =
+        std::fs::File::open(&*crate::library::artwork::extended_path(path)).map_err(|_| ())?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
     f.read_exact(&mut header).map_err(|_| ())?;
 
@@ -725,7 +726,7 @@ fn read_dsf_id3v2_raw(path: &Path, metadata_offset: Option<u64>) -> Option<Vec<u
 
     let offset = metadata_offset?;
 
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
     let file_len = f.metadata().ok()?.len();
 
     // Sanity check: offset must be within the file, with room for at least
@@ -878,7 +879,9 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         return None;
     }
 
-    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .ok()
+        .map(|m| m.len());
 
     let (sample_rate, channels, duration_ms, metadata_offset) = if ext == "dsf" {
         match parse_dsf_header_full(path) {
@@ -1106,7 +1109,9 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
             (None, Some(file_name.to_string()))
         };
 
-    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .ok()
+        .map(|m| m.len());
 
     tracing::debug!(path = %path.display(), title = ?title, artist = ?artist, album = ?album, "m4a_fallback_metadata");
 
@@ -1222,7 +1227,9 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         genre: None,
         genres: vec![],
         format,
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
         duration_ms: Some(props.duration().as_millis() as u64),
@@ -1293,7 +1300,9 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         genre: None,
         genres: vec![],
         format: Some(ext),
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         sample_rate: None,
         channels: Some(2),
         duration_ms: None,
@@ -1347,7 +1356,9 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
 }
 
 fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .map(|m| m.len())
+        .unwrap_or(0);
     if file_size == 0 || lofty_ms == 0 {
         return lofty_ms;
     }
@@ -1580,7 +1591,9 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
                 props.bit_depth(),
             ),
         }),
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         bpm,
         compilation,
         label: get(ItemKey::Label),
