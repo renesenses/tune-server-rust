@@ -85,7 +85,15 @@ impl OutputTarget for BluosOutput {
             .text()
             .await
             .map_err(|e| format!("bluos Play read: {e}"))?;
-        info!(device = %self.name, url = media.url, "bluos_play");
+        info!(
+            device = %self.name,
+            url = media.url,
+            title = media.title.unwrap_or(""),
+            artist = media.artist.unwrap_or(""),
+            album = media.album.unwrap_or(""),
+            image = media.cover_url.unwrap_or(""),
+            "bluos_play"
+        );
         Ok(())
     }
 
@@ -202,7 +210,15 @@ impl OutputTarget for BluosOutput {
             .send()
             .await
             .map_err(|e| format!("bluos Add: {e}"))?;
-        info!(device = %self.name, url = media.url, "bluos_set_next");
+        info!(
+            device = %self.name,
+            url = media.url,
+            title = media.title.unwrap_or(""),
+            artist = media.artist.unwrap_or(""),
+            album = media.album.unwrap_or(""),
+            image = media.cover_url.unwrap_or(""),
+            "bluos_set_next"
+        );
         Ok(())
     }
 }
