@@ -2281,11 +2281,26 @@ impl PositionPoller {
                 }
             }
             RepeatMode::Off => {
-                let next = zone_state.queue_position + 1;
-                if next >= zone_state.queue_length {
-                    None
+                if zone_state.shuffle {
+                    // Shuffle under repeat-off previously fell through to the
+                    // sequential branch below, so enabling shuffle did NOTHING:
+                    // the queue advanced by raw index and stopped at the raw end
+                    // (or replayed the last track), instead of continuing to
+                    // random tracks — eric, #954, DLNA shuffle stopping after a
+                    // few tracks. The runtime has no materialised shuffle order
+                    // (the PlayQueue permutation is unused; shuffle is driven
+                    // solely by rand_pos), so mirror the RepeatMode::All+shuffle
+                    // path and pick a random next track. Both the poller's
+                    // auto-advance and the manual `next` endpoint call this, so
+                    // they stay consistent.
+                    Some(rand_pos(zone_state.queue_length, zone_state.queue_position))
                 } else {
-                    Some(next)
+                    let next = zone_state.queue_position + 1;
+                    if next >= zone_state.queue_length {
+                        None
+                    } else {
+                        Some(next)
+                    }
                 }
             }
         }
@@ -2737,6 +2752,58 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position(&state), None);
+    }
+
+    #[test]
+    fn next_position_repeat_off_shuffle_continues_not_end() {
+        // Regression (#954, eric): repeat-off + shuffle used to ignore shuffle,
+        // walk the queue sequentially and stop at the raw end. At the last raw
+        // index it must NOT return None — shuffle keeps playing a random track.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            ..Default::default()
+        };
+        let next = PositionPoller::next_position(&state);
+        assert!(next.is_some(), "shuffle+off at last index must continue");
+        let p = next.unwrap();
+        assert!(p >= 0 && p < 5, "next position within queue bounds");
+    }
+
+    #[test]
+    fn next_position_repeat_off_shuffle_avoids_current() {
+        // rand_pos never returns the currently playing index (no immediate
+        // repeat) for a queue of length > 1.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            ..Default::default()
+        };
+        for _ in 0..50 {
+            let p = PositionPoller::next_position(&state).unwrap();
+            assert_ne!(p, 2, "shuffle next must differ from current");
+            assert!(p >= 0 && p < 5);
+        }
+    }
+
+    #[test]
+    fn next_position_repeat_off_shuffle_single_track() {
+        // A one-track queue: rand_pos returns 0 (only valid index), never None.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 0,
+            queue_length: 1,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(0));
     }
 
     #[test]
