@@ -37,6 +37,16 @@ const RETRY_FILE_TIMEOUT: Duration = Duration::from_secs(90);
 // and only the hash is skipped (Progman: 23-min FLAC 24/88.2 exceeded 30s).
 const HASH_TIMEOUT: Duration = Duration::from_secs(120);
 
+// Per-file metadata reads are I/O-bound: each rayon task blocks on the tag read
+// (lofty), frequently on high-latency network storage. The default rayon pool
+// has only ~CPU-core-count threads, so effective concurrency — and throughput —
+// was capped at the core count, which made a full scan ~10x slower than a
+// tag-only indexer like MinimServer (Pierre M; Philippe Landes: 12h for 20200
+// DSD tracks). Read metadata on a dedicated, higher-concurrency pool so many
+// more per-file latencies overlap. Mirrors the 32-thread stat pool already used
+// for the mtime pre-check (#619).
+const SCAN_IO_CONCURRENCY: usize = 32;
+
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff", "aif", "wv", "wma", "dsf", "dff", "dst",
     "alac", "ape", "iso",
@@ -466,56 +476,74 @@ pub fn scan_files_batched(
     let mut aggregate = ScanStats::default();
     aggregate.total_files = total;
 
+    // Dedicated high-concurrency pool for the I/O-bound tag reads (see
+    // SCAN_IO_CONCURRENCY). Built once and reused across batches. If the pool
+    // fails to build, fall back to the default rayon pool.
+    let io_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(SCAN_IO_CONCURRENCY)
+        .thread_name(|i| format!("scan-io-{i}"))
+        .build()
+        .ok();
+
     for (batch_idx, chunk) in files.chunks(batch_sz).enumerate() {
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);
 
-        let batch: Vec<ScannedFile> = chunk
-            .par_iter()
-            .map(|path| {
-                // NFC-normalize: see comment in scan_files_parallel
-                let path_str: String = path.to_string_lossy().nfc().collect();
+        let read_batch = || {
+            chunk
+                .par_iter()
+                .map(|path| {
+                    // NFC-normalize: see comment in scan_files_parallel
+                    let path_str: String = path.to_string_lossy().nfc().collect();
 
-                let file_meta = path.metadata().ok();
-                let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let mtime = file_meta
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                    let file_meta = path.metadata().ok();
+                    let file_size = file_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let mtime = file_meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
 
-                let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
-                    Ok((meta, hash)) => (meta, hash),
-                    Err(ref reason) if reason == "timeout" => {
-                        warn!(
-                            path = %path_str,
-                            timeout_secs = FILE_TIMEOUT.as_secs(),
-                            "scan_file_timeout — file skipped (metadata read exceeded timeout)"
-                        );
-                        batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
-                        (None, None)
+                    let (metadata, audio_hash) = match read_file_with_retry(path, with_hash) {
+                        Ok((meta, hash)) => (meta, hash),
+                        Err(ref reason) if reason == "timeout" => {
+                            warn!(
+                                path = %path_str,
+                                timeout_secs = FILE_TIMEOUT.as_secs(),
+                                "scan_file_timeout — file skipped (metadata read exceeded timeout)"
+                            );
+                            batch_timeout_counter.fetch_add(1, Ordering::Relaxed);
+                            (None, None)
+                        }
+                        Err(err) => {
+                            warn!(
+                                path = %path_str,
+                                error = %err,
+                                "scan_file_failed"
+                            );
+                            failed_files.lock().unwrap().push((path_str.clone(), err));
+                            (None, None)
+                        }
+                    };
+
+                    ScannedFile {
+                        path: path_str,
+                        metadata,
+                        audio_hash,
+                        file_size,
+                        mtime,
                     }
-                    Err(err) => {
-                        warn!(
-                            path = %path_str,
-                            error = %err,
-                            "scan_file_failed"
-                        );
-                        failed_files.lock().unwrap().push((path_str.clone(), err));
-                        (None, None)
-                    }
-                };
-
-                ScannedFile {
-                    path: path_str,
-                    metadata,
-                    audio_hash,
-                    file_size,
-                    mtime,
-                }
-            })
-            .collect();
+                })
+                .collect()
+        };
+        // Run the I/O-bound reads on the dedicated high-concurrency pool so many
+        // per-file latencies overlap; fall back to the default pool if the
+        // dedicated one couldn't be built.
+        let batch: Vec<ScannedFile> = match &io_pool {
+            Some(pool) => pool.install(read_batch),
+            None => read_batch(),
+        };
 
         let batch_timeouts = batch_timeout_counter.load(Ordering::Relaxed);
 
