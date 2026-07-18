@@ -99,8 +99,25 @@ pub(super) async fn completeness_stats(
         .query_row("SELECT COUNT(*) FROM albums", [], |row| row.get(0))
         .unwrap_or(0);
     let with_mbid: i64 = conn.query_row("SELECT COUNT(*) FROM tracks WHERE musicbrainz_recording_id IS NOT NULL AND musicbrainz_recording_id != ''", [], |row| row.get(0)).unwrap_or(0);
-    let albums_with_genre: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a JOIN tracks t ON t.album_id = a.id WHERE t.genre IS NOT NULL AND t.genre != ''", [], |row| row.get(0)).unwrap_or(0);
-    let albums_with_year: i64 = conn.query_row("SELECT COUNT(DISTINCT a.id) FROM albums a JOIN tracks t ON t.album_id = a.id WHERE t.year IS NOT NULL AND t.year > 0", [], |row| row.get(0)).unwrap_or(0);
+    // Count the ALBUM's own genre/year column — the exact field the Metadata
+    // view displays, edits and filters on (`no_genre` = albums where a.genre is
+    // empty). The old queries counted albums having ≥1 TRACK with a genre/year,
+    // a different set: the "Genre manquant" badge (105) then never matched the
+    // actual list of albums missing a genre (7) — Reivax66, #1091.
+    let albums_with_genre: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM albums WHERE genre IS NOT NULL AND genre != ''",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let albums_with_year: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     drop(conn);
 
     // Count only album-artists — the same set the library shows — so the
