@@ -320,39 +320,30 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
         "local_audio_enumerating_devices"
     );
 
-    let mut devices = Vec::new();
+    let mut devices: Vec<AudioDevice> = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
+    // On Linux, PipeWire re-exposes the SAME physical output many times with
+    // *different* reported capabilities (e.g. "ALC255 Analog" as 2ch/48k, then
+    // 32ch/384k, then a stereo fallback), so name disambiguation turns each
+    // variant into a phantom zone (JeromeQ: 43 devices → 48 zones on Ubuntu
+    // 24.04, RC2). Collapse by NAME instead, keeping the richest-capability
+    // variant. Maps raw device name → index into `devices`.
+    #[cfg(target_os = "linux")]
+    let mut linux_by_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
-                let name = device
+                let raw_name = device
                     .description()
                     .map(|desc| desc.name().to_string())
                     .unwrap_or_else(|_| "Unknown".into());
 
                 // Skip ALSA null/dummy sinks that produce no audio
-                if name.contains("Discard all samples") || name.contains("Dummy") {
-                    debug!(device = %name, "local_audio_device_skipped_null_sink");
+                if raw_name.contains("Discard all samples") || raw_name.contains("Dummy") {
+                    debug!(device = %raw_name, "local_audio_device_skipped_null_sink");
                     continue;
                 }
-
-                // Disambiguate duplicate device names (common on Windows WASAPI
-                // where multiple USB DACs all show as "Haut-Parleurs").
-                let name = if seen_names.contains(&name) {
-                    let mut n = 2;
-                    loop {
-                        let candidate = format!("{name} ({n})");
-                        if !seen_names.contains(&candidate) {
-                            break candidate;
-                        }
-                        n += 1;
-                    }
-                } else {
-                    name
-                };
-                seen_names.insert(name.clone());
-
-                let is_default = name == default_name;
 
                 let (max_channels, sample_rates) = match device.supported_output_configs() {
                     Ok(configs) => {
@@ -377,22 +368,61 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                         // through to the fallback probe below.
                         if max_ch == 0 || rates.is_empty() {
                             debug!(
-                                device = %name,
+                                device = %raw_name,
                                 "local_audio_device_supported_configs_empty"
                             );
-                            probe_device_fallback_caps(&device, &name)
+                            probe_device_fallback_caps(&device, &raw_name)
                         } else {
                             (max_ch, rates)
                         }
                     }
                     Err(_) => {
                         debug!(
-                            device = %name,
+                            device = %raw_name,
                             "local_audio_device_supported_configs_failed"
                         );
-                        probe_device_fallback_caps(&device, &name)
+                        probe_device_fallback_caps(&device, &raw_name)
                     }
                 };
+
+                let is_default = raw_name == default_name;
+
+                // Linux: collapse PipeWire duplicates by name, keeping the richest
+                // capabilities (channels, then sample-rate count) among variants.
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(&idx) = linux_by_name.get(&raw_name) {
+                        let richer = max_channels > devices[idx].max_channels
+                            || (max_channels == devices[idx].max_channels
+                                && sample_rates.len() > devices[idx].sample_rates.len());
+                        if richer {
+                            devices[idx].max_channels = max_channels;
+                            devices[idx].sample_rates = sample_rates.clone();
+                        }
+                        if is_default {
+                            devices[idx].is_default = true;
+                        }
+                        debug!(device = %raw_name, "local_audio_device_collapsed_pipewire_duplicate");
+                        continue;
+                    }
+                }
+
+                // Disambiguate duplicate device names (common on Windows WASAPI
+                // where multiple USB DACs all show as "Haut-Parleurs"). On Linux
+                // names are already collapsed above, so this stays a no-op there.
+                let name = if seen_names.contains(&raw_name) {
+                    let mut n = 2;
+                    loop {
+                        let candidate = format!("{raw_name} ({n})");
+                        if !seen_names.contains(&candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    raw_name.clone()
+                };
+                seen_names.insert(name.clone());
 
                 info!(
                     device = %name,
@@ -409,6 +439,8 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     sample_rates,
                     backend: host_name.to_string(),
                 });
+                #[cfg(target_os = "linux")]
+                linux_by_name.insert(raw_name.clone(), devices.len() - 1);
             }
         }
         Err(e) => {
