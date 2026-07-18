@@ -335,13 +335,23 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
         "local_audio_enumerating_devices"
     );
 
-    let mut devices = Vec::new();
+    let mut devices: Vec<AudioDevice> = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
     // Signature = (raw name, caps). Windows WASAPI can list the same physical
     // endpoint (onboard "HDA ..." codecs) more than once with an identical name
     // AND identical capabilities; those true duplicates are collapsed so they
     // don't spawn a phantom second zone (Elie).
+    #[cfg(not(target_os = "linux"))]
     let mut seen_signatures = std::collections::HashSet::new();
+    // On Linux, PipeWire re-exposes the SAME physical output many times with
+    // *different* reported capabilities (e.g. "ALC255 Analog" as 2ch/48k, then
+    // 32ch/384k, then a stereo fallback), so the (name, caps) signature above
+    // never collapses them and each variant becomes a phantom zone (JeromeQ:
+    // 43 devices → 48 zones on Ubuntu 24.04). Collapse by NAME instead, keeping
+    // the richest-capability variant. Maps raw device name → index into `devices`.
+    #[cfg(target_os = "linux")]
+    let mut linux_by_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     match host.output_devices() {
         Ok(output_devices) => {
             for device in output_devices {
@@ -396,14 +406,42 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     }
                 };
 
-                // Collapse true duplicates (same name AND same caps = same
-                // physical device). Genuinely different devices that merely share
-                // a name (e.g. two USB DACs) differ in caps and fall through to
-                // the disambiguation below, staying individually selectable.
-                let signature = (raw_name.clone(), max_channels, sample_rates.clone());
-                if !seen_signatures.insert(signature) {
-                    debug!(device = %raw_name, "local_audio_device_skipped_duplicate");
-                    continue;
+                let is_default = raw_name == default_name;
+
+                // Collapse duplicates. On Linux PipeWire lists the same physical
+                // output repeatedly with varying caps, so collapse by NAME and
+                // keep the richest-capability variant (else 43 phantom devices →
+                // 48 zones, JeromeQ on Ubuntu 24.04). On Windows/macOS two real
+                // DACs can share a name but differ in caps, so collapse only exact
+                // (name, caps) duplicates and disambiguate the rest.
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(&idx) = linux_by_name.get(&raw_name) {
+                        let richer = max_channels > devices[idx].max_channels
+                            || (max_channels == devices[idx].max_channels
+                                && sample_rates.len() > devices[idx].sample_rates.len());
+                        if richer {
+                            devices[idx].max_channels = max_channels;
+                            devices[idx].sample_rates = sample_rates.clone();
+                        }
+                        if is_default {
+                            devices[idx].is_default = true;
+                        }
+                        debug!(device = %raw_name, "local_audio_device_collapsed_pipewire_duplicate");
+                        continue;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Collapse true duplicates (same name AND same caps = same
+                    // physical device). Genuinely different devices that merely
+                    // share a name (e.g. two USB DACs) differ in caps and fall
+                    // through to the disambiguation below, staying selectable.
+                    let signature = (raw_name.clone(), max_channels, sample_rates.clone());
+                    if !seen_signatures.insert(signature) {
+                        debug!(device = %raw_name, "local_audio_device_skipped_duplicate");
+                        continue;
+                    }
                 }
 
                 // Disambiguate duplicate device names (common on Windows WASAPI
@@ -422,8 +460,6 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 };
                 seen_names.insert(name.clone());
 
-                let is_default = raw_name == default_name;
-
                 info!(
                     device = %name,
                     is_default,
@@ -439,6 +475,8 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     sample_rates,
                     backend: host_name.to_string(),
                 });
+                #[cfg(target_os = "linux")]
+                linux_by_name.insert(raw_name.clone(), devices.len() - 1);
             }
         }
         Err(e) => {
