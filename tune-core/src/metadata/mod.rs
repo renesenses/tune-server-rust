@@ -468,6 +468,25 @@ fn syncsafe_to_u32(bytes: &[u8]) -> u32 {
         | (bytes[3] as u32)
 }
 
+/// Reverse ID3v2 unsynchronisation: every `0xFF 0x00` pair becomes `0xFF`.
+/// Applied to the whole tag body when the header's unsynchronisation flag
+/// (0x80) is set (ID3v2.2/v2.3). A no-op when no such pair is present. Old
+/// taggers commonly set this on DSD/DSF files (Benjithom, #959); without
+/// reversing it the frame sizes desync and the title/artist are lost.
+fn deunsynchronise(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        out.push(data[i]);
+        if data[i] == 0xFF && i + 1 < data.len() && data[i + 1] == 0x00 {
+            i += 2; // drop the stuffed 0x00
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Read and parse an ID3v2 tag from a byte slice starting at "ID3".
 ///
 /// Supports ID3v2.3 and ID3v2.4 text frames (TIT2, TPE1, TALB, etc.)
@@ -533,12 +552,30 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     let tag_end = (10 + tag_size).min(data.len());
     let mut tags = Id3v2Tags::default();
 
+    // ID3v2.2/v2.3 may unsynchronise the whole tag (header flag 0x80): every
+    // 0xFF byte is followed by a stuffed 0x00 that must be removed before the
+    // frames can be parsed. Old taggers commonly set this on DSD/DSF files
+    // (Benjithom, #959) — without reversing it the frame sizes desync (notably
+    // when a PIC image precedes the title) and the title is lost, so Tune fell
+    // back to the filename. (v2.4 uses per-frame unsync, not handled here.)
+    let unsync = flags & 0x80 != 0;
+    let raw_frames = &data[pos.min(tag_end)..tag_end];
+    let deunsynced;
+    let frames: &[u8] = if unsync && major_version <= 3 {
+        deunsynced = deunsynchronise(raw_frames);
+        &deunsynced
+    } else {
+        raw_frames
+    };
+    let frames_end = frames.len();
+
     // v2.2 frames: 3-char id + 3-byte size, no flags (6-byte header).
     // v2.3/v2.4 frames: 4-char id + 4-byte size + 2-byte flags (10-byte header).
     let (id_len, header_len) = if major_version == 2 { (3, 6) } else { (4, 10) };
 
-    while pos + header_len <= tag_end {
-        let raw_id = match std::str::from_utf8(&data[pos..pos + id_len]) {
+    let mut fpos = 0usize;
+    while fpos + header_len <= frames_end {
+        let raw_id = match std::str::from_utf8(&frames[fpos..fpos + id_len]) {
             Ok(s) => s.to_string(),
             Err(_) => break,
         };
@@ -549,18 +586,22 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
         }
 
         let frame_size = match major_version {
-            4 => syncsafe_to_u32(&data[pos + 4..pos + 8]) as usize,
-            3 => u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize,
+            4 => syncsafe_to_u32(&frames[fpos + 4..fpos + 8]) as usize,
+            3 => u32::from_be_bytes([
+                frames[fpos + 4],
+                frames[fpos + 5],
+                frames[fpos + 6],
+                frames[fpos + 7],
+            ]) as usize,
             // v2.2: 3-byte big-endian size.
             _ => {
-                ((data[pos + 3] as usize) << 16)
-                    | ((data[pos + 4] as usize) << 8)
-                    | (data[pos + 5] as usize)
+                ((frames[fpos + 3] as usize) << 16)
+                    | ((frames[fpos + 4] as usize) << 8)
+                    | (frames[fpos + 5] as usize)
             }
         };
 
-        pos += header_len; // skip frame header
+        fpos += header_len; // skip frame header
 
         // Normalize v2.2 3-char ids to their v2.3/v2.4 equivalents.
         let frame_id = if major_version == 2 {
@@ -571,12 +612,12 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
             raw_id
         };
 
-        if frame_size == 0 || pos + frame_size > tag_end {
+        if frame_size == 0 || fpos + frame_size > frames_end {
             break;
         }
 
-        let frame_data = &data[pos..pos + frame_size];
-        pos += frame_size;
+        let frame_data = &frames[fpos..fpos + frame_size];
+        fpos += frame_size;
 
         // Check for picture frames (APIC in v2.3/2.4, PIC in v2.2).
         if frame_id == "APIC" {
@@ -1967,6 +2008,62 @@ mod tests {
         let (mime, data) = extract_apic_picture(&body, 2).expect("v2.2 PIC parses");
         assert_eq!(mime, "image/png");
         assert_eq!(data, img);
+    }
+
+    #[test]
+    fn deunsynchronise_removes_stuffed_zeros() {
+        // 0xFF 0x00 -> 0xFF; other bytes untouched; trailing 0xFF kept.
+        assert_eq!(
+            deunsynchronise(&[0x01, 0xFF, 0x00, 0x02, 0xFF, 0x00, 0xFF]),
+            vec![0x01, 0xFF, 0x02, 0xFF, 0xFF]
+        );
+        // No stuffing -> identity.
+        assert_eq!(deunsynchronise(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn parse_id3v22_unsynchronised_title() {
+        // An unsynchronised ID3v2.2 tag (header flag 0x80) with a PIC frame
+        // whose data contains 0xFF bytes — which get 0x00-stuffed — placed
+        // BEFORE the TT2 title. Without de-unsynchronisation the PIC frame's
+        // real byte length exceeds its declared size, the cursor desyncs and
+        // the title is never found → filename fallback (Benjithom, #959).
+        fn frame_v22(id: &str, data: &[u8]) -> Vec<u8> {
+            let mut f = id.as_bytes().to_vec();
+            let n = data.len();
+            f.push((n >> 16) as u8);
+            f.push((n >> 8) as u8);
+            f.push(n as u8);
+            f.extend_from_slice(data);
+            f
+        }
+        // Frame sizes are the de-synchronised (true) sizes.
+        let pic = frame_v22("PIC", &[0x00, 0xFF, 0xFF, 0x01]);
+        let tt2 = frame_v22("TT2", &[0x00, b'H', b'i']); // Latin-1 "Hi"
+        let mut body = Vec::new();
+        body.extend_from_slice(&pic);
+        body.extend_from_slice(&tt2);
+
+        // Unsynchronise the assembled body: 0xFF -> 0xFF 0x00.
+        let mut unsynced = Vec::new();
+        for &b in &body {
+            unsynced.push(b);
+            if b == 0xFF {
+                unsynced.push(0x00);
+            }
+        }
+
+        let size = unsynced.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x02, 0x00, 0x80]; // v2.2, unsync flag
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&unsynced);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("Hi"));
+        assert!(parsed.has_picture);
     }
 
     #[test]
