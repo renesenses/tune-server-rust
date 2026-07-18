@@ -98,22 +98,6 @@ const GAPLESS_STUCK_THRESHOLD: u8 = 2;
 /// the slider from bouncing back on DLNA renderers with latent GetVolume.
 const VOLUME_GRACE_SECS: u64 = 5;
 
-fn rand_pos(queue_length: i64, current: i64) -> i64 {
-    if queue_length <= 1 {
-        return 0;
-    }
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as i64;
-    let pos = seed.abs() % queue_length;
-    if pos == current {
-        (pos + 1) % queue_length
-    } else {
-        pos
-    }
-}
-
 /// Pure decision predicates extracted **verbatim** from the poller `tick`
 /// loop. They contain no I/O and no state mutation, so they can be unit-tested
 /// against the *real* code path.
@@ -1476,15 +1460,40 @@ impl PositionPoller {
         if zone_state.queue_length == 0 {
             return None;
         }
+        if zone_state.repeat == RepeatMode::One {
+            return Some(zone_state.queue_position);
+        }
+
+        // Shuffle follows a materialised order (a permutation of the queue
+        // indices, generated when shuffle is enabled and kept in ZoneState).
+        // Playing the order in sequence guarantees every track exactly once per
+        // cycle — repeat-off stops at the end, repeat-all loops to the start.
+        // This is the SINGLE next-track decision used by the poller's gapless
+        // auto-advance, the manual `next` endpoint AND prefetch, so they stay
+        // consistent (eric, #954). Previously shuffle under repeat-off was
+        // ignored: it walked the queue by raw index and stopped at the raw end.
+        if zone_state.shuffle && !zone_state.shuffle_order.is_empty() {
+            let next_idx = zone_state.shuffle_index + 1;
+            if next_idx < 0 {
+                return zone_state.shuffle_order.first().map(|&i| i as i64);
+            }
+            if next_idx as usize >= zone_state.shuffle_order.len() {
+                return match zone_state.repeat {
+                    RepeatMode::All => zone_state.shuffle_order.first().map(|&i| i as i64),
+                    _ => None, // repeat-off: every track played once → stop
+                };
+            }
+            return zone_state
+                .shuffle_order
+                .get(next_idx as usize)
+                .map(|&i| i as i64);
+        }
+
+        // Non-shuffle (or shuffle order not yet materialised — falls back to
+        // sequential until the next update_queue_info rebuilds the order).
         match zone_state.repeat {
             RepeatMode::One => Some(zone_state.queue_position),
-            RepeatMode::All => {
-                if zone_state.shuffle {
-                    Some(rand_pos(zone_state.queue_length, zone_state.queue_position))
-                } else {
-                    Some((zone_state.queue_position + 1) % zone_state.queue_length)
-                }
-            }
+            RepeatMode::All => Some((zone_state.queue_position + 1) % zone_state.queue_length),
             RepeatMode::Off => {
                 let next = zone_state.queue_position + 1;
                 if next >= zone_state.queue_length {
@@ -1889,6 +1898,77 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position(&state), None);
+    }
+
+    #[test]
+    fn next_position_shuffle_follows_order() {
+        // Shuffle follows the materialised order, NOT the raw queue index
+        // (#954, eric). Order [3,1,4,0,2], cursor at index 1 (track 1 playing)
+        // → next is order[2] = 4.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 1,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(4));
+    }
+
+    #[test]
+    fn next_position_shuffle_off_stops_after_full_cycle() {
+        // repeat-off + shuffle: at the last position of the order, playback
+        // stops (every track played exactly once) — no premature stop, no
+        // endless loop.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 4, // last index
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), None);
+    }
+
+    #[test]
+    fn next_position_shuffle_all_wraps_to_order_start() {
+        // repeat-all + shuffle: at the end of the order, loop back to the first
+        // shuffled track (order[0] = 3), not raw index 0.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::All,
+            shuffle: true,
+            shuffle_order: vec![3, 1, 4, 0, 2],
+            shuffle_index: 4,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(3));
+    }
+
+    #[test]
+    fn next_position_shuffle_empty_order_falls_back_sequential() {
+        // Before the order is materialised (e.g. just after a restart, before
+        // update_queue_info rebuilds it), shuffle falls back to sequential so
+        // playback still advances.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 1,
+            queue_length: 5,
+            repeat: RepeatMode::Off,
+            shuffle: true,
+            shuffle_order: Vec::new(),
+            shuffle_index: -1,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position(&state), Some(2));
     }
 
     #[test]

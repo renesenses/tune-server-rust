@@ -50,6 +50,17 @@ pub struct ZoneState {
     pub repeat: RepeatMode,
     pub queue_position: i64,
     pub queue_length: i64,
+    /// Materialised shuffle order: a permutation of the queue indices
+    /// `[0, queue_length)`. Empty when shuffle is off. Regenerated when shuffle
+    /// is enabled or the queue length changes, and re-synced on every position
+    /// update. `next_position` follows this order so shuffle plays every track
+    /// exactly once per cycle (repeat-off stops at the end; repeat-all loops).
+    #[serde(skip)]
+    pub shuffle_order: Vec<usize>,
+    /// Current index into `shuffle_order` (-1 before the first track). The next
+    /// shuffle track is `shuffle_order[shuffle_index + 1]`.
+    #[serde(skip)]
+    pub shuffle_index: i64,
     /// Monotonically increasing counter bumped on each `play()` call.
     /// The poller uses this to detect track changes and reset its state
     /// (peak_position, gapless flags, etc.) so stale data from the
@@ -96,12 +107,44 @@ impl Default for ZoneState {
             repeat: RepeatMode::Off,
             queue_position: 0,
             queue_length: 0,
+            shuffle_order: Vec::new(),
+            shuffle_index: -1,
             track_generation: 0,
             play_seq: 0,
             last_seek_at: None,
             last_volume_set_at: None,
         }
     }
+}
+
+/// Build a materialised shuffle order: a Fisher-Yates permutation of
+/// `[0, length)` with `current` moved to index 0, so the first advance goes to
+/// a different track than the one playing. Seeded from the wall clock via a
+/// xorshift64 PRNG (no `rand` crate dependency).
+pub(crate) fn generate_shuffle_order(length: usize, current: usize) -> Vec<usize> {
+    if length == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..length).collect();
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    // Fisher-Yates using a xorshift64 PRNG.
+    for i in (1..length).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let j = (seed % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    if current < length {
+        if let Some(pos) = order.iter().position(|&x| x == current) {
+            order.swap(0, pos);
+        }
+    }
+    order
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,6 +390,22 @@ impl PlaybackManager {
             let mut zones = self.zones.lock().await;
             if let Some(state) = zones.get_mut(&zone_id) {
                 state.shuffle = enabled;
+                if enabled {
+                    // Build a fresh order around the currently playing track so
+                    // the next advance goes to a different track.
+                    state.shuffle_order = generate_shuffle_order(
+                        state.queue_length.max(0) as usize,
+                        state.queue_position.max(0) as usize,
+                    );
+                    state.shuffle_index = if state.shuffle_order.is_empty() {
+                        -1
+                    } else {
+                        0
+                    };
+                } else {
+                    state.shuffle_order.clear();
+                    state.shuffle_index = -1;
+                }
             }
         }
         self.emit(PlaybackEvent {
@@ -382,6 +441,28 @@ impl PlaybackManager {
         if let Some(state) = zones.get_mut(&zone_id) {
             state.queue_position = position;
             state.queue_length = length;
+            if state.shuffle {
+                let len = length.max(0) as usize;
+                let pos = position.max(0) as usize;
+                if len == 0 {
+                    state.shuffle_order.clear();
+                    state.shuffle_index = -1;
+                } else if state.shuffle_order.len() != len {
+                    // Queue length changed (tracks added/removed, or the order
+                    // was lost across a restart — it is not persisted). Rebuild
+                    // around the current track.
+                    state.shuffle_order = generate_shuffle_order(len, pos);
+                    state.shuffle_index = 0;
+                } else if let Some(idx) = state.shuffle_order.iter().position(|&p| p == pos) {
+                    // Sync the cursor to the track now playing so the next
+                    // advance follows the order from here.
+                    state.shuffle_index = idx as i64;
+                } else {
+                    // Position not in the order (shouldn't happen) — rebuild.
+                    state.shuffle_order = generate_shuffle_order(len, pos);
+                    state.shuffle_index = 0;
+                }
+            }
         }
     }
 
@@ -444,5 +525,28 @@ mod tests {
         assert_eq!(ev.event, "repeat");
         assert_eq!(ev.zone_id, 3);
         assert_eq!(ev.data["mode"], "all");
+    }
+
+    #[test]
+    fn generate_shuffle_order_is_a_permutation_with_current_first() {
+        let order = generate_shuffle_order(10, 4);
+        assert_eq!(order.len(), 10);
+        // Current track sits at index 0 so the first advance moves away from it.
+        assert_eq!(order[0], 4);
+        // Every index 0..10 appears exactly once (a true permutation).
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn generate_shuffle_order_edge_cases() {
+        assert!(generate_shuffle_order(0, 0).is_empty());
+        assert_eq!(generate_shuffle_order(1, 0), vec![0]);
+        // current out of range is ignored (no panic), still a full permutation.
+        let order = generate_shuffle_order(3, 99);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2]);
     }
 }
