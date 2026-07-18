@@ -1339,6 +1339,33 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         }
     };
 
+    // DSF/DFF: lofty parses the container and returns a tag object, but often
+    // misreads the ID3v2.2 frames commonly used on DSD files — the title comes
+    // back empty and the track ends up showing its filename (LANDES Philippe,
+    // Benjithom). Because a (mostly-empty) tag *is* present, the `None` branch
+    // above never fires. So when lofty's title is empty for a DSD file, prefer
+    // our own ID3v2.2/.3/.4 parser, which reads those frames correctly.
+    {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(ext.as_str(), "dsf" | "dff")
+            && tag.title().map_or(true, |t| t.trim().is_empty())
+        {
+            if let Some(meta) = dsf_dff_fallback(path) {
+                if meta
+                    .title
+                    .as_deref()
+                    .map_or(false, |t| !t.trim().is_empty())
+                {
+                    return Ok(meta);
+                }
+            }
+        }
+    }
+
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
 
     let compilation_str = get(ItemKey::FlagCompilation).unwrap_or_default();
@@ -2136,6 +2163,30 @@ mod tests {
     fn try_read_metadata_non_dsd_still_errors() {
         let result = try_read_metadata(Path::new("/tmp/nonexistent_fallback_test.flac"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_read_metadata_dsf_title_not_filename() {
+        // Regression (LANDES Philippe / Benjithom): a tagged DSF must surface its
+        // real ID3v2 title through the full try_read_metadata path, never fall
+        // back to the filename. Covers the case where lofty parses the container
+        // and returns a (possibly title-less) tag: our DSF ID3v2 parser must
+        // still fill the title.
+        use std::io::Write;
+        let id3_tag = build_id3v2_tag(&[("TIT2", "Aurora"), ("TPE1", "Yes"), ("TALB", "Fragile")]);
+        let buf = build_dsf_bytes(Some(&id3_tag));
+        let tmp = std::env::temp_dir().join("tune_test_dsf_title_e2e.dsf");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let meta = try_read_metadata(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        let meta = meta.expect("try_read_metadata should succeed for a tagged DSF");
+        assert_eq!(meta.title.as_deref(), Some("Aurora"));
+        assert_eq!(meta.artist.as_deref(), Some("Yes"));
+        assert_eq!(meta.album.as_deref(), Some("Fragile"));
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
     }
 
     #[test]
