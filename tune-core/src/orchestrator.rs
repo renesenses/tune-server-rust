@@ -364,12 +364,21 @@ impl PlaybackOrchestrator {
                             .to_string(),
                     )
                 }),
-            sample_rate: resolved.sample_rate.or(track_meta
+            // Prefer the SOURCE resolution (library metadata) over the resolved
+            // OUTPUT format. Local playback forces a 32-bit WAV to the DAC, but
+            // the "now playing" label must show the file's real depth (16/24) —
+            // matching the gapless path (advance_queue_metadata), which avoids the
+            // "first tracks show 32-bit then correct to 16" glitch. Streaming has
+            // no local row (track_meta = None) so it falls back to the resolved
+            // stream format. DSD display is handled separately in zones.rs.
+            sample_rate: track_meta
                 .as_ref()
-                .and_then(|t| t.sample_rate.map(|v| v as u32))),
-            bit_depth: resolved.bit_depth.or(track_meta
+                .and_then(|t| t.sample_rate.map(|v| v as u32))
+                .or(resolved.sample_rate),
+            bit_depth: track_meta
                 .as_ref()
-                .and_then(|t| t.bit_depth.map(|v| v as u32))),
+                .and_then(|t| t.bit_depth.map(|v| v as u32))
+                .or(resolved.bit_depth),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
             year: track_meta.as_ref().and_then(|t| t.year),
         };
