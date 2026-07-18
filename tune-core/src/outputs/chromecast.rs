@@ -34,6 +34,16 @@ impl OutputTarget for ChromecastOutput {
         "chromecast"
     }
 
+    /// Chromecast does not consume `set_next_media` (no cast-queue / autoplay
+    /// staging is implemented — `set_next_url` is the no-op default). Returning
+    /// true here made the poller arm the gapless guard, which orphaned the
+    /// staged track and suppressed the natural-end advance: playback stalled
+    /// ~30-60s at every track boundary (Rhorn, Chromecast Audio, forum #1072).
+    /// Rely on the poller's natural-end fallback instead, like slimproto.
+    fn supports_internal_gapless(&self) -> bool {
+        false
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host)
     }
