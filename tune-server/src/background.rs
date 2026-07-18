@@ -33,8 +33,175 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_slimproto_server(state);
     spawn_social_sharing_listener(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
+    #[cfg(feature = "oaat")]
+    spawn_oaat_stall_supervisor(state);
     #[cfg(feature = "cloud-relay")]
     spawn_relay_client(state).await;
+}
+
+/// Supervise OAAT zones and recover a stalled one with a stop+play restart.
+///
+/// The OAAT streaming loop can stall when the *source* transcode stream hangs
+/// (the transcode downloads the whole track to a temp file before emitting any
+/// PCM, so a slow/stalled hi-res download starves `stream.next()`). The output's
+/// own 10s watchdog only reconnects the endpoint TCP — the wrong layer — and
+/// cannot re-request a transcoded WAV session (they are not seekable and a re-GET
+/// re-attaches to the same hung channel). The only reliable recovery is a fresh
+/// play, exactly what the `/zones/{id}/stop` + `/zones/{id}/play` sequence does.
+///
+/// This supervisor polls every 10s, and when an OAAT zone reports a packet stall
+/// (`playing && !paused && last_packet_age_ms > 30s`) it re-issues stop+play for
+/// the current track. A per-device back-off (≥60s between restarts, give up after
+/// 3 consecutive that don't recover → clean stop) prevents a restart loop on a
+/// permanently-dead source. History is cleared once a device plays cleanly again.
+#[cfg(feature = "oaat")]
+fn spawn_oaat_stall_supervisor(state: &AppState) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    let orchestrator = state.orchestrator.clone();
+    let outputs = state.outputs.clone();
+    let playback = state.playback.clone();
+    let backend = state.backend.clone();
+
+    // Restart only after the stall has persisted well beyond the output's own
+    // 10s watchdog window, so a transient hiccup that self-recovers is left alone.
+    const STALL_MS: u64 = 30_000;
+    const MIN_INTERVAL: Duration = Duration::from_secs(60);
+    const MAX_CONSECUTIVE: u32 = 3;
+
+    tokio::spawn(async move {
+        // device_id → (last restart, consecutive restart count)
+        let mut history: HashMap<String, (Instant, u32)> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+
+        loop {
+            ticker.tick().await;
+
+            // Collect the device_id + current stall state of every OAAT output,
+            // then release the registry lock before doing any stop/play I/O.
+            let mut states: Vec<(String, bool)> = Vec::new();
+            {
+                let reg = outputs.lock().await;
+                for device_id in reg.list() {
+                    if !device_id.starts_with("oaat:") && !device_id.starts_with("oaat-group:") {
+                        continue;
+                    }
+                    if let Some(arc) = reg.get(&device_id) {
+                        let out = arc.lock().await;
+                        if let Some(oaat) = out
+                            .as_any()
+                            .downcast_ref::<tune_core::outputs::oaat::OaatOutput>()
+                        {
+                            let snap = oaat.diagnostics_snapshot();
+                            let playing = snap["playing"].as_bool().unwrap_or(false);
+                            let paused = snap["paused"].as_bool().unwrap_or(false);
+                            let age = snap["last_packet_age_ms"].as_u64().unwrap_or(0);
+                            let stalled = playing && !paused && age > STALL_MS;
+                            states.push((device_id.clone(), stalled));
+                        }
+                    }
+                }
+            }
+
+            for (device_id, stalled) in states {
+                if !stalled {
+                    // Healthy again → forget any prior restart history so the next
+                    // isolated stall starts from a clean consecutive count.
+                    history.remove(&device_id);
+                    continue;
+                }
+
+                let now = Instant::now();
+                let count = match history.get(&device_id) {
+                    // Backing off: restarted this device too recently, wait.
+                    Some((last, _)) if now.duration_since(*last) < MIN_INTERVAL => continue,
+                    Some((_, c)) => *c,
+                    None => 0,
+                };
+
+                let zone = match tune_core::db::zone_repo::ZoneRepo::with_backend(backend.clone())
+                    .get_by_device_id(&device_id)
+                {
+                    Ok(Some(z)) => z,
+                    _ => continue,
+                };
+                let zone_id = match zone.id {
+                    Some(id) => id,
+                    None => continue,
+                };
+
+                if count >= MAX_CONSECUTIVE {
+                    // Restarts aren't helping — stop cleanly so we stop hammering
+                    // the endpoint and leave a well-defined idle state. Once stopped
+                    // the zone is no longer "playing" so this won't fire again until
+                    // the user replays.
+                    error!(
+                        zone_id,
+                        device_id = %device_id,
+                        "oaat_stall_supervisor_giving_up_stopping_zone"
+                    );
+                    orchestrator.stop(zone_id, Some(&device_id)).await;
+                    history.remove(&device_id);
+                    continue;
+                }
+
+                info!(
+                    zone_id,
+                    device_id = %device_id,
+                    attempt = count + 1,
+                    "oaat_stall_supervisor_restarting_zone"
+                );
+
+                orchestrator.stop(zone_id, Some(&device_id)).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                let st = playback.get_state(zone_id).await;
+                if let Some(np) = st.now_playing {
+                    let req = tune_core::orchestrator::PlayRequest {
+                        zone_id,
+                        output_device_id: Some(device_id.clone()),
+                        track_id: np.track_id,
+                        source: if np.source == "local" {
+                            None
+                        } else {
+                            Some(np.source.clone())
+                        },
+                        source_id: np.source_id.clone(),
+                        title: Some(np.title.clone()),
+                        artist_name: np.artist_name.clone(),
+                        album_title: np.album_title.clone(),
+                        cover_url: np.cover_path.clone(),
+                        duration_ms: Some(np.duration_ms),
+                        seek_ms: None,
+                        temp_file_path: None,
+                    };
+                    match orchestrator.play(req).await {
+                        Ok(_) => {
+                            // Restore the queue length from the DB so the poller
+                            // keeps auto-advancing after the restart (mirrors the
+                            // /zones/{id}/play handler; without it a mid-album stall
+                            // recovery would play the current track then stop).
+                            let qr = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(
+                                backend.clone(),
+                            );
+                            let q_len = qr.count(zone_id).unwrap_or(0)
+                                + qr.count_streaming(zone_id).unwrap_or(0);
+                            if q_len > 0 {
+                                let cur_pos = playback.get_state(zone_id).await.queue_position;
+                                playback.update_queue_info(zone_id, cur_pos, q_len).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(zone_id, error = %e, "oaat_stall_supervisor_replay_failed");
+                        }
+                    }
+                }
+
+                history.insert(device_id.clone(), (now, count + 1));
+            }
+        }
+    });
 }
 
 #[cfg(feature = "cloud-relay")]
