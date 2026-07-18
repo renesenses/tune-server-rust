@@ -9,4 +9,3 @@ pub mod importer;
 pub mod m3u_parser;
 pub mod smart_collections;
 pub mod track_matcher;
-pub mod watcher;

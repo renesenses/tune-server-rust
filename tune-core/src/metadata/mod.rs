@@ -356,6 +356,8 @@ struct Id3v2Tags {
     txxx_frames: Vec<(String, String)>,
     /// Whether an APIC (picture) frame was found
     has_picture: bool,
+    /// First embedded picture found, as `(mime_type, image_bytes)`.
+    picture: Option<(String, Vec<u8>)>,
 }
 
 impl Id3v2Tags {
@@ -576,9 +578,12 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
         let frame_data = &data[pos..pos + frame_size];
         pos += frame_size;
 
-        // Check for picture frames
+        // Check for picture frames (APIC in v2.3/2.4, PIC in v2.2).
         if frame_id == "APIC" {
             tags.has_picture = true;
+            if tags.picture.is_none() {
+                tags.picture = extract_apic_picture(frame_data, major_version);
+            }
             continue;
         }
 
@@ -720,6 +725,83 @@ fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v
     parse_id3v2_tag(&tag_data)
 }
 
+/// Decode the image bytes and MIME type from an ID3v2 picture frame body.
+///
+/// Handles both the v2.3/2.4 `APIC` layout (encoding byte, NUL-terminated
+/// Latin-1 MIME string, picture-type byte, NUL-terminated description, image
+/// data) and the v2.2 `PIC` layout (encoding byte, 3-char image-format code,
+/// picture-type byte, NUL-terminated description, image data). The description
+/// terminator is one NUL for Latin-1/UTF-8 encodings and a two-byte NUL for the
+/// UTF-16 encodings. Returns `(mime_type, image_bytes)`.
+fn extract_apic_picture(body: &[u8], major_version: u8) -> Option<(String, Vec<u8>)> {
+    if body.is_empty() {
+        return None;
+    }
+    let encoding = body[0];
+    let mut pos = 1usize;
+
+    let mime = if major_version == 2 {
+        // v2.2 "PIC": 3-character image format code (e.g. "JPG", "PNG").
+        if body.len() < pos + 3 {
+            return None;
+        }
+        let fmt = &body[pos..pos + 3];
+        pos += 3;
+        match fmt.to_ascii_uppercase().as_slice() {
+            b"PNG" => "image/png".to_string(),
+            _ => "image/jpeg".to_string(),
+        }
+    } else {
+        // v2.3/2.4 "APIC": NUL-terminated Latin-1 MIME string.
+        let start = pos;
+        while pos < body.len() && body[pos] != 0 {
+            pos += 1;
+        }
+        if pos >= body.len() {
+            return None;
+        }
+        let mime = String::from_utf8_lossy(&body[start..pos]).into_owned();
+        pos += 1; // skip NUL terminator
+        if mime.is_empty() {
+            "image/jpeg".to_string()
+        } else {
+            mime
+        }
+    };
+
+    // Picture type (1 byte).
+    if pos >= body.len() {
+        return None;
+    }
+    pos += 1;
+
+    // Description, NUL-terminated in the frame's text encoding.
+    match encoding {
+        1 | 2 => {
+            // UTF-16: terminated by a 0x0000 code unit.
+            while pos + 1 < body.len() && !(body[pos] == 0 && body[pos + 1] == 0) {
+                pos += 2;
+            }
+            pos += 2;
+        }
+        _ => {
+            while pos < body.len() && body[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+    }
+
+    if pos >= body.len() {
+        return None;
+    }
+    let data = body[pos..].to_vec();
+    if data.is_empty() {
+        return None;
+    }
+    Some((mime, data))
+}
+
 /// Extract the embedded cover art (APIC) from a DSF file's ID3v2 chunk.
 ///
 /// lofty does not read the ID3v2 tag stored at the DSF metadata offset, so
@@ -736,14 +818,8 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
     let info = parse_dsf_header_full(path).ok()?;
     let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset)?;
 
-    let tag = id3::Tag::read_from2(std::io::Cursor::new(tag_data)).ok()?;
-    let pic = tag.pictures().next()?;
-    let mime = if pic.mime_type.is_empty() {
-        "image/jpeg".to_string()
-    } else {
-        pic.mime_type.clone()
-    };
-    Some((pic.data.clone(), mime))
+    let (mime, data) = parse_id3v2_tag(&tag_data)?.picture?;
+    Some((data, mime))
 }
 
 /// Fallback metadata extraction for DSF/DFF files when lofty fails.
@@ -1839,6 +1915,74 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal ID3v2.3 tag containing a single APIC frame.
+    fn id3v23_with_apic(mime: &[u8], img: &[u8]) -> Vec<u8> {
+        // Frame body: encoding(1) + mime + NUL + pic_type(1) + desc NUL + data.
+        let mut body = vec![0u8]; // Latin-1
+        body.extend_from_slice(mime);
+        body.push(0);
+        body.push(3); // picture type: front cover
+        body.push(0); // empty description + NUL
+        body.extend_from_slice(img);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]); // v2.3, no flags
+        // syncsafe tag size (frame header 10 + body)
+        let size = (10 + body.len()) as u32;
+        tag.extend_from_slice(&[
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]);
+        tag.extend_from_slice(b"APIC");
+        tag.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+        tag.extend_from_slice(&[0, 0]); // frame flags
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    #[test]
+    fn apic_extracted_from_id3v23() {
+        let img = [0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]; // JPEG-ish
+        let tag = id3v23_with_apic(b"image/jpeg", &img);
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert!(parsed.has_picture);
+        let (mime, data) = parsed.picture.expect("picture present");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn apic_body_v22_pic_png() {
+        // v2.2 "PIC": encoding(1) + 3-char format + pic_type(1) + desc NUL + data.
+        let img = [0x89u8, 0x50, 0x4E, 0x47, 9, 9];
+        let mut body = vec![0u8]; // Latin-1
+        body.extend_from_slice(b"PNG");
+        body.push(3); // picture type
+        body.push(0); // empty description
+        body.extend_from_slice(&img);
+        let (mime, data) = extract_apic_picture(&body, 2).expect("v2.2 PIC parses");
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn apic_utf16_description_skipped() {
+        // encoding 1 (UTF-16): description terminated by a 2-byte NUL.
+        let img = [0xFFu8, 0xD8, 42];
+        let mut body = vec![1u8]; // UTF-16
+        body.extend_from_slice(b"image/jpeg");
+        body.push(0);
+        body.push(3); // picture type
+        body.extend_from_slice(&[0x00, 0x00]); // empty UTF-16 description
+        body.extend_from_slice(&img);
+        let (mime, data) = extract_apic_picture(&body, 4).expect("utf-16 desc parses");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, img);
+    }
 
     #[test]
     fn alac_bit_depth_from_magic_cookie() {
