@@ -24,6 +24,15 @@ pub struct TrackCredit {
     pub instrument: Option<String>,
 }
 
+/// Max size of an embedded cover kept in `TrackMetadata.cover_art`. The scanner
+/// retains this buffer for every file and accumulates a whole batch in memory,
+/// so an oversized (or malformed) embedded picture, multiplied across files,
+/// blew the scanner past the OOM killer (JeromeQ: 261 files → 6.1 GB RSS on an
+/// 8 GB machine). Above this, we keep `has_cover=true` but drop the bytes and
+/// let the scan re-extract that one file's cover to the artwork cache on demand,
+/// keeping peak scan memory bounded. Normal covers (well under 4 MB) stay cached.
+pub const MAX_RETAINED_COVER_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackMetadata {
     pub title: Option<String>,
@@ -1607,13 +1616,20 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         has_cover: !tag.pictures().is_empty(),
         // Capture the embedded cover from this same lofty pass so the scanner
         // doesn't have to re-open the file to extract it.
-        cover_art: tag.pictures().first().map(|pic| {
+        cover_art: tag.pictures().first().and_then(|pic| {
+            let data = pic.data();
+            // Don't retain oversized embedded pictures — they accumulate across
+            // the scan batch and OOM the scanner. has_cover stays true, so the
+            // scan re-extracts this file's cover to the cache on demand.
+            if data.len() > MAX_RETAINED_COVER_BYTES {
+                return None;
+            }
             let mime = match pic.mime_type() {
                 Some(lofty::picture::MimeType::Png) => "image/png",
                 Some(lofty::picture::MimeType::Bmp) => "image/bmp",
                 _ => "image/jpeg",
             };
-            (pic.data().to_vec(), mime.to_string())
+            Some((data.to_vec(), mime.to_string()))
         }),
         credits,
         comment: tag.comment().map(|s| s.to_string()),
