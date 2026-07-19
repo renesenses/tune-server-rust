@@ -35,6 +35,10 @@ struct TopQuery {
 #[derive(Deserialize)]
 struct EpisodesQuery {
     feed_url: Option<String>,
+    /// Apple top-chart id ("apple-{trackId}"). Top-chart podcasts carry no feed
+    /// URL, so this lets episodes be previewed by resolving the feed URL from the
+    /// id — without subscribing first (Bilou, #1000).
+    source_id: Option<String>,
     #[serde(default = "default_episode_limit")]
     limit: usize,
 }
@@ -210,12 +214,33 @@ async fn episodes_by_feed_url(
     State(state): State<AppState>,
     Query(q): Query<EpisodesQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let Some(feed_url) = q.feed_url else {
-        return Err(AppError::bad_request(
-            "feed_url query parameter is required",
-        ));
-    };
     let svc = PodcastService::with_client(state.http_client.clone());
+    // Use the feed URL directly, or resolve it from an Apple top-chart id
+    // ("apple-{trackId}") — top-chart podcasts have no feed URL, so this lets
+    // their episodes be previewed without subscribing first (Bilou, #1000).
+    let feed_url = match q.feed_url.filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => {
+            let apple_id = q
+                .source_id
+                .as_deref()
+                .and_then(|s| s.strip_prefix("apple-"))
+                .unwrap_or("");
+            if apple_id.is_empty() {
+                return Err(AppError::bad_request(
+                    "feed_url or source_id (apple-…) query parameter is required",
+                ));
+            }
+            match svc.resolve_feed_url(apple_id).await {
+                Some(u) => u,
+                None => {
+                    return Err(AppError::bad_request(
+                        "could not resolve feed URL from Apple id",
+                    ));
+                }
+            }
+        }
+    };
     match svc.get_episodes(&feed_url, q.limit).await {
         Ok(episodes) => Ok(Json(
             json!({"feed_url": feed_url, "count": episodes.len(), "episodes": episodes}),
