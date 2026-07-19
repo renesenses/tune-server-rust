@@ -144,6 +144,13 @@ pub mod sql {
         )
     }
 
+    pub fn clear_image<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET image_path = NULL, image_source = NULL WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
     /// Engine-agnostic full-text search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -567,6 +574,14 @@ impl ArtistRepo {
     pub fn update_mbid(&self, id: i64, mbid: &str) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mbid, sql::update_mbid);
         self.db.execute(&sql, &[&id as &dyn ToSqlValue, &mbid])?;
+        Ok(())
+    }
+
+    /// Clear an artist's stored image (path + source) so the next enrichment
+    /// re-fetches it. Used when a user reports the current image as wrong.
+    pub fn clear_image(&self, id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::clear_image, sql::clear_image);
+        self.db.execute(&sql, &[&id as &dyn ToSqlValue])?;
         Ok(())
     }
 
