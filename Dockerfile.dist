@@ -23,13 +23,21 @@ RUN groupadd -g 1000 tune && \
 WORKDIR /app
 
 # Prebuilt, arch-specific binaries staged by CI (dist/amd64, dist/arm64).
-# librespot (Spotify Connect) is a real binary on amd64 and an empty placeholder
-# on arm64 for now — same best-effort behavior as the previous single-arch image.
+# librespot (Spotify Connect) and airplay-daemon (AirPlay 2 sender) are real
+# binaries on amd64 and empty placeholders on arm64 for now — same best-effort
+# behavior as the previous single-arch image. Without airplay-daemon, the server
+# falls back to legacy AirPlay 1 (RAOP), which AirPlay-2-only speakers (e.g.
+# Devialet Phantom) refuse — hence no sound on those devices (#700).
+#
+# airplay-daemon is GPL-2.0, shipped as a standalone subprocess binary (mere
+# aggregation — no linking). Corresponding source:
+# https://github.com/renesenses/airplay2-rs
 COPY dist/${TARGETARCH}/tune-server /app/tune-server
 COPY dist/${TARGETARCH}/librespot /usr/local/bin/librespot
+COPY dist/${TARGETARCH}/airplay-daemon /usr/local/bin/airplay-daemon
 COPY web/ /app/web/
 
-RUN chmod +x /app/tune-server /usr/local/bin/librespot && \
+RUN chmod +x /app/tune-server /usr/local/bin/librespot /usr/local/bin/airplay-daemon && \
     chown -R root:root /app && chmod -R 755 /app
 
 # Data + artwork cache owned by the tune user
