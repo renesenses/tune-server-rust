@@ -2016,7 +2016,31 @@ impl PlaybackOrchestrator {
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
-            let sr = stream_data.quality.sample_rate;
+            // Cap the WAV rate to the zone's max_sample_rate (e.g. an OAAT
+            // endpoint whose DAC tops out at 96k). resolve_local_track applies
+            // this cap for local files; the streaming path historically did NOT,
+            // so a 192k Qobuz/Tidal track was transcoded to a 192k WAV and handed
+            // to a 96k OAAT endpoint → the DAC rejected the rate → silence with no
+            // server-side error (radio at 44.1/48k on the same zone played fine).
+            // decode_to_pcm_streaming_with_levels resamples to `sr`, so capping
+            // here downsamples the PCM, not just the WAV header.
+            let zone_max_sample_rate = ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.max_sample_rate);
+            let mut sr = stream_data.quality.sample_rate;
+            if let Some(max_sr) = zone_max_sample_rate {
+                if sr > max_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = sr,
+                        max_rate = max_sr,
+                        "streaming_zone_max_sample_rate_cap_applied"
+                    );
+                    sr = max_sr;
+                }
+            }
             // Local output: 32-bit to avoid 24-bit byte misalignment noise
             // (see local_needs_wav comment in resolve_local_track).
             // OAAT: cap at 24-bit (endpoints may not support 32-bit WAV).
