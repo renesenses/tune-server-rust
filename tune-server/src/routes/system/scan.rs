@@ -493,6 +493,7 @@ pub(super) async fn trigger_scan(
                     if let Some(aid) = album_id {
                         album_repo.update_dates(
                             aid,
+                            meta.year.map(|y| y as i32),
                             meta.original_year.map(|y| y as i32),
                             meta.release_date.as_deref(),
                             meta.original_date.as_deref(),
