@@ -1,9 +1,10 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────────
 FROM rust:1-bookworm AS builder
 
-# Install librespot build dependencies
+# Install librespot + airplay-daemon build dependencies (cmake/clang are for
+# airplay-daemon's vendored C encoders: fdk-aac + alac-encoder)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libasound2-dev pkg-config && \
+    apt-get install -y --no-install-recommends libasound2-dev pkg-config cmake clang && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -26,6 +27,14 @@ RUN echo 'fn main() {}' > tune-server/src/main.rs && \
 # Build librespot (Spotify Connect) — optional, touch a placeholder if it fails
 RUN cargo install librespot --no-default-features --features "alsa-backend" \
     || touch /usr/local/cargo/bin/librespot
+
+# Build airplay-daemon (AirPlay 2 sender, #700) — GPL-2.0 standalone subprocess
+# binary from a pinned rev of our fork. Optional in this dev image: on failure,
+# touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
+# to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
+RUN cargo install --git https://github.com/renesenses/airplay2-rs \
+      --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 airplay-daemon --locked \
+    || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
 COPY tune-core/ tune-core/
@@ -55,6 +64,7 @@ WORKDIR /app
 
 COPY --from=builder /build/target/release/tune-server /app/tune-server
 COPY --from=builder /usr/local/cargo/bin/librespot /usr/local/bin/librespot
+COPY --from=builder /usr/local/cargo/bin/airplay-daemon /usr/local/bin/airplay-daemon
 COPY web/ /app/web/
 
 # Ensure tune user can read the app but not write

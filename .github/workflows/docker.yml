@@ -93,6 +93,23 @@ jobs:
           fi
           touch dist/arm64/librespot
 
+      # airplay-daemon (AirPlay 2 sender): real binary on amd64, empty placeholder
+      # on arm64 for now (AirPlay 2 falls back to legacy AirPlay 1 there). Fixes
+      # #700 — without this the Docker image has no AirPlay 2 path, so AirPlay-2-
+      # only speakers (Devialet Phantom) got no sound. GPL-2.0, built from a pinned
+      # rev of our fork and shipped as a standalone subprocess binary (mere
+      # aggregation). amd64 is a HARD requirement: if it fails to build, the
+      # release fails loudly rather than silently shipping a placeholder.
+      - name: Build airplay-daemon (amd64)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libasound2-dev pkg-config
+          cargo install --git https://github.com/renesenses/airplay2-rs \
+            --rev d87396a07ea8c3e16aa1d0525f5ef6d1a7626686 \
+            airplay-daemon --root /tmp/ap --locked
+          cp /tmp/ap/bin/airplay-daemon dist/amd64/airplay-daemon
+          touch dist/arm64/airplay-daemon
+
       - uses: docker/build-push-action@v6
         with:
           context: .
