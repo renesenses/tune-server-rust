@@ -17,6 +17,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Build the MusicBrainz Lucene clause used to look up an artist by name.
+///
+/// A bare `artist:"<name>"` phrase only matches the artist's primary `name`
+/// (and `sort-name`). For non-Latin artists MusicBrainz stores the romanized
+/// form as the primary name (e.g. `IU`, `BTS`, `坂本龍一`→`Ryuichi Sakamoto`)
+/// and keeps the native-script name only as an *alias*. The bare phrase query
+/// therefore returns zero results for a Hangul/CJK/Cyrillic query, so no MBID
+/// is resolved and no bio/image enrichment happens.
+///
+/// Adding `OR alias:"<name>"` makes the native-script name resolve while
+/// keeping the quoted phrase precision for Latin names (verified against the
+/// live MB API on IU/BTS/坂本龍一 as well as Radiohead/The Beatles/Björk).
+pub(crate) fn mb_artist_query(name: &str) -> String {
+    format!("artist:\"{name}\" OR alias:\"{name}\"")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackCredit {
     pub name: String,
@@ -2030,6 +2046,21 @@ fn build_id3v2_tag(frames: &[(&str, &str)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mb_artist_query_includes_alias_clause() {
+        // The alias clause is what lets non-Latin (Hangul/CJK) names resolve:
+        // MusicBrainz indexes their romanized form as `name` and the native
+        // script only as an alias, so a bare `artist:"…"` phrase returns none.
+        let q = mb_artist_query("아이유");
+        assert_eq!(q, "artist:\"아이유\" OR alias:\"아이유\"");
+        assert!(q.contains("alias:"));
+        // Quoted phrase precision preserved for Latin names.
+        assert_eq!(
+            mb_artist_query("The Beatles"),
+            "artist:\"The Beatles\" OR alias:\"The Beatles\""
+        );
+    }
 
     /// Build a minimal ID3v2.3 tag containing a single APIC frame.
     fn id3v23_with_apic(mime: &[u8], img: &[u8]) -> Vec<u8> {
