@@ -314,17 +314,28 @@ pub(super) async fn artist_image_upload(
 pub(super) async fn artist_image_report(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<ImageReportBody>,
+    // Optional body: the web flag button POSTs with no JSON payload, so a
+    // required `Json<ImageReportBody>` extractor rejected it with 422 and the
+    // UI showed "erreur lors du signalement" (Jean Valjean #1096). Accept a
+    // missing/empty body; `reason` stays None.
+    body: Option<Json<ImageReportBody>>,
 ) -> impl IntoResponse {
+    let reason = body.and_then(|Json(b)| b.reason);
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let key = format!("reported_artist_image_{id}");
     let val = json!({
         "artist_id": id,
-        "reason": body.reason,
+        "reason": reason,
         "reported_at": now_iso_utc(),
     });
     settings.set(&key, &val.to_string()).ok();
-    Json(json!({"reported": true, "artist_id": id}))
+    // Also remove the wrong image locally so the artist shows a placeholder and
+    // a fresh image is re-fetched on the next enrichment (Jean Valjean #1096:
+    // "supprimer les images incorrectes en appuyant sur le drapeau").
+    let cleared = ArtistRepo::with_backend(state.backend.clone())
+        .clear_image(id)
+        .is_ok();
+    Json(json!({"reported": true, "artist_id": id, "image_cleared": cleared}))
 }
 
 // ---------------------------------------------------------------------------
