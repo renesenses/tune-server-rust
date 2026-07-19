@@ -1565,10 +1565,38 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         None
     };
 
+    // lofty occasionally mis-decodes an MP3's ID3v2 text frames and returns an
+    // EMPTY title/artist/album even though the frames are valid (Yves Scordia: a
+    // Chris Isaak MP3 with UTF-16 TIT2/TPE1/TALB read as empty, so BluOS got no
+    // metadata — other frames like TPE2/TCON/TYER read fine). When the title is
+    // empty and the file has a leading ID3v2 tag (MP3, WAV+ID3), re-read those
+    // frames with our own ID3v2 parser — the same one used for DSF.
+    let mut title = tag.title().map(|s| s.to_string());
+    let mut artist = tag.artist().map(|s| s.to_string());
+    let mut album = tag.album().map(|s| s.to_string());
+    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0)) {
+            if let Some(id3) = parse_id3v2_tag(&raw) {
+                let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
+                    if cur.as_deref().map_or(true, |x| x.trim().is_empty()) {
+                        alt.filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string())
+                            .or(cur)
+                    } else {
+                        cur
+                    }
+                };
+                title = prefer(title, id3.title());
+                artist = prefer(artist, id3.artist());
+                album = prefer(album, id3.album());
+            }
+        }
+    }
+
     Ok(TrackMetadata {
-        title: tag.title().map(|s| s.to_string()),
-        artist: tag.artist().map(|s| s.to_string()),
-        album: tag.album().map(|s| s.to_string()),
+        title,
+        artist,
+        album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
         track_number: tag.track(),
@@ -2065,6 +2093,38 @@ mod tests {
         );
         // No stuffing -> identity.
         assert_eq!(deunsynchronise(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn parse_id3v23_utf16_title() {
+        // A v2.3 TIT2 frame encoded as UTF-16-with-BOM — the case lofty
+        // mis-decoded as an empty string on Yves Scordia's Chris Isaak MP3, so
+        // Tune now falls back to this parser. Verify it reads the real title.
+        fn utf16_frame(id: &str, text: &str) -> Vec<u8> {
+            let mut body = vec![0x01u8]; // encoding 1 = UTF-16 with BOM
+            body.extend_from_slice(&[0xFF, 0xFE]); // little-endian BOM
+            for u in text.encode_utf16() {
+                body.extend_from_slice(&u.to_le_bytes());
+            }
+            let mut f = id.as_bytes().to_vec();
+            f.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+            f.extend_from_slice(&[0, 0]); // frame flags
+            f.extend_from_slice(&body);
+            f
+        }
+        let mut frames = utf16_frame("TIT2", "First Comes The Night");
+        frames.extend_from_slice(&utf16_frame("TPE1", "Chris Isaak"));
+        let mut tag = vec![b'I', b'D', b'3', 0x03, 0x00, 0x00]; // ID3v2.3, no flags
+        let size = frames.len();
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&frames);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("First Comes The Night"));
+        assert_eq!(parsed.artist(), Some("Chris Isaak"));
     }
 
     #[test]
