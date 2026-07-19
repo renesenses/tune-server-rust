@@ -791,7 +791,12 @@ impl AlbumRepo {
             "release_date" => format!(
                 "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC"
             ),
-            "year" => format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC"),
+            // The web client's sort dropdown labels this option "original_year"
+            // (LibraryView AlbumSortKey); accept it as an alias for "year" so an
+            // unknown key doesn't silently fall through to the `a.id` default.
+            "year" | "original_year" => {
+                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC")
+            }
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
@@ -805,7 +810,13 @@ impl AlbumRepo {
             // never purged by delete_all), falling back to file mtime for any
             // track not yet recorded. Streaming albums have no local file →
             // NULLS LAST, id tiebreaker.
-            "added_at" => format!(
+            // "added_date" is the web client's key (LibraryView AlbumSortKey) for
+            // this same option; alias it so "sort by date added" actually sorts by
+            // date rather than silently falling through to the `a.id` default —
+            // which only *looks* correct for the most-recently-added albums (their
+            // ids happen to be the highest), hence the "only the first few albums
+            // are sorted" report (Bilou, #1102).
+            "added_at" | "added_date" => format!(
                 // file_first_seen.first_seen_at is DOUBLE, but tracks.file_mtime
                 // is TEXT in the Postgres schema — a bare COALESCE(double, text)
                 // is a hard error on PG ("types double precision and text cannot
@@ -1643,6 +1654,74 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn client_sort_key_aliases_match_canonical() {
+        // The web client's sort dropdown sends "added_date" and "original_year"
+        // (LibraryView AlbumSortKey), but the SQL layer's canonical keys are
+        // "added_at" and "year". Before aliasing, the unknown keys fell through to
+        // the `a.id` default — so "sort by date added" only *looked* right for the
+        // most-recently-added albums (their ids are the highest), the "only the
+        // first few albums are sorted" report (Bilou, #1102). The aliases must
+        // route to the real logic, not the id fallback.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        // ids A<B<C, but first_seen makes A newest and C oldest — the OPPOSITE of
+        // id order, so the id fallback (DESC → C,B,A) is distinguishable from the
+        // real "date added" order (DESC → A,B,C).
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+        for (album_id, path, mtime) in [
+            (a, "/a.flac", 1.0),
+            (b, "/b.flac", 2.0),
+            (c, "/c.flac", 3.0),
+        ] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+        for (path, seen) in [
+            ("/a.flac", 3000.0f64),
+            ("/b.flac", 2000.0),
+            ("/c.flac", 1000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen} WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        let titles = |v: Vec<Album>| v.into_iter().map(|a| a.title).collect::<Vec<_>>();
+        let canon = titles(arepo.list_sorted(100, 0, "added_at", "desc").unwrap());
+        let alias = titles(arepo.list_sorted(100, 0, "added_date", "desc").unwrap());
+        assert_eq!(alias, canon, "added_date must alias added_at");
+        assert_eq!(
+            alias,
+            vec!["A", "B", "C"],
+            "must follow first_seen, not the id fallback"
+        );
+
+        // "original_year" must behave like "year" (New 2020 before Old 1970,
+        // NULL-year albums last), not fall through to id order.
+        let mut old = Album::new("Old".into());
+        old.year = Some(1970);
+        arepo.create(&old).unwrap();
+        let mut new = Album::new("New".into());
+        new.year = Some(2020);
+        arepo.create(&new).unwrap();
+        let by_year = titles(arepo.list_sorted(100, 0, "year", "desc").unwrap());
+        let by_orig = titles(arepo.list_sorted(100, 0, "original_year", "desc").unwrap());
+        assert_eq!(by_orig, by_year, "original_year must alias year");
+        assert_eq!(by_orig[0], "New");
+        assert_eq!(by_orig[1], "Old");
     }
 
     #[test]
