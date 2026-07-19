@@ -86,6 +86,25 @@ pub mod sql {
         )
     }
 
+    /// Non-radio play count for one track, matched by title + artist — the same
+    /// grouping `top_tracks` uses (many history rows carry a null track_id).
+    pub fn track_plays<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title = {} AND artist_name = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn track_plays_null_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title = {} AND artist_name IS NULL",
+            d.placeholder(1)
+        )
+    }
+
     pub fn top_artists<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT artist_name, COUNT(*) as plays FROM listen_history WHERE artist_name IS NOT NULL AND source != 'radio' GROUP BY artist_name ORDER BY plays DESC LIMIT {}",
@@ -225,6 +244,29 @@ impl HistoryRepo {
                 })
             })
             .collect())
+    }
+
+    /// How many times a track (matched by `title` + `artist_name`) was played,
+    /// excluding radio. Mirrors the dashboard "top tracks" grouping.
+    pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
+        let count = |sql: &str, params: &[&dyn ToSqlValue]| -> Result<i64, String> {
+            Ok(self
+                .db
+                .query_one(sql, params)?
+                .and_then(|c| c.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0))
+        };
+        match artist_name {
+            Some(a) => {
+                let sql = self.dialect_sql(sql::track_plays, sql::track_plays);
+                count(&sql, &[&title, &a])
+            }
+            None => {
+                let sql =
+                    self.dialect_sql(sql::track_plays_null_artist, sql::track_plays_null_artist);
+                count(&sql, &[&title])
+            }
+        }
     }
 
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {
