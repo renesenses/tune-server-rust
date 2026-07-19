@@ -1429,7 +1429,18 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         p.options(
             ParseOptions::new()
                 .parsing_mode(ParsingMode::Relaxed)
-                .max_junk_bytes(1024 * 1024),
+                .max_junk_bytes(1024 * 1024)
+                // Don't load embedded cover art in the tag pass: lofty otherwise
+                // reads the whole PICTURE block into memory, and a huge/malformed
+                // embedded image, multiplied by the scan's concurrency (up to 32
+                // reads at once), spikes the scanner past the OOM killer (JeromeQ:
+                // 261 files → 6.1 GB RSS → tune-server killed, black screen). The
+                // cover is extracted separately, sequentially, by
+                // `artwork::get_or_extract` when the album needs one, so artwork
+                // is unaffected. (has_cover becomes false here — it has no
+                // consumers beyond serialization; the album cover_path is the
+                // real signal.)
+                .read_cover_art(false),
         )
         .guess_file_type()?
         .read()
