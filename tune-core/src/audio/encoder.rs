@@ -1,8 +1,6 @@
-use std::io::Cursor;
-
 use tracing::{debug, warn};
 
-/// Audio encoder that handles WAV (via hound) and FLAC (native pure-Rust).
+/// Audio encoder that handles WAV (native) and FLAC (native pure-Rust).
 /// MP3 and OGG requests are transparently encoded as FLAC with a warning,
 /// since pure-Rust encoders for those formats are not available.
 ///
@@ -14,7 +12,7 @@ pub struct AudioEncoder {
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
-    /// WAV-only: accumulates all PCM data (hound needs it all upfront).
+    /// WAV-only: accumulates all PCM data (the WAV writer needs it all upfront).
     pcm_buffer: Option<Vec<u8>>,
     /// FLAC streaming state (None when not started or after finish).
     flac_state: Option<FlacStreamState>,
@@ -69,7 +67,7 @@ impl AudioEncoder {
                     format = "wav",
                     sample_rate = self.sample_rate,
                     bit_depth = self.bit_depth,
-                    "encoder_start_hound"
+                    "encoder_start_wav"
                 );
                 self.pcm_buffer = Some(Vec::new());
             }
@@ -152,7 +150,7 @@ impl AudioEncoder {
         }
 
         match self.format.as_str() {
-            "wav" => encode_wav_hound(&pcm_data, self.sample_rate, self.bit_depth, self.channels),
+            "wav" => encode_wav(&pcm_data, self.sample_rate, self.bit_depth, self.channels),
             _ => {
                 // Should not reach here (FLAC uses flac_state), but as a fallback:
                 encode_flac_batch(&pcm_data, self.sample_rate, self.bit_depth, self.channels)
@@ -167,77 +165,43 @@ impl AudioEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// WAV encoder (hound)
+// WAV encoder (native)
 // ---------------------------------------------------------------------------
 
-fn encode_wav_hound(
+/// Encode interleaved little-endian integer PCM into a complete WAV file.
+///
+/// The input `pcm` is already in the on-disk sample layout (16/24/32-bit LE),
+/// so the encoder is a canonical 44-byte header followed by the PCM bytes
+/// verbatim — no per-sample rewrite. The trailing bytes of an incomplete final
+/// sample are dropped so the `data` chunk always covers whole samples.
+fn encode_wav(
     pcm: &[u8],
     sample_rate: u32,
     bit_depth: u32,
     channels: u32,
 ) -> Result<Vec<u8>, String> {
-    let spec = hound::WavSpec {
-        channels: channels as u16,
-        sample_rate,
-        bits_per_sample: bit_depth as u16,
-        sample_format: hound::SampleFormat::Int,
+    let bytes_per_sample = match bit_depth {
+        16 | 24 | 32 => (bit_depth / 8) as usize,
+        _ => return Err(format!("unsupported bit depth: {bit_depth}")),
     };
 
-    let mut cursor = Cursor::new(Vec::new());
-    let mut writer =
-        hound::WavWriter::new(&mut cursor, spec).map_err(|e| format!("hound init: {e}"))?;
+    let body_len = pcm.len() - (pcm.len() % bytes_per_sample);
+    let pcm = &pcm[..body_len];
+    let data_size = u32::try_from(body_len).map_err(|_| "wav: pcm exceeds 4 GiB".to_string())?;
 
-    write_pcm_samples(&mut writer, pcm, bit_depth)?;
-
-    writer
-        .finalize()
-        .map_err(|e| format!("hound finalize: {e}"))?;
-    debug!(
-        pcm_bytes = pcm.len(),
-        wav_bytes = cursor.get_ref().len(),
-        "wav_encoded_hound"
+    let header = crate::audio::wav::build_wav_header_with_data_size(
+        channels as u16,
+        sample_rate,
+        bit_depth as u16,
+        data_size,
     );
-    Ok(cursor.into_inner())
-}
 
-fn write_pcm_samples(
-    writer: &mut hound::WavWriter<&mut Cursor<Vec<u8>>>,
-    pcm: &[u8],
-    bit_depth: u32,
-) -> Result<(), String> {
-    match bit_depth {
-        16 => {
-            for chunk in pcm.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        24 => {
-            for chunk in pcm.chunks_exact(3) {
-                let sample = i32::from_le_bytes([
-                    chunk[0],
-                    chunk[1],
-                    chunk[2],
-                    if chunk[2] & 0x80 != 0 { 0xFF } else { 0 },
-                ]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        32 => {
-            for chunk in pcm.chunks_exact(4) {
-                let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                writer
-                    .write_sample(sample)
-                    .map_err(|e| format!("hound write: {e}"))?;
-            }
-        }
-        _ => return Err(format!("unsupported bit depth: {bit_depth}")),
-    }
-    Ok(())
+    let mut out = Vec::with_capacity(44 + body_len);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(pcm);
+
+    debug!(pcm_bytes = body_len, wav_bytes = out.len(), "wav_encoded");
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,17 +407,19 @@ fn flac_finish(
     // use the actual block size
     if total_samples > 0 {
         let actual_max_block = FLAC_BLOCK_SIZE.min(total_samples as usize) as u16;
-        // For the last frame, min block size might be smaller
+        // Per the FLAC spec, STREAMINFO min block size is the smallest block
+        // *excluding the last block*. With a single frame, min = max = that
+        // frame. With several frames, every non-last block is FLAC_BLOCK_SIZE,
+        // so min = FLAC_BLOCK_SIZE even when the last frame is shorter.
+        // Reporting the short last block here made min != max, which strict
+        // decoders (symphonia, CoreAudio) read as a variable-block stream that
+        // conflicts with the fixed blocking-strategy flag → whole stream
+        // rejected ("unexpected end of file"), so the transcoded FLAC's final
+        // frame broke playback.
         let actual_min_block = if total_samples <= FLAC_BLOCK_SIZE as u64 {
             total_samples as u16
         } else {
-            // With FLAC_BLOCK_SIZE blocks + possibly shorter last block
-            let last_block = (total_samples as usize) % FLAC_BLOCK_SIZE;
-            if last_block == 0 {
-                FLAC_BLOCK_SIZE as u16
-            } else {
-                last_block as u16
-            }
+            FLAC_BLOCK_SIZE as u16
         };
         output[si..si + 2].copy_from_slice(&actual_min_block.to_be_bytes());
         output[si + 2..si + 4].copy_from_slice(&actual_max_block.to_be_bytes());
@@ -1088,11 +1054,15 @@ fn write_rice_signed(bw: &mut BitWriter, value: i64, k: u8) {
     let quotient = (mapped >> k) as u32;
     let remainder = mapped & ((1u64 << k) - 1);
 
-    // Unary code for quotient: `quotient` ones followed by a zero
+    // Unary code for quotient: `quotient` zeros followed by a terminating one.
+    // FLAC decoders read the quotient with read_unary_zeros() (count leading
+    // zeros up to the first 1), so writing ones-then-zero desynchronised every
+    // Rice-coded residual — corrupting all FIXED subframes (audible as noise on
+    // transcoded ALAC; CONSTANT subframes, which use no Rice coding, were fine).
     for _ in 0..quotient {
-        bw.write_bits(1, 1);
+        bw.write_bits(0, 1);
     }
-    bw.write_bits(0, 1);
+    bw.write_bits(1, 1);
 
     // Binary code for remainder: k bits
     if k > 0 {
@@ -1167,6 +1137,59 @@ fn flac_crc16(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
+    /// Encode a known 24-bit signal to FLAC and decode it back: the stream must
+    /// be valid and bit-exact. Guards two encoder bugs that made transcoded
+    /// ALAC play as noise: (1) the Rice quotient was written as ones-then-zero
+    /// instead of the FLAC zeros-then-one convention, corrupting every FIXED
+    /// subframe; (2) STREAMINFO min_block_size reported the short final block,
+    /// making min != max so strict decoders rejected the whole stream. The
+    /// length (5000) is deliberately not a multiple of the 4096 block size so a
+    /// partial final frame is exercised.
+    #[test]
+    fn flac_24bit_roundtrip_is_bit_exact() {
+        let n = 5000usize;
+        let amp = 7_549_746i32; // 0.9 * (2^23 - 1)
+        let mono: Vec<i32> = (0..n)
+            .map(|i| {
+                (amp as f64 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48000.0).sin())
+                    as i32
+            })
+            .collect();
+
+        // Interleave to stereo, pack as 24-bit little-endian PCM.
+        let mut pcm = Vec::with_capacity(n * 2 * 3);
+        for &s in &mono {
+            let b = s.to_le_bytes();
+            for _ in 0..2 {
+                pcm.extend_from_slice(&b[..3]);
+            }
+        }
+
+        let mut enc = AudioEncoder::new("flac", 48000, 24, 2);
+        enc.start_sync().expect("start");
+        enc.write_sync(&pcm).expect("write");
+        let flac = enc.finish_sync().expect("finish");
+        assert!(flac.len() > 64, "flac output too small");
+
+        let tmp = std::env::temp_dir().join(format!("tune-flac-rt-{n}.flac"));
+        std::fs::write(&tmp, &flac).expect("write temp flac");
+        let decoded =
+            crate::audio::decode::decode_to_pcm(tmp.to_str().unwrap(), None, None, 0.0, 0.0)
+                .expect("decoding our own FLAC must succeed");
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(decoded.bit_depth, 24, "bit depth preserved");
+        assert_eq!(decoded.sample_rate, 48000, "sample rate preserved");
+        assert_eq!(decoded.channels, 2, "channels preserved");
+        assert_eq!(decoded.samples_i32.len(), n * 2, "sample count preserved");
+
+        // Every decoded sample must equal the input (FLAC is lossless).
+        let expected: Vec<i32> = mono.iter().flat_map(|&s| [s, s]).collect();
+        for (i, (&e, &g)) in expected.iter().zip(decoded.samples_i32.iter()).enumerate() {
+            assert_eq!(e, g, "sample {i} mismatch: {e} != {g}");
+        }
+    }
+
     #[test]
     fn encoder_new() {
         let enc = AudioEncoder::new("flac", 44100, 16, 2);
@@ -1190,7 +1213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wav_encode_hound() {
+    async fn wav_encode_via_api() {
         let mut enc = AudioEncoder::new("wav", 44100, 16, 2);
         enc.start().await.unwrap();
         // 100 frames of silence (stereo 16-bit = 400 bytes)
@@ -1204,11 +1227,16 @@ mod tests {
     }
 
     #[test]
-    fn wav_encode_24bit() {
-        let pcm = vec![0u8; 600]; // 100 frames * 2ch * 3 bytes
-        let wav = encode_wav_hound(&pcm, 96000, 24, 2).unwrap();
-        assert!(wav.len() > 44);
+    fn wav_encode_24bit_is_header_plus_pcm() {
+        let pcm: Vec<u8> = (0..600u16).map(|i| i as u8).collect(); // 100 frames * 2ch * 3 bytes
+        let wav = encode_wav(&pcm, 96000, 24, 2).unwrap();
+        // Output is exactly a 44-byte header followed by the PCM verbatim.
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(&wav[44..], &pcm[..]);
         assert_eq!(&wav[0..4], b"RIFF");
+        // data chunk size (bytes 40..44) equals the PCM length exactly.
+        let data_size = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
+        assert_eq!(data_size as usize, pcm.len());
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod artist_enrichment;
+pub mod artist_split;
 pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
@@ -16,12 +17,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Build the MusicBrainz Lucene clause used to look up an artist by name.
+///
+/// A bare `artist:"<name>"` phrase only matches the artist's primary `name`
+/// (and `sort-name`). For non-Latin artists MusicBrainz stores the romanized
+/// form as the primary name (e.g. `IU`, `BTS`, `坂本龍一`→`Ryuichi Sakamoto`)
+/// and keeps the native-script name only as an *alias*. The bare phrase query
+/// therefore returns zero results for a Hangul/CJK/Cyrillic query, so no MBID
+/// is resolved and no bio/image enrichment happens.
+///
+/// Adding `OR alias:"<name>"` makes the native-script name resolve while
+/// keeping the quoted phrase precision for Latin names (verified against the
+/// live MB API on IU/BTS/坂本龍一 as well as Radiohead/The Beatles/Björk).
+pub(crate) fn mb_artist_query(name: &str) -> String {
+    format!("artist:\"{name}\" OR alias:\"{name}\"")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackCredit {
     pub name: String,
     pub role: String,
     pub instrument: Option<String>,
 }
+
+/// Max size of an embedded cover kept in `TrackMetadata.cover_art`. The scanner
+/// retains this buffer for every file and accumulates a whole batch in memory,
+/// so an oversized (or malformed) embedded picture, multiplied across files,
+/// blew the scanner past the OOM killer (JeromeQ: 261 files → 6.1 GB RSS on an
+/// 8 GB machine). Above this, we keep `has_cover=true` but drop the bytes and
+/// let the scan re-extract that one file's cover to the artwork cache on demand,
+/// keeping peak scan memory bounded. Normal covers (well under 4 MB) stay cached.
+pub const MAX_RETAINED_COVER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrackMetadata {
@@ -60,6 +86,12 @@ pub struct TrackMetadata {
     pub musicbrainz_release_group_id: Option<String>,
     pub isrc: Option<String>,
     pub has_cover: bool,
+    /// Embedded cover art (bytes, mime) read from the SAME lofty pass that
+    /// parsed the tags. Lets the scanner cache the cover without re-opening the
+    /// file — a second `lofty::read_from_path` failed with "path not found"
+    /// (os error 3) for some accented Windows paths even though the first read
+    /// succeeded (Thibaud: <1% of albums had no artwork).
+    pub cover_art: Option<(Vec<u8>, String)>,
     pub credits: Vec<TrackCredit>,
     pub comment: Option<String>,
 }
@@ -175,7 +207,7 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("m4a");
@@ -196,6 +228,73 @@ pub fn probe_m4a_codec(path: &std::path::Path) -> Option<String> {
     }
 }
 
+/// Probe an M4A/MP4 file for its real codec **and** bit depth.
+///
+/// lofty reports neither for these files: it can't tell ALAC (lossless) from
+/// AAC (lossy) and never fills in the bit depth. symphonia's ISOMP4 demuxer
+/// also leaves `bits_per_sample` empty for ALAC, so the depth is read from the
+/// ALAC magic cookie in `extra_data` (bit depth at byte 5 of the 24-byte
+/// payload, after optional `frma`/`alac` atom prefixes) — the same layout the
+/// decoder uses. Returns `(format, bit_depth)`; bit depth is `None` for AAC.
+pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let file = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("m4a");
+    let format_reader = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = format_reader.default_track(symphonia::core::formats::TrackType::Audio)?;
+
+    // Match on the codec id (0x2003 for ALAC) rather than a Debug string — the
+    // Debug form of the codec parameters doesn't spell out "Alac".
+    let params = match &track.codec_params {
+        Some(CodecParameters::Audio(p)) => p,
+        _ => return Some(("aac".to_string(), None)),
+    };
+    if params.codec != CODEC_ID_ALAC {
+        return Some(("aac".to_string(), None));
+    }
+
+    let bit_depth = params
+        .bits_per_sample
+        .map(|b| b as u16)
+        .or_else(|| alac_bit_depth_from_cookie(params.extra_data.as_deref()));
+    Some(("alac".to_string(), bit_depth))
+}
+
+/// Extract the ALAC bit depth from the magic cookie (`extra_data`).
+/// Byte 5 of the 24-byte payload holds the bit depth, after optional 12-byte
+/// `frma` and `alac` atom prefixes.
+fn alac_bit_depth_from_cookie(extra: Option<&[u8]>) -> Option<u16> {
+    let mut buf = extra?;
+    if buf.len() >= 12 && &buf[4..8] == b"frma" {
+        buf = &buf[12..];
+    }
+    if buf.len() >= 12 && &buf[4..8] == b"alac" {
+        buf = &buf[12..];
+    }
+    if buf.len() >= 24 {
+        let bd = buf[5];
+        if bd > 0 && bd <= 32 {
+            return Some(bd as u16);
+        }
+    }
+    None
+}
+
 // ── DSF / DFF support ──────────────────────────────────────────────────
 
 /// Parsed DSF header information.
@@ -212,7 +311,8 @@ struct DsfHeaderInfo {
 fn parse_dsf_header_full(path: &Path) -> Result<DsfHeaderInfo, ()> {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(path).map_err(|_| ())?;
+    let mut f =
+        std::fs::File::open(&*crate::library::artwork::extended_path(path)).map_err(|_| ())?;
     let mut header = [0u8; 92]; // DSD chunk (28) + fmt chunk header (64 is plenty)
     f.read_exact(&mut header).map_err(|_| ())?;
 
@@ -282,6 +382,8 @@ struct Id3v2Tags {
     txxx_frames: Vec<(String, String)>,
     /// Whether an APIC (picture) frame was found
     has_picture: bool,
+    /// First embedded picture found, as `(mime_type, image_bytes)`.
+    picture: Option<(String, Vec<u8>)>,
 }
 
 impl Id3v2Tags {
@@ -392,6 +494,25 @@ fn syncsafe_to_u32(bytes: &[u8]) -> u32 {
         | (bytes[3] as u32)
 }
 
+/// Reverse ID3v2 unsynchronisation: every `0xFF 0x00` pair becomes `0xFF`.
+/// Applied to the whole tag body when the header's unsynchronisation flag
+/// (0x80) is set (ID3v2.2/v2.3). A no-op when no such pair is present. Old
+/// taggers commonly set this on DSD/DSF files (Benjithom, #959); without
+/// reversing it the frame sizes desync and the title/artist are lost.
+fn deunsynchronise(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        out.push(data[i]);
+        if data[i] == 0xFF && i + 1 < data.len() && data[i + 1] == 0x00 {
+            i += 2; // drop the stuffed 0x00
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Read and parse an ID3v2 tag from a byte slice starting at "ID3".
 ///
 /// Supports ID3v2.3 and ID3v2.4 text frames (TIT2, TPE1, TALB, etc.)
@@ -457,12 +578,30 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
     let tag_end = (10 + tag_size).min(data.len());
     let mut tags = Id3v2Tags::default();
 
+    // ID3v2.2/v2.3 may unsynchronise the whole tag (header flag 0x80): every
+    // 0xFF byte is followed by a stuffed 0x00 that must be removed before the
+    // frames can be parsed. Old taggers commonly set this on DSD/DSF files
+    // (Benjithom, #959) — without reversing it the frame sizes desync (notably
+    // when a PIC image precedes the title) and the title is lost, so Tune fell
+    // back to the filename. (v2.4 uses per-frame unsync, not handled here.)
+    let unsync = flags & 0x80 != 0;
+    let raw_frames = &data[pos.min(tag_end)..tag_end];
+    let deunsynced;
+    let frames: &[u8] = if unsync && major_version <= 3 {
+        deunsynced = deunsynchronise(raw_frames);
+        &deunsynced
+    } else {
+        raw_frames
+    };
+    let frames_end = frames.len();
+
     // v2.2 frames: 3-char id + 3-byte size, no flags (6-byte header).
     // v2.3/v2.4 frames: 4-char id + 4-byte size + 2-byte flags (10-byte header).
     let (id_len, header_len) = if major_version == 2 { (3, 6) } else { (4, 10) };
 
-    while pos + header_len <= tag_end {
-        let raw_id = match std::str::from_utf8(&data[pos..pos + id_len]) {
+    let mut fpos = 0usize;
+    while fpos + header_len <= frames_end {
+        let raw_id = match std::str::from_utf8(&frames[fpos..fpos + id_len]) {
             Ok(s) => s.to_string(),
             Err(_) => break,
         };
@@ -473,18 +612,22 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
         }
 
         let frame_size = match major_version {
-            4 => syncsafe_to_u32(&data[pos + 4..pos + 8]) as usize,
-            3 => u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize,
+            4 => syncsafe_to_u32(&frames[fpos + 4..fpos + 8]) as usize,
+            3 => u32::from_be_bytes([
+                frames[fpos + 4],
+                frames[fpos + 5],
+                frames[fpos + 6],
+                frames[fpos + 7],
+            ]) as usize,
             // v2.2: 3-byte big-endian size.
             _ => {
-                ((data[pos + 3] as usize) << 16)
-                    | ((data[pos + 4] as usize) << 8)
-                    | (data[pos + 5] as usize)
+                ((frames[fpos + 3] as usize) << 16)
+                    | ((frames[fpos + 4] as usize) << 8)
+                    | (frames[fpos + 5] as usize)
             }
         };
 
-        pos += header_len; // skip frame header
+        fpos += header_len; // skip frame header
 
         // Normalize v2.2 3-char ids to their v2.3/v2.4 equivalents.
         let frame_id = if major_version == 2 {
@@ -495,16 +638,19 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
             raw_id
         };
 
-        if frame_size == 0 || pos + frame_size > tag_end {
+        if frame_size == 0 || fpos + frame_size > frames_end {
             break;
         }
 
-        let frame_data = &data[pos..pos + frame_size];
-        pos += frame_size;
+        let frame_data = &frames[fpos..fpos + frame_size];
+        fpos += frame_size;
 
-        // Check for picture frames
+        // Check for picture frames (APIC in v2.3/2.4, PIC in v2.2).
         if frame_id == "APIC" {
             tags.has_picture = true;
+            if tags.picture.is_none() {
+                tags.picture = extract_apic_picture(frame_data, major_version);
+            }
             continue;
         }
 
@@ -605,7 +751,7 @@ fn read_dsf_id3v2_raw(path: &Path, metadata_offset: Option<u64>) -> Option<Vec<u
 
     let offset = metadata_offset?;
 
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = std::fs::File::open(&*crate::library::artwork::extended_path(path)).ok()?;
     let file_len = f.metadata().ok()?.len();
 
     // Sanity check: offset must be within the file, with room for at least
@@ -646,6 +792,83 @@ fn read_dsf_id3v2_tags(path: &Path, metadata_offset: Option<u64>) -> Option<Id3v
     parse_id3v2_tag(&tag_data)
 }
 
+/// Decode the image bytes and MIME type from an ID3v2 picture frame body.
+///
+/// Handles both the v2.3/2.4 `APIC` layout (encoding byte, NUL-terminated
+/// Latin-1 MIME string, picture-type byte, NUL-terminated description, image
+/// data) and the v2.2 `PIC` layout (encoding byte, 3-char image-format code,
+/// picture-type byte, NUL-terminated description, image data). The description
+/// terminator is one NUL for Latin-1/UTF-8 encodings and a two-byte NUL for the
+/// UTF-16 encodings. Returns `(mime_type, image_bytes)`.
+fn extract_apic_picture(body: &[u8], major_version: u8) -> Option<(String, Vec<u8>)> {
+    if body.is_empty() {
+        return None;
+    }
+    let encoding = body[0];
+    let mut pos = 1usize;
+
+    let mime = if major_version == 2 {
+        // v2.2 "PIC": 3-character image format code (e.g. "JPG", "PNG").
+        if body.len() < pos + 3 {
+            return None;
+        }
+        let fmt = &body[pos..pos + 3];
+        pos += 3;
+        match fmt.to_ascii_uppercase().as_slice() {
+            b"PNG" => "image/png".to_string(),
+            _ => "image/jpeg".to_string(),
+        }
+    } else {
+        // v2.3/2.4 "APIC": NUL-terminated Latin-1 MIME string.
+        let start = pos;
+        while pos < body.len() && body[pos] != 0 {
+            pos += 1;
+        }
+        if pos >= body.len() {
+            return None;
+        }
+        let mime = String::from_utf8_lossy(&body[start..pos]).into_owned();
+        pos += 1; // skip NUL terminator
+        if mime.is_empty() {
+            "image/jpeg".to_string()
+        } else {
+            mime
+        }
+    };
+
+    // Picture type (1 byte).
+    if pos >= body.len() {
+        return None;
+    }
+    pos += 1;
+
+    // Description, NUL-terminated in the frame's text encoding.
+    match encoding {
+        1 | 2 => {
+            // UTF-16: terminated by a 0x0000 code unit.
+            while pos + 1 < body.len() && !(body[pos] == 0 && body[pos + 1] == 0) {
+                pos += 2;
+            }
+            pos += 2;
+        }
+        _ => {
+            while pos < body.len() && body[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+    }
+
+    if pos >= body.len() {
+        return None;
+    }
+    let data = body[pos..].to_vec();
+    if data.is_empty() {
+        return None;
+    }
+    Some((mime, data))
+}
+
 /// Extract the embedded cover art (APIC) from a DSF file's ID3v2 chunk.
 ///
 /// lofty does not read the ID3v2 tag stored at the DSF metadata offset, so
@@ -662,14 +885,8 @@ pub(crate) fn extract_dsf_cover(path: &Path) -> Option<(Vec<u8>, String)> {
     let info = parse_dsf_header_full(path).ok()?;
     let tag_data = read_dsf_id3v2_raw(path, info.metadata_offset)?;
 
-    let tag = id3::Tag::read_from2(std::io::Cursor::new(tag_data)).ok()?;
-    let pic = tag.pictures().next()?;
-    let mime = if pic.mime_type.is_empty() {
-        "image/jpeg".to_string()
-    } else {
-        pic.mime_type.clone()
-    };
-    Some((pic.data.clone(), mime))
+    let (mime, data) = parse_id3v2_tag(&tag_data)?.picture?;
+    Some((data, mime))
 }
 
 /// Fallback metadata extraction for DSF/DFF files when lofty fails.
@@ -687,7 +904,9 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         return None;
     }
 
-    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .ok()
+        .map(|m| m.len());
 
     let (sample_rate, channels, duration_ms, metadata_offset) = if ext == "dsf" {
         match parse_dsf_header_full(path) {
@@ -808,9 +1027,15 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         )
     };
 
-    // Fall back to filename/directory for fields the ID3v2 tag didn't provide
-    let title = title.or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
-    let album = album.or_else(|| {
+    // Fall back to filename/directory for fields the ID3v2 tag didn't provide.
+    // Treat a present-but-empty/whitespace tag as absent: a file whose ALBUM tag
+    // is "" (not missing) otherwise produced a blank, untitled album that no
+    // amount of re-scanning could name (Bilou #1093). `filter` drops the empty
+    // value so the folder-name fallback kicks in.
+    let title = title
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let album = album.filter(|s| !s.trim().is_empty()).or_else(|| {
         path.parent()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().to_string())
@@ -884,6 +1109,7 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_release_group_id: mb_release_group_id,
         isrc,
         has_cover,
+        cover_art: None,
         credits,
         comment: None,
     })
@@ -914,7 +1140,9 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
             (None, Some(file_name.to_string()))
         };
 
-    let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .ok()
+        .map(|m| m.len());
 
     tracing::debug!(path = %path.display(), title = ?title, artist = ?artist, album = ?album, "m4a_fallback_metadata");
 
@@ -952,6 +1180,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     })
@@ -991,11 +1220,13 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         .and_then(|e| e.to_str())
         .unwrap_or("wav")
         .to_lowercase();
+    let mut probed_bit_depth: Option<u16> = None;
     let format = {
         let mut fmt = normalize_format(&ext, props.bit_depth());
         if fmt == "aac" && (ext == "m4a" || ext == "mp4") && props.bit_depth().is_none() {
-            if let Some(probed) = probe_m4a_codec(path) {
+            if let Some((probed, bd)) = probe_m4a_props(path) {
                 fmt = probed;
+                probed_bit_depth = bd;
             }
         }
         Some(fmt)
@@ -1027,11 +1258,13 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         genre: None,
         genres: vec![],
         format,
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
         duration_ms: Some(props.duration().as_millis() as u64),
-        bit_depth: props.bit_depth().map(|b| b as u16),
+        bit_depth: props.bit_depth().map(|b| b as u16).or(probed_bit_depth),
         bpm: None,
         compilation: false,
         label: None,
@@ -1043,6 +1276,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     }
@@ -1097,7 +1331,9 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         genre: None,
         genres: vec![],
         format: Some(ext),
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         sample_rate: None,
         channels: Some(2),
         duration_ms: None,
@@ -1113,6 +1349,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         musicbrainz_release_group_id: None,
         isrc: None,
         has_cover: false,
+        cover_art: None,
         credits: vec![],
         comment: None,
     }
@@ -1150,7 +1387,9 @@ fn extract_title_from_filename(path: &Path) -> (Option<u32>, Option<String>) {
 }
 
 fn mp3_duration_sanity_check(path: &Path, lofty_ms: u64) -> u64 {
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(&*crate::library::artwork::extended_path(path))
+        .map(|m| m.len())
+        .unwrap_or(0);
     if file_size == 0 || lofty_ms == 0 {
         return lofty_ms;
     }
@@ -1215,13 +1454,14 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
                 .max_junk_bytes(1024 * 1024)
                 // Don't load embedded cover art in the tag pass: lofty otherwise
                 // reads the whole PICTURE block into memory, and a huge/malformed
-                // embedded image, multiplied by the scan's concurrency, spikes the
-                // scanner past the OOM killer (JeromeQ, RC2: 261 files → 6.1 GB RSS
-                // → tune-server killed, black screen). The cover is extracted
-                // separately, sequentially, by `artwork::get_or_extract` when the
-                // album needs one, so artwork is unaffected. (has_cover becomes
-                // false here — no consumers beyond serialization; the album
-                // cover_path is the real signal.)
+                // embedded image, multiplied by the scan's concurrency (up to 32
+                // reads at once), spikes the scanner past the OOM killer (JeromeQ:
+                // 261 files → 6.1 GB RSS → tune-server killed, black screen). The
+                // cover is extracted separately, sequentially, by
+                // `artwork::get_or_extract` when the album needs one, so artwork
+                // is unaffected. (has_cover becomes false here — it has no
+                // consumers beyond serialization; the album cover_path is the
+                // real signal.)
                 .read_cover_art(false),
         )
         .guess_file_type()?
@@ -1269,6 +1509,33 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         }
     };
 
+    // DSF/DFF: lofty parses the container and returns a tag object, but often
+    // misreads the ID3v2.2 frames commonly used on DSD files — the title comes
+    // back empty and the track ends up showing its filename (LANDES Philippe,
+    // Benjithom). Because a (mostly-empty) tag *is* present, the `None` branch
+    // above never fires. So when lofty's title is empty for a DSD file, prefer
+    // our own ID3v2.2/.3/.4 parser, which reads those frames correctly.
+    {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(ext.as_str(), "dsf" | "dff")
+            && tag.title().map_or(true, |t| t.trim().is_empty())
+        {
+            if let Some(meta) = dsf_dff_fallback(path) {
+                if meta
+                    .title
+                    .as_deref()
+                    .map_or(false, |t| !t.trim().is_empty())
+                {
+                    return Ok(meta);
+                }
+            }
+        }
+    }
+
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
 
     let compilation_str = get(ItemKey::FlagCompilation).unwrap_or_default();
@@ -1295,10 +1562,57 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         .unwrap_or_default();
     let genre = genres.first().cloned().or(raw_genre);
 
+    // lofty can't distinguish ALAC (lossless) from AAC (lossy) in an M4A/MP4
+    // container and reports no bit depth for either, so a tagged ALAC file was
+    // stored as "aac" with no bit depth — the signal path then showed the wrong
+    // format and a fabricated 16-bit (Yves: ALAC 24/96 shown as AAC/FLAC).
+    // Probe the real codec and, for ALAC, the true bit depth from the magic
+    // cookie. Only used for M4A containers with no lofty bit depth.
+    let file_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let m4a_probe = if (file_ext == "m4a" || file_ext == "mp4" || file_ext == "m4b")
+        && props.bit_depth().is_none()
+    {
+        probe_m4a_props(path)
+    } else {
+        None
+    };
+
+    // lofty occasionally mis-decodes an MP3's ID3v2 text frames and returns an
+    // EMPTY title/artist/album even though the frames are valid (Yves Scordia: a
+    // Chris Isaak MP3 with UTF-16 TIT2/TPE1/TALB read as empty, so BluOS got no
+    // metadata — other frames like TPE2/TCON/TYER read fine). When the title is
+    // empty and the file has a leading ID3v2 tag (MP3, WAV+ID3), re-read those
+    // frames with our own ID3v2 parser — the same one used for DSF.
+    let mut title = tag.title().map(|s| s.to_string());
+    let mut artist = tag.artist().map(|s| s.to_string());
+    let mut album = tag.album().map(|s| s.to_string());
+    if title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+        if let Some(raw) = read_dsf_id3v2_raw(path, Some(0)) {
+            if let Some(id3) = parse_id3v2_tag(&raw) {
+                let prefer = |cur: Option<String>, alt: Option<&str>| -> Option<String> {
+                    if cur.as_deref().map_or(true, |x| x.trim().is_empty()) {
+                        alt.filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string())
+                            .or(cur)
+                    } else {
+                        cur
+                    }
+                };
+                title = prefer(title, id3.title());
+                artist = prefer(artist, id3.artist());
+                album = prefer(album, id3.album());
+            }
+        }
+    }
+
     Ok(TrackMetadata {
-        title: tag.title().map(|s| s.to_string()),
-        artist: tag.artist().map(|s| s.to_string()),
-        album: tag.album().map(|s| s.to_string()),
+        title,
+        artist,
+        album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
         track_number: tag.track(),
@@ -1335,13 +1649,21 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
             }
         },
         sample_rate: props.sample_rate(),
-        bit_depth: props.bit_depth().map(|b| b as u16),
+        bit_depth: props
+            .bit_depth()
+            .map(|b| b as u16)
+            .or_else(|| m4a_probe.as_ref().and_then(|(_, bd)| *bd)),
         channels: props.channels().map(|c| c as u16),
-        format: Some(normalize_format(
-            &format!("{:?}", tagged.file_type()).to_lowercase(),
-            props.bit_depth(),
-        )),
-        file_size: std::fs::metadata(path).ok().map(|m| m.len()),
+        format: Some(match m4a_probe.as_ref() {
+            Some((fmt, _)) => fmt.clone(),
+            None => normalize_format(
+                &format!("{:?}", tagged.file_type()).to_lowercase(),
+                props.bit_depth(),
+            ),
+        }),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
         bpm,
         compilation,
         label: get(ItemKey::Label),
@@ -1353,6 +1675,23 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
         musicbrainz_release_group_id: get(ItemKey::MusicBrainzReleaseGroupId),
         isrc: get(ItemKey::Isrc),
         has_cover: !tag.pictures().is_empty(),
+        // Capture the embedded cover from this same lofty pass so the scanner
+        // doesn't have to re-open the file to extract it.
+        cover_art: tag.pictures().first().and_then(|pic| {
+            let data = pic.data();
+            // Don't retain oversized embedded pictures — they accumulate across
+            // the scan batch and OOM the scanner. has_cover stays true, so the
+            // scan re-extracts this file's cover to the cache on demand.
+            if data.len() > MAX_RETAINED_COVER_BYTES {
+                return None;
+            }
+            let mime = match pic.mime_type() {
+                Some(lofty::picture::MimeType::Png) => "image/png",
+                Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                _ => "image/jpeg",
+            };
+            Some((data.to_vec(), mime.to_string()))
+        }),
         credits,
         comment: tag.comment().map(|s| s.to_string()),
     })
@@ -1709,6 +2048,207 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mb_artist_query_includes_alias_clause() {
+        // The alias clause is what lets non-Latin (Hangul/CJK) names resolve:
+        // MusicBrainz indexes their romanized form as `name` and the native
+        // script only as an alias, so a bare `artist:"…"` phrase returns none.
+        let q = mb_artist_query("아이유");
+        assert_eq!(q, "artist:\"아이유\" OR alias:\"아이유\"");
+        assert!(q.contains("alias:"));
+        // Quoted phrase precision preserved for Latin names.
+        assert_eq!(
+            mb_artist_query("The Beatles"),
+            "artist:\"The Beatles\" OR alias:\"The Beatles\""
+        );
+    }
+
+    /// Build a minimal ID3v2.3 tag containing a single APIC frame.
+    fn id3v23_with_apic(mime: &[u8], img: &[u8]) -> Vec<u8> {
+        // Frame body: encoding(1) + mime + NUL + pic_type(1) + desc NUL + data.
+        let mut body = vec![0u8]; // Latin-1
+        body.extend_from_slice(mime);
+        body.push(0);
+        body.push(3); // picture type: front cover
+        body.push(0); // empty description + NUL
+        body.extend_from_slice(img);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]); // v2.3, no flags
+        // syncsafe tag size (frame header 10 + body)
+        let size = (10 + body.len()) as u32;
+        tag.extend_from_slice(&[
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]);
+        tag.extend_from_slice(b"APIC");
+        tag.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+        tag.extend_from_slice(&[0, 0]); // frame flags
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    #[test]
+    fn apic_extracted_from_id3v23() {
+        let img = [0xFFu8, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4]; // JPEG-ish
+        let tag = id3v23_with_apic(b"image/jpeg", &img);
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert!(parsed.has_picture);
+        let (mime, data) = parsed.picture.expect("picture present");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn apic_body_v22_pic_png() {
+        // v2.2 "PIC": encoding(1) + 3-char format + pic_type(1) + desc NUL + data.
+        let img = [0x89u8, 0x50, 0x4E, 0x47, 9, 9];
+        let mut body = vec![0u8]; // Latin-1
+        body.extend_from_slice(b"PNG");
+        body.push(3); // picture type
+        body.push(0); // empty description
+        body.extend_from_slice(&img);
+        let (mime, data) = extract_apic_picture(&body, 2).expect("v2.2 PIC parses");
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn deunsynchronise_removes_stuffed_zeros() {
+        // 0xFF 0x00 -> 0xFF; other bytes untouched; trailing 0xFF kept.
+        assert_eq!(
+            deunsynchronise(&[0x01, 0xFF, 0x00, 0x02, 0xFF, 0x00, 0xFF]),
+            vec![0x01, 0xFF, 0x02, 0xFF, 0xFF]
+        );
+        // No stuffing -> identity.
+        assert_eq!(deunsynchronise(&[0x01, 0x02, 0x03]), vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn parse_id3v23_utf16_title() {
+        // A v2.3 TIT2 frame encoded as UTF-16-with-BOM — the case lofty
+        // mis-decoded as an empty string on Yves Scordia's Chris Isaak MP3, so
+        // Tune now falls back to this parser. Verify it reads the real title.
+        fn utf16_frame(id: &str, text: &str) -> Vec<u8> {
+            let mut body = vec![0x01u8]; // encoding 1 = UTF-16 with BOM
+            body.extend_from_slice(&[0xFF, 0xFE]); // little-endian BOM
+            for u in text.encode_utf16() {
+                body.extend_from_slice(&u.to_le_bytes());
+            }
+            let mut f = id.as_bytes().to_vec();
+            f.extend_from_slice(&(body.len() as u32).to_be_bytes()); // v2.3 plain size
+            f.extend_from_slice(&[0, 0]); // frame flags
+            f.extend_from_slice(&body);
+            f
+        }
+        let mut frames = utf16_frame("TIT2", "First Comes The Night");
+        frames.extend_from_slice(&utf16_frame("TPE1", "Chris Isaak"));
+        let mut tag = vec![b'I', b'D', b'3', 0x03, 0x00, 0x00]; // ID3v2.3, no flags
+        let size = frames.len();
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&frames);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("First Comes The Night"));
+        assert_eq!(parsed.artist(), Some("Chris Isaak"));
+    }
+
+    #[test]
+    fn parse_id3v22_unsynchronised_title() {
+        // An unsynchronised ID3v2.2 tag (header flag 0x80) with a PIC frame
+        // whose data contains 0xFF bytes — which get 0x00-stuffed — placed
+        // BEFORE the TT2 title. Without de-unsynchronisation the PIC frame's
+        // real byte length exceeds its declared size, the cursor desyncs and
+        // the title is never found → filename fallback (Benjithom, #959).
+        fn frame_v22(id: &str, data: &[u8]) -> Vec<u8> {
+            let mut f = id.as_bytes().to_vec();
+            let n = data.len();
+            f.push((n >> 16) as u8);
+            f.push((n >> 8) as u8);
+            f.push(n as u8);
+            f.extend_from_slice(data);
+            f
+        }
+        // Frame sizes are the de-synchronised (true) sizes.
+        let pic = frame_v22("PIC", &[0x00, 0xFF, 0xFF, 0x01]);
+        let tt2 = frame_v22("TT2", &[0x00, b'H', b'i']); // Latin-1 "Hi"
+        let mut body = Vec::new();
+        body.extend_from_slice(&pic);
+        body.extend_from_slice(&tt2);
+
+        // Unsynchronise the assembled body: 0xFF -> 0xFF 0x00.
+        let mut unsynced = Vec::new();
+        for &b in &body {
+            unsynced.push(b);
+            if b == 0xFF {
+                unsynced.push(0x00);
+            }
+        }
+
+        let size = unsynced.len();
+        let mut tag = vec![b'I', b'D', b'3', 0x02, 0x00, 0x80]; // v2.2, unsync flag
+        tag.push(((size >> 21) & 0x7F) as u8);
+        tag.push(((size >> 14) & 0x7F) as u8);
+        tag.push(((size >> 7) & 0x7F) as u8);
+        tag.push((size & 0x7F) as u8);
+        tag.extend_from_slice(&unsynced);
+
+        let parsed = parse_id3v2_tag(&tag).expect("tag parses");
+        assert_eq!(parsed.title(), Some("Hi"));
+        assert!(parsed.has_picture);
+    }
+
+    #[test]
+    fn apic_utf16_description_skipped() {
+        // encoding 1 (UTF-16): description terminated by a 2-byte NUL.
+        let img = [0xFFu8, 0xD8, 42];
+        let mut body = vec![1u8]; // UTF-16
+        body.extend_from_slice(b"image/jpeg");
+        body.push(0);
+        body.push(3); // picture type
+        body.extend_from_slice(&[0x00, 0x00]); // empty UTF-16 description
+        body.extend_from_slice(&img);
+        let (mime, data) = extract_apic_picture(&body, 4).expect("utf-16 desc parses");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(data, img);
+    }
+
+    #[test]
+    fn alac_bit_depth_from_magic_cookie() {
+        // ALACSpecificConfig: bit depth lives at byte 5 of the 24-byte payload.
+        let mut cookie = [0u8; 24];
+        cookie[5] = 24;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&cookie)), Some(24));
+        cookie[5] = 16;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&cookie)), Some(16));
+
+        // With the optional `frma`/`alac` atom prefixes, the payload is offset.
+        let mut prefixed = Vec::new();
+        prefixed.extend_from_slice(&[0, 0, 0, 12]);
+        prefixed.extend_from_slice(b"frma");
+        prefixed.extend_from_slice(&[0, 0, 0, 0]);
+        prefixed.extend_from_slice(&[0, 0, 0, 12]);
+        prefixed.extend_from_slice(b"alac");
+        prefixed.extend_from_slice(&[0, 0, 0, 0]);
+        let mut payload = [0u8; 24];
+        payload[5] = 24;
+        prefixed.extend_from_slice(&payload);
+        assert_eq!(alac_bit_depth_from_cookie(Some(&prefixed)), Some(24));
+
+        // Missing / too-short / out-of-range depths yield None.
+        assert_eq!(alac_bit_depth_from_cookie(None), None);
+        assert_eq!(alac_bit_depth_from_cookie(Some(&[0u8; 10])), None);
+        let mut bad = [0u8; 24];
+        bad[5] = 99;
+        assert_eq!(alac_bit_depth_from_cookie(Some(&bad)), None);
+    }
+
+    #[test]
     fn nonexistent_file_returns_none() {
         assert!(read_metadata(Path::new("/tmp/nonexistent.flac")).is_none());
     }
@@ -2004,6 +2544,30 @@ mod tests {
     }
 
     #[test]
+    fn try_read_metadata_dsf_title_not_filename() {
+        // Regression (LANDES Philippe / Benjithom): a tagged DSF must surface its
+        // real ID3v2 title through the full try_read_metadata path, never fall
+        // back to the filename. Covers the case where lofty parses the container
+        // and returns a (possibly title-less) tag: our DSF ID3v2 parser must
+        // still fill the title.
+        use std::io::Write;
+        let id3_tag = build_id3v2_tag(&[("TIT2", "Aurora"), ("TPE1", "Yes"), ("TALB", "Fragile")]);
+        let buf = build_dsf_bytes(Some(&id3_tag));
+        let tmp = std::env::temp_dir().join("tune_test_dsf_title_e2e.dsf");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let meta = try_read_metadata(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        let meta = meta.expect("try_read_metadata should succeed for a tagged DSF");
+        assert_eq!(meta.title.as_deref(), Some("Aurora"));
+        assert_eq!(meta.artist.as_deref(), Some("Yes"));
+        assert_eq!(meta.album.as_deref(), Some("Fragile"));
+        assert_eq!(meta.format.as_deref(), Some("dsd"));
+    }
+
+    #[test]
     fn normalize_format_mp4_aac_no_bit_depth() {
         // AAC (lossy) in M4A container: lofty reports no bit depth
         assert_eq!(normalize_format("mp4", None), "aac");
@@ -2077,6 +2641,7 @@ mod tests {
             bpm: Some(120.5),
             compilation: true,
             has_cover: true,
+            cover_art: None,
             genres: vec!["Jazz".into(), "Fusion".into()],
             ..Default::default()
         };

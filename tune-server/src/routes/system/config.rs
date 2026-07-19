@@ -594,7 +594,35 @@ pub(super) async fn remove_music_dir(
 
 pub(super) async fn restart() -> impl IntoResponse {
     tokio::spawn(async {
+        // Let the HTTP response flush before we swap the process image.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // UNIX: re-exec in place with execv (same PID) so the server actually
+        // comes back WITHOUT relying on an external supervisor. The previous
+        // `exit(0)` only recovered when something restarted us on exit (systemd
+        // Restart=always) — on a bare/manual install with no supervisor (e.g.
+        // Yacine's Synology DSM scheduled task) it just killed Tune and it never
+        // came back. Same approach as the update flow (#528). The listening
+        // socket is CLOEXEC so exec() releases port 8888 for the new image.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            if let Ok(exe) = std::env::current_exe() {
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                tracing::info!(exe = %exe.display(), "restart_reexec");
+                let err = std::process::Command::new(&exe).args(&args).exec();
+                // exec() only returns on failure → fall back to spawn+exit so a
+                // supervised deployment still recovers.
+                tracing::warn!(error = %err, "restart_reexec_failed — falling back to spawn+exit");
+                let _ = std::process::Command::new(&exe)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn();
+            }
+        }
+
         std::process::exit(0);
     });
     Json(json!({ "status": "restarting" }))

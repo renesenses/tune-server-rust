@@ -49,6 +49,8 @@ pub fn router() -> Router<AppState> {
         .route("/scan/status", get(scan::scan_status))
         .route("/scan/cancel", post(scan::scan_cancel))
         .route("/scan/report", get(scan::scan_report))
+        .route("/artist-split-preview", get(scan::artist_split_preview))
+        .route("/background-tasks", get(enrich::background_tasks_status))
         .route("/restart", post(config::restart))
         .route("/database/status", get(database::database_status))
         .route("/database/optimize", post(database::database_optimize))

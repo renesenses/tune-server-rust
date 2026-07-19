@@ -81,7 +81,7 @@ pub mod sql {
 
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM radio_stations WHERE LOWER(name) LIKE LOWER({}) OR LOWER(genre) LIKE LOWER({}) OR LOWER(country) LIKE LOWER({}) ORDER BY is_favorite DESC, LOWER(name) LIMIT 50",
+            "SELECT {COLS} FROM radio_stations WHERE LOWER(unaccent(name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(country)) LIKE LOWER(unaccent({})) ORDER BY is_favorite DESC, LOWER(name) LIMIT 50",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3)
@@ -480,7 +480,7 @@ mod tests {
         assert!(!sql::favorites().contains("COLLATE"));
         assert!(!sql::search(&s).contains("COLLATE"));
         let pg_search = sql::search(&p);
-        assert!(pg_search.contains("LOWER(name) LIKE LOWER($1)"));
+        assert!(pg_search.contains("LOWER(unaccent(name)) LIKE LOWER(unaccent($1))"));
         assert!(pg_search.ends_with("LIMIT 50"));
     }
 

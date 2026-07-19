@@ -33,16 +33,21 @@ pub mod sql {
         )
     }
 
+    // The play-history LIST excludes radio: since v0.8.258 the orchestrator no
+    // longer records radio plays (a live stream's title is a frozen snapshot
+    // that never matches what's actually on air), but pre-existing radio rows
+    // still surfaced here (Bilou: "la radio est toujours ajoutée à l'historique").
+    // Stats already filter `source != 'radio'`; align the list with them.
     pub fn recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {}",
+            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {}",
             d.placeholder(1)
         )
     }
 
     pub fn recent_paginated<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {RECORD_COLS} FROM listen_history ORDER BY listened_at DESC LIMIT {} OFFSET {}",
+            "SELECT {RECORD_COLS} FROM listen_history WHERE source != 'radio' ORDER BY listened_at DESC LIMIT {} OFFSET {}",
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -50,6 +55,12 @@ pub mod sql {
 
     pub fn count_all() -> &'static str {
         "SELECT COUNT(*) FROM listen_history"
+    }
+
+    /// Total excluding radio — the pagination total for the history list, which
+    /// hides radio rows.
+    pub fn count_non_radio() -> &'static str {
+        "SELECT COUNT(*) FROM listen_history WHERE source != 'radio'"
     }
 
     pub fn top_tracks<D: SqlDialect>(d: &D) -> String {
@@ -71,6 +82,25 @@ pub mod sql {
              WHERE h.source != 'radio' \
              GROUP BY h.title, h.artist_name \
              ORDER BY plays DESC LIMIT {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// Non-radio play count for one track, matched by title + artist — the same
+    /// grouping `top_tracks` uses (many history rows carry a null track_id).
+    pub fn track_plays<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title = {} AND artist_name = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn track_plays_null_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM listen_history \
+             WHERE source != 'radio' AND title = {} AND artist_name IS NULL",
             d.placeholder(1)
         )
     }
@@ -186,7 +216,7 @@ impl HistoryRepo {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ListenRecord>, i64), String> {
-        let total = match self.db.query_one(sql::count_all(), &[])? {
+        let total = match self.db.query_one(sql::count_non_radio(), &[])? {
             None => 0,
             Some(cols) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
         };
@@ -214,6 +244,29 @@ impl HistoryRepo {
                 })
             })
             .collect())
+    }
+
+    /// How many times a track (matched by `title` + `artist_name`) was played,
+    /// excluding radio. Mirrors the dashboard "top tracks" grouping.
+    pub fn track_plays(&self, title: &str, artist_name: Option<&str>) -> Result<i64, String> {
+        let count = |sql: &str, params: &[&dyn ToSqlValue]| -> Result<i64, String> {
+            Ok(self
+                .db
+                .query_one(sql, params)?
+                .and_then(|c| c.first().and_then(|v| v.as_i64()))
+                .unwrap_or(0))
+        };
+        match artist_name {
+            Some(a) => {
+                let sql = self.dialect_sql(sql::track_plays, sql::track_plays);
+                count(&sql, &[&title, &a])
+            }
+            None => {
+                let sql =
+                    self.dialect_sql(sql::track_plays_null_artist, sql::track_plays_null_artist);
+                count(&sql, &[&title])
+            }
+        }
     }
 
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {

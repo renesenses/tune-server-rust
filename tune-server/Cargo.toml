@@ -15,6 +15,7 @@ postgres = ["tune-core/postgres"]
 [dependencies]
 tune-core = { path = "../tune-core", default-features = false }
 tokio = { workspace = true }
+rayon = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

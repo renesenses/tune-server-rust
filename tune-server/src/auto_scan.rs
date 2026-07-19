@@ -149,6 +149,7 @@ pub fn build_track_from_metadata_opts(
         album_repo
             .update_dates(
                 aid,
+                meta.year.map(|y| y as i32),
                 meta.original_year.map(|y| y as i32),
                 meta.release_date.as_deref(),
                 meta.original_date.as_deref(),
@@ -246,27 +247,38 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             .get_existing_audio_hash_album_pairs()
             .unwrap_or_default();
 
-        let files_to_scan: Vec<std::path::PathBuf> = files
-            .into_iter()
-            .filter(|path| {
-                let path_str: String = path.to_string_lossy().nfc().collect();
-                if let Some(&(_, existing_mtime, existing_size)) =
-                    existing_tracks.get(path_str.as_str())
-                    && let Ok(file_meta) = path.metadata()
-                {
-                    let mtime = file_meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let unchanged = existing_mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                        && (existing_size == Some(file_meta.len() as i64));
-                    return !unchanged;
-                }
-                true
-            })
-            .collect();
+        // Keep only files that are new or whose mtime/size changed since the
+        // last scan. This stat()s every discovered file; on a network mount
+        // (SMB/NFS) each stat is a round-trip, so 100k files took minutes at
+        // startup (Yves: "très long à démarrer"). Run the checks on a dedicated
+        // thread pool oversubscribed well past the core count so the network
+        // latency of many stats overlaps instead of running one at a time.
+        use rayon::prelude::*;
+        let is_changed = |path: &std::path::Path| -> bool {
+            let path_str: String = path.to_string_lossy().nfc().collect();
+            if let Some(&(_, existing_mtime, existing_size)) =
+                existing_tracks.get(path_str.as_str())
+                && let Ok(file_meta) = path.metadata()
+            {
+                let mtime = file_meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let unchanged = existing_mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+                    && (existing_size == Some(file_meta.len() as i64));
+                return !unchanged;
+            }
+            true
+        };
+        let stat_pool = rayon::ThreadPoolBuilder::new().num_threads(32).build().ok();
+        let files_to_scan: Vec<std::path::PathBuf> = match &stat_pool {
+            Some(pool) => {
+                pool.install(|| files.into_par_iter().filter(|p| is_changed(p)).collect())
+            }
+            None => files.into_iter().filter(|p| is_changed(p)).collect(),
+        };
         let pre_skipped = total_discovered - files_to_scan.len();
 
         info!(

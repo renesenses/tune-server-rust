@@ -104,6 +104,14 @@ pub mod sql {
         "SELECT id, name, musicbrainz_id, image_path FROM artists WHERE image_path IS NOT NULL AND image_path != '' AND musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
     }
 
+    pub fn list_with_mbid() -> &'static str {
+        "SELECT id, name, musicbrainz_id FROM artists WHERE musicbrainz_id IS NOT NULL AND musicbrainz_id != '' ORDER BY id"
+    }
+
+    pub fn list_all_id_name_mbid() -> &'static str {
+        "SELECT id, name, COALESCE(musicbrainz_id, '') FROM artists ORDER BY id"
+    }
+
     pub fn list_without_mbid() -> &'static str {
         "SELECT id, name FROM artists WHERE (musicbrainz_id IS NULL OR musicbrainz_id = '') ORDER BY id"
     }
@@ -136,10 +144,17 @@ pub mod sql {
         )
     }
 
+    pub fn clear_image<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE artists SET image_path = NULL, image_source = NULL WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
     /// Engine-agnostic full-text search.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(a.name) LIKE LOWER({}) LIMIT {}",
+            "SELECT {COLS} FROM artists a WHERE {} OR LOWER(unaccent(a.name)) LIKE LOWER(unaccent({})) LIMIT {}",
             d.fts_where("artists", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3)
@@ -391,6 +406,41 @@ impl ArtistRepo {
             .collect())
     }
 
+    /// All artists that have a MusicBrainz ID, regardless of whether an image
+    /// is already set. Used by the "force re-fetch" path to re-pull artwork for
+    /// everyone (e.g. when the DB has stale/broken image_path entries that never
+    /// render). Each entry is (artist_id, name, musicbrainz_id).
+    pub fn list_with_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_with_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// All artists as (id, name, mbid) — mbid is `""` when unknown. Used by the
+    /// force re-fetch so artists without an MBID are also re-tried (mozaiklabs
+    /// by-name + other by-name sources).
+    pub fn list_all_id_name_mbid(&self) -> Result<Vec<(i64, String, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_all_id_name_mbid(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
     /// Artists that have an image_path AND an MBID. Used to detect the case
     /// where the DB column is set but the cache file is missing (a scan set the
     /// column while the cache write failed, or the cache was later cleared), so
@@ -527,6 +577,14 @@ impl ArtistRepo {
         Ok(())
     }
 
+    /// Clear an artist's stored image (path + source) so the next enrichment
+    /// re-fetches it. Used when a user reports the current image as wrong.
+    pub fn clear_image(&self, id: i64) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::clear_image, sql::clear_image);
+        self.db.execute(&sql, &[&id as &dyn ToSqlValue])?;
+        Ok(())
+    }
+
     /// Update only the image_path and image_source for an artist.
     pub fn update_image(&self, id: i64, hash: &str, source: &str) -> Result<(), TuneError> {
         let sql = match self.db.engine() {
@@ -627,6 +685,22 @@ mod tests {
         let results = repo.search("floyd", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "Pink Floyd");
+    }
+
+    #[test]
+    fn search_artist_accent_insensitive() {
+        let db = test_db();
+        let repo = ArtistRepo::new(db);
+        repo.create(&Artist::new("Carlão".into())).unwrap();
+        repo.create(&Artist::new("Beyoncé".into())).unwrap();
+
+        // Query without accents finds the accented name…
+        assert_eq!(repo.search("carlao", 10).unwrap().len(), 1);
+        assert_eq!(repo.search("beyonce", 10).unwrap().len(), 1);
+        // …and querying WITH accents still works.
+        assert_eq!(repo.search("carlão", 10).unwrap().len(), 1);
+        // Uppercase accented query folds too (LOWER after unaccent).
+        assert_eq!(repo.search("CARLAO", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -793,8 +867,8 @@ mod tests {
         );
         let p_sql = sql::search(&PostgresDialect);
         assert!(p_sql.contains("a.search_tsv @@ to_tsquery('simple', unaccent($1))"));
-        assert!(s_sql.contains("LOWER(a.name) LIKE LOWER(?)"));
-        assert!(p_sql.contains("LOWER(a.name) LIKE LOWER($2)"));
+        assert!(s_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent(?))"));
+        assert!(p_sql.contains("LOWER(unaccent(a.name)) LIKE LOWER(unaccent($2))"));
     }
 
     #[test]

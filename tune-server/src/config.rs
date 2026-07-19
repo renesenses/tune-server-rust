@@ -349,12 +349,20 @@ impl TuneConfig {
 ///
 /// Resolution order:
 ///   1. `TUNE_WEB_DIR` — honored verbatim (absolute or relative override).
-///   2. `<cwd>/web` when it exists — preserves Docker and manual-run layouts
-///      where the web/ lives next to the working directory, not the binary.
-///   3. `<exe_dir>/web` — where the auto-updater always writes the fresh copy.
+///   2. When both `<cwd>/web` and `<exe_dir>/web` exist, the **newer** one (by
+///      `index.html` mtime). After an in-app auto-update + restart, the launch
+///      working directory's `./web` can be a *stale* copy from an earlier
+///      version, while the updater always refreshes `<exe_dir>/web`. Preferring
+///      `<cwd>/web` unconditionally then served an old SPA, so the browser kept
+///      showing pre-update behaviour despite a new binary (Elie: fixes appear to
+///      "recur" after auto-update; same class as Fabien's stale SPA). Serving
+///      the newest fixes that; Docker/manual layouts — where `<cwd>/web` is the
+///      only or newest copy — are unaffected.
+///   3. Whichever of the two exists.
 ///   4. `<cwd>/web` as a last resort (may not exist yet; ServeDir 404s cleanly).
 pub fn resolve_web_dir() -> std::path::PathBuf {
     use std::path::PathBuf;
+    use std::time::SystemTime;
 
     if let Ok(custom) = std::env::var("TUNE_WEB_DIR") {
         return PathBuf::from(custom);
@@ -363,21 +371,35 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
     let cwd_web = std::env::current_dir()
         .map(|d| d.join("web"))
         .unwrap_or_else(|_| PathBuf::from("web"));
-    if cwd_web.exists() {
-        return cwd_web;
+    let exe_web = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("web")))
+        .filter(|p| p.exists());
+
+    // A web build's freshness, from its index.html mtime (rewritten with fresh
+    // asset hashes on every build/copy); missing → epoch so a present dir wins.
+    fn freshness(dir: &std::path::Path) -> SystemTime {
+        std::fs::metadata(dir.join("index.html"))
+            .or_else(|_| std::fs::metadata(dir))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let exe_web = dir.join("web");
-        if exe_web.exists() {
-            info!(path = %exe_web.display(), "web_dir_resolved_to_binary_dir");
-            return exe_web;
+    match exe_web {
+        Some(exe_web) if cwd_web.exists() => {
+            if freshness(&exe_web) > freshness(&cwd_web) {
+                info!(path = %exe_web.display(), "web_dir_resolved_newest_exe");
+                exe_web
+            } else {
+                cwd_web
+            }
         }
+        Some(exe_web) => {
+            info!(path = %exe_web.display(), "web_dir_resolved_to_binary_dir");
+            exe_web
+        }
+        None => cwd_web,
     }
-
-    cwd_web
 }
 
 /// Path of the server's own log file, written on every platform (not just

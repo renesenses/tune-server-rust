@@ -184,7 +184,7 @@ async fn pg_playlists_round_trip() {
     let tid = track_repo.create(&t).unwrap();
 
     let repo = PlaylistRepo::with_backend(db);
-    let plid = repo.create("My PL", None).unwrap();
+    let plid = repo.create("My PL", None, 1).unwrap();
     // add_tracks uses write_tx — exercises the tx bridge.
     let inserted = repo.add_tracks(plid, &[tid], None).unwrap();
     assert_eq!(inserted, vec![tid]);

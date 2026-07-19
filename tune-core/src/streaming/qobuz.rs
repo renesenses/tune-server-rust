@@ -601,17 +601,29 @@ impl StreamingService for QobuzService {
         match self.fetch_track_url(track_id, format_id).await {
             Ok(stream_url) => Ok(stream_url),
             Err(e) => {
-                if format_id != "6" {
+                // Fall down the quality ladder to the next-lower format the track
+                // is actually offered in: 24/192 (27) → 24/96 (7) → CD (6).
+                // Falling straight from 27 to 6 dropped Sublime (Hi-Res) users to
+                // lossy-CD on the many tracks Qobuz only offers in 24/96, instead
+                // of the hi-res they're entitled to (Yves). CD (6) and MP3 (5)
+                // have no lossless format below them.
+                let ladder: &[&str] = match format_id {
+                    "27" => &["7", "6"],
+                    "7" => &["6"],
+                    _ => &[],
+                };
+                for &fid in ladder {
                     info!(
                         track_id,
-                        format_id,
-                        error = %e,
-                        "qobuz_format_id_failed_retrying_cd_quality"
+                        from = format_id,
+                        to = fid,
+                        "qobuz_format_fallback"
                     );
-                    Ok(self.fetch_track_url(track_id, "6").await?)
-                } else {
-                    Err(e.into())
+                    if let Ok(url) = self.fetch_track_url(track_id, fid).await {
+                        return Ok(url);
+                    }
                 }
+                Err(e.into())
             }
         }
     }

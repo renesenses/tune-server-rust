@@ -22,7 +22,21 @@ use crate::state::AppState;
 /// and should be 502 Bad Gateway, not 500 Internal Server Error.
 /// Device-offline errors are 503 Service Unavailable.
 /// Everything else is 500.
-fn play_error_response(e: String) -> (StatusCode, String) {
+fn play_error_response(e: String) -> axum::response::Response {
+    // Free-tier zone cap sentinel from orchestrator.play() → clean 402 the
+    // web/app can render as an upgrade prompt.
+    if let Some(msg) = e.strip_prefix("premium_required:") {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(json!({
+                "error": "premium_required",
+                "feature": "Unlimited Zones",
+                "message": msg,
+                "upgrade_url": "https://mozaiklabs.fr/pricing",
+            })),
+        )
+            .into_response();
+    }
     let code = if e.contains("YouTube")
         || e.contains("youtube")
         || e.contains("yt-dlp")
@@ -49,7 +63,7 @@ fn play_error_response(e: String) -> (StatusCode, String) {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (code, e)
+    (code, e).into_response()
 }
 
 /// Persist the queue state for a zone to disk (non-blocking).
@@ -367,6 +381,38 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         }
     }
     Json(v)
+}
+
+/// Replace a zone's queue, retrying briefly on the transient
+/// "cannot start a transaction within a transaction" error.
+///
+/// A library scan holds a per-batch write transaction on the shared SQLite
+/// connection (BEGIN IMMEDIATE … COMMIT) while releasing the connection mutex
+/// between statements, so a concurrent `set_queue` sees an open transaction and
+/// fails. Each scan batch commits within ~1–2 s, so a few short async waits let
+/// playback replace the queue instead of failing silently and leaving the user
+/// stuck on the current track (Yves: impossible de quitter le dernier MP3
+/// pendant qu'un scan tourne). Non-transient errors return immediately.
+async fn set_queue_retrying(
+    queue_repo: &PlayQueueRepo,
+    zone_id: i64,
+    track_ids: &[i64],
+) -> Result<(), String> {
+    const MAX_ATTEMPTS: usize = 12;
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        match queue_repo.set_queue(zone_id, track_ids) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("within a transaction") => {
+                last_err = e;
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err)
 }
 
 async fn play(
@@ -818,7 +864,7 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    if let Err(e) = queue_repo.set_queue(zone_id, &track_ids) {
+    if let Err(e) = set_queue_retrying(&queue_repo, zone_id, &track_ids).await {
         warn!(zone_id, error = %e, "set_queue_failed");
     }
 
@@ -2159,7 +2205,12 @@ pub async fn shuffle_all(
             .map(|v| v.into_iter().filter_map(|t| t.id).collect())
             .unwrap_or_default()
     } else {
-        track_repo.random_ids(100).unwrap_or_default()
+        // Whole-library shuffle: queue every track, not just 100 (tester wanted
+        // to shuffle the entire library). Album/artist shuffles above are
+        // already uncapped, so this makes the no-filter case consistent. IDs are
+        // i64s so even a large library is cheap to hold; the Fisher-Yates below
+        // reshuffles them anyway.
+        track_repo.random_ids(i64::MAX).unwrap_or_default()
     };
     if all_ids.is_empty() {
         return (StatusCode::BAD_REQUEST, "no tracks to shuffle").into_response();

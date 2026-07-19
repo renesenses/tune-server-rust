@@ -529,7 +529,16 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
     #[cfg(feature = "local-audio")]
     {
         let backend = &state.config.local_audio_backend;
-        let devices = tune_core::outputs::local::list_audio_devices_with_backend(backend);
+        // The web client's sidebar fetches this on every page load. Re-enumerating
+        // WASAPI devices probes each device's formats, which can crash the active
+        // render stream and stop playback on Windows (DEvir: refresh UI during
+        // local playback → audio dies). While a local output is playing, serve the
+        // last cached device list instead of re-scanning the hardware.
+        let devices = if crate::background::any_local_output_playing(&state).await {
+            tune_core::outputs::local::cached_audio_devices()
+        } else {
+            tune_core::outputs::local::list_audio_devices_with_backend(backend)
+        };
         Json(json!({
             "devices": devices,
             "backend": tune_core::outputs::local::active_backend_name(backend),

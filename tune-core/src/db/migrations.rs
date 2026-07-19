@@ -1148,6 +1148,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     add_column_if_missing(db, "zones", "autoplay_enabled", "INTEGER DEFAULT 0");
     add_column_if_missing(db, "zones", "dsd_mode", "TEXT DEFAULT 'auto'");
     add_column_if_missing(db, "zones", "dlna_native_flac", "INTEGER DEFAULT 0");
+    // Opt-in: serve ALAC directly to a renderer that decodes it (bit-perfect,
+    // no FLAC transcode). Off by default — ALAC and AAC share the audio/mp4
+    // MIME, so it can't be auto-detected safely.
+    add_column_if_missing(db, "zones", "alac_passthrough", "INTEGER DEFAULT 0");
+    // Opt-in: transcode lossless to WAV/LPCM (not FLAC) for this DLNA renderer.
+    // Skips the slow native FLAC encoder for hi-res AND avoids renderers whose
+    // ALAC decoder pops at start (Yves, LHC-56). Overrides alac_passthrough.
+    add_column_if_missing(db, "zones", "dlna_lpcm", "INTEGER DEFAULT 0");
     // Physical host (IP) of the renderer, used to dedup DLNA zones across
     // rediscovery: a renderer that comes back with a NEW UPnP UUID (Denon Ceol
     // N12 after a restart) must reconnect to its existing zone instead of

@@ -137,12 +137,20 @@ pub mod sql {
     /// Update album date fields using COALESCE so we only fill in
     /// values that are not already set.
     pub fn update_dates<D: SqlDialect>(d: &D) -> String {
+        // `year` is COALESCE'd like the other date fields: it's set at album
+        // creation from the first track that creates the row, but if THAT track's
+        // year was missing (e.g. its tag read errored during the scan) the album
+        // was left with year = NULL forever — no later track back-filled it, so
+        // "sort/filter by year" and the "missing year" list were wrong even though
+        // the files had the year (Bilou, #1106). COALESCE fills NULL from any
+        // track that carries a year, and never overwrites an existing value.
         format!(
-            "UPDATE albums SET original_year = COALESCE(original_year, {}), release_date = COALESCE(release_date, {}), original_date = COALESCE(original_date, {}) WHERE id = {}",
+            "UPDATE albums SET year = COALESCE(year, {}), original_year = COALESCE(original_year, {}), release_date = COALESCE(release_date, {}), original_date = COALESCE(original_date, {}) WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
-            d.placeholder(4)
+            d.placeholder(4),
+            d.placeholder(5)
         )
     }
 
@@ -247,7 +255,7 @@ pub mod sql {
 
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE ({}) OR LOWER(a.title) LIKE LOWER({}) OR LOWER(ar.name) LIKE LOWER({}) OR LOWER(a.genre) LIKE LOWER({}) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(t.title) LIKE LOWER({})) LIMIT {}",
+            "{} WHERE ({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({}))) LIMIT {}",
             select_album(),
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
@@ -524,17 +532,27 @@ impl AlbumRepo {
     pub fn update_dates(
         &self,
         album_id: i64,
+        year: Option<i32>,
         original_year: Option<i32>,
         release_date: Option<&str>,
         original_date: Option<&str>,
     ) -> Result<(), TuneError> {
         // Skip if all values are None — nothing to update.
-        if original_year.is_none() && release_date.is_none() && original_date.is_none() {
+        if year.is_none()
+            && original_year.is_none()
+            && release_date.is_none()
+            && original_date.is_none()
+        {
             return Ok(());
         }
         let sql = self.dialect_sql(sql::update_dates, sql::update_dates);
-        let params: [&dyn ToSqlValue; 4] =
-            [&original_year, &release_date, &original_date, &album_id];
+        let params: [&dyn ToSqlValue; 5] = [
+            &year,
+            &original_year,
+            &release_date,
+            &original_date,
+            &album_id,
+        ];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -791,7 +809,12 @@ impl AlbumRepo {
             "release_date" => format!(
                 "COALESCE(a.release_date, a.original_date, CAST(a.year AS TEXT)) {dir} NULLS LAST, LOWER(a.title) ASC"
             ),
-            "year" => format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC"),
+            // The web client's sort dropdown labels this option "original_year"
+            // (LibraryView AlbumSortKey); accept it as an alias for "year" so an
+            // unknown key doesn't silently fall through to the `a.id` default.
+            "year" | "original_year" => {
+                format!("a.year {dir} NULLS LAST, LOWER(a.title) ASC")
+            }
             "artist" => {
                 format!("LOWER(ar.name) {dir}, a.year ASC, LOWER(a.title) ASC")
             }
@@ -805,7 +828,13 @@ impl AlbumRepo {
             // never purged by delete_all), falling back to file mtime for any
             // track not yet recorded. Streaming albums have no local file →
             // NULLS LAST, id tiebreaker.
-            "added_at" => format!(
+            // "added_date" is the web client's key (LibraryView AlbumSortKey) for
+            // this same option; alias it so "sort by date added" actually sorts by
+            // date rather than silently falling through to the `a.id` default —
+            // which only *looks* correct for the most-recently-added albums (their
+            // ids happen to be the highest), hence the "only the first few albums
+            // are sorted" report (Bilou, #1102).
+            "added_at" | "added_date" => format!(
                 // file_first_seen.first_seen_at is DOUBLE, but tracks.file_mtime
                 // is TEXT in the Postgres schema — a bare COALESCE(double, text)
                 // is a hard error on PG ("types double precision and text cannot
@@ -1557,6 +1586,43 @@ mod tests {
     }
 
     #[test]
+    fn update_dates_backfills_null_year_without_overwriting() {
+        // #1106: album.year is set at creation from the first track's year; if
+        // that read errored (year missing) the album stayed NULL forever. A later
+        // scan of a track that DOES carry the year must back-fill it — but must
+        // never overwrite an album that already has a year.
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        // Album created without a year (as if the creating track's year was lost).
+        let missing = repo.create(&Album::new("Missing".into())).unwrap();
+        assert_eq!(repo.get(missing).unwrap().unwrap().year, None);
+        repo.update_dates(missing, Some(1985), None, None, None)
+            .unwrap();
+        assert_eq!(
+            repo.get(missing).unwrap().unwrap().year,
+            Some(1985),
+            "NULL year must be back-filled from a track that carries it"
+        );
+        // A second track reporting a different year must NOT overwrite it.
+        repo.update_dates(missing, Some(1990), None, None, None)
+            .unwrap();
+        assert_eq!(
+            repo.get(missing).unwrap().unwrap().year,
+            Some(1985),
+            "an existing year must be preserved (COALESCE, not overwrite)"
+        );
+
+        // An album that already has a year is left untouched.
+        let mut has = Album::new("Has".into());
+        has.year = Some(2001);
+        let has = repo.create(&has).unwrap();
+        repo.update_dates(has, Some(1999), None, None, None)
+            .unwrap();
+        assert_eq!(repo.get(has).unwrap().unwrap().year, Some(2001));
+    }
+
+    #[test]
     fn list_sorted_by_year() {
         let db = test_db();
         let artist_repo = ArtistRepo::new(db.clone());
@@ -1643,6 +1709,74 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "added_at", "desc").unwrap();
         assert_eq!(desc[0].title, "Third");
         assert_eq!(desc[2].title, "First");
+    }
+
+    #[test]
+    fn client_sort_key_aliases_match_canonical() {
+        // The web client's sort dropdown sends "added_date" and "original_year"
+        // (LibraryView AlbumSortKey), but the SQL layer's canonical keys are
+        // "added_at" and "year". Before aliasing, the unknown keys fell through to
+        // the `a.id` default — so "sort by date added" only *looked* right for the
+        // most-recently-added albums (their ids are the highest), the "only the
+        // first few albums are sorted" report (Bilou, #1102). The aliases must
+        // route to the real logic, not the id fallback.
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let trepo = TrackRepo::new(db.clone());
+
+        // ids A<B<C, but first_seen makes A newest and C oldest — the OPPOSITE of
+        // id order, so the id fallback (DESC → C,B,A) is distinguishable from the
+        // real "date added" order (DESC → A,B,C).
+        let a = arepo.create(&Album::new("A".into())).unwrap();
+        let b = arepo.create(&Album::new("B".into())).unwrap();
+        let c = arepo.create(&Album::new("C".into())).unwrap();
+        for (album_id, path, mtime) in [
+            (a, "/a.flac", 1.0),
+            (b, "/b.flac", 2.0),
+            (c, "/c.flac", 3.0),
+        ] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album_id);
+            t.file_path = Some(path.into());
+            t.file_mtime = Some(mtime);
+            trepo.create(&t).unwrap();
+        }
+        for (path, seen) in [
+            ("/a.flac", 3000.0f64),
+            ("/b.flac", 2000.0),
+            ("/c.flac", 1000.0),
+        ] {
+            db.execute_batch(&format!(
+                "UPDATE file_first_seen SET first_seen_at = {seen} WHERE file_path = '{path}';"
+            ))
+            .unwrap();
+        }
+
+        let titles = |v: Vec<Album>| v.into_iter().map(|a| a.title).collect::<Vec<_>>();
+        let canon = titles(arepo.list_sorted(100, 0, "added_at", "desc").unwrap());
+        let alias = titles(arepo.list_sorted(100, 0, "added_date", "desc").unwrap());
+        assert_eq!(alias, canon, "added_date must alias added_at");
+        assert_eq!(
+            alias,
+            vec!["A", "B", "C"],
+            "must follow first_seen, not the id fallback"
+        );
+
+        // "original_year" must behave like "year" (New 2020 before Old 1970,
+        // NULL-year albums last), not fall through to id order.
+        let mut old = Album::new("Old".into());
+        old.year = Some(1970);
+        arepo.create(&old).unwrap();
+        let mut new = Album::new("New".into());
+        new.year = Some(2020);
+        arepo.create(&new).unwrap();
+        let by_year = titles(arepo.list_sorted(100, 0, "year", "desc").unwrap());
+        let by_orig = titles(arepo.list_sorted(100, 0, "original_year", "desc").unwrap());
+        assert_eq!(by_orig, by_year, "original_year must alias year");
+        assert_eq!(by_orig[0], "New");
+        assert_eq!(by_orig[1], "Old");
     }
 
     #[test]

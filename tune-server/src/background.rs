@@ -286,21 +286,9 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     continue;
                 }
 
-                // Premium gate: check zone limit before auto-creating new zones.
-                // get_or_create returns (id, false) for existing zones, so we only
-                // need to check when the zone doesn't already exist.
-                if zone_repo.get_by_device_id(&d.id).ok().flatten().is_none() {
-                    let zone_count = zone_repo.count_online().unwrap_or(0);
-                    if !state.license.check_zone_limit(zone_count).await {
-                        info!(
-                            name = %d.name,
-                            zone_count,
-                            "ssdp_startup_zone_creation_blocked_free_tier_limit"
-                        );
-                        continue;
-                    }
-                }
-
+                // Auto-created zones start dormant and don't count against the
+                // free tier; the cap is enforced at first play in
+                // orchestrator.play(). So discovery may always register a device.
                 match zone_repo.get_or_create(&d.name, Some("dlna"), &d.id) {
                     Ok((zid, true)) => {
                         info!(name = %d.name, zone_id = zid, device_id = %d.id, "ssdp_startup_zone_created");
@@ -975,6 +963,28 @@ fn spawn_local_audio_rescan(state: &AppState) {
 #[cfg(not(feature = "local-audio"))]
 fn spawn_local_audio_rescan(_state: &AppState) {}
 
+/// Whether any registered local (`local:`) output is currently playing. Used to
+/// suppress device enumeration (which probes formats and can crash the active
+/// WASAPI stream on Windows — DEvir) while local playback is in progress.
+#[cfg(feature = "local-audio")]
+pub async fn any_local_output_playing(state: &AppState) -> bool {
+    let outputs = state.outputs.lock().await;
+    for id in outputs.list() {
+        if !id.starts_with("local:") {
+            continue;
+        }
+        if let Some(output) = outputs.get(&id) {
+            let output = output.lock().await;
+            if let Ok(status) = output.get_status().await {
+                if status.state == tune_core::outputs::traits::TransportState::Playing {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Re-enumerate local audio devices and register any new ones.
 /// Removes devices that have disappeared (unless actively playing).
 #[cfg(feature = "local-audio")]
@@ -1003,6 +1013,20 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
         configured_backend.clone()
     };
     let is_asio_configured = configured_backend.eq_ignore_ascii_case("asio");
+
+    // Do NOT re-enumerate audio devices while a local output is actively
+    // playing. On Windows the WASAPI enumeration probes each device's supported
+    // formats, which can invalidate the active render stream and kill playback:
+    // refreshing the UI during local playback triggered a hotplug rescan whose
+    // enumeration crashed the active fallback stream (audio_stream_error: "The
+    // requested device is no longer available") → 10s decoder timeout → total
+    // stop (DEvir, Win11 WASAPI fallback). Hotplug detection resumes on the next
+    // cycle once playback stops. This also protects any active ASIO output.
+    if any_local_output_playing(state).await {
+        debug!("local_audio_rescan_skipped_active_playback");
+        return;
+    }
+
     let backend_clone = scan_backend.clone();
     let devices = match tokio::task::spawn_blocking(move || {
         tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)

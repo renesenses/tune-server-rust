@@ -26,6 +26,10 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConvertSource {
     pub track_id: Option<i64>,
+    /// Whole album: expanded to all of its tracks' files. The web Converter
+    /// selects albums, so this is the common case (Reivax66/Bilou, #1094/#1095 —
+    /// the web sent album ids the server didn't accept → 422).
+    pub album_id: Option<i64>,
     pub path: Option<String>,
 }
 
@@ -146,6 +150,19 @@ async fn start_job(
                 }
                 Err(e) => {
                     warn!(track_id, error = %e, "converter_skip_track_lookup_error");
+                }
+            }
+        } else if let Some(album_id) = src.album_id {
+            match repo.list_by_album(album_id) {
+                Ok(tracks) => {
+                    for t in tracks {
+                        if let Some(ref fp) = t.file_path {
+                            file_paths.push(PathBuf::from(fp));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(album_id, error = %e, "converter_skip_album_lookup_error");
                 }
             }
         } else if let Some(ref path) = src.path {

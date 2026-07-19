@@ -305,7 +305,13 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
         )
         .ok();
 
+    let task_guard = state.background_tasks.begin(
+        "artwork",
+        "Récupération des pochettes d'albums…",
+        "enrichment",
+    );
     tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
         tune_core::library::artwork::batch_enrich_artwork(db, cache_dir).await;
     });
 
@@ -350,7 +356,21 @@ pub(super) async fn batch_enrich_artist_artwork(
     // Count artists missing images (Phase 2 candidates)
     let missing = artist_repo.list_without_image().unwrap_or_default();
 
-    if missing.is_empty() && without_mbid == 0 {
+    // Also count artists whose DB image_path is set but the cache file is gone
+    // (moved/wiped artwork_cache): the normal pass would otherwise skip because
+    // the DB "claims" every artist has an image, so the enrichment never runs
+    // and the folder stays empty (Fabien: full scan + premium, no artist
+    // images). Phase 1 already re-downloads these — we just must not skip.
+    let broken_cache = artist_repo
+        .list_with_image_and_mbid()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, _, image_path)| {
+            !tune_core::library::artwork::cached_artwork_exists(&cache_dir, image_path)
+        })
+        .count();
+
+    if missing.is_empty() && broken_cache == 0 && without_mbid == 0 {
         return Json(json!({
             "status": "skipped",
             "message": "all artists already have MBID and images",
@@ -369,13 +389,52 @@ pub(super) async fn batch_enrich_artist_artwork(
         )
         .ok();
 
+    let task_guard = state.background_tasks.begin(
+        "artist_artwork",
+        "Récupération des images d'artistes…",
+        "enrichment",
+    );
+    let bg_tasks = state.background_tasks.clone();
+    let poll_db = state.backend.clone();
     tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
+
+        // Mirror the enrichment's granular progress (written to the
+        // `artist_artwork_enrich_result` setting by the two phases) into the
+        // background-tasks registry, so the global indicator shows e.g.
+        // "MusicBrainz 340/1183" instead of a bare "in progress" (grafts the
+        // per-artist detail onto the presence-only task).
+        let progress_poller = tokio::spawn(async move {
+            let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(poll_db);
+            for _ in 0..1200u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let Some(raw) = settings.get("artist_artwork_enrich_result").ok().flatten() else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if v.get("status").and_then(|s| s.as_str()) != Some("running") {
+                    break;
+                }
+                let processed = v.get("processed").and_then(|n| n.as_u64()).unwrap_or(0);
+                let total = v.get("total").and_then(|n| n.as_u64()).unwrap_or(0);
+                let detail = match v.get("phase").and_then(|s| s.as_str()) {
+                    Some("images") => "Images",
+                    _ => "MusicBrainz",
+                };
+                bg_tasks.update_progress("artist_artwork", processed, total, detail);
+            }
+        });
+
         // Phase 1: Match artists without MBID by searching MusicBrainz
         let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
         tracing::info!(matched, "batch_artist_mbid_phase_complete");
 
         // Phase 2: Fetch images for all artists with MBID but no image
         tune_core::library::artwork::batch_enrich_artist_artwork(db, cache_dir).await;
+
+        progress_poller.abort();
     });
 
     (
@@ -385,6 +444,55 @@ pub(super) async fn batch_enrich_artist_artwork(
             "message": "batch artist enrichment started (Phase 1: MBID matching, Phase 2: image fetch)",
             "artists_without_mbid": without_mbid,
             "artists_without_image": missing.len(),
+        })),
+    )
+        .into_response()
+}
+
+/// Force re-fetch of artist images for EVERY artist with an MBID, ignoring the
+/// "already has an image" guard. For libraries where image_path is set to
+/// stale/broken entries that never render, so the normal pass skips them.
+pub(super) async fn force_refetch_artist_artwork(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cache_dir = artwork_cache_dir();
+    let db = state.backend.clone();
+
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
+    let total_artists = artist_repo
+        .list_all_id_name_mbid()
+        .unwrap_or_default()
+        .len();
+
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("artist_artwork_enrich_status", "running").ok();
+    settings
+        .set(
+            "artist_artwork_enrich_result",
+            &json!({"total": total_artists, "enriched": 0, "status": "running", "force": true})
+                .to_string(),
+        )
+        .ok();
+
+    let task_guard = state.background_tasks.begin(
+        "artist_artwork",
+        "Récupération forcée des images d'artistes…",
+        "enrichment",
+    );
+    tokio::spawn(async move {
+        let _task_guard = task_guard; // ends the task when this future completes
+        // Phase 1: ensure MBIDs are matched, then force re-fetch everyone.
+        let matched = tune_core::metadata::matcher::batch_match_artist_mbids(db.clone()).await;
+        tracing::info!(matched, "force_artist_mbid_phase_complete");
+        tune_core::library::artwork::batch_refetch_artist_artwork(db, cache_dir).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "message": "forced artist artwork re-fetch started (all artists)",
+            "artists": total_artists,
         })),
     )
         .into_response()

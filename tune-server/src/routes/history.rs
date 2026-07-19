@@ -1,10 +1,11 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::history_repo::HistoryRepo;
+use tune_core::db::track_repo::TrackRepo;
 
 use crate::state::AppState;
 
@@ -36,11 +37,27 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(recent_history).delete(clear_history))
         .route("/top-tracks", get(top_tracks))
+        .route("/tracks/{id}/plays", get(track_plays))
         .route("/top-artists", get(top_artists))
         .route("/top-albums", get(top_albums))
         .route("/dashboard", get(dashboard))
         .route("/at", get(slot_tracks))
         .route("/export", get(export_csv))
+}
+
+/// GET /library/history/tracks/{id}/plays — how many times this track was
+/// played (non-radio), so the UI can show a play count on a track (Progman,
+/// feature #1056). Matched by title + artist, like the dashboard top tracks.
+async fn track_plays(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let (title, artist) = match track_repo.get(id) {
+        Ok(Some(t)) => (t.title, t.artist_name),
+        _ => return Json(json!({ "track_id": id, "plays": 0 })),
+    };
+    let plays = HistoryRepo::with_backend(state.backend.clone())
+        .track_plays(&title, artist.as_deref())
+        .unwrap_or(0);
+    Json(json!({ "track_id": id, "plays": plays }))
 }
 
 /// Tracks listened during one weekday×hour heatmap cell (drill-down).

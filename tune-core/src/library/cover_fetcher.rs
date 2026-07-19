@@ -24,16 +24,28 @@ pub async fn fetch_cover_from_caa(musicbrainz_release_id: &str, cache_dir: &str)
         .build()
         .ok()?;
 
-    let url = format!("{CAA_URL}/{musicbrainz_release_id}/front-500");
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let img_data = resp.bytes().await.ok()?;
-    if img_data.len() < 1000 {
-        return None;
-    }
+    // Prefer the 1200px rendition for a crisp full-screen display (Now Playing
+    // on Retina); fall back to 500px if the larger size isn't available.
+    let img_data = {
+        let mut data = None;
+        for size in ["front-1200", "front-500"] {
+            let url = format!("{CAA_URL}/{musicbrainz_release_id}/{size}");
+            let Ok(resp) = client.get(&url).send().await else {
+                continue;
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let Ok(bytes) = resp.bytes().await else {
+                continue;
+            };
+            if bytes.len() >= 1000 {
+                data = Some(bytes);
+                break;
+            }
+        }
+        data?
+    };
 
     let h = md5_hex(musicbrainz_release_id);
     let cache_path = PathBuf::from(cache_dir).join(format!("caa_{h}.jpg"));

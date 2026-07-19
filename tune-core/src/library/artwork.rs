@@ -41,10 +41,52 @@ const FOLDER_COVER_NAMES: &[&str] = &[
 
 const MB_USER_AGENT: &str = "Tune/0.1.0 (https://mozaiklabs.fr)";
 
+/// Wrap an absolute Windows path for extended-length (`\\?\`) access.
+///
+/// The Win32 file APIs (used by `std::fs` and `lofty`) reject paths longer than
+/// MAX_PATH (260 chars) with "The system cannot find the path specified.
+/// (os error 3)" unless the path carries the extended-length `\\?\` prefix.
+/// This surfaced as missing cover art for albums whose folder/file names push
+/// the full path past 260 chars on Windows (Thibaud): the tracks scan fine but
+/// the artwork read on the full path fails.
+///
+/// Pure string transform, safe on every platform: it only rewrites paths that
+/// look like Windows absolute paths (drive `C:\…` or UNC `\\server\…`), so on
+/// Unix (paths starting with `/`) and for relative paths it is a no-op. Verbatim
+/// paths require `\` separators, so we normalize `/` and only touch already
+/// absolute paths.
+pub(crate) fn extended_path(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::borrow::Cow;
+    let s = match path.to_str() {
+        Some(s) => s,
+        None => return Cow::Borrowed(path), // non-UTF-8: leave untouched
+    };
+    if s.starts_with("\\\\?\\") {
+        return Cow::Borrowed(path); // already verbatim
+    }
+    let b = s.as_bytes();
+    let is_drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    let is_unc = s.starts_with("\\\\") || s.starts_with("//");
+    if !is_drive && !is_unc {
+        return Cow::Borrowed(path); // Unix / relative path: no-op
+    }
+    let normalized = s.replace('/', "\\");
+    let prefixed = if is_unc {
+        // \\server\share\… -> \\?\UNC\server\share\…
+        format!("\\\\?\\UNC\\{}", normalized.trim_start_matches('\\'))
+    } else {
+        format!("\\\\?\\{normalized}")
+    };
+    Cow::Owned(std::path::PathBuf::from(prefixed))
+}
+
 pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     use lofty::file::TaggedFileExt;
 
-    match lofty::read_from_path(audio_path) {
+    match lofty::read_from_path(&*extended_path(audio_path)) {
         Ok(tagged) => {
             if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
                 if let Some(pic) = tag.pictures().first() {
@@ -77,7 +119,7 @@ pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
     for name in FOLDER_COVER_NAMES {
         let candidate = dir.join(name);
-        if candidate.exists() {
+        if extended_path(&candidate).exists() {
             return Some(candidate);
         }
     }
@@ -124,23 +166,31 @@ pub fn artwork_hash(file_path: &str) -> String {
 
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
-    let url = format!("https://coverartarchive.org/release/{mbid}/front-500");
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if resp.status().is_success() {
-        let bytes = resp.bytes().await.ok()?;
-        // Reject tiny responses (likely error pages)
-        if bytes.len() < 1000 {
-            return None;
+    // Prefer the 1200px rendition for a crisp full-screen display (Now Playing
+    // on Retina). Fall back to 500px if the larger size isn't available for
+    // this release.
+    for size in ["front-1200", "front-500"] {
+        let url = format!("https://coverartarchive.org/release/{mbid}/{size}");
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if resp.status().is_success() {
+            let Ok(bytes) = resp.bytes().await else {
+                continue;
+            };
+            // Reject tiny responses (likely error pages)
+            if bytes.len() < 1000 {
+                continue;
+            }
+            return Some(bytes.to_vec());
         }
-        Some(bytes.to_vec())
-    } else {
-        None
     }
+    None
 }
 
 /// Search MusicBrainz for a release MBID by artist name and album title.
@@ -167,6 +217,42 @@ pub async fn search_musicbrainz_release(artist: &str, title: &str) -> Option<Str
     let data: serde_json::Value = resp.json().await.ok()?;
     let releases = data.get("releases")?.as_array()?;
     let first = releases.first()?;
+    first.get("id")?.as_str().map(|s| s.to_string())
+}
+
+/// Resolve an artist's MusicBrainz ID from its name (best match).
+///
+/// Libraries whose files carry no MusicBrainz tags leave artists without an
+/// MBID, so the rich MBID-based image sources (Fanart.tv / TheAudioDB /
+/// MusicBrainz) can never find them. Look the artist up by name and accept only
+/// a high-confidence match (MB returns a 0-100 score) to avoid mis-binding two
+/// artists that share a name.
+pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Unknown Artist") {
+        return None;
+    }
+    let query = format!("artist:\"{}\"", trimmed.replace('"', ""));
+    let url = format!(
+        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit=1",
+        urlencoding::encode(&query)
+    );
+    let client = crate::http::client::builder()
+        .user_agent(MB_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let first = data.get("artists")?.as_array()?.first()?;
+    // Only accept a confident match; MB scores the query 0-100.
+    let score = first.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
+    if score < 90 {
+        return None;
+    }
     first.get("id")?.as_str().map(|s| s.to_string())
 }
 
@@ -306,26 +392,41 @@ pub async fn fetch_artist_image(
         .build()
         .ok()?;
 
-    // 1. Mozaiklabs community (fastest, no rate limit)
-    if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
-        return Some(bytes);
+    // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
+    if !mbid.is_empty() {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
+            return Some(bytes);
+        }
     }
 
-    // 2. Fanart.tv
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
-        return Some(bytes);
+    // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
+    // for artists without an MBID (which never reach the by-MBID lookup above),
+    // BEFORE falling back to any external source.
+    if !artist_name.is_empty() {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name).await {
+            return Some(bytes);
+        }
     }
 
-    // 3. TheAudioDB (free API, good coverage)
-    if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
-        return Some(bytes);
-    }
+    // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
+    // (avoids pointless requests + their rate-limit sleeps during a force pass).
+    if !mbid.is_empty() {
+        // 2. Fanart.tv
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
+            return Some(bytes);
+        }
 
-    // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
-        return Some(bytes);
+        // 3. TheAudioDB (free API, good coverage)
+        if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
+            return Some(bytes);
+        }
+
+        // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
+            return Some(bytes);
+        }
     }
 
     // 6. Discogs (if token configured, search by artist name)
@@ -385,6 +486,52 @@ async fn fetch_artist_image_mozaiklabs(client: &reqwest::Client, mbid: &str) -> 
     if image_url.is_empty() {
         return None;
     }
+    let full_url = if image_url.starts_with('/') {
+        format!("https://mozaiklabs.fr{image_url}")
+    } else {
+        image_url.to_string()
+    };
+    download_image(client, &full_url).await
+}
+
+/// Fetch an artist image from mozaiklabs.fr by **name** (community metadata),
+/// via `GET /api/v1/artists/search?q=<name>`. Used as a fallback for artists
+/// without an MBID so mozaiklabs stays the priority source for them too.
+///
+/// Requires an exact (case-insensitive) name match on a result that actually
+/// has a non-empty `image_url`, to avoid grabbing the wrong artist from the
+/// substring (`ilike %q%`) search.
+async fn fetch_artist_image_mozaiklabs_by_name(
+    client: &reqwest::Client,
+    artist_name: &str,
+) -> Option<Vec<u8>> {
+    let q = artist_name.trim();
+    if q.len() < 2 {
+        return None;
+    }
+    let url = format!(
+        "https://mozaiklabs.fr/api/v1/artists/search?q={}",
+        urlencoding::encode(q)
+    );
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let results = data.get("data")?.as_array()?;
+    let want = q.to_lowercase();
+    let image_url = results
+        .iter()
+        .filter(|a| {
+            a.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.trim().to_lowercase() == want)
+        })
+        .find_map(|a| {
+            a.get("image_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })?;
     let full_url = if image_url.starts_with('/') {
         format!("https://mozaiklabs.fr{image_url}")
     } else {
@@ -594,9 +741,18 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
 /// re-fetch when the DB claims an image but the cache file is gone).
 /// A remote `http(s)` `image_path` is served by redirect, so treat it as
 /// present. Local paths are cache hashes → probe both `.jpg` and `.png`.
-fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> bool {
+/// Whether the artwork referenced by `image_path` exists **as a local cache
+/// file**. A remote `http(s)` URL counts as NOT cached: streaming services
+/// (Tidal, Deezer, Amazon) store the artist picture as a remote URL, which
+/// leaves no local file, is served only as a redirect that many renderers/
+/// clients can't load, and blocks enrichment from ever caching a real image
+/// (Fabien: full scan + Tidal premium, artwork_cache empty, no artist images).
+/// Returning false for URLs makes enrichment localize them into the cache.
+/// Also lets callers detect a stale DB `image_path` whose cache file is gone
+/// (moved/wiped `artwork_cache`).
+pub fn cached_artwork_exists(cache_dir: &std::path::Path, image_path: &str) -> bool {
     if image_path.starts_with("http") {
-        return true;
+        return false;
     }
     cache_dir.join(format!("{image_path}.jpg")).exists()
         || cache_dir.join(format!("{image_path}.png")).exists()
@@ -611,6 +767,25 @@ pub async fn batch_enrich_artist_artwork(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: PathBuf,
 ) {
+    batch_enrich_artist_artwork_inner(db, cache_dir, false).await
+}
+
+/// Force variant: re-fetch artwork for EVERY artist with an MBID, ignoring the
+/// "already has an image" guard. Fixes libraries where `image_path` is set to
+/// stale/broken entries that never render (Fabien: full scan + premium, still
+/// no artist images — the normal pass skips because the DB claims images exist).
+pub async fn batch_refetch_artist_artwork(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+) {
+    batch_enrich_artist_artwork_inner(db, cache_dir, true).await
+}
+
+async fn batch_enrich_artist_artwork_inner(
+    db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: PathBuf,
+    force: bool,
+) {
     let artist_repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
 
     // --- Phase 1: Bulk-apply community-approved artist images ---
@@ -624,10 +799,13 @@ pub async fn batch_enrich_artist_artwork(
             // a scan can set image_path while the cache write failed, leaving a
             // grey square that would otherwise be skipped forever (Sandro).
             if let Ok(Some(artist)) = artist_repo.get_by_musicbrainz_id(&img.mbid) {
-                if artist
-                    .image_path
-                    .as_deref()
-                    .is_some_and(|ip| cached_artwork_exists(&cache_dir, ip))
+                // In force mode, re-apply even if the DB claims a cached image
+                // (the point is to overwrite stale/broken entries).
+                if !force
+                    && artist
+                        .image_path
+                        .as_deref()
+                        .is_some_and(|ip| cached_artwork_exists(&cache_dir, ip))
                 {
                     continue;
                 }
@@ -665,14 +843,24 @@ pub async fn batch_enrich_artist_artwork(
         }
     }
 
-    // --- Phase 2: Fetch from external sources for remaining artists ---
-    let mut artists = match artist_repo.list_without_image() {
+    // --- Phase 2: Fetch from external sources ---
+    // Force mode re-fetches EVERY artist (overwriting stale entries), including
+    // those without an MBID — mozaiklabs-by-name + other by-name sources can
+    // still find them. Normal mode only targets artists without an image.
+    let mut artists = match if force {
+        artist_repo.list_all_id_name_mbid()
+    } else {
+        artist_repo.list_without_image()
+    } {
         Ok(a) => a,
         Err(e) => {
             warn!(error = %e, "batch_artist_artwork_list_failed");
             return;
         }
     };
+    if force {
+        info!(count = artists.len(), "batch_artist_artwork_force_refetch");
+    }
 
     // Re-queue artists whose image_path is set in the DB but whose cache file is
     // actually missing. list_without_image only checks the column, so a scan
@@ -680,20 +868,23 @@ pub async fn batch_enrich_artist_artwork(
     // later cleared/moved) leaves a grey square that would be skipped forever
     // (Fabien: "j'ai pas les images d'artistes" despite a full scan + premium).
     // This extends the Phase-1 cache-existence guard (Sandro) to Phase 2.
-    match artist_repo.list_with_image_and_mbid() {
-        Ok(with_image) => {
-            let before = artists.len();
-            for (id, name, mbid, image_path) in with_image {
-                if !cached_artwork_exists(&cache_dir, &image_path) {
-                    artists.push((id, name, mbid));
+    // Skipped in force mode, which already includes every MBID artist.
+    if !force {
+        match artist_repo.list_with_image_and_mbid() {
+            Ok(with_image) => {
+                let before = artists.len();
+                for (id, name, mbid, image_path) in with_image {
+                    if !cached_artwork_exists(&cache_dir, &image_path) {
+                        artists.push((id, name, mbid));
+                    }
+                }
+                let requeued = artists.len() - before;
+                if requeued > 0 {
+                    info!(requeued, "batch_artist_artwork_missing_cache_requeued");
                 }
             }
-            let requeued = artists.len() - before;
-            if requeued > 0 {
-                info!(requeued, "batch_artist_artwork_missing_cache_requeued");
-            }
+            Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
         }
-        Err(e) => warn!(error = %e, "batch_artist_artwork_with_image_list_failed"),
     }
 
     if artists.is_empty() {
@@ -704,6 +895,8 @@ pub async fn batch_enrich_artist_artwork(
             .set(
                 "artist_artwork_enrich_result",
                 &serde_json::json!({
+                    "status": "done",
+                    "phase": "done",
                     "total": 0,
                     "enriched": 0,
                     "failed": 0,
@@ -747,16 +940,42 @@ pub async fn batch_enrich_artist_artwork(
 
     let mut enriched = 0u32;
     let mut failed = 0u32;
+    let total_images = artists.len();
 
-    for (artist_id, name, mbid) in &artists {
+    for (i, (artist_id, name, mbid)) in artists.iter().enumerate() {
         // Rate limit: short delay between community lookups (no rate limit),
         // longer delay only when hitting external APIs (MusicBrainz etc.)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        match fetch_artist_image(mbid, name, discogs_token.as_deref()).await {
+        // Resolve a MusicBrainz ID from the artist name when the files carried
+        // no MB tag. Without it the rich image sources (Fanart/TheAudioDB/
+        // MusicBrainz) and community matching can't find this artist — the whole
+        // reason untagged libraries end up with almost no artist images. Persist
+        // it so future runs and community lookups reuse it. MB asks for ~1 req/s,
+        // so only pay that extra delay for artists we actually have to look up.
+        let mut mbid = mbid.clone();
+        if mbid.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            if let Some(found) = search_musicbrainz_artist(name).await {
+                artist_repo.update_mbid(*artist_id, &found).ok();
+                info!(artist_id, artist = %name, mbid = %found, "batch_artist_artwork_mbid_resolved");
+                mbid = found;
+            }
+        }
+
+        match fetch_artist_image(&mbid, name, discogs_token.as_deref()).await {
             Some(data) => {
-                // Use artist-specific hash key (same as manual upload)
-                let hash = artwork_hash(&format!("artist-mbid-{mbid}"));
+                // Cache key: by MBID when known, else by NAME. Keying by
+                // `artist-mbid-` with an EMPTY mbid made every artist without an
+                // MBID collide on the same file (md5("artist-mbid-")), so they
+                // overwrote each other's image (Keith Jarrett, Duke Ellington…
+                // all sharing one photo). By-name matches Phase 3's convention.
+                let key = if mbid.is_empty() {
+                    format!("artist-name-{name}")
+                } else {
+                    format!("artist-mbid-{mbid}")
+                };
+                let hash = artwork_hash(&key);
                 std::fs::create_dir_all(&cache_dir).ok();
                 if save_to_cache(&data, &cache_dir, &hash, "jpg").is_some() {
                     artist_repo.update_image(*artist_id, &hash, "auto").ok();
@@ -769,8 +988,10 @@ pub async fn batch_enrich_artist_artwork(
                         "batch_artist_artwork_enriched"
                     );
 
-                    // Fire-and-forget: submit to community for sharing
-                    if !instance_id.is_empty() {
+                    // Fire-and-forget: submit to community for sharing.
+                    // Only when we have an MBID — the community store is keyed by
+                    // MBID, so submitting with an empty one is meaningless.
+                    if !instance_id.is_empty() && !mbid.is_empty() {
                         let mbid = mbid.clone();
                         let name = name.clone();
                         let instance_id = instance_id.clone();
@@ -798,6 +1019,25 @@ pub async fn batch_enrich_artist_artwork(
                 failed += 1;
                 debug!(artist_id, artist = %name, mbid = %mbid, "batch_artist_artwork_not_found");
             }
+        }
+
+        // Publish live progress for the UI (Fabien: enrichment looked frozen).
+        if (i + 1) % 5 == 0 || i + 1 == total_images {
+            settings
+                .set(
+                    "artist_artwork_enrich_result",
+                    &serde_json::json!({
+                        "status": "running",
+                        "phase": "images",
+                        "processed": i + 1,
+                        "total": total_images,
+                        "enriched": enriched,
+                        "failed": failed,
+                        "community_applied": community_applied,
+                    })
+                    .to_string(),
+                )
+                .ok();
         }
     }
 
@@ -893,6 +1133,8 @@ pub async fn batch_enrich_artist_artwork(
         .set(
             "artist_artwork_enrich_result",
             &serde_json::json!({
+                "status": "done",
+                "phase": "done",
                 "total": artists.len(),
                 "enriched": total_enriched,
                 "phase2_enriched": enriched,
@@ -904,6 +1146,49 @@ pub async fn batch_enrich_artist_artwork(
             .to_string(),
         )
         .ok();
+}
+
+/// Save cover art bytes that were **already read during the metadata pass** into
+/// the artwork cache, without re-opening the audio file.
+///
+/// `get_or_extract` opens the file a *second* time through lofty to pull the
+/// embedded picture. On some Windows setups that second open fails with
+/// `os error 3` (path not found) on accented paths even though the metadata read
+/// moments earlier succeeded — so the album ends up with no cover although its
+/// tags carry one (Thibaud). When the scan already has the cover bytes from the
+/// metadata read, call this instead: same cache key as `get_or_extract`, so a
+/// later `get_or_extract` on the same file is a cache hit.
+pub fn save_embedded_cover(
+    audio_path: &Path,
+    cache_dir: &Path,
+    cover: &(Vec<u8>, String),
+) -> Option<String> {
+    let hash = artwork_hash(&audio_path.to_string_lossy());
+
+    // Already cached (from a previous scan or from get_or_extract): reuse it.
+    if cache_dir.join(format!("{hash}.jpg")).exists()
+        || cache_dir.join(format!("{hash}.png")).exists()
+    {
+        return Some(hash);
+    }
+
+    let (data, mime) = cover;
+    let ext = if mime.contains("png") {
+        "png"
+    } else if mime.contains("bmp") {
+        "bmp"
+    } else {
+        "jpg"
+    };
+    if save_to_cache(data, cache_dir, &hash, ext).is_some() {
+        return Some(hash);
+    }
+    warn!(
+        path = %audio_path.display(),
+        cache_dir = %cache_dir.display(),
+        "embedded_cover_from_tag_save_failed"
+    );
+    None
 }
 
 pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
@@ -934,7 +1219,7 @@ pub fn get_or_extract(audio_path: &Path, cache_dir: &Path) -> Option<String> {
 
     // Try folder-level cover art (cover.jpg, folder.jpg, front.jpg, etc.)
     if let Some(folder_cover) = find_folder_cover(audio_path) {
-        match std::fs::read(&folder_cover) {
+        match std::fs::read(&*extended_path(&folder_cover)) {
             Ok(data) => {
                 let ext = folder_cover
                     .extension()
@@ -1011,6 +1296,48 @@ pub fn backfill_embedded_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_path_windows_and_noop() {
+        // Windows drive path -> verbatim prefix, separators normalized.
+        assert_eq!(
+            extended_path(Path::new("C:\\Music\\Long\\file.flac"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\C:\\Music\\Long\\file.flac"
+        );
+        assert_eq!(
+            extended_path(Path::new("C:/Music/Long/file.flac"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\C:\\Music\\Long\\file.flac"
+        );
+        // UNC (NAS) path -> \\?\UNC\server\share\…
+        assert_eq!(
+            extended_path(Path::new("\\\\nas\\music\\album\\cover.jpg"))
+                .to_str()
+                .unwrap(),
+            "\\\\?\\UNC\\nas\\music\\album\\cover.jpg"
+        );
+        // Already verbatim -> unchanged.
+        assert_eq!(
+            extended_path(Path::new("\\\\?\\C:\\a")).to_str().unwrap(),
+            "\\\\?\\C:\\a"
+        );
+        // Unix absolute and relative paths -> untouched no-op.
+        assert_eq!(
+            extended_path(Path::new("/home/user/music/x.flac"))
+                .to_str()
+                .unwrap(),
+            "/home/user/music/x.flac"
+        );
+        assert_eq!(
+            extended_path(Path::new("album/cover.jpg"))
+                .to_str()
+                .unwrap(),
+            "album/cover.jpg"
+        );
+    }
 
     #[test]
     fn artwork_hash_deterministic() {

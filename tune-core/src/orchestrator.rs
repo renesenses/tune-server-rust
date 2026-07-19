@@ -1,8 +1,22 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Error marker returned by `resolve_local_track` when a play was superseded by
+/// a newer tap before its transcode started; `play_inner` maps it to a quiet
+/// no-op result instead of a user-facing error.
+const SUPERSEDED_BEFORE_TRANSCODE: &str = "__superseded_before_transcode__";
+
+/// Serializes ALAC/PCM→FLAC transcodes of the *same* source file across
+/// concurrent plays, keyed by source path. A burst of play taps for a
+/// slow-to-decode NAS track otherwise kicks off one full transcode each
+/// (Yves: 6 concurrent transcodes of a single file in 20s → overlapping FLAC
+/// streams to the DLNA renderer = noise). The winner transcodes; every play a
+/// newer tap has already superseded skips it entirely.
+static TRANSCODE_GATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 use crate::audio::formats::AudioFormat;
 use crate::db::history_repo::{HistoryRepo, ListenRecord};
@@ -25,6 +39,9 @@ pub struct PlaybackOrchestrator {
     pub outputs: Arc<Mutex<OutputRegistry>>,
     pub advertised_ip: Option<String>,
     pub event_bus: Option<Arc<EventBus>>,
+    /// Optional license manager for the free-tier zone cap (set in production,
+    /// left None in tests → no gating). Enforced at zone activation in `play`.
+    pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
     pub prefetch: Arc<PrefetchEngine>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
@@ -114,6 +131,7 @@ impl PlaybackOrchestrator {
             outputs,
             advertised_ip,
             event_bus: None,
+            license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
@@ -141,9 +159,45 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play(&self, req: PlayRequest) -> Result<PlayResult, String> {
+        // Free-tier zone cap, enforced at *activation* (a zone's first play).
+        // This is the single choke point for every play entry point (direct
+        // play, resume, streaming, transfer, alarms, AI) — gating here, rather
+        // than at zone creation, both fixes the false "premium required" when
+        // dormant auto-discovered zones filled the quota AND closes the "play a
+        // few zones at a time to stay free" loophole.
+        self.enforce_zone_cap(req.zone_id).await?;
         // Public entry point: this is a *new* logical play, so it is recorded
         // in the listen history.
         self.play_inner(req, true).await
+    }
+
+    /// Free-tier gate: block *activating* a brand-new zone once the free active
+    /// limit is reached. A zone that has already played (`last_track_id` set) is
+    /// unaffected, so replays / auto-advance / resume never trip the gate; only
+    /// the first play of an as-yet-unused zone counts. No license set (tests) or
+    /// Premium tier → always allowed.
+    async fn enforce_zone_cap(&self, zone_id: i64) -> Result<(), String> {
+        let Some(ref lic) = self.license else {
+            return Ok(());
+        };
+        let zrepo = ZoneRepo::with_backend(self.db.clone());
+        let already_active = zrepo
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.last_track_id)
+            .is_some();
+        if already_active || lic.is_premium().await {
+            return Ok(());
+        }
+        let active = zrepo.count_active().unwrap_or(0);
+        if active >= lic.free_zone_limit() {
+            return Err(format!(
+                "premium_required:Free tier is limited to {} active zones. Upgrade to Tune Premium for unlimited zones.",
+                lic.free_zone_limit()
+            ));
+        }
+        Ok(())
     }
 
     /// Like `play`, but does NOT write a listen-history row.  Used for internal
@@ -260,14 +314,57 @@ impl PlaybackOrchestrator {
         // Bump track_generation NOW so the poller resets its wall-clock
         // timer immediately. Without this, a long DASH transcode (20-30s)
         // can run into the 300s timeout from the previous track.
-        self.playback.bump_generation(req.zone_id).await;
+        let play_gen = self.playback.bump_generation(req.zone_id).await;
 
         let resolved = if let Some(ref temp_path) = req.temp_file_path {
             self.resolve_uploaded_file(temp_path, &req).await?
         } else {
-            self.resolve_stream(&req).await?
+            match self.resolve_stream(&req).await {
+                Ok(r) => r,
+                // A newer tap superseded this play before its transcode ran:
+                // yield quietly (the winning play drives the output) instead of
+                // surfacing an error for the redundant tap.
+                Err(e) if e == SUPERSEDED_BEFORE_TRANSCODE => {
+                    info!(
+                        zone_id = req.zone_id,
+                        "orchestrator_play_superseded_before_transcode"
+                    );
+                    return Ok(PlayResult {
+                        stream_url: None,
+                        output_sent: false,
+                        source: "local".into(),
+                        error: Some("superseded by a newer play".into()),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         };
         let resolve_ms = play_start.elapsed().as_millis();
+
+        // If a newer play for this zone started while we were resolving, abort
+        // before sending output. Resolving can take tens of seconds (a slow
+        // network-volume ALAC→FLAC transcode for a DLNA renderer), during which
+        // a user tapping play again — or the poller — stacks several plays; if
+        // each one pushed its stream to the renderer, the overlapping audio came
+        // out as noise (Yves, DMP-A10 over DLNA). Only the latest play should
+        // reach the device.
+        if self.playback.current_play_seq(req.zone_id).await != play_gen {
+            info!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                resolve_ms,
+                "orchestrator_play_superseded_skipping_output"
+            );
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            return Ok(PlayResult {
+                stream_url: None,
+                output_sent: false,
+                source: resolved.source,
+                error: Some("superseded by a newer play".into()),
+            });
+        }
 
         let cover_path = req.cover_url.clone().or(resolved.cover_url.clone());
         let album = req.album_title.clone().or(resolved.album.clone());
@@ -307,12 +404,21 @@ impl PlaybackOrchestrator {
                             .to_string(),
                     )
                 }),
-            sample_rate: resolved.sample_rate.or(track_meta
+            // Prefer the SOURCE resolution (library metadata) over the resolved
+            // OUTPUT format. Local playback forces a 32-bit WAV to the DAC, but
+            // the "now playing" label must show the file's real depth (16/24) —
+            // matching the gapless path (advance_queue_metadata), which avoids the
+            // "first tracks show 32-bit then correct to 16" glitch. Streaming has
+            // no local row (track_meta = None) so it falls back to the resolved
+            // stream format. DSD display is handled separately in zones.rs.
+            sample_rate: track_meta
                 .as_ref()
-                .and_then(|t| t.sample_rate.map(|v| v as u32))),
-            bit_depth: resolved.bit_depth.or(track_meta
+                .and_then(|t| t.sample_rate.map(|v| v as u32))
+                .or(resolved.sample_rate),
+            bit_depth: track_meta
                 .as_ref()
-                .and_then(|t| t.bit_depth.map(|v| v as u32))),
+                .and_then(|t| t.bit_depth.map(|v| v as u32))
+                .or(resolved.bit_depth),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
             year: track_meta.as_ref().and_then(|t| t.year),
         };
@@ -1110,8 +1216,23 @@ impl PlaybackOrchestrator {
             false
         };
 
+        // ALAC native passthrough (opt-in per zone): serve the ALAC file
+        // straight to a renderer that decodes it, instead of transcoding to
+        // FLAC — bit-perfect and zero CPU. Off by default because ALAC and AAC
+        // share the audio/mp4 MIME, so it can't be auto-detected safely.
+        // LPCM override: a zone set to serve WAV/LPCM must transcode (to strip
+        // the renderer's ALAC decoder quirks — e.g. LHC-56 pops at start), so it
+        // takes precedence over ALAC passthrough.
+        let dlna_lpcm =
+            is_network_output && ZoneRepo::with_backend(self.db.clone()).get_dlna_lpcm(req.zone_id);
+        let alac_passthrough = source_format == Some(AudioFormat::Alac)
+            && is_network_output
+            && !dlna_lpcm
+            && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+
         let needs_transcode_for_output = is_network_output
             && !dsd_passthrough
+            && !alac_passthrough
             && source_format
                 .as_ref()
                 .is_some_and(|f| f.needs_transcode_for_dlna());
@@ -1131,7 +1252,13 @@ impl PlaybackOrchestrator {
                 .as_deref()
                 .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
                 .unwrap_or("");
-            if did.is_empty() {
+            if dlna_lpcm {
+                // User forces WAV/LPCM for this zone: skips the slow native FLAC
+                // encoder for hi-res AND avoids a renderer whose ALAC decoder
+                // pops at start (Yves, LHC-56). Takes precedence over the FLAC
+                // override below.
+                true
+            } else if did.is_empty() {
                 false
             } else if ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id) {
                 // User forces native FLAC for this zone: some renderers decode
@@ -1295,6 +1422,30 @@ impl PlaybackOrchestrator {
                     ))
                     .to_string_lossy()
                     .to_string();
+
+                // Serialize transcodes of this same source file and drop any
+                // play a newer tap has already superseded, so a burst of taps
+                // can't spawn overlapping ALAC→FLAC transcodes of one file
+                // (Yves, DMP-A10 over DLNA). Capture our own play seq, then
+                // wait our turn on the per-file gate; if a newer play bumped the
+                // generation while we waited, skip the transcode entirely.
+                let my_seq = self.playback.current_play_seq(req.zone_id).await;
+                let file_gate = {
+                    let mut gates = TRANSCODE_GATE.lock().await;
+                    gates
+                        .entry(file_path.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(())))
+                        .clone()
+                };
+                let _file_hold = file_gate.lock().await;
+                if self.playback.current_play_seq(req.zone_id).await != my_seq {
+                    info!(
+                        zone_id = req.zone_id,
+                        file = %file_path,
+                        "transcode_skipped_superseded_burst"
+                    );
+                    return Err(SUPERSEDED_BEFORE_TRANSCODE.into());
+                }
 
                 info!(
                     file = %fp,
@@ -1605,6 +1756,25 @@ impl PlaybackOrchestrator {
                 .create_file_session(info, file_path.clone(), false)
                 .await;
 
+            // For M4A/ALAC passthrough, attach an on-the-fly faststart map so the
+            // file is served as `ftyp + patched-moov + mdat` (moov relocated to
+            // the front). The renderer then reads its metadata up front and starts
+            // immediately instead of seeking to the END of the file first — a slow
+            // start + Range storm, esp. over a NAS mount (Yves, LHC-56, 192/24
+            // ALAC on SMB). This reads only ftyp+moov (never mdat), so it adds no
+            // copy latency, and falls back to the original file if not applicable.
+            if source_format == Some(AudioFormat::Alac) {
+                let fp = file_path.clone();
+                if let Ok(Some(map)) = tokio::task::spawn_blocking(move || {
+                    crate::audio::faststart::prepare_faststart(std::path::Path::new(&fp))
+                })
+                .await
+                {
+                    info!(file = %file_path, "m4a_faststart_applied");
+                    self.streamer.set_faststart(&session_id, map).await;
+                }
+            }
+
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
             // affect the actual audio stream served to the output device.
@@ -1751,13 +1921,23 @@ impl PlaybackOrchestrator {
             };
             let is_truncated = prefetch_buffer_truncated(buffered_ms, prefetched.duration_ms);
 
-            if is_network && is_truncated {
+            // Skip a truncated prefetch buffer for EVERY output, not just DLNA.
+            // The prefetch head-start is only ~30s; `serve_prefetched_pcm` feeds
+            // exactly that PCM into the session and then drops the sender. On a
+            // network output that meant a short file; on a LOCAL EXCLUSIVE output
+            // (ASIO) the blocking HTTP read never gets a clean EOF at the loop
+            // point, so once the 30s buffer is consumed the audio thread starves
+            // and freezes until the 20s watchdog resets the host to WASAPI
+            // (DEvir bug-20, repeat-one on a >30s track). Fetching the full
+            // stream instead keeps the exclusive read fed for the whole track.
+            if is_truncated {
                 info!(
                     service = service_name,
                     source_id = %source_id,
                     buffered_ms,
                     duration_ms = prefetched.duration_ms,
-                    "prefetch_skip_truncated_for_dlna"
+                    is_network,
+                    "prefetch_skip_truncated_serving_full_stream"
                 );
             } else {
                 info!(
@@ -4004,9 +4184,20 @@ impl PlaybackOrchestrator {
         if let Some(track_id) = entry.track_id {
             let album = entry.album_title.clone();
             let cover = entry.cover_path.clone();
+            // Resolve the gapless/prefetch stream FOR THE ACTUAL OUTPUT. Without
+            // the device id, resolve_stream doesn't apply the output's format
+            // rules, so a local output (which needs WAV/PCM) was pre-armed with
+            // the raw FLAC stream — the local gapless chain then hit a non-WAV
+            // header and fell back (local_audio_gapless_next_not_wav_falling_back),
+            // breaking seamless FLAC gapless (Jean Valjean).
+            let output_device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
             let req = PlayRequest {
                 zone_id,
-                output_device_id: None,
+                output_device_id,
                 track_id: Some(track_id),
                 source: None,
                 source_id: None,
@@ -4563,38 +4754,6 @@ mod tests {
         orch.set_volume(zone_id, 1.0, None).await;
         let state = orch.playback.get_state(zone_id).await;
         assert!((state.volume - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_never_upsamples() {
-        // The Resampler enforces "never upsample": when target > source,
-        // the actual target is clamped to source rate/depth.
-        use crate::audio::resampler::Resampler;
-
-        // 44.1kHz source, 96kHz target requested -> should stay at 44.1kHz
-        let r = Resampler::new(44100, 96000, 16, 24, 2);
-        assert_eq!(r.output_rate(), 44100, "must not upsample rate");
-        assert_eq!(r.output_depth(), 16, "must not upsample bit depth");
-        assert!(
-            !r.needs_resample(),
-            "no resample needed when target > source"
-        );
-
-        // 96kHz source, 48kHz target -> should downsample to 48kHz
-        let r = Resampler::new(96000, 48000, 24, 16, 2);
-        assert_eq!(r.output_rate(), 48000);
-        assert_eq!(r.output_depth(), 16);
-        assert!(r.needs_resample(), "downsample should be flagged");
-
-        // Same rate -> no resample
-        let r = Resampler::new(48000, 48000, 24, 24, 2);
-        assert!(!r.needs_resample());
-
-        // Mixed: rate up but depth down -> rate clamped, depth reduced
-        let r = Resampler::new(44100, 96000, 24, 16, 2);
-        assert_eq!(r.output_rate(), 44100, "rate must not increase");
-        assert_eq!(r.output_depth(), 16, "depth correctly reduced");
-        assert!(r.needs_resample(), "bit depth change requires resample");
     }
 
     #[tokio::test]

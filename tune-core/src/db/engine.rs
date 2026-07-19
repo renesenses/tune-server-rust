@@ -53,6 +53,24 @@ impl fmt::Display for Engine {
     }
 }
 
+/// Strip diacritics from a string (case-preserving), so accent-insensitive
+/// `LIKE` search matches `carlão` against `carlao`.
+///
+/// Decomposes to NFD and drops Unicode combining marks (U+0300–U+036F), which
+/// turns Latin accented letters into their base ASCII letter (é→e, ã→a, ç→c,
+/// É→E). Non-decomposable scripts (Cyrillic, CJK, …) pass through unchanged.
+/// Case is intentionally preserved: callers wrap the result in SQL `LOWER()`,
+/// and once diacritics are gone the remaining Latin text is ASCII, so SQLite's
+/// ASCII-only `LOWER()` folds it correctly. This mirrors PostgreSQL's
+/// `unaccent()` (which is likewise case-preserving); both engines therefore use
+/// the identical SQL `LOWER(unaccent(col)) LIKE LOWER(unaccent(?))`.
+pub fn fold_diacritics(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfd()
+        .filter(|c| !matches!(*c, '\u{0300}'..='\u{036F}'))
+        .collect()
+}
+
 /// Format a user-supplied search query for the engine's FTS dialect.
 ///
 /// Splits on whitespace, strips non-alphanumeric chars (defensive), and
@@ -370,6 +388,19 @@ impl SqlDialect for PostgresDialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_diacritics_strips_latin_accents() {
+        assert_eq!(fold_diacritics("Carlão"), "Carlao");
+        assert_eq!(fold_diacritics("Beyoncé"), "Beyonce");
+        assert_eq!(fold_diacritics("Motörhead"), "Motorhead");
+        assert_eq!(fold_diacritics("Édith Piaf"), "Edith Piaf");
+        assert_eq!(fold_diacritics("Sigur Rós"), "Sigur Ros");
+        // Non-Latin scripts pass through unchanged (no false folding).
+        assert_eq!(fold_diacritics("Мельница"), "Мельница");
+        // ASCII is untouched.
+        assert_eq!(fold_diacritics("Pink Floyd"), "Pink Floyd");
+    }
 
     #[test]
     fn engine_from_str_accepts_aliases() {

@@ -34,6 +34,16 @@ impl OutputTarget for ChromecastOutput {
         "chromecast"
     }
 
+    /// Chromecast does not consume `set_next_media` (no cast-queue / autoplay
+    /// staging is implemented — `set_next_url` is the no-op default). Returning
+    /// true here made the poller arm the gapless guard, which orphaned the
+    /// staged track and suppressed the natural-end advance: playback stalled
+    /// ~30-60s at every track boundary (Rhorn, Chromecast Audio, forum #1072).
+    /// Rely on the poller's natural-end fallback instead, like slimproto.
+    fn supports_internal_gapless(&self) -> bool {
+        false
+    }
+
     fn host(&self) -> Option<&str> {
         Some(&self.host)
     }
@@ -381,6 +391,17 @@ impl OutputTarget for ChromecastOutput {
 
             let current_uri = entry.media.as_ref().map(|m| m.content_id.clone());
 
+            // The receiver reports `idle_reason = FINISHED` when a track played
+            // to its end (vs CANCELLED / INTERRUPTED / ERROR). Surface that as
+            // `ended_naturally` so the poller advances to the next track right
+            // away. Without it, every FINISHED looked like a plain Stopped state
+            // and the poller only advanced via its 30 s wall-clock fallback —
+            // Chromecast albums stalled 30-60 s between tracks (#1072, Rhorn).
+            let ended_naturally = matches!(
+                entry.idle_reason,
+                Some(rust_cast::channels::media::IdleReason::Finished)
+            );
+
             Ok(OutputStatus {
                 state,
                 position_ms,
@@ -390,7 +411,7 @@ impl OutputTarget for ChromecastOutput {
                 current_uri,
                 track_title: None,
                 track_artist: None,
-                ended_naturally: false,
+                ended_naturally,
             })
         })
         .await

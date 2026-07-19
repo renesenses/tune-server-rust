@@ -305,6 +305,21 @@ pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
     result
 }
 
+/// Return the last cached device list WITHOUT triggering a fresh enumeration.
+///
+/// Enumerating WASAPI devices probes each device's supported formats, which can
+/// invalidate an active render stream and kill playback on Windows (DEvir). So
+/// while a local stream is playing we serve this cache instead of re-scanning.
+/// Returns an empty list if nothing has been enumerated yet this session.
+pub fn cached_audio_devices() -> Vec<AudioDevice> {
+    SCAN_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, devices)| devices.clone())
+        .unwrap_or_default()
+}
+
 fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     let host = select_host(backend);
     let host_name = host.id().name();
@@ -322,12 +337,16 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
 
     let mut devices: Vec<AudioDevice> = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
+    // Signature = (raw name, caps). Windows WASAPI can list the same physical
+    // endpoint (onboard "HDA ..." codecs) more than once with an identical name
+    // AND identical capabilities; those true duplicates are collapsed so they
+    // don't spawn a phantom second zone (Elie).
     // On Linux, PipeWire re-exposes the SAME physical output many times with
     // *different* reported capabilities (e.g. "ALC255 Analog" as 2ch/48k, then
-    // 32ch/384k, then a stereo fallback), so name disambiguation turns each
-    // variant into a phantom zone (JeromeQ: 43 devices → 48 zones on Ubuntu
-    // 24.04, RC2). Collapse by NAME instead, keeping the richest-capability
-    // variant. Maps raw device name → index into `devices`.
+    // 32ch/384k, then a stereo fallback), so the (name, caps) signature above
+    // never collapses them and each variant becomes a phantom zone (JeromeQ:
+    // 43 devices → 48 zones on Ubuntu 24.04). Collapse by NAME instead, keeping
+    // the richest-capability variant. Maps raw device name → index into `devices`.
     #[cfg(target_os = "linux")]
     let mut linux_by_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -345,50 +364,59 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     continue;
                 }
 
-                let (max_channels, sample_rates) = match device.supported_output_configs() {
-                    Ok(configs) => {
-                        let mut max_ch = 0u16;
-                        let mut rates = Vec::new();
-                        for config in configs {
-                            max_ch = max_ch.max(config.channels());
-                            let min = config.min_sample_rate();
-                            let max = config.max_sample_rate();
-                            for &rate in
-                                &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
-                            {
-                                if rate >= min && rate <= max && !rates.contains(&rate) {
-                                    rates.push(rate);
+                let (max_channels, sample_rates, caps_reliable) =
+                    match device.supported_output_configs() {
+                        Ok(configs) => {
+                            let mut max_ch = 0u16;
+                            let mut rates = Vec::new();
+                            for config in configs {
+                                max_ch = max_ch.max(config.channels());
+                                let min = config.min_sample_rate();
+                                let max = config.max_sample_rate();
+                                for &rate in
+                                    &[44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000]
+                                {
+                                    if rate >= min && rate <= max && !rates.contains(&rate) {
+                                        rates.push(rate);
+                                    }
                                 }
                             }
-                        }
-                        rates.sort();
+                            rates.sort();
 
-                        // PipeWire's ALSA plugin can return Ok but with an
-                        // empty iterator — treat it like an error and fall
-                        // through to the fallback probe below.
-                        if max_ch == 0 || rates.is_empty() {
+                            // PipeWire's ALSA plugin can return Ok but with an
+                            // empty iterator — treat it like an error and fall
+                            // through to the fallback probe below.
+                            if max_ch == 0 || rates.is_empty() {
+                                debug!(
+                                    device = %raw_name,
+                                    "local_audio_device_supported_configs_empty"
+                                );
+                                probe_device_fallback_caps(&device, &raw_name)
+                            } else {
+                                // Enumerated caps are real → safe to collapse on.
+                                (max_ch, rates, true)
+                            }
+                        }
+                        Err(_) => {
                             debug!(
                                 device = %raw_name,
-                                "local_audio_device_supported_configs_empty"
+                                "local_audio_device_supported_configs_failed"
                             );
                             probe_device_fallback_caps(&device, &raw_name)
-                        } else {
-                            (max_ch, rates)
                         }
-                    }
-                    Err(_) => {
-                        debug!(
-                            device = %raw_name,
-                            "local_audio_device_supported_configs_failed"
-                        );
-                        probe_device_fallback_caps(&device, &raw_name)
-                    }
-                };
+                    };
 
                 let is_default = raw_name == default_name;
+                // caps_reliable was only read by the removed (name, caps) collapse
+                // (Linux collapses by name; Windows/macOS now keep every device).
+                let _ = caps_reliable;
 
-                // Linux: collapse PipeWire duplicates by name, keeping the richest
-                // capabilities (channels, then sample-rate count) among variants.
+                // Collapse duplicates. On Linux PipeWire lists the same physical
+                // output repeatedly with varying caps, so collapse by NAME and
+                // keep the richest-capability variant (else 43 phantom devices →
+                // 48 zones, JeromeQ on Ubuntu 24.04). On Windows/macOS two real
+                // DACs can share a name but differ in caps, so collapse only exact
+                // (name, caps) duplicates and disambiguate the rest.
                 #[cfg(target_os = "linux")]
                 {
                     if let Some(&idx) = linux_by_name.get(&raw_name) {
@@ -406,10 +434,25 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                         continue;
                     }
                 }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Windows/macOS: do NOT collapse — always disambiguate below.
+                    // Two genuinely different physical devices can share BOTH the
+                    // name AND the caps: Alain's Ugreen card and his USB DAC both
+                    // enumerate as "Speakers" with identical reliable caps, so the
+                    // old (name, caps) collapse dropped the DAC entirely and it
+                    // could never get a zone (#1084) — even after #654, because
+                    // its caps are real, not the assumed fallback. cpal exposes no
+                    // unique WASAPI endpoint id to tell a true duplicate from two
+                    // same-named devices, so keep every entry and disambiguate
+                    // ("Speakers (2)"), restoring the pre-0.8.314 behaviour Alain
+                    // had on 0.8.307. A rare truly-duplicated onboard endpoint
+                    // then merely shows twice (harmless — both select the same
+                    // output) instead of a real device silently vanishing.
+                }
 
                 // Disambiguate duplicate device names (common on Windows WASAPI
-                // where multiple USB DACs all show as "Haut-Parleurs"). On Linux
-                // names are already collapsed above, so this stays a no-op there.
+                // where multiple USB DACs all show as "Haut-Parleurs").
                 let name = if seen_names.contains(&raw_name) {
                     let mut n = 2;
                     loop {
@@ -3384,7 +3427,16 @@ fn find_device_with_fallback(host: &cpal::Host, device_name: &str) -> Option<(cp
 ///    doesn't (PipeWire handles it at the session-manager level).
 /// 2. If that also fails, assume conservative defaults: stereo, 44100+48000 Hz.
 ///    PipeWire will accept these and resample internally.
-fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u32>) {
+/// Probe a device's capabilities when `supported_output_configs()` is
+/// unavailable. Returns `(max_channels, sample_rates, caps_reliable)`.
+///
+/// `caps_reliable` is true when the caps came from the device's real default
+/// config, false when they are the last-resort assumed stereo guess. Callers
+/// must NOT collapse two devices as duplicates on unreliable caps: a generic
+/// "Haut-Parleurs" USB DAC and the onboard output both fall to the same assumed
+/// `(2, [44100,48000])` on Windows, and collapsing would wrongly drop the DAC
+/// (Alain, #1084).
+fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u32>, bool) {
     if let Ok(default_cfg) = device.default_output_config() {
         let cfg = default_cfg.config();
         let ch = cfg.channels;
@@ -3405,7 +3457,7 @@ fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u3
             rates = ?rates,
             "local_audio_device_fallback_via_default_config"
         );
-        (ch, rates)
+        (ch, rates, true)
     } else {
         // Last resort: assume stereo 44100/48000.  PipeWire will accept
         // these through its ALSA PCM plugin even without enumeration.
@@ -3413,7 +3465,7 @@ fn probe_device_fallback_caps(device: &cpal::Device, name: &str) -> (u16, Vec<u3
             device = %name,
             "local_audio_device_fallback_to_assumed_stereo_44100_48000"
         );
-        (2, vec![44100, 48000])
+        (2, vec![44100, 48000], false)
     }
 }
 

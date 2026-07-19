@@ -85,10 +85,135 @@ pub fn router() -> Router<AppState> {
             post(fix_genres_by_artist_fuzzy),
         )
         .route("/fix-genres-by-family", post(fix_genres_by_family))
+        // Year fix tools (local — no external API). The web UI exposed these but
+        // they were never ported from the old Python server, so they 404'd
+        // (Reivax66, #1089).
+        .route("/fix-years-tags", post(fix_years_tags))
+        .route("/fix-years-from-path", post(fix_years_from_path))
         // Album merge (targeted, by IDs)
         .route("/albums/merge", post(merge_albums))
         // Batch rename artist (used by web client)
         .route("/batch/rename-artist", post(batch_rename_artist))
+}
+
+/// Extract a plausible release year (1900–2099) from a file/folder path — e.g.
+/// `…/Pink Floyd/1973 - The Dark Side of the Moon/…` or `Album (1973)`. Returns
+/// the LAST plausible standalone 4-digit year (the album year usually appears
+/// after the artist), ignoring digit runs that are part of a longer number.
+fn extract_year_from_path(path: &str) -> Option<u32> {
+    let b = path.as_bytes();
+    let mut best: Option<u32> = None;
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        let is_run = b[i..i + 4].iter().all(|c| c.is_ascii_digit());
+        let bounded = (i == 0 || !b[i - 1].is_ascii_digit())
+            && (i + 4 == b.len() || !b[i + 4].is_ascii_digit());
+        if is_run && bounded {
+            if let Ok(y) = std::str::from_utf8(&b[i..i + 4])
+                .unwrap_or("")
+                .parse::<u32>()
+            {
+                if (1900..=2099).contains(&y) {
+                    best = Some(y);
+                }
+            }
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Albums with no year, each joined to one of its track file paths.
+fn albums_missing_year(state: &AppState) -> Result<Vec<(i64, String)>, String> {
+    let rows = state.backend.query_many(
+        "SELECT al.id, MIN(t.file_path) FROM albums al \
+         JOIN tracks t ON t.album_id = al.id \
+         WHERE (al.year IS NULL OR al.year = 0) AND t.file_path IS NOT NULL AND t.file_path <> '' \
+         GROUP BY al.id",
+        &[],
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let path = r.get(1).and_then(|v| v.as_string())?;
+            Some((id, path))
+        })
+        .collect())
+}
+
+fn set_album_year(state: &AppState, album_id: i64, year: u32) {
+    let y = year as i64;
+    state
+        .backend
+        .execute(
+            "UPDATE albums SET year = ? WHERE id = ?",
+            &[
+                &y as &dyn tune_core::db::backend::ToSqlValue,
+                &album_id as &dyn tune_core::db::backend::ToSqlValue,
+            ],
+        )
+        .ok();
+}
+
+/// POST /metadata/fix-years-tags — fill missing album years from the file tags.
+async fn fix_years_tags(State(state): State<AppState>) -> impl IntoResponse {
+    let albums = match albums_missing_year(&state) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+    let total = albums.len();
+    let mut fixed = 0usize;
+    for (album_id, path) in albums {
+        let year = tune_core::metadata::try_read_metadata(std::path::Path::new(&path))
+            .ok()
+            .and_then(|m| m.year)
+            .filter(|y| (1900..=2099).contains(y));
+        if let Some(y) = year {
+            set_album_year(&state, album_id, y);
+            fixed += 1;
+        }
+    }
+    tracing::info!(total, fixed, "fix_years_tags_done");
+    Json(json!({"ok": true, "total": total, "fixed": fixed})).into_response()
+}
+
+/// POST /metadata/fix-years-from-path — infer missing album years from the
+/// folder/file path (e.g. "1973 - Dark Side" or "Album (1973)").
+async fn fix_years_from_path(State(state): State<AppState>) -> impl IntoResponse {
+    let albums = match albums_missing_year(&state) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": e})),
+            )
+                .into_response();
+        }
+    };
+    let total = albums.len();
+    let mut fixed = 0usize;
+    let mut not_found = 0usize;
+    for (album_id, path) in albums {
+        match extract_year_from_path(&path) {
+            Some(y) => {
+                set_album_year(&state, album_id, y);
+                fixed += 1;
+            }
+            None => not_found += 1,
+        }
+    }
+    tracing::info!(total, fixed, not_found, "fix_years_from_path_done");
+    Json(json!({"ok": true, "total": total, "fixed": fixed, "not_found": not_found}))
+        .into_response()
 }
 
 async fn edit_track(
@@ -1969,4 +2094,37 @@ async fn merge_albums(
         "merged_ids": merged_ids,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod year_path_tests {
+    use super::extract_year_from_path;
+
+    #[test]
+    fn extracts_year_from_common_layouts() {
+        assert_eq!(
+            extract_year_from_path("/Music/Pink Floyd/1973 - The Dark Side of the Moon/01.flac"),
+            Some(1973)
+        );
+        assert_eq!(
+            extract_year_from_path("/Music/Yes/Fragile (1971)/track.flac"),
+            Some(1971)
+        );
+        // Prefer the album year (last plausible) over an artist-name year.
+        assert_eq!(
+            extract_year_from_path("/Music/1984 (band)/2005 - Album/x.flac"),
+            Some(2005)
+        );
+    }
+
+    #[test]
+    fn ignores_non_years_and_longer_runs() {
+        // Part of a longer digit run (catalog number) — not a year.
+        assert_eq!(extract_year_from_path("/Music/Album/CAT19730/x.flac"), None);
+        // Out of the 1900..=2099 range.
+        assert_eq!(extract_year_from_path("/Music/1899/x.flac"), None);
+        assert_eq!(extract_year_from_path("/Music/2200/x.flac"), None);
+        // No 4-digit token at all.
+        assert_eq!(extract_year_from_path("/Music/Greatest Hits/x.flac"), None);
+    }
 }

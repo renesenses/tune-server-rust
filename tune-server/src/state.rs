@@ -37,6 +37,9 @@ pub struct AppState {
     pub orchestrator: Arc<PlaybackOrchestrator>,
     pub scanner: Arc<Mutex<SsdpScanner>>,
     pub event_bus: Arc<EventBus>,
+    /// Registry of in-progress background tasks (enrichment, artwork, bios) for
+    /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
+    pub background_tasks: crate::background_tasks::BackgroundTasks,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
@@ -112,6 +115,7 @@ impl AppState {
         let services = Arc::new(Mutex::new(services));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         let event_bus = Arc::new(EventBus::new());
+        let background_tasks = crate::background_tasks::BackgroundTasks::new(event_bus.clone());
 
         let mut orch = PlaybackOrchestrator::new(
             backend.clone(),
@@ -122,6 +126,7 @@ impl AppState {
             tune_config.advertised_ip.clone(),
         );
         orch.event_bus = Some(event_bus.clone());
+        orch.license = Some(license.clone());
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
@@ -164,6 +169,7 @@ impl AppState {
             orchestrator,
             scanner,
             event_bus,
+            background_tasks,
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,

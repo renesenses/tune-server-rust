@@ -213,6 +213,59 @@ fn is_wavpack(file_path: &str) -> bool {
     ext == "wv"
 }
 
+/// A source file staged to a fast local temp so the decoder doesn't do
+/// seek-heavy reads over a slow network mount. Removes the temp on drop.
+struct StagedFile {
+    path: std::path::PathBuf,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// If `src` lives on a different device than the OS temp dir (i.e. an external
+/// or network mount), copy it to a local temp file and return a guard.
+///
+/// Decoders — especially m4a/ALAC via Symphonia — do many small seeks (moov
+/// atoms, sample tables). Over SMB/WiFi each seek is a network round-trip, so a
+/// few-second decode balloons to 90s+ (Yves: ALAC on a NAS, Mac on WiFi). One
+/// sequential copy is fast even on WiFi; decoding then happens from the local
+/// copy. Returns `None` (decode the original in place) for same-device files or
+/// on any error — never fatal.
+#[cfg(unix)]
+fn stage_locally_for_decode(src: &str) -> Option<StagedFile> {
+    use std::os::unix::fs::MetadataExt;
+    let src_path = Path::new(src);
+    let tmp_dir = std::env::temp_dir();
+    let src_dev = std::fs::metadata(src_path).ok()?.dev();
+    let tmp_dev = std::fs::metadata(&tmp_dir).ok()?.dev();
+    if src_dev == tmp_dev {
+        return None; // same device as temp → already local & fast
+    }
+    let ext = src_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let dst = tmp_dir.join(format!("tune-stage-{}.{ext}", uuid::Uuid::new_v4()));
+    match std::fs::copy(src_path, &dst) {
+        Ok(bytes) => {
+            debug!(src = %src, staged = %dst.display(), bytes, "decode_source_staged_locally");
+            Some(StagedFile { path: dst })
+        }
+        Err(e) => {
+            tracing::warn!(src = %src, error = %e, "decode_source_stage_failed_decoding_in_place");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn stage_locally_for_decode(_src: &str) -> Option<StagedFile> {
+    None
+}
+
 pub fn decode_to_pcm(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -220,6 +273,16 @@ pub fn decode_to_pcm(
     seek_s: f64,
     max_duration_s: f64,
 ) -> Result<DecodedAudio, String> {
+    // Stage network/external sources to a fast local temp before decoding so the
+    // decoder's many small seeks don't each cost a network round-trip (Yves: NAS
+    // over WiFi, 90s+ per track). No-op for local files. The guard lives for the
+    // whole decode; the temp is removed when it drops.
+    let _staged = stage_locally_for_decode(file_path);
+    let file_path: &str = _staged
+        .as_ref()
+        .and_then(|s| s.path.to_str())
+        .unwrap_or(file_path);
+
     let ext = Path::new(file_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -537,7 +600,7 @@ fn decode_to_pcm_streaming_inner(
             // Send PCM data first, compute levels after (same rationale
             // as the symphonia path: avoid delaying the audio stream).
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk.to_vec()),
             )) {
                 Ok(Ok(())) => {}
@@ -752,7 +815,7 @@ fn decode_to_pcm_streaming_inner(
             // floating-point math) and was previously called before send(),
             // introducing micro-pauses that caused Squeezebox/LMS stuttering.
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk.clone()),
             )) {
                 Ok(Ok(())) => {}
@@ -788,7 +851,7 @@ fn decode_to_pcm_streaming_inner(
     // Flush remaining bytes
     if !pcm_buf.is_empty() {
         match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf),
         )) {
             Ok(Ok(())) => {}
@@ -1166,7 +1229,7 @@ fn decode_dsd_streaming(
                 // Send PCM data first, compute levels after (same rationale
                 // as the symphonia path: avoid delaying the audio stream).
                 match rt.block_on(tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(300),
                     tx.send(chunk.clone()),
                 )) {
                     Ok(Ok(())) => {}
@@ -1255,7 +1318,7 @@ fn decode_dsd_streaming(
     // Send any remaining bytes (send first, levels after)
     if !pcm_buf.is_empty() {
         let send_ok = match rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf.clone()),
         )) {
             Ok(Ok(())) => true,
@@ -1326,7 +1389,7 @@ pub fn decode_dsd_to_dop_streaming(
         while pcm_buf.len() >= chunk_size {
             let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
             match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(300),
                 tx.send(chunk),
             )) {
                 Ok(Ok(())) => {}
@@ -1367,7 +1430,7 @@ pub fn decode_dsd_to_dop_streaming(
 
     if !pcm_buf.is_empty() {
         let _ = rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(300),
             tx.send(pcm_buf),
         ));
     }

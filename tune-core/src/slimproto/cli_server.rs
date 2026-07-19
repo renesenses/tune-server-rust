@@ -55,6 +55,11 @@ pub async fn start_cli_server(state: Arc<CliState>) {
             }
             Err(e) => {
                 warn!(error = %e, "lms_cli_accept_error");
+                // Back off before retrying: a persistent accept() error (e.g.
+                // EMFILE / ENFILE when fd's are exhausted) returns immediately,
+                // so looping straight back would busy-spin a core and flood the
+                // log. A short sleep yields the CPU until the condition clears.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
     }

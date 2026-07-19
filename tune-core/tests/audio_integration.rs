@@ -11,22 +11,42 @@ use tempfile::TempDir;
 
 // ── File generators ──────────────────────────────────────────────────────
 
-/// Create a 1-second stereo 16-bit 44100 Hz WAV file using hound.
+/// Create a 1-second stereo 16-bit 44100 Hz WAV file (canonical PCM WAV,
+/// written manually — no encoder crate).
 fn create_test_wav(path: &Path) {
-    let spec = hound::WavSpec {
-        channels: 2,
-        sample_rate: 44100,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec).unwrap();
+    let channels: u16 = 2;
+    let sample_rate: u32 = 44100;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * channels as u32 * (bits as u32 / 8);
+    let block_align = channels * (bits / 8);
+
+    let mut pcm: Vec<u8> = Vec::with_capacity(44100 * 4);
     for i in 0..44100u32 {
         // Simple sine-ish pattern so samples aren't all zero
         let val = ((i % 100) as i16).wrapping_mul(100);
-        writer.write_sample(val).unwrap(); // L
-        writer.write_sample(-val).unwrap(); // R
+        pcm.extend_from_slice(&val.to_le_bytes()); // L
+        pcm.extend_from_slice(&val.wrapping_neg().to_le_bytes()); // R
     }
-    writer.finalize().unwrap();
+    let data_size = pcm.len() as u32;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(44 + pcm.len());
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_size).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    buf.extend_from_slice(&pcm);
+
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(&buf).unwrap();
 }
 
 /// Create a 1-second stereo 16-bit 44100 Hz AIFF file manually.

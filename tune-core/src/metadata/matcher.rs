@@ -241,7 +241,7 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
         return None;
     }
     let client = crate::http::client::shared();
-    let query = format!("artist:\"{name}\"");
+    let query = super::mb_artist_query(name);
     let resp = client
         .get(format!("{MB_API}/artist"))
         .query(&[
@@ -273,7 +273,7 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
 pub async fn batch_match_artist_mbids(
     db: std::sync::Arc<dyn crate::db::backend::DbBackend>,
 ) -> usize {
-    let repo = crate::db::artist_repo::ArtistRepo::with_backend(db);
+    let repo = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
     let artists = repo.list_without_mbid().unwrap_or_default();
 
     if artists.is_empty() {
@@ -283,13 +283,38 @@ pub async fn batch_match_artist_mbids(
 
     tracing::info!(count = artists.len(), "batch_artist_mbid_match_started");
     let mut matched = 0usize;
+    let total = artists.len();
 
-    for (artist_id, name) in &artists {
+    // Publish live progress so the UI can show a bar instead of looking frozen:
+    // this MBID phase throttles to ~1 req/s for MusicBrainz, so a large library
+    // takes many minutes before any image appears (Fabien).
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
+    let write_progress = |processed: usize, matched: usize| {
+        settings
+            .set(
+                "artist_artwork_enrich_result",
+                &serde_json::json!({
+                    "status": "running",
+                    "phase": "mbid",
+                    "processed": processed,
+                    "total": total,
+                    "matched": matched,
+                })
+                .to_string(),
+            )
+            .ok();
+    };
+    write_progress(0, 0);
+
+    for (i, (artist_id, name)) in artists.iter().enumerate() {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         if let Some(mbid) = lookup_artist(name).await {
             repo.update_mbid(*artist_id, &mbid).ok();
             matched += 1;
             tracing::debug!(artist_id, name = %name, mbid = %mbid, "artist_mbid_matched");
+        }
+        if (i + 1) % 5 == 0 || i + 1 == total {
+            write_progress(i + 1, matched);
         }
     }
 

@@ -61,6 +61,13 @@ struct PatchZone {
     /// (empty/failed GetProtocolInfo Sink) — for renderers that decode FLAC but
     /// under-report (Denon Ceol N12).
     dlna_native_flac: Option<bool>,
+    /// When enabled, serve ALAC straight to the renderer (bit-perfect, no FLAC
+    /// transcode). Only for renderers that decode ALAC natively.
+    alac_passthrough: Option<bool>,
+    /// When enabled, transcode lossless to WAV/LPCM (not FLAC) for this DLNA
+    /// renderer — skips the slow FLAC encoder for hi-res and avoids renderers
+    /// whose ALAC decoder pops at start (LHC-56). Overrides alac_passthrough.
+    dlna_lpcm: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -355,11 +362,31 @@ fn build_signal_path(
             r if r >= 5_000_000 => "DSD128",
             _ => "DSD64",
         }
+    } else if let Some(f) = source_format.as_ref() {
+        f.display_name()
     } else {
-        source_format
-            .as_ref()
-            .map(|f| f.display_name())
-            .unwrap_or("Unknown")
+        // A UPnP/NAS media-server source reports its codec as a MIME type or DLNA
+        // profile (e.g. "audio/mp4", "AAC_ISO_320"), not a file extension, so
+        // from_extension() returned None and the signal path showed "Unknown"
+        // (Yves: NAS as source). Recognize the codec from the raw string instead.
+        let l = fmt_str.to_lowercase();
+        if l.contains("aac") || l.contains("mp4") || l.contains("m4a") {
+            "AAC"
+        } else if l.contains("mp3") || l.contains("mpeg") {
+            "MP3"
+        } else if l.contains("flac") {
+            "FLAC"
+        } else if l.contains("alac") {
+            "ALAC"
+        } else if l.contains("wav") {
+            "WAV"
+        } else if l.contains("ogg") || l.contains("vorbis") {
+            "OGG"
+        } else if l.contains("opus") {
+            "OPUS"
+        } else {
+            "Unknown"
+        }
     };
     let is_lossless = source_format.as_ref().is_some_and(|f| f.is_lossless());
 
@@ -403,9 +430,11 @@ fn build_signal_path(
             }
         }
         "oaat" => {
-            // FLAC/WAV/DSD → WAV is lossless; only lossy sources lose quality
+            // Lossless PCM → WAV preserves every bit, but DSD → WAV is a domain
+            // conversion (1-bit sigma-delta decimated to multi-bit PCM), so it is
+            // NOT bit-perfect even though DSD counts as a lossless *format*.
             (
-                is_lossless || !oaat_transcodes,
+                (is_lossless && !is_dsd) || !oaat_transcodes,
                 "OAAT",
                 if oaat_transcodes { "WAV" } else { format_name },
             )
@@ -482,19 +511,24 @@ fn build_signal_path(
         "bit_perfect": true,
     })];
 
-    // Decoder step
-    steps.push(json!({
-        "name": "Decoder",
-        "description": format_name,
-        "bit_perfect": is_lossless,
-    }));
+    // Decoder step. Skipped for DSD: the Source already reads e.g.
+    // "DSD64 2.8 MHz" and the DSD→PCM/FLAC conversion is shown by the Transcoder
+    // step, so a bare "DSD64" decoder line was just a confusing duplicate.
+    if !is_dsd {
+        steps.push(json!({
+            "name": "Decoder",
+            "description": format_name,
+            "bit_perfect": is_lossless,
+        }));
+    }
 
     // Transcoding step (only if transcoding occurs)
     let transcode_active =
         needs_transcode_for_output || oaat_transcodes || output_type == "airplay";
     if transcode_active {
-        // OAAT lossless→WAV preserves all audio data
-        let transcode_lossless = is_oaat && is_lossless;
+        // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
+        // lossy domain conversion (see the "oaat" transport arm above).
+        let transcode_lossless = is_oaat && is_lossless && !is_dsd;
         steps.push(json!({
             "name": "Transcoder",
             "description": format!("{format_name} \u{2192} {output_format_name}"),
@@ -518,7 +552,7 @@ fn build_signal_path(
     if !volume_full {
         steps.push(json!({
             "name": "Volume",
-            "description": format!("{}%", (ps.volume * 100.0).round() as i32),
+            "description": format!("Volume {}%", (ps.volume * 100.0).round() as i32),
             "bit_perfect": true,
         }));
     }
@@ -560,6 +594,11 @@ fn build_signal_path(
 
     Some(json!({
         "bit_perfect": bit_perfect,
+        // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
+        // Distinct from bit_perfect: a lossless source transcoded to another
+        // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
+        // bit-perfect but is still lossless — the UI must not call it "lossy".
+        "lossless": is_lossless,
         "summary": summary,
         "steps": steps,
     }))
@@ -625,6 +664,11 @@ async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 "dlna_native_flac".into(),
                 json!(zone_repo.get_dlna_native_flac(zone_id)),
             );
+            obj.insert(
+                "alac_passthrough".into(),
+                json!(zone_repo.get_alac_passthrough(zone_id)),
+            );
+            obj.insert("dlna_lpcm".into(), json!(zone_repo.get_dlna_lpcm(zone_id)));
             let online = match z.output_type.as_deref() {
                 Some("local") | Some("browser") => true,
                 _ => z
@@ -681,6 +725,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
+                // Expose the queue index too so the client can refresh the
+                // "now playing" highlight on track change without refetching the
+                // whole queue (expensive under a large shuffle queue, #1096).
+                obj.insert("queue_position".into(), json!(ps.queue_position));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
                 let devices = state.scanner.lock().await.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
@@ -697,6 +745,11 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                     "dlna_native_flac".into(),
                     json!(repo.get_dlna_native_flac(id)),
                 );
+                obj.insert(
+                    "alac_passthrough".into(),
+                    json!(repo.get_alac_passthrough(id)),
+                );
+                obj.insert("dlna_lpcm".into(), json!(repo.get_dlna_lpcm(id)));
                 let online = match zone.output_type.as_deref() {
                     Some("local") | Some("browser") => true,
                     _ => zone
@@ -804,6 +857,16 @@ async fn patch_zone(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     }
+    if let Some(passthrough) = body.alac_passthrough {
+        if let Err(e) = repo.update_alac_passthrough(id, passthrough) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Some(lpcm) = body.dlna_lpcm {
+        if let Err(e) = repo.update_dlna_lpcm(id, lpcm) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
     get_zone(State(state), Path(id)).await.into_response()
 }
 
@@ -846,26 +909,11 @@ async fn create_zone(
         }
     }
 
-    // Premium gate: Free tier is limited in zone count
-    let zone_count = ZoneRepo::with_backend(state.backend.clone())
-        .count_online()
-        .unwrap_or(0);
-    if !state.license.check_zone_limit(zone_count).await {
-        let limit = state.license.free_zone_limit();
-        info!(zone_count, limit, "zone_creation_blocked_free_tier");
-        return (
-            StatusCode::PAYMENT_REQUIRED,
-            Json(json!({
-                "error": "premium_required",
-                "feature": "Unlimited Zones",
-                "message": format!("Free tier is limited to {} zones. Upgrade to Tune Premium for unlimited zones.", limit),
-                "current_zones": zone_count,
-                "zone_limit": limit,
-                "upgrade_url": "https://mozaiklabs.fr/pricing"
-            })),
-        )
-            .into_response();
-    }
+    // The free-tier zone cap is enforced at *activation* (first play) in
+    // orchestrator.play(), not at creation: creating/discovering a zone is
+    // always allowed and the zone starts dormant. This avoids blocking a free
+    // user from creating their actual renderer just because auto-discovered
+    // zones filled the old count. See PlaybackOrchestrator::enforce_zone_cap.
 
     // For DLNA/OpenHome zones, ensure the output is registered before persisting
     if let Some(device_id) = output_device_id {

@@ -10,7 +10,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 lofty = { workspace = true }
-id3 = { workspace = true }
 reqwest = { workspace = true }
 quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
@@ -40,7 +39,6 @@ regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
 rubato = { workspace = true }
-hound = { workspace = true }
 unicode-normalization = { workspace = true }
 oaat-core = { workspace = true, optional = true }
 oaat-controller = { workspace = true, optional = true }
