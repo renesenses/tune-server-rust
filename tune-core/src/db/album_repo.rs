@@ -137,12 +137,20 @@ pub mod sql {
     /// Update album date fields using COALESCE so we only fill in
     /// values that are not already set.
     pub fn update_dates<D: SqlDialect>(d: &D) -> String {
+        // `year` is COALESCE'd like the other date fields: it's set at album
+        // creation from the first track that creates the row, but if THAT track's
+        // year was missing (e.g. its tag read errored during the scan) the album
+        // was left with year = NULL forever — no later track back-filled it, so
+        // "sort/filter by year" and the "missing year" list were wrong even though
+        // the files had the year (Bilou, #1106). COALESCE fills NULL from any
+        // track that carries a year, and never overwrites an existing value.
         format!(
-            "UPDATE albums SET original_year = COALESCE(original_year, {}), release_date = COALESCE(release_date, {}), original_date = COALESCE(original_date, {}) WHERE id = {}",
+            "UPDATE albums SET year = COALESCE(year, {}), original_year = COALESCE(original_year, {}), release_date = COALESCE(release_date, {}), original_date = COALESCE(original_date, {}) WHERE id = {}",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
-            d.placeholder(4)
+            d.placeholder(4),
+            d.placeholder(5)
         )
     }
 
@@ -524,17 +532,27 @@ impl AlbumRepo {
     pub fn update_dates(
         &self,
         album_id: i64,
+        year: Option<i32>,
         original_year: Option<i32>,
         release_date: Option<&str>,
         original_date: Option<&str>,
     ) -> Result<(), TuneError> {
         // Skip if all values are None — nothing to update.
-        if original_year.is_none() && release_date.is_none() && original_date.is_none() {
+        if year.is_none()
+            && original_year.is_none()
+            && release_date.is_none()
+            && original_date.is_none()
+        {
             return Ok(());
         }
         let sql = self.dialect_sql(sql::update_dates, sql::update_dates);
-        let params: [&dyn ToSqlValue; 4] =
-            [&original_year, &release_date, &original_date, &album_id];
+        let params: [&dyn ToSqlValue; 5] = [
+            &year,
+            &original_year,
+            &release_date,
+            &original_date,
+            &album_id,
+        ];
         self.db.execute(&sql, &params)?;
         Ok(())
     }
@@ -1565,6 +1583,43 @@ mod tests {
         let desc = repo.list_sorted(100, 0, "title", "desc").unwrap();
         assert_eq!(desc[0].title, "Gamma");
         assert_eq!(desc[2].title, "Alpha");
+    }
+
+    #[test]
+    fn update_dates_backfills_null_year_without_overwriting() {
+        // #1106: album.year is set at creation from the first track's year; if
+        // that read errored (year missing) the album stayed NULL forever. A later
+        // scan of a track that DOES carry the year must back-fill it — but must
+        // never overwrite an album that already has a year.
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+
+        // Album created without a year (as if the creating track's year was lost).
+        let missing = repo.create(&Album::new("Missing".into())).unwrap();
+        assert_eq!(repo.get(missing).unwrap().unwrap().year, None);
+        repo.update_dates(missing, Some(1985), None, None, None)
+            .unwrap();
+        assert_eq!(
+            repo.get(missing).unwrap().unwrap().year,
+            Some(1985),
+            "NULL year must be back-filled from a track that carries it"
+        );
+        // A second track reporting a different year must NOT overwrite it.
+        repo.update_dates(missing, Some(1990), None, None, None)
+            .unwrap();
+        assert_eq!(
+            repo.get(missing).unwrap().unwrap().year,
+            Some(1985),
+            "an existing year must be preserved (COALESCE, not overwrite)"
+        );
+
+        // An album that already has a year is left untouched.
+        let mut has = Album::new("Has".into());
+        has.year = Some(2001);
+        let has = repo.create(&has).unwrap();
+        repo.update_dates(has, Some(1999), None, None, None)
+            .unwrap();
+        assert_eq!(repo.get(has).unwrap().unwrap().year, Some(2001));
     }
 
     #[test]
