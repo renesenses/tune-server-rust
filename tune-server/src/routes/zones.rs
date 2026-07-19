@@ -725,6 +725,10 @@ async fn get_zone(State(state): State<AppState>, Path(id): Path<i64>) -> impl In
                 obj.insert("current_track".into(), json!(ps.now_playing));
                 obj.insert("position_ms".into(), json!(ps.position_ms));
                 obj.insert("queue_length".into(), json!(ps.queue_length));
+                // Expose the queue index too so the client can refresh the
+                // "now playing" highlight on track change without refetching the
+                // whole queue (expensive under a large shuffle queue, #1096).
+                obj.insert("queue_position".into(), json!(ps.queue_position));
                 obj.insert("volume".into(), json!(zone.volume as f64 / 100.0));
                 let devices = state.scanner.lock().await.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
