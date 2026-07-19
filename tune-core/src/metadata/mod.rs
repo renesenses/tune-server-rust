@@ -1011,9 +1011,15 @@ fn dsf_dff_fallback(path: &Path) -> Option<TrackMetadata> {
         )
     };
 
-    // Fall back to filename/directory for fields the ID3v2 tag didn't provide
-    let title = title.or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
-    let album = album.or_else(|| {
+    // Fall back to filename/directory for fields the ID3v2 tag didn't provide.
+    // Treat a present-but-empty/whitespace tag as absent: a file whose ALBUM tag
+    // is "" (not missing) otherwise produced a blank, untitled album that no
+    // amount of re-scanning could name (Bilou #1093). `filter` drops the empty
+    // value so the folder-name fallback kicks in.
+    let title = title
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()));
+    let album = album.filter(|s| !s.trim().is_empty()).or_else(|| {
         path.parent()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().to_string())
