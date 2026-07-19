@@ -47,8 +47,19 @@ impl PostgresDb {
         // already-migrated DB. The albums list sorts "added_at" via a LEFT JOIN
         // on file_first_seen, so its absence made the query fail on .15 prod
         // (`relation "file_first_seen" does not exist`) → empty library → the
-        // "black screen" reported on the iOS/Android clients. CREATE TABLE IF NOT
-        // EXISTS is idempotent; add new tables here like the columns below.
+        // "black screen" reported on the iOS/Android clients. Same class again in
+        // v0.9: the unified `queue_items` table (replacing play_queue/streaming_queue)
+        // was added to PG_FULL_SCHEMA only, so .15 prod raised `relation "queue_items"
+        // does not exist` on set_queue → no sound. Its CREATE is included below.
+        // NOTE the column types: the unified-queue queries do integer arithmetic on
+        // `position`/`is_current` (`position - 1`, `COALESCE(MAX(position), -1)`,
+        // `is_current = 1`, `ORDER BY position`), which PG rejects on TEXT columns
+        // (`COALESCE types text and integer cannot be matched`). The legacy play_queue /
+        // streaming_queue on .15 prod are BIGINT, so queue_items must be BIGINT too. No
+        // data copy here: this runs every startup, and an on-empty copy would resurrect a
+        // stale queue from play_queue/streaming_queue after a user clears their queue. The
+        // one-time copy lives in the SQLite→PG migrator (pg_migrate.rs) instead.
+        // CREATE TABLE IF NOT EXISTS is idempotent; add new tables here like the columns below.
         const ENSURE_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL);\
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;\
@@ -65,7 +76,22 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (\
     created_at TEXT,\
     UNIQUE(profile_id, item_type, service, service_id)\
 );\
-ALTER TABLE streaming_favorites ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')::text;";
+ALTER TABLE streaming_favorites ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')::text;\
+CREATE SEQUENCE IF NOT EXISTS queue_items_id_seq;\
+CREATE TABLE IF NOT EXISTS queue_items (\
+    id BIGINT PRIMARY KEY DEFAULT nextval('queue_items_id_seq'),\
+    zone_id BIGINT NOT NULL,\
+    position BIGINT NOT NULL DEFAULT 0,\
+    is_current BIGINT DEFAULT 0,\
+    track_id BIGINT,\
+    source TEXT,\
+    source_id TEXT,\
+    title TEXT,\
+    artist TEXT,\
+    album TEXT,\
+    cover_url TEXT,\
+    duration_ms BIGINT DEFAULT 0\
+);";
         if let Err(e) = sqlx::raw_sql(ENSURE_TABLES).execute(&self.pool).await {
             warn!(error = %e, "pg_ensure_tables_failed");
         }
