@@ -1150,7 +1150,8 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
     info!(zone_id = zone_id, "api_next_requested");
     let current = state.playback.get_state(zone_id).await;
 
-    let Some(next_pos) = tune_core::poller::PositionPoller::next_position(&current) else {
+    // Manual skip: ignore repeat-one so the button always changes track (#1110).
+    let Some(next_pos) = tune_core::poller::PositionPoller::next_position_manual(&current) else {
         let device_id = get_zone_device_id(&state, zone_id);
         state.orchestrator.stop(zone_id, device_id.as_deref()).await;
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();

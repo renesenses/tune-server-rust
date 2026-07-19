@@ -1456,11 +1456,33 @@ impl PositionPoller {
         }
     }
 
+    /// Next-track decision for AUTOMATIC advance (poller gapless auto-advance
+    /// and prefetch): honours repeat-one by replaying the current position.
     pub fn next_position(zone_state: &crate::playback::ZoneState) -> Option<i64> {
+        Self::next_position_inner(zone_state, false)
+    }
+
+    /// Next-track decision for a MANUAL skip (the `next` button). A manual skip
+    /// is an explicit request for a *different* track, so it ignores repeat-one
+    /// — treating it as repeat-all (advance, wrapping at the end) instead of
+    /// replaying the current track. Matches Spotify/Apple Music: repeat-one only
+    /// governs automatic end-of-track advance, never the next button (#1110).
+    pub fn next_position_manual(zone_state: &crate::playback::ZoneState) -> Option<i64> {
+        Self::next_position_inner(zone_state, true)
+    }
+
+    fn next_position_inner(zone_state: &crate::playback::ZoneState, manual: bool) -> Option<i64> {
         if zone_state.queue_length == 0 {
             return None;
         }
-        if zone_state.repeat == RepeatMode::One {
+        // A manual skip overrides repeat-one (see next_position_manual). For the
+        // automatic path `repeat` is unchanged, so behaviour is identical.
+        let repeat = if manual && zone_state.repeat == RepeatMode::One {
+            RepeatMode::All
+        } else {
+            zone_state.repeat
+        };
+        if repeat == RepeatMode::One {
             return Some(zone_state.queue_position);
         }
 
@@ -1478,7 +1500,7 @@ impl PositionPoller {
                 return zone_state.shuffle_order.first().map(|&i| i as i64);
             }
             if next_idx as usize >= zone_state.shuffle_order.len() {
-                return match zone_state.repeat {
+                return match repeat {
                     RepeatMode::All => zone_state.shuffle_order.first().map(|&i| i as i64),
                     _ => None, // repeat-off: every track played once → stop
                 };
@@ -1491,7 +1513,7 @@ impl PositionPoller {
 
         // Non-shuffle (or shuffle order not yet materialised — falls back to
         // sequential until the next update_queue_info rebuilds the order).
-        match zone_state.repeat {
+        match repeat {
             RepeatMode::One => Some(zone_state.queue_position),
             RepeatMode::All => Some((zone_state.queue_position + 1) % zone_state.queue_length),
             RepeatMode::Off => {
@@ -1885,6 +1907,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PositionPoller::next_position(&state), Some(2));
+    }
+
+    #[test]
+    fn next_position_manual_ignores_repeat_one() {
+        // A manual skip under repeat-one must advance, not replay (#1110).
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 2,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        // Auto path still replays…
+        assert_eq!(PositionPoller::next_position(&state), Some(2));
+        // …but the manual button moves to the next track.
+        assert_eq!(PositionPoller::next_position_manual(&state), Some(3));
+    }
+
+    #[test]
+    fn next_position_manual_repeat_one_wraps_at_end() {
+        // Manual skip on the last track under repeat-one wraps to the start
+        // (treated as repeat-all) rather than dead-ending.
+        let state = crate::playback::ZoneState {
+            state: PlayState::Playing,
+            queue_position: 4,
+            queue_length: 5,
+            repeat: RepeatMode::One,
+            shuffle: false,
+            ..Default::default()
+        };
+        assert_eq!(PositionPoller::next_position_manual(&state), Some(0));
     }
 
     #[test]
