@@ -341,8 +341,6 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
     // endpoint (onboard "HDA ..." codecs) more than once with an identical name
     // AND identical capabilities; those true duplicates are collapsed so they
     // don't spawn a phantom second zone (Elie).
-    #[cfg(not(target_os = "linux"))]
-    let mut seen_signatures = std::collections::HashSet::new();
     // On Linux, PipeWire re-exposes the SAME physical output many times with
     // *different* reported capabilities (e.g. "ALC255 Analog" as 2ch/48k, then
     // 32ch/384k, then a stereo fallback), so the (name, caps) signature above
@@ -409,10 +407,8 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     };
 
                 let is_default = raw_name == default_name;
-                // caps_reliable only gates the non-Linux collapse below; the
-                // Linux branch collapses by name regardless, so discard it there
-                // to avoid an unused-variable warning.
-                #[cfg(target_os = "linux")]
+                // caps_reliable was only read by the removed (name, caps) collapse
+                // (Linux collapses by name; Windows/macOS now keep every device).
                 let _ = caps_reliable;
 
                 // Collapse duplicates. On Linux PipeWire lists the same physical
@@ -440,22 +436,19 @@ fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    // Collapse true duplicates (same name AND same caps = same
-                    // physical device). Genuinely different devices that merely
-                    // share a name (e.g. two USB DACs) differ in caps and fall
-                    // through to the disambiguation below, staying selectable.
-                    //
-                    // Only collapse when caps are RELIABLE. When they came from
-                    // the last-resort assumed fallback, a generic-named USB DAC
-                    // and the onboard output both report `(2, [44100,48000])` on
-                    // Windows and would wrongly collapse, dropping the DAC
-                    // entirely (Alain, #1084). Logged at info! so the collapse is
-                    // visible in normal diagnostics.
-                    let signature = (raw_name.clone(), max_channels, sample_rates.clone());
-                    if caps_reliable && !seen_signatures.insert(signature) {
-                        info!(device = %raw_name, "local_audio_device_skipped_duplicate");
-                        continue;
-                    }
+                    // Windows/macOS: do NOT collapse — always disambiguate below.
+                    // Two genuinely different physical devices can share BOTH the
+                    // name AND the caps: Alain's Ugreen card and his USB DAC both
+                    // enumerate as "Speakers" with identical reliable caps, so the
+                    // old (name, caps) collapse dropped the DAC entirely and it
+                    // could never get a zone (#1084) — even after #654, because
+                    // its caps are real, not the assumed fallback. cpal exposes no
+                    // unique WASAPI endpoint id to tell a true duplicate from two
+                    // same-named devices, so keep every entry and disambiguate
+                    // ("Speakers (2)"), restoring the pre-0.8.314 behaviour Alain
+                    // had on 0.8.307. A rare truly-duplicated onboard endpoint
+                    // then merely shows twice (harmless — both select the same
+                    // output) instead of a real device silently vanishing.
                 }
 
                 // Disambiguate duplicate device names (common on Windows WASAPI
