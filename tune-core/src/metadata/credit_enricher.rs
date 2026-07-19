@@ -177,7 +177,7 @@ pub async fn lookup_artist_instrument(
     client: &reqwest::Client,
     artist_name: &str,
 ) -> Option<String> {
-    let query = format!("artist:\"{artist_name}\"");
+    let query = super::mb_artist_query(artist_name);
     let resp = client
         .get(format!("{MB_API}/artist"))
         .query(&[

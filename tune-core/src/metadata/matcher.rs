@@ -241,7 +241,7 @@ pub async fn lookup_artist(name: &str) -> Option<String> {
         return None;
     }
     let client = crate::http::client::shared();
-    let query = format!("artist:\"{name}\"");
+    let query = super::mb_artist_query(name);
     let resp = client
         .get(format!("{MB_API}/artist"))
         .query(&[
