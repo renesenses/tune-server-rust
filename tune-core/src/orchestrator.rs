@@ -4384,6 +4384,10 @@ impl PlaybackOrchestrator {
             let track_repo = crate::db::track_repo::TrackRepo::with_backend(self.db.clone());
             let track = track_repo.get(track_id).ok().flatten();
             let cover_path = track.as_ref().and_then(|t| t.cover_path.clone());
+            // Audio-format fields (format/sample_rate/bit_depth/genre/year) come
+            // from the library row via `from_track` (single source of the
+            // source-over-output bit-depth rule); display fields come from the
+            // queue-entry cache and source is pinned local.
             crate::playback::NowPlaying {
                 track_id: Some(track_id),
                 title: entry.title.clone().unwrap_or_default(),
@@ -4393,12 +4397,10 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
-                stream_id: None,
-                format: track.as_ref().and_then(|t| t.format.clone()),
-                sample_rate: track.as_ref().and_then(|t| t.sample_rate.map(|v| v as u32)),
-                bit_depth: track.as_ref().and_then(|t| t.bit_depth.map(|v| v as u32)),
-                genre: track.as_ref().and_then(|t| t.genre.clone()),
-                year: track.as_ref().and_then(|t| t.year),
+                ..track
+                    .as_ref()
+                    .map(crate::playback::NowPlaying::from_track)
+                    .unwrap_or_default()
             }
         } else {
             let source = entry

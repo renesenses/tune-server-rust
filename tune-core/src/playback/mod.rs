@@ -38,6 +38,42 @@ pub struct NowPlaying {
     pub year: Option<i32>,
 }
 
+impl NowPlaying {
+    /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
+    /// to a local `NowPlaying`.
+    ///
+    /// Centralises the audio-metadata fields (`format`, `sample_rate`,
+    /// `bit_depth`, `genre`, `year`) so every "now playing" surface reports the
+    /// **source** resolution — the file's real depth (16/24) from the library
+    /// row — rather than the transcoded output format. Local playback forces a
+    /// 32-bit WAV to the DAC; without this, the label flickered "32-bit then
+    /// correct to 16" on the first tracks (see `play_inner` and the gapless
+    /// `advance_queue_metadata` path).
+    ///
+    /// `source`/`source_id`/`cover_path` are taken verbatim from the row; callers
+    /// that need URL-resolved cover art or a zone-derived source override those
+    /// fields on the returned value. `stream_id` is always `None` (local rows are
+    /// not streamed sessions).
+    pub fn from_track(track: &crate::db::models::Track) -> Self {
+        Self {
+            track_id: track.id,
+            title: track.title.clone(),
+            artist_name: track.artist_name.clone(),
+            album_title: track.album_title.clone(),
+            cover_path: track.cover_path.clone(),
+            duration_ms: track.duration_ms,
+            source: track.source.clone(),
+            source_id: track.source_id.clone(),
+            stream_id: None,
+            format: track.format.clone(),
+            sample_rate: track.sample_rate.map(|v| v as u32),
+            bit_depth: track.bit_depth.map(|v| v as u32),
+            genre: track.genre.clone(),
+            year: track.year,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZoneState {
     pub zone_id: i64,
@@ -557,5 +593,58 @@ mod tests {
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn from_track_maps_all_metadata_fields() {
+        let mut track = crate::db::models::Track::new("Blue in Green".into());
+        track.id = Some(42);
+        track.artist_name = Some("Miles Davis".into());
+        track.album_title = Some("Kind of Blue".into());
+        track.cover_path = Some("/covers/kob.jpg".into());
+        track.duration_ms = 337_000;
+        track.source = "local".into();
+        track.source_id = Some("row-42".into());
+        track.format = Some("flac".into());
+        track.sample_rate = Some(44_100);
+        track.bit_depth = Some(24);
+        track.genre = Some("Jazz".into());
+        track.year = Some(1959);
+
+        let np = NowPlaying::from_track(&track);
+        assert_eq!(np.track_id, Some(42));
+        assert_eq!(np.title, "Blue in Green");
+        assert_eq!(np.artist_name.as_deref(), Some("Miles Davis"));
+        assert_eq!(np.album_title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(np.cover_path.as_deref(), Some("/covers/kob.jpg"));
+        assert_eq!(np.duration_ms, 337_000);
+        assert_eq!(np.source, "local");
+        assert_eq!(np.source_id.as_deref(), Some("row-42"));
+        // Local rows are not streamed sessions.
+        assert_eq!(np.stream_id, None);
+        assert_eq!(np.format.as_deref(), Some("flac"));
+        // i32 → u32 casts on the audio-format fields.
+        assert_eq!(np.sample_rate, Some(44_100));
+        assert_eq!(np.bit_depth, Some(24));
+        assert_eq!(np.genre.as_deref(), Some("Jazz"));
+        assert_eq!(np.year, Some(1959));
+    }
+
+    #[test]
+    fn from_track_preserves_source_over_output_bit_depth() {
+        // The source depth (24) must survive verbatim — the constructor never
+        // substitutes the 32-bit WAV output depth used for local DAC playback.
+        let mut track = crate::db::models::Track::new("t".into());
+        track.bit_depth = Some(24);
+        track.sample_rate = Some(96_000);
+        assert_eq!(NowPlaying::from_track(&track).bit_depth, Some(24));
+        assert_eq!(NowPlaying::from_track(&track).sample_rate, Some(96_000));
+
+        // Missing audio metadata maps to None, not a fabricated default.
+        let bare = crate::db::models::Track::new("bare".into());
+        let np = NowPlaying::from_track(&bare);
+        assert_eq!(np.bit_depth, None);
+        assert_eq!(np.sample_rate, None);
+        assert_eq!(np.format, None);
     }
 }
