@@ -14,7 +14,7 @@ use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::models::Album;
 use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
-use tune_core::db::track_repo::TrackRepo;
+use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
 use super::Pagination;
 
@@ -219,9 +219,10 @@ pub(super) async fn album_tracks(
     // forwards it here so the album detail shows only the matching tracks
     // (Sergio: a Hi-Res/FLAC filter must not reveal the album's MP3/44.1
     // tracks). With no filter this is identical to list_by_album.
-    let items = repo
-        .list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
-        .unwrap_or_default();
+    let items = dedup_display_tracks(
+        repo.list_by_album_filtered(id, f.format.as_deref(), f.quality.as_deref())
+            .unwrap_or_default(),
+    );
     Json(json!(items))
 }
 
