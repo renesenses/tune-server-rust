@@ -463,6 +463,84 @@ fn parse_range_start(range: &str) -> Option<u64> {
 
 // ─── HTTPS→HTTP proxy ───────────────────────────────────────────
 
+/// Max number of transparent upstream re-connections after a mid-stream
+/// body error before we give up and end the response.
+const PROXY_MAX_RESUMES: u32 = 5;
+
+/// Build a body that streams `initial` chunks to the client and, on a
+/// mid-stream body error (reqwest "error decoding response body" — a dropped
+/// Akamai keep-alive connection, NOT a content-decode issue since the client
+/// has no compression features), transparently re-fetches the CDN from the
+/// exact byte offset reached and continues. The renderer never sees the drop,
+/// so Hi-Res tracks no longer stop mid-file (#1136).
+///
+/// Bytes are streamed verbatim — no decoding or transformation — so the audio
+/// stays byte-exact. `abs_offset` is the absolute file offset of the first
+/// byte of `initial` (0 for a full fetch, N for a `bytes=N-` resume).
+fn resumable_proxy_body(
+    client: &'static reqwest::Client,
+    upstream_url: String,
+    initial: reqwest::Response,
+    abs_offset: u64,
+) -> Body {
+    Body::from_stream(async_stream::stream! {
+        use futures_util::StreamExt;
+        let mut resp = initial;
+        // Absolute file offset of the next byte we expect to yield.
+        let mut pos = abs_offset;
+        let mut resumes: u32 = 0;
+        loop {
+            let mut stream = resp.bytes_stream();
+            let mut clean_eof = true;
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        pos += chunk.len() as u64;
+                        yield Ok::<_, std::io::Error>(chunk);
+                    }
+                    Some(Err(e)) => {
+                        warn!(error = %e, pos, resumes, "proxy_chunk_error");
+                        clean_eof = false;
+                        break;
+                    }
+                    None => break, // clean end of body
+                }
+            }
+            if clean_eof {
+                break;
+            }
+            if resumes >= PROXY_MAX_RESUMES {
+                warn!(pos, "proxy_resume_giveup");
+                break;
+            }
+            resumes += 1;
+            // Backoff before reconnecting: the CDN just dropped us.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                200u64 * u64::from(resumes),
+            ))
+            .await;
+            let req = client
+                .get(&upstream_url)
+                .header("Accept-Encoding", "identity")
+                .header("Range", format!("bytes={pos}-"));
+            match req.send().await {
+                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    info!(pos, resumes, "proxy_resume_reconnect_206");
+                    resp = r;
+                }
+                Ok(r) => {
+                    warn!(status = %r.status(), pos, "proxy_resume_bad_status");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, pos, "proxy_upstream_error");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 async fn proxy_stream(
     upstream_url: &str,
     info: &StreamInfo,
@@ -503,7 +581,11 @@ async fn proxy_stream(
         .and_then(parse_range_start)
         .filter(|&n| n >= RESUME_RANGE_THRESHOLD);
 
-    let mut upstream_req = client.get(upstream_url);
+    // Ask the CDN for the raw bytes — `identity` disables any upstream
+    // content-coding so we proxy the FLAC verbatim (byte-exact audio).
+    let mut upstream_req = client
+        .get(upstream_url)
+        .header("Accept-Encoding", "identity");
     if let Some(start) = resume_start {
         upstream_req = upstream_req.header("Range", format!("bytes={start}-"));
         info!(url = upstream_url, start, "proxy_forward_resume_range");
@@ -579,20 +661,7 @@ async fn proxy_stream(
         }
         info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
 
-        let body = Body::from_stream(async_stream::stream! {
-            let mut stream = upstream_resp.bytes_stream();
-            use futures_util::StreamExt;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                    Err(e) => {
-                        warn!(error = %e, "proxy_chunk_error");
-                        break;
-                    }
-                }
-            }
-        });
-
+        let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, start);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -632,20 +701,7 @@ async fn proxy_stream(
             HeaderValue::from_str(&format!("bytes 0-{}/{}", cl - 1, cl)).unwrap(),
         );
 
-        let body = Body::from_stream(async_stream::stream! {
-            let mut stream = upstream_resp.bytes_stream();
-            use futures_util::StreamExt;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                    Err(e) => {
-                        warn!(error = %e, "proxy_chunk_error");
-                        break;
-                    }
-                }
-            }
-        });
-
+        let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, 0);
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -653,20 +709,7 @@ async fn proxy_stream(
         headers.insert("Content-Length", HeaderValue::from(cl));
     }
 
-    let body = Body::from_stream(async_stream::stream! {
-        let mut stream = upstream_resp.bytes_stream();
-        use futures_util::StreamExt;
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(chunk) => yield Ok::<_, std::io::Error>(chunk),
-                Err(e) => {
-                    warn!(error = %e, "proxy_chunk_error");
-                    break;
-                }
-            }
-        }
-    });
-
+    let body = resumable_proxy_body(client, upstream_url.to_string(), upstream_resp, 0);
     (StatusCode::OK, headers, body).into_response()
 }
 
