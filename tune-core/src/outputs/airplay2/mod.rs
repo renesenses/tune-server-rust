@@ -13,6 +13,11 @@ use tracing::{debug, info, warn};
 
 use crate::outputs::traits::{OutputStatus, OutputTarget, PlayMedia, TransportState};
 
+/// HomeKit-style PIN pairing (pair-setup SRP-6a + pair-verify Curve25519).
+/// Phase-1 scaffold: pure, unit-tested crypto/TLV8 building blocks; the live
+/// handshakes land in a later increment (see `pairing::run_pair_setup`).
+pub mod pairing;
+
 const DAEMON_BINARY: &str = "airplay-daemon";
 
 pub struct Airplay2Output {

@@ -110,6 +110,64 @@ impl SettingsRepo {
             })
             .collect())
     }
+
+    // --- AirPlay 2 pairing credentials (keyed per device_id) --------------
+    //
+    // Long-term secrets from a successful HomeKit-style pairing: our controller
+    // Ed25519 seed + the accessory's long-term public key (`AccessoryLTPK`) +
+    // its pairing identifier. Stored as JSON under `airplay2_pairing:<id>` in
+    // the same key/value settings table (no schema change needed). The values
+    // are populated by the pair-setup handshake in a later increment; the
+    // storage/accessor plumbing lives here now.
+
+    /// Persist pairing credentials for a device.
+    pub fn set_airplay_pairing(
+        &self,
+        device_id: &str,
+        creds: &AirplayPairingRecord,
+    ) -> Result<(), String> {
+        let json =
+            serde_json::to_string(creds).map_err(|e| format!("serialize airplay pairing: {e}"))?;
+        self.set(&airplay_pairing_key(device_id), &json)
+    }
+
+    /// Load pairing credentials for a device, if we have paired with it.
+    pub fn get_airplay_pairing(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<AirplayPairingRecord>, String> {
+        match self.get(&airplay_pairing_key(device_id))? {
+            None => Ok(None),
+            Some(json) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| format!("deserialize airplay pairing: {e}")),
+        }
+    }
+
+    /// Forget a device's pairing (e.g. user re-pairs or removes it).
+    pub fn delete_airplay_pairing(&self, device_id: &str) -> Result<(), String> {
+        self.delete(&airplay_pairing_key(device_id))
+    }
+}
+
+/// Settings key namespace for AirPlay 2 pairing records.
+fn airplay_pairing_key(device_id: &str) -> String {
+    format!("airplay2_pairing:{device_id}")
+}
+
+/// Stored AirPlay 2 / HomeKit pairing credentials for one accessory.
+///
+/// Byte arrays are hex-encoded strings so the record is human-readable JSON in
+/// the settings table. Kept independent of `tune_core::outputs::airplay2` so the
+/// DB layer has no dependency on the crypto module.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AirplayPairingRecord {
+    /// Our controller Ed25519 seed (32 bytes, hex) — secret.
+    pub our_ed25519_seed_hex: String,
+    /// The accessory's long-term public key (`AccessoryLTPK`, 32 bytes, hex).
+    pub accessory_ltpk_hex: String,
+    /// The accessory pairing identifier (its `AccessoryPairingID` string).
+    pub accessory_id: String,
 }
 
 #[cfg(test)]
@@ -233,6 +291,44 @@ mod tests {
         assert_eq!(
             sql::delete_by_key(&d),
             "DELETE FROM settings WHERE key = $1"
+        );
+    }
+
+    #[test]
+    fn airplay_pairing_roundtrip_per_device() {
+        let repo = fresh_repo();
+        let dev = "airplay2:AA-BB-CC";
+
+        // Nothing stored yet.
+        assert!(repo.get_airplay_pairing(dev).unwrap().is_none());
+
+        let rec = AirplayPairingRecord {
+            our_ed25519_seed_hex: "00".repeat(32),
+            accessory_ltpk_hex: "ab".repeat(32),
+            accessory_id: "AABBCCDDEEFF".into(),
+        };
+        repo.set_airplay_pairing(dev, &rec).unwrap();
+
+        // Round-trips to the exact same record.
+        assert_eq!(repo.get_airplay_pairing(dev).unwrap().unwrap(), rec);
+
+        // A different device is isolated.
+        assert!(
+            repo.get_airplay_pairing("airplay2:other")
+                .unwrap()
+                .is_none()
+        );
+
+        // Deletion forgets it.
+        repo.delete_airplay_pairing(dev).unwrap();
+        assert!(repo.get_airplay_pairing(dev).unwrap().is_none());
+    }
+
+    #[test]
+    fn airplay_pairing_key_is_namespaced() {
+        assert_eq!(
+            airplay_pairing_key("airplay2:x"),
+            "airplay2_pairing:airplay2:x"
         );
     }
 }

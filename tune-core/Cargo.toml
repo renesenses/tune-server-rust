@@ -51,6 +51,16 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], 
 rustls = "0.23"
 webpki-roots = "0.26"
 
+# AirPlay 2 HomeKit-style pairing (pair-setup SRP-6a + pair-verify Curve25519).
+# All pinned to the RustCrypto digest 0.10 / sha2 0.10 generation used across
+# the workspace so no duplicate hashing stack is pulled in.
+srp = "0.6"
+hkdf = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
 objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }

@@ -419,19 +419,45 @@ fn service_to_device(
         device.mac_address = Some(mac.to_string());
     }
 
-    // AirPlay version detection
+    // AirPlay version detection + features/flags parsing.
     if output_type == OutputType::Airplay {
-        let version = if info.get_property_val_str("features").is_some() {
-            "2"
-        } else {
-            "1"
-        };
+        let features_raw = info.get_property_val_str("features");
+        let version = if features_raw.is_some() { "2" } else { "1" };
         device.airplay_version = Some(version.to_string());
         caps.insert("airplay".to_string(), serde_json::Value::Bool(true));
         caps.insert(
             "airplay_version".to_string(),
             serde_json::Value::String(version.to_string()),
         );
+
+        // Parse the AirPlay `features` bitmask (and `flags`) so callers can tell
+        // whether the receiver demands a HomeKit-style pair-setup before it will
+        // accept an RTSP session (Apple TV, Samsung/LG TVs, HomePod, ...).
+        if let Some(raw) = features_raw {
+            if let Some(bits) = parse_airplay_features(raw) {
+                caps.insert(
+                    "airplay_features".to_string(),
+                    serde_json::Value::String(format!("0x{bits:016X}")),
+                );
+                let needs_pairing = airplay_requires_pairing(bits);
+                caps.insert(
+                    "airplay_requires_pairing".to_string(),
+                    serde_json::Value::Bool(needs_pairing),
+                );
+            }
+        }
+        // The `flags` TXT independently signals "PIN required" (bit 9 / 0x200)
+        // on many receivers even when features are ambiguous.
+        if let Some(flags_raw) = info.get_property_val_str("flags") {
+            if let Some(flags) = parse_hex_u64(flags_raw) {
+                if flags & AIRPLAY_FLAG_PIN_REQUIRED != 0 {
+                    caps.insert(
+                        "airplay_requires_pairing".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
+        }
     }
 
     // BluOS capabilities
@@ -549,9 +575,106 @@ fn detect_local_subnet() -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AirPlay `features` / `flags` bitmask parsing.
+// ---------------------------------------------------------------------------
+
+/// `flags` TXT bit meaning "the receiver requires a PIN / password".
+/// (RAOP/AirPlay `flags`, bit 9.)
+const AIRPLAY_FLAG_PIN_REQUIRED: u64 = 0x200;
+
+// AirPlay feature bits relevant to whether pairing is mandatory. The `features`
+// value is a 64-bit mask; the low 32 bits are the first word and the high 32
+// bits the second (see the `features` TXT record used by RAOP/AirPlay 2).
+//
+//   bit 26 — SupportsSystemPairing / PairSetupAndMFi
+//   bit 27 — SupportsUnifiedPairSetupAndMFi
+//   bit 46 — SupportsCoreUtilsPairingAndEncryption
+//   bit 51 — SupportsUnifiedPairVerify (AirPlay 2 access control)
+const FT_BIT_SYSTEM_PAIRING: u64 = 1 << 26;
+const FT_BIT_UNIFIED_PAIR_SETUP: u64 = 1 << 27;
+const FT_BIT_COREUTILS_PAIR_ENC: u64 = 1 << 46;
+const FT_BIT_UNIFIED_PAIR_VERIFY: u64 = 1 << 51;
+
+/// Parse a single hex or decimal integer TXT value like `0x200` or `514`.
+fn parse_hex_u64(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse the AirPlay `features` TXT record into a single 64-bit mask.
+///
+/// The record appears in two shapes in the wild:
+///   * one word:  `0x5A7FFFF7`
+///   * two words: `0x5A7FFFF7,0x1E`  (low word first, high word second)
+/// Returns `None` if nothing parses.
+pub fn parse_airplay_features(raw: &str) -> Option<u64> {
+    let mut parts = raw.split(',');
+    let low = parse_hex_u64(parts.next()?.trim())?;
+    match parts.next() {
+        Some(high_str) => {
+            let high = parse_hex_u64(high_str.trim())?;
+            Some((high << 32) | (low & 0xFFFF_FFFF))
+        }
+        None => Some(low),
+    }
+}
+
+/// Whether the parsed `features` mask indicates the receiver mandates a
+/// HomeKit-style pair-setup/pair-verify before accepting an RTSP session.
+pub fn airplay_requires_pairing(features: u64) -> bool {
+    features
+        & (FT_BIT_SYSTEM_PAIRING
+            | FT_BIT_UNIFIED_PAIR_SETUP
+            | FT_BIT_COREUTILS_PAIR_ENC
+            | FT_BIT_UNIFIED_PAIR_VERIFY)
+        != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_features_single_and_double_word() {
+        // Single 32-bit word.
+        assert_eq!(parse_airplay_features("0x5A7FFFF7"), Some(0x5A7F_FFF7));
+        // Two words: high word shifted into bits 32..63.
+        assert_eq!(
+            parse_airplay_features("0x5A7FFFF7,0x1E"),
+            Some((0x1E << 32) | 0x5A7F_FFF7)
+        );
+        // Decimal fallback.
+        assert_eq!(parse_airplay_features("514"), Some(514));
+        // Garbage → None.
+        assert_eq!(parse_airplay_features("nope"), None);
+    }
+
+    #[test]
+    fn features_pairing_bit_detection() {
+        // Bit 27 set → requires pairing (typical AirPlay 2 receiver / TV).
+        let with_pairing = FT_BIT_UNIFIED_PAIR_SETUP | 0xFF;
+        assert!(airplay_requires_pairing(with_pairing));
+        // No pairing bits → legacy AirPlay 1, no pairing.
+        assert!(!airplay_requires_pairing(0x0000_00FF));
+        // Bit 51 (high word) also triggers.
+        assert!(airplay_requires_pairing(FT_BIT_UNIFIED_PAIR_VERIFY));
+
+        // End-to-end via the string parser: a two-word features value whose
+        // high word carries bit 51 (bit 19 of the high word).
+        let raw = format!("0x000000FF,0x{:X}", 1u64 << 19);
+        let bits = parse_airplay_features(&raw).unwrap();
+        assert!(airplay_requires_pairing(bits));
+    }
+
+    #[test]
+    fn pin_flag_constant() {
+        assert_eq!(AIRPLAY_FLAG_PIN_REQUIRED, 0x200);
+    }
 
     #[test]
     fn service_constants_end_with_local() {

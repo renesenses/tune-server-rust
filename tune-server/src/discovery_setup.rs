@@ -413,13 +413,47 @@ pub fn spawn_mdns_handler(state: &AppState) -> Option<tune_core::discovery::mdns
                                 info!(name = %dev.name, "airplay2_output_registered");
                                 (Some(Box::new(ap2)), "airplay2")
                             } else {
-                                let ap = tune_core::outputs::airplay::AirplayOutput::new(
-                                    dev.name.clone(),
-                                    dev.id.clone(),
-                                    dev.host.clone(),
-                                    dev.port,
-                                );
-                                (Some(Box::new(ap)), "airplay")
+                                // Does this receiver mandate HomeKit-style
+                                // pair-setup? (Apple TV / Samsung / LG TVs …)
+                                // Parsed from the `features`/`flags` TXT in
+                                // discovery/mdns.rs.
+                                let requires_pairing = dev
+                                    .capabilities
+                                    .get("airplay_requires_pairing")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+
+                                if requires_pairing {
+                                    // Previously we silently fell back to the
+                                    // no-auth legacy AirplayOutput here, which
+                                    // sends an unauthenticated RTSP ANNOUNCE the
+                                    // TV rejects with 403. Do NOT do that.
+                                    //
+                                    // TODO(phase2): once native pair-setup /
+                                    // pair-verify (tune_core::outputs::airplay2
+                                    // ::pairing) is wired, look up stored
+                                    // credentials via SettingsRepo keyed by
+                                    // dev.id; if paired, register an encrypted
+                                    // AirPlay 2 output; if not, surface a
+                                    // "needs pairing" prompt to the UI. For now
+                                    // we register no output and log, rather than
+                                    // emit a doomed ANNOUNCE.
+                                    tracing::warn!(
+                                        name = %dev.name,
+                                        host = %dev.host,
+                                        "airplay_needs_pairing: receiver requires HomeKit pair-setup; \
+                                         skipping no-auth legacy path (native pairing lands in phase 2)"
+                                    );
+                                    (None, "airplay-needs-pairing")
+                                } else {
+                                    let ap = tune_core::outputs::airplay::AirplayOutput::new(
+                                        dev.name.clone(),
+                                        dev.id.clone(),
+                                        dev.host.clone(),
+                                        dev.port,
+                                    );
+                                    (Some(Box::new(ap)), "airplay")
+                                }
                             }
                         }
                         OutputType::Bluos => {
