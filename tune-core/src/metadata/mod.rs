@@ -149,12 +149,20 @@ pub fn normalize_genre(genre: &str) -> String {
         }
     }
 
-    // Handle slash-separated compound genres like "Folk/Rock"
+    // Handle slash-separated compound genres like "Folk/Rock", and title-case
+    // each hyphen-separated part so "Folk-Punk" stays "Folk-Punk" (not
+    // "Folk-punk") and "Hip-Hop"/"Lo-Fi" keep both parts capitalised
+    // (Yves Scordia: Folk-Punk was lower-cased after the hyphen).
     genre
         .split('/')
         .map(|part| {
             part.split_whitespace()
-                .map(title_case_word)
+                .map(|word| {
+                    word.split('-')
+                        .map(title_case_word)
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -2299,6 +2307,19 @@ mod tests {
     fn split_genre_trims_whitespace() {
         let genres = split_genre_tag("  Jazz ;  Fusion  ; Progressive  ");
         assert_eq!(genres, vec!["Jazz", "Fusion", "Progressive"]);
+    }
+
+    #[test]
+    fn normalize_genre_preserves_hyphen_casing() {
+        // Yves Scordia: "Folk-Punk" was lower-cased after the hyphen.
+        assert_eq!(normalize_genre("Folk-Punk"), "Folk-Punk");
+        assert_eq!(normalize_genre("folk-punk"), "Folk-Punk");
+        assert_eq!(normalize_genre("hip-hop"), "Hip-Hop");
+        assert_eq!(normalize_genre("lo-fi"), "Lo-Fi");
+        // Slash + hyphen combos still work.
+        assert_eq!(normalize_genre("Folk-Punk/Ska-Punk"), "Folk-Punk/Ska-Punk");
+        // Single-word genres are unaffected.
+        assert_eq!(normalize_genre("rock"), "Rock");
     }
 
     #[test]
