@@ -408,7 +408,23 @@ fn build_signal_path(
         output_type,
         "dlna" | "openhome" | "chromecast" | "bluos" | "squeezebox"
     );
+    // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
+    // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
+    // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
+    // so the signal path does not show a phantom ALAC→FLAC transcode step when the
+    // wire is really ALAC (forum #1131: DartZeel DAC displays ALAC at the right
+    // resolution, yet the signal path claimed an ALAC→FLAC transcode).
+    // A zone forced to serve WAV/LPCM (`dlna_lpcm`) always transcodes, so it takes
+    // precedence over ALAC passthrough — matching the orchestrator.
+    let zone_id = zone.id.unwrap_or(0);
+    let dlna_lpcm =
+        is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_lpcm(zone_id);
+    let alac_passthrough = source_format == Some(AudioFormat::Alac)
+        && is_network_output
+        && !dlna_lpcm
+        && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
     let needs_transcode_for_output = is_network_output
+        && !alac_passthrough
         && source_format
             .as_ref()
             .is_some_and(|f| f.needs_transcode_for_dlna());
