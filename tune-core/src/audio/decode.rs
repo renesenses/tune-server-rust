@@ -1827,6 +1827,19 @@ mod decode_integration_tests {
     }
 
     #[test]
+    fn convert_pcm_bytes_24_to_16_for_dlna_lpcm() {
+        // #1137: a 24-bit source served to a DLNA renderer over the LPCM
+        // fallback must be reduced to genuine 16-bit PCM, not relabelled.
+        // 24-bit LE sample 0x123456 -> keep the top 16 bits -> 0x1234 (LE 34 12).
+        // A negative sample 0x800000 (-8388608) -> 0x8000 (i16::MIN, LE 00 80).
+        let src = [0x56, 0x34, 0x12, /* next */ 0x00, 0x00, 0x80];
+        let out = convert_pcm_bytes(&src, 24, 16);
+        assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
+        // Output is exactly 2 bytes per sample (16-bit).
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
     fn resolve_bit_depth_from_bits_per_sample() {
         let mut params = AudioCodecParameters::new();
         params.bits_per_sample = Some(24);
